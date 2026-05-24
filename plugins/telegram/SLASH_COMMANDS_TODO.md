@@ -240,11 +240,65 @@ allowed-cmd list. Floor: `/help` and `/whoami` always allowed.
 Update `plugins/telegram/README.md` with the full command catalog. Mirror
 into `5dive-blog/` if user wants public docs.
 
-### T17b — Sharpen mandatory-load markdown (token diet)
+### T17a — Silence-prevention via system-reminder hook
+
+Mechanical fix for "Claude went 10 minutes silent on Telegram." Prose
+instructions (CLAUDE.md, notify-user skill, silence-threshold memory)
+have all failed — Claude reads them at session start and still ignores
+mid-task. A hook that injects a fresh `<system-reminder>` when the
+silence threshold is crossed is the forcing function.
+
+**Why this and not the v0.2.0 watchdog:** v0.2.0 tried an auto-edited
+"⏳ working… 47s • last: Bash" bubble. User scrapped it — felt fake,
+delayed, robotic. **This is different:** the hook injects a reminder
+into Claude's context (visible only to Claude), Claude writes the
+actual TG content. No fake voice, no auto-edit; just a forcing
+function.
+
+**Shape:**
+- New hook: `hooks/silence-watchdog.sh` registered as PostToolUse.
+- State: `~/.claude/channels/telegram/silence.json` →
+  `{lastReplyAt, toolCallsSinceReply}`.
+- Plugin's reply/edit_message MCP tools call into the same state file
+  on successful send (resets the counters).
+- Hook decrements toolCallsSinceReply on every tool call; if
+  `(now - lastReplyAt) > 90s` OR `toolCallsSinceReply >= 5`, emits a
+  hookSpecificOutput with a `<system-reminder>` saying e.g.: "It's
+  been Xs and Y tool calls since your last Telegram message. The user
+  alarms at >60s silence — edit the previous reply with a one-line
+  status, or send a fresh one if a new inbound landed."
+- Re-fires every N calls if still silent (avoid one-shot fatigue).
+- Inert when not paired to a TG chat (check `~/.claude/channels/telegram/
+  access.json` `allowFrom` count).
+
+**Acceptance:**
+- Manual test: pair to a chat, run a long Bash command + several Read
+  calls without sending a TG reply. After ~5 tool calls, verify the
+  next tool result shows the system-reminder.
+- Reset test: send a reply, then run 4 tool calls — confirm no
+  reminder yet (under both thresholds).
+- Idle test: open a session that's not paired — confirm hook is inert
+  (no reminders).
+- No tmux/pane manipulation. No auto-edit. No fake voice.
+
+**Out of scope:**
+- Automatic message posting. Claude must write the content itself.
+- TaskUpdate-bound progress edits (deferred — could be T17c if T17a
+  proves insufficient).
+
+### T17b — Sharpen mandatory-load markdown (token diet) ✅ (shipped v0.3.1)
 
 Trim what Claude sees on every paired session. Mandatory load today
 ~1200 tokens; audit finds ~180 trimmable (~15%) with no content loss.
 Compounds across every turn of every session.
+
+**Shipped 2026-05-24 in v0.3.1:** dropped MCP instructions ¶3 (duplicated
+tool descs), tightened ¶2, extracted FORMAT_DESC const so the markdownv2
+explainer ships once instead of twice. ~150 tokens off.
+
+**Still open if we want another pass:** plugin description marketplace
+tail (~30 tokens), `access` and `configure` skill bodies (load on-invoke
+only — lower leverage).
 
 **Targets (priority order):**
 
