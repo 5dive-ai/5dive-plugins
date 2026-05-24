@@ -220,12 +220,13 @@ a specific chat, not necessarily the one that started it).
 
 ## Phase 4 — Polish (do after the above ships)
 
-### T15 — BotFather menu auto-sync
+### T15 — BotFather menu auto-sync ✅ (shipped with T0/v0.3.0)
 
-`bot.telegram.setMyCommands(...)` on every startup using T0's registry.
-Means users see the `/` menu without us manually editing it via BotFather.
-**Watch:** menu only supports ~32 commands; if we exceed, group by
-scope (admin vs user) using `setMyCommands` scopes.
+`bot.telegram.setMyCommands(...)` on every startup, driven by T0's
+`botFatherCommands()` derivation from the registry. Users see the `/`
+menu without us manually editing via BotFather.
+**Future watch:** menu only supports ~32 commands; if we exceed, group
+by scope (admin vs user) using `setMyCommands` scopes.
 
 ### T16 — Permission tiers
 
@@ -238,6 +239,47 @@ allowed-cmd list. Floor: `/help` and `/whoami` always allowed.
 
 Update `plugins/telegram/README.md` with the full command catalog. Mirror
 into `5dive-blog/` if user wants public docs.
+
+### T17b — Sharpen mandatory-load markdown (token diet)
+
+Trim what Claude sees on every paired session. Mandatory load today
+~1200 tokens; audit finds ~180 trimmable (~15%) with no content loss.
+Compounds across every turn of every session.
+
+**Targets (priority order):**
+
+1. **MCP `instructions` ¶3 (server.ts:436)** — "reply accepts file
+   paths… use react/edit_message…" duplicates the per-tool schema
+   `description` fields. Drop the paragraph. **~80 tokens.**
+2. **Duplicated `format` description** — the markdownv2 explainer
+   appears verbatim in both `reply` and `edit_message` tool schemas
+   (server.ts:502, :544). Pull into a `const FORMAT_DESC =` and reuse.
+   **~30 tokens.**
+3. **MCP `instructions` ¶2** (server.ts:434) — ~440 chars, dense,
+   mentions `reply_to` twice and overlaps with ¶1's "reply tool"
+   guidance. Restructure as 3 tight bullets: (a) inbound shape, (b)
+   image_path/attachment handling, (c) reply_to usage rule. **~40
+   tokens.**
+4. **Plugin description marketplace tail** — "Fork of Anthropic's
+   telegram plugin, maintained by 5dive" is useful in registry UIs,
+   noise to Claude. Borderline; keep unless we add a separate
+   `marketplace_description`. **~30 tokens (optional).**
+
+**Out of scope for T17b (do later if needed):**
+- SKILL.md bodies load only on-invoke, not per session. Lower
+  leverage. `access` and `configure` have some redundancy but no urgent
+  need.
+
+**Acceptance:**
+- Diff the rendered MCP instructions before/after — confirm no semantic
+  drop (every behavior the old text described still appears either in
+  the new instructions or in a tool schema description).
+- Run plugin smoke test (`bun build server.ts --no-bundle`) — passes.
+- Bump version (probably v0.3.1, patch — no behavior change).
+
+**Why it matters:** every paired session reads this. Marketing's agents,
+community's agents, and main's agents all pay the cost on every turn.
+~15% off the mandatory budget is real money over a year of usage.
 
 ---
 
