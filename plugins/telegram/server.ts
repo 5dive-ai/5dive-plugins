@@ -9,6 +9,8 @@
  * Telegram's Bot API has no history or search. Reply-only tools.
  */
 
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
@@ -695,34 +697,191 @@ bot.command('start', async ctx => {
 bot.command('help', async ctx => {
   if (!dmCommandGate(ctx)) return
   await ctx.reply(
-    `Messages you send here route to a paired Claude Code session. ` +
-    `Text and photos are forwarded; replies and reactions come back.\n\n` +
-    `/start — pairing instructions\n` +
-    `/status — check your pairing state`
+    `This bot bridges your Telegram chat to a Claude Code session — ` +
+    `freeform messages and photos are forwarded; replies and reactions come back.\n\n` +
+    `Commands:\n` +
+    `/help — this message\n` +
+    `/status — pairing state + session health (uptime, model, last activity)\n` +
+    `/stop — interrupt the agent's current task (Ctrl-C)\n` +
+    `/restart — kill claude and let systemd respawn it\n` +
+    `/agents — list sibling agents on this host\n` +
+    `/start — pairing instructions (only useful before you're paired)\n\n` +
+    `Forwarded messages go straight to the agent — no slash prefix needed.`
   )
 })
+
+// Find the most-recently-updated claude session file. Each running claude
+// process writes ~/.claude/sessions/<pid>.json with status/uptime metadata.
+// Returns null if no session file is readable (claude not started yet).
+function findActiveSession(): {
+  pid: number
+  sessionId: string
+  startedAt: number
+  updatedAt: number
+  status: string
+  version: string
+  cwd: string
+} | null {
+  const dir = join(homedir(), '.claude', 'sessions')
+  let best: any = null
+  let bestMtime = 0
+  try {
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith('.json')) continue
+      const path = join(dir, f)
+      try {
+        const st = statSync(path)
+        if (st.mtimeMs <= bestMtime) continue
+        const raw = readFileSync(path, 'utf8')
+        const j = JSON.parse(raw)
+        if (typeof j.pid !== 'number') continue
+        // Skip session files whose PID is no longer alive — they're stale.
+        try { process.kill(j.pid, 0) } catch { continue }
+        best = j
+        bestMtime = st.mtimeMs
+      } catch {}
+    }
+  } catch {}
+  return best
+}
+
+// Parse model from /proc/<pid>/cmdline. Claude is launched with
+// `--model <name>` or just defaults — fall back to "default" when no flag.
+function readClaudeModel(pid: number): string {
+  try {
+    const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
+    const i = cmdline.indexOf('--model')
+    if (i >= 0 && cmdline[i + 1]) return cmdline[i + 1]
+  } catch {}
+  return 'default'
+}
+
+function formatDuration(ms: number): string {
+  const sec = Math.floor(ms / 1000)
+  if (sec < 60) return `${sec}s`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m`
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr}h ${min % 60}m`
+  const day = Math.floor(hr / 24)
+  return `${day}d ${hr % 24}h`
+}
 
 bot.command('status', async ctx => {
   const gated = dmCommandGate(ctx)
   if (!gated) return
   const { access, senderId } = gated
 
-  if (access.allowFrom.includes(senderId)) {
-    const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
-    await ctx.reply(`Paired as ${name}.`)
+  // Unpaired senders get the upstream pairing flow — no health detail leaked.
+  if (!access.allowFrom.includes(senderId)) {
+    for (const [code, p] of Object.entries(access.pending)) {
+      if (p.senderId === senderId) {
+        await ctx.reply(
+          `Pending pairing — run in Claude Code:\n\n/telegram:access pair ${code}`
+        )
+        return
+      }
+    }
+    await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
     return
   }
 
-  for (const [code, p] of Object.entries(access.pending)) {
-    if (p.senderId === senderId) {
-      await ctx.reply(
-        `Pending pairing — run in Claude Code:\n\n/telegram:access pair ${code}`
-      )
+  const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
+  const session = findActiveSession()
+  const lines = [`Paired as ${name}.`, '']
+  if (!session) {
+    lines.push(`⚠️  no active claude session detected`)
+  } else {
+    const now = Date.now()
+    lines.push(`status: ${session.status}`)
+    lines.push(`model: ${readClaudeModel(session.pid)}`)
+    lines.push(`uptime: ${formatDuration(now - session.startedAt)}`)
+    lines.push(`last activity: ${formatDuration(now - session.updatedAt)} ago`)
+    lines.push(`claude: v${session.version}`)
+    lines.push(`cwd: ${session.cwd}`)
+  }
+  await ctx.reply(lines.join('\n'))
+})
+
+const execFileP = promisify(execFile)
+
+// /stop — interrupt the agent's current task. Sends C-c to the tmux pane
+// the running claude session lives in. Same effect as the user pressing
+// Esc / Ctrl-C in the local terminal. Paired senders only.
+bot.command('stop', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  if (!gated.access.allowFrom.includes(gated.senderId)) {
+    await ctx.reply(`Not paired — /stop requires a paired session.`)
+    return
+  }
+  const user = process.env.USER ?? process.env.LOGNAME ?? ''
+  const target = user.startsWith('agent-') ? user : ''
+  if (!target) {
+    await ctx.reply(`Can't determine tmux session name (USER=${user || '?'}).`)
+    return
+  }
+  try {
+    await execFileP('tmux', ['send-keys', '-t', `${target}:0`, 'C-c'])
+    await ctx.reply(`Sent Ctrl-C to ${target}.`)
+  } catch (err) {
+    await ctx.reply(`Failed to send Ctrl-C: ${err instanceof Error ? err.message : String(err)}`)
+  }
+})
+
+// /restart — kill the claude process; systemd's respawn loop brings it back
+// within ~2s. Useful when claude is stuck in an error state. Paired only.
+bot.command('restart', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  if (!gated.access.allowFrom.includes(gated.senderId)) {
+    await ctx.reply(`Not paired — /restart requires a paired session.`)
+    return
+  }
+  const session = findActiveSession()
+  if (!session) {
+    await ctx.reply(`No active claude session to restart.`)
+    return
+  }
+  try {
+    process.kill(session.pid, 'SIGTERM')
+    await ctx.reply(`Killed claude (pid=${session.pid}). systemd will respawn within ~2s.`)
+  } catch (err) {
+    await ctx.reply(`Failed to kill: ${err instanceof Error ? err.message : String(err)}`)
+  }
+})
+
+// /agents — list sibling agents managed by 5dive on the same host. Requires
+// `sudo 5dive` to read the agent registry. Paired senders only.
+bot.command('agents', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  if (!gated.access.allowFrom.includes(gated.senderId)) {
+    await ctx.reply(`Not paired — /agents requires a paired session.`)
+    return
+  }
+  try {
+    const { stdout } = await execFileP('sudo', ['-n', '5dive', 'agent', 'list', '--json'])
+    const j = JSON.parse(stdout)
+    if (!j.ok || !Array.isArray(j.data)) {
+      await ctx.reply(`5dive returned unexpected output.`)
       return
     }
+    if (j.data.length === 0) {
+      await ctx.reply(`No agents configured.`)
+      return
+    }
+    const me = (process.env.USER ?? '').replace(/^agent-/, '')
+    const lines = j.data.map((a: any) => {
+      const marker = a.name === me ? ' ← you' : ''
+      const ch = a.channels && a.channels !== 'none' ? ` [${a.channels}]` : ''
+      const profile = a.profile && a.profile !== '-' ? ` (${a.profile})` : ''
+      return `• ${a.name} · ${a.type}${ch}${profile} · ${a.active}${marker}`
+    })
+    await ctx.reply(`Agents on this host:\n\n${lines.join('\n')}`)
+  } catch (err) {
+    await ctx.reply(`Failed to list agents: ${err instanceof Error ? err.message : String(err)}`)
   }
-
-  await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
 // Inline-button handler for permission requests. Callback data is
@@ -1006,9 +1165,12 @@ void (async () => {
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           void bot.api.setMyCommands(
             [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
+              { command: 'help', description: 'List commands' },
+              { command: 'status', description: 'Pairing + session health' },
+              { command: 'stop', description: 'Interrupt current task (Ctrl-C)' },
+              { command: 'restart', description: 'Kill claude; systemd respawns' },
+              { command: 'agents', description: 'List sibling agents' },
+              { command: 'start', description: 'Pairing instructions' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
