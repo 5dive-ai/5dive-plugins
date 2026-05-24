@@ -745,15 +745,28 @@ function findActiveSession(): {
   return best
 }
 
-// Parse model from /proc/<pid>/cmdline. Claude is launched with
-// `--model <name>` or just defaults — fall back to "default" when no flag.
-function readClaudeModel(pid: number): string {
+// Read the model + effort the running claude is configured with. The CLI
+// flag wins if present (`--model`/`--effort`); otherwise fall back to
+// settings.json. Returns undefined for fields we couldn't determine — the
+// caller decides whether to emit a line for them.
+function readClaudeModelAndEffort(pid: number): { model?: string; effort?: string } {
+  let model: string | undefined
+  let effort: string | undefined
   try {
     const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
-    const i = cmdline.indexOf('--model')
-    if (i >= 0 && cmdline[i + 1]) return cmdline[i + 1]
+    const im = cmdline.indexOf('--model')
+    if (im >= 0 && cmdline[im + 1]) model = cmdline[im + 1]
+    const ie = cmdline.indexOf('--effort')
+    if (ie >= 0 && cmdline[ie + 1]) effort = cmdline[ie + 1]
   } catch {}
-  return 'default'
+  try {
+    const settings = JSON.parse(
+      readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'),
+    )
+    if (!model && typeof settings.model === 'string') model = settings.model
+    if (!effort && typeof settings.effortLevel === 'string') effort = settings.effortLevel
+  } catch {}
+  return { model, effort }
 }
 
 function formatDuration(ms: number): string {
@@ -793,12 +806,13 @@ bot.command('status', async ctx => {
     lines.push(`⚠️  no active claude session detected`)
   } else {
     const now = Date.now()
+    const { model, effort } = readClaudeModelAndEffort(session.pid)
     lines.push(`status: ${session.status}`)
-    lines.push(`model: ${readClaudeModel(session.pid)}`)
+    if (model) lines.push(`model: ${model}${effort ? ` · ${effort}` : ''}`)
     lines.push(`uptime: ${formatDuration(now - session.startedAt)}`)
     lines.push(`last activity: ${formatDuration(now - session.updatedAt)} ago`)
     lines.push(`claude: v${session.version}`)
-    lines.push(`cwd: ${session.cwd}`)
+    lines.push(`workdir: ${session.cwd}`)
   }
   await ctx.reply(lines.join('\n'))
 })
