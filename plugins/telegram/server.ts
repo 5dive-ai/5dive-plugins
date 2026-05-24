@@ -835,6 +835,57 @@ function patchSettings(patch: Record<string, unknown>): void {
   renameSync(tmp, path)
 }
 
+// Inline keyboards for /model and /effort. Callback data is parsed by the
+// bot.on('callback_query:data') handler — keep the `model:` / `effort:`
+// prefixes in sync there. Telegram caps callback_data at 64 bytes; our keys
+// are short enough to never approach that.
+function modelKeyboard(): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  for (const alias of Object.keys(MODEL_ALIASES)) kb.text(alias, `model:${alias}`)
+  return kb
+}
+function effortKeyboard(): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  for (const level of EFFORT_LEVELS) kb.text(level, `effort:${level}`)
+  return kb
+}
+
+// Shared apply path for the text and callback flows. Returns the
+// status string and whether a restart was scheduled — the callback
+// handler edits the originating message with the status text and removes
+// the keyboard so the same button can't be tapped twice.
+type ApplyResult = { text: string; restart: boolean }
+function applyModel(alias: string): ApplyResult {
+  if (!(alias in MODEL_ALIASES)) {
+    return { text: `Unknown model "${alias}".`, restart: false }
+  }
+  try {
+    patchSettings({ model: alias })
+  } catch (err) {
+    return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}`, restart: false }
+  }
+  const session = findActiveSession()
+  if (session) {
+    try { process.kill(session.pid, 'SIGTERM') } catch {}
+  }
+  return { text: `Switched to ${alias}. Restarting in ~1s; the session will resume.`, restart: true }
+}
+function applyEffort(level: string): ApplyResult {
+  if (!(EFFORT_LEVELS as readonly string[]).includes(level)) {
+    return { text: `Unknown effort "${level}".`, restart: false }
+  }
+  try {
+    patchSettings({ effortLevel: level })
+  } catch (err) {
+    return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}`, restart: false }
+  }
+  const session = findActiveSession()
+  if (session) {
+    try { process.kill(session.pid, 'SIGTERM') } catch {}
+  }
+  return { text: `Effort set to ${level}. Restarting in ~1s; the session will resume.`, restart: true }
+}
+
 function formatDuration(ms: number): string {
   const sec = Math.floor(ms / 1000)
   if (sec < 60) return `${sec}s`
@@ -950,61 +1001,47 @@ const commandHandlers: Record<string, CommandHandler> = {
   },
 
   // /model — show or switch the model field in ~/.claude/settings.json. With
-  // no arg we just echo the current value. With an alias we rewrite the file
-  // and SIGTERM claude so systemd respawns it on the new model. Claude Code
-  // accepts both short aliases ("opus") and full IDs ("claude-opus-4-7"), so
-  // we write the short alias the user typed — easier to read in settings.json.
+  // no arg we just echo the current value alongside an inline-keyboard so the
+  // user taps instead of typing. With a text arg we still accept the alias
+  // (back-compat + scripting). Both paths route through applyModel().
+  // Claude Code accepts short aliases ("opus") and full IDs
+  // ("claude-opus-4-7") — we write the short form, easier to read.
   model: async ctx => {
     const arg = (ctx.match ?? '').trim()
-    const session = findActiveSession()
-
     if (!arg) {
+      const session = findActiveSession()
       const cur = session ? readClaudeModelAndEffort(session.pid).model : undefined
-      const list = Object.keys(MODEL_ALIASES).join(' | ')
-      await ctx.reply(`Current model: ${cur ?? '(unset — using default)'}\nSwitch with: /model ${list}`)
+      await ctx.reply(`Current model: ${cur ?? '(unset — using default)'}`, {
+        reply_markup: modelKeyboard(),
+      })
       return
     }
     if (!(arg in MODEL_ALIASES)) {
       await ctx.reply(`Unknown model "${arg}". Try: /model ${Object.keys(MODEL_ALIASES).join(' | ')}`)
       return
     }
-    try {
-      patchSettings({ model: arg })
-    } catch (err) {
-      await ctx.reply(`Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}`)
-      return
-    }
-    await ctx.reply(`Switched to ${arg}. Restarting in ~1s; the session will resume.`)
-    if (session) {
-      try { process.kill(session.pid, 'SIGTERM') } catch {}
-    }
+    const r = applyModel(arg)
+    await ctx.reply(r.text)
   },
 
   // /effort — same shape as /model, different field. Claude Code stores the
   // current reasoning effort under `effortLevel` in settings.json.
   effort: async ctx => {
     const arg = (ctx.match ?? '').trim()
-    const session = findActiveSession()
-
     if (!arg) {
+      const session = findActiveSession()
       const cur = session ? readClaudeModelAndEffort(session.pid).effort : undefined
-      await ctx.reply(`Current effort: ${cur ?? '(unset — using default)'}\nSwitch with: /effort ${EFFORT_LEVELS.join(' | ')}`)
+      await ctx.reply(`Current effort: ${cur ?? '(unset — using default)'}`, {
+        reply_markup: effortKeyboard(),
+      })
       return
     }
     if (!(EFFORT_LEVELS as readonly string[]).includes(arg)) {
       await ctx.reply(`Unknown effort "${arg}". Try: /effort ${EFFORT_LEVELS.join(' | ')}`)
       return
     }
-    try {
-      patchSettings({ effortLevel: arg })
-    } catch (err) {
-      await ctx.reply(`Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}`)
-      return
-    }
-    await ctx.reply(`Effort set to ${arg}. Restarting in ~1s; the session will resume.`)
-    if (session) {
-      try { process.kill(session.pid, 'SIGTERM') } catch {}
-    }
+    const r = applyEffort(arg)
+    await ctx.reply(r.text)
   },
 
   // /agents — list sibling agents managed by 5dive on the same host. Requires
@@ -1052,20 +1089,41 @@ for (const def of COMMAND_REGISTRY) {
   })
 }
 
-// Inline-button handler for permission requests. Callback data is
-// `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
+// Inline-button handler. Routes:
+//   perm:allow|deny|more:<id>  → permission flow (declared upstream)
+//   model:<alias>              → /model picker
+//   effort:<level>             → /effort picker
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
-  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
-  if (!m) {
-    await ctx.answerCallbackQuery().catch(() => {})
-    return
-  }
   const access = loadAccess()
   const senderId = String(ctx.from.id)
   if (!access.allowFrom.includes(senderId)) {
     await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+
+  const modelM = /^model:([a-z0-9-]+)$/.exec(data)
+  if (modelM) {
+    const r = applyModel(modelM[1]!)
+    await ctx.answerCallbackQuery({ text: r.restart ? 'Switching…' : 'Failed' }).catch(() => {})
+    // Strip the keyboard so the same option can't be tapped twice, and
+    // surface the outcome inline. editMessageText errors when the new text
+    // equals the old; swallow so a no-op edit doesn't bubble.
+    await ctx.editMessageText(r.text).catch(() => {})
+    return
+  }
+  const effortM = /^effort:([a-z]+)$/.exec(data)
+  if (effortM) {
+    const r = applyEffort(effortM[1]!)
+    await ctx.answerCallbackQuery({ text: r.restart ? 'Switching…' : 'Failed' }).catch(() => {})
+    await ctx.editMessageText(r.text).catch(() => {})
+    return
+  }
+
+  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
+  if (!m) {
+    await ctx.answerCallbackQuery().catch(() => {})
     return
   }
   const [, behavior, request_id] = m

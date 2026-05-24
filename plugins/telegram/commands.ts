@@ -50,7 +50,7 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     name: 'agents',
-    description: 'List sibling agents on this host',
+    description: 'List agents on this host',
     scope: 'paired',
   },
   {
