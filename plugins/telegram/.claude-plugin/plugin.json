@@ -1,7 +1,12 @@
 {
   "name": "telegram",
-  "description": "Telegram channel for Claude Code \u2014 messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /telegram:access.",
-  "version": "0.0.6",
+  "description": "Telegram channel for Claude Code \u2014 messaging bridge with built-in access control, bundled lifecycle hooks (AskUserQuestion intercept, Stop-reply safety net). Fork of Anthropic's telegram plugin, maintained by 5dive.",
+  "version": "0.1.0",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "homepage": "https://github.com/5dive-com/5dive-plugins/tree/main/plugins/telegram",
   "keywords": [
     "telegram",
     "messaging",
