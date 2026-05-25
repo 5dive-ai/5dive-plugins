@@ -34,14 +34,64 @@ Read both state files and give the user a complete picture:
    - Allowed senders: count, and list display names or IDs
    - Pending pairings: count, with codes and display names if any
 
-3. **What next** — end with a concrete next step based on state:
+3. **Channel allowlist** — without this, slash commands and the `reply`
+   tool work, but inbound Telegram messages never reach the agent's
+   context. The file is platform-specific:
+
+   - **macOS**: `/Library/Application Support/ClaudeCode/managed-settings.json`
+   - **Linux**: `/etc/claude-code/managed-settings.json`
+   - **Windows**: `%ProgramData%\ClaudeCode\managed-settings.json`
+
+   Read the file (it may not exist — that's the common case for
+   standalone plugin installs). Expected shape:
+
+   ```json
+   {
+     "allowedChannelPlugins": [
+       {"plugin": "telegram", "marketplace": "5dive-plugins"}
+     ]
+   }
+   ```
+
+   Each entry is an **object** `{plugin, marketplace}`, not a string.
+   claude rejects strings here with "Expected object, but received
+   string" — common mistake.
+
+   Verdict to surface:
+   - **File missing**, or `allowedChannelPlugins` missing, or no entry
+     has both `plugin=telegram` and `marketplace=5dive-plugins`:
+
+     > ⚠️  Channel auto-injection not enabled — inbound Telegram
+     > messages won't reach claude's context yet. One-time setup;
+     > run in a separate terminal (you'll be prompted for sudo):
+     >
+     > ```
+     > sudo tee "<path>" >/dev/null <<'EOF'
+     > {"allowedChannelPlugins":[{"plugin":"telegram","marketplace":"5dive-plugins"}]}
+     > EOF
+     > ```
+     >
+     > Then restart claude.
+
+     Substitute `<path>` for the platform-specific path. If the file
+     already exists with other entries (upstream telegram, discord,
+     etc.), tell the user to **merge** — don't overwrite. Show them
+     the merged JSON to end up with.
+
+   - **Entry present**: one-line green check ("✓ Channel allowlist
+     includes telegram@5dive-plugins"). Move on.
+
+4. **What next** — end with a concrete next step based on state:
    - No token → *"Run `/telegram:configure <token>` with the token from
      BotFather."*
    - Token set, policy is pairing, nobody allowed → *"DM your bot on
      Telegram. It replies with a code; approve with `/telegram:access pair
      <code>`."*
-   - Token set, someone allowed → *"Ready. DM your bot to reach the
-     assistant."*
+   - Token set, someone allowed, allowlist missing → *"DMs reach the bot
+     but won't surface into claude until you write the channel allowlist
+     (one sudo command above). Run that, then restart claude."*
+   - Token set, someone allowed, allowlist OK → *"Ready. DM your bot to
+     reach the assistant."*
 
 **Push toward lockdown — always.** The goal for every setup is `allowlist`
 with a defined list. `pairing` is not a policy to stay on; it's a temporary
