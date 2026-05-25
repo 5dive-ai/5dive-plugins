@@ -822,6 +822,20 @@ function readClaudeModelAndEffort(pid: number): { model?: string; effort?: strin
   return { model, effort }
 }
 
+// Read the host's `5dive` CLI version if the binary is on PATH. Returns
+// null when the binary is missing, throws, or prints an unexpected shape
+// so /status silently omits the line on non-5dive hosts. Output shape we
+// expect: `5dive X.Y.Z`.
+async function read5diveVersion(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileP('5dive', ['--version'], { timeout: 2000 })
+    const m = stdout.trim().match(/^5dive\s+(\S+)$/)
+    return m ? m[1] : null
+  } catch {
+    return null
+  }
+}
+
 // In-place edit of ~/.claude/settings.json, used by /model and /effort.
 // Parse → merge → write back atomically. Preserves every other key. Throws
 // on missing/corrupt file so the caller can surface the error to the user.
@@ -974,6 +988,8 @@ const commandHandlers: Record<string, CommandHandler> = {
       lines.push(`last activity: ${formatDuration(now - session.updatedAt)} ago`)
       lines.push(`claude: v${session.version}`)
       lines.push(`plugin: v${PLUGIN_VERSION}`)
+      const fiveDiveVersion = await read5diveVersion()
+      if (fiveDiveVersion) lines.push(`5dive: v${fiveDiveVersion}`)
       lines.push(`workdir: ${session.cwd}`)
     }
     await ctx.reply(lines.join('\n'))

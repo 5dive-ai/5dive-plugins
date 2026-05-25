@@ -10,8 +10,9 @@ Tracks the diff between `plugins/telegram/` and upstream
 - **`/help`** — full command listing (replaces upstream's two-line version).
 - **`/status`** — pairing line **plus** session health for paired senders:
   uptime, model, last activity, cwd, claude version (read from
-  `~/.claude/sessions/<pid>.json`). Pairing-only output preserved for
-  un-paired senders.
+  `~/.claude/sessions/<pid>.json`), plugin version, and the host's
+  `5dive` CLI version when the binary is on PATH. Pairing-only output
+  preserved for un-paired senders.
 - **`/stop`** — interrupt the agent's current task. Sends `C-c` to the tmux
   pane the running claude session lives in.
 - **`/restart`** — `SIGTERM` claude; systemd's respawn loop brings it back
