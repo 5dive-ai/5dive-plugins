@@ -1114,9 +1114,10 @@ function applyModel(alias: string): ApplyResult {
 }
 // Apply path for /account: shell out to `sudo -n 5dive agent set-account
 // <me> <name>` (which writes the registry + repoints the agent's auth-profile
-// symlink). On success we still need to restart claude so the running
-// session picks up the new credentials — same SIGTERM-deferred pattern as
-// applyModel/applyEffort. Returns a status string + deferred restart fn.
+// symlink and schedules its own deferred restart of 5dive-agent@<me>.service
+// via systemd-run). We don't queue our own SIGTERM here — doing so on top of
+// the CLI's deferred restart caused a double-restart race; the CLI owns the
+// restart now so the running session picks up the new credentials.
 async function applyAccount(name: string): Promise<ApplyResult> {
   const me = thisAgentName()
   if (!me) return { text: `Can't determine this agent's name (not running as agent-* user).` }
@@ -1134,7 +1135,9 @@ async function applyAccount(name: string): Promise<ApplyResult> {
   }
   return {
     text: `✅ Account → ${name}\n\n⚠️  Claude is restarting in ~1s so the new credentials take effect.`,
-    after: scheduleClaudeRestart,
+    // Marker so the callback handler still shows the "Switching…" toast.
+    // The CLI schedules the actual systemctl restart; no client-side action.
+    after: () => {},
   }
 }
 
@@ -1152,17 +1155,6 @@ function applyEffort(level: string): ApplyResult {
     after: () => proxyToClaudeTUI(`/effort ${level}`),
   }
 }
-// Defer the kill by 500ms so any awaited reply/edit ahead of it lands at
-// Telegram before server.ts shuts down (server.ts has a 2s grace, but the
-// in-flight outbound HTTP request needs to finish before bot.stop fires).
-function scheduleClaudeRestart(): void {
-  const session = findActiveSession()
-  if (!session) return
-  setTimeout(() => {
-    try { process.kill(session.pid, 'SIGTERM') } catch {}
-  }, 500).unref()
-}
-
 // Send a slash command into the running claude TUI by typing it into the
 // agent's tmux pane. Same wiring as /stop (which sends C-c). The agent's
 // tmux session is named after its user ("agent-<name>:0"). Errors are
