@@ -30,13 +30,13 @@ export interface CommandDef {
 export const COMMAND_REGISTRY: CommandDef[] = [
   {
     name: 'start',
-    description: 'Pairing instructions',
+    description: 'Pair this chat',
     scope: 'allowed',
     hidden: true,
   },
   {
     name: 'help',
-    description: 'List commands',
+    description: 'Show commands',
     scope: 'allowed',
   },
   {
@@ -46,42 +46,42 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     name: 'stop',
-    description: 'Interrupt current task',
+    description: 'Interrupt task',
     scope: 'paired',
   },
   {
     name: 'restart',
-    description: 'Respawn claude (kill + systemd)',
+    description: 'Respawn claude',
     scope: 'paired',
   },
   {
     name: 'clear',
-    description: 'Wipe context (in-place; no respawn)',
+    description: 'Clear context',
     scope: 'paired',
   },
   {
     name: 'agents',
-    description: 'List or control sibling agents',
+    description: 'Sibling agents',
     scope: 'paired-5dive',
   },
   {
     name: 'model',
-    description: 'Show or switch model',
+    description: 'Pick model',
     scope: 'paired',
   },
   {
     name: 'effort',
-    description: 'Show or switch reasoning effort',
+    description: 'Pick reasoning effort',
     scope: 'paired',
   },
   {
     name: 'account',
-    description: 'Show or switch auth account',
+    description: 'Pick auth account',
     scope: 'paired-5dive',
   },
   {
     name: 'goal',
-    description: 'Self-paced goal via /loop',
+    description: 'Self-paced goal',
     scope: 'paired',
   },
 ]
