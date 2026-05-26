@@ -78,8 +78,16 @@ saveSilence({
 })
 
 if (shouldFire) {
+  // Pick the right verb. If the latest inbound hasn't been replied to yet,
+  // the user expects an answer BELOW their question — edits land on older
+  // messages and look misplaced. Only edit when the in-flight task already
+  // has an ack and no new inbound has landed since.
+  const unansweredInbound = lastInbound > lastReply
+  const action = unansweredInbound
+    ? 'Send a fresh reply (mcp__plugin_telegram_telegram__reply, reply_to the latest inbound) — the user is waiting on an answer to their newest message.'
+    : 'Edit your last reply (mcp__plugin_telegram_telegram__edit_message) with a one-line status — same in-flight task, no new inbound, so an edit avoids re-pinging their phone.'
   emitPostToolContext(
-    `You've gone ${sinceReply}s and ${calls} tool calls without sending a Telegram message. The user alarms at >60s silence — edit your last reply (mcp__plugin_telegram_telegram__edit_message) with a one-line status now, or send a fresh reply if a new inbound landed. Don't go silent.`,
+    `You've gone ${sinceReply}s and ${calls} tool calls without sending a Telegram message. The user alarms at >60s silence. ${action} Don't go silent.`,
   )
 }
 process.exit(0)

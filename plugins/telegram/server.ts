@@ -26,11 +26,13 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 
-// Plugin version is sourced from the colocated package.json so /status
-// can surface it without a build-time stamp. Wrapped to never throw.
+// Plugin version is sourced from .claude-plugin/plugin.json — the same
+// manifest the Claude Code plugin system reads, so /status can never
+// drift from what users have installed. Wrapped to never throw.
 let PLUGIN_VERSION = '?'
 try {
-  PLUGIN_VERSION = JSON.parse(readFileSync(join(import.meta.dir, 'package.json'), 'utf8')).version ?? '?'
+  PLUGIN_VERSION =
+    JSON.parse(readFileSync(join(import.meta.dir, '.claude-plugin', 'plugin.json'), 'utf8')).version ?? '?'
 } catch {}
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
