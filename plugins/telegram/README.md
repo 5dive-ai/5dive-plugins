@@ -40,7 +40,26 @@ Writes `TELEGRAM_BOT_TOKEN=...` to `~/.claude/channels/telegram/.env`. You can a
 
 > To run multiple bots on one machine (different tokens, separate allowlists), point `TELEGRAM_STATE_DIR` at a different directory per instance.
 
-**4. Relaunch with the channel flag.**
+**4. Approve the channel plugin.**
+
+Claude Code 2.1.150+ enforces an allowlist for channel plugins. Add it to managed-settings:
+
+**Personal accounts** — write `/etc/claude-code/managed-settings.json` (requires sudo):
+
+```json
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "plugin": "telegram", "marketplace": "claude-plugins-official" }
+  ]
+}
+```
+
+**Team/org accounts** (Anthropic Console OAuth) — the local file is **ignored**; remote policy overrides it. Set the same JSON at **claude.ai → Admin Settings → Claude Code → Managed settings → Manage**. Personal accounts can use this path too if they prefer.
+
+> Symptom if missing: the MCP log shows `Channel notifications skipped: plugin telegram@... is not on the approved channels allowlist`, and your bot's DMs never reach Claude.
+
+**5. Relaunch with the channel flag.**
 
 The server won't connect without this — exit your session and start a new one:
 
@@ -48,7 +67,7 @@ The server won't connect without this — exit your session and start a new one:
 claude --channels plugin:telegram@claude-plugins-official
 ```
 
-**5. Pair.**
+**6. Pair.**
 
 With Claude Code running from the previous step, DM your bot on Telegram — it replies with a 6-character pairing code. If the bot doesn't respond, make sure your session is running with `--channels`. In your Claude Code session:
 
@@ -60,7 +79,7 @@ Your next DM reaches the assistant.
 
 > Unlike Discord, there's no server invite step — Telegram bots accept DMs immediately. Pairing handles the user-ID lookup so you never touch numeric IDs.
 
-**6. Lock it down.**
+**7. Lock it down.**
 
 Pairing is for capturing IDs. Once you're in, switch to `allowlist` so strangers don't get pairing-code replies. Ask Claude to do it, or `/telegram:access policy allowlist` directly.
 
