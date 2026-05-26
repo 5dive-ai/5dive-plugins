@@ -286,6 +286,31 @@ function markInbound(): void {
   writeSilence({ lastInboundAt: Math.floor(Date.now() / 1000) })
 }
 
+// Sticky-header anchors: every reply is remembered so subsequent
+// edit_message calls can prepend the original text. Without this the
+// agent overwrites a task ack with later progress and the user loses
+// context if they didn't read the earlier version. First-write-wins —
+// edits never overwrite the anchor. In-memory only; on restart the
+// cache empties and edits fall back to legacy replace-all behavior.
+const ANCHOR_CAP = 500
+const ANCHOR_SEPARATOR = '\n\n→ '
+const anchors = new Map<string, string>()
+function anchorKey(chat_id: string, message_id: number): string {
+  return `${chat_id}:${message_id}`
+}
+function rememberAnchor(chat_id: string, message_id: number, text: string): void {
+  const key = anchorKey(chat_id, message_id)
+  if (anchors.has(key)) return
+  if (anchors.size >= ANCHOR_CAP) {
+    const oldest = anchors.keys().next().value
+    if (oldest != null) anchors.delete(oldest)
+  }
+  anchors.set(key, text)
+}
+function getAnchor(chat_id: string, message_id: number): string | undefined {
+  return anchors.get(anchorKey(chat_id, message_id))
+}
+
 function pruneExpired(a: Access): boolean {
   const now = Date.now()
   let changed = false
@@ -581,7 +606,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'edit_message',
-      description: 'Edit a message the bot previously sent. Useful for interim progress updates. Edits don\'t trigger push notifications — send a new reply when a long task completes so the user\'s device pings.',
+      description: 'Edit a message the bot previously sent. Useful for interim progress updates. The server automatically prepends the original message text as a sticky header, so pass ONLY the new status — do not re-include the original ack. Edits don\'t trigger push notifications — send a new reply when a long task completes so the user\'s device pings.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -640,6 +665,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
             })
+            rememberAnchor(chat_id, sent.message_id, chunks[i])
             sentIds.push(sent.message_id)
           }
         } catch (err) {
@@ -699,13 +725,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: path }] }
       }
       case 'edit_message': {
-        assertAllowedChat(args.chat_id as string)
+        const chat_id = args.chat_id as string
+        const message_id = Number(args.message_id)
+        assertAllowedChat(chat_id)
         const editFormat = (args.format as string | undefined) ?? 'text'
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const anchor = getAnchor(chat_id, message_id)
+        // If we have an anchor and the agent already echoed it back (e.g.
+        // re-sent the full prior text), strip it so we don't stitch twice.
+        let body = args.text as string
+        if (anchor && body.startsWith(anchor)) {
+          body = body.slice(anchor.length).replace(/^(\s*\n)+\s*(→\s+)?/, '')
+        }
+        const finalText = anchor ? `${anchor}${ANCHOR_SEPARATOR}${body}` : body
         const edited = await bot.api.editMessageText(
-          args.chat_id as string,
-          Number(args.message_id),
-          args.text as string,
+          chat_id,
+          message_id,
+          finalText,
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
         markReplySent()

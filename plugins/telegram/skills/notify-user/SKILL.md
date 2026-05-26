@@ -21,6 +21,11 @@ Telegram message MUST get a `reply` before the turn ends, even if it's just
   in the chat. If a fresher message exists (a new inbound from the user, or
   another reply you sent in between), the older message will be missed in
   scrollback; send a new `reply` instead.
+- **Editing keeps a sticky header.** The server auto-prepends the original
+  reply's text on every `edit_message`, so the task ack stays visible while
+  the status below it changes. Pass ONLY the new status as the `text` arg —
+  don't re-include the original ack, or it'll be doubled (the server tries
+  to detect and strip echoed headers, but it's best to just send the delta).
 - **Done or blocked → new reply.** A fresh `reply` triggers push
   notification; an edit does not.
 - **Silence ceiling: ~60s.** Beyond that the user starts assuming the
