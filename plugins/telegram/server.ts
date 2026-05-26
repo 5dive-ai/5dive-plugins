@@ -1005,50 +1005,58 @@ function patchSettings(patch: Record<string, unknown>): void {
   renameSync(tmp, path)
 }
 
-// Inline keyboards for /model and /effort. Callback data is parsed by the
-// bot.on('callback_query:data') handler — keep the `model:` / `effort:`
-// prefixes in sync there. Telegram caps callback_data at 64 bytes; our keys
-// are short enough to never approach that.
-function modelKeyboard(): InlineKeyboard {
+// Inline keyboards for /model, /effort, /account. Callback data is parsed by
+// the bot.on('callback_query:data') handler — keep the `model:` / `effort:` /
+// `account:` prefixes in sync there. Telegram caps callback_data at 64 bytes;
+// our keys are short enough to never approach that.
+//
+// The active option is rendered as a no-op button (prefix "✓ ", callback_data
+// "<scope>:noop") so the user sees which one is current. Telegram requires
+// callback_data on every button — there's no "disabled" flag — so the noop
+// variant is the conventional workaround. The callback handler ignores it.
+function isActiveModel(alias: string, current: string | undefined): boolean {
+  if (!current) return false
+  return alias === current || MODEL_ALIASES[alias] === current
+}
+function modelKeyboard(current?: string): InlineKeyboard {
   const kb = new InlineKeyboard()
-  for (const alias of Object.keys(MODEL_ALIASES)) kb.text(alias, `model:${alias}`)
+  for (const alias of Object.keys(MODEL_ALIASES)) {
+    if (isActiveModel(alias, current)) kb.text(`✓ ${alias}`, 'model:noop')
+    else kb.text(alias, `model:${alias}`)
+  }
   return kb
 }
-function effortKeyboard(): InlineKeyboard {
+function effortKeyboard(current?: string): InlineKeyboard {
   const kb = new InlineKeyboard()
-  for (const level of EFFORT_LEVELS) kb.text(level, `effort:${level}`)
+  for (const level of EFFORT_LEVELS) {
+    if (level === current) kb.text(`✓ ${level}`, 'effort:noop')
+    else kb.text(level, `effort:${level}`)
+  }
   return kb
 }
 
-// /account keyboard: one row per account, plus a final "default" row that
-// clears the binding. The active row is rendered as a no-op button (prefix
-// "✓ ", callback_data "account:noop") so the user sees which one is current.
-// Telegram requires callback_data on every button — there's no "disabled"
-// flag — so the noop variant is the conventional workaround. The callback
-// handler ignores `account:noop`.
+// /account keyboard: single inline row matching /model and /effort, plus a
+// final "default" button that clears the binding. Active option marked the
+// same way as the other pickers (see modelKeyboard above for the noop trick).
 function accountKeyboard(names: string[], current: string): InlineKeyboard {
   const kb = new InlineKeyboard()
-  const rows = [...names, 'default']
-  for (const name of rows) {
-    if (name === current) {
-      kb.text(`✓ ${name}`, 'account:noop').row()
-    } else {
-      kb.text(name, `account:${name}`).row()
-    }
+  for (const name of [...names, 'default']) {
+    if (name === current) kb.text(`✓ ${name}`, 'account:noop')
+    else kb.text(name, `account:${name}`)
   }
   return kb
 }
 
 // Shared apply path for the text and callback flows. Edits settings.json
-// and returns the status string + a deferred-restart fn the caller invokes
-// AFTER it finishes its outbound Telegram I/O. Triggering SIGTERM inline
-// raced the bot's pending sendMessage/editMessageText: server.ts shuts
-// down with a 2s grace, but the in-flight HTTP request to Telegram's API
-// didn't reliably land before the process exited, so the user saw the
-// original message with the keyboard still attached — looked like
-// nothing happened. Now the caller awaits the reply/edit first, then
-// fires restart(), which schedules the SIGTERM on a short timer.
-type ApplyResult = { text: string; restart?: () => void }
+// and returns the status string + a deferred-action fn the caller invokes
+// AFTER it finishes its outbound Telegram I/O. The deferred action either
+// proxies the change into the running claude TUI (model/effort, via tmux
+// send-keys to the agent's pane — no restart needed) or schedules a SIGTERM
+// (account, which needs a fresh process to pick up new credentials).
+// Running the action inline raced the bot's pending sendMessage/editMessageText
+// so the user saw the original keyboard still attached — now we await
+// Telegram I/O first, then fire the action.
+type ApplyResult = { text: string; after?: () => void }
 function applyModel(alias: string): ApplyResult {
   if (!(alias in MODEL_ALIASES)) {
     return { text: `Unknown model "${alias}".` }
@@ -1059,8 +1067,8 @@ function applyModel(alias: string): ApplyResult {
     return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}` }
   }
   return {
-    text: `✅ Model → ${alias}\n\n⚠️  Claude is restarting in ~1s — the session will resume on the new model. You may notice a short pause before the next reply.`,
-    restart: scheduleClaudeRestart,
+    text: `✅ Model → ${alias} (sent /model to the running session)`,
+    after: () => proxyToClaudeTUI(`/model ${alias}`),
   }
 }
 // Apply path for /account: shell out to `sudo -n 5dive agent set-account
@@ -1085,7 +1093,7 @@ async function applyAccount(name: string): Promise<ApplyResult> {
   }
   return {
     text: `✅ Account → ${name}\n\n⚠️  Claude is restarting in ~1s so the new credentials take effect.`,
-    restart: scheduleClaudeRestart,
+    after: scheduleClaudeRestart,
   }
 }
 
@@ -1099,8 +1107,8 @@ function applyEffort(level: string): ApplyResult {
     return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}` }
   }
   return {
-    text: `✅ Effort → ${level}\n\n⚠️  Claude is restarting in ~1s — the session will resume with the new effort level. You may notice a short pause before the next reply.`,
-    restart: scheduleClaudeRestart,
+    text: `✅ Effort → ${level} (sent /effort to the running session)`,
+    after: () => proxyToClaudeTUI(`/effort ${level}`),
   }
 }
 // Defer the kill by 500ms so any awaited reply/edit ahead of it lands at
@@ -1112,6 +1120,18 @@ function scheduleClaudeRestart(): void {
   setTimeout(() => {
     try { process.kill(session.pid, 'SIGTERM') } catch {}
   }, 500).unref()
+}
+
+// Send a slash command into the running claude TUI by typing it into the
+// agent's tmux pane. Same wiring as /stop (which sends C-c). The agent's
+// tmux session is named after its user ("agent-<name>:0"). Errors are
+// swallowed — if there's no tmux session, the settings.json edit we did
+// before this still ensures the next claude startup picks up the change.
+function proxyToClaudeTUI(line: string): void {
+  const user = process.env.USER ?? process.env.LOGNAME ?? ''
+  const target = user.startsWith('agent-') ? user : ''
+  if (!target) return
+  execFileP('tmux', ['send-keys', '-t', `${target}:0`, line, 'Enter']).catch(() => {})
 }
 
 function formatDuration(ms: number): string {
@@ -1186,16 +1206,16 @@ const commandHandlers: Record<string, CommandHandler> = {
       const { model, effort } = readClaudeModelAndEffort(session.pid)
       lines.push(`status: ${session.status}`)
       if (model) lines.push(`model: ${model}${effort ? ` · ${effort}` : ''}`)
-      // Usage line: 5h / 7d come from the statusline cache; context %
-      // from the latest assistant turn in the JSONL transcript. Each
-      // value is optional — emit a single combined line when at least
-      // one is present, dropping the missing pieces silently.
-      const usage = readStatuslineCache()
+      // Context % comes from the latest assistant turn in the JSONL transcript.
+      // 5h / 1w come from the statusline cache (written by the host's
+      // statusline.sh on every render). Each is optional — skip the line if
+      // the source isn't available rather than emitting an empty field.
       const ctxPct = readContextPct(session)
+      if (typeof ctxPct === 'number') lines.push(`context: ${ctxPct}%`)
+      const usage = readStatuslineCache()
       const usageParts: string[] = []
-      if (typeof ctxPct === 'number') usageParts.push(`ctx: ${ctxPct}%`)
       if (usage?.five_hour_pct !== undefined) usageParts.push(`5h: ${Math.round(usage.five_hour_pct)}%`)
-      if (usage?.seven_day_pct !== undefined) usageParts.push(`7d: ${Math.round(usage.seven_day_pct)}%`)
+      if (usage?.seven_day_pct !== undefined) usageParts.push(`1w: ${Math.round(usage.seven_day_pct)}%`)
       if (usageParts.length) lines.push(`usage: ${usageParts.join(' · ')}`)
       lines.push(`uptime: ${formatDuration(now - session.startedAt)}`)
       lines.push(`last activity: ${formatDuration(now - session.updatedAt)} ago`)
@@ -1254,7 +1274,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       const session = findActiveSession()
       const cur = session ? readClaudeModelAndEffort(session.pid).model : undefined
       await ctx.reply(`Current model: ${cur ?? '(unset — using default)'}`, {
-        reply_markup: modelKeyboard(),
+        reply_markup: modelKeyboard(cur),
       })
       return
     }
@@ -1264,7 +1284,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     }
     const r = applyModel(arg)
     await ctx.reply(r.text)
-    r.restart?.()
+    r.after?.()
   },
 
   // /effort — same shape as /model, different field. Claude Code stores the
@@ -1275,7 +1295,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       const session = findActiveSession()
       const cur = session ? readClaudeModelAndEffort(session.pid).effort : undefined
       await ctx.reply(`Current effort: ${cur ?? '(unset — using default)'}`, {
-        reply_markup: effortKeyboard(),
+        reply_markup: effortKeyboard(cur),
       })
       return
     }
@@ -1285,7 +1305,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     }
     const r = applyEffort(arg)
     await ctx.reply(r.text)
-    r.restart?.()
+    r.after?.()
   },
 
   // /agents — list sibling agents managed by 5dive on the same host. Requires
@@ -1386,6 +1406,10 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  if (data === 'model:noop' || data === 'effort:noop') {
+    await ctx.answerCallbackQuery({ text: 'Already active.' }).catch(() => {})
+    return
+  }
   const modelM = /^model:([a-z0-9-]+)$/.exec(data)
   if (modelM) {
     const r = applyModel(modelM[1]!)
@@ -1394,17 +1418,17 @@ bot.on('callback_query:data', async ctx => {
     // replaces the original message body and strips the keyboard so the
     // same option can't be tapped twice. We await both BEFORE scheduling
     // the SIGTERM so the user actually sees the confirmation.
-    await ctx.answerCallbackQuery({ text: r.restart ? 'Switching…' : 'Failed' }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Failed' }).catch(() => {})
     await ctx.editMessageText(r.text).catch(() => {})
-    r.restart?.()
+    r.after?.()
     return
   }
   const effortM = /^effort:([a-z]+)$/.exec(data)
   if (effortM) {
     const r = applyEffort(effortM[1]!)
-    await ctx.answerCallbackQuery({ text: r.restart ? 'Switching…' : 'Failed' }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Failed' }).catch(() => {})
     await ctx.editMessageText(r.text).catch(() => {})
-    r.restart?.()
+    r.after?.()
     return
   }
   // /account picker: account:noop is the active-row no-op; account:<name>
@@ -1418,9 +1442,9 @@ bot.on('callback_query:data', async ctx => {
   const accountM = /^account:([a-z][a-z0-9_-]{0,31}|default)$/.exec(data)
   if (accountM) {
     const r = await applyAccount(accountM[1]!)
-    await ctx.answerCallbackQuery({ text: r.restart ? 'Switching…' : 'Failed' }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Failed' }).catch(() => {})
     await ctx.editMessageText(r.text).catch(() => {})
-    r.restart?.()
+    r.after?.()
     return
   }
 
