@@ -29,10 +29,23 @@ export function readEntries(transcriptPath: string): TranscriptEntry[] {
 // "resets Xpm (TZ)" line claude received from the 429 response.
 // Immune to the tmux alt-screen issue that hides the pane line when the
 // "Stop and wait" menu is showing.
+// How far back from the tail we'll trust a rate-limit reset line. The
+// relevant message is always at the tail — claude emits the synthetic
+// api-error and *stops*, which is what fires StopFailure — so a small window
+// captures it. Critically, it must NOT reach rate-limit messages from an
+// *earlier* limit episode in the same long-lived session: those carry a stale
+// clock time (e.g. this morning's "resets 9:10am") that parseResetEpoch then
+// bumps to *tomorrow*, producing an absurd ~18h wait. Bounding the scan also
+// makes the flush race safe: if the current synthetic entry hasn't been
+// written to the transcript yet when the hook fires, we return null (caller
+// retries / falls back) instead of silently reusing a stale earlier line.
+const RATE_LIMIT_LOOKBACK = 40
+
 export function findRateLimitText(entries: TranscriptEntry[]): string | null {
+  const from = Math.max(0, entries.length - RATE_LIMIT_LOOKBACK)
   // Primary: the synthetic message claude tags error="rate_limit". Most
-  // reliable when present.
-  for (let i = entries.length - 1; i >= 0; i--) {
+  // reliable when present. Bounded to the recent window (see above).
+  for (let i = entries.length - 1; i >= from; i--) {
     const e = entries[i]
     if (e.error !== 'rate_limit' || !e.isApiErrorMessage) continue
     const content = e.message?.content
@@ -44,12 +57,11 @@ export function findRateLimitText(entries: TranscriptEntry[]): string | null {
     }
   }
   // Fallback: the tag isn't guaranteed (weekly/5h-limit phrasings, upstream
-  // changes). Scan the last ~40 entries' text blocks for a line that carries
-  // an actual reset clue — a clock time or a "reset/try again in …" phrase —
-  // and return it for parseResetEpoch to interpret. Kept specific to avoid
-  // returning unrelated prose.
+  // changes). Scan the same recent window's text blocks for a line that
+  // carries an actual reset clue — a clock time or a "reset/try again in …"
+  // phrase — and return it for parseResetEpoch to interpret. Kept specific to
+  // avoid returning unrelated prose.
   const RESET_TIME = /resets?\b|reset (?:at|in)\b|try again (?:at|in)\b|\bin\s+\d+\s*(?:h|m|hour|min|sec)|\d{1,2}(?::\d{2})?\s*(?:am|pm)/i
-  const from = Math.max(0, entries.length - 40)
   for (let i = entries.length - 1; i >= from; i--) {
     const content = entries[i].message?.content
     if (!Array.isArray(content)) continue

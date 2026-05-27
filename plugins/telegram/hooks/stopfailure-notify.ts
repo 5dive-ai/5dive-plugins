@@ -32,7 +32,7 @@ const raw = JSON.stringify(payload)
 const isRateLimit = /rate_limit|usage.limit/i.test(raw)
 
 const transcriptPath = payload.transcript_path
-const entries = transcriptPath ? readEntries(transcriptPath) : []
+let entries = transcriptPath ? readEntries(transcriptPath) : []
 
 // Capture the pane up front. Two uses:
 //   1. Scrape "API Error: 529 ..." for non-rate-limit failures (payload only
@@ -61,9 +61,29 @@ if (resetRaw !== undefined && resetRaw !== null) {
   resetEpoch = parseResetEpoch(String(resetRaw))
 }
 
-if (resetEpoch === null) {
-  const transcriptResetText = findRateLimitText(entries)
-  if (transcriptResetText) resetEpoch = parseResetEpoch(transcriptResetText)
+if (resetEpoch === null && transcriptPath) {
+  // The synthetic rate-limit entry is written ~concurrently with this hook
+  // firing, so the first read can miss it (flush race). findRateLimitText is
+  // bounded to recent entries, so a miss returns null rather than silently
+  // reusing a stale earlier-episode reset line — which means we can safely
+  // retry: re-read the transcript a few times over ~2s to catch the write.
+  // Well within the hook's 10s budget; the slow recovery lives in the detached
+  // helper, not here. Non-rate-limit failures don't retry (no extra latency).
+  const tries = isRateLimit ? 5 : 1
+  for (let attempt = 0; attempt < tries; attempt++) {
+    if (attempt > 0) {
+      await new Promise(r => setTimeout(r, 500))
+      entries = readEntries(transcriptPath)
+    }
+    const transcriptResetText = findRateLimitText(entries)
+    if (transcriptResetText) {
+      const e = parseResetEpoch(transcriptResetText)
+      if (e !== null) {
+        resetEpoch = e
+        break
+      }
+    }
+  }
 }
 
 if (resetEpoch === null) {
