@@ -12,7 +12,7 @@
 // ~/.claude/channels/telegram/.env, etc).
 
 import { spawn } from 'child_process'
-import { existsSync, mkdirSync, openSync } from 'fs'
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { readPayload } from './lib/payload'
@@ -97,6 +97,10 @@ let text: string
 if (isRateLimit) {
   if (timeLeft && tmuxCtx) {
     text = `Usage limit hit — resumes in ${timeLeft}. Will auto-press the menu and type 'continue' when the limit lifts.`
+  } else if (tmuxCtx) {
+    // Couldn't read a reset time, but we still have a pane to drive — the
+    // helper below polls and resumes on its own, so this is NOT a dead end.
+    text = `Usage limit hit — couldn't read the reset time. I'll keep retrying and resume automatically once it lifts.`
   } else if (timeLeft) {
     text = `Usage limit hit — resumes in ${timeLeft}.`
   } else {
@@ -118,27 +122,50 @@ const callerChat = getCallerChatId(entries)
 if (callerChat) chatIds = [callerChat]
 else chatIds = getAllowedChatIds()
 
+// For a recoverable rate limit (we have a pane to drive), claim the per-agent
+// resume lock BEFORE notifying. If it's already held, a helper is mid-recovery
+// and this StopFailure is just the poll loop's "continue" bouncing off the
+// still-active limit — stay silent (no duplicate DM, no second helper) and let
+// the running helper see it through. The lock dir doubles as the helper's log
+// dir. The lock auto-expires (mtime TTL) so a crashed helper can't wedge
+// recovery forever.
+let lockPath: string | null = null
+let resumeLogDir = ''
+if (isRateLimit && tmuxCtx) {
+  resumeLogDir = join(homedir(), '.cache', '5dive-telegram', 'resume')
+  try {
+    mkdirSync(resumeLogDir, { recursive: true })
+  } catch {
+    resumeLogDir = '/tmp'
+  }
+  lockPath = join(resumeLogDir, 'resume.lock')
+  if (!tryAcquireResumeLock(lockPath)) {
+    process.exit(0)
+  }
+}
+
 await Promise.all(chatIds.map(cid => sendMessage(cid, text)))
 
-// Detach the recovery helper for rate-limit failures. Skipped if we don't
-// have tmux context (can't press anything) or a reset epoch (don't know
-// when to resume) — DM above already covered the user, just no auto-resume.
-if (isRateLimit && resetEpoch !== null && tmuxCtx) {
+// Detach the recovery helper (we already hold the lock). It poll-retries and
+// resumes once the limit lifts — even with NO reset epoch, which is exactly
+// the case that used to leave the agent parked until a manual unlock. The
+// helper releases the lock when it finishes.
+if (isRateLimit && tmuxCtx && lockPath) {
   const resumeHelper = join(import.meta.dir, 'resume-after-reset.ts')
   if (existsSync(resumeHelper)) {
-    // Log dir: ~/.cache/5dive-telegram/resume/ is the agent-writable default.
-    // Fall back to /tmp if even that fails (HOME unset, full disk).
-    let logDir = join(homedir(), '.cache', '5dive-telegram', 'resume')
-    try {
-      mkdirSync(logDir, { recursive: true })
-    } catch {
-      logDir = '/tmp'
-    }
-    const logFile = join(logDir, `resume-${Math.floor(Date.now() / 1000)}-${process.pid}.log`)
+    const logFile = join(resumeLogDir, `resume-${Math.floor(Date.now() / 1000)}-${process.pid}.log`)
     const out = openSync(logFile, 'a')
     const child = spawn(
       'bun',
-      [resumeHelper, String(resetEpoch), tmuxCtx.socket, tmuxCtx.target, chatIds.join(',')],
+      [
+        resumeHelper,
+        String(resetEpoch ?? 0),
+        tmuxCtx.socket,
+        tmuxCtx.target,
+        chatIds.join(','),
+        lockPath,
+        transcriptPath ?? '',
+      ],
       {
         detached: true,
         stdio: ['ignore', out, out],
@@ -146,7 +173,42 @@ if (isRateLimit && resetEpoch !== null && tmuxCtx) {
       },
     )
     child.unref()
+  } else {
+    // Helper missing (deploy gap): we already DM'd, so just release the lock
+    // so the next limit episode isn't blocked by a stale one.
+    try {
+      unlinkSync(lockPath)
+    } catch {
+      /* noop */
+    }
   }
 }
 
 process.exit(0)
+
+// Best-effort cross-process lock guarding a single resume helper per agent.
+// Exclusive-create wins; an existing lock is honored unless it's older than
+// the TTL (longer than the helper's max retry window), in which case it's
+// treated as stale and taken over.
+const RESUME_LOCK_TTL_MS = 6.5 * 3600 * 1000
+function tryAcquireResumeLock(lockPath: string): boolean {
+  try {
+    const fd = openSync(lockPath, 'wx')
+    writeSync(fd, `${process.pid} ${Date.now()}`)
+    closeSync(fd)
+    return true
+  } catch {
+    try {
+      const st = statSync(lockPath)
+      if (Date.now() - st.mtimeMs > RESUME_LOCK_TTL_MS) {
+        const fd = openSync(lockPath, 'w')
+        writeSync(fd, `${process.pid} ${Date.now()}`)
+        closeSync(fd)
+        return true
+      }
+    } catch {
+      /* lock vanished mid-check — let the next StopFailure retry acquire it */
+    }
+    return false
+  }
+}

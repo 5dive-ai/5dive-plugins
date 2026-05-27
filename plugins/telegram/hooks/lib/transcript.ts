@@ -30,6 +30,8 @@ export function readEntries(transcriptPath: string): TranscriptEntry[] {
 // Immune to the tmux alt-screen issue that hides the pane line when the
 // "Stop and wait" menu is showing.
 export function findRateLimitText(entries: TranscriptEntry[]): string | null {
+  // Primary: the synthetic message claude tags error="rate_limit". Most
+  // reliable when present.
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i]
     if (e.error !== 'rate_limit' || !e.isApiErrorMessage) continue
@@ -37,6 +39,22 @@ export function findRateLimitText(entries: TranscriptEntry[]): string | null {
     if (!Array.isArray(content)) continue
     for (const block of content) {
       if (block.type === 'text' && typeof block.text === 'string') {
+        return block.text
+      }
+    }
+  }
+  // Fallback: the tag isn't guaranteed (weekly/5h-limit phrasings, upstream
+  // changes). Scan the last ~40 entries' text blocks for a line that carries
+  // an actual reset clue — a clock time or a "reset/try again in …" phrase —
+  // and return it for parseResetEpoch to interpret. Kept specific to avoid
+  // returning unrelated prose.
+  const RESET_TIME = /resets?\b|reset (?:at|in)\b|try again (?:at|in)\b|\bin\s+\d+\s*(?:h|m|hour|min|sec)|\d{1,2}(?::\d{2})?\s*(?:am|pm)/i
+  const from = Math.max(0, entries.length - 40)
+  for (let i = entries.length - 1; i >= from; i--) {
+    const content = entries[i].message?.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (block.type === 'text' && typeof block.text === 'string' && RESET_TIME.test(block.text)) {
         return block.text
       }
     }
