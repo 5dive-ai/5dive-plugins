@@ -11,9 +11,9 @@ Source of inspiration: `NousResearch/hermes-agent` at
 - `website/docs/reference/slash-commands.md` — command catalog
 
 **Current command surface** (server.ts): `/start /help /status /stop
-/restart /clear /model /effort /agents /account /goal`. `/agents` also
-takes a `stop <name>` subcommand. `/goal` takes `status / pause /
-resume / clear`.
+/restart /clear /model /effort /agents /account /goal /checkpoint
+/resume`. `/agents` also takes a `stop <name>` subcommand. `/goal` takes
+`status / pause / resume / clear`.
 
 ## Shipped (excluded from backlog)
 
@@ -25,6 +25,7 @@ resume / clear`.
 | T6    | `/model`                             | v0.4.0   |
 | T7    | `/effort`                            | v0.4.0   |
 | T8    | `/goal` (+ status/pause/resume/clear) | v0.4.13–14 |
+| T9    | `/checkpoint` + `/resume` (native session resume) | v0.4.24 |
 | —     | `/clear` (Claude built-in via TUI)   | v0.4.15  |
 | —     | `/agents stop <name>`                | v0.4.15  |
 | T15   | BotFather menu auto-sync             | v0.3.0   |
@@ -84,43 +85,70 @@ Host health summary.
 
 ## Phase 2 — Claude session commands
 
-These touch the running agent. Two patterns:
+These touch the running agent. Three patterns:
 - **Settings edit + restart** (model, effort): edit `~/.claude/settings.json`,
   then `systemd-run --on-active=1 --collect systemctl restart <svc>`.
-- **In-session inject** (clear, goal, checkpoint): send the slash command
-  or directive into the running Claude via tmux send-keys.
+- **In-session inject** (clear, goal): send the slash command or directive
+  into the running Claude via tmux send-keys.
+- **State file + deferred restart** (checkpoint/resume): persist a marker the
+  launcher reads at next start; defer the restart so the reply lands first.
 
-### T9 — `/checkpoint`
+### T9 — `/checkpoint` + `/resume` (SHIPPED v0.4.24)
 
-Save in-flight session state to a file so a fresh session (after
-`/clear` or `/restart`) can resume without losing ephemeral context.
-Distinct from auto-memory, which captures long-lived facts;
-`/checkpoint` captures "what we're debugging right now" type state that
-dies on context wipe.
+Native session resume — NOT the HANDOFF.md-summary approach originally
+sketched here (that idea graduated into `/handoff`, T9b below). We chose
+verbatim full-context resume over a model-written summary.
 
-NOT the original T9 (inter-agent handoff — we dropped that; if we ever
-want it, name it differently to match hermes' `/handoff` semantics:
-"hand off this session to another messaging platform").
+- `/checkpoint [label]` — save-only. Pins the current claude session id
+  (+ optional label) to `checkpoint.json`. No restart. Single slot —
+  overwrites the prior checkpoint.
+- `/resume` — arms a one-shot marker (`resume-next`, the bare session id)
+  that `5dive-agent-start` consumes on the next unit start, relaunching
+  claude with `--resume <id>` so the EXACT conversation returns. The
+  restart is deferred (`systemd-run --on-active=1`) so the confirmation
+  reply lands before SIGTERM — same race lesson as `/account`.
+- Launcher hook (`5dive-cli/5dive-agent-start`): guarded no-op when no
+  marker is present (no-resume path byte-identical to before). One-shot —
+  `--resume` only on the FIRST loop iteration; a later crash/exit respawn
+  starts fresh. Marker is deleted on read regardless of validity so a
+  stuck file can't wedge the agent into permanent resume. Session id is
+  UUID-validated before it reaches the claude argv.
+- Scope: paired-5dive (relies on the 5dive launcher honoring the marker).
 
-**Subcommands:**
+Cross-repo: launcher change lives in the `5dive` repo (install.5dive.com
+is the source of truth), so it shipped on its own commit + the Hetzner
+smoke test before the plugin push.
 
-- `/checkpoint` (no args) — plugin sends a TUI directive: *"Write
-  HANDOFF.md at the project root. Cover: what we're working on, what's
-  done, what's next, blockers, key file paths. Be terse — this is for
-  your future self after /clear."* Agent writes via Write tool.
-- `/checkpoint resume` — after a fresh session, injects *"Read
-  HANDOFF.md and continue from there."* into the running TUI.
+### T9b — `/handoff` (ON HOLD — design captured 2026-05-27)
 
-**Future (v2):** SessionStart hook auto-detects HANDOFF.md presence and
-injects it as a `<system-reminder>` so no explicit `/checkpoint resume`
-needed. Risk: surprises if HANDOFF.md is stale.
+Hand the current session to a target via a model-written summary, seeding
+a FRESH session. Complementary to /resume: /resume = same session
+verbatim; /handoff = new session seeded with a compacted summary (good
+when the context window is full or messy). Revives the recipient-semantics
+"/handoff" the old T9 note deferred — we're OK with our meaning now that a
+picker makes "to whom" explicit.
 
-**Naming rationale:** matches git/db vocab; "/handoff" implies a
-recipient and conflicts with hermes' channel-switch meaning;
-"/snapshot" is hermes' term for config/state snapshots — different
-concept.
+**UX:** `/handoff [note]` → inline picker of sibling agents (reuse the
+`/agents` list / `accountKeyboard` shape) + a "↪ myself" row. Callback
+`handoff:<name>` or `handoff:self`.
 
-- Scope: admin DM only
+**Summary generation (the hard part):** only the running model can write a
+good summary. Proxy a directive into the TUI (same tmux send-keys wiring
+`/goal` + `/model` use): *"Summarize this session as a handoff and write
+HANDOFF.md to <path>."*
+- **Open decision:** block until the file appears (timeout / watch races)
+  vs. fire-and-forget and just hand the target a pointer. Leaning
+  fire-and-forget — simpler, no race.
+
+**Delivery:**
+- Target = another agent → write the summary to a shared path, then
+  `5dive agent send <name> "pick up handoff at <path>"` (inter-agent
+  messaging; see T2 `/dispatch`). The target's session reads + continues.
+- Target = self → seed a NEW session with the summary as the opening
+  message — a "smart /clear": fresh window carrying a compacted summary
+  forward.
+
+- Scope: paired-5dive (needs the sibling agent list + inter-agent send).
 
 ### T10 — `/pwd` and `/cd <dir>`
 
