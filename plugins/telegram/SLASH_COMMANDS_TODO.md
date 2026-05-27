@@ -81,6 +81,25 @@ Host health summary.
 - Render: `errors=N warnings=M` + bullet list of any failing checks
 - Scope: admin DM only
 
+### T5c — `/update` (run the soft-update now)
+
+Apply pending CLI/plugin/hook/unit updates on demand instead of waiting
+for the 03:00 soft-update cron. Kills the "push a fix, wait until 03:00"
+friction.
+
+- Runs the same path the nightly cron does: refresh managed files via
+  `install.5dive.com … --upgrade` (confirm entrypoint at build time —
+  `5dive-soft-updates.sh` vs the raw `curl … | bash -s -- --upgrade`).
+- **Gotcha — same race as `/account` + `/resume`:** the refresh + restart
+  tear down the running session, so the new plugin/CLI only loads after a
+  restart. Reply "updating + restarting…" FIRST, then fire the
+  update-and-restart on a deferred `systemd-run` timer so the ack lands
+  before SIGTERM.
+- Consider echoing the before→after `5dive --version` (and/or plugin
+  version) in a follow-up reply once the new session is back, so the user
+  can see what changed.
+- Scope: paired-5dive, admin DM only.
+
 ---
 
 ## Phase 2 — Claude session commands
