@@ -84,7 +84,32 @@ args = ["/absolute/path/to/5dive-plugins/plugins/telegram-codex/server.ts"]
 Drop the contents of [`AGENTS.md`](./AGENTS.md) into your
 `~/.codex/AGENTS.md` so the model knows when and how to use the tools.
 
-**6. Run Codex**
+**6. (Optional) Wire the "turn complete" ping**
+
+To get a Telegram ping every time Codex finishes a turn, add the `Stop`
+hook to `~/.codex/config.toml`:
+
+```toml
+[features]
+hooks = true
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "bun /absolute/path/to/5dive-plugins/plugins/telegram-codex/hooks/notify-stop.ts"
+async = false
+```
+
+Codex 0.134 doesn't support `async = true` — keep it sync. The hook
+fires once per Codex turn and runs in under a second.
+
+Override the message text per-session with `CODEX_NOTIFY_TEXT=...`;
+silence pings entirely with `CODEX_NOTIFY_DISABLED=1` (useful when
+you're already talking to the bot via `wait_for_message`/`reply` and
+the Stop ping would be duplicate).
+
+**7. Run Codex**
 
 ```sh
 codex
@@ -100,13 +125,13 @@ replies via the `reply` tool. Done.
 | Inbound delivery      | `claude/channel` JSON-RPC notification | `wait_for_message` blocking tool |
 | Permission relay      | `claude/channel/permission` protocol   | not yet (planned for v0.2)       |
 | Slash commands        | `/telegram:configure`, `:access`, …    | not yet (Codex plugin API TBD)   |
-| Lifecycle hooks       | PreToolUse, Stop, etc.                 | wire `[notify]` in config.toml   |
+| Lifecycle hooks       | PreToolUse, Stop, etc.                 | `Stop` hook ships in `hooks/`    |
 | State dir             | `~/.claude/channels/telegram/`         | `~/.codex/channels/telegram/`    |
 | Pairing flow          | code via DM → `/telegram:access pair`  | preconfigured `access.json` only |
 
 ## Roadmap
 
-- v0.1.x — outbound + blocking inbound, preconfigured allowlist (this)
+- v0.1.0 — outbound + blocking inbound, preconfigured allowlist
+- v0.1.1 — `Stop` hook for "turn complete" Telegram ping (this)
 - v0.2.0 — pairing flow (CLI: `bunx telegram-codex pair <code>`)
-- v0.2.0 — `notify` integration for "Codex went idle / errored" pings
 - v0.3.0 — approval-mode bridge so risky-command y/n prompts route to TG
