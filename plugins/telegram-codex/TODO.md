@@ -5,11 +5,6 @@ ordered by UX criticality unless noted.
 
 ## Up next
 
-- **v0.1.9 — stop-failure notification.** Send a Telegram alert when the
-  Codex session exits unexpectedly (non-zero, crash). Mirror of
-  `plugins/telegram/hooks/stopfailure-notify.ts`. Needs a separate
-  trigger (Codex `SubagentStop` hook or systemd ExecStopPost — TBD).
-
 - **v0.1.10 — `/restart` and `/stop` bot commands.** Let the user
   interrupt a stuck Codex from Telegram. `/stop` sends C-c via tmux to
   the running Codex pane; `/restart` SIGTERMs the systemd unit (relies
@@ -53,3 +48,8 @@ These don't translate to Codex's runtime, mentioned for completeness:
   `wait_for_message` dequeue and `reply`; 5min ceiling
 - v0.1.8 — silence watchdog `PreToolUse` hook (`CODEX_SILENCE_WATCHDOG_MS`,
   default 120000); single ping per silence window
+- v0.1.9 — `Notification` hook relays error-flavored notifications to
+  Telegram (`CODEX_NOTIFY_RELAY_ALL=1` to relay everything; pattern match
+  on error/failed/timeout/rate-limit etc. by default). True crash-aware
+  notification still pending — needs ExecStopPost in 5dive's unit (main's
+  territory).
