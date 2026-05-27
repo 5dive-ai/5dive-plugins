@@ -5,11 +5,6 @@ ordered by UX criticality unless noted.
 
 ## Up next
 
-- **v0.1.10 — `/restart` and `/stop` bot commands.** Let the user
-  interrupt a stuck Codex from Telegram. `/stop` sends C-c via tmux to
-  the running Codex pane; `/restart` SIGTERMs the systemd unit (relies
-  on respawn). Both gate on allowFrom.
-
 - **v0.1.11 — `/agents` bot command.** List sibling agents on the host
   via `5dive agent list --json`. Useful since multi-agent is the 5dive
   story.
@@ -53,3 +48,5 @@ These don't translate to Codex's runtime, mentioned for completeness:
   on error/failed/timeout/rate-limit etc. by default). True crash-aware
   notification still pending — needs ExecStopPost in 5dive's unit (main's
   territory).
+- v0.1.10 — `/stop` (tmux C-c) + `/restart` (`5dive agent restart`) bot
+  commands.

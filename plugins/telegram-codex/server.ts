@@ -31,7 +31,7 @@ import {
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
-const PLUGIN_VERSION = '0.1.9'
+const PLUGIN_VERSION = '0.1.10'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
   ?? join(homedir(), '.codex', 'channels', 'telegram')
@@ -329,9 +329,11 @@ let lastInboundTs: string | null = null
 // switching, stop, restart, checkpoint). Those would require IPC into the
 // running session and are out of scope here.
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
-  { command: 'help',   description: 'list bot commands and version' },
-  { command: 'status', description: 'show bridge health: token, allowlist, MCP server, last inbound' },
-  { command: 'ping',   description: 'liveness check — replies with bot + plugin version' },
+  { command: 'help',    description: 'list bot commands and version' },
+  { command: 'status',  description: 'show bridge health: token, allowlist, MCP server, last inbound' },
+  { command: 'ping',    description: 'liveness check — replies with bot + plugin version' },
+  { command: 'stop',    description: 'interrupt the current Codex turn (sends Ctrl-C to the pane)' },
+  { command: 'restart', description: 'restart the Codex agent (systemd respawn brings it back in ~2s)' },
 ]
 
 function helpText(): string {
@@ -371,6 +373,53 @@ function statusText(): string {
   return lines.join('\n')
 }
 
+// Derive the 5dive agent name from the current Unix user. The MCP server
+// runs as agent-<name> per 5dive convention; the tmux session and systemd
+// unit follow the same naming. Returns 'unknown' if not in that shape so
+// /stop and /restart fail loudly rather than acting on the wrong target.
+function agentName(): string {
+  try {
+    const user = require('os').userInfo().username as string
+    if (user.startsWith('agent-')) return user.slice('agent-'.length)
+  } catch {}
+  return 'unknown'
+}
+
+async function interruptCodex(): Promise<string> {
+  const name = agentName()
+  if (name === 'unknown') return '⚠️ cannot determine agent name; not running under a 5dive systemd unit'
+  return new Promise(resolve => {
+    // `tmux send-keys -t <session> C-c` interrupts whatever the foreground
+    // process in that pane is doing. Codex's loop in 5dive-agent-start is
+    //   while true; do codex; sleep 2; done
+    // so C-c kills the current codex run, sleep fires, then a fresh
+    // codex starts. From the user's POV the session is back in <5s.
+    const child = require('child_process').execFile('tmux',
+      ['send-keys', '-t', `agent-${name}`, 'C-c'],
+      { timeout: 5000 },
+      (err: any) => {
+        if (err) resolve(`⚠️ tmux send-keys failed: ${err.message}`)
+        else resolve(`✋ sent Ctrl-C to agent \`${name}\` — current Codex turn interrupted`)
+      },
+    )
+    void child
+  })
+}
+
+async function restartAgent(name: string): Promise<void> {
+  if (name === 'unknown') return
+  await new Promise<void>(resolve => {
+    // `sudo 5dive agent restart <name>` is the canonical path — it
+    // touches the systemd unit, not the tmux session directly, so the
+    // unit's audit log and restart counter stay consistent.
+    require('child_process').execFile('sudo',
+      ['-n', '5dive', 'agent', 'restart', name],
+      { timeout: 10_000 },
+      () => resolve(),
+    )
+  })
+}
+
 // Returns true if this message was handled as a slash command (caller
 // should NOT enqueue it for Codex).
 async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> {
@@ -404,6 +453,27 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         })
         return true
+      case 'stop': {
+        const result = await interruptCodex()
+        await bot.api.sendMessage(chat_id, result, {
+          ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+        })
+        return true
+      }
+      case 'restart': {
+        // Send the reply BEFORE restarting — our own process is the MCP
+        // server, but the systemd unit owns the Codex pane that runs us.
+        // 5dive agent restart kills + respawns the pane; depending on
+        // 5dive's implementation it may or may not also terminate us.
+        // Sending first keeps the user informed even in the kill-us case.
+        const name = agentName()
+        await bot.api.sendMessage(chat_id, `restarting agent \`${name}\` — back in ~2s`, {
+          parse_mode: 'Markdown',
+          ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+        }).catch(() => {})
+        await restartAgent(name)
+        return true
+      }
     }
   } catch (err) {
     process.stderr.write(`telegram-codex: /${cmd} reply failed: ${err}\n`)
