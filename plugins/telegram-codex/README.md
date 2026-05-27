@@ -102,7 +102,53 @@ args = ["/absolute/path/to/5dive-plugins/plugins/telegram-codex/server.ts"]
 Drop the contents of [`AGENTS.md`](./AGENTS.md) into your
 `~/.codex/AGENTS.md` so the model knows when and how to use the tools.
 
-**6. (Optional) Wire the "turn complete" ping**
+**6a. (Optional) Wire the "approve risky commands from Telegram" bridge**
+
+Codex's `PermissionRequest` hook fires every time it wants to run a command
+that exceeds its current `approval_policy` / `sandbox_mode`. The
+`request-permission.ts` hook in this plugin routes that prompt to your
+Telegram bot — a message with **✅ allow / ❌ deny** inline buttons. Tap one
+and Codex proceeds (or doesn't).
+
+```toml
+[features]
+hooks = true
+
+[[hooks.PermissionRequest]]
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "bun /absolute/path/to/5dive-plugins/plugins/telegram-codex/hooks/request-permission.ts"
+timeout = 180
+async = false
+```
+
+Behavior notes:
+
+- **Fail-closed.** If the MCP server isn't running (no Telegram bridge),
+  or no one taps a button before the 120s default timeout, the hook
+  returns `deny`. Codex's native UI then takes over — you're never
+  silently auto-approved.
+- The MCP server must be live for the bridge to work. In practice this
+  means Codex must have called at least one telegram tool earlier in the
+  session (the MCP server lazy-spawns). For one-shot Codex runs where
+  the very first action is privileged, the bridge will fall through to
+  Codex's native UI.
+- **Hook trust gate.** On the first session after wiring this hook,
+  Codex shows a one-time "Hook needs review" TUI prompt. Press `2` (or
+  `t`) to trust. Codex persists the decision in `[hooks.state]` of the
+  config.
+- **Override timeout** with `CODEX_TG_APPROVAL_TIMEOUT_MS` env (range
+  5000–600000).
+- **Bypass entirely** with `CODEX_TG_APPROVAL_DISABLED=1` env — useful
+  for unattended runs where you want Codex's own approval policy to be
+  authoritative without going to Telegram.
+
+This is useless if your `approval_policy = "never"` / `sandbox_mode =
+"danger-full-access"`. The bridge only matters when Codex actually
+needs to ask.
+
+**6b. (Optional) Wire the "turn complete" ping**
 
 To get a Telegram ping every time Codex finishes a turn, add the `Stop`
 hook to `~/.codex/config.toml`:
@@ -141,7 +187,7 @@ replies via the `reply` tool. Done.
 | Concern               | `telegram/` (Claude Code)              | `telegram-codex/` (this)         |
 | --------------------- | -------------------------------------- | -------------------------------- |
 | Inbound delivery      | `claude/channel` JSON-RPC notification | `wait_for_message` blocking tool |
-| Permission relay      | `claude/channel/permission` protocol   | not yet (planned for v0.2)       |
+| Permission relay      | `claude/channel/permission` protocol   | `PermissionRequest` hook + buttons |
 | Slash commands        | `/telegram:configure`, `:access`, …    | not yet (Codex plugin API TBD)   |
 | Lifecycle hooks       | PreToolUse, Stop, etc.                 | `Stop` hook ships in `hooks/`    |
 | State dir             | `~/.claude/channels/telegram/`         | `~/.codex/channels/telegram/`    |
@@ -151,5 +197,5 @@ replies via the `reply` tool. Done.
 
 - v0.1.0 — outbound + blocking inbound, preconfigured allowlist
 - v0.1.1 — `Stop` hook for "turn complete" Telegram ping
-- v0.1.2 — pairing CLI (`bun pair.ts`) for one-shot user-id capture (this)
-- v0.2.0 — approval-mode bridge so risky-command y/n prompts route to TG
+- v0.1.2 — pairing CLI (`bun pair.ts`) for one-shot user-id capture
+- v0.1.3 — approval-mode bridge: `PermissionRequest` → Telegram buttons (this)

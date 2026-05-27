@@ -22,26 +22,28 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { Bot, GrammyError, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, statSync,
-  realpathSync, renameSync,
+  realpathSync, renameSync, readdirSync, watch, existsSync, unlinkSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
-const PLUGIN_VERSION = '0.1.0'
+const PLUGIN_VERSION = '0.1.3'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
   ?? join(homedir(), '.codex', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
+const PERMS_DIR = join(STATE_DIR, 'permissions')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+mkdirSync(PERMS_DIR, { recursive: true, mode: 0o700 })
 
 // Lock the token to owner-only, then load it. Real env wins so callers
 // running the server with TELEGRAM_BOT_TOKEN=... in their shell override.
@@ -275,13 +277,6 @@ async function ingest(
   const chat = ctx.chat!
   const msgId = ctx.message?.message_id
 
-  // Fire-and-forget ack reaction so the user sees the bot received the msg.
-  if (msgId != null) {
-    void bot.api.setMessageReaction(String(chat.id), msgId, [
-      { type: 'emoji', emoji: '👀' },
-    ]).catch(() => {})
-  }
-
   const imagePath = downloadImage ? await downloadImage() : undefined
 
   enqueueInbound({
@@ -367,6 +362,127 @@ bot.on('message:sticker', async ctx => {
 bot.catch(err => {
   process.stderr.write(`telegram-codex: handler error (polling continues): ${err.error}\n`)
 })
+
+// ============================================================================
+// Permission bridge (Codex PermissionRequest hook ↔ Telegram inline buttons)
+//
+// hooks/request-permission.ts writes req-<id>.json under permissions/. We
+// watch the dir; on each new req we post a Telegram message with [✅ allow]
+// [❌ deny] buttons, register the {callback_data → request_id} mapping, and
+// (on tap) write res-<id>.json with the user's decision + edit the message
+// to show who answered. The hook reads res-<id>.json and returns to Codex.
+//
+// Why file-IPC over a socket: one moving part fewer, survives MCP server
+// restarts (pending requests resume as soon as the watcher comes back), and
+// the codex hook is a short-lived process that can't easily hold a socket.
+// ============================================================================
+
+type PendingApproval = {
+  reqId: string
+  chat_id: string
+  message_id: number
+}
+
+const pendingApprovals = new Map<string, PendingApproval>() // key = callback prefix
+
+function shortToolDesc(req: any): string {
+  const tool = req.tool_name ?? 'tool'
+  if (tool === 'Bash' && req.tool_input?.command) {
+    return `\`$ ${String(req.tool_input.command).slice(0, 300)}\``
+  }
+  const inputStr = JSON.stringify(req.tool_input ?? {}, null, 2).slice(0, 500)
+  return `\`${tool}\`\n\`\`\`\n${inputStr}\n\`\`\``
+}
+
+async function broadcastApproval(reqPath: string) {
+  let req: any
+  try {
+    req = JSON.parse(readFileSync(reqPath, 'utf8'))
+  } catch (err) {
+    process.stderr.write(`telegram-codex: bad req file ${reqPath}: ${err}\n`)
+    return
+  }
+  const reqId = String(req.id ?? '')
+  if (!reqId) return
+
+  const access = loadAccess()
+  if (access.allowFrom.length === 0) {
+    process.stderr.write(`telegram-codex: no allowFrom entries, can't ask anyone for approval (req ${reqId})\n`)
+    return
+  }
+
+  const body =
+    `🔐 *Codex wants to run:*\n${shortToolDesc(req)}\n\n` +
+    `_cwd: ${req.cwd ?? '?'} · model: ${req.model ?? '?'}_`
+
+  const kb = new InlineKeyboard()
+    .text('✅ allow', `tgcodex:allow:${reqId}`)
+    .text('❌ deny',  `tgcodex:deny:${reqId}`)
+
+  // DM the first allowFrom user. (We pick one chat to avoid double-decisions
+  // from multiple recipients racing each other on the same request.)
+  const chat_id = access.allowFrom[0]
+  try {
+    const sent = await bot.api.sendMessage(chat_id, body, {
+      parse_mode: 'Markdown',
+      reply_markup: kb,
+    })
+    pendingApprovals.set(reqId, { reqId, chat_id, message_id: sent.message_id })
+  } catch (err) {
+    process.stderr.write(`telegram-codex: failed to send approval prompt for ${reqId}: ${err}\n`)
+  }
+}
+
+bot.on('callback_query:data', async ctx => {
+  const data = ctx.callbackQuery.data ?? ''
+  const m = data.match(/^tgcodex:(allow|deny):(.+)$/)
+  if (!m) return
+  const behavior = m[1] as 'allow' | 'deny'
+  const reqId = m[2]!
+
+  // Re-gate the responder: anyone tapping must be in allowFrom — otherwise
+  // a leaked button-share link could let a stranger answer.
+  const senderId = String(ctx.from.id)
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+    return
+  }
+
+  const pending = pendingApprovals.get(reqId)
+  pendingApprovals.delete(reqId)
+
+  // Write the response file (the hook polls for it).
+  const resPath = join(PERMS_DIR, `res-${reqId}.json`)
+  const user = ctx.from.username ?? ctx.from.first_name ?? senderId
+  writeFileSync(resPath, JSON.stringify({ behavior, user, ts: new Date().toISOString() }))
+
+  // Acknowledge to the button-tapper.
+  await ctx.answerCallbackQuery({ text: behavior === 'allow' ? '✅ allowed' : '❌ denied' }).catch(() => {})
+
+  // Edit the original message to show who decided + remove the buttons.
+  if (pending) {
+    const label = behavior === 'allow' ? `✅ allowed by ${user}` : `❌ denied by ${user}`
+    await bot.api.editMessageText(pending.chat_id, pending.message_id, label, { reply_markup: undefined })
+      .catch(() => {})
+  }
+})
+
+// Initial sweep + fs.watch on permissions/. fs.watch fires on req-*.json
+// creation; we re-stat to confirm the file is fully written before parsing.
+function startPermissionBridge() {
+  for (const f of readdirSync(PERMS_DIR)) {
+    if (f.startsWith('req-') && f.endsWith('.json')) void broadcastApproval(join(PERMS_DIR, f))
+  }
+  watch(PERMS_DIR, (event, filename) => {
+    if (!filename || !filename.startsWith('req-') || !filename.endsWith('.json')) return
+    const full = join(PERMS_DIR, filename)
+    if (!existsSync(full)) return
+    // Tiny debounce — a hook that's still writing when watch fires would
+    // otherwise produce a half-parse and a "deny" decision.
+    setTimeout(() => { if (existsSync(full)) void broadcastApproval(full) }, 100)
+  })
+}
 
 // ============================================================================
 // MCP server
@@ -582,6 +698,8 @@ process.on('SIGTERM', () => { shuttingDown = true; bot.stop().catch(() => {}) })
 process.on('SIGINT',  () => { shuttingDown = true; bot.stop().catch(() => {}) })
 
 await mcp.connect(new StdioServerTransport())
+
+startPermissionBridge()
 
 void (async () => {
   for (let attempt = 1; ; attempt++) {
