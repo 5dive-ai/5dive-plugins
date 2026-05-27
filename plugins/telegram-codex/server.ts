@@ -31,7 +31,7 @@ import {
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
-const PLUGIN_VERSION = '0.1.4'
+const PLUGIN_VERSION = '0.1.5'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
   ?? join(homedir(), '.codex', 'channels', 'telegram')
@@ -257,6 +257,31 @@ let shuttingDown = false
 
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'])
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+// Telegram sendMessage caps at 4096 characters per message. Codex turns
+// regularly exceed that on long explanations or diffs — without chunking,
+// reply() would fail with 400 Bad Request and the user sees nothing.
+// We leave 96 chars of headroom for any per-chunk wrapper Telegram adds.
+const TG_MAX_MESSAGE_CHARS = 4000
+
+// Split text into chunks that fit Telegram's per-message char cap. Prefer
+// breaking on paragraph (\n\n), then line (\n), then word boundaries.
+// Last-resort: hard-cut at the cap.
+function chunkForTelegram(text: string, limit = TG_MAX_MESSAGE_CHARS): string[] {
+  if (text.length <= limit) return [text]
+  const out: string[] = []
+  let rest = text
+  while (rest.length > limit) {
+    let split = rest.lastIndexOf('\n\n', limit)
+    if (split < limit / 2) split = rest.lastIndexOf('\n', limit)
+    if (split < limit / 2) split = rest.lastIndexOf(' ', limit)
+    if (split < limit / 2) split = limit
+    out.push(rest.slice(0, split))
+    rest = rest.slice(split).replace(/^\s+/, '')
+  }
+  if (rest.length > 0) out.push(rest)
+  return out
+}
 
 // Tracked for /status — last time an inbound message landed (not the
 // startup time, not the last reply).
@@ -723,11 +748,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        const sent = await bot.api.sendMessage(chat_id, text, {
-          ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
-          ...(parseMode ? { parse_mode: parseMode } : {}),
-        })
-        const sentIds = [sent.message_id]
+        const chunks = chunkForTelegram(text)
+        const sentIds: number[] = []
+        try {
+          for (let i = 0; i < chunks.length; i++) {
+            // Thread reply_to only on the first chunk — subsequent chunks
+            // would all quote the same inbound, which is noisy.
+            const sent = await bot.api.sendMessage(chat_id, chunks[i]!, {
+              ...(i === 0 && reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(parseMode ? { parse_mode: parseMode } : {}),
+            })
+            sentIds.push(sent.message_id)
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
+        }
 
         for (const f of files) {
           const ext = extname(f).toLowerCase()

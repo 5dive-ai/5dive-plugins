@@ -199,4 +199,5 @@ replies via the `reply` tool. Done.
 - v0.1.1 — `Stop` hook for "turn complete" Telegram ping
 - v0.1.2 — pairing CLI (`bun pair.ts`) for one-shot user-id capture
 - v0.1.3 — approval-mode bridge: `PermissionRequest` → Telegram buttons
-- v0.1.4 — bot slash commands (`/help`, `/status`, `/ping`) + setMyCommands menu; wait_for_message capped at 90s to stay inside Codex's MCP-call timeout (this)
+- v0.1.4 — bot slash commands (`/help`, `/status`, `/ping`) + setMyCommands menu; wait_for_message capped at 90s to stay inside Codex's MCP-call timeout
+- v0.1.5 — `reply` chunks text >4000 chars across multiple Telegram messages (paragraph→line→word→hard cut), so long Codex outputs no longer fail with 400 Bad Request (this)
