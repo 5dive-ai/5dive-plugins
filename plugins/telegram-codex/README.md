@@ -46,8 +46,25 @@ chmod 600 ~/.codex/channels/telegram/.env
 
 **3. Seed the allowlist**
 
-Write `~/.codex/channels/telegram/access.json` with the chat/user IDs
-allowed to talk to your bot:
+Two options:
+
+**3a. Pair via the bot (recommended)**
+
+```sh
+bun pair.ts
+```
+
+The CLI prints `DM @<botname> from your Telegram account within 60s to
+pair...`. Send any message to your bot from the Telegram account you
+want allowed. The CLI captures your user_id, writes
+`~/.codex/channels/telegram/access.json`, and replies "✅ paired" in
+the chat.
+
+Re-run anytime to add another user to the allowlist. Conflicts with a
+running Codex MCP server (one getUpdates consumer per token) — stop
+Codex first, pair, then restart.
+
+**3b. Hand-write access.json**
 
 ```json
 {
@@ -67,7 +84,8 @@ allowed to talk to your bot:
     non-empty list overrides per group.
 
 Messages from anyone not on the lists are silently dropped before they
-reach `wait_for_message`.
+reach `wait_for_message`. Group access can only be configured by
+hand-writing access.json — the `pair.ts` CLI handles DMs only.
 
 **4. Wire into Codex**
 
@@ -127,11 +145,11 @@ replies via the `reply` tool. Done.
 | Slash commands        | `/telegram:configure`, `:access`, …    | not yet (Codex plugin API TBD)   |
 | Lifecycle hooks       | PreToolUse, Stop, etc.                 | `Stop` hook ships in `hooks/`    |
 | State dir             | `~/.claude/channels/telegram/`         | `~/.codex/channels/telegram/`    |
-| Pairing flow          | code via DM → `/telegram:access pair`  | preconfigured `access.json` only |
+| Pairing flow          | code via DM → `/telegram:access pair`  | `bun pair.ts` standalone CLI     |
 
 ## Roadmap
 
 - v0.1.0 — outbound + blocking inbound, preconfigured allowlist
-- v0.1.1 — `Stop` hook for "turn complete" Telegram ping (this)
-- v0.2.0 — pairing flow (CLI: `bunx telegram-codex pair <code>`)
-- v0.3.0 — approval-mode bridge so risky-command y/n prompts route to TG
+- v0.1.1 — `Stop` hook for "turn complete" Telegram ping
+- v0.1.2 — pairing CLI (`bun pair.ts`) for one-shot user-id capture (this)
+- v0.2.0 — approval-mode bridge so risky-command y/n prompts route to TG
