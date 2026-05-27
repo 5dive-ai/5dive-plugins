@@ -31,7 +31,7 @@ import {
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
-const PLUGIN_VERSION = '0.1.6'
+const PLUGIN_VERSION = '0.1.7'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
   ?? join(homedir(), '.codex', 'channels', 'telegram')
@@ -261,6 +261,37 @@ let shuttingDown = false
 
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'])
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+// Telegram clears the "typing…" indicator ~5s after each sendChatAction.
+// Re-send every 4s per chat from when Codex picks up an inbound (via
+// wait_for_message) until the next reply lands, with a 5min ceiling so a
+// crashed turn never loops forever. Without this, a thinking Codex looks
+// identical to a hung one from the user's phone.
+const TYPING_INTERVAL_MS = 4_000
+const TYPING_CEILING_MS = 5 * 60 * 1000
+const typingLoops = new Map<string, ReturnType<typeof setInterval>>()
+const typingCeilings = new Map<string, ReturnType<typeof setTimeout>>()
+function startTypingLoop(chat_id: string) {
+  stopTypingLoop(chat_id)
+  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  const handle = setInterval(() => {
+    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  }, TYPING_INTERVAL_MS)
+  typingLoops.set(chat_id, handle)
+  typingCeilings.set(chat_id, setTimeout(() => stopTypingLoop(chat_id), TYPING_CEILING_MS))
+}
+function stopTypingLoop(chat_id: string) {
+  const handle = typingLoops.get(chat_id)
+  if (handle) {
+    clearInterval(handle)
+    typingLoops.delete(chat_id)
+  }
+  const ceiling = typingCeilings.get(chat_id)
+  if (ceiling) {
+    clearTimeout(ceiling)
+    typingCeilings.delete(chat_id)
+  }
+}
 
 // Telegram sendMessage caps at 4096 characters per message. Codex turns
 // regularly exceed that on long explanations or diffs — without chunking,
@@ -732,6 +763,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!msg) {
           return { content: [{ type: 'text', text: `<telegram timeout=true seconds=${seconds}/>` }] }
         }
+        // Codex now has a message to work on — keep "typing…" visible until
+        // it sends `reply` (or the 5min ceiling).
+        startTypingLoop(msg.chat_id)
         return { content: [{ type: 'text', text: formatInbound(msg) }] }
       }
 
@@ -744,6 +778,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
 
         assertAllowedChat(chat_id)
+        stopTypingLoop(chat_id)
         for (const f of files) {
           assertInStateDir(f)
           const st = statSync(f)
