@@ -1,0 +1,108 @@
+#!/usr/bin/env bun
+/**
+ * Codex `PreToolUse` hook — pings the user if Codex has been working
+ * silently for too long.
+ *
+ * Wire from ~/.codex/config.toml:
+ *
+ *   [[hooks.PreToolUse]]
+ *
+ *   [[hooks.PreToolUse.hooks]]
+ *   type = "command"
+ *   command = "bun /abs/path/to/telegram-codex/hooks/silence-watchdog.ts"
+ *   async = false
+ *
+ * Fires once per tool call. We:
+ *   - read last-reply.stamp (epoch ms) — touched on every successful
+ *     `reply` and also by this hook when it pings, so a single ping
+ *     resets the clock
+ *   - if (now - stamp) > CODEX_SILENCE_WATCHDOG_MS (default 120s),
+ *     send a "🟡 still working — N tool calls since last reply" ping
+ *     to every allowFrom user, then touch the stamp so we don't ping
+ *     again immediately
+ *
+ * Knobs:
+ *   - CODEX_SILENCE_WATCHDOG_DISABLED=1  → bypass entirely
+ *   - CODEX_SILENCE_WATCHDOG_MS=N        → threshold in ms (default 120000)
+ *   - CODEX_SILENCE_TOOL_COUNT_FILE      → optional, ignored if absent
+ *
+ * The hook always exits 0 (continue=true) — silence-watchdog is a
+ * notification, not a gate. A bad ping must never block tool execution.
+ */
+
+import { readFileSync, writeFileSync, statSync } from 'fs'
+import { homedir } from 'os'
+import { join } from 'path'
+
+function exitContinue(): never {
+  process.stdout.write(JSON.stringify({ continue: true }))
+  process.exit(0)
+}
+
+if (process.env.CODEX_SILENCE_WATCHDOG_DISABLED === '1') exitContinue()
+
+const STATE_DIR = process.env.TELEGRAM_STATE_DIR
+  ?? join(homedir(), '.codex', 'channels', 'telegram')
+const LAST_REPLY_FILE = join(STATE_DIR, 'last-reply.stamp')
+const TOOL_COUNT_FILE = join(STATE_DIR, 'silence-tool-count')
+
+const THRESHOLD_MS = Math.max(10_000, Math.min(3_600_000,
+  Number(process.env.CODEX_SILENCE_WATCHDOG_MS ?? 120_000)))
+
+// Track how many tool calls have happened since the last user-visible
+// reply. The number is what makes the silence ping useful — "5 tool
+// calls in" is meaningful, "still working" alone is not.
+let toolCount = 0
+let lastReplyTs = 0
+try { lastReplyTs = Number(readFileSync(LAST_REPLY_FILE, 'utf8')) || 0 } catch {}
+try { toolCount = Number(readFileSync(TOOL_COUNT_FILE, 'utf8')) || 0 } catch {}
+
+// If the stamp moved forward since our last tool count snapshot, the
+// agent replied — reset the counter and exit.
+let countStamp = 0
+try { countStamp = statSync(TOOL_COUNT_FILE).mtimeMs || 0 } catch {}
+if (lastReplyTs > countStamp) {
+  try { writeFileSync(TOOL_COUNT_FILE, '0') } catch {}
+  exitContinue()
+}
+
+toolCount += 1
+try { writeFileSync(TOOL_COUNT_FILE, String(toolCount)) } catch {}
+
+const elapsed = Date.now() - (lastReplyTs || Date.now())
+if (lastReplyTs === 0 || elapsed < THRESHOLD_MS) exitContinue()
+
+// Threshold tripped. Load access + token to send a ping.
+try {
+  for (const line of readFileSync(join(STATE_DIR, '.env'), 'utf8').split('\n')) {
+    const m = line.match(/^(\w+)=(.*)$/)
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+  }
+} catch {}
+
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN
+if (!TOKEN) exitContinue()
+
+let access: { allowFrom?: string[] } = {}
+try { access = JSON.parse(readFileSync(join(STATE_DIR, 'access.json'), 'utf8')) } catch {}
+const recipients = access.allowFrom ?? []
+if (recipients.length === 0) exitContinue()
+
+const secs = Math.round(elapsed / 1000)
+const text = `🟡 still working — ${toolCount} tool call${toolCount === 1 ? '' : 's'} in, ${secs}s since last reply`
+
+await Promise.all(recipients.map(chat_id =>
+  fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ chat_id, text }),
+  }).catch(() => {})
+))
+
+// Reset the silence-clock so we don't re-ping immediately — and the
+// counter so the next "still working" ping reflects work done since
+// THIS ping, not since the last actual reply.
+try { writeFileSync(LAST_REPLY_FILE, String(Date.now())) } catch {}
+try { writeFileSync(TOOL_COUNT_FILE, '0') } catch {}
+
+exitContinue()

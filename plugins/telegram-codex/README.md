@@ -201,4 +201,6 @@ replies via the `reply` tool. Done.
 - v0.1.3 — approval-mode bridge: `PermissionRequest` → Telegram buttons
 - v0.1.4 — bot slash commands (`/help`, `/status`, `/ping`) + setMyCommands menu; wait_for_message capped at 90s to stay inside Codex's MCP-call timeout
 - v0.1.5 — `reply` chunks text >4000 chars across multiple Telegram messages (paragraph→line→word→hard cut), so long Codex outputs no longer fail with 400 Bad Request
-- v0.1.6 — Stop hook suppresses the "turn complete" ping when Codex sent a `reply` within the last 30s (the user already knows). Override via `CODEX_NOTIFY_SUPPRESS_MS` env (0 disables suppression). (this)
+- v0.1.6 — Stop hook suppresses the "turn complete" ping when Codex sent a `reply` within the last 30s (the user already knows). Override via `CODEX_NOTIFY_SUPPRESS_MS` env (0 disables suppression)
+- v0.1.7 — typing indicator (re-sends `sendChatAction` every 4s between `wait_for_message` and `reply`, with a 5min ceiling) so a thinking Codex looks different from a hung one
+- v0.1.8 — silence watchdog `PreToolUse` hook — pings "🟡 still working — N tool calls in, Xs since last reply" when Codex has been silent past `CODEX_SILENCE_WATCHDOG_MS` (default 120000). Single ping per silence window — the hook resets its own clock so spam is impossible. (this)

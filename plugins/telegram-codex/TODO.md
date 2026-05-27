@@ -3,20 +3,7 @@
 Parity with `plugins/telegram/` (the Claude Code build) is the goal. Items
 ordered by UX criticality unless noted.
 
-## In flight
-
-- **v0.1.7 — typing indicator.** Keep "typing…" visible during long Codex
-  turns by re-sending `sendChatAction` every ~4s. Start when an inbound is
-  dequeued (Codex is now working on it); stop when `reply` lands. Mirrors
-  `startTypingLoop` / `stopTypingLoop` in `plugins/telegram/server.ts`.
-  Without this, a thinking Codex looks identical to a hung one.
-
 ## Up next
-
-- **v0.1.8 — silence watchdog hook.** Ping the user if Codex has been
-  silent for N seconds mid-turn without a `reply`. Currently the `Stop`
-  hook only fires at end-of-turn, so a stuck Codex is undetectable.
-  Mirror of `plugins/telegram/hooks/silence-watchdog.ts`.
 
 - **v0.1.9 — stop-failure notification.** Send a Telegram alert when the
   Codex session exits unexpectedly (non-zero, crash). Mirror of
@@ -62,3 +49,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 - v0.1.5 — `reply` chunks text >4000 chars across multiple messages
 - v0.1.6 — Stop hook suppresses ping when `reply` was sent in the last 30s
   (override via `CODEX_NOTIFY_SUPPRESS_MS`)
+- v0.1.7 — typing indicator (`startTypingLoop`/`stopTypingLoop`) between
+  `wait_for_message` dequeue and `reply`; 5min ceiling
+- v0.1.8 — silence watchdog `PreToolUse` hook (`CODEX_SILENCE_WATCHDOG_MS`,
+  default 120000); single ping per silence window
