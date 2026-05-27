@@ -1123,26 +1123,41 @@ function applyModel(alias: string): ApplyResult {
 // via systemd-run). We don't queue our own SIGTERM here — doing so on top of
 // the CLI's deferred restart caused a double-restart race; the CLI owns the
 // restart now so the running session picks up the new credentials.
-async function applyAccount(name: string): Promise<ApplyResult> {
+//
+// The set-account call is deferred into `after()` rather than run inline,
+// because the CLI's restart timer starts the instant set-account returns
+// (~1s, via systemd-run). Running it before our Telegram I/O meant SIGTERM
+// raced — and usually beat — the confirmation reply, so the user saw the
+// keyboard vanish with no "switched / restarting" ack. Deferring it (like
+// /model defers its TUI proxy) means the restart clock only starts once the
+// handler has finished sending the ack.
+async function applyAccount(name: string, chatId: number): Promise<ApplyResult> {
   const me = thisAgentName()
   if (!me) return { text: `Can't determine this agent's name (not running as agent-* user).` }
-  // Validate against the shell command we're about to construct. The CLI
-  // also validates, but rejecting here means we never spawn a sudo process
-  // with attacker-controlled input that happens to escape argv quoting.
+  // Validate against the shell command after() will construct. The CLI also
+  // validates, but rejecting here means we never spawn a sudo process with
+  // attacker-controlled input that happens to escape argv quoting. The picker
+  // only offers known accounts, so a tapped button is already valid; this
+  // guards the (unreachable-by-UI) malformed-callback case.
   if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name) && name !== 'default') {
     return { text: `Invalid account name.` }
   }
-  try {
-    await execFileP('sudo', ['-n', '5dive', 'agent', 'set-account', me, name], { timeout: 5000 })
-  } catch (err: any) {
-    const stderr = err?.stderr ? String(err.stderr).trim() : ''
-    return { text: `Failed to set account: ${stderr || (err instanceof Error ? err.message : String(err))}` }
-  }
   return {
     text: `✅ Account → ${name}\n\n⚠️  Claude is restarting in ~1s so the new credentials take effect.`,
-    // Marker so the callback handler still shows the "Switching…" toast.
-    // The CLI schedules the actual systemctl restart; no client-side action.
-    after: () => {},
+    // Runs after the handler's editMessageText + reply have been awaited, so
+    // the ack is on the wire before set-account schedules the restart. On the
+    // rare failure (sudo denied, CLI error) no restart fires and the bot is
+    // still alive, so we correct the optimistic ✅ with a fresh reply.
+    after: () => {
+      void execFileP('sudo', ['-n', '5dive', 'agent', 'set-account', me, name], { timeout: 5000 })
+        .catch((err: any) => {
+          const stderr = err?.stderr ? String(err.stderr).trim() : ''
+          void bot.api.sendMessage(
+            chatId,
+            `❌ Failed to switch account: ${stderr || (err instanceof Error ? err.message : String(err))}`,
+          ).catch(() => {})
+        })
+    },
   }
 }
 
@@ -1633,7 +1648,8 @@ bot.on('callback_query:data', async ctx => {
   }
   const accountM = /^account:([a-z][a-z0-9_-]{0,31}|default)$/.exec(data)
   if (accountM) {
-    const r = await applyAccount(accountM[1]!)
+    const chatId = ctx.chat?.id ?? Number(ctx.callbackQuery.from.id)
+    const r = await applyAccount(accountM[1]!, chatId)
     await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Failed' }).catch(() => {})
     // Edit the picker message to clear the keyboard, then send a fresh reply
     // so the user actually gets a push notification — editMessageText is silent.
