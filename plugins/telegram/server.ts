@@ -1151,14 +1151,39 @@ function thisAgentName(): string {
   return user.startsWith('agent-') ? user.slice('agent-'.length) : ''
 }
 
-// In-place edit of ~/.claude/settings.json, used by /model and /effort.
-// Parse → merge → write back atomically. Preserves every other key. Throws
-// on missing/corrupt file so the caller can surface the error to the user.
+// In-place merge of model/effort into the settings files Claude Code reads.
+// Claude precedence (high → low): managed > project-local > project-shared >
+// user. We always write user (~/.claude/settings.json) since it's the
+// per-agent layer the plugin owns. We ALSO refresh the higher-precedence
+// project-local and project-shared layers when they already have the key,
+// because a stale `model`/`effortLevel` there will shadow the user write and
+// the live process boots with the wrong value. We don't create those files
+// or add new keys — only update keys that are already present, so we don't
+// surprise users with new project state. Throws on missing/corrupt user
+// file so the caller can surface the error.
 function patchSettings(patch: Record<string, unknown>): void {
-  const path = join(homedir(), '.claude', 'settings.json')
-  const raw = readFileSync(path, 'utf8')
+  patchSettingsFile(join(homedir(), '.claude', 'settings.json'), patch, /*addNewKeys*/ true)
+  const cwd = process.cwd()
+  patchSettingsFile(join(cwd, '.claude', 'settings.local.json'), patch, /*addNewKeys*/ false)
+  patchSettingsFile(join(cwd, '.claude', 'settings.json'), patch, /*addNewKeys*/ false)
+}
+function patchSettingsFile(path: string, patch: Record<string, unknown>, addNewKeys: boolean): void {
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch (err: any) {
+    if (!addNewKeys && err?.code === 'ENOENT') return
+    throw err
+  }
   const obj = JSON.parse(raw) as Record<string, unknown>
-  Object.assign(obj, patch)
+  let dirty = false
+  for (const [k, v] of Object.entries(patch)) {
+    if (addNewKeys || k in obj) {
+      obj[k] = v
+      dirty = true
+    }
+  }
+  if (!dirty) return
   const tmp = path + '.tmp'
   writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', { mode: 0o600 })
   renameSync(tmp, path)
