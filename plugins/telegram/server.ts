@@ -1424,28 +1424,22 @@ const commandHandlers: Record<string, CommandHandler> = {
       return
     }
     const snap = readContextSnapshot(session)
-    if (!snap) {
-      await ctx.reply(`Context usage not available yet — send a message first so the statusline cache populates.`)
-      return
-    }
-    // Prefer the statusline-cached model id/name (always matches the
-    // session that emitted the context block); fall back to the per-pid
-    // settings read for the JSONL branch.
-    let modelId = snap.modelId
-    let modelName = snap.modelName
-    if (!modelId) {
-      const m = readClaudeModelAndEffort(session.pid)
-      modelId = m.model ?? undefined
-    }
-    const bar = renderContextBar(snap.usedPercentage, 20)
-    const usedStr = formatContextTokens(snap.usedTokens)
-    const totalStr = formatContextTokens(snap.windowTokens)
+    // No snapshot yet (statusline cache empty AND no JSONL turns) → render
+    // the empty bar at 0% rather than an explanation. Reads cleaner and
+    // mirrors what the native /context shows on a fresh session.
+    const { model: pidModel } = readClaudeModelAndEffort(session.pid)
+    const modelId = snap?.modelId ?? pidModel ?? undefined
+    const modelName = snap?.modelName
+    const pct = snap?.usedPercentage ?? 0
+    const usedStr = snap ? formatContextTokens(snap.usedTokens) : '0'
+    const totalStr = snap ? formatContextTokens(snap.windowTokens) : '—'
+    const bar = renderContextBar(pct, 20)
     const header = modelName
       ? `${modelName}${modelId ? ` · ${modelId}` : ''}`
       : (modelId ?? '')
     const lines = ['Context Usage', '']
     if (header) lines.push(header, '')
-    lines.push(`${bar}  ${snap.usedPercentage}%`)
+    lines.push(`${bar}  ${pct}%`)
     lines.push(`${usedStr} / ${totalStr} tokens`)
     await ctx.reply(lines.join('\n'))
   },
