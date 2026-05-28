@@ -45,13 +45,33 @@ import type { HookPayload, TranscriptEntry, TranscriptContentBlock } from './lib
 
 const payload = await readPayload<HookPayload>()
 
-// Allow buffered transcript writes to settle. claude appends async; the
-// last assistant entry can be in-flight when Stop fires and we'd otherwise
-// relay stale text and miss the latest.
-await sleep(50)
-
 const transcriptPath = payload.transcript_path
 if (!transcriptPath || !existsSync(transcriptPath)) process.exit(0)
+
+// Wait for the transcript tail to STABILIZE before reading. claude appends
+// the turn's final assistant message async, and Stop can fire before that
+// block is flushed to the JSONL. A blind `sleep(50)` then single read was
+// the cause of a real miss: the agent answered in transcript text (no reply
+// tool), but only the earlier pre-tool narration was on disk when the hook
+// read — so the auto-relay sent the narration and dropped the actual answer.
+// Poll until the line count stops growing (one quiet interval) or we hit the
+// ceiling, so `texts` always includes the genuine final answer. Bounded well
+// under the hook's 10s timeout.
+async function readStableEntries(path: string): Promise<TranscriptEntry[]> {
+  const SETTLE_MS = 120
+  const MAX_WAIT_MS = 1500
+  const deadline = Date.now() + MAX_WAIT_MS
+  let prevLen = -1
+  let entries = readEntries(path)
+  // Always pay at least one settle interval — the Stop-triggering message is
+  // the one most likely to be mid-flush right now.
+  do {
+    prevLen = entries.length
+    await sleep(SETTLE_MS)
+    entries = readEntries(path)
+  } while (entries.length !== prevLen && Date.now() < deadline)
+  return entries
+}
 
 const lockKey = createHash('sha1').update(transcriptPath).digest('hex')
 const lockFile = join(tmpdir(), `5dive-stopblock-${lockKey}.lock`)
@@ -66,7 +86,7 @@ if (existsSync(lockFile)) {
   }
 }
 
-const entries = readEntries(transcriptPath)
+const entries = await readStableEntries(transcriptPath)
 
 // Session-limit notice: claude renders the 5h-window / weekly-Max limit as a
 // regular assistant message with isApiErrorMessage=true (stop_reason=
