@@ -41,8 +41,13 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     name: 'status',
-    description: 'Pairing, usage, model, context',
+    description: 'Pairing, usage, model',
     scope: 'allowed',
+  },
+  {
+    name: 'context',
+    description: 'Context-window usage',
+    scope: 'paired',
   },
   {
     name: 'stop',

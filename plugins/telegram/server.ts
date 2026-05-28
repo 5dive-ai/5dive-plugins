@@ -996,23 +996,58 @@ function readStatuslineCache(): {
   }
 }
 
-// Compute the running context-window utilisation for the active session.
-// Walks the JSONL transcript backwards and pulls the latest assistant turn's
-// usage block; total tokens = input + cache_creation + cache_read (every
-// cached token still counts against the window). The session record from
-// findActiveSession() gives us the cwd + sessionId we need to locate the
-// file. Returns null when we can't find / parse a usable usage line.
+// Snapshot of the current context-window usage for the active session, used
+// by /context. Two sources, in order of preference:
 //
-// CONTEXT_WINDOW is 200k — matches Opus 4.7, Sonnet 4.6, and Haiku 4.5; if a
-// future model widens the window we'll surface a misleading low percentage,
-// but the floor (not the ceiling) is the user-visible cap that matters here.
-const CONTEXT_WINDOW_TOKENS = 200_000
-function readContextPct(session: { sessionId: string; cwd: string }): number | null {
+//   1. ~/.claude/statusline-last.json — written by the host's statusline.sh
+//      on every render. Has the real context_window_size (200k vs 1m
+//      varies per session config), so this branch is correct on both 200k
+//      and 1m-context runs. Stale while the user is idle (no statusline
+//      render → no fresh write), but good enough for an on-demand command.
+//
+//   2. JSONL transcript walk — fallback for hosts where statusline.sh
+//      doesn't dump the context block (e.g. upstream Claude Code without
+//      5dive). Assumes 200k window because the JSONL records used tokens
+//      but not the negotiated window; on a 1m session this under-reports
+//      the percentage by ~5x. The fallback is a graceful degrade, not
+//      accurate.
+//
+// CONTEXT_WINDOW_FALLBACK_TOKENS is the 200k floor — matches Opus 4.7,
+// Sonnet 4.6, and Haiku 4.5 default windows. Only used in branch (2).
+const CONTEXT_WINDOW_FALLBACK_TOKENS = 200_000
+type ContextSnapshot = {
+  usedTokens: number
+  windowTokens: number
+  usedPercentage: number
+  modelId?: string
+  modelName?: string
+  source: 'statusline' | 'jsonl'
+}
+function readContextSnapshot(session: { sessionId: string; cwd: string }): ContextSnapshot | null {
+  // (1) statusline cache — preferred.
   try {
-    // ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl — claude encodes the
-    // cwd by replacing every '/' with '-' (see the directory listing under
-    // ~/.claude/projects/). Be defensive: if our encoding diverges from
-    // claude's, fall back to a glob over the projects dir for the sessionId.
+    const raw = readFileSync(join(homedir(), '.claude', 'statusline-last.json'), 'utf8')
+    const j = JSON.parse(raw)
+    const cw = j?.context_window
+    if (cw && typeof cw.context_window_size === 'number') {
+      const used = typeof cw.total_input_tokens === 'number' ? cw.total_input_tokens : null
+      const pct = typeof cw.used_percentage === 'number'
+        ? cw.used_percentage
+        : (used !== null ? Math.round((used / cw.context_window_size) * 100) : null)
+      if (used !== null && pct !== null) {
+        return {
+          usedTokens: used,
+          windowTokens: cw.context_window_size,
+          usedPercentage: Math.min(100, pct),
+          modelId: typeof j?.model?.id === 'string' ? j.model.id : undefined,
+          modelName: typeof j?.model?.display_name === 'string' ? j.model.display_name : undefined,
+          source: 'statusline',
+        }
+      }
+    }
+  } catch {}
+  // (2) JSONL fallback — assume 200k window.
+  try {
     const projects = join(homedir(), '.claude', 'projects')
     const encoded = '-' + session.cwd.replace(/^\//, '').replace(/\//g, '-')
     let jsonlPath = join(projects, encoded, `${session.sessionId}.jsonl`)
@@ -1025,8 +1060,6 @@ function readContextPct(session: { sessionId: string; cwd: string }): number | n
       if (!jsonlPath) return null
     }
     const raw = readFileSync(jsonlPath, 'utf8')
-    // Scan from the bottom: most recent assistant turn wins. Pre-split keeps
-    // peak memory bounded vs walking the whole file in one pass.
     const lines = raw.split('\n')
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i]
@@ -1035,17 +1068,46 @@ function readContextPct(session: { sessionId: string; cwd: string }): number | n
       try { j = JSON.parse(line) } catch { continue }
       const u = j?.message?.usage
       if (!u || typeof u.input_tokens !== 'number') continue
-      const total =
+      const used =
         (u.input_tokens ?? 0) +
         (u.cache_creation_input_tokens ?? 0) +
         (u.cache_read_input_tokens ?? 0)
-      if (total <= 0) continue
-      return Math.min(100, Math.round((total / CONTEXT_WINDOW_TOKENS) * 100))
+      if (used <= 0) continue
+      const window = CONTEXT_WINDOW_FALLBACK_TOKENS
+      return {
+        usedTokens: used,
+        windowTokens: window,
+        usedPercentage: Math.min(100, Math.round((used / window) * 100)),
+        source: 'jsonl',
+      }
     }
     return null
   } catch {
     return null
   }
+}
+
+// Compact token count, e.g. 346200 → "346.2k", 1_000_000 → "1m".
+function formatContextTokens(n: number): string {
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000
+    return m === Math.floor(m) ? `${m}m` : `${m.toFixed(1)}m`
+  }
+  if (n >= 1_000) {
+    const k = n / 1_000
+    return k === Math.floor(k) ? `${k}k` : `${k.toFixed(1)}k`
+  }
+  return String(n)
+}
+
+// 20-cell bar matching Claude Code's /context aesthetic — filled cells on the
+// left, empty on the right. We use simple block glyphs rather than the dice
+// faces Claude renders, because Telegram's default fonts space them
+// inconsistently and the row would wrap on narrow clients.
+function renderContextBar(pct: number, width: number = 20): string {
+  const clamped = Math.max(0, Math.min(100, pct))
+  const filled = Math.round((clamped / 100) * width)
+  return '▰'.repeat(filled) + '▱'.repeat(width - filled)
 }
 
 // 5dive's `agent list --json` shape, narrowed to the fields /status and
@@ -1318,12 +1380,11 @@ const commandHandlers: Record<string, CommandHandler> = {
       const { model, effort } = readClaudeModelAndEffort(session.pid)
       lines.push(`status: ${session.status}`)
       if (model) lines.push(`model: ${model}${effort ? ` · ${effort}` : ''}`)
-      // Context % comes from the latest assistant turn in the JSONL transcript.
       // 5h / 1w come from the statusline cache (written by the host's
-      // statusline.sh on every render). Each is optional — skip the line if
-      // the source isn't available rather than emitting an empty field.
-      const ctxPct = readContextPct(session)
-      if (typeof ctxPct === 'number') lines.push(`context: ${ctxPct}%`)
+      // statusline.sh on every render). Optional — skip the line if the
+      // source isn't available rather than emitting an empty field.
+      // Context-window usage lives in /context (split out because it has its
+      // own visual rendering and was the noisiest line when stale).
       const usage = readStatuslineCache()
       const usageParts: string[] = []
       if (usage?.five_hour_pct !== undefined) usageParts.push(`5h: ${Math.round(usage.five_hour_pct)}%`)
@@ -1347,6 +1408,45 @@ const commandHandlers: Record<string, CommandHandler> = {
       }
       lines.push(`workdir: ${session.cwd}`)
     }
+    await ctx.reply(lines.join('\n'))
+  },
+
+  // /context — mirrors Claude Code's own /context command. Reports the
+  // session's context-window utilisation as a single bar + token totals.
+  // Was a line on /status, but the underlying read was wrong on 1m-context
+  // sessions (assumed 200k window) and frequently stale, so it got split
+  // out: this handler reads from the statusline cache, which carries the
+  // real context_window_size emitted by claude.
+  context: async ctx => {
+    const session = findActiveSession()
+    if (!session) {
+      await ctx.reply(`No active claude session detected.`)
+      return
+    }
+    const snap = readContextSnapshot(session)
+    if (!snap) {
+      await ctx.reply(`Context usage not available yet — send a message first so the statusline cache populates.`)
+      return
+    }
+    // Prefer the statusline-cached model id/name (always matches the
+    // session that emitted the context block); fall back to the per-pid
+    // settings read for the JSONL branch.
+    let modelId = snap.modelId
+    let modelName = snap.modelName
+    if (!modelId) {
+      const m = readClaudeModelAndEffort(session.pid)
+      modelId = m.model ?? undefined
+    }
+    const bar = renderContextBar(snap.usedPercentage, 20)
+    const usedStr = formatContextTokens(snap.usedTokens)
+    const totalStr = formatContextTokens(snap.windowTokens)
+    const header = modelName
+      ? `${modelName}${modelId ? ` · ${modelId}` : ''}`
+      : (modelId ?? '')
+    const lines = ['Context Usage', '']
+    if (header) lines.push(header, '')
+    lines.push(`${bar}  ${snap.usedPercentage}%`)
+    lines.push(`${usedStr} / ${totalStr} tokens`)
     await ctx.reply(lines.join('\n'))
   },
 
