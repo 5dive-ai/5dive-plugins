@@ -86,16 +86,9 @@ access.json — `pair.ts` handles DMs only.
 
 Grok reads the Claude plugin format natively, so there are two ways:
 
-**As a plugin (recommended).** Make the plugin discoverable — symlink or
-copy this directory into `~/.grok/plugins/`, or add a marketplace source
-pointing at the `5dive-plugins` repo. Grok loads the bundled `.mcp.json`
-(the `telegram` MCP server) and `hooks/hooks.json` (lifecycle hooks)
-automatically. Trust the plugin so its hooks/MCP run (`/plugins trust`, or
-launch with `--always-approve`).
-
-**Manual `~/.grok/config.toml`.** If you'd rather wire the server by hand
-(this is the most reliable path — no reliance on `${GROK_PLUGIN_ROOT}`
-expansion):
+**Wire the MCP server via `~/.grok/config.toml`** — the method that works
+on grok 0.1.x (see [Grok 0.1.x quirks](#grok-01x-quirks) below). Use an
+absolute path:
 
 ```toml
 [mcp_servers.telegram]
@@ -105,6 +98,16 @@ args = ["/absolute/path/to/5dive-plugins/plugins/telegram-grok/server.ts"]
 # raise both together if you want longer idle polls.
 tool_timeouts = { wait_for_message = 60 }
 ```
+
+`--always-approve` auto-trusts plugin/MCP commands, so there's no separate
+`/plugins trust` step.
+
+**Or as a plugin (forward-looking).** Grok discovers plugins from
+`~/.grok/plugins/` (symlink or copy this dir) or a marketplace source and
+loads the bundled `.mcp.json` + `hooks/hooks.json`. On grok 0.1.x,
+`${GROK_PLUGIN_ROOT}` does NOT expand in `.mcp.json`, so the MCP server
+path won't resolve this way yet — use the `config.toml` form above until
+grok supports the variable in MCP configs.
 
 **5. Add the comms playbook**
 
@@ -121,10 +124,26 @@ grok
 DM your bot. Grok calls `wait_for_message`, your DM resolves it, Grok
 replies via the `reply` tool. Done.
 
+## Grok 0.1.x quirks
+
+Confirmed live on grok 0.1.x — both affect wiring:
+
+- **`config.toml` `[[hooks.*]]` is ignored.** Grok loads hooks only from
+  `~/.grok/hooks/*.json` (and a plugin's `hooks/hooks.json`). The TOML
+  `[[hooks.Stop]]` form that Codex uses does nothing in grok.
+- **`${GROK_PLUGIN_ROOT}` does not expand in `.mcp.json`** command/args
+  (it does expand in hook `command` fields). Wire the MCP server with an
+  absolute path in `config.toml` `[mcp_servers.telegram]` instead — the
+  managed 5dive provisioning does exactly this.
+- **`--always-approve` auto-trusts** plugin/MCP commands — no separate
+  `/plugins trust` step needed.
+
 ## Lifecycle hooks
 
-Wired via `hooks/hooks.json` (or `~/.grok/hooks/*.json` for a standalone
-install). All are non-blocking and read the same state dir as the server:
+Wired via the plugin's `hooks/hooks.json`, or `~/.grok/hooks/*.json` for a
+standalone install. **Note:** grok ignores `[[hooks.*]]` in `config.toml`
+(unlike Codex) — hook configs must live in `~/.grok/hooks/*.json`. All
+hooks are non-blocking and read the same state dir as the server:
 
 | Hook | Event | What it does | Knobs |
 | ---- | ----- | ------------ | ----- |

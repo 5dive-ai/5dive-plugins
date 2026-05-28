@@ -9,16 +9,20 @@ ordered by UX criticality unless noted.
 
 ## Still open
 
-- 5dive `--channels=telegram` **grok** provisioning (handed off to main):
-  grok must be added to the channel-capable type list in `cmd_agent.sh`
-  and the plugin staged, mirroring what codex got in 5dive-cli 0.1.8/0.1.9.
-- Confirm grok plugin **trust** under `--always-approve` — plugins must be
-  trusted before hooks/MCP run; verify the launch flag bypasses the trust
-  gate or wire a `/plugins trust` step (main's territory).
 - ExecStopPost in 5dive's systemd unit for true crash-aware notification.
-- `.mcp.json` `${GROK_PLUGIN_ROOT}` expansion: verify on a live grok; the
-  reliable fallback is an absolute path in `~/.grok/config.toml`
-  `[mcp_servers.telegram]` (documented in README).
+
+## Resolved (2026-05-28, 5dive-cli 0.1.11)
+
+- `grok --channels=telegram` provisioning shipped end-to-end by main (mirrors
+  codex). Verified live: `grok mcp doctor` (5 tools healthy), `grok inspect`
+  (3 hooks loaded).
+- Plugin **trust**: `--always-approve` auto-trusts plugin/MCP commands — no
+  separate `/plugins trust` step.
+- `${GROK_PLUGIN_ROOT}` does NOT expand in `.mcp.json` on grok 0.1.x (does
+  expand in hook `command` fields) → MCP server wired via absolute path in
+  `~/.grok/config.toml` `[mcp_servers.telegram]`. See README "Grok 0.1.x quirks".
+- grok IGNORES `config.toml [[hooks.*]]` — hooks load only from
+  `~/.grok/hooks/*.json` (or plugin `hooks/hooks.json`). Documented in README.
 
 ## Won't port
 
