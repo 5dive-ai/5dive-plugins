@@ -100,6 +100,11 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     scope: 'paired-5dive',
   },
   {
+    name: 'update',
+    description: 'Refresh plugins, then restart',
+    scope: 'paired-5dive',
+  },
+  {
     name: 'model',
     description: 'Pick model + effort',
     scope: 'paired',

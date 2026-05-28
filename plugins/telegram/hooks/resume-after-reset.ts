@@ -40,7 +40,12 @@ const chatIdsCsv = process.argv[5] ?? ''
 const lockPath = process.argv[6] ?? ''
 const transcriptPath = process.argv[7] ?? ''
 
-const MAX_WINDOW_SEC = 6 * 3600 // overall recovery budget (covers the 5h limit + buffer)
+// Split into two budgets so weekly-cap resets — where the API hands us a
+// real future epoch 12-24h out — don't get treated as untrustworthy and
+// bumped to the retry loop, where the retry loop's own 6h ceiling then
+// gives up before the limit actually lifts.
+const MAX_WAIT_SEC = 30 * 3600 // trust a future reset epoch up to 30h (5h rolling + weekly cap)
+const MAX_RETRY_SEC = 6 * 3600 // after wait/blind, poll-retry for this long before giving up
 const RETRY_INTERVAL_SEC = 300 // back-off between blind resume attempts
 const VERIFY_POLLS = 6 // after a "continue", watch this many times…
 const VERIFY_STEP_MS = 4000 // …at this cadence (~24s) for claude to pick up
@@ -137,7 +142,7 @@ try {
   {
     const now = Math.floor(Date.now() / 1000)
     const delta = resetEpoch - now
-    if (delta > 0 && delta <= MAX_WINDOW_SEC) {
+    if (delta > 0 && delta <= MAX_WAIT_SEC) {
       log(`phase2 sleeping ${delta + 30}s until reset`)
       await sleep((delta + 30) * 1000)
     } else if (resetEpoch > 0) {
@@ -150,7 +155,7 @@ try {
   // Phase 3 — resume with verification + bounded retry.
   if (ctx) {
     const start = Math.floor(Date.now() / 1000)
-    while (Math.floor(Date.now() / 1000) - start < MAX_WINDOW_SEC) {
+    while (Math.floor(Date.now() / 1000) - start < MAX_RETRY_SEC) {
       if (await attemptResume()) {
         resumed = true
         log('phase3 resume confirmed')
@@ -163,7 +168,7 @@ try {
         .find(l => /resets?\s+\d|try again|in\s+\d+\s*(?:h|m|hour|min)/i.test(l))
       const epoch = line ? parseResetEpoch(line) : null
       const now = Math.floor(Date.now() / 1000)
-      if (epoch && epoch > now && epoch - now <= MAX_WINDOW_SEC) {
+      if (epoch && epoch > now && epoch - now <= MAX_WAIT_SEC) {
         log(`phase3 still limited; learned reset, sleeping ${epoch - now + 30}s`)
         await sleep((epoch - now + 30) * 1000)
       } else {

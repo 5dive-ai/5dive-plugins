@@ -1177,19 +1177,26 @@ function isActiveModel(alias: string, current: string | undefined): boolean {
   if (!current) return false
   return alias === current || MODEL_ALIASES[alias] === current
 }
-// Combined /model picker: model row on top, effort rows below. Both knobs
+// Combined /model picker: model rows on top, effort rows below. Both knobs
 // configure the same "next turn runs as" question so we render them on one
-// keyboard — fewer slash commands to remember, one tap still acts. Effort
-// levels split 3 + 2 across two rows so the labels stay legible on mobile.
+// keyboard — fewer slash commands to remember, one tap still acts. Models
+// split 2 per row (base + [1m] variant side by side) and effort levels split
+// 3 + 2 across two rows so labels stay legible on mobile — 5 buttons in one
+// row got squeezed unreadable.
 function modelAndEffortKeyboard(
   curModel?: string,
   curEffort?: string,
 ): InlineKeyboard {
   const kb = new InlineKeyboard()
-  for (const alias of Object.keys(MODEL_ALIASES)) {
+  const aliases = Object.keys(MODEL_ALIASES)
+  aliases.forEach((alias, i) => {
     if (isActiveModel(alias, curModel)) kb.text(`✓ ${alias}`, 'model:noop')
     else kb.text(alias, `model:${alias}`)
-  }
+    // Break after every 2nd button so base + [1m] sit on one row, then
+    // wrap. Skip the trailing row() for the final button (kb.row() below
+    // unconditionally separates the effort section).
+    if (i % 2 === 1 && i < aliases.length - 1) kb.row()
+  })
   kb.row()
   EFFORT_LEVELS.forEach((level, i) => {
     if (level === curEffort) kb.text(`✓ ${level}`, 'effort:noop')
@@ -1553,6 +1560,67 @@ const commandHandlers: Record<string, CommandHandler> = {
       void bot.api.sendMessage(
         chatId,
         `❌ Failed to restart for resume: ${stderr || (err instanceof Error ? err.message : String(err))}`,
+      ).catch(() => {})
+    })
+  },
+
+  // /update — pull the latest plugin marketplace HEAD into this agent's
+  // plugin cache, then schedule a deferred restart so the new code loads.
+  // Same restart shape as /resume: ack lands first, then systemd-run fires
+  // ~1s later as a transient unit that survives our teardown.
+  update: async ctx => {
+    const me = thisAgentName()
+    if (!me) {
+      await ctx.reply(`Can't determine this agent's name (not running as agent-* user).`)
+      return
+    }
+    const chatId = ctx.chat?.id ?? Number(ctx.from?.id)
+    let refreshStdout = ''
+    try {
+      const { stdout } = await execFileP(
+        'sudo',
+        ['-n', '/usr/local/bin/5dive-refresh-plugins.sh', me],
+        { timeout: 120_000 },
+      )
+      refreshStdout = stdout
+    } catch (err: any) {
+      const stderr = err?.stderr ? String(err.stderr).trim() : ''
+      await ctx.reply(
+        `❌ Plugin refresh failed: ${stderr || (err instanceof Error ? err.message : String(err))}`,
+      )
+      return
+    }
+    // The refresh script prints "<user>: before:" and "<user>: after:"
+    // sections; under each, the 4-space-indented lines are "<key> <ver>
+    // <sha>" per plugin. Pull those out so the reply names the version
+    // delta (or confirms no change).
+    const versionLine = (label: string): string => {
+      const m = new RegExp(`${label}:\\n((?:    .*\\n?)+)`).exec(refreshStdout)
+      if (!m) return ''
+      return m[1]!
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean)
+        .join(' · ')
+    }
+    const before = versionLine('before')
+    const after = versionLine('after')
+    const summary = before && after && before !== after
+      ? `Plugins refreshed:\n  was: ${before}\n  now: ${after}`
+      : before || after
+        ? `Plugins refreshed (no version change):\n  ${after || before}`
+        : `Plugins refreshed.`
+    await ctx.reply(`${summary}\n\n⚠️  Restarting in ~1s — back shortly.`)
+    void execFileP(
+      'sudo',
+      ['-n', 'systemd-run', '--on-active=1', '--collect',
+        '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+      { timeout: 5000 },
+    ).catch((err: any) => {
+      const stderr = err?.stderr ? String(err.stderr).trim() : ''
+      void bot.api.sendMessage(
+        chatId,
+        `❌ Refresh succeeded but restart failed: ${stderr || (err instanceof Error ? err.message : String(err))}`,
       ).catch(() => {})
     })
   },
@@ -1944,7 +2012,10 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery({ text: 'Already active.' }).catch(() => {})
     return
   }
-  const modelM = /^model:([a-z0-9-]+)$/.exec(data)
+  // Allow [ and ] so the [1m] long-context variants (opus[1m], sonnet[1m])
+  // match. applyModel rejects anything not in MODEL_ALIASES, so the looser
+  // character class doesn't widen what actually executes.
+  const modelM = /^model:([a-z0-9\-[\]]+)$/.exec(data)
   if (modelM) {
     const r = applyModel(modelM[1]!)
     // answerCallbackQuery dismisses the spinner Telegram shows after a tap;
