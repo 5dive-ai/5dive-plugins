@@ -364,6 +364,10 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'stop',    description: 'interrupt the current Codex turn (sends Ctrl-C to the pane)' },
   { command: 'restart', description: 'restart the Codex agent (systemd respawn brings it back in ~2s)' },
   { command: 'agents',  description: 'list sibling 5dive agents on this host' },
+  { command: 'tasks',   description: 'list open tasks from the shared 5dive queue' },
+  { command: 'task',    description: 'create a task: /task add <title>' },
+  { command: 'org',     description: 'show the 5dive agent org chart' },
+  { command: 'start',   description: 'how to pair this bot to a Codex session' },
 ]
 
 function helpText(): string {
@@ -464,6 +468,72 @@ async function listAgents(): Promise<string> {
   })
 }
 
+// Run `sudo -n 5dive <args> --json` and return the parsed {ok,data,error}
+// envelope. Rejects on spawn/exec failure so callers can show a clean error.
+function run5dive(args: string[], timeout = 8000): Promise<{ ok: boolean; data?: any; error?: { message?: string } }> {
+  return new Promise((resolve, reject) => {
+    require('child_process').execFile('sudo', ['-n', '5dive', ...args], { timeout },
+      (err: any, stdout: string) => {
+        if (err && !stdout) return reject(err)
+        try { resolve(JSON.parse(stdout)) } catch (e) { reject(e) }
+      },
+    )
+  })
+}
+
+// /tasks — list open tasks from the shared 5dive queue.
+async function listTasks(): Promise<string> {
+  try {
+    const j = await run5dive(['task', 'ls', '--json'])
+    if (!j.ok || !Array.isArray(j.data?.tasks)) return '⚠️ `5dive task ls` returned unexpected output.'
+    const tasks = j.data.tasks
+    if (tasks.length === 0) return 'No open tasks.\n\nAdd one with `/task add <title>`.'
+    const lines = tasks.map((t: any) => {
+      const pri = t.priority && t.priority !== 'medium' ? ` (${t.priority})` : ''
+      const who = t.assignee ? ` · ${t.assignee}` : ''
+      return `• \`${t.ident}\` [${t.status}]${pri} ${t.title}${who}`
+    })
+    return `*Open tasks:*\n\n${lines.join('\n')}`
+  } catch (err) {
+    return `⚠️ Failed to list tasks: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
+// /task add <title> — create a task on the shared queue.
+async function addTask(arg: string, from: string): Promise<string> {
+  const sp = arg.indexOf(' ')
+  const sub = (sp === -1 ? arg : arg.slice(0, sp)).toLowerCase()
+  const title = sp === -1 ? '' : arg.slice(sp + 1).trim()
+  if (sub !== 'add') return 'Usage:\n`/task add <title>` — create a task\n`/tasks` — list open tasks'
+  if (!title) return "What's the task? Try:\n`/task add Wire up the billing webhook`"
+  try {
+    const j = await run5dive(['task', 'add', '--json', `--from=${from}`, '--', title])
+    if (!j.ok) return `⚠️ Failed: ${j.error?.message ?? 'unknown error'}`
+    return `✅ Created \`${j.data.ident}\` — ${j.data.title}`
+  } catch (err) {
+    return `⚠️ Failed to add task: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
+// /org [tree] — show the agent org chart.
+async function orgTree(arg: string): Promise<string> {
+  if (arg !== '' && arg !== 'tree') return 'Usage:\n`/org tree` — show the agent org chart'
+  try {
+    const j = await run5dive(['org', 'tree', '--json'])
+    if (!j.ok || !Array.isArray(j.data?.tree)) return '⚠️ `5dive org tree` returned unexpected output.'
+    const tree = j.data.tree
+    if (tree.length === 0) return 'Org chart is empty.'
+    const lines = tree.map((n: any) => {
+      const indent = '  '.repeat(Math.max(0, n.depth ?? 0))
+      const label = n.title || n.role ? ` — ${n.title || n.role}` : ''
+      return `${indent}${n.name}${label}`
+    })
+    return `*Org chart:*\n\n${lines.join('\n')}`
+  } catch (err) {
+    return `⚠️ Failed to read org chart: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
 async function restartAgent(name: string): Promise<void> {
   if (name === 'unknown') return
   await new Promise<void>(resolve => {
@@ -491,6 +561,13 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
 
   const chat_id = String(ctx.chat!.id)
   const reply_to = ctx.message?.message_id
+  // Everything after "/cmd" (and optional @botname) — the command arguments,
+  // e.g. "add Wire up billing" for /task or "tree" for /org.
+  const cmdArg = text.slice(m[0]!.length).trim()
+  const md = (t: string) => bot.api.sendMessage(chat_id, t, {
+    parse_mode: 'Markdown',
+    ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+  })
 
   try {
     switch (cmd) {
@@ -540,6 +617,24 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         })
         return true
       }
+      case 'tasks':
+        await md(await listTasks())
+        return true
+      case 'task':
+        await md(await addTask(cmdArg, ctx.from?.username || 'telegram'))
+        return true
+      case 'org':
+        await md(await orgTree(cmdArg))
+        return true
+      case 'start':
+        await md(
+          'This bot bridges Telegram to an OpenAI Codex session.\n\n' +
+          'To pair:\n' +
+          '1. Run `bun pair.ts` in the telegram-codex plugin dir to get your user id allowlisted\n' +
+          '2. After that, messages here reach that Codex session.\n\n' +
+          'Try `/help` for the full command list.',
+        )
+        return true
     }
   } catch (err) {
     process.stderr.write(`telegram-codex: /${cmd} reply failed: ${err}\n`)
