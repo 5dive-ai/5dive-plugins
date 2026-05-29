@@ -20,6 +20,27 @@ export function getAllowedChatIds(access?: AccessConfig): string[] {
 // A chat to notify, plus the optional forum-topic it should land in.
 export type CallerChat = { chatId: string; threadId?: string }
 
+// The agent's bound group topic(s) — each configured group with its
+// message_thread_id (the agent's "home" forum thread, e.g. its #5dive topic).
+// Used as the autonomous-turn fallback in stopfailure-notify: when a failure
+// fires on a turn with NO telegram inbound (cron/long-running agent), routing
+// here keeps the alert in the agent's own topic instead of fanning out to
+// every paired DM + the group's General channel. Returns [] when no group is
+// configured (callers then fall back to all allowed chats).
+export function getGroupTopics(access?: AccessConfig): CallerChat[] {
+  const a = access ?? loadAccess()
+  const groups = a.groups ?? {}
+  const out: CallerChat[] = []
+  for (const [chatId, cfg] of Object.entries(groups)) {
+    const threadId =
+      cfg && typeof cfg === 'object'
+        ? (cfg as { message_thread_id?: string | number }).message_thread_id
+        : undefined
+    out.push(threadId != null && threadId !== '' ? { chatId, threadId: String(threadId) } : { chatId })
+  }
+  return out
+}
+
 // Caller-only narrowing. When an agent is paired with multiple chats
 // (DM + group), the "ping everyone in access.json" approach makes an
 // unrelated group buzz every time a single user's session hits a failure.

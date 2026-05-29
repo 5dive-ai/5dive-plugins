@@ -3,6 +3,31 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.40
+
+### Added — auto-resume on transient API errors
+
+- **`hooks/resume-after-error.ts`** — new detached recovery helper for
+  transient API failures (Overloaded / 5xx). When claude exhausts its built-in
+  retries on an overloaded response it aborts the turn and drops to an idle
+  prompt; the `while true; claude; done` agent loop only restarts on process
+  *exit*, so the still-running-but-idle session used to sit there until a human
+  nudged it. `stopfailure-notify.ts` now detects these (distinct from a usage
+  limit) and forks this helper to type `continue` with growing backoff
+  (`20/45/90/150s`, 4 tries), verifying via the transcript that claude actually
+  picked back up. Shares the per-agent resume lock with the rate-limit flow so
+  only one helper drives the pane at a time.
+
+### Fixed — StopFailure notify fanned out to all chats on autonomous turns
+
+- On a turn with no Telegram inbound (cron / long-running background agent),
+  the StopFailure notifier fell back to *every* allowed chat — both paired DMs
+  and the supergroup's General channel — instead of the agent's bound forum
+  topic. Added `getGroupTopics()` (access.ts) and switched the autonomous-turn
+  fallback to route into the configured group topic(s) (`message_thread_id`),
+  so an agent's failure alert lands in its own thread. Falls back to all chats
+  only when no group is configured.
+
 ## v0.1.1
 
 ### Added — bot slash commands

@@ -17,7 +17,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { readPayload } from './lib/payload'
 import { readEntries, findRateLimitText } from './lib/transcript'
-import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
+import { getAllowedChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
 import { parseResetEpoch } from './lib/time'
@@ -46,6 +46,19 @@ let entries = transcriptPath ? readEntries(transcriptPath) : []
 // The transcript captures that line as a structured synthetic message
 // (error="rate_limit", isApiErrorMessage=true) and is immune.
 const pane = capturePane()
+
+// Transient API error (NOT a usage limit): claude exhausted its built-in
+// retries on an Overloaded / 5xx response, aborted the turn, and dropped back
+// to an idle prompt — no "Stop and wait" menu, no reset epoch. The
+// `while true; claude; done` agent loop only restarts on process *exit*, so an
+// aborted-turn-but-still-running claude just sits there until a human nudges
+// it. We detect it here and fork resume-after-error.ts to type "continue" with
+// backoff. Match the API status line in the pane ("API Error: Overloaded",
+// "API Error: 529 …") and the raw payload ("overloaded_error" etc).
+const transientHaystack = `${raw}\n${pane}`
+const isTransientApiError =
+  !isRateLimit &&
+  /overloaded|API Error:\s*(?:5(?:0[234]|29))\b|"type":\s*"(?:overloaded|api)_error"/i.test(transientHaystack)
 
 // Resolve an unlock/reset epoch. Order: payload → transcript → message text → pane.
 let resetEpoch: number | null = null
@@ -129,18 +142,29 @@ if (isRateLimit) {
 } else {
   text = `The agent stopped with an error: ${msg}`
   if (pane) {
-    const apiErr = pane.match(/API Error:\s+\d+[^.-]*/g)?.pop()
+    const apiErr = pane.match(/API Error:\s+(?:\d+|Overloaded)[^.-]*/gi)?.pop()
     if (apiErr) text += `\n${apiErr}`
+  }
+  if (isTransientApiError && tmuxCtx) {
+    text += `\nTransient API error — auto-retrying 'continue' with backoff.`
   }
 }
 
-// Caller-only narrowing: prefer the inbound chat (and its forum topic) over
-// fanning to all paired chats. Falls back to all chats for autonomous turns
-// so we don't silence the alert entirely — those carry no topic.
+// Caller-only narrowing: prefer the inbound chat (and its forum topic) the
+// user actually wrote from. On an autonomous turn (no telegram inbound in the
+// transcript — cron-triggered, long-running background agent, etc) fall back
+// to the agent's bound group topic(s) so the alert lands in its own thread
+// instead of buzzing every paired DM + the group's General channel. Only when
+// no group is configured at all do we fan to all allowed chats — better a
+// noisy alert than a silenced one.
 let targets: CallerChat[]
 const callerChat = getCallerChat(entries)
-if (callerChat) targets = [callerChat]
-else targets = getAllowedChatIds().map(chatId => ({ chatId }))
+if (callerChat) {
+  targets = [callerChat]
+} else {
+  const topics = getGroupTopics()
+  targets = topics.length ? topics : getAllowedChatIds().map(chatId => ({ chatId }))
+}
 
 // For a recoverable rate limit (we have a pane to drive), claim the per-agent
 // resume lock BEFORE notifying. If it's already held, a helper is mid-recovery
@@ -149,9 +173,13 @@ else targets = getAllowedChatIds().map(chatId => ({ chatId }))
 // the running helper see it through. The lock dir doubles as the helper's log
 // dir. The lock auto-expires (mtime TTL) so a crashed helper can't wedge
 // recovery forever.
+//
+// The same lock serializes BOTH recovery flows (usage-limit and transient
+// API error) — only one helper should drive the pane at a time.
+const needsRecovery = (isRateLimit || isTransientApiError) && !!tmuxCtx
 let lockPath: string | null = null
 let resumeLogDir = ''
-if (isRateLimit && tmuxCtx) {
+if (needsRecovery) {
   resumeLogDir = join(homedir(), '.cache', '5dive-telegram', 'resume')
   try {
     mkdirSync(resumeLogDir, { recursive: true })
@@ -166,40 +194,38 @@ if (isRateLimit && tmuxCtx) {
 
 await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
 
-// Detach the recovery helper (we already hold the lock). It poll-retries and
-// resumes once the limit lifts — even with NO reset epoch, which is exactly
-// the case that used to leave the agent parked until a manual unlock. The
-// helper releases the lock when it finishes.
-if (isRateLimit && tmuxCtx && lockPath) {
-  const resumeHelper = join(import.meta.dir, 'resume-after-reset.ts')
+// Detach the recovery helper (we already hold the lock). Two flows share the
+// same lock + ping encoding but own distinct helpers:
+//   • usage limit      → resume-after-reset.ts (park menu, wait for reset,
+//                         then continue + retry). Resumes even with NO reset
+//                         epoch — the case that used to park the agent until a
+//                         manual unlock.
+//   • transient API err → resume-after-error.ts (no menu, no wait — just
+//                         continue with backoff up to a cap).
+// Encode the topic alongside each chat as "chatId:threadId" (bare "chatId"
+// when General/DM) so the detached helper threads its resume ping back into
+// the same forum topic. chat ids never contain ':' so a plain split is safe
+// even for negative supergroup ids.
+if (needsRecovery && tmuxCtx && lockPath) {
+  const chatsCsv = targets.map(t => (t.threadId ? `${t.chatId}:${t.threadId}` : t.chatId)).join(',')
+  const resumeHelper = isRateLimit
+    ? join(import.meta.dir, 'resume-after-reset.ts')
+    : join(import.meta.dir, 'resume-after-error.ts')
+  const helperArgs = isRateLimit
+    ? [resumeHelper, String(resetEpoch ?? 0), tmuxCtx.socket, tmuxCtx.target, chatsCsv, lockPath, transcriptPath ?? '']
+    : [resumeHelper, tmuxCtx.socket, tmuxCtx.target, chatsCsv, lockPath, transcriptPath ?? '']
   if (existsSync(resumeHelper)) {
     const logFile = join(resumeLogDir, `resume-${Math.floor(Date.now() / 1000)}-${process.pid}.log`)
     const out = openSync(logFile, 'a')
-    const child = spawn(
-      'bun',
-      [
-        resumeHelper,
-        String(resetEpoch ?? 0),
-        tmuxCtx.socket,
-        tmuxCtx.target,
-        // Encode the topic alongside each chat as "chatId:threadId" (bare
-        // "chatId" when General/DM) so the detached helper can thread its
-        // resume ping back into the same forum topic. chat ids never contain
-        // ':' so a plain split is safe even for negative supergroup ids.
-        targets.map(t => (t.threadId ? `${t.chatId}:${t.threadId}` : t.chatId)).join(','),
-        lockPath,
-        transcriptPath ?? '',
-      ],
-      {
-        detached: true,
-        stdio: ['ignore', out, out],
-        env: process.env,
-      },
-    )
+    const child = spawn('bun', helperArgs, {
+      detached: true,
+      stdio: ['ignore', out, out],
+      env: process.env,
+    })
     child.unref()
   } else {
     // Helper missing (deploy gap): we already DM'd, so just release the lock
-    // so the next limit episode isn't blocked by a stale one.
+    // so the next episode isn't blocked by a stale one.
     try {
       unlinkSync(lockPath)
     } catch {
