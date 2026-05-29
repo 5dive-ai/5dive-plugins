@@ -39,7 +39,7 @@ import { readEntries, analyzeTurn, hadTelegramToolCallAfter } from './lib/transc
 import { sendMessage, getToken } from './lib/telegram'
 import { emitBlock } from './lib/output'
 import { TG_TOOL_PREFIX } from './lib/paths'
-import { getAllowedChatIds, getCallerChatId } from './lib/access'
+import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { parseResetEpoch } from './lib/time'
 import type { HookPayload, TranscriptEntry, TranscriptContentBlock } from './lib/types'
 
@@ -132,9 +132,11 @@ if (sessionLimitHit && getToken()) {
     // Find a chat: prefer the inbound chat from this turn (caller scoping),
     // else fall back to every allowed chat so an autonomous-turn limit hit
     // still pings someone.
-    const callerChat = getCallerChatId(entries)
-    const chatIds = callerChat ? [callerChat] : getAllowedChatIds()
-    if (chatIds.length > 0) {
+    const callerChat = getCallerChat(entries)
+    const targets: CallerChat[] = callerChat
+      ? [callerChat]
+      : getAllowedChatIds().map(chatId => ({ chatId }))
+    if (targets.length > 0) {
       // Compose the DM. Add a parsed time-left when the message carries a
       // reset clue ("resets 9am" / "in 2h"), so the user knows when to expect
       // the agent back; silent fallback if we can't parse one.
@@ -162,7 +164,7 @@ if (sessionLimitHit && getToken()) {
       } catch {
         // ignore — at worst we send the DM twice on next Stop
       }
-      await Promise.all(chatIds.map(cid => sendMessage(cid, dm)))
+      await Promise.all(targets.map(t => sendMessage(t.chatId, dm, t.threadId)))
     }
   }
 }
@@ -174,11 +176,13 @@ if (payload.stop_hook_active === true) {
     let cachedChat = ''
     let cachedMsg = ''
     let cachedLine = 0
+    let cachedThread = ''
     try {
       const parts = readFileSync(lockFile, 'utf8').split('|')
       cachedChat = parts[0] ?? ''
       cachedMsg = parts[1] ?? ''
       cachedLine = parseInt(parts[2] ?? '0', 10) || 0
+      cachedThread = parts[3] ?? ''
       unlinkSync(lockFile)
     } catch {
       // ignore
@@ -191,7 +195,7 @@ if (payload.stop_hook_active === true) {
       let diag = '[5dive] Agent stopped without a Telegram reply and produced no transcript text'
       if (cachedMsg) diag += ` (unanswered message_id=${cachedMsg})`
       diag += '. Retry-after-block already attempted; check journalctl on the host.'
-      await sendMessage(cachedChat, diag)
+      await sendMessage(cachedChat, diag, cachedThread || undefined)
     }
   }
   process.exit(0)
@@ -204,6 +208,7 @@ const a = analyzeTurn(entries, TG_TOOL_PREFIX)
 // chat to send to.
 if (!a.hadInbound || !a.lastChatId || !getToken()) process.exit(0)
 const chatId = a.lastChatId
+const threadId = a.lastThreadId ?? undefined
 
 // Turn-level rule: if the agent delivered text through the proper channel
 // — reply or edit_message — anywhere in this turn, every loose assistant
@@ -216,7 +221,7 @@ if (a.hadSend) process.exit(0)
 if (a.texts.length > 0) {
   const joined = a.texts.join('\n\n').trim()
   if (joined) {
-    await sendMessage(chatId, `(auto-relay) ${joined}`)
+    await sendMessage(chatId, `(auto-relay) ${joined}`, threadId)
     process.exit(0)
   }
 }
@@ -230,27 +235,30 @@ if (a.hadTool) process.exit(0)
 if (existsSync(lockFile)) {
   let cachedChat = ''
   let cachedMsg = ''
+  let cachedThread = ''
   try {
     const parts = readFileSync(lockFile, 'utf8').split('|')
     cachedChat = parts[0] ?? ''
     cachedMsg = parts[1] ?? ''
+    cachedThread = parts[3] ?? ''
     unlinkSync(lockFile)
   } catch {
     // ignore
   }
   const diagChat = cachedChat || chatId
+  const diagThread = (cachedChat ? cachedThread : threadId) || undefined
   const diagMsg = cachedMsg || a.lastMessageId || ''
   let diag = '(auto-relay) Agent stopped without a Telegram reply and produced no transcript text'
   if (diagMsg) diag += ` (unanswered message_id=${diagMsg})`
   diag += '. Retry-after-block already attempted; check journalctl on the host.'
-  await sendMessage(diagChat, diag)
+  await sendMessage(diagChat, diag, diagThread)
   process.exit(0)
 }
 
 // Write lock with line-count anchor + block the Stop.
 const lineCount = readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean).length
 try {
-  writeFileSync(lockFile, `${chatId}|${a.lastMessageId ?? ''}|${lineCount}`)
+  writeFileSync(lockFile, `${chatId}|${a.lastMessageId ?? ''}|${lineCount}|${threadId ?? ''}`)
 } catch {
   // ignore
 }

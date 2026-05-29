@@ -84,7 +84,8 @@ export function findRateLimitText(entries: TranscriptEntry[]): string | null {
 //   - hadSend: a strict subset of hadTool — reply or edit_message only
 //     (react / download_attachment don't count as a text answer).
 //   - texts: every non-empty assistant text block in turn order.
-//   - lastChatId / lastMessageId: from the most-recent inbound.
+//   - lastChatId / lastMessageId / lastThreadId: from the most-recent inbound
+//     (lastThreadId is the forum-topic id, null outside a non-General topic).
 export type TurnAnalysis = {
   turnStart: number
   hadInbound: boolean
@@ -93,6 +94,7 @@ export type TurnAnalysis = {
   texts: string[]
   lastChatId: string | null
   lastMessageId: string | null
+  lastThreadId: string | null
 }
 
 export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnAnalysis {
@@ -107,8 +109,11 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
   }
   const turn = entries.slice(turnStart)
 
-  const chatRe = /source="plugin:telegram:telegram"\s+chat_id="(\d+)"/
-  const msgRe = /source="plugin:telegram:telegram"[^>]*message_id="(\d+)"/
+  // Match the full opening tag, then pull chat_id / message_id /
+  // message_thread_id from within it. chat_id is -?\d+ so negative group
+  // ids match (a bare \d+ silently dropped the leading '-'); thread id is
+  // optional and read from the SAME tag so it's always paired with its chat.
+  const tagRe = /source="plugin:telegram:telegram"[^>]*/
 
   let hadInbound = false
   let hadTool = false
@@ -116,6 +121,7 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
   const texts: string[] = []
   let lastChatId: string | null = null
   let lastMessageId: string | null = null
+  let lastThreadId: string | null = null
 
   for (const e of turn) {
     if (e.type === 'user') {
@@ -123,12 +129,15 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
         typeof e.message?.content === 'string'
           ? e.message.content
           : JSON.stringify(e.message?.content ?? '')
-      if (content.includes('source="plugin:telegram:telegram"')) {
+      const tag = tagRe.exec(content)?.[0]
+      if (tag) {
         hadInbound = true
-        const cm = chatRe.exec(content)
+        const cm = /chat_id="(-?\d+)"/.exec(tag)
         if (cm) lastChatId = cm[1]
-        const mm = msgRe.exec(content)
+        const mm = /message_id="(\d+)"/.exec(tag)
         if (mm) lastMessageId = mm[1]
+        const tm = /message_thread_id="(-?\d+)"/.exec(tag)
+        lastThreadId = tm ? tm[1] : null
       }
     } else if (e.type === 'assistant') {
       const content = e.message?.content
@@ -151,7 +160,7 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
     }
   }
 
-  return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId }
+  return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId, lastThreadId }
 }
 
 // Scan transcript entries past a given line index for any telegram tool

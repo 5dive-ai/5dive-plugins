@@ -17,7 +17,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { readPayload } from './lib/payload'
 import { readEntries, findRateLimitText } from './lib/transcript'
-import { getAllowedChatIds, getCallerChatId } from './lib/access'
+import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
 import { parseResetEpoch } from './lib/time'
@@ -134,13 +134,13 @@ if (isRateLimit) {
   }
 }
 
-// Caller-only narrowing: prefer the inbound chat over fanning to all
-// paired chats. Falls back to all chats for autonomous turns so we don't
-// silence the alert entirely.
-let chatIds: string[]
-const callerChat = getCallerChatId(entries)
-if (callerChat) chatIds = [callerChat]
-else chatIds = getAllowedChatIds()
+// Caller-only narrowing: prefer the inbound chat (and its forum topic) over
+// fanning to all paired chats. Falls back to all chats for autonomous turns
+// so we don't silence the alert entirely — those carry no topic.
+let targets: CallerChat[]
+const callerChat = getCallerChat(entries)
+if (callerChat) targets = [callerChat]
+else targets = getAllowedChatIds().map(chatId => ({ chatId }))
 
 // For a recoverable rate limit (we have a pane to drive), claim the per-agent
 // resume lock BEFORE notifying. If it's already held, a helper is mid-recovery
@@ -164,7 +164,7 @@ if (isRateLimit && tmuxCtx) {
   }
 }
 
-await Promise.all(chatIds.map(cid => sendMessage(cid, text)))
+await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
 
 // Detach the recovery helper (we already hold the lock). It poll-retries and
 // resumes once the limit lifts — even with NO reset epoch, which is exactly
@@ -182,7 +182,11 @@ if (isRateLimit && tmuxCtx && lockPath) {
         String(resetEpoch ?? 0),
         tmuxCtx.socket,
         tmuxCtx.target,
-        chatIds.join(','),
+        // Encode the topic alongside each chat as "chatId:threadId" (bare
+        // "chatId" when General/DM) so the detached helper can thread its
+        // resume ping back into the same forum topic. chat ids never contain
+        // ':' so a plain split is safe even for negative supergroup ids.
+        targets.map(t => (t.threadId ? `${t.chatId}:${t.threadId}` : t.chatId)).join(','),
         lockPath,
         transcriptPath ?? '',
       ],

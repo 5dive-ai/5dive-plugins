@@ -180,12 +180,20 @@ try {
 
   // Phase 4 — Telegram ping (success, or a heads-up that we gave up).
   if (process.env.TELEGRAM_BOT_TOKEN && chatIdsCsv) {
-    const cids = chatIdsCsv.split(',').filter(Boolean)
+    // Each entry is "chatId" or "chatId:threadId" (forum topic) — see the
+    // encoding in stopfailure-notify.ts. Split on the first ':' so the resume
+    // ping lands back in the same topic the limit notice went to.
+    const targets = chatIdsCsv.split(',').filter(Boolean).map(c => {
+      const idx = c.indexOf(':')
+      return idx === -1
+        ? { chatId: c, threadId: undefined as string | undefined }
+        : { chatId: c.slice(0, idx), threadId: c.slice(idx + 1) || undefined }
+    })
     const msg = resumed
       ? 'Usage limit reset — agent resumed.'
-      : `Still rate-limited after ${Math.round(MAX_WINDOW_SEC / 3600)}h — couldn't auto-resume. ` +
+      : `Still rate-limited after ${Math.round(MAX_RETRY_SEC / 3600)}h — couldn't auto-resume. ` +
         `Send "continue" or /resume when you're ready.`
-    await Promise.all(cids.map(c => sendMessage(c, msg)))
+    await Promise.all(targets.map(t => sendMessage(t.chatId, msg, t.threadId)))
     log(`phase4 telegram ping sent (resumed=${resumed})`)
   }
 } finally {

@@ -10,7 +10,10 @@ export function getToken(): string | undefined {
   return process.env.TELEGRAM_BOT_TOKEN
 }
 
-export async function sendMessage(chatId: string, text: string): Promise<void> {
+// threadId is the forum-topic id (message_thread_id). Pass it for inbound
+// from a supergroup topic so the message lands in that topic instead of the
+// supergroup's General channel; omit for DMs, regular groups, and General.
+export async function sendMessage(chatId: string, text: string, threadId?: string): Promise<void> {
   const token = getToken()
   if (!token || !chatId) return
   const trimmed =
@@ -19,6 +22,7 @@ export async function sendMessage(chatId: string, text: string): Promise<void> {
       : text
   try {
     const params = new URLSearchParams({ chat_id: chatId, text: trimmed })
+    if (threadId) params.set('message_thread_id', threadId)
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
