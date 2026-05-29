@@ -2113,9 +2113,16 @@ bot.on('callback_query:data', async ctx => {
     // follows so the user gets a push (editMessageText is silent) before the
     // restart timer fires.
     await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Failed' }).catch(() => {})
-    await ctx.editMessageText(r.text).catch(() => {})
+    // On success: strip the keyboard so the option can't be tapped twice, but
+    // DON'T rewrite the body — editMessageText(r.text) + reply(r.text) showed
+    // the same ack twice. The single reply below carries the ack and a push
+    // (editMessageText is silent). On failure there's no reply, so surface the
+    // error by editing the picker body instead.
     if (r.after) {
+      await ctx.editMessageReplyMarkup().catch(() => {})
       await ctx.reply(r.text).catch(() => {})
+    } else {
+      await ctx.editMessageText(r.text).catch(() => {})
     }
     r.after?.()
     return
@@ -2125,9 +2132,14 @@ bot.on('callback_query:data', async ctx => {
     const chatId = ctx.chat?.id ?? Number(ctx.callbackQuery.from.id)
     const r = applyEffort(effortM[1]!, chatId)
     await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Failed' }).catch(() => {})
-    await ctx.editMessageText(r.text).catch(() => {})
+    // Same anti-duplicate shape as the model branch: strip the keyboard on
+    // success and let the single reply carry the ack+push; only edit the body
+    // on failure to show the error.
     if (r.after) {
+      await ctx.editMessageReplyMarkup().catch(() => {})
       await ctx.reply(r.text).catch(() => {})
+    } else {
+      await ctx.editMessageText(r.text).catch(() => {})
     }
     r.after?.()
     return
@@ -2145,13 +2157,16 @@ bot.on('callback_query:data', async ctx => {
     const chatId = ctx.chat?.id ?? Number(ctx.callbackQuery.from.id)
     const r = await applyAccount(accountM[1]!, chatId)
     await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Failed' }).catch(() => {})
-    // Edit the picker message to clear the keyboard, then send a fresh reply
-    // so the user actually gets a push notification — editMessageText is silent.
-    // The fresh reply matters here because the CLI schedules a SIGTERM ~1s
-    // out and the user otherwise wouldn't know the switch landed.
-    await ctx.editMessageText(r.text).catch(() => {})
+    // Clear the keyboard so the picker can't be re-tapped, then send a fresh
+    // reply for the push (editMessageText is silent; the CLI schedules a
+    // SIGTERM ~1s out so the user needs to know the switch landed). We strip
+    // only the markup rather than rewriting the body, which previously showed
+    // the same ack twice. On failure, no reply fires, so edit the body instead.
     if (r.after) {
+      await ctx.editMessageReplyMarkup().catch(() => {})
       await ctx.reply(r.text).catch(() => {})
+    } else {
+      await ctx.editMessageText(r.text).catch(() => {})
     }
     r.after?.()
     return
