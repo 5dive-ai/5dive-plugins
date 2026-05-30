@@ -444,6 +444,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'ping',    description: 'liveness check — replies with bot + plugin version' },
   { command: 'stop',    description: 'interrupt the current Antigravity turn (sends Ctrl-C to the pane)' },
   { command: 'restart', description: 'restart the Antigravity agent (systemd respawn brings it back in ~2s)' },
+  { command: 'model',   description: 'show available models (switching via agy TUI for now)' },
   { command: 'agents',  description: 'list sibling 5dive agents on this host' },
   { command: 'tasks',   description: 'list open tasks from the shared 5dive queue' },
   { command: 'task',    description: 'create a task: /task add <title>' },
@@ -628,6 +629,25 @@ async function restartAgent(name: string): Promise<void> {
   })
 }
 
+// ─── /model — list only ──────────────────────────────────────────────────────
+// Antigravity selects its model via the in-CLI picker and exposes no config
+// file key to write (unlike codex/grok's config.toml `model`), so switching
+// from chat isn't wired yet — /model lists the known models and points at the
+// TUI picker. Kept signature-compatible with the codex/grok build so the
+// case handler is identical across plugins.
+const AGY_KNOWN_MODELS = [
+  'gemini-3-pro-preview', 'gemini-3-flash-preview',
+  'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite',
+]
+
+async function handleModelCommand(arg: string): Promise<{ text: string; switchTo?: string }> {
+  const list = AGY_KNOWN_MODELS.map(m => `  • \`${m}\``).join('\n')
+  const lead = arg.trim()
+    ? `ℹ️ Switching agy's model from chat isn't wired yet — Antigravity selects its model via the in-CLI picker and exposes no config key to write. Use agy's own \`/model\` in the TUI for now.`
+    : `*model* — Antigravity (agy)\n\nAntigravity selects its model via the in-CLI picker; switching from chat isn't wired yet.`
+  return { text: `${lead}\n\nKnown models:\n${list}` }
+}
+
 // Returns true if this message was handled as a slash command (caller
 // should NOT enqueue it for Antigravity).
 async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> {
@@ -687,6 +707,12 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         }).catch(() => {})
         await restartAgent(name)
+        return true
+      }
+      case 'model': {
+        const r = await handleModelCommand(cmdArg)
+        await md(r.text)
+        if (r.switchTo) await restartAgent(agentName())
         return true
       }
       case 'agents': {

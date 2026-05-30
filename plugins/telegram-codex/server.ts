@@ -446,6 +446,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'ping',    description: 'liveness check — replies with bot + plugin version' },
   { command: 'stop',    description: 'interrupt the current Codex turn (sends Ctrl-C to the pane)' },
   { command: 'restart', description: 'restart the Codex agent (systemd respawn brings it back in ~2s)' },
+  { command: 'model',   description: 'show or switch the model: /model [id]' },
   { command: 'agents',  description: 'list sibling 5dive agents on this host' },
   { command: 'tasks',   description: 'list open tasks from the shared 5dive queue' },
   { command: 'task',    description: 'create a task: /task add <title>' },
@@ -631,6 +632,60 @@ async function restartAgent(name: string): Promise<void> {
   })
 }
 
+// ─── /model — show or switch the CLI model ───────────────────────────────────
+// The model is the top-level `model = "..."` key in <CLI_HOME>/config.toml
+// (STATE_DIR is <CLI_HOME>/channels/telegram, so config.toml is two levels up).
+// Switching writes the key and restarts the agent — the CLI reads its model at
+// startup and there's no reliable hot-swap from outside the running session.
+const CLI_LABEL = 'Codex'
+const CLI_CONFIG_FILE = join(STATE_DIR, '..', '..', 'config.toml')
+
+function readConfigModel(): string | null {
+  try {
+    const raw = readFileSync(CLI_CONFIG_FILE, 'utf8')
+    const firstSection = raw.search(/^\s*\[/m)
+    const head = firstSection === -1 ? raw : raw.slice(0, firstSection)
+    const m = head.match(/^[ \t]*model[ \t]*=[ \t]*["']?([^"'\n#]+?)["']?[ \t]*(?:#.*)?$/m)
+    return m ? m[1].trim() : null
+  } catch { return null }
+}
+
+function writeConfigModel(model: string): void {
+  let raw = ''
+  try { raw = readFileSync(CLI_CONFIG_FILE, 'utf8') } catch {}
+  const firstSection = raw.search(/^\s*\[/m)
+  const head = firstSection === -1 ? raw : raw.slice(0, firstSection)
+  const tail = firstSection === -1 ? '' : raw.slice(firstSection)
+  // Drop any existing top-level model= line, then prepend the new one so it
+  // stays above the first [section] table (a bare key after a table header
+  // would belong to that table, not the document root).
+  const headClean = head.replace(/^[ \t]*model[ \t]*=.*\r?\n?/m, '').replace(/^\s*\n/, '')
+  const next = `model = ${JSON.stringify(model)}\n` + headClean + tail
+  const tmp = CLI_CONFIG_FILE + '.tmp'
+  writeFileSync(tmp, next)
+  renameSync(tmp, CLI_CONFIG_FILE)
+}
+
+async function handleModelCommand(arg: string): Promise<{ text: string; switchTo?: string }> {
+  const current = readConfigModel()
+  const name = arg.trim()
+  if (!name) {
+    return { text:
+      `*model* — ${CLI_LABEL}\n\n` +
+      `current: \`${current ?? '(CLI default)'}\`\n\n` +
+      `Switch with \`/model <id>\` — any valid ${CLI_LABEL} model id. ` +
+      `The agent restarts (~2s) to apply.`,
+    }
+  }
+  if (!/^[A-Za-z0-9._:\/-]+$/.test(name)) {
+    return { text: `⚠️ \`${name}\` doesn't look like a model id (allowed: letters, digits, . _ : / -).` }
+  }
+  if (name === current) return { text: `already on \`${name}\` — nothing to do.` }
+  try { writeConfigModel(name) }
+  catch (e) { return { text: `⚠️ couldn't update config.toml: ${e instanceof Error ? e.message : String(e)}` } }
+  return { text: `🔁 model → \`${name}\`\nrestarting ${CLI_LABEL} agent (~2s)…`, switchTo: name }
+}
+
 // Returns true if this message was handled as a slash command (caller
 // should NOT enqueue it for Codex).
 async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> {
@@ -690,6 +745,12 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         }).catch(() => {})
         await restartAgent(name)
+        return true
+      }
+      case 'model': {
+        const r = await handleModelCommand(cmdArg)
+        await md(r.text)
+        if (r.switchTo) await restartAgent(agentName())
         return true
       }
       case 'agents': {
