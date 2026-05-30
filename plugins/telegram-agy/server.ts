@@ -497,11 +497,15 @@ function execText(cmd: string, args: string[]): Promise<string | null> {
 // resolves cliVersion by probing the agent's actual TYPE_BIN — more accurate
 // than a PATH lookup (agy's binary isn't on the agent PATH; codex runs 0.134
 // via TYPE_BIN even when a newer one sits on the login PATH).
-async function read5diveInfo(): Promise<{ cliVersion?: string; authProfile?: string } | null> {
+async function read5diveInfo(): Promise<{ cliVersion?: string; authProfile?: string; model?: string } | null> {
   try {
-    const j = await run5dive(['agent', 'info', agentName()])
+    const j = await run5dive(['agent', 'info', agentName(), '--json'])
     if (!j.ok || !j.data) return null
-    return { cliVersion: j.data.cliVersion ?? undefined, authProfile: j.data.authProfile ?? undefined }
+    return {
+      cliVersion: j.data.cliVersion ?? undefined,
+      authProfile: j.data.authProfile ?? undefined,
+      model: j.data.model ?? undefined,
+    }
   } catch { return null }
 }
 
@@ -726,50 +730,33 @@ async function restartAgent(name: string): Promise<void> {
   })
 }
 
-// ─── /model — switch Antigravity's model ─────────────────────────────────────
-// Antigravity has no config.toml; the model lives in its settings.json
-// (`~/.gemini/antigravity-cli/settings.json`, key "model"). We merge-write that
-// key and restart — agy reads it on boot. Valid model ids are server-driven
-// (the CLI validates against the backend, and deprecated ids are dropped), so
-// we don't hard-validate: an unknown/deprecated id just makes agy fall back to
-// its default and say so in its own UI. STATE_DIR is ~/.gemini/channels/telegram,
-// so settings.json sits at ../../antigravity-cli/settings.json.
-const AGY_SETTINGS_FILE = join(STATE_DIR, '..', '..', 'antigravity-cli', 'settings.json')
-const AGY_MODEL_HINTS = ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-pro', 'gemini-2.5-flash']
-
-function readAgySettings(): Record<string, unknown> {
-  try {
-    const v = JSON.parse(readFileSync(AGY_SETTINGS_FILE, 'utf8'))
-    return v && typeof v === 'object' ? v as Record<string, unknown> : {}
-  } catch { return {} }
-}
-
+// Switch by shelling out to the CLI (5dive v0.1.26+): it does the settings.json
+// .model merge-write + the deferred ~1s restart, so we don't touch the file or
+// restart ourselves. Current model comes from `agent info` (live-reads config).
+// Antigravity's valid ids are server-driven; a deprecated/unknown id falls back
+// to the default with a notice in agy's own UI.
 async function handleModelCommand(arg: string): Promise<{ text: string; switchTo?: string }> {
-  const cur = readAgySettings().model as string | undefined
   const name = arg.trim()
   if (!name) {
+    let cur: string | undefined
+    try { const j = await run5dive(['agent', 'info', agentName(), '--json']); cur = j?.data?.model ?? undefined } catch {}
     return { text:
-      `*model* — Antigravity (agy)\n\n` +
-      `current (configured): \`${cur ?? '(default — picker-managed)'}\`\n\n` +
-      `Switch with \`/model <id>\` — writes Antigravity's settings.json and restarts (~2s). ` +
-      `Valid ids are server-driven; a deprecated/unknown id falls back to the default with a notice in agy. ` +
-      `Recent families: ${AGY_MODEL_HINTS.map(m => `\`${m}\``).join(', ')}.`,
+      `*model* — ${CLI_LABEL}\n\n` +
+      `current: \`${cur ?? '(default — picker-managed)'}\`\n\n` +
+      `Switch with \`/model <id>\` — sets Antigravity's model and restarts (~2s). ` +
+      `Valid ids are server-driven; a deprecated/unknown id falls back to the default with a notice in agy.`,
     }
   }
   if (!/^[A-Za-z0-9._:\/-]+$/.test(name)) {
     return { text: `⚠️ \`${name}\` doesn't look like a model id (allowed: letters, digits, . _ : / -).` }
   }
-  if (name === cur) return { text: `already configured for \`${name}\` — nothing to do.` }
   try {
-    const s = readAgySettings()
-    s.model = name
-    const tmp = AGY_SETTINGS_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify(s, null, 2) + '\n')
-    renameSync(tmp, AGY_SETTINGS_FILE)
+    const j = await run5dive(['agent', 'config', agentName(), 'set', `model=${name}`, '--json'])
+    if (!j.ok) return { text: `⚠️ ${j.error?.message ?? 'failed to set model'}` }
   } catch (e) {
-    return { text: `⚠️ couldn't update settings.json: ${e instanceof Error ? e.message : String(e)}` }
+    return { text: `⚠️ couldn't set model: ${e instanceof Error ? e.message : String(e)}` }
   }
-  return { text: `🔁 model → \`${name}\`\nrestarting Antigravity (~2s)… (if that id isn't available, agy falls back to its default and says so)`, switchTo: name }
+  return { text: `🔁 model → \`${name}\`\nrestarting ${CLI_LABEL} (~2s) to apply… (if that id isn't available, agy falls back to its default and says so)` }
 }
 
 // Returns true if this message was handled as a slash command (caller

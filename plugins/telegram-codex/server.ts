@@ -498,11 +498,15 @@ function execText(cmd: string, args: string[]): Promise<string | null> {
 // resolves cliVersion by probing the agent's actual TYPE_BIN — more accurate
 // than a PATH lookup (agy's binary isn't on the agent PATH; codex runs 0.134
 // via TYPE_BIN even when a newer one sits on the login PATH).
-async function read5diveInfo(): Promise<{ cliVersion?: string; authProfile?: string } | null> {
+async function read5diveInfo(): Promise<{ cliVersion?: string; authProfile?: string; model?: string } | null> {
   try {
-    const j = await run5dive(['agent', 'info', agentName()])
+    const j = await run5dive(['agent', 'info', agentName(), '--json'])
     if (!j.ok || !j.data) return null
-    return { cliVersion: j.data.cliVersion ?? undefined, authProfile: j.data.authProfile ?? undefined }
+    return {
+      cliVersion: j.data.cliVersion ?? undefined,
+      authProfile: j.data.authProfile ?? undefined,
+      model: j.data.model ?? undefined,
+    }
   } catch { return null }
 }
 
@@ -759,40 +763,31 @@ function readConfigModel(): string | null {
   } catch { return null }
 }
 
-function writeConfigModel(model: string): void {
-  let raw = ''
-  try { raw = readFileSync(CLI_CONFIG_FILE, 'utf8') } catch {}
-  const firstSection = raw.search(/^\s*\[/m)
-  const head = firstSection === -1 ? raw : raw.slice(0, firstSection)
-  const tail = firstSection === -1 ? '' : raw.slice(firstSection)
-  // Drop any existing top-level model= line, then prepend the new one so it
-  // stays above the first [section] table (a bare key after a table header
-  // would belong to that table, not the document root).
-  const headClean = head.replace(/^[ \t]*model[ \t]*=.*\r?\n?/m, '').replace(/^\s*\n/, '')
-  const next = `model = ${JSON.stringify(model)}\n` + headClean + tail
-  const tmp = CLI_CONFIG_FILE + '.tmp'
-  writeFileSync(tmp, next)
-  renameSync(tmp, CLI_CONFIG_FILE)
-}
-
+// Switch by shelling out to the CLI (5dive v0.1.26+): it does the preamble-safe
+// config.toml write + the deferred ~1s restart, so we don't touch the file or
+// restart ourselves. Current model comes from `agent info` (live-reads config).
 async function handleModelCommand(arg: string): Promise<{ text: string; switchTo?: string }> {
-  const current = readConfigModel()
   const name = arg.trim()
   if (!name) {
+    let cur: string | undefined
+    try { const j = await run5dive(['agent', 'info', agentName(), '--json']); cur = j?.data?.model ?? undefined } catch {}
+    if (!cur) cur = readConfigModel() ?? undefined
     return { text:
       `*model* — ${CLI_LABEL}\n\n` +
-      `current: \`${current ?? '(CLI default)'}\`\n\n` +
-      `Switch with \`/model <id>\` — any valid ${CLI_LABEL} model id. ` +
-      `The agent restarts (~2s) to apply.`,
+      `current: \`${cur ?? '(CLI default)'}\`\n\n` +
+      `Switch with \`/model <id>\` — any valid ${CLI_LABEL} model id. The agent restarts (~2s) to apply.`,
     }
   }
   if (!/^[A-Za-z0-9._:\/-]+$/.test(name)) {
     return { text: `⚠️ \`${name}\` doesn't look like a model id (allowed: letters, digits, . _ : / -).` }
   }
-  if (name === current) return { text: `already on \`${name}\` — nothing to do.` }
-  try { writeConfigModel(name) }
-  catch (e) { return { text: `⚠️ couldn't update config.toml: ${e instanceof Error ? e.message : String(e)}` } }
-  return { text: `🔁 model → \`${name}\`\nrestarting ${CLI_LABEL} agent (~2s)…`, switchTo: name }
+  try {
+    const j = await run5dive(['agent', 'config', agentName(), 'set', `model=${name}`, '--json'])
+    if (!j.ok) return { text: `⚠️ ${j.error?.message ?? 'failed to set model'}` }
+  } catch (e) {
+    return { text: `⚠️ couldn't set model: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  return { text: `🔁 model → \`${name}\`\nrestarting ${CLI_LABEL} (~2s) to apply…` }
 }
 
 // Returns true if this message was handled as a slash command (caller
