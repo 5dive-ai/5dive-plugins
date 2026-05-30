@@ -507,21 +507,78 @@ async function read5diveSelf(): Promise<{ authProfile?: string; workdir?: string
 // CLI runtime allows. Antigravity has no session-status / usage cache and no
 // model config key (the model is chosen in its in-CLI picker), so `status` is
 // derived from the bridge and `model` is shown as picker-managed.
+// Normalise a `--version` blob to a leading "v<semver>" ("5dive 0.1.23"
+// → "v0.1.23", "1.0.3" → "v1.0.3"); fall back to the raw string.
+function fmtVer(raw: string): string {
+  const m = raw.match(/\d+\.\d+(?:\.\d+)?[\w.+-]*/)
+  return m ? `v${m[0]}` : raw
+}
+
+// Listening vs working, from the inbound/reply stamps (same signal the Stop
+// hook uses): "working" only when the latest inbound hasn't been replied to
+// yet. Avoids the racy wait_for_message-waiter check.
+function bridgeStatus(): string {
+  let li = 0, lr = 0
+  try { li = Number(readFileSync(LAST_INBOUND_FILE, 'utf8')) || 0 } catch {}
+  try { lr = Number(readFileSync(LAST_REPLY_FILE, 'utf8')) || 0 } catch {}
+  return li > lr ? '🟡 working' : '🟢 listening'
+}
+
+// Real agent session uptime via the `agent-<name>` tmux session creation time;
+// falls back to the bridge process start if tmux can't be read.
+function agentUptimeMs(): number {
+  const name = agentName()
+  if (name !== 'unknown') {
+    try {
+      const out = require('child_process').execFileSync('tmux',
+        ['display-message', '-t', `agent-${name}`, '-p', '#{session_created}'],
+        { timeout: 3000 }).toString().trim()
+      const created = Number(out) * 1000
+      if (created > 0) return Date.now() - created
+    } catch {}
+  }
+  return Date.now() - SERVER_STARTED_AT
+}
+
+// Live cwd of the agent's tmux pane — used when the 5dive registry carries no
+// explicit workdir override.
+function agentWorkdir(): string | undefined {
+  const name = agentName()
+  if (name === 'unknown') return undefined
+  try {
+    const out = require('child_process').execFileSync('tmux',
+      ['display-message', '-t', `agent-${name}`, '-p', '#{pane_current_path}'],
+      { timeout: 3000 }).toString().trim()
+    return out || undefined
+  } catch { return undefined }
+}
+
+// Most recent bridge activity (inbound or reply), epoch ms, or null.
+function lastActivityMs(): number | null {
+  let li = 0, lr = 0
+  try { li = Number(readFileSync(LAST_INBOUND_FILE, 'utf8')) || 0 } catch {}
+  try { lr = Number(readFileSync(LAST_REPLY_FILE, 'utf8')) || 0 } catch {}
+  const m = Math.max(li, lr)
+  return m > 0 ? m : null
+}
+
 async function statusText(senderName: string): Promise<string> {
   const now = Date.now()
   const lines = [`Paired as ${senderName}.`, '']
-  lines.push(`status: ${waiters.length > 0 ? '🟢 listening' : '🟡 working'}`)
+  lines.push(`status: ${bridgeStatus()}`)
   lines.push(`model: (selected in the agy picker)`)
-  lines.push(`uptime: ${formatDuration(now - SERVER_STARTED_AT)}`)
-  lines.push(`last activity: ${lastInboundTs ? `${formatDuration(now - Date.parse(lastInboundTs))} ago` : '(none this session)'}`)
-  const cliVer = await execText(CLI_BIN, ['--version'])
-  if (cliVer) lines.push(`${CLI_LABEL.toLowerCase()}: ${cliVer}`)
+  lines.push(`uptime: ${formatDuration(agentUptimeMs())}`)
+  const lastAct = lastActivityMs()
+  lines.push(`last activity: ${lastAct ? `${formatDuration(now - lastAct)} ago` : '(none this session)'}`)
+  const cliVer = await execText('bash', ['-lc', `${CLI_BIN} --version`])
+  if (cliVer) lines.push(`${CLI_LABEL.toLowerCase()}: ${fmtVer(cliVer)}`)
   lines.push(`plugin: v${PLUGIN_VERSION}`)
   const fiveVer = await execText('sudo', ['-n', '5dive', '--version'])
-  if (fiveVer) lines.push(`5dive: ${fiveVer}`)
+  if (fiveVer) lines.push(`5dive: ${fmtVer(fiveVer)}`)
   const self = await read5diveSelf()
-  if (self?.authProfile) lines.push(`account: ${self.authProfile}`)
-  if (self?.workdir) lines.push(`workdir: ${self.workdir}`)
+  if (self) lines.push(`account: ${self.authProfile || 'default'}`)
+  const wd = self?.workdir || agentWorkdir()
+  if (wd) lines.push(`workdir: ${wd}`)
   return lines.join('\n')
 }
 
