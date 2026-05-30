@@ -447,7 +447,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'tasks',   description: 'List open tasks' },
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
-  { command: 'model',   description: 'Show models' },
+  { command: 'model',   description: 'Pick model' },
   { command: 'ping',    description: 'Liveness check' },
   { command: 'start',   description: 'Pair this chat' },
 ]
@@ -722,23 +722,50 @@ async function restartAgent(name: string): Promise<void> {
   })
 }
 
-// ─── /model — list only ──────────────────────────────────────────────────────
-// Antigravity selects its model via the in-CLI picker and exposes no config
-// file key to write (unlike codex/grok's config.toml `model`), so switching
-// from chat isn't wired yet — /model lists the known models and points at the
-// TUI picker. Kept signature-compatible with the codex/grok build so the
-// case handler is identical across plugins.
-const AGY_KNOWN_MODELS = [
-  'gemini-3-pro-preview', 'gemini-3-flash-preview',
-  'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite',
-]
+// ─── /model — switch Antigravity's model ─────────────────────────────────────
+// Antigravity has no config.toml; the model lives in its settings.json
+// (`~/.gemini/antigravity-cli/settings.json`, key "model"). We merge-write that
+// key and restart — agy reads it on boot. Valid model ids are server-driven
+// (the CLI validates against the backend, and deprecated ids are dropped), so
+// we don't hard-validate: an unknown/deprecated id just makes agy fall back to
+// its default and say so in its own UI. STATE_DIR is ~/.gemini/channels/telegram,
+// so settings.json sits at ../../antigravity-cli/settings.json.
+const AGY_SETTINGS_FILE = join(STATE_DIR, '..', '..', 'antigravity-cli', 'settings.json')
+const AGY_MODEL_HINTS = ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-pro', 'gemini-2.5-flash']
+
+function readAgySettings(): Record<string, unknown> {
+  try {
+    const v = JSON.parse(readFileSync(AGY_SETTINGS_FILE, 'utf8'))
+    return v && typeof v === 'object' ? v as Record<string, unknown> : {}
+  } catch { return {} }
+}
 
 async function handleModelCommand(arg: string): Promise<{ text: string; switchTo?: string }> {
-  const list = AGY_KNOWN_MODELS.map(m => `  • \`${m}\``).join('\n')
-  const lead = arg.trim()
-    ? `ℹ️ Switching agy's model from chat isn't wired yet — Antigravity selects its model via the in-CLI picker and exposes no config key to write. Use agy's own \`/model\` in the TUI for now.`
-    : `*model* — Antigravity (agy)\n\nAntigravity selects its model via the in-CLI picker; switching from chat isn't wired yet.`
-  return { text: `${lead}\n\nKnown models:\n${list}` }
+  const cur = readAgySettings().model as string | undefined
+  const name = arg.trim()
+  if (!name) {
+    return { text:
+      `*model* — Antigravity (agy)\n\n` +
+      `current (configured): \`${cur ?? '(default — picker-managed)'}\`\n\n` +
+      `Switch with \`/model <id>\` — writes Antigravity's settings.json and restarts (~2s). ` +
+      `Valid ids are server-driven; a deprecated/unknown id falls back to the default with a notice in agy. ` +
+      `Recent families: ${AGY_MODEL_HINTS.map(m => `\`${m}\``).join(', ')}.`,
+    }
+  }
+  if (!/^[A-Za-z0-9._:\/-]+$/.test(name)) {
+    return { text: `⚠️ \`${name}\` doesn't look like a model id (allowed: letters, digits, . _ : / -).` }
+  }
+  if (name === cur) return { text: `already configured for \`${name}\` — nothing to do.` }
+  try {
+    const s = readAgySettings()
+    s.model = name
+    const tmp = AGY_SETTINGS_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(s, null, 2) + '\n')
+    renameSync(tmp, AGY_SETTINGS_FILE)
+  } catch (e) {
+    return { text: `⚠️ couldn't update settings.json: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  return { text: `🔁 model → \`${name}\`\nrestarting Antigravity (~2s)… (if that id isn't available, agy falls back to its default and says so)`, switchTo: name }
 }
 
 // Returns true if this message was handled as a slash command (caller
