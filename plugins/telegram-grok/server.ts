@@ -441,14 +441,14 @@ let lastInboundTs: string | null = null
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'help',    description: 'Show commands' },
   { command: 'status',  description: 'Pairing, usage, model' },
-  { command: 'ping',    description: 'Liveness check' },
   { command: 'stop',    description: 'Interrupt task' },
   { command: 'restart', description: 'Respawn grok' },
-  { command: 'model',   description: 'Pick model' },
   { command: 'agents',  description: 'Team' },
   { command: 'tasks',   description: 'List open tasks' },
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
+  { command: 'model',   description: 'Pick model' },
+  { command: 'ping',    description: 'Liveness check' },
   { command: 'start',   description: 'Pair this chat' },
 ]
 
