@@ -117,6 +117,19 @@ pointing at the installed plugin dir:
 > runs with `--dangerously-skip-permissions`, so there's no separate trust
 > step.
 
+To get the lifecycle hooks too, write `~/.gemini/config/hooks.json`
+(same dir) with absolute `command` paths into the installed plugin:
+
+```json
+{
+  "hooks": {
+    "PreToolUse":    [{ "hooks": [{ "type": "command", "command": "bun /home/you/.gemini/config/plugins/telegram-agy/hooks/silence-watchdog.ts", "timeout": 5 }] }],
+    "Stop":          [{ "hooks": [{ "type": "command", "command": "bun /home/you/.gemini/config/plugins/telegram-agy/hooks/notify-stop.ts", "timeout": 10 }] }],
+    "Notification":  [{ "hooks": [{ "type": "command", "command": "bun /home/you/.gemini/config/plugins/telegram-agy/hooks/notification-relay.ts", "timeout": 10 }] }]
+  }
+}
+```
+
 **5. Add the comms playbook**
 
 The bundled `notify-user` skill is auto-discovered once the plugin is
@@ -147,27 +160,32 @@ Confirmed live on agy 1.0.3:
 - **Runtime plugin discovery only auto-wires skills + agents — not MCP
   servers or hooks.** `agy plugin validate/install` *processes* the MCP
   and hook manifests, but the running CLI does not load them from the
-  plugin dir. So the MCP server must be declared in the **global**
-  `~/.gemini/config/mcp_config.json` with an absolute `--cwd` (see step 4).
+  plugin dir. So **both** the MCP server and the hooks must be declared in
+  the **global** `~/.gemini/config/` files (see step 4) with absolute
+  paths:
+  - MCP → `~/.gemini/config/mcp_config.json` (absolute `--cwd`).
+  - Hooks → `~/.gemini/config/hooks.json` (flat file, same dir; absolute
+    `command` paths, e.g. `bun /abs/.../hooks/notify-stop.ts`).
+  Both verified live on agy 1.0.3 — the PreToolUse `silence-watchdog` hook
+  fires once wired into the global `hooks.json`.
 - **The global `~/.gemini/config/mcp_config.json` ships empty (0 bytes)** →
   agy logs `unexpected end of JSON input` until it holds valid JSON.
 - **No `config.toml`.** agy configures MCP via
-  `~/.gemini/config/mcp_config.json` and settings via
-  `~/.gemini/antigravity-cli/settings.json`.
+  `~/.gemini/config/mcp_config.json`, hooks via `~/.gemini/config/hooks.json`,
+  and settings via `~/.gemini/antigravity-cli/settings.json`.
 - **Runs `--dangerously-skip-permissions`** — no trust prompt to bridge.
-- **Hook runtime firing is not yet confirmed** under agy. validate accepts
-  every event and the manifest installs, but probe hooks did not fire in
-  headless `agy -p`. Keepalive does not depend on a Stop hook — the MCP
-  server's own re-arm watchdog (tmux send-keys to session `agent-<name>`)
-  re-kicks the `wait_for_message` loop after idle.
+- Keepalive does not depend on a Stop hook regardless — the MCP server's
+  own re-arm watchdog (tmux send-keys to session `agent-<name>`) re-kicks
+  the `wait_for_message` loop after idle.
 
 ## Lifecycle hooks
 
 Declared in the plugin's `hooks/hooks.json` (events: PreToolUse, Stop,
-Notification). ⚠️ Runtime firing under agy is unconfirmed (see quirks
-above) — these are shipped validate-clean but should not be relied on
-until verified in a live TUI session. All hooks are non-blocking and read
-the same state dir as the server:
+Notification) for the declarative form, **and wired into the global
+`~/.gemini/config/hooks.json`** for agy to actually load them (see quirks
+above — agy does not auto-load a plugin's hooks). Verified firing on agy
+1.0.3. All hooks are non-blocking and read the same state dir as the
+server:
 
 | Hook | Event | What it does | Knobs |
 | ---- | ----- | ------------ | ----- |

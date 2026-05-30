@@ -16,18 +16,26 @@ protocol) — inbound arrives via the blocking `wait_for_message` tool.
   a Google login screen until that file is copied into
   `~agent-<name>/.gemini/antigravity-cli/` (chown, mode 600). Same gap
   grok's `auth.json` had.
+  (c) **write the global config files** the runtime actually reads:
+  `~/.gemini/config/mcp_config.json` (telegram server, absolute `--cwd`)
+  and `~/.gemini/config/hooks.json` (the 3 hooks, absolute `bun …` paths).
+  agy does not auto-load these from the installed plugin dir.
 
 ## Still open
 
-- **Hook firing under agy is unconfirmed.** `agy plugin validate` accepts
-  all events (PreToolUse/PostToolUse/Stop/Notification/…) and the plugin
-  installs them, but probe hooks did not fire under headless `agy -p`
-  (no exec, no log). Likely TUI-only or wired differently — needs a live
-  TUI verification. Until confirmed, keepalive does NOT rely on a Stop
-  hook: the MCP server's own re-arm watchdog (tmux send-keys to session
-  `agent-<name>` after idle) re-kicks the `wait_for_message` loop. The
-  silence-watchdog is opt-in (`AGY_SILENCE_WATCHDOG_ENABLED=1`) anyway.
 - ExecStopPost in 5dive's systemd unit for true crash-aware notification.
+
+## Resolved (2026-05-30)
+
+- **Hook firing — CONFIRMED.** agy does not auto-load a plugin's hooks
+  (only skills/agents), but hooks wired into the **global**
+  `~/.gemini/config/hooks.json` (flat file, same dir as `mcp_config.json`)
+  with absolute `command` paths DO fire — verified the PreToolUse
+  `silence-watchdog` running on agy's first tool call. So full lifecycle
+  parity is achievable; provisioning must write that global file (same
+  pattern as the MCP global wiring). Keepalive doesn't depend on it anyway
+  (server re-arm watchdog). silence-watchdog stays opt-in
+  (`AGY_SILENCE_WATCHDOG_ENABLED=1`).
 
 ## agy plugin-runtime quirks (verified 2026-05-30, agy 1.0.3)
 
@@ -38,9 +46,11 @@ protocol) — inbound arrives via the blocking `wait_for_message` tool.
   install with `agy plugin install <path>` → copies to
   `~/.gemini/config/plugins/<name>/`.
 - **Runtime plugin discovery only auto-wires skills + agents — NOT mcp
-  servers or hooks.** So the MCP server must be declared in the **global**
-  `~/.gemini/config/mcp_config.json` with an **absolute** `--cwd` pointing
-  at the installed plugin dir. (Same absolute-path lesson as grok.)
+  servers or hooks.** So the MCP server goes in the **global**
+  `~/.gemini/config/mcp_config.json` (absolute `--cwd`) and the hooks in
+  the **global** `~/.gemini/config/hooks.json` (absolute `bun …` commands),
+  both pointing at the installed plugin dir. (Same absolute-path lesson as
+  grok.) Both verified firing on agy 1.0.3.
 - The global `~/.gemini/config/mcp_config.json` ships **empty (0 bytes)**;
   agy logs `unexpected end of JSON input` and MCP discovery breaks until
   it holds a valid `{"mcpServers":{…}}`.
