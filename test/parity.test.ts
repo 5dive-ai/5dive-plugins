@@ -182,6 +182,26 @@ describe('fork vs Claude baseline delta', () => {
   })
 })
 
+// ---- /restart redelivery-loop regression (DIVE-13) ----
+//
+// A /restart sitting unacked at the head of getUpdates would be redelivered after the
+// agent respawned → infinite self-restart loop. The fix: restartAgent acks the
+// triggering update (getUpdates offset = id+1) BEFORE respawning, and the callers must
+// actually pass the update id (codex once had the ack logic but dead callers).
+
+describe.each(FORKS)('%s: /restart acks before respawn (DIVE-13)', plugin => {
+  const src = read(plugin)
+
+  test('restartAgent takes an ack update id and advances the offset before restarting', () => {
+    expect(src).toMatch(/function restartAgent\([^)]*ackUpdateId\??:\s*number/)
+    expect(src).toMatch(/getUpdates\(\{\s*offset:\s*ackUpdateId\s*\+\s*1/)
+  })
+
+  test('the /restart caller actually passes the update id (not dead code)', () => {
+    expect(src).toMatch(/restartAgent\([^)]*\bupdateId\b/)
+  })
+})
+
 // ---- turn-based liveness (DIVE-15 / DIVE-14) ----
 
 describe('turn-based re-arm liveness', () => {
