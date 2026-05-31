@@ -321,6 +321,21 @@ type Waiter = { resolve: (m: InboundMsg) => void; timer: ReturnType<typeof setTi
 const waiters: Waiter[] = []
 
 function enqueueInbound(msg: InboundMsg) {
+  // While the agent is in a detected stall (quota/auth/wedge) it can't run a
+  // model turn to answer, so a queued message would just sit there silently —
+  // the user can't tell if it's still stuck. Instead, reply to EACH inbound
+  // with the current cause (re-detected, short-cached) so they can always probe
+  // the live state, and don't queue it (avoids a flood of stale messages
+  // dumping on the agent when it finally recovers). Normal delivery resumes the
+  // moment the loop recovers — clearStallAlert() flips stallAlerted back off.
+  if (!STALL_ALERT_DISABLED && stallAlerted) {
+    const { cause, detail } = detectStallCauseCached()
+    const text = `⚠️ ${agentName()} can’t respond right now — ${cause}.\n${detail}.`
+    bot.api.sendMessage(msg.chat_id, text,
+      msg.message_thread_id ? { message_thread_id: Number(msg.message_thread_id) } : undefined)
+      .catch((err: any) => process.stderr.write(`telegram-grok: stall auto-reply failed: ${err?.message}\n`))
+    return
+  }
   const next = waiters.shift()
   if (next) {
     if (next.timer) clearTimeout(next.timer)
@@ -1351,6 +1366,18 @@ function detectStallCause(): { cause: string; detail: string } {
   } catch {
     return { cause: 'not responding', detail: 'could not read the agent pane' }
   }
+}
+
+// detectStallCause does a synchronous pane capture; cache it briefly so a burst
+// of inbound messages (each auto-replied while stalled) doesn't fire one tmux
+// capture per message. 5s TTL keeps the reported cause effectively live.
+let _causeCache: { at: number; val: { cause: string; detail: string } } | null = null
+function detectStallCauseCached(): { cause: string; detail: string } {
+  const now = Date.now()
+  if (_causeCache && now - _causeCache.at < 5_000) return _causeCache.val
+  const val = detectStallCause()
+  _causeCache = { at: now, val }
+  return val
 }
 
 // Send one stall alert to every owner (allowFrom) DM. Plain text — no markdown,
