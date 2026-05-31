@@ -26,7 +26,7 @@ import { Bot, GrammyError, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, statSync,
-  realpathSync, renameSync,
+  realpathSync, renameSync, existsSync, unlinkSync,
 } from 'fs'
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
@@ -1276,6 +1276,85 @@ let lastServerActivity = Date.now()
 let rearmKicks = 0
 function markActivity(): void { lastServerActivity = Date.now() }
 
+// ── Silent-failure self-report ──────────────────────────────────────────────
+// The re-arm watchdog above keeps a *healthy* agent in the listen loop. Some
+// stalls can't be re-armed, though: an exhausted model quota (Antigravity has a
+// hard per-account quota), an expired login, or a wedged TUI. The agent then
+// takes no model turn at all — so neither the listen loop nor the silence hook
+// (which only fires on a tool call) can tell the user anything; the bot just
+// goes quiet. This server is still alive draining getUpdates, so it's the one
+// component that can still reach Telegram. When re-arm kicks repeatedly fail to
+// revive the loop, we scan the pane for a known cause and send the owner ONE
+// alert.
+//
+// Knobs: TELEGRAM_STALL_ALERT_DISABLED=1 turns it off; TELEGRAM_STALL_ESCALATE_AFTER
+// sets how many failed re-arm kicks count as "genuinely wedged" (default 3).
+const STALL_ALERT_DISABLED = process.env.TELEGRAM_STALL_ALERT_DISABLED === '1'
+const STALL_ESCALATE_AFTER = Math.max(1, Math.min(20,
+  Number(process.env.TELEGRAM_STALL_ESCALATE_AFTER ?? 3)))
+const LAST_STALL_ALERT_FILE = join(STATE_DIR, 'last-stall-alert.stamp')
+// One alert per stall episode. Set when we alert, cleared when the loop
+// recovers (a waiter re-parks). Persisted to a stamp so a server bounce
+// mid-stall doesn't re-ping.
+let stallAlerted = existsSync(LAST_STALL_ALERT_FILE)
+
+function capitalize(s: string): string { return s.charAt(0).toUpperCase() + s.slice(1) }
+
+// Capture the agent's tmux pane and classify a stall cause from known failure
+// banners, so the alert can name the actual problem. Best-effort: any failure
+// to read/classify falls back to a generic "wedged" message.
+function detectStallCause(): { cause: string; detail: string } {
+  const name = agentName()
+  try {
+    const cp = require('child_process')
+    const pane: string = cp.execFileSync('tmux',
+      ['capture-pane', '-t', `agent-${name}`, '-p'],
+      { timeout: 5_000, encoding: 'utf8' })
+    const tail = pane.slice(-4000)
+    // Model/credit quota exhausted (e.g. Antigravity "Individual quota reached").
+    if (/quota reached|out of (?:credits|quota)|usage limit|rate limit exceeded/i.test(tail)) {
+      const reset = tail.match(/resets? in[^\n]*/i)?.[0]?.trim()
+      return { cause: 'model quota/credits exhausted', detail: reset ? capitalize(reset) : 'no reset time shown in the pane' }
+    }
+    // Auth expired / sitting at a login screen.
+    if (/\b(sign in|log ?in|authenticate|re-?authenticate|oauth|enter your api key)\b/i.test(tail)) {
+      return { cause: 'auth expired — sitting at a login screen', detail: 're-run `5dive agent auth …` for this agent' }
+    }
+    return { cause: 'listen loop wedged', detail: 'agent is idle outside wait_for_message and won’t re-arm' }
+  } catch {
+    return { cause: 'not responding', detail: 'could not read the agent pane' }
+  }
+}
+
+// Send one stall alert to every owner (allowFrom) DM. Plain text — no markdown,
+// so a banner containing special characters can't break the message.
+function sendStallAlert(): void {
+  if (stallAlerted) return
+  const name = agentName()
+  const { cause, detail } = detectStallCause()
+  const text = `⚠️ ${name} stopped responding — ${cause}.\n${detail}.\n\n`
+    + 'The Telegram listen loop isn’t recovering on its own. Try /restart, or check the agent pane.'
+  const owners = loadAccess().allowFrom ?? []
+  if (owners.length === 0) {
+    process.stderr.write('telegram-agy: stall detected but no allowFrom owner to alert\n')
+    return
+  }
+  for (const id of owners) {
+    bot.api.sendMessage(id, text).catch((err: any) =>
+      process.stderr.write(`telegram-agy: stall alert to ${id} failed: ${err?.message}\n`))
+  }
+  stallAlerted = true
+  try { writeFileSync(LAST_STALL_ALERT_FILE, String(Date.now())) } catch {}
+  process.stderr.write(`telegram-agy: stall alert sent (${cause}) to ${owners.length} owner(s)\n`)
+}
+
+// Loop recovered — drop the dedup flag so a future stall alerts again.
+function clearStallAlert(): void {
+  if (!stallAlerted) return
+  stallAlerted = false
+  try { if (existsSync(LAST_STALL_ALERT_FILE)) unlinkSync(LAST_STALL_ALERT_FILE) } catch {}
+}
+
 function kickListenLoop(): void {
   const name = agentName()
   if (name === 'unknown') return
@@ -1296,7 +1375,7 @@ function startRearmWatchdog(): void {
   if (agentName() === 'unknown') return
   const timer = setInterval(() => {
     // Parked in wait_for_message → loop is armed and healthy.
-    if (waiters.length > 0) { rearmKicks = 0; return }
+    if (waiters.length > 0) { rearmKicks = 0; clearStallAlert(); return }
     const idle = Date.now() - lastServerActivity
     if (idle < REARM_IDLE_MS) return
     // Stalled out of the loop. Back off on repeated kicks (1×,2×,4×…cap 8×) so a
@@ -1307,6 +1386,9 @@ function startRearmWatchdog(): void {
     kickListenLoop()
     rearmKicks += 1
     lastServerActivity = Date.now()  // reset clock; wait before the next kick
+    // Repeated kicks aren't reviving the loop → a quota/auth/wedge stall the
+    // watchdog can't fix on its own. Tell the owner once (best-effort, deduped).
+    if (!STALL_ALERT_DISABLED && rearmKicks >= STALL_ESCALATE_AFTER) sendStallAlert()
   }, REARM_CHECK_MS)
   timer.unref?.()
 }
