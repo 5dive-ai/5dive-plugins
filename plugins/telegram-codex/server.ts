@@ -746,8 +746,20 @@ async function orgTree(arg: string): Promise<string> {
   }
 }
 
-async function restartAgent(name: string): Promise<void> {
+async function restartAgent(name: string, ackUpdateId?: number): Promise<void> {
   if (name === 'unknown') return
+  // Ack the triggering update BEFORE we kill the process. The restart tears
+  // down this poller; getUpdates only commits the offset on its NEXT call, so
+  // if a /restart (or /model) update isn't acked first it sits at the head of
+  // the backlog and Telegram REDELIVERS it on the next boot → the bot re-runs
+  // /restart → infinite self-restart loop, ~1/sec, until systemd's start-limit
+  // trips and the unit fails ("bot looks dead"). Calling getUpdates(offset=id+1)
+  // is the ack. Safe here: grammy processes updates sequentially, so no poll is
+  // in flight mid-handler. Higher-id updates in the same batch stay pending and
+  // are correctly redelivered (they weren't handled). DIVE-13 — hit live on agy.
+  if (ackUpdateId != null) {
+    try { await bot.api.getUpdates({ offset: ackUpdateId + 1, limit: 1, timeout: 0 }) } catch {}
+  }
   await new Promise<void>(resolve => {
     // `sudo 5dive agent restart <name>` is the canonical path — it
     // touches the systemd unit, not the tmux session directly, so the
@@ -818,6 +830,11 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
 
   const chat_id = String(ctx.chat!.id)
   const reply_to = ctx.message?.message_id
+  // update_id of the triggering update. Passed to restartAgent for /restart and
+  // /model so it acks/advances the getUpdates offset past this update BEFORE the
+  // restart tears us down — otherwise Telegram redelivers it and we self-restart
+  // in a loop (DIVE-13).
+  const updateId = ctx.update.update_id
   // Everything after "/cmd" (and optional @botname) — the command arguments,
   // e.g. "add Wire up billing" for /task or "tree" for /org.
   const cmdArg = text.slice(m[0]!.length).trim()
@@ -864,13 +881,13 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
           parse_mode: 'Markdown',
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         }).catch(() => {})
-        await restartAgent(name)
+        await restartAgent(name, updateId)
         return true
       }
       case 'model': {
         const r = await handleModelCommand(cmdArg)
         await md(r.text)
-        if (r.switchTo) await restartAgent(agentName())
+        if (r.switchTo) await restartAgent(agentName(), updateId)
         return true
       }
       case 'agents': {

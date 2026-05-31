@@ -49,3 +49,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
   `textChunkLimit`, `dmPolicy`.
 - v0.2.1 — `notify-user` SKILL.md ported from the Claude build,
   adapted for Codex's `wait_for_message`/`reply` loop semantics.
+- v0.2.24 — DIVE-13: `/restart` (and `/model`) ack/advance the getUpdates
+  offset past the triggering update before tearing down the poller, so
+  Telegram can't redeliver it into a self-restart loop. (Same fix in
+  telegram-grok v0.1.23 + telegram-agy v0.1.12.)
