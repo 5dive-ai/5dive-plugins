@@ -5,25 +5,30 @@ forked from `plugins/telegram-grok/` because Antigravity (`agy`) shares
 the same poll-based inbound model (no Claude-Code `channel` push
 protocol) — inbound arrives via the blocking `wait_for_message` tool.
 
-## Up next
-
-- **5dive provisioning** (main's lane): first-class
-  `5dive agent <name> --type=antigravity --channels=telegram`. Needs the
-  agent-create path to (a) add antigravity to the channel-capable list,
-  (b) **seed the OAuth cred into the agent home** — `5dive agent auth
-  login antigravity` writes `~/.gemini/antigravity-cli/antigravity-oauth-token`
-  for the *host* (claude) user, not the agent, so headless `agy` boots to
-  a Google login screen until that file is copied into
-  `~agent-<name>/.gemini/antigravity-cli/` (chown, mode 600). Same gap
-  grok's `auth.json` had.
-  (c) **write the global config files** the runtime actually reads:
-  `~/.gemini/config/mcp_config.json` (telegram server, absolute `--cwd`)
-  and `~/.gemini/config/hooks.json` (the 3 hooks, absolute `bun …` paths).
-  agy does not auto-load these from the installed plugin dir.
-
 ## Still open
 
 - ExecStopPost in 5dive's systemd unit for true crash-aware notification.
+- **Live end-to-end smoke test is blocked on Antigravity account quota,
+  NOT on the bridge.** The test account (@MarketZoomBot's Google OAuth)
+  is quota-walled ("Individual quota reached … Resets in ~144h" as of
+  2026-05-31 → ~2026-06-06). A healthy bridge (service active, MCP server
+  up, keepalive re-arming) + a silent bot during this window = quota, not
+  a bug. Re-run the pairing/reply smoke test after the quota resets, or
+  point agy at a fresh-quota Antigravity account.
+
+## Resolved (2026-05-31)
+
+- **5dive provisioning — DONE** (main's lane, 5dive v0.1.24, commit
+  c91df79). `5dive agent <name> --type=antigravity --channels=telegram`
+  now: (a) lists antigravity as channel-capable, (b) seeds the OAuth cred
+  into the agent home via the auth-profile HOME-redirect
+  (`profile_type_auth_path` → `…/.gemini/antigravity-cli/antigravity-oauth-token`),
+  and (c) writes the global `~/.gemini/config/{mcp_config.json,hooks.json}`
+  at boot (`agent_setup.sh`). **Verified live 2026-05-31**: the `agy`
+  agent is provisioned (type antigravity, bot MarketZoomBot), its systemd
+  unit is active, the telegram MCP `server.ts` is running, and agy boots
+  straight to a model turn — it hits the account **quota** banner, NOT a
+  Google login screen, which confirms the cred-seeding works end-to-end.
 
 ## Resolved (2026-05-30)
 
