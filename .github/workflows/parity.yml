@@ -1,0 +1,31 @@
+name: fork parity
+
+# Asserts the telegram-{codex,grok,agy} forks stay in lockstep with each other and
+# in their documented delta from the Claude `telegram` baseline (DIVE-8). Pure static
+# parse — no servers booted, no plugin deps installed.
+
+on:
+  push:
+    paths:
+      - 'plugins/telegram/**'
+      - 'plugins/telegram-codex/**'
+      - 'plugins/telegram-grok/**'
+      - 'plugins/telegram-agy/**'
+      - 'test/**'
+      - '.github/workflows/parity.yml'
+  pull_request:
+    paths:
+      - 'plugins/telegram/**'
+      - 'plugins/telegram-codex/**'
+      - 'plugins/telegram-grok/**'
+      - 'plugins/telegram-agy/**'
+      - 'test/**'
+      - '.github/workflows/parity.yml'
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun test test/parity.test.ts
