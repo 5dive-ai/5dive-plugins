@@ -1,0 +1,114 @@
+[
+  {
+    "find": "const SERVER_STARTED_AT = Date.now()\nconst CLI_BIN = 'agy'",
+    "replace": "const SERVER_STARTED_AT = Date.now()\nconst CLI_LABEL = 'Antigravity'\nconst CLI_BIN = 'agy'",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "// /status — mirrors the Claude telegram plugin's layout as closely as the\n// CLI runtime allows. Antigravity has no session-status / usage cache like claude's,\n// so `status` is derived from the bridge (listening vs working) and usage is\n// omitted rather than faked.\n// Normalise a `--version` blob to a leading \"v<semver>\" (\"5dive 0.1.23\"",
+    "replace": "// /status — mirrors the Claude telegram plugin's layout as closely as the\n// CLI runtime allows. Antigravity has no session-status / usage cache and no\n// model config key (the model is chosen in its in-CLI picker), so `status` is\n// derived from the bridge and `model` is shown as picker-managed.\n// Normalise a `--version` blob to a leading \"v<semver>\" (\"5dive 0.1.23\"",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "\n// Generic top-level config.toml key reader (model effort, etc).\nfunction readConfigKey(key: string): string | null {\n  try {\n    const raw = readFileSync(CLI_CONFIG_FILE, 'utf8')\n    const firstSection = raw.search(/^\\s*\\[/m)\n    const head = firstSection === -1 ? raw : raw.slice(0, firstSection)\n    const m = head.match(new RegExp(`^[ \\\\t]*${key}[ \\\\t]*=[ \\\\t]*[\"']?([^\"'\\\\n#]+?)[\"']?[ \\\\t]*(?:#.*)?$`, 'm'))\n    return m ? m[1].trim() : null\n  } catch { return null }\n}\n\n// Real agent session uptime via the `agent-<name>` tmux session creation time;",
+    "replace": "\n// Real agent session uptime via the `agent-<name>` tmux session creation time;",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "  lines.push(`status: ${bridgeStatus()}`)\n  const model = readConfigModel()\n  const effort = readConfigKey('model_reasoning_effort')\n  if (model) lines.push(`model: ${model}${effort ? ` · ${effort}` : ''}`)\n  lines.push(`uptime: ${formatDuration(agentUptimeMs())}`)",
+    "replace": "  lines.push(`status: ${bridgeStatus()}`)\n  lines.push(`model: (selected in the agy picker)`)\n  lines.push(`uptime: ${formatDuration(agentUptimeMs())}`)",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "\n// ─── /model — show or switch the CLI model ───────────────────────────────────\n// The model is the top-level `model = \"...\"` key in <CLI_HOME>/config.toml\n// (STATE_DIR is <CLI_HOME>/channels/telegram, so config.toml is two levels up).\n// Switching writes the key and restarts the agent — the CLI reads its model at\n// startup and there's no reliable hot-swap from outside the running session.\nconst CLI_LABEL = 'Antigravity'\nconst CLI_CONFIG_FILE = join(STATE_DIR, '..', '..', 'config.toml')\n\nfunction readConfigModel(): string | null {\n  try {\n    const raw = readFileSync(CLI_CONFIG_FILE, 'utf8')\n    const firstSection = raw.search(/^\\s*\\[/m)\n    const head = firstSection === -1 ? raw : raw.slice(0, firstSection)\n    const m = head.match(/^[ \\t]*model[ \\t]*=[ \\t]*[\"']?([^\"'\\n#]+?)[\"']?[ \\t]*(?:#.*)?$/m)\n    return m ? m[1].trim() : null\n  } catch { return null }\n}\n\n// Switch by shelling out to the CLI (5dive v0.1.26+): it does the preamble-safe\n// config.toml write + the deferred ~1s restart, so we don't touch the file or\n// restart ourselves. Current model comes from `agent info` (live-reads config).",
+    "replace": "\n// Switch by shelling out to the CLI (5dive v0.1.26+): it does the settings.json\n// .model merge-write + the deferred ~1s restart, so we don't touch the file or\n// restart ourselves. Current model comes from `agent info` (live-reads config).",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "// restart ourselves. Current model comes from `agent info` (live-reads config).\nasync function handleModelCommand(arg: string): Promise<{ text: string; switchTo?: string }> {",
+    "replace": "// restart ourselves. Current model comes from `agent info` (live-reads config).\n// Antigravity's valid ids are server-driven; a deprecated/unknown id falls back\n// to the default with a notice in agy's own UI.\nasync function handleModelCommand(arg: string): Promise<{ text: string; switchTo?: string }> {",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "    try { const j = await run5dive(['agent', 'info', agentName(), '--json']); cur = j?.data?.model ?? undefined } catch {}\n    if (!cur) cur = readConfigModel() ?? undefined\n    return { text:",
+    "replace": "    try { const j = await run5dive(['agent', 'info', agentName(), '--json']); cur = j?.data?.model ?? undefined } catch {}\n    return { text:",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "      `*model* — ${CLI_LABEL}\\n\\n` +\n      `current: \\`${cur ?? '(CLI default)'}\\`\\n\\n` +\n      `Switch with \\`/model <id>\\` — any valid ${CLI_LABEL} model id. The agent restarts (~2s) to apply.`,\n    }",
+    "replace": "      `*model* — ${CLI_LABEL}\\n\\n` +\n      `current: \\`${cur ?? '(default — picker-managed)'}\\`\\n\\n` +\n      `Switch with \\`/model <id>\\` — sets Antigravity's model and restarts (~2s). ` +\n      `Valid ids are server-driven; a deprecated/unknown id falls back to the default with a notice in agy.`,\n    }",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "  }\n  return { text: `🔁 model → \\`${name}\\`\\nrestarting ${CLI_LABEL} (~2s) to apply…` }\n}",
+    "replace": "  }\n  return { text: `🔁 model → \\`${name}\\`\\nrestarting ${CLI_LABEL} (~2s) to apply… (if that id isn't available, agy falls back to its default and says so)` }\n}",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "// Knobs: TELEGRAM_REARM_DISABLED=1 turns it off; TELEGRAM_REARM_IDLE_MS sets the\n// idle threshold (default 180000). It MUST comfortably exceed the longest single\n// model-inference span: a reasoning model can reason 60–120s+ in ONE span that\n// writes nothing to the session transcript, so newestTurnMtimeMs() goes stale\n// mid-turn and a lower threshold kicks a busy agent off its task (customer bug\n// 5dive-exact-swallow). 180s covers typical reasoning; a genuinely-wedged\n// session is still caught (just slower) and backstopped by sendStallAlert.\n// Tunable up to 600s for agents that reason even longer.\n// ============================================================================",
+    "replace": "// Knobs: TELEGRAM_REARM_DISABLED=1 turns it off; TELEGRAM_REARM_IDLE_MS sets the\n// idle threshold (default 180000 — raised from 45s to match codex/grok: Antigravity\n// is a reasoning model that can think for a single long span which writes nothing,\n// so a shorter threshold false-kicks a busy agent. Liveness also consults the real\n// agent-turn mtime below, so this threshold only governs the genuinely-idle case).\n// ============================================================================",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "// The re-arm watchdog above keeps a *healthy* agent in the listen loop. Some\n// stalls can't be re-armed, though: an exhausted model quota, an expired login,\n// or a wedged TUI. The agent then takes no model turn at all — so neither the\n// listen loop nor the silence hook (which only fires on a tool call) can tell\n// the user anything; the bot just goes quiet. This server is still alive\n// draining getUpdates, so it's the one component that can still reach Telegram.\n// When re-arm kicks repeatedly fail to revive the loop, we scan the pane for a\n// known cause and send the owner ONE alert.\n//",
+    "replace": "// The re-arm watchdog above keeps a *healthy* agent in the listen loop. Some\n// stalls can't be re-armed, though: an exhausted model quota (Antigravity has a\n// hard per-account quota), an expired login, or a wedged TUI. The agent then\n// takes no model turn at all — so neither the listen loop nor the silence hook\n// (which only fires on a tool call) can tell the user anything; the bot just\n// goes quiet. This server is still alive draining getUpdates, so it's the one\n// component that can still reach Telegram. When re-arm kicks repeatedly fail to\n// revive the loop, we scan the pane for a known cause and send the owner ONE\n// alert.\n//",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "// Newest agent-turn mtime (ms) — the \"still doing real work\" signal used by the\n// watchdog below. Antigravity writes per-turn transcript files (events/chat_history/\n// updates .jsonl) under ~/.gemini/sessions/<cwd>/<session-id>/. prompt_history.jsonl\n// is deliberately EXCLUDED: the re-arm prompt itself lands there, so it would\n// mask a genuinely-wedged session. Returns 0 if none found.\nconst AGY_SESSIONS_DIR = join(STATE_DIR, '..', '..', 'sessions')\nfunction newestTurnMtimeMs(): number {",
+    "replace": "// Newest agent-turn mtime (ms) — the \"still doing real work\" signal used by the\n// watchdog below. Antigravity writes a per-conversation protobuf to\n// ~/.gemini/antigravity-cli/conversations/<uuid>.pb on every turn; the re-arm\n// prompt also lands in history.jsonl, so the conversation files are the clean\n// PRIMARY and history.jsonl the fallback (covers the first turn before any\n// conversation file exists). Returns 0 if none. Mirrors codex/grok (DIVE-14).\nconst AGY_CLI_DIR = join(\n  process.env.ANTIGRAVITY_HOME ?? process.env.GEMINI_HOME ?? join(homedir(), '.gemini'),\n  'antigravity-cli')\nconst AGY_CONVERSATIONS_DIR = join(AGY_CLI_DIR, 'conversations')\nconst AGY_HISTORY_FILE = join(AGY_CLI_DIR, 'history.jsonl')\nfunction newestTurnMtimeMs(): number {",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "    const out: string = cp.execFileSync('find',\n      [AGY_SESSIONS_DIR, '-type', 'f', '(',\n        '-name', 'events.jsonl', '-o', '-name', 'chat_history.jsonl', '-o', '-name', 'updates.jsonl',\n       ')', '-printf', '%T@\\\\n'],\n      { timeout: 4_000, encoding: 'utf8' })",
+    "replace": "    const out: string = cp.execFileSync('find',\n      [AGY_CONVERSATIONS_DIR, '-name', '*.pb', '-printf', '%T@\\\\n'],\n      { timeout: 4_000, encoding: 'utf8' })",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "    if (secs > 0) return Math.round(secs * 1000)\n  } catch { /* fall through */ }\n  return 0\n}",
+    "replace": "    if (secs > 0) return Math.round(secs * 1000)\n  } catch { /* fall through to history.jsonl */ }\n  try { return statSync(AGY_HISTORY_FILE).mtimeMs } catch { return 0 }\n}",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "    // Liveness = the most recent of a Telegram-MCP call OR a real agent turn.\n    // markActivity() only fires on Telegram tool calls, so an agent heads-down\n    // on a task (shell/edits/`5dive task start`) leaves lastServerActivity stale\n    // and would be wrongly kicked back into wait_for_message, abandoning the\n    // task (customer bug 5dive-exact-swallow). Only pay for the turn-activity\n    // stat once the cheap signal already looks stale.\n    let idle = now - lastServerActivity",
+    "replace": "    // Liveness = the most recent of a Telegram-MCP call OR a real agent turn.\n    // markActivity() only fires on Telegram tool calls, so an agent heads-down on\n    // a task leaves lastServerActivity stale and would be wrongly kicked back into\n    // wait_for_message, abandoning the task (the codex/grok 5dive-exact-swallow\n    // bug). Only pay for the turn-mtime stat once the cheap signal already looks stale.\n    let idle = now - lastServerActivity",
+    "files": [
+      "server.ts"
+    ]
+  },
+  {
+    "find": "    rearmKicks += 1\n    lastServerActivity = now  // reset clock; wait before the next kick\n    // Repeated kicks aren't reviving the loop → a quota/auth/wedge stall the",
+    "replace": "    rearmKicks += 1\n    lastServerActivity = Date.now()  // reset clock; wait before the next kick\n    // Repeated kicks aren't reviving the loop → a quota/auth/wedge stall the",
+    "files": [
+      "server.ts"
+    ]
+  }
+]

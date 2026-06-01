@@ -1,0 +1,21 @@
+{
+  "tokens": {
+    "slug": "agy",
+    "displayName": "Antigravity",
+    "vendor": "Google",
+    "cliBin": "agy",
+    "homeExpr": "process.env.ANTIGRAVITY_HOME ?? process.env.GEMINI_HOME ?? join(homedir(), '.gemini')",
+    "homeEnvVar": "ANTIGRAVITY_HOME",
+    "homeDir": "gemini",
+    "envPrefix": "AGY",
+    "pluginRootVar": "CLAUDE_PLUGIN_ROOT",
+    "timeoutKey": "MCP tool timeout",
+    "pkgScope": "@5dive/telegram-agy-mcp"
+  },
+  "version": "0.1.13",
+  "manifest": "root",
+  "manifestKeyword": "gemini",
+  "blocks": [
+    "agy-structural"
+  ]
+}

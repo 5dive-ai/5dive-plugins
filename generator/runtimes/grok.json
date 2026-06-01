@@ -1,0 +1,18 @@
+{
+  "tokens": {
+    "slug": "grok",
+    "displayName": "Grok",
+    "vendor": "xAI",
+    "cliBin": "grok",
+    "homeExpr": "process.env.GROK_HOME ?? join(homedir(), '.grok')",
+    "homeEnvVar": "GROK_HOME",
+    "homeDir": "grok",
+    "envPrefix": "GROK",
+    "pluginRootVar": "GROK_PLUGIN_ROOT",
+    "timeoutKey": "tool_timeout_sec",
+    "pkgScope": "@5dive/telegram-grok-mcp"
+  },
+  "version": "0.1.23",
+  "manifest": "claude-plugin",
+  "blocks": []
+}

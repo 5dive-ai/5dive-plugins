@@ -11,6 +11,7 @@ on:
       - 'plugins/telegram-codex/**'
       - 'plugins/telegram-grok/**'
       - 'plugins/telegram-agy/**'
+      - 'generator/**'
       - 'test/**'
       - '.github/workflows/parity.yml'
   pull_request:
@@ -19,6 +20,7 @@ on:
       - 'plugins/telegram-codex/**'
       - 'plugins/telegram-grok/**'
       - 'plugins/telegram-agy/**'
+      - 'generator/**'
       - 'test/**'
       - '.github/workflows/parity.yml'
 
@@ -29,3 +31,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun test test/parity.test.ts
+      # Generator drift gate (DIVE-9): every runtime config must still regenerate
+      # its committed fork byte-exact. Catches a fork hand-edited without updating
+      # its generator config (or the base) — the structural successor to the
+      # hand-kept parity above.
+      - run: bun generator/generate.ts --check

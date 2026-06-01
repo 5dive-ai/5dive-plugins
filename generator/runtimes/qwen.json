@@ -1,0 +1,18 @@
+{
+  "tokens": {
+    "slug": "qwen",
+    "displayName": "Qwen Code",
+    "vendor": "Alibaba",
+    "cliBin": "qwen",
+    "homeExpr": "process.env.QWEN_HOME ?? join(homedir(), '.qwen')",
+    "homeEnvVar": "QWEN_HOME",
+    "homeDir": "qwen",
+    "envPrefix": "QWEN",
+    "pluginRootVar": "QWEN_PLUGIN_ROOT",
+    "timeoutKey": "tool_timeout_sec",
+    "pkgScope": "@5dive/telegram-qwen-mcp"
+  },
+  "version": "0.1.0",
+  "manifest": "claude-plugin",
+  "blocks": []
+}
