@@ -2056,7 +2056,7 @@ const commandHandlers: Record<string, CommandHandler> = {
   usage: async ctx => {
     const usage = await read5diveAccountUsage()
     if (!usage) {
-      await ctx.reply(`Couldn't read usage. Try: sudo 5dive account usage`)
+      await ctx.reply(`Couldn't read usage — your 5dive CLI may be out of date. Update to the latest 5dive CLI, then try again.`)
       return
     }
     if (usage.length === 0) {
@@ -2171,7 +2171,7 @@ for (const def of COMMAND_REGISTRY) {
       // Silently no-op rather than echoing "command unknown" so an upstream
       // host doesn't leak the existence of 5dive-only commands. The /help
       // text already hides them for non-5dive hosts.
-      await ctx.reply(`/${def.name} requires the 5dive CLI — not detected on this host.`)
+      await ctx.reply(`/${def.name} needs a newer 5dive CLI than this server is running. Update to the latest 5dive CLI, then try again.`)
       return
     }
     await handler(ctx, gate)
