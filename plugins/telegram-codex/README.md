@@ -188,10 +188,14 @@ replies via the `reply` tool. Done.
 | --------------------- | -------------------------------------- | -------------------------------- |
 | Inbound delivery      | `claude/channel` JSON-RPC notification | `wait_for_message` blocking tool |
 | Permission relay      | `claude/channel/permission` protocol   | `PermissionRequest` hook + buttons |
-| Slash commands        | `/telegram:configure`, `:access`, …    | not yet (Codex plugin API TBD)   |
+| Slash commands        | `/telegram:configure`, `:access`, …    | bot-side menu (`/help` `/status` `/stop` `/restart` `/agents` `/tasks` `/task` `/org` `/model` `/ping` `/start`) |
 | Lifecycle hooks       | PreToolUse, Stop, etc.                 | `Stop` hook ships in `hooks/`    |
 | State dir             | `~/.claude/channels/telegram/`         | `~/.codex/channels/telegram/`    |
 | Pairing flow          | code via DM → `/telegram:access pair`  | `bun pair.ts` standalone CLI     |
+
+A fifth runtime, [`telegram-opencode`](../telegram-opencode), is **not** in this
+family: opencode ships a headless HTTP server, so its bridge is a long-running
+relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
 
 ## Roadmap
 

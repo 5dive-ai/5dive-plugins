@@ -148,10 +148,10 @@ hooks are non-blocking and read the same state dir as the server:
 | Hook | Event | What it does | Knobs |
 | ---- | ----- | ------------ | ----- |
 | `silence-watchdog.ts` | `PreToolUse` | **Off by default** (v0.1.5+) — the notify-user skill carries the "still alive" signal via progress edits. Opt in with `GROK_SILENCE_WATCHDOG_ENABLED=1`. When enabled, pings `⏳ still working…` after `GROK_SILENCE_WATCHDOG_MS` (default 600s) of silence; backs off 1× / 10× / 15× cap so long silent runs don't ping every 10 min | `GROK_SILENCE_WATCHDOG_ENABLED`, `GROK_SILENCE_WATCHDOG_DISABLED`, `GROK_SILENCE_WATCHDOG_MS` |
-
-`PLUGIN_VERSION` (reported by `/ping`, `/status`, `setMyCommands`) is read from `package.json` at server startup, so PATCH bumps don't require a second edit in `server.ts`.
 | `notify-stop.ts` | `Stop` | "🟢 grok: turn complete" ping; suppressed if a reply was sent in the last 30s | `GROK_NOTIFY_DISABLED`, `GROK_NOTIFY_TEXT`, `GROK_NOTIFY_SUPPRESS_MS` |
 | `notification-relay.ts` | `Notification` | Relays error-flavored notifications (rate limit, API error, crash) with a `⚠️ grok:` prefix | `GROK_NOTIFY_RELAY_ALL`, `GROK_NOTIFY_RELAY_DISABLED` |
+
+`PLUGIN_VERSION` (reported by `/ping`, `/status`, `setMyCommands`) is read from `package.json` at server startup, so PATCH bumps don't require a second edit in `server.ts`.
 
 ## Differences from the Claude Code and Codex builds
 
@@ -163,5 +163,9 @@ hooks are non-blocking and read the same state dir as the server:
 | State dir | `~/.claude/channels/telegram/` | `~/.codex/channels/telegram/` | `~/.grok/channels/telegram/` (honors `GROK_HOME`) |
 | Lifecycle hooks | PreToolUse, Stop, … | Stop (+ more) | PreToolUse, Stop, Notification |
 | Pairing flow | code via DM → `/telegram:access pair` | `bun pair.ts` | `bun pair.ts` |
+
+A fifth runtime, [`telegram-opencode`](../telegram-opencode), is **not** in this
+family: opencode ships a headless HTTP server, so its bridge is a long-running
+relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
 
 See [`TODO.md`](./TODO.md) for the roadmap and the "Won't port" list.

@@ -206,4 +206,8 @@ server:
 | Lifecycle hooks | PreToolUse, Stop, … | Stop (+ more) | PreToolUse, Stop, Notification |
 | Pairing flow | code via DM → `/telegram:access pair` | `bun pair.ts` | `bun pair.ts` |
 
+A fifth runtime, [`telegram-opencode`](../telegram-opencode), is **not** in this
+family: opencode ships a headless HTTP server, so its bridge is a long-running
+relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
+
 See [`TODO.md`](./TODO.md) for the roadmap and the "Won't port" list.

@@ -2,9 +2,24 @@
 
 Claude Code plugin marketplace maintained by [5dive](https://5dive.com).
 
-| Plugin | Purpose |
-| --- | --- |
-| [`telegram`](./plugins/telegram) | Telegram bridge for Claude Code — MCP server + access control + bundled lifecycle hooks. Fork of Anthropic's `telegram` plugin extended with 5dive auto-relay, stop-reply gating, and ask-user-question routing. |
+The `telegram` plugin pairs an agent CLI with a Telegram bot — DM the bot, the
+agent answers. The original targets Claude Code; the **runtime forks** below
+bring the same bridge to other agent CLIs that lack Claude Code's `channel`
+push protocol.
+
+| Plugin | Runtime | Inbound model | Notes |
+| --- | --- | --- | --- |
+| [`telegram`](./plugins/telegram) | Claude Code | `channel` push | The baseline. Fork of Anthropic's `telegram` plugin, extended with 5dive auto-relay, stop-reply gating, and ask-user-question routing. |
+| [`telegram-codex`](./plugins/telegram-codex) | OpenAI Codex | `wait_for_message` poll | MCP server. Adds a `PermissionRequest`-hook → inline-button approval bridge. |
+| [`telegram-grok`](./plugins/telegram-grok) | xAI Grok | `wait_for_message` poll | MCP server. Runs `--always-approve` (no permission bridge). |
+| [`telegram-agy`](./plugins/telegram-agy) | Google Antigravity | `wait_for_message` poll | MCP server. Plugin manifest + MCP wired global+absolute in `~/.gemini/config`. |
+| [`telegram-opencode`](./plugins/telegram-opencode) | opencode | HTTP + `/event` SSE | **Not an MCP fork** — a long-running relay over `opencode serve`. No watchdog/hooks/file-IPC needed (the server pushes events). |
+
+The four poll-based forks share one codebase shape and move in lockstep, checked
+by [`test/parity.test.ts`](./test) and the [`generator/`](./generator) (DIVE-9) —
+a new poll-based runtime is a config block, not a hand-fork. `telegram-opencode`
+is a deliberate exception: opencode's headless server makes a relay simpler than
+an MCP fork (see its README + [the spike](./plugins/telegram-opencode-SPIKE.md)).
 
 ## Install
 
