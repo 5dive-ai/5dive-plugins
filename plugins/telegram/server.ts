@@ -1173,6 +1173,7 @@ async function read5diveAccountUsage(): Promise<FiveDiveAccountUsage[] | null> {
 type FiveDiveRotation = {
   active: string
   enabled: boolean
+  allAccounts?: boolean
   accounts: string[]
   cooldowns: Record<string, number>
 }
@@ -1193,14 +1194,15 @@ async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
   }
 }
 
-// Write the rotation config via `agent rotation set`. The CLI re-validates
-// every account (configured + same-type) and dedups/preserves order, so we
-// pass the list as-is. Returns an error string on failure, null on success.
-async function write5diveRotation(me: string, enabled: boolean, accounts: string[]): Promise<string | null> {
+// Write the rotation config via `agent rotation set`. accountsArg is passed to
+// --accounts verbatim: either a comma-joined explicit list or the literal
+// `all` sentinel (use every eligible same-type profile). The CLI re-validates
+// + dedups. Returns an error string on failure, null on success.
+async function write5diveRotation(me: string, enabled: boolean, accountsArg: string): Promise<string | null> {
   try {
     await execFileP(
       'sudo',
-      ['-n', '5dive', 'agent', 'rotation', 'set', me, `--enabled=${enabled}`, `--accounts=${accounts.join(',')}`],
+      ['-n', '5dive', 'agent', 'rotation', 'set', me, `--enabled=${enabled}`, `--accounts=${accountsArg}`],
       { timeout: 5000 },
     )
     return null
@@ -1338,33 +1340,43 @@ function accountKeyboard(
 // so callback_data only needs to carry the verb + (for accounts) the name.
 function rotationKeyboard(
   names: string[],
-  rot: { enabled: boolean; accounts: string[] },
+  rot: { enabled: boolean; allAccounts?: boolean; accounts: string[] },
   suffixFor?: (name: string) => string,
 ): InlineKeyboard {
   const kb = new InlineKeyboard()
   kb.text(`Auto-rotate: ${rot.enabled ? '🟢 on' : '⚪️ off'}`, 'rot:toggle').row()
-  names.forEach(name => {
-    const idx = rot.accounts.indexOf(name)
-    const mark = idx >= 0 ? `${idx + 1}. ` : '— '
-    kb.text(`${mark}${name}${suffixFor?.(name) ?? ''}`, `rot:acct:${name}`).row()
-  })
+  // "Use all accounts" mode toggle: on → rotate across every eligible profile
+  // (the per-account picker is hidden); off → pick a specific set + order.
+  kb.text(`Use all accounts: ${rot.allAccounts ? '🟢 on' : '⚪️ off'}`, 'rot:all').row()
+  if (!rot.allAccounts) {
+    names.forEach(name => {
+      const idx = rot.accounts.indexOf(name)
+      const mark = idx >= 0 ? `${idx + 1}. ` : '— '
+      kb.text(`${mark}${name}${suffixFor?.(name) ?? ''}`, `rot:acct:${name}`).row()
+    })
+  }
   kb.text('‹ Back to accounts', 'rot:back')
   return kb
 }
 
-// The two-line body shown above the rotation keyboard. Mirrors the dashboard
-// copy: needs ≥2 accounts to do anything, and the limited turn is lost.
-function rotationBody(rot: { enabled: boolean; accounts: string[] }): string {
-  const lines = [
-    `⟳ Auto-rotate on usage limit: ${rot.enabled ? 'ON' : 'off'}`,
-    rot.accounts.length
-      ? `Order: ${rot.accounts.map((a, i) => `${i + 1}.${a}`).join('  ')}`
-      : `No accounts picked yet.`,
-  ]
-  if (rot.enabled && rot.accounts.length < 2) {
-    lines.push(`⚠️ Pick at least 2 accounts to rotate between.`)
+// The body shown above the rotation keyboard. Mirrors the dashboard copy:
+// "all" uses every eligible profile; otherwise needs ≥2 picked; the limited
+// turn is lost on resume either way.
+function rotationBody(rot: { enabled: boolean; allAccounts?: boolean; accounts: string[] }): string {
+  const lines = [`⟳ Auto-rotate on usage limit: ${rot.enabled ? 'ON' : 'off'}`]
+  if (rot.allAccounts) {
+    lines.push(`Pool: all eligible accounts (auto-includes new ones).`)
+  } else {
+    lines.push(
+      rot.accounts.length
+        ? `Order: ${rot.accounts.map((a, i) => `${i + 1}.${a}`).join('  ')}`
+        : `No accounts picked yet.`,
+    )
+    if (rot.enabled && rot.accounts.length < 2) {
+      lines.push(`⚠️ Pick at least 2 accounts to rotate between.`)
+    }
+    lines.push(`Tap accounts in priority order. The turn that hits the limit is lost on resume.`)
   }
-  lines.push(`Tap accounts in priority order. The turn that hits the limit is lost on resume.`)
   return lines.join('\n')
 }
 
@@ -2423,11 +2435,18 @@ bot.on('callback_query:data', async ctx => {
       return
     }
     let enabled = rot.enabled
+    let allAccounts = rot.allAccounts ?? false
     let accounts = rot.accounts
     const acctM = /^rot:acct:([a-z][a-z0-9_-]{0,31})$/.exec(data)
     if (data === 'rot:toggle') {
       enabled = !enabled
+    } else if (data === 'rot:all') {
+      // Flip the "use all eligible profiles" mode; keep the explicit list around
+      // so toggling back off restores the user's prior picks.
+      allAccounts = !allAccounts
     } else if (acctM) {
+      // Only reachable when allAccounts is off (the per-account rows are hidden
+      // otherwise) — add/remove from the ordered explicit list.
       const name = acctM[1]!
       accounts = accounts.includes(name)
         ? accounts.filter(a => a !== name)
@@ -2436,7 +2455,7 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery().catch(() => {})
       return
     }
-    const err = await write5diveRotation(me, enabled, accounts)
+    const err = await write5diveRotation(me, enabled, allAccounts ? 'all' : accounts.join(','))
     if (err) {
       // The CLI rejected it (e.g. an account with no same-type credential).
       // Surface the reason in the toast and leave the keyboard as-is.
