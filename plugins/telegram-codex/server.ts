@@ -1587,6 +1587,62 @@ function newestTurnMtimeMs(): number {
   try { return statSync(CODEX_HISTORY_FILE).mtimeMs } catch { return 0 }
 }
 
+// Whether a model turn is genuinely IN FLIGHT right now — the authoritative
+// "don't kick" signal. newestTurnMtimeMs() infers liveness from file mtime, but
+// codex writes NOTHING to the rollout during a model-inference span: a reasoning
+// model can reason for minutes in a single span, so mtime goes stale mid-turn and
+// the idle threshold alone false-kicks a busy agent off its task (DIVE-15, residual
+// of customer bug 5dive-exact-swallow). The turn *boundary* is logged, though:
+// codex writes an event_msg with payload.type `task_started` when a turn begins and
+// `task_complete` when it ends (rollout-*.jsonl). So an OPEN turn — the most recent
+// of those two markers being `task_started` — means a turn is in progress no matter
+// how long it has been silent. Trust is capped at TURN_MAX_MS: a turn that logged
+// its start but never its end (a hard wedge mid inference) eventually becomes
+// kickable again rather than wedging the watchdog forever. Best-effort — any
+// read/parse failure returns false, leaving the mtime + idle fallback in force.
+const TURN_MAX_MS = Math.max(60_000, Math.min(1_800_000,
+  Number(process.env.TELEGRAM_TURN_MAX_MS ?? 900_000)))
+function turnInFlight(): boolean {
+  const OPEN = 'task_started', CLOSE = 'task_complete'
+  try {
+    const cp = require('child_process')
+    const out: string = cp.execFileSync('find',
+      [CODEX_SESSIONS_DIR, '-name', 'rollout-*.jsonl', '-printf', '%T@\\t%p\\n'],
+      { timeout: 4_000, encoding: 'utf8' })
+    let newest = '', newestT = 0
+    for (const line of out.split('\n')) {
+      const tab = line.indexOf('\t'); if (tab < 0) continue
+      const t = Number(line.slice(0, tab))
+      if (t > newestT) { newestT = t; newest = line.slice(tab + 1) }
+    }
+    if (!newest) return false
+    // Scan the tail newest-first for the last turn boundary. A generous slice so a
+    // turn with many records before a long final reasoning span is still covered
+    // without reading the whole (possibly large) rollout.
+    const buf = readFileSync(newest, 'utf8')
+    const lines = (buf.length > 262_144 ? buf.slice(-262_144) : buf).split('\n')
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const l = lines[i].trim(); if (!l) continue
+      let rec: any
+      try { rec = JSON.parse(l) } catch { continue }
+      const ptype = rec?.payload?.type
+      if (ptype === CLOSE) return false
+      if (ptype === OPEN) {
+        // Only a turn that began within THIS server's lifetime is genuinely in
+        // flight. A task_started left open by a previous session — e.g. a rough
+        // restart (the nightly cron timeout-kill) that killed the agent mid-turn
+        // without logging task_complete — is stale; ignoring it keeps cold-start
+        // re-arm working. TURN_MAX_MS additionally bounds a turn that started this
+        // session but then wedged. Unparseable ts → don't block (allow the kick).
+        const ts = Date.parse(rec.timestamp ?? rec.payload?.timestamp ?? '')
+        if (!Number.isFinite(ts) || ts < SERVER_STARTED_AT || Date.now() - ts > TURN_MAX_MS) return false
+        return true
+      }
+    }
+  } catch { /* fall through */ }
+  return false
+}
+
 function startRearmWatchdog(): void {
   if (REARM_DISABLED) return
   if (agentName() === 'unknown') return
@@ -1602,6 +1658,11 @@ function startRearmWatchdog(): void {
     // stat once the cheap signal already looks stale.
     let idle = now - lastServerActivity
     if (idle >= REARM_IDLE_MS) {
+      // A turn genuinely in flight (incl. a multi-minute silent reasoning span
+      // that writes nothing, so mtime alone goes stale) must NEVER be kicked,
+      // regardless of elapsed time — the real fix for DIVE-15. The agent is
+      // provably alive, so also reset the kick counter and clear any stall alert.
+      if (turnInFlight()) { rearmKicks = 0; clearStallAlert(); return }
       const lastTurn = newestTurnMtimeMs()
       if (lastTurn > 0) idle = Math.min(idle, now - lastTurn)
     }

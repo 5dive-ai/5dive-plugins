@@ -1438,6 +1438,16 @@ function newestTurnMtimeMs(): number {
   try { return statSync(AGY_HISTORY_FILE).mtimeMs } catch { return 0 }
 }
 
+// Whether a model turn is genuinely IN FLIGHT right now — the authoritative
+// "don't kick" signal used by codex/grok to avoid false-kicking a busy agent
+// during a silent multi-minute reasoning span (DIVE-15). Those runtimes log a
+// turn_started/turn_ended boundary to a text event stream we can scan. Antigravity
+// does NOT: it writes each turn to a per-conversation protobuf (<uuid>.pb), with no
+// cheap text marker for an open turn. So turnInFlight() returns false here and agy
+// keeps the newestTurnMtimeMs() + idle-threshold heuristic — DIVE-14 tracks giving
+// agy a real in-flight signal (decode the protobuf, or a process/connection probe).
+function turnInFlight(): boolean { return false }
+
 function startRearmWatchdog(): void {
   if (REARM_DISABLED) return
   if (agentName() === 'unknown') return
@@ -1452,6 +1462,11 @@ function startRearmWatchdog(): void {
     // bug). Only pay for the turn-mtime stat once the cheap signal already looks stale.
     let idle = now - lastServerActivity
     if (idle >= REARM_IDLE_MS) {
+      // A turn genuinely in flight (incl. a multi-minute silent reasoning span
+      // that writes nothing, so mtime alone goes stale) must NEVER be kicked,
+      // regardless of elapsed time — the real fix for DIVE-15. The agent is
+      // provably alive, so also reset the kick counter and clear any stall alert.
+      if (turnInFlight()) { rearmKicks = 0; clearStallAlert(); return }
       const lastTurn = newestTurnMtimeMs()
       if (lastTurn > 0) idle = Math.min(idle, now - lastTurn)
     }
