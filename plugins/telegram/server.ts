@@ -2194,7 +2194,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     const STALE_MS = 20 * 60 * 1000
     const fmtReset = (resetsAt?: number): string =>
       resetsAt ? formatDuration(Math.max(0, resetsAt * 1000 - now)) : '?'
-    const lines: string[] = ['📊 Account usage', '']
+    const lines: string[] = ['Account usage', '']
     for (const a of usage) {
       const u = a.usage
       if (!u || (u.fiveHour == null && u.sevenDay == null)) {
@@ -2206,12 +2206,13 @@ const commandHandlers: Record<string, CommandHandler> = {
       const worst = Math.max(five ?? 0, seven ?? 0)
       const dot = worst >= 90 ? '🔴' : worst >= 70 ? '🟡' : '🟢'
       const stale = now - u.asOf * 1000 > STALE_MS
+      const fivePct = five != null ? Math.round(five) + '%' : '—'
+      const sevenPct = seven != null ? Math.round(seven) + '%' : '—'
+      // Name, then the two windows (pct + reset-in), then freshness — each on
+      // its own short line so nothing wraps awkwardly on mobile.
       lines.push(`${dot} ${a.name}`)
-      lines.push(
-        `   5h ${five != null ? Math.round(five) + '%' : '—'} (resets ${fmtReset(u.fiveHour?.resetsAt)})`
-        + ` · 7d ${seven != null ? Math.round(seven) + '%' : '—'} (resets ${fmtReset(u.sevenDay?.resetsAt)})`,
-      )
-      lines.push(`   as of ${formatDuration(now - u.asOf * 1000)} ago via ${u.source}${stale ? ' ⚠️ stale' : ''}`)
+      lines.push(`5h: ${fivePct} ${fmtReset(u.fiveHour?.resetsAt)} · 7d: ${sevenPct} ${fmtReset(u.sevenDay?.resetsAt)}`)
+      lines.push(`${formatDuration(now - u.asOf * 1000)} ago via ${u.source}${stale ? ' ⚠️ stale' : ''}`)
     }
     await ctx.reply(lines.join('\n'))
   },
