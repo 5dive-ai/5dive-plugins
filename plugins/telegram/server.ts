@@ -1463,7 +1463,7 @@ function applyModel(alias: string, chatId: number): ApplyResult {
     return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}` }
   }
   return {
-    text: `✅ Model → ${alias}\n\n⚠️  Claude is restarting in ~1s so the new model takes effect.`,
+    text: `✅ Model → ${alias}\n\n⚠️  Claude is restarting to apply it — back in ~20-30s once the new session loads.`,
     // Mirror applyAccount: deferred systemd-run restart fires ~1s later as a
     // transient unit that survives this process's teardown, so the ack above
     // is on the wire first. The previous design tried to flip the model live
@@ -1513,7 +1513,7 @@ async function applyAccount(name: string, chatId: number): Promise<ApplyResult> 
     return { text: `Invalid account name.` }
   }
   return {
-    text: `✅ Account → ${name}\n\n⚠️  Claude is restarting in ~1s so the new credentials take effect.`,
+    text: `✅ Account → ${name}\n\n⚠️  Claude is restarting to apply it — back in ~20-30s once the new session loads.`,
     // Runs after the handler's editMessageText + reply have been awaited, so
     // the ack is on the wire before set-account schedules the restart. On the
     // rare failure (sudo denied, CLI error) no restart fires and the bot is
@@ -1543,7 +1543,7 @@ function applyEffort(level: string, chatId: number): ApplyResult {
     return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}` }
   }
   return {
-    text: `✅ Effort → ${level}\n\n⚠️  Claude is restarting in ~1s so the new effort takes effect.`,
+    text: `✅ Effort → ${level}\n\n⚠️  Claude is restarting to apply it — back in ~20-30s once the new session loads.`,
     // Same shape as applyModel — see comment there. Live-flipping effort via
     // tmux send-keys was unreliable; deferred restart is the source of truth.
     after: () => {
@@ -1788,7 +1788,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     }
     try {
       process.kill(session.pid, 'SIGTERM')
-      await ctx.reply(`Killed claude (pid=${session.pid}). systemd will respawn within ~2s.`)
+      await ctx.reply(`Killed claude (pid=${session.pid}). systemd respawns it immediately — back in ~20-30s once the new session loads.`)
     } catch (err) {
       await ctx.reply(`Failed to kill: ${err instanceof Error ? err.message : String(err)}`)
     }
@@ -1845,7 +1845,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     const chatId = ctx.chat?.id ?? Number(ctx.from?.id)
     await ctx.reply(
       `▶ Resuming${cp.label ? ` "${cp.label}"` : ''} (session ${short})\n` +
-        `⚠️  Restarting in ~1s — full context will be back once the new session loads.`,
+        `⚠️  Restarting — full context will be back in ~20-30s once the new session loads.`,
     )
     // Deferred restart: systemd-run fires ~1s later as a transient unit that
     // survives this process's teardown, so the reply above is already on the
@@ -1911,7 +1911,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       : before || after
         ? `Plugins refreshed (no version change):\n  ${after || before}`
         : `Plugins refreshed.`
-    await ctx.reply(`${summary}\n\n⚠️  Restarting in ~1s — back shortly.`)
+    await ctx.reply(`${summary}\n\n⚠️  Restarting to apply — back in ~20-30s once the new session loads.`)
     void execFileP(
       SUDO,
       ['-n', 'systemd-run', '--on-active=1', '--collect',
