@@ -1154,7 +1154,7 @@ type FiveDiveAccountUsage = {
   } | null
 }
 
-// `5dive account usage --json` — per-account Anthropic 5h/7d limit usage, read
+// `5dive account usage --json` — per-account Anthropic 5h/1w limit usage, read
 // from each account's freshest bound-agent statusline cache. Backs the
 // /account button dots and the /usage board. Best-effort: returns null on any
 // failure (e.g. a CLI without the `usage` subcommand yet) so callers degrade
@@ -2197,7 +2197,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     await ctx.reply(menu.text, { reply_markup: menu.keyboard })
   },
 
-  // /usage — the full Anthropic 5h/7d limit board across every account (the
+  // /usage — the full Anthropic 5h/1w limit board across every account (the
   // detail view; /account shows the same signal as compact dots on the
   // switcher buttons). null usage for an account means no bound agent
   // rendered a statusline recently, so there are no live numbers to show.
@@ -2232,7 +2232,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       // Name, then the two windows (pct + reset-in), then freshness — each on
       // its own short line so nothing wraps awkwardly on mobile.
       lines.push(`${dot} ${a.name}`)
-      lines.push(`5h: ${fivePct} ${fmtReset(u.fiveHour?.resetsAt)} · 7d: ${sevenPct} ${fmtReset(u.sevenDay?.resetsAt)}`)
+      lines.push(`5h: ${fivePct} ${fmtReset(u.fiveHour?.resetsAt)} · 1w: ${sevenPct} ${fmtReset(u.sevenDay?.resetsAt)}`)
       lines.push(`${formatDuration(now - u.asOf * 1000)} ago via ${u.source}${stale ? ' ⚠️ stale' : ''}`)
     }
     await ctx.reply(lines.join('\n'))

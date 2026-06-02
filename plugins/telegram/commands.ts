@@ -125,7 +125,7 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     name: 'usage',
-    description: '5h/7d limit usage',
+    description: '5h/1w limit usage',
     scope: 'paired-5dive',
   },
   {
