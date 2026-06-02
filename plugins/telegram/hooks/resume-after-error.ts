@@ -83,7 +83,7 @@ function paneStillErrored(pane: string): boolean {
 async function attemptResume(): Promise<boolean> {
   if (!ctx) return false
   const baseline = transcriptLen()
-  sendKeys(ctx, 'continue', 'Enter')
+  sendKeys(ctx, 'continue and reply to the latest message', 'Enter')
   for (let i = 0; i < VERIFY_POLLS; i++) {
     await sleep(VERIFY_STEP_MS)
     if (transcriptPath) {

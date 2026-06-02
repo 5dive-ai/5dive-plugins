@@ -104,7 +104,7 @@ async function attemptResume(): Promise<boolean> {
     sendKeys(ctx, '1', 'Enter')
     await sleep(2000)
   }
-  sendKeys(ctx, 'continue', 'Enter')
+  sendKeys(ctx, 'continue and reply to the latest message', 'Enter')
   for (let i = 0; i < VERIFY_POLLS; i++) {
     await sleep(VERIFY_STEP_MS)
     if (transcriptPath) {

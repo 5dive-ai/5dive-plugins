@@ -299,18 +299,22 @@ function tryRotate(resetEpoch: number | null): { from: string; to: string } | nu
   const sessionId = transcriptPath ? basename(transcriptPath).replace(/\.jsonl$/, '') : ''
   if (!/^[0-9a-fA-F-]{36}$/.test(sessionId)) return null
 
-  // Line 1 = session id; line 2 = "continue" (the auto-resume prompt). A bare
+  // Line 1 = session id; line 2 = the auto-resume prompt. A bare
   // `claude --resume <id>` reloads the conversation but sits idle at the prompt,
   // so without line 2 the swapped-in account would carry full context yet never
   // answer the in-flight turn. 5dive-agent-start reads line 2 and appends it as
-  // the first interactive prompt (`claude --resume <id> … continue`), so the new
-  // account picks up the unanswered turn automatically. Manual /resume omits
-  // line 2 and stays idle-on-resume (unchanged).
+  // the first interactive prompt, so the new account picks up automatically.
+  // The prompt is "continue and reply to the latest message", not a bare
+  // "continue": when the interrupted turn was an unanswered user DM (not a
+  // multi-step task), bare "continue" makes the model hunt for in-progress work,
+  // find none, and stay silent — so it never answers the user. The explicit
+  // "reply to the latest message" covers both cases (finish the task AND answer
+  // the pending message). Manual /resume omits line 2 and stays idle (unchanged).
   const marker = join(STATE_DIR, 'resume-next')
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     const tmp = `${marker}.tmp.${process.pid}`
-    writeFileSync(tmp, sessionId + '\ncontinue\n', { mode: 0o600 })
+    writeFileSync(tmp, sessionId + '\ncontinue and reply to the latest message\n', { mode: 0o600 })
     renameSync(tmp, marker)
   } catch {
     return null
