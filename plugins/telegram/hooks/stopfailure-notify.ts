@@ -11,10 +11,11 @@
 // launchd plist, an interactive shell that sourced
 // ~/.claude/channels/telegram/.env, etc).
 
-import { spawn } from 'child_process'
-import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync, readFileSync } from 'fs'
+import { spawn, spawnSync } from 'child_process'
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync, readFileSync, writeFileSync, renameSync } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { join, basename } from 'path'
+import { STATE_DIR } from './lib/paths'
 import { readPayload } from './lib/payload'
 import { readEntries, findRateLimitText } from './lib/transcript'
 import { getAllowedChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
@@ -209,6 +210,28 @@ if (needsRecovery) {
   }
 }
 
+// --- Multi-account auto-rotation (opt-in) --------------------------------
+// For a real usage limit with a pane to drive, if this agent has rotation
+// enabled and an eligible backup account, swap to it and resume THIS session
+// on the new credentials instead of waiting out the reset. Reuses
+// 5dive-agent-start's one-shot resume marker (the same mechanism /resume
+// uses). Falls through to the normal wait-for-reset helper below when rotation
+// is off or nothing is eligible (all cooling / none configured). We hold the
+// resume lock here, so a concurrent StopFailure can't double-rotate.
+if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
+  const rot = tryRotate(resetEpoch)
+  if (rot) {
+    const rotText =
+      `Usage limit hit on '${rot.from}' — rotating to '${rot.to}' and resuming this session on the new account.`
+    await Promise.all(targets.map(t => sendMessage(t.chatId, rotText, t.threadId)))
+    // The rotate scheduled a deferred unit restart that relaunches with
+    // `claude --resume <id>` on the new creds — no wait-helper needed. The
+    // restart tears this process down; the next episode reclaims the
+    // dead-PID resume lock.
+    process.exit(0)
+  }
+}
+
 await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
 
 // Detach the recovery helper (we already hold the lock). Two flows share the
@@ -252,6 +275,66 @@ if (needsRecovery && tmuxCtx && lockPath) {
 }
 
 process.exit(0)
+
+// deriveAgentName — the tmux session is named "agent-<name>" (5dive-agent-start).
+function deriveAgentName(target: string): string | null {
+  const sess = target.split(':')[0] ?? ''
+  const m = sess.match(/^agent-(.+)$/)
+  return m && m[1] ? m[1] : null
+}
+
+// tryRotate — arm the one-shot resume marker, then ask the CLI to swap to the
+// next eligible account. Returns {from,to} on a real rotation, else null
+// (rotation disabled, nothing eligible, or any failure → caller waits for
+// reset). The CLI is the single source of truth for eligibility/selection; we
+// only translate its verdict. The marker is armed BEFORE the swap so the
+// post-rotate restart resumes this conversation, and removed when no rotation
+// happens so a later unrelated restart can't wrongly resume a stale session.
+function tryRotate(resetEpoch: number | null): { from: string; to: string } | null {
+  if (!tmuxCtx) return null
+  const agentName = deriveAgentName(tmuxCtx.target)
+  if (!agentName) return null
+  // claude writes the transcript as <session-id>.jsonl; that basename is the
+  // id `claude --resume` wants.
+  const sessionId = transcriptPath ? basename(transcriptPath).replace(/\.jsonl$/, '') : ''
+  if (!/^[0-9a-fA-F-]{36}$/.test(sessionId)) return null
+
+  const marker = join(STATE_DIR, 'resume-next')
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = `${marker}.tmp.${process.pid}`
+    writeFileSync(tmp, sessionId + '\n', { mode: 0o600 })
+    renameSync(tmp, marker)
+  } catch {
+    return null
+  }
+
+  // Cool the account we're leaving until its reset (or a 5h fallback when the
+  // reset time was unreadable) so we don't bounce straight back to it.
+  const cooldownUntil =
+    resetEpoch && resetEpoch > 0 ? resetEpoch : Math.floor(Date.now() / 1000) + 5 * 3600
+  const r = spawnSync(
+    'sudo',
+    ['-n', '5dive', '--json', 'agent', 'rotation', 'rotate', agentName, `--cooldown-current=${cooldownUntil}`],
+    { encoding: 'utf8', timeout: 8000 },
+  )
+  let parsed: any = null
+  try {
+    parsed = JSON.parse((r.stdout || '').trim())
+  } catch {
+    /* non-JSON / CLI failure → treat as no rotation */
+  }
+  if (parsed?.ok && parsed.data?.rotated && parsed.data?.to) {
+    return { from: parsed.data.from ?? '?', to: String(parsed.data.to) }
+  }
+  // No rotation — drop the marker we armed.
+  try {
+    unlinkSync(marker)
+  } catch {
+    /* noop */
+  }
+  return null
+}
 
 // Best-effort cross-process lock guarding a single resume helper per agent.
 // Exclusive-create wins; an existing lock is honored only if the recorded

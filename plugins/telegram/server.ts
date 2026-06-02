@@ -1170,6 +1170,46 @@ async function read5diveAccountUsage(): Promise<FiveDiveAccountUsage[] | null> {
   }
 }
 
+type FiveDiveRotation = {
+  active: string
+  enabled: boolean
+  accounts: string[]
+  cooldowns: Record<string, number>
+}
+
+// `5dive agent rotation get <me> --json` — this agent's multi-account
+// auto-rotation config (DIVE-35): the ordered pool it cycles through when it
+// hits a real usage limit. Backs the /account rotation submenu. Best-effort:
+// null on any failure (e.g. an older CLI without the `rotation` subcommand) so
+// the picker just hides the rotation row rather than erroring.
+async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
+  try {
+    const { stdout } = await execFileP('sudo', ['-n', '5dive', '--json', 'agent', 'rotation', 'get', me], { timeout: 3000 })
+    const j = JSON.parse(stdout)
+    if (j?.ok && j.data) return j.data as FiveDiveRotation
+    return null
+  } catch {
+    return null
+  }
+}
+
+// Write the rotation config via `agent rotation set`. The CLI re-validates
+// every account (configured + same-type) and dedups/preserves order, so we
+// pass the list as-is. Returns an error string on failure, null on success.
+async function write5diveRotation(me: string, enabled: boolean, accounts: string[]): Promise<string | null> {
+  try {
+    await execFileP(
+      'sudo',
+      ['-n', '5dive', 'agent', 'rotation', 'set', me, `--enabled=${enabled}`, `--accounts=${accounts.join(',')}`],
+      { timeout: 5000 },
+    )
+    return null
+  } catch (err: any) {
+    const stderr = err?.stderr ? String(err.stderr).trim() : ''
+    return stderr || (err instanceof Error ? err.message : String(err))
+  }
+}
+
 // Pick the 🟢/🟡/🔴 dot from the WORSE of an account's two windows (whichever
 // throttles first): green <70%, amber 70–90%, red ≥90%. '' when there's no
 // usage (non-claude account, or no agent rendered a statusline recently).
@@ -1288,6 +1328,105 @@ function accountKeyboard(
     if (i < all.length - 1) kb.row()
   })
   return kb
+}
+
+// /account rotation submenu: a header toggle row + one row per account showing
+// its position in the rotation order ("1. mark", "2. chemmonitor") or "— name"
+// when it's not in the pool. Tapping the toggle flips enabled; tapping an
+// account adds it to the end of the order (or removes it). Stateless — every
+// tap re-reads `rotation get`, mutates, writes, and re-renders this keyboard,
+// so callback_data only needs to carry the verb + (for accounts) the name.
+function rotationKeyboard(
+  names: string[],
+  rot: { enabled: boolean; accounts: string[] },
+  suffixFor?: (name: string) => string,
+): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  kb.text(`Auto-rotate: ${rot.enabled ? '🟢 on' : '⚪️ off'}`, 'rot:toggle').row()
+  names.forEach(name => {
+    const idx = rot.accounts.indexOf(name)
+    const mark = idx >= 0 ? `${idx + 1}. ` : '— '
+    kb.text(`${mark}${name}${suffixFor?.(name) ?? ''}`, `rot:acct:${name}`).row()
+  })
+  kb.text('‹ Back to accounts', 'rot:back')
+  return kb
+}
+
+// The two-line body shown above the rotation keyboard. Mirrors the dashboard
+// copy: needs ≥2 accounts to do anything, and the limited turn is lost.
+function rotationBody(rot: { enabled: boolean; accounts: string[] }): string {
+  const lines = [
+    `⟳ Auto-rotate on usage limit: ${rot.enabled ? 'ON' : 'off'}`,
+    rot.accounts.length
+      ? `Order: ${rot.accounts.map((a, i) => `${i + 1}.${a}`).join('  ')}`
+      : `No accounts picked yet.`,
+  ]
+  if (rot.enabled && rot.accounts.length < 2) {
+    lines.push(`⚠️ Pick at least 2 accounts to rotate between.`)
+  }
+  lines.push(`Tap accounts in priority order. The turn that hits the limit is lost on resume.`)
+  return lines.join('\n')
+}
+
+// Build the /account picker (body + keyboard) for `me`. Shared by the /account
+// command and the rotation submenu's "‹ Back to accounts" button so both
+// render identically. Returns {error} when the account list can't be read.
+async function buildAccountMenu(
+  me: string,
+): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+  const [accounts, agents, usage, rotation] = await Promise.all([
+    read5diveAccountList(),
+    read5diveAgentList(),
+    read5diveAccountUsage(),
+    read5diveRotation(me),
+  ])
+  if (!accounts) return { error: `Failed to list accounts. Try: sudo 5dive account list` }
+  if (accounts.length === 0) {
+    return { error: `No accounts configured.\n\nAdd one with: sudo 5dive account add <name>` }
+  }
+  const current = agents?.find(a => a.name === me)?.authProfile || 'default'
+  const usageByName = new Map((usage ?? []).map(u => [u.name, u.usage]))
+  const suffixFor = (name: string): string => {
+    const u = usageByName.get(name)
+    const dot = usageDot(u)
+    if (!dot) return ''
+    const five = u?.fiveHour?.pct
+    return five != null ? ` ${dot} ${Math.round(five)}%` : ` ${dot}`
+  }
+  const kb = accountKeyboard(accounts.map(a => a.name), current, suffixFor)
+  // Auto-rotate entry button — only when the CLI supports `rotation get`
+  // (read5diveRotation returned non-null). Older CLIs just omit the row.
+  if (rotation) {
+    kb.row().text(`⟳ Auto-rotate: ${rotation.enabled ? '🟢 on' : '⚪️ off'}`, 'rot:menu')
+  }
+  const text = [
+    `Current account: ${current}`,
+    `Tap to switch · /usage for the full board`,
+  ].join('\n')
+  return { text, keyboard: kb }
+}
+
+// Build the rotation submenu (body + keyboard) for `me`. Returns null when
+// rotation is unsupported (older CLI) or the account list can't be read, so
+// the caller can fall back to an error toast.
+async function buildRotationMenu(
+  me: string,
+): Promise<{ text: string; keyboard: InlineKeyboard } | null> {
+  const [accounts, usage, rot] = await Promise.all([
+    read5diveAccountList(),
+    read5diveAccountUsage(),
+    read5diveRotation(me),
+  ])
+  if (!accounts || !rot) return null
+  const usageByName = new Map((usage ?? []).map(u => [u.name, u.usage]))
+  const suffixFor = (name: string): string => {
+    const dot = usageDot(usageByName.get(name))
+    return dot ? ` ${dot}` : ''
+  }
+  return {
+    text: rotationBody(rot),
+    keyboard: rotationKeyboard(accounts.map(a => a.name), rot, suffixFor),
+  }
 }
 
 // Shared apply path for the text and callback flows. Edits settings.json
@@ -2017,36 +2156,12 @@ const commandHandlers: Record<string, CommandHandler> = {
       await ctx.reply(`Can't determine this agent's name (not running as agent-* user).`)
       return
     }
-    const [accounts, agents, usage] = await Promise.all([
-      read5diveAccountList(),
-      read5diveAgentList(),
-      read5diveAccountUsage(),
-    ])
-    if (!accounts) {
-      await ctx.reply(`Failed to list accounts. Try: sudo 5dive account list`)
+    const menu = await buildAccountMenu(me)
+    if ('error' in menu) {
+      await ctx.reply(menu.error)
       return
     }
-    if (accounts.length === 0) {
-      await ctx.reply(
-        `No accounts configured.\n\nAdd one with: sudo 5dive account add <name>`,
-      )
-      return
-    }
-    const current = agents?.find(a => a.name === me)?.authProfile || 'default'
-    const usageByName = new Map((usage ?? []).map(u => [u.name, u.usage]))
-    const suffixFor = (name: string): string => {
-      const u = usageByName.get(name)
-      const dot = usageDot(u)
-      if (!dot) return ''
-      const five = u?.fiveHour?.pct
-      return five != null ? ` ${dot} ${Math.round(five)}%` : ` ${dot}`
-    }
-    const kb = accountKeyboard(accounts.map(a => a.name), current, suffixFor)
-    const lines = [
-      `Current account: ${current}`,
-      `Tap to switch · /usage for the full board`,
-    ]
-    await ctx.reply(lines.join('\n'), { reply_markup: kb })
+    await ctx.reply(menu.text, { reply_markup: menu.keyboard })
   },
 
   // /usage — the full Anthropic 5h/7d limit board across every account (the
@@ -2267,6 +2382,72 @@ bot.on('callback_query:data', async ctx => {
       await ctx.editMessageText(r.text).catch(() => {})
     }
     r.after?.()
+    return
+  }
+
+  // /account auto-rotate submenu (DIVE-35). Every rot:* tap re-reads the live
+  // config, applies the mutation via `rotation set`, then re-renders this same
+  // message so the keyboard always mirrors the registry. No restart is ever
+  // triggered here — this only edits rotation config; the actual swap happens
+  // later, inside the StopFailure hook, if a real usage limit hits.
+  if (data?.startsWith('rot:')) {
+    const me = thisAgentName()
+    if (!me) {
+      await ctx.answerCallbackQuery({ text: 'Not an agent user.' }).catch(() => {})
+      return
+    }
+    if (data === 'rot:menu') {
+      const menu = await buildRotationMenu(me)
+      if (!menu) {
+        await ctx.answerCallbackQuery({ text: 'Rotation unavailable.' }).catch(() => {})
+        return
+      }
+      await ctx.answerCallbackQuery().catch(() => {})
+      await ctx.editMessageText(menu.text, { reply_markup: menu.keyboard }).catch(() => {})
+      return
+    }
+    if (data === 'rot:back') {
+      const menu = await buildAccountMenu(me)
+      await ctx.answerCallbackQuery().catch(() => {})
+      if ('error' in menu) {
+        await ctx.editMessageText(menu.error).catch(() => {})
+        return
+      }
+      await ctx.editMessageText(menu.text, { reply_markup: menu.keyboard }).catch(() => {})
+      return
+    }
+    // Mutating taps: read current → mutate → write → re-render.
+    const rot = await read5diveRotation(me)
+    if (!rot) {
+      await ctx.answerCallbackQuery({ text: 'Rotation unavailable.' }).catch(() => {})
+      return
+    }
+    let enabled = rot.enabled
+    let accounts = rot.accounts
+    const acctM = /^rot:acct:([a-z][a-z0-9_-]{0,31})$/.exec(data)
+    if (data === 'rot:toggle') {
+      enabled = !enabled
+    } else if (acctM) {
+      const name = acctM[1]!
+      accounts = accounts.includes(name)
+        ? accounts.filter(a => a !== name)
+        : [...accounts, name]
+    } else {
+      await ctx.answerCallbackQuery().catch(() => {})
+      return
+    }
+    const err = await write5diveRotation(me, enabled, accounts)
+    if (err) {
+      // The CLI rejected it (e.g. an account with no same-type credential).
+      // Surface the reason in the toast and leave the keyboard as-is.
+      await ctx.answerCallbackQuery({ text: err.slice(0, 180) }).catch(() => {})
+      return
+    }
+    await ctx.answerCallbackQuery().catch(() => {})
+    const menu = await buildRotationMenu(me)
+    if (menu) {
+      await ctx.editMessageText(menu.text, { reply_markup: menu.keyboard }).catch(() => {})
+    }
     return
   }
 
