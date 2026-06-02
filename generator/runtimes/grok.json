@@ -12,7 +12,7 @@
     "timeoutKey": "tool_timeout_sec",
     "pkgScope": "@5dive/telegram-grok-mcp"
   },
-  "version": "0.1.24",
+  "version": "0.1.25",
   "manifest": "claude-plugin",
   "blocks": []
 }

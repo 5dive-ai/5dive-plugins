@@ -1564,8 +1564,24 @@ function startRearmWatchdog(): void {
 // Boot
 // ============================================================================
 
-process.on('SIGTERM', () => { shuttingDown = true; bot.stop().catch(() => {}) })
-process.on('SIGINT',  () => { shuttingDown = true; bot.stop().catch(() => {}) })
+// Stop cleanly AND exit. bot.stop() aborts the in-flight getUpdates long-poll
+// so the next poller doesn't 409-conflict on the single-consumer token — but
+// the MCP StdioServerTransport keeps stdin (and the event loop) alive, so the
+// process won't exit on its own. Without an explicit exit, systemd waits the
+// full TimeoutStopSec then SIGKILLs, and each create-flow restart burns that
+// window before the bridge answers (the ~2-3min dead window). Force exit on a
+// short deadline too, in case bot.stop() can't settle mid-abort.
+let shuttingDownExit = false
+function shutdown() {
+  if (shuttingDownExit) return
+  shuttingDownExit = true
+  shuttingDown = true
+  const deadline = setTimeout(() => process.exit(0), 2000)
+  deadline.unref?.()
+  bot.stop().catch(() => {}).finally(() => process.exit(0))
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT',  shutdown)
 
 await mcp.connect(new StdioServerTransport())
 
