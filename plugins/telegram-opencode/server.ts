@@ -391,6 +391,136 @@ async function sendReply(chat_id: string, text: string, opts?: { reply_to?: numb
 
 let lastInboundTs: string | null = null
 
+// ============================================================================
+// Progressive streaming relay
+// ============================================================================
+//
+// The per-token stream comes from `message.part.delta` events (field:text). We
+// accumulate those and edit a Telegram message in place as it grows, so the user
+// watches the reply form instead of waiting for one dump at turn-end.
+//
+// Three traps the live API taught us, all handled here:
+//   • `message.part.updated` is NOT the token stream — it fires only at part
+//     start (empty) and end (full). Keying off it makes the reply land as one
+//     block. It IS the source of truth for a part's TYPE and final text.
+//   • reasoning streams through the same `field:text` deltas as the answer, but
+//     on parts typed `reasoning`. We learn each part's type from `updated` and
+//     append deltas only for `text` parts, so reasoning never leaks in.
+//   • the user's OWN prompt echoes back as a text part (role=user) — skipped via
+//     the role learned from `message.updated`.
+
+const EDIT_THROTTLE_MS = 1100
+
+type StreamState = {
+  chat_id: string
+  ses: string
+  reply_to?: number
+  thread?: number
+  textParts: Map<string, string>   // assistant text partID -> accumulated text
+  partType: Map<string, string>    // partID -> opencode part type (text/reasoning/…)
+  order: string[]                  // text partIDs in first-seen order
+  msgIds: number[]                 // telegram message id per chunk
+  sentChunks: string[]             // last text set on each chunk's message
+  lastEditAt: number
+  timer: ReturnType<typeof setTimeout> | null
+  started: boolean                 // first chunk sent (typing can stop)
+  finalized: boolean
+  finalText: string | null         // authoritative text from the prompt POST
+  flushing: boolean
+  dirty: boolean
+}
+
+const streams = new Map<string, StreamState>()   // sessionID -> stream
+const roleByMsg = new Map<string, string>()       // messageID -> role
+const lastPromptByChat = new Map<string, string>() // chat_id -> last prompt text
+
+function newStream(chat_id: string, ses: string, reply_to?: number, thread?: number): StreamState {
+  const s: StreamState = {
+    chat_id, ses, reply_to, thread,
+    textParts: new Map(), partType: new Map(), order: [], msgIds: [], sentChunks: [],
+    lastEditAt: 0, timer: null, started: false, finalized: false,
+    finalText: null, flushing: false, dirty: false,
+  }
+  streams.set(ses, s)
+  return s
+}
+
+function renderStream(s: StreamState): string {
+  return s.order.map(id => s.textParts.get(id) ?? '').join('').trim()
+}
+function targetText(s: StreamState): string {
+  return s.finalText ?? renderStream(s)
+}
+
+function scheduleFlush(s: StreamState): void {
+  if (s.timer || s.finalized) return
+  const wait = Math.max(0, EDIT_THROTTLE_MS - (Date.now() - s.lastEditAt))
+  s.timer = setTimeout(() => { s.timer = null; void flushStream(s) }, wait)
+}
+
+// Render the current target text into one-or-more Telegram messages, editing in
+// place. chunkForTelegram splits greedily from the front, so once text only
+// grows by appending, earlier chunk boundaries are stable — only the tail chunk
+// keeps changing, and sentChunks[] dedup skips no-op edits on the settled ones.
+async function flushStream(s: StreamState): Promise<void> {
+  if (s.flushing) { s.dirty = true; return }
+  s.flushing = true
+  try {
+    const full = targetText(s)
+    if (!full && !s.started) return
+    const limit = loadAccess().textChunkLimit ?? TG_MAX_MESSAGE_CHARS
+    const chunks = chunkForTelegram(full || '…', limit)
+    s.lastEditAt = Date.now()
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i]!
+      if (i < s.msgIds.length) {
+        if (s.sentChunks[i] === chunk) continue
+        try {
+          await bot.api.editMessageText(s.chat_id, s.msgIds[i]!, chunk)
+        } catch (err: any) {
+          const d = String(err?.description ?? err?.message ?? err)
+          if (!/not modified/i.test(d)) process.stderr.write(`telegram-opencode: stream edit failed: ${d}\n`)
+        }
+        s.sentChunks[i] = chunk
+      } else {
+        try {
+          const sent = await bot.api.sendMessage(s.chat_id, chunk, {
+            ...(i === 0 && s.reply_to != null ? { reply_parameters: { message_id: s.reply_to } } : {}),
+            ...(s.thread != null ? { message_thread_id: s.thread } : {}),
+          })
+          s.msgIds[i] = sent.message_id
+          s.sentChunks[i] = chunk
+          if (!s.started) { s.started = true; stopTypingLoop(s.chat_id) }
+        } catch (err) {
+          process.stderr.write(`telegram-opencode: stream send failed: ${err}\n`)
+        }
+      }
+    }
+  } finally {
+    s.flushing = false
+    if (s.dirty) { s.dirty = false; void flushStream(s) }
+  }
+}
+
+// Lock in the authoritative text from the prompt POST and flush one last time,
+// so the final Telegram state always matches opencode's response exactly even
+// if some stream events were missed.
+async function finalizeStream(s: StreamState, finalText: string): Promise<void> {
+  s.finalText = finalText.trim() ? finalText : (renderStream(s) || '(opencode returned no text)')
+  s.finalized = true
+  if (s.timer) { clearTimeout(s.timer); s.timer = null }
+  await flushStream(s)
+  if (s.dirty) { await new Promise(r => setTimeout(r, 50)); await flushStream(s) }
+  streams.delete(s.ses)
+  stopTypingLoop(s.chat_id)
+}
+
+function dropStream(ses: string): void {
+  const s = streams.get(ses)
+  if (s?.timer) { clearTimeout(s.timer); s.timer = null }
+  streams.delete(ses)
+}
+
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'help',    description: 'Show commands' },
   { command: 'status',  description: 'Server, model, session' },
@@ -608,6 +738,7 @@ async function abortChat(chat_id: string): Promise<string> {
   if (!ses) return 'Nothing running for this chat.'
   try {
     const r = await ocFetch(`/session/${ses}/abort`, { method: 'POST', body: '{}' })
+    dropStream(ses)
     stopTypingLoop(chat_id)
     return r.ok ? '✋ aborted the current turn.' : `⚠️ abort failed: HTTP ${r.status}`
   } catch (e) { return `⚠️ abort failed: ${e instanceof Error ? e.message : String(e)}` }
@@ -703,38 +834,55 @@ async function ingest(ctx: Context, text: string): Promise<void> {
   }
 
   startTypingLoop(chat_id)
+  lastPromptByChat.set(chat_id, text)
+  let ses = ''
   try {
-    const ses = await sessionForChat(chat_id)
+    ses = await sessionForChat(chat_id)
     const model = currentModel()
     const body: any = { parts: [{ type: 'text', text }] }
     if (model) body.model = model
+    // Register a stream so the SSE relay can edit a Telegram message in place as
+    // assistant text parts arrive during this turn.
+    const stream = newStream(chat_id, ses, reply_to, threadId)
     // Synchronous prompt: resolves with the assistant message once the turn
     // ends. Permission/question interrupts that arrive mid-turn are handled
     // concurrently by the SSE relay below.
     const r = await ocFetch(`/session/${ses}/message`, { method: 'POST', body: JSON.stringify(body) })
     if (!r.ok) {
+      dropStream(ses)
       stopTypingLoop(chat_id)
       await sendReply(chat_id, `⚠️ opencode error: HTTP ${r.status}`, { reply_to, thread: threadId })
       return
     }
     const msg = (await r.json()) as { parts?: any[]; info?: any }
-    const out = extractText(msg.parts ?? [])
-    stopTypingLoop(chat_id)
-    await sendReply(chat_id, out || '(opencode returned no text)', { reply_to, thread: threadId })
+    // Finalize against the authoritative response text — this both delivers the
+    // reply when nothing streamed (fast turns) and corrects any drift when it did.
+    await finalizeStream(stream, extractText(msg.parts ?? []))
   } catch (err) {
+    if (ses) dropStream(ses)
     stopTypingLoop(chat_id)
     await sendReply(chat_id, `⚠️ failed to reach opencode: ${err instanceof Error ? err.message : String(err)}`,
       { reply_to, thread: threadId })
   }
 }
 
-bot.on('message:text', async ctx => { await ingest(ctx, ctx.message.text) })
-bot.on('message:photo', async ctx => {
+// IMPORTANT: do NOT await ingest() here. grammy's bot.start() processes updates
+// sequentially — it won't fetch the next update until the current handler
+// resolves. An opencode turn blocks until it ends, and a turn that hits a
+// permission prompt can't end until the user TAPS a button — but that tap is the
+// next update, which can't be processed while we're still awaiting the turn.
+// Awaiting would deadlock (turn waits for tap, tap waits for turn). Firing the
+// turn async keeps the update loop free so callbacks/new messages flow through.
+const runIngest = (ctx: Context, text: string) =>
+  void ingest(ctx, text).catch(err => process.stderr.write(`telegram-opencode: ingest failed: ${err}\n`))
+
+bot.on('message:text', ctx => { runIngest(ctx, ctx.message.text) })
+bot.on('message:photo', ctx => {
   // Image understanding via file parts is a follow-up; for now forward the caption.
-  await ingest(ctx, ctx.message.caption ?? '(photo — image input not yet wired)')
+  runIngest(ctx, ctx.message.caption ?? '(photo — image input not yet wired)')
 })
-bot.on('message:document', async ctx => {
-  await ingest(ctx, ctx.message.caption ?? `(document: ${ctx.message.document.file_name ?? 'file'} — file input not yet wired)`)
+bot.on('message:document', ctx => {
+  runIngest(ctx, ctx.message.caption ?? `(document: ${ctx.message.document.file_name ?? 'file'} — file input not yet wired)`)
 })
 
 bot.catch(err => { process.stderr.write(`telegram-opencode: handler error (polling continues): ${err.error}\n`) })
@@ -751,8 +899,11 @@ async function postPermissionPrompt(ev: any): Promise<void> {
   const ses = String(p.sessionID ?? ''), reqId = String(p.id ?? '')
   const chat_id = sessionToChat.get(ses)
   if (!chat_id || !reqId) return
-  const tool = p.tool?.callID ? ` (${p.permission})` : ''
-  const body = `🔐 opencode wants permission${tool}:\n\`${String(p.permission).slice(0, 300)}\``
+  // `permission` is the tool/action (e.g. "bash"); `patterns` holds the concrete
+  // thing being permitted (e.g. the command), which is what the user wants to see.
+  const what = Array.isArray(p.patterns) && p.patterns.length
+    ? p.patterns.join('\n') : String(p.permission ?? 'action')
+  const body = `🔐 opencode wants to run *${String(p.permission)}*:\n\`${what.slice(0, 350)}\``
   const kb = new InlineKeyboard()
     .text('✅ once', `ocperm:once:${reqId}`).text('✅ always', `ocperm:always:${reqId}`).text('❌ reject', `ocperm:reject:${reqId}`)
   try {
@@ -768,6 +919,7 @@ bot.on('callback_query:data', async ctx => {
   const response = m[1] as 'once' | 'always' | 'reject'
   const reqId = m[2]!
   const senderId = String(ctx.from.id)
+  process.stderr.write(`telegram-opencode: callback ${response} for ${reqId} from ${senderId}\n`)
   if (!loadAccess().allowFrom.includes(senderId)) {
     await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
     return
@@ -827,18 +979,68 @@ async function startEventRelay(): Promise<void> {
 async function handleEvent(ev: any): Promise<void> {
   switch (ev.type) {
     case 'permission.asked': await postPermissionPrompt(ev); break
+    case 'message.updated': {
+      // Learn each message's role so we can tell the assistant's answer apart
+      // from the user's echoed prompt when streaming text parts below.
+      const info = ev.properties?.info
+      if (info?.id && info?.role) {
+        roleByMsg.set(info.id, info.role)
+        if (roleByMsg.size > 2000) roleByMsg.clear()
+      }
+      break
+    }
+    case 'message.part.updated': {
+      // This event carries part.type but only fires at part start (empty) and
+      // end (full) — NOT per token. We use it purely to learn each part's TYPE
+      // (so delta events below can be filtered to text vs reasoning) and to
+      // correct the accumulated text with the authoritative full value.
+      const part = ev.properties?.part
+      if (!part) break
+      const s = streams.get(String(part.sessionID ?? ''))
+      if (!s) break
+      const role = roleByMsg.get(part.messageID)
+      if (role === 'user') break   // skip the user's own echoed prompt
+      if (role === undefined && part.type === 'text' && typeof part.text === 'string'
+          && part.text === lastPromptByChat.get(s.chat_id)) break
+      s.partType.set(part.id, part.type)
+      if (part.type !== 'text') break
+      if (!s.textParts.has(part.id)) s.order.push(part.id)
+      // Take the full text only if it's at least as long as what deltas built,
+      // so a late empty/short update can't clobber streamed tokens.
+      if (typeof part.text === 'string' && part.text.length >= (s.textParts.get(part.id) ?? '').length) {
+        s.textParts.set(part.id, part.text)
+      }
+      scheduleFlush(s)
+      break
+    }
+    case 'message.part.delta': {
+      // The real token stream. Deltas don't carry part type, so we only append
+      // for parts already known to be text (reasoning streams here too, on parts
+      // typed 'reasoning' — excluded). Leading tokens before the part's first
+      // `updated` are skipped; the prompt POST's authoritative text fills any gap.
+      const p = ev.properties ?? {}
+      if (p.field !== 'text') break
+      const s = streams.get(String(p.sessionID ?? ''))
+      if (!s || s.partType.get(p.partID) !== 'text') break
+      if (!s.textParts.has(p.partID)) s.order.push(p.partID)
+      s.textParts.set(p.partID, (s.textParts.get(p.partID) ?? '') + String(p.delta ?? ''))
+      scheduleFlush(s)
+      break
+    }
     case 'session.error': {
       const p = ev.properties ?? ev
-      const chat_id = sessionToChat.get(String(p.sessionID ?? ''))
+      const ses = String(p.sessionID ?? '')
+      const chat_id = sessionToChat.get(ses)
       if (chat_id) {
+        dropStream(ses)
         stopTypingLoop(chat_id)
         const detail = p.error?.data?.message ?? p.error?.name ?? JSON.stringify(p.error ?? {}).slice(0, 300)
         await sendReply(chat_id, `⚠️ opencode error: ${detail}`)
       }
       break
     }
-    // session.idle / heartbeat / deltas are observed for liveness but the text
-    // reply is delivered from the awaited prompt POST, so nothing to do here.
+    // session.idle / heartbeat are observed for liveness; the authoritative text
+    // is finalized from the awaited prompt POST, so nothing to do here.
     default: break
   }
 }
@@ -858,6 +1060,12 @@ void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
+        // Telegram REMEMBERS the last allowed_updates passed to getUpdates and
+        // reuses it when omitted. A bridge that ran on this token before (e.g.
+        // an antigravity bot with no inline buttons) may have narrowed it to
+        // exclude callback_query — which silently kills our permission buttons
+        // (messages arrive, taps don't). Pin it explicitly to what we handle.
+        allowed_updates: ['message', 'callback_query'],
         onStart: info => {
           attempt = 0
           botUsername = info.username
