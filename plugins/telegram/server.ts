@@ -1121,7 +1121,7 @@ type FiveDiveAgentEntry = {
 
 async function read5diveAgentList(): Promise<FiveDiveAgentEntry[] | null> {
   try {
-    const { stdout } = await execFileP('sudo', ['-n', '5dive', 'agent', 'list', '--json'], { timeout: 3000 })
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'agent', 'list', '--json'], { timeout: 3000 })
     const j = JSON.parse(stdout)
     if (j?.ok && Array.isArray(j.data)) return j.data as FiveDiveAgentEntry[]
     return null
@@ -1134,7 +1134,7 @@ type FiveDiveAccountEntry = { name: string; types?: string[]; agents?: string[] 
 
 async function read5diveAccountList(): Promise<FiveDiveAccountEntry[] | null> {
   try {
-    const { stdout } = await execFileP('sudo', ['-n', '5dive', 'account', 'list', '--json'], { timeout: 3000 })
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'account', 'list', '--json'], { timeout: 3000 })
     const j = JSON.parse(stdout)
     if (j?.ok && Array.isArray(j.data)) return j.data as FiveDiveAccountEntry[]
     return null
@@ -1161,7 +1161,7 @@ type FiveDiveAccountUsage = {
 // to "no usage" rather than erroring.
 async function read5diveAccountUsage(): Promise<FiveDiveAccountUsage[] | null> {
   try {
-    const { stdout } = await execFileP('sudo', ['-n', '5dive', 'account', 'usage', '--json'], { timeout: 5000 })
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'account', 'usage', '--json'], { timeout: 5000 })
     const j = JSON.parse(stdout)
     if (j?.ok && Array.isArray(j.data)) return j.data as FiveDiveAccountUsage[]
     return null
@@ -1185,7 +1185,7 @@ type FiveDiveRotation = {
 // the picker just hides the rotation row rather than erroring.
 async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
   try {
-    const { stdout } = await execFileP('sudo', ['-n', '5dive', '--json', 'agent', 'rotation', 'get', me], { timeout: 3000 })
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', '--json', 'agent', 'rotation', 'get', me], { timeout: 3000 })
     const j = JSON.parse(stdout)
     if (j?.ok && j.data) return j.data as FiveDiveRotation
     return null
@@ -1201,7 +1201,7 @@ async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
 async function write5diveRotation(me: string, enabled: boolean, accountsArg: string): Promise<string | null> {
   try {
     await execFileP(
-      'sudo',
+      SUDO,
       ['-n', '5dive', 'agent', 'rotation', 'set', me, `--enabled=${enabled}`, `--accounts=${accountsArg}`],
       { timeout: 5000 },
     )
@@ -1473,7 +1473,7 @@ function applyModel(alias: string, chatId: number): ApplyResult {
     // process running the old model. Restarting picks up settings.json cleanly.
     after: () => {
       void execFileP(
-        'sudo',
+        SUDO,
         ['-n', 'systemd-run', '--on-active=1', '--collect',
           '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
         { timeout: 5000 },
@@ -1519,7 +1519,7 @@ async function applyAccount(name: string, chatId: number): Promise<ApplyResult> 
     // rare failure (sudo denied, CLI error) no restart fires and the bot is
     // still alive, so we correct the optimistic ✅ with a fresh reply.
     after: () => {
-      void execFileP('sudo', ['-n', '5dive', 'agent', 'set-account', me, name], { timeout: 5000 })
+      void execFileP(SUDO, ['-n', '5dive', 'agent', 'set-account', me, name], { timeout: 5000 })
         .catch((err: any) => {
           const stderr = err?.stderr ? String(err.stderr).trim() : ''
           void bot.api.sendMessage(
@@ -1548,7 +1548,7 @@ function applyEffort(level: string, chatId: number): ApplyResult {
     // tmux send-keys was unreliable; deferred restart is the source of truth.
     after: () => {
       void execFileP(
-        'sudo',
+        SUDO,
         ['-n', 'systemd-run', '--on-active=1', '--collect',
           '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
         { timeout: 5000 },
@@ -1615,6 +1615,20 @@ function formatDuration(ms: number): string {
 }
 
 const execFileP = promisify(execFile)
+
+// Absolute path to sudo. The plugin's MCP server can run with a PATH that
+// omits /usr/bin — observed via /update, whose deferred restart spawn failed
+// with `ENOENT: no such file or directory, posix_spawn 'sudo'` even though an
+// earlier sudo in the same handler had worked. Resolving once at load makes
+// every spawn below PATH-independent. Falls back to the canonical location.
+const SUDO =
+  ['/usr/bin/sudo', '/bin/sudo'].find(p => {
+    try {
+      return statSync(p).isFile()
+    } catch {
+      return false
+    }
+  }) ?? '/usr/bin/sudo'
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
@@ -1831,7 +1845,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     // wire. On failure no restart fires (bot stays alive) — correct the
     // optimistic ack with a fresh reply.
     void execFileP(
-      'sudo',
+      SUDO,
       ['-n', 'systemd-run', '--on-active=1', '--collect',
         '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
       { timeout: 5000 },
@@ -1858,7 +1872,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     let refreshStdout = ''
     try {
       const { stdout } = await execFileP(
-        'sudo',
+        SUDO,
         ['-n', '/usr/local/bin/5dive-refresh-plugins.sh', me],
         { timeout: 120_000 },
       )
@@ -1892,7 +1906,7 @@ const commandHandlers: Record<string, CommandHandler> = {
         : `Plugins refreshed.`
     await ctx.reply(`${summary}\n\n⚠️  Restarting in ~1s — back shortly.`)
     void execFileP(
-      'sudo',
+      SUDO,
       ['-n', 'systemd-run', '--on-active=1', '--collect',
         '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
       { timeout: 5000 },
@@ -1968,7 +1982,7 @@ const commandHandlers: Record<string, CommandHandler> = {
 
     if (parts.length === 0) {
       try {
-        const { stdout } = await execFileP('sudo', ['-n', '5dive', 'agent', 'list', '--json'])
+        const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'agent', 'list', '--json'])
         const j = JSON.parse(stdout)
         if (!j.ok || !Array.isArray(j.data)) {
           await ctx.reply(`5dive returned unexpected output.`)
@@ -2017,7 +2031,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       }
       try {
         const { stdout } = await execFileP(
-          'sudo', ['-n', '5dive', 'agent', action, name, '--json'], { timeout: 8000 },
+          SUDO, ['-n', '5dive', 'agent', action, name, '--json'], { timeout: 8000 },
         )
         const j = JSON.parse(stdout)
         if (!j.ok) {
@@ -2046,7 +2060,7 @@ const commandHandlers: Record<string, CommandHandler> = {
   // on the dashboard / CLI for now.
   tasks: async ctx => {
     try {
-      const { stdout } = await execFileP('sudo', ['-n', '5dive', 'task', 'ls', '--json'])
+      const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'])
       const j = JSON.parse(stdout)
       if (!j.ok || !Array.isArray(j.data?.tasks)) {
         await ctx.reply(`5dive returned unexpected output.`)
@@ -2089,7 +2103,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     const from = ctx.from?.username || 'telegram'
     try {
       const { stdout } = await execFileP(
-        'sudo',
+        SUDO,
         ['-n', '5dive', 'task', 'add', '--json', `--from=${from}`, '--', title],
         { timeout: 8000 },
       )
@@ -2114,7 +2128,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       return
     }
     try {
-      const { stdout } = await execFileP('sudo', ['-n', '5dive', 'org', 'tree', '--json'])
+      const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'org', 'tree', '--json'])
       const j = JSON.parse(stdout)
       if (!j.ok || !Array.isArray(j.data?.tree)) {
         await ctx.reply(`5dive returned unexpected output.`)
