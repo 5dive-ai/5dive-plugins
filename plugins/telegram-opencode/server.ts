@@ -260,9 +260,25 @@ async function ocAlive(base: string): Promise<boolean> {
   } catch { return false }
 }
 
-// Attach to OPENCODE_SERVER_URL if reachable, else spawn `opencode serve` and
-// read its port off stdout. The spawned server is a child of this process and
-// dies with it (the systemd unit owns the lifecycle either way).
+// Bind an OS-assigned loopback port, then release it and hand the number to
+// `opencode serve --port N`. Lets multiple opencode agents share one box with no
+// per-agent port bookkeeping in provisioning (DIVE-42). The bind→close→reuse
+// window is tiny and we're the only thing spawning servers in this state dir.
+function pickFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = require('net').createServer()
+    srv.once('error', reject)
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address()
+      const port = typeof addr === 'object' && addr ? addr.port : 0
+      srv.close(() => port ? resolve(port) : reject(new Error('could not acquire a free port')))
+    })
+  })
+}
+
+// Attach to OPENCODE_SERVER_URL if reachable, else spawn `opencode serve`. The
+// spawned server is a child of this process and dies with it (the systemd unit
+// owns the lifecycle either way).
 let serveChild: ReturnType<typeof import('child_process').spawn> | null = null
 async function ensureServer(): Promise<void> {
   const configured = process.env.OPENCODE_SERVER_URL
@@ -271,9 +287,11 @@ async function ensureServer(): Promise<void> {
     process.stderr.write(`telegram-opencode: attached to ${ocBase}\n`)
     return
   }
-  // Spawn our own server on a fixed loopback port.
   const { spawn } = require('child_process')
-  const port = Number(process.env.OPENCODE_SERVE_PORT ?? 4096)
+  // Honor an explicit OPENCODE_SERVE_PORT (debug/attach), otherwise auto-pick a
+  // free loopback port so co-located opencode agents never collide.
+  const explicit = process.env.OPENCODE_SERVE_PORT
+  const port = explicit ? Number(explicit) : await pickFreePort()
   const bin = process.env.OPENCODE_BIN ?? 'opencode'
   const env = { ...process.env }
   if (OC_PASS) env.OPENCODE_SERVER_PASSWORD = OC_PASS
