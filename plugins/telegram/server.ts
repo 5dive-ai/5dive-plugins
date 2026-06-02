@@ -963,7 +963,7 @@ function readClaudeModelAndEffort(pid: number): { model?: string; effort?: strin
 // expect: `5dive X.Y.Z`.
 async function read5diveVersion(): Promise<string | null> {
   try {
-    const { stdout } = await execFileP('5dive', ['--version'], { timeout: 2000 })
+    const { stdout } = await execFileP(FIVEDIVE, ['--version'], { timeout: 2000 })
     const m = stdout.trim().match(/^5dive\s+(\S+)$/)
     return m ? m[1] : null
   } catch {
@@ -1579,7 +1579,7 @@ function proxyToClaudeTUI(line: string, autoConfirm?: RegExp): void {
   const target = user.startsWith('agent-') ? user : ''
   if (!target) return
   const paneTarget = `${target}:0`
-  execFileP('tmux', ['send-keys', '-t', paneTarget, line, 'Enter']).catch(() => {})
+  execFileP(TMUX, ['send-keys', '-t', paneTarget, line, 'Enter']).catch(() => {})
   if (autoConfirm) void confirmMenuIfPresent(paneTarget, autoConfirm)
 }
 
@@ -1590,9 +1590,9 @@ async function confirmMenuIfPresent(paneTarget: string, re: RegExp): Promise<voi
   const deadline = Date.now() + 5000
   while (Date.now() < deadline) {
     try {
-      const { stdout } = await execFileP('tmux', ['capture-pane', '-t', paneTarget, '-p'])
+      const { stdout } = await execFileP(TMUX, ['capture-pane', '-t', paneTarget, '-p'])
       if (re.test(stdout)) {
-        await execFileP('tmux', ['send-keys', '-t', paneTarget, '1', 'Enter']).catch(() => {})
+        await execFileP(TMUX, ['send-keys', '-t', paneTarget, '1', 'Enter']).catch(() => {})
         return
       }
     } catch {
@@ -1616,19 +1616,26 @@ function formatDuration(ms: number): string {
 
 const execFileP = promisify(execFile)
 
-// Absolute path to sudo. The plugin's MCP server can run with a PATH that
-// omits /usr/bin — observed via /update, whose deferred restart spawn failed
-// with `ENOENT: no such file or directory, posix_spawn 'sudo'` even though an
-// earlier sudo in the same handler had worked. Resolving once at load makes
-// every spawn below PATH-independent. Falls back to the canonical location.
-const SUDO =
-  ['/usr/bin/sudo', '/bin/sudo'].find(p => {
+// The plugin's MCP server can run with a PATH that omits /usr/bin and
+// /usr/local/bin — observed on a managed agent where /update's deferred
+// restart spawn failed with `ENOENT: posix_spawn 'sudo'` and the 5dive
+// version probe (bare `5dive --version`) silently returned null, making the
+// dispatcher wrongly report every 5dive command as "needs a newer CLI".
+// Resolve each external binary to an absolute path once at load so every
+// spawn below is PATH-independent. Falls back to the canonical location.
+const resolveBin = (candidates: string[]): string => {
+  for (const p of candidates) {
     try {
-      return statSync(p).isFile()
+      if (statSync(p).isFile()) return p
     } catch {
-      return false
+      // not here — try the next candidate
     }
-  }) ?? '/usr/bin/sudo'
+  }
+  return candidates[0]!
+}
+const SUDO = resolveBin(['/usr/bin/sudo', '/bin/sudo'])
+const FIVEDIVE = resolveBin(['/usr/local/bin/5dive', '/usr/bin/5dive'])
+const TMUX = resolveBin(['/usr/bin/tmux', '/usr/local/bin/tmux', '/bin/tmux'])
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
@@ -1764,7 +1771,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       return
     }
     try {
-      await execFileP('tmux', ['send-keys', '-t', `${target}:0`, 'C-c'])
+      await execFileP(TMUX, ['send-keys', '-t', `${target}:0`, 'C-c'])
       await ctx.reply(`Sent Ctrl-C to ${target}.`)
     } catch (err) {
       await ctx.reply(`Failed to send Ctrl-C: ${err instanceof Error ? err.message : String(err)}`)
@@ -2163,7 +2170,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       return
     }
     try {
-      await execFileP('tmux', ['send-keys', '-t', `${target}:0`, '/clear', 'Enter'])
+      await execFileP(TMUX, ['send-keys', '-t', `${target}:0`, '/clear', 'Enter'])
       await ctx.reply(`Sent /clear — context wiped, session continues. (For a full process respawn use /restart.)`)
     } catch (err) {
       await ctx.reply(`Failed to send /clear: ${err instanceof Error ? err.message : String(err)}`)
