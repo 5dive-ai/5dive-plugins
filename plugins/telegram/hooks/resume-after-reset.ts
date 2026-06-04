@@ -27,7 +27,7 @@
 // spawns this detached so it runs free of the hook timeout.
 
 import { setTimeout as sleep } from 'timers/promises'
-import { unlinkSync } from 'fs'
+import { unlinkSync, utimesSync } from 'fs'
 import { capturePaneFor, sendKeys, type TmuxCtx } from './lib/tmux'
 import { sendMessage } from './lib/telegram'
 import { readEntries } from './lib/transcript'
@@ -62,6 +62,33 @@ function releaseLock(): void {
     unlinkSync(lockPath)
   } catch {
     /* already gone */
+  }
+}
+
+// Touch the resume lock's mtime. stopfailure-notify treats the lock as held
+// only while its mtime is fresh (< RESUME_LOCK_TTL_MS, 10min), so we MUST
+// heartbeat for the entire time we're working — including the long Phase-2
+// wait-for-reset — or a concurrent StopFailure will declare the lock stale,
+// reclaim it, and re-DM + spawn a duplicate helper (the 700-DMs-in-20s bug).
+function heartbeat(): void {
+  if (!lockPath) return
+  try {
+    const now = new Date()
+    utimesSync(lockPath, now, now)
+  } catch {
+    /* lock vanished — recovery will end naturally */
+  }
+}
+
+// sleep, but heartbeat the lock every ≤60s so long waits don't let it go stale.
+async function sleepHeartbeat(totalMs: number): Promise<void> {
+  const STEP_MS = 60 * 1000
+  let left = totalMs
+  while (left > 0) {
+    const chunk = Math.min(STEP_MS, left)
+    await sleep(chunk)
+    left -= chunk
+    heartbeat()
   }
 }
 
@@ -134,6 +161,7 @@ try {
         break
       }
       await sleep(1000)
+      heartbeat()
     }
     if (!pressed) log('phase1 menu never appeared after 60s — proceeding anyway')
   }
@@ -144,7 +172,7 @@ try {
     const delta = resetEpoch - now
     if (delta > 0 && delta <= MAX_WAIT_SEC) {
       log(`phase2 sleeping ${delta + 30}s until reset`)
-      await sleep((delta + 30) * 1000)
+      await sleepHeartbeat((delta + 30) * 1000)
     } else if (resetEpoch > 0) {
       log(`phase2 reset epoch out of trusted window (delta=${delta}s) — going to retry loop`)
     } else {
@@ -170,10 +198,10 @@ try {
       const now = Math.floor(Date.now() / 1000)
       if (epoch && epoch > now && epoch - now <= MAX_WAIT_SEC) {
         log(`phase3 still limited; learned reset, sleeping ${epoch - now + 30}s`)
-        await sleep((epoch - now + 30) * 1000)
+        await sleepHeartbeat((epoch - now + 30) * 1000)
       } else {
         log(`phase3 still limited; retrying in ${RETRY_INTERVAL_SEC}s`)
-        await sleep(RETRY_INTERVAL_SEC * 1000)
+        await sleepHeartbeat(RETRY_INTERVAL_SEC * 1000)
       }
     }
   }

@@ -19,7 +19,7 @@
 // the per-agent resume lock before spawning us; we release it when done.
 
 import { setTimeout as sleep } from 'timers/promises'
-import { unlinkSync } from 'fs'
+import { unlinkSync, utimesSync } from 'fs'
 import { capturePaneFor, sendKeys, type TmuxCtx } from './lib/tmux'
 import { sendMessage } from './lib/telegram'
 import { readEntries } from './lib/transcript'
@@ -49,6 +49,20 @@ function releaseLock(): void {
     unlinkSync(lockPath)
   } catch {
     /* already gone */
+  }
+}
+
+// Touch the resume lock's mtime. stopfailure-notify treats the lock as held
+// only while its mtime is fresh (< RESUME_LOCK_TTL_MS, 10min); heartbeat each
+// retry so a concurrent StopFailure can't declare it stale and re-DM + spawn a
+// duplicate helper while we're still backing off.
+function heartbeat(): void {
+  if (!lockPath) return
+  try {
+    const now = new Date()
+    utimesSync(lockPath, now, now)
+  } catch {
+    /* lock vanished — recovery will end naturally */
   }
 }
 
@@ -101,6 +115,7 @@ let resumed = false
 try {
   if (ctx) {
     for (let attempt = 0; attempt < BACKOFFS_SEC.length; attempt++) {
+      heartbeat()
       const wait = BACKOFFS_SEC[attempt]
       log(`attempt ${attempt + 1}/${BACKOFFS_SEC.length}: backing off ${wait}s before 'continue'`)
       await sleep(wait * 1000)

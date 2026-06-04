@@ -12,7 +12,7 @@
 // ~/.claude/channels/telegram/.env, etc).
 
 import { spawn, spawnSync } from 'child_process'
-import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync, readFileSync, writeFileSync, renameSync } from 'fs'
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync, writeFileSync, renameSync } from 'fs'
 import { homedir } from 'os'
 import { join, basename } from 'path'
 import { STATE_DIR } from './lib/paths'
@@ -347,17 +347,25 @@ function tryRotate(resetEpoch: number | null): { from: string; to: string } | nu
   return null
 }
 
-// Best-effort cross-process lock guarding a single resume helper per agent.
-// Exclusive-create wins; an existing lock is honored only if the recorded
-// PID is still alive AND the lock is within TTL. A dead PID is reclaimed
-// immediately (covers the common failure: agent service restart SIGKILL'd
-// the helper before it could releaseLock(), leaving the lock pinned for
-// hours and silencing every subsequent rate-limit episode).
+// Best-effort cross-process lock guarding a single resume helper per agent —
+// AND the per-agent dedup that stops us re-DMing the same usage-limit episode.
 //
-// TTL covers helpers we can't probe (e.g. PID was recycled by an unrelated
-// process). Set generously past the helper's max wait+retry budget so a
-// live helper isn't ousted mid-recovery.
-const RESUME_LOCK_TTL_MS = 37 * 3600 * 1000
+// The lock is held iff its mtime is FRESH (within RESUME_LOCK_TTL_MS). The
+// detached recovery helper (resume-after-reset / resume-after-error) touches
+// the lock on a < TTL heartbeat for the whole time it's working, so a long
+// wait-for-reset keeps the lock held and every concurrent StopFailure stays
+// silent. When the helper exits it unlinks the lock; if it's killed, the
+// mtime simply goes stale and the next episode reclaims it.
+//
+// We deliberately do NOT key the decision on the recorded PID. The PID written
+// here is this StopFailure HOOK process, which spawns the detached helper and
+// then exits within milliseconds — so a PID-liveness check ALWAYS saw it dead,
+// declared the lock stale, and re-notified + re-spawned on every single
+// StopFailure. A fast claude-restart-while-limited loop turned that into 700+
+// identical "usage limit" DMs in ~20s. mtime + heartbeat is immune: the very
+// first acquire stamps a fresh mtime, so a same-instant second StopFailure
+// already sees the lock held.
+const RESUME_LOCK_TTL_MS = 10 * 60 * 1000 // 10 min; helper heartbeats well under this
 function tryAcquireResumeLock(lockPath: string): boolean {
   try {
     const fd = openSync(lockPath, 'wx')
@@ -365,38 +373,21 @@ function tryAcquireResumeLock(lockPath: string): boolean {
     closeSync(fd)
     return true
   } catch {
-    let stale = false
+    // Lock exists. Honor it while its mtime is fresh (a helper is heartbeating);
+    // reclaim only once it's gone stale (helper died/finished without cleanup).
     try {
-      const raw = readFileSync(lockPath, 'utf8')
-      const pid = parseInt(raw.split(/\s+/)[0] ?? '', 10)
-      // process.kill(pid, 0) throws ESRCH if PID is dead. Any other throw
-      // (e.g. EPERM — PID alive but owned by another user) means the holder
-      // is alive enough to keep the lock.
-      if (Number.isFinite(pid) && pid > 0) {
-        try {
-          process.kill(pid, 0)
-        } catch (err: any) {
-          if (err?.code === 'ESRCH') stale = true
-        }
-      }
-      if (!stale) {
-        const st = statSync(lockPath)
-        if (Date.now() - st.mtimeMs > RESUME_LOCK_TTL_MS) stale = true
-      }
+      const st = statSync(lockPath)
+      if (Date.now() - st.mtimeMs <= RESUME_LOCK_TTL_MS) return false
     } catch {
-      /* lock vanished mid-check — let the next StopFailure retry acquire it */
+      /* lock vanished mid-check — fall through and try to (re)create it */
+    }
+    try {
+      const fd = openSync(lockPath, 'w')
+      writeSync(fd, `${process.pid} ${Date.now()}`)
+      closeSync(fd)
+      return true
+    } catch {
       return false
     }
-    if (stale) {
-      try {
-        const fd = openSync(lockPath, 'w')
-        writeSync(fd, `${process.pid} ${Date.now()}`)
-        closeSync(fd)
-        return true
-      } catch {
-        return false
-      }
-    }
-    return false
   }
 }
