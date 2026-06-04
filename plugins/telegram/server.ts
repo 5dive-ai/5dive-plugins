@@ -2311,9 +2311,7 @@ async function buildTaskList(): Promise<string> {
   const lines = tasks.slice(0, MAX).map((t: any) => {
     const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
     const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
-    let title = String(t.title)
-    if (title.length > 44) title = title.slice(0, 43).trimEnd() + '…'
-    return `${mine}${flag}${t.ident} · ${title}  /task_${t.id}`
+    return `${mine}${flag}${t.ident} · ${t.title}  /task_${t.id}`
   })
   const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more)` : ''
   return `Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`
