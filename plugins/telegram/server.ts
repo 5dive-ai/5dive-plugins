@@ -2066,27 +2066,12 @@ const commandHandlers: Record<string, CommandHandler> = {
   // Read-only; mutations go through /task add (create) — status changes stay
   // on the dashboard / CLI for now.
   tasks: async ctx => {
-    try {
-      const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'])
-      const j = JSON.parse(stdout)
-      if (!j.ok || !Array.isArray(j.data?.tasks)) {
-        await ctx.reply(`5dive returned unexpected output.`)
-        return
-      }
-      const tasks = j.data.tasks
-      if (tasks.length === 0) {
-        await ctx.reply(`No open tasks.\n\nAdd one with /task add <title>.`)
-        return
-      }
-      const lines = tasks.map((t: any) => {
-        const pri = t.priority && t.priority !== 'medium' ? ` (${t.priority})` : ''
-        const who = t.assignee ? ` · ${t.assignee}` : ''
-        return `• ${t.ident} [${t.status}]${pri} ${t.title}${who}`
-      })
-      await ctx.reply(`Open tasks:\n\n${lines.join('\n')}`)
-    } catch (err) {
-      await ctx.reply(`Failed to list tasks: ${err instanceof Error ? err.message : String(err)}`)
+    const r = await buildTaskList()
+    if ('error' in r) {
+      await ctx.reply(r.error)
+      return
     }
+    await ctx.reply(r.text, { reply_markup: r.keyboard })
   },
 
   // /task add <title> — create a task on the shared queue. Bare /task (or any
@@ -2302,6 +2287,73 @@ const commandHandlers: Record<string, CommandHandler> = {
   },
 }
 
+// --- /tasks: tappable list + single-task detail (host-shared queue) ---
+// Open tasks render as one button each (tap -> detail); rows assigned to THIS
+// agent are starred. The detail view carries a Back button that re-renders the
+// list. Read-only; mutations still go through /task add and the dashboard/CLI.
+function taskAssignedToMe(assignee: string | null | undefined): boolean {
+  if (!assignee) return false
+  const me = thisAgentName()
+  if (!me) return false
+  // task assignees appear as either the bare agent name ("main") or the unix
+  // user form ("agent-main") in the queue — match both.
+  return assignee === me || assignee === `agent-${me}`
+}
+
+async function buildTaskList(): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+  let j: any
+  try {
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'], { timeout: 8000 })
+    j = JSON.parse(stdout)
+  } catch (err) {
+    return { error: `Failed to list tasks: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  if (!j.ok || !Array.isArray(j.data?.tasks)) return { error: '5dive returned unexpected output.' }
+  const tasks = j.data.tasks
+  if (tasks.length === 0) return { error: 'No open tasks.\n\nAdd one with /task add <title>.' }
+  const kb = new InlineKeyboard()
+  const MAX = 30
+  for (const t of tasks.slice(0, MAX)) {
+    const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
+    const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
+    let label = `${mine}${flag}${t.ident}  ${t.title}`
+    if (label.length > 56) label = label.slice(0, 55) + '…'
+    kb.text(label, `task:${t.id}`).row()
+  }
+  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more, see the dashboard)` : ''
+  return { text: `Open tasks (tap to view) · ⭐ = assigned to you${more}`, keyboard: kb }
+}
+
+async function buildTaskDetail(id: number): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+  let j: any
+  try {
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'show', String(id), '--json'], { timeout: 8000 })
+    j = JSON.parse(stdout)
+  } catch (err) {
+    return { error: `Failed to load task: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  if (!j.ok || !j.data?.task) return { error: 'Task not found.' }
+  const t = j.data.task
+  const mine = taskAssignedToMe(t.assignee) ? ' ⭐' : ''
+  const lines = [
+    `${t.ident} · ${t.title}`,
+    ``,
+    `status: ${t.status}${t.priority ? `  ·  priority: ${t.priority}` : ''}`,
+    `assignee: ${t.assignee || '(unassigned)'}${mine}`,
+  ]
+  if (t.created_by) lines.push(`created by: ${t.created_by}`)
+  const subs = Array.isArray(j.data.subtasks) ? j.data.subtasks : []
+  if (subs.length) lines.push(`subtasks: ${subs.length}`)
+  if (t.body) {
+    let body = String(t.body)
+    if (body.length > 1500) body = body.slice(0, 1500) + '\n…(truncated)'
+    lines.push('', body)
+  }
+  if (t.result) lines.push('', `result: ${t.result}`)
+  const kb = new InlineKeyboard().text('‹ Back to tasks', 'task:list')
+  return { text: lines.join('\n'), keyboard: kb }
+}
+
 for (const def of COMMAND_REGISTRY) {
   const handler = commandHandlers[def.name]
   if (!handler) {
@@ -2416,6 +2468,30 @@ bot.on('callback_query:data', async ctx => {
       await ctx.editMessageText(r.text).catch(() => {})
     }
     r.after?.()
+    return
+  }
+
+  // /tasks tappable list <-> single-task detail. task:list re-renders the list;
+  // task:<id> opens that task with a Back button. Read-only (gated above).
+  if (data === 'task:list') {
+    const r = await buildTaskList()
+    await ctx.answerCallbackQuery().catch(() => {})
+    if ('error' in r) {
+      await ctx.editMessageText(r.error).catch(() => {})
+      return
+    }
+    await ctx.editMessageText(r.text, { reply_markup: r.keyboard }).catch(() => {})
+    return
+  }
+  const taskM = /^task:(\d+)$/.exec(data)
+  if (taskM) {
+    const r = await buildTaskDetail(Number(taskM[1]))
+    await ctx.answerCallbackQuery().catch(() => {})
+    if ('error' in r) {
+      await ctx.editMessageText(r.error).catch(() => {})
+      return
+    }
+    await ctx.editMessageText(r.text, { reply_markup: r.keyboard }).catch(() => {})
     return
   }
 
