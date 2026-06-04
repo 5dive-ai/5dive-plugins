@@ -2312,13 +2312,18 @@ async function buildTaskList(): Promise<{ text: string; keyboard: InlineKeyboard
   const tasks = j.data.tasks
   if (tasks.length === 0) return { error: 'No open tasks.\n\nAdd one with /task add <title>.' }
   const kb = new InlineKeyboard()
-  const MAX = 30
+  const MAX = 25
   for (const t of tasks.slice(0, MAX)) {
     const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
     const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
-    let label = `${mine}${flag}${t.ident}  ${t.title}`
-    if (label.length > 56) label = label.slice(0, 55) + '…'
-    kb.text(label, `task:${t.id}`).row()
+    // Two rows per task so long titles don't get truncated: row 1 is the full
+    // title (with the star / status flag), row 2 is the ident + status + priority.
+    // Both buttons open the same task detail.
+    let title = `${mine}${flag}${t.title}`
+    if (title.length > 60) title = title.slice(0, 59) + '…'
+    const pri = t.priority && t.priority !== 'medium' ? ` · ${t.priority}` : ''
+    kb.text(title, `task:${t.id}`).row()
+    kb.text(`${t.ident} · ${t.status}${pri}`, `task:${t.id}`).row()
   }
   const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more, see the dashboard)` : ''
   return { text: `Open tasks (tap to view) · ⭐ = assigned to you${more}`, keyboard: kb }
