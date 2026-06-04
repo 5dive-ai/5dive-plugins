@@ -2066,12 +2066,7 @@ const commandHandlers: Record<string, CommandHandler> = {
   // Read-only; mutations go through /task add (create) — status changes stay
   // on the dashboard / CLI for now.
   tasks: async ctx => {
-    const r = await buildTaskList()
-    if ('error' in r) {
-      await ctx.reply(r.error)
-      return
-    }
-    await ctx.reply(r.text, { reply_markup: r.keyboard })
+    await ctx.reply(await buildTaskList())
   },
 
   // /task add <title> — create a task on the shared queue. Bare /task (or any
@@ -2287,10 +2282,11 @@ const commandHandlers: Record<string, CommandHandler> = {
   },
 }
 
-// --- /tasks: tappable list + single-task detail (host-shared queue) ---
-// Open tasks render as one button each (tap -> detail); rows assigned to THIS
-// agent are starred. The detail view carries a Back button that re-renders the
-// list. Read-only; mutations still go through /task add and the dashboard/CLI.
+// --- /tasks: left-aligned text list + single-task detail (host-shared queue) ---
+// Telegram inline buttons are always center-aligned and hard-truncate long
+// labels, so the list is plain left-aligned text with a tappable /task_<id>
+// deep link per row (handled by the bot.hears below). Rows assigned to THIS
+// agent are starred. Read-only; mutations go through /task add + dashboard/CLI.
 function taskAssignedToMe(assignee: string | null | undefined): boolean {
   if (!assignee) return false
   const me = thisAgentName()
@@ -2300,44 +2296,38 @@ function taskAssignedToMe(assignee: string | null | undefined): boolean {
   return assignee === me || assignee === `agent-${me}`
 }
 
-async function buildTaskList(): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+async function buildTaskList(): Promise<string> {
   let j: any
   try {
     const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'], { timeout: 8000 })
     j = JSON.parse(stdout)
   } catch (err) {
-    return { error: `Failed to list tasks: ${err instanceof Error ? err.message : String(err)}` }
+    return `Failed to list tasks: ${err instanceof Error ? err.message : String(err)}`
   }
-  if (!j.ok || !Array.isArray(j.data?.tasks)) return { error: '5dive returned unexpected output.' }
+  if (!j.ok || !Array.isArray(j.data?.tasks)) return '5dive returned unexpected output.'
   const tasks = j.data.tasks
-  if (tasks.length === 0) return { error: 'No open tasks.\n\nAdd one with /task add <title>.' }
-  const kb = new InlineKeyboard()
-  const MAX = 25
-  for (const t of tasks.slice(0, MAX)) {
+  if (tasks.length === 0) return 'No open tasks.\n\nAdd one with /task add <title>.'
+  const MAX = 40
+  const lines = tasks.slice(0, MAX).map((t: any) => {
     const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
     const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
-    // Two rows per task so long titles don't get truncated: row 1 is the full
-    // title (with the star / status flag), row 2 is the ident + status + priority.
-    // Both buttons open the same task detail.
-    let title = `${mine}${flag}${t.title}`
-    if (title.length > 60) title = title.slice(0, 59) + '…'
-    const pri = t.priority && t.priority !== 'medium' ? ` · ${t.priority}` : ''
-    kb.text(title, `task:${t.id}`).row()
-    kb.text(`${t.ident} · ${t.status}${pri}`, `task:${t.id}`).row()
-  }
-  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more, see the dashboard)` : ''
-  return { text: `Open tasks (tap to view) · ⭐ = assigned to you${more}`, keyboard: kb }
+    let title = String(t.title)
+    if (title.length > 44) title = title.slice(0, 43).trimEnd() + '…'
+    return `${mine}${flag}${t.ident} · ${title}  /task_${t.id}`
+  })
+  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more)` : ''
+  return `Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`
 }
 
-async function buildTaskDetail(id: number): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+async function buildTaskDetail(id: number): Promise<string> {
   let j: any
   try {
     const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'show', String(id), '--json'], { timeout: 8000 })
     j = JSON.parse(stdout)
   } catch (err) {
-    return { error: `Failed to load task: ${err instanceof Error ? err.message : String(err)}` }
+    return `Failed to load task: ${err instanceof Error ? err.message : String(err)}`
   }
-  if (!j.ok || !j.data?.task) return { error: 'Task not found.' }
+  if (!j.ok || !j.data?.task) return 'Task not found.'
   const t = j.data.task
   const mine = taskAssignedToMe(t.assignee) ? ' ⭐' : ''
   const lines = [
@@ -2355,8 +2345,8 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard: In
     lines.push('', body)
   }
   if (t.result) lines.push('', `result: ${t.result}`)
-  const kb = new InlineKeyboard().text('‹ Back to tasks', 'task:list')
-  return { text: lines.join('\n'), keyboard: kb }
+  lines.push('', 'back to list: /tasks')
+  return lines.join('\n')
 }
 
 for (const def of COMMAND_REGISTRY) {
@@ -2473,30 +2463,6 @@ bot.on('callback_query:data', async ctx => {
       await ctx.editMessageText(r.text).catch(() => {})
     }
     r.after?.()
-    return
-  }
-
-  // /tasks tappable list <-> single-task detail. task:list re-renders the list;
-  // task:<id> opens that task with a Back button. Read-only (gated above).
-  if (data === 'task:list') {
-    const r = await buildTaskList()
-    await ctx.answerCallbackQuery().catch(() => {})
-    if ('error' in r) {
-      await ctx.editMessageText(r.error).catch(() => {})
-      return
-    }
-    await ctx.editMessageText(r.text, { reply_markup: r.keyboard }).catch(() => {})
-    return
-  }
-  const taskM = /^task:(\d+)$/.exec(data)
-  if (taskM) {
-    const r = await buildTaskDetail(Number(taskM[1]))
-    await ctx.answerCallbackQuery().catch(() => {})
-    if ('error' in r) {
-      await ctx.editMessageText(r.error).catch(() => {})
-      return
-    }
-    await ctx.editMessageText(r.text, { reply_markup: r.keyboard }).catch(() => {})
     return
   }
 
@@ -2619,6 +2585,17 @@ bot.on('callback_query:data', async ctx => {
   if (msg && 'text' in msg && msg.text) {
     await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
   }
+})
+
+// /task_<id> — tappable deep link from the /tasks list. Opens the single-task
+// detail. Registered BEFORE the message bridge so the tap is handled here and
+// NOT forwarded to the agent as a normal message. Gated like a paired command.
+bot.hears(/^\/task_(\d+)\b/, async ctx => {
+  const senderId = String(ctx.from?.id ?? '')
+  if (!loadAccess().allowFrom.includes(senderId)) return
+  const m = /^\/task_(\d+)\b/.exec(ctx.message?.text ?? '')
+  if (!m) return
+  await ctx.reply(await buildTaskDetail(Number(m[1])))
 })
 
 bot.on('message:text', async ctx => {
