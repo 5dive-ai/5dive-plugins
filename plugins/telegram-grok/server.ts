@@ -22,7 +22,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { Bot, GrammyError, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, statSync,
@@ -690,22 +690,69 @@ function run5dive(args: string[], timeout = 8000): Promise<{ ok: boolean; data?:
   })
 }
 
-// /tasks — list open tasks from the shared 5dive queue.
-async function listTasks(): Promise<string> {
+// --- /tasks: tappable list + single-task detail (host-shared queue) ---
+// Open tasks render as one button each (tap -> detail); rows assigned to THIS
+// agent are starred. The detail view carries a Back button that re-renders the
+// list. Read-only; mutations still go through /task add and the dashboard/CLI.
+function taskAssignedToMe(assignee: string | null | undefined): boolean {
+  if (!assignee) return false
+  const me = agentName()
+  if (!me || me === 'unknown') return false
+  // task assignees appear as either the bare agent name ("main") or the unix
+  // user form ("agent-main") in the queue — match both.
+  return assignee === me || assignee === `agent-${me}`
+}
+
+async function buildTaskList(): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+  let j: any
   try {
-    const j = await run5dive(['task', 'ls', '--json'])
-    if (!j.ok || !Array.isArray(j.data?.tasks)) return '⚠️ `5dive task ls` returned unexpected output.'
-    const tasks = j.data.tasks
-    if (tasks.length === 0) return 'No open tasks.\n\nAdd one with `/task add <title>`.'
-    const lines = tasks.map((t: any) => {
-      const pri = t.priority && t.priority !== 'medium' ? ` (${t.priority})` : ''
-      const who = t.assignee ? ` · ${t.assignee}` : ''
-      return `• \`${t.ident}\` [${t.status}]${pri} ${t.title}${who}`
-    })
-    return `*Open tasks:*\n\n${lines.join('\n')}`
+    j = await run5dive(['task', 'ls', '--json'])
   } catch (err) {
-    return `⚠️ Failed to list tasks: ${err instanceof Error ? err.message : String(err)}`
+    return { error: `⚠️ Failed to list tasks: ${err instanceof Error ? err.message : String(err)}` }
   }
+  if (!j.ok || !Array.isArray(j.data?.tasks)) return { error: '⚠️ `5dive task ls` returned unexpected output.' }
+  const tasks = j.data.tasks
+  if (tasks.length === 0) return { error: 'No open tasks.\n\nAdd one with `/task add <title>`.' }
+  const kb = new InlineKeyboard()
+  const MAX = 30
+  for (const t of tasks.slice(0, MAX)) {
+    const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
+    const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
+    let label = `${mine}${flag}${t.ident}  ${t.title}`
+    if (label.length > 56) label = label.slice(0, 55) + '…'
+    kb.text(label, `task:${t.id}`).row()
+  }
+  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more, see the dashboard)` : ''
+  return { text: `Open tasks (tap to view) · ⭐ = assigned to you${more}`, keyboard: kb }
+}
+
+async function buildTaskDetail(id: number): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+  let j: any
+  try {
+    j = await run5dive(['task', 'show', String(id), '--json'])
+  } catch (err) {
+    return { error: `⚠️ Failed to load task: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  if (!j.ok || !j.data?.task) return { error: 'Task not found.' }
+  const t = j.data.task
+  const mine = taskAssignedToMe(t.assignee) ? ' ⭐' : ''
+  const lines = [
+    `${t.ident} · ${t.title}`,
+    ``,
+    `status: ${t.status}${t.priority ? `  ·  priority: ${t.priority}` : ''}`,
+    `assignee: ${t.assignee || '(unassigned)'}${mine}`,
+  ]
+  if (t.created_by) lines.push(`created by: ${t.created_by}`)
+  const subs = Array.isArray(j.data.subtasks) ? j.data.subtasks : []
+  if (subs.length) lines.push(`subtasks: ${subs.length}`)
+  if (t.body) {
+    let body = String(t.body)
+    if (body.length > 1500) body = body.slice(0, 1500) + '\n…(truncated)'
+    lines.push('', body)
+  }
+  if (t.result) lines.push('', `result: ${t.result}`)
+  const kb = new InlineKeyboard().text('‹ Back to tasks', 'task:list')
+  return { text: lines.join('\n'), keyboard: kb }
 }
 
 // /task add <title> — create a task on the shared queue.
@@ -895,9 +942,15 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         })
         return true
       }
-      case 'tasks':
-        await md(await listTasks())
+      case 'tasks': {
+        const r = await buildTaskList()
+        if ('error' in r) { await md(r.error); return true }
+        await bot.api.sendMessage(chat_id, r.text, {
+          reply_markup: r.keyboard,
+          ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+        })
         return true
+      }
       case 'task':
         await md(await addTask(cmdArg, ctx.from?.username || 'telegram'))
         return true
@@ -1052,6 +1105,28 @@ bot.on('message:sticker', async ctx => {
   await ingest(ctx, `(sticker${emoji})`, undefined, {
     kind: 'sticker', file_id: s.file_id, size: s.file_size,
   })
+})
+
+// /tasks tappable list <-> single-task detail. task:list re-renders the list;
+// task:<id> opens that task with a Back button. Read-only, but re-gate the
+// tapper against allowFrom so a leaked button-share link can't read the queue.
+bot.on('callback_query:data', async ctx => {
+  const data = ctx.callbackQuery.data ?? ''
+  const isList = data === 'task:list'
+  const taskM = /^task:(\d+)$/.exec(data)
+  if (!isList && !taskM) return
+
+  const senderId = String(ctx.from.id)
+  if (!loadAccess().allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+    return
+  }
+
+  const r = isList ? await buildTaskList() : await buildTaskDetail(Number(taskM![1]))
+  await ctx.answerCallbackQuery().catch(() => {})
+  await ctx.editMessageText('error' in r ? r.error : r.text, {
+    reply_markup: 'error' in r ? undefined : r.keyboard,
+  }).catch(() => {})
 })
 
 bot.catch(err => {
@@ -1591,6 +1666,12 @@ void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
+        // Telegram REMEMBERS the last allowed_updates passed to getUpdates and
+        // reuses it when omitted. A bridge that ran on this token before may
+        // have narrowed it to exclude callback_query — which silently kills the
+        // /tasks tappable buttons (messages arrive, taps don't). Pin it
+        // explicitly to what we handle.
+        allowed_updates: ['message', 'callback_query'],
         onStart: info => {
           attempt = 0
           botUsername = info.username
