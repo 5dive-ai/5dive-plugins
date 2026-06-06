@@ -1575,7 +1575,7 @@ function applyEffort(level: string, chatId: number): ApplyResult {
 // cached and switching invalidates it). No-op when the menu never renders
 // (e.g. switching to the already-active model is a silent "Kept model as").
 // Returns true if it could address a pane (agent-* user), false otherwise —
-// callers that surface a confirmation to the user (e.g. the handoff button)
+// callers that surface a confirmation to the user (e.g. the carry-over button)
 // branch their copy on this so they don't claim success when nothing was sent.
 function proxyToClaudeTUI(line: string, autoConfirm?: RegExp): boolean {
   const user = process.env.USER ?? process.env.LOGNAME ?? ''
@@ -2449,23 +2449,24 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  // Context-handoff nudge buttons (DIVE-114). The context-nudge Stop hook DMs
-  // "Handoff now / Not yet" as the window fills. `ho:now` types the handoff
+  // Context carry-over nudge buttons (DIVE-114). The context-nudge Stop hook DMs
+  // "Carry over / Not yet" as the window fills. `ho:now` types the carryover
   // command into the agent's TUI so it writes a structured carryover; `ho:skip`
   // just dismisses (the hook's per-tier dedupe already prevents this tier
   // re-firing, so a later tier can still escalate). Fail-soft: strip the
-  // keyboard either way so the buttons can't be tapped twice.
+  // keyboard either way so the buttons can't be tapped twice. (The `ho:`
+  // callback prefix is an internal id — kept stable so live buttons don't break.)
   //
   // NB: plugin slash commands are namespaced `/<plugin>:<command>`, so this MUST
-  // be `/telegram:handoff` — bare `/handoff` resolves to "Unknown command".
+  // be `/telegram:carryover` — bare `/carryover` resolves to "Unknown command".
   if (data === 'ho:now') {
-    const dispatched = proxyToClaudeTUI('/telegram:handoff')
-    await ctx.answerCallbackQuery({ text: dispatched ? 'Writing handoff…' : 'Run /telegram:handoff in your session' }).catch(() => {})
+    const dispatched = proxyToClaudeTUI('/telegram:carryover')
+    await ctx.answerCallbackQuery({ text: dispatched ? 'Carrying over…' : 'Run /telegram:carryover in your session' }).catch(() => {})
     await ctx
       .editMessageText(
         dispatched
-          ? 'Writing the handoff carryover — start a fresh session when I confirm.'
-          : "Couldn't reach the session from here — type /telegram:handoff in your terminal to save the carryover.",
+          ? 'Saving the carryover — start a fresh session when I confirm.'
+          : "Couldn't reach the session from here — type /telegram:carryover in your terminal to save the carryover.",
       )
       .catch(() => {})
     return

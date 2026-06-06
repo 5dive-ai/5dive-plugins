@@ -1,12 +1,12 @@
 #!/usr/bin/env -S bun
-// Stop hook: DIVE-114 context-handoff nudge.
+// Stop hook: DIVE-114 context carry-over nudge.
 //
 // "Context rot" — degraded reasoning as the window fills — sets in around
 // ~40% on a 1M window. Rather than let a session silently coast into a deep,
 // expensive, lower-quality state, this hook watches the live context-usage %
 // and, at a natural break (turn end), drops a SUBTLE nudge with a one-tap
-// "📥 Handoff now" button so the user can spin up a fresh session that loads a
-// structured carryover (see the /handoff command + ho: callback in server.ts).
+// "Carry over" button so the user can spin up a fresh session that loads a
+// structured carryover (see the /carryover command + ho: callback in server.ts).
 //
 // Tiers (each fires AT MOST ONCE per session, escalating only if ignored):
 //   45% → first nudge (rot onset; cleanest, cheapest moment to hand off)
@@ -38,9 +38,9 @@ import type { HookPayload } from './lib/types'
 // with the copy shown when it fires. Order matters: we walk high→low to find
 // the most relevant crossed tier.
 const TIERS: { at: number; text: string }[] = [
-  { at: 45, text: "Context's at ~45% — good spot for a clean handoff. Tap to save a carryover, or keep going." },
-  { at: 60, text: "Context's at ~60% — quality starts slipping here. A handoff keeps things sharp." },
-  { at: 75, text: "Context's at ~75% — getting heavy. Strongly suggest a handoff now. Last nudge this session." },
+  { at: 45, text: "Context's at ~45% — good spot to carry over to a fresh session. Tap to save, or keep going." },
+  { at: 60, text: "Context's at ~60% — quality starts slipping here. Carrying over keeps things sharp." },
+  { at: 75, text: "Context's at ~75% — getting heavy. Strongly suggest carrying over now. Last nudge this session." },
 ]
 
 const payload = await readPayload<HookPayload>()
@@ -78,7 +78,7 @@ if (!crossed) process.exit(0)
 
 // --- Per-session dedupe: store the max tier already fired --------------------
 // Key on session_id when present (survives transcript-path quirks), else the
-// transcript path. A fresh session (post-handoff /clear or new run) gets a new
+// transcript path. A fresh session (post-carryover /clear or new run) gets a new
 // id → the nudge cycle resets, which is exactly what we want.
 const sessionKey = cache.session_id || payload.transcript_path || 'unknown'
 const stateFile = join(tmpdir(), `5dive-ctx-nudge-${createHash('sha1').update(sessionKey).digest('hex')}.txt`)
@@ -106,14 +106,14 @@ const target: CallerChat | null = caller ?? (getAllowedChatIds().map(chatId => (
 if (!target) process.exit(0)
 
 // --- Send the nudge with a one-tap button -----------------------------------
-// ho:now  → run /handoff in the agent's TUI (writes the carryover)
+// ho:now  → run /carryover in the agent's TUI (writes the carryover)
 // ho:skip → dismiss; the per-tier dedupe already prevents this tier re-firing,
 //           so a later tier can still escalate if the user keeps going.
 const token = getToken()!
 const reply_markup = {
   inline_keyboard: [
     [
-      { text: 'Handoff now', callback_data: 'ho:now' },
+      { text: 'Carry over', callback_data: 'ho:now' },
       { text: 'Not yet', callback_data: 'ho:skip' },
     ],
   ],
