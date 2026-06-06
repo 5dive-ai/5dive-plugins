@@ -1,5 +1,5 @@
 {
-  "description": "5dive telegram plugin lifecycle hooks — block invisible pickers in telegram-paired sessions, nudge the agent when it goes silent on Telegram, catch 'agent talked to the transcript instead of replying' misses, and DM-on-StopFailure with auto-resume after usage-limit hits.",
+  "description": "5dive telegram plugin lifecycle hooks — block invisible pickers in telegram-paired sessions, nudge the agent when it goes silent on Telegram, catch 'agent talked to the transcript instead of replying' misses, nudge a context handoff (with one-tap button) as the window fills, and DM-on-StopFailure with auto-resume after usage-limit hits.",
   "hooks": {
     "PreToolUse": [
       {
@@ -31,6 +31,11 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop-reply-check.ts",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/context-nudge.ts",
+            "timeout": 8
           }
         ]
       }

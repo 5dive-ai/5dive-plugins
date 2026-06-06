@@ -1574,13 +1574,17 @@ function applyEffort(level: string, chatId: number): ApplyResult {
 // claude's "Switch model?" prompt that appears when the conversation is
 // cached and switching invalidates it). No-op when the menu never renders
 // (e.g. switching to the already-active model is a silent "Kept model as").
-function proxyToClaudeTUI(line: string, autoConfirm?: RegExp): void {
+// Returns true if it could address a pane (agent-* user), false otherwise —
+// callers that surface a confirmation to the user (e.g. the handoff button)
+// branch their copy on this so they don't claim success when nothing was sent.
+function proxyToClaudeTUI(line: string, autoConfirm?: RegExp): boolean {
   const user = process.env.USER ?? process.env.LOGNAME ?? ''
   const target = user.startsWith('agent-') ? user : ''
-  if (!target) return
+  if (!target) return false
   const paneTarget = `${target}:0`
   execFileP(TMUX, ['send-keys', '-t', paneTarget, line, 'Enter']).catch(() => {})
   if (autoConfirm) void confirmMenuIfPresent(paneTarget, autoConfirm)
+  return true
 }
 
 // Poll the pane up to ~5s for a confirmation menu and press "1\n" on hit.
@@ -2442,6 +2446,30 @@ bot.on('callback_query:data', async ctx => {
       // Telegram clears the tap spinner; never throw.
       await ctx.answerCallbackQuery({ text: "Couldn't apply — open the dashboard." }).catch(() => {})
     }
+    return
+  }
+
+  // Context-handoff nudge buttons (DIVE-114). The context-nudge Stop hook DMs
+  // "Handoff now / Not yet" as the window fills. `ho:now` types /handoff into
+  // the agent's TUI so it writes a structured carryover; `ho:skip` just dismisses
+  // (the hook's per-tier dedupe already prevents this tier re-firing, so a later
+  // tier can still escalate). Fail-soft: strip the keyboard either way so the
+  // buttons can't be tapped twice.
+  if (data === 'ho:now') {
+    const dispatched = proxyToClaudeTUI('/handoff')
+    await ctx.answerCallbackQuery({ text: dispatched ? 'Writing handoff…' : 'Run /handoff in your session' }).catch(() => {})
+    await ctx
+      .editMessageText(
+        dispatched
+          ? 'Writing the handoff carryover — start a fresh session when I confirm.'
+          : "Couldn't reach the session from here — type /handoff in your terminal to save the carryover.",
+      )
+      .catch(() => {})
+    return
+  }
+  if (data === 'ho:skip') {
+    await ctx.answerCallbackQuery({ text: 'Okay, carrying on.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup().catch(() => {})
     return
   }
 
