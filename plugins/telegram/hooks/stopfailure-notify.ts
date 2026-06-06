@@ -22,6 +22,7 @@ import { getAllowedChatIds, getGroupTopics, getCallerChat, type CallerChat } fro
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
 import { parseResetEpoch } from './lib/time'
+import { claimNotify, notifyStampPath, pruneStaleNotifyStamps } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
 
 const payload = await readPayload<HookPayload>()
@@ -262,7 +263,40 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
   }
 }
 
-await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
+// DIVE-122: dedup the usage-limit DM across respawns. claude runs under a
+// systemd unit (KillMode=control-group + Restart=on-failure/RestartSec=3): on a
+// usage limit it exits, systemd tears down the cgroup — killing the detached
+// resume helper — and respawns claude, which re-hits the limit and re-fires this
+// hook. The resume.lock above only dedups while a helper is ALIVE heartbeating
+// it, so once it's killed every respawn re-DMs. This stamp is helper-independent
+// — the respawns themselves are the heartbeat — so it collapses the storm to ONE
+// DM per episode (keyed account+resetEpoch; stable 'noepoch' token + sliding
+// window when no reset time is readable). Only the usage-limit text is spammed by
+// the respawn loop, so we gate just that path; transient-error / generic-stop
+// DMs send unconditionally.
+let shouldSend = true
+if (isRateLimit) {
+  let dir = resumeLogDir
+  if (!dir) {
+    dir = join(homedir(), '.cache', '5dive-telegram', 'resume')
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch {
+      dir = '/tmp'
+    }
+  }
+  const account = resolveActiveAccount() ?? (tmuxCtx ? deriveAgentName(tmuxCtx.target) : null) ?? 'unknown'
+  const stamp = notifyStampPath(dir, account, resetEpoch)
+  const res = claimNotify(stamp, Date.now())
+  shouldSend = res.send
+  // One-line stderr trace (lands in the resume log) so we can see hits vs sends.
+  console.error(`[stopfailure-notify] usage-limit dedup: ${res.send ? 'SEND' : 'suppress'} (${res.reason}) account=${account} reset=${resetEpoch ?? 'null'}`)
+  if (res.send) pruneStaleNotifyStamps(dir, Date.now())
+}
+
+if (shouldSend) {
+  await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
+}
 
 // Detach the recovery helper (we already hold the lock). Two flows share the
 // same lock + ping encoding but own distinct helpers:
@@ -321,28 +355,39 @@ function deriveAgentName(target: string): string | null {
 // returns false so the caller falls back to the existing rotate-on-limit path.
 // Two cheap CLI reads, well within the hook's 10s budget; same `sudo -n 5dive`
 // privilege the rotation rotate call already relies on.
-function activeAccountHasHeadroom(): boolean {
-  if (!tmuxCtx) return false
+// resolveActiveAccount — which named account is this agent on right now? Memoized
+// (one `sudo -n 5dive agent rotation get` per hook run) because both the
+// headroom check and the DIVE-122 notify-dedup key need it. Returns null on any
+// uncertainty (no tmux, CLI failure, non-ok JSON, unknown active).
+let _activeAccount: string | null | undefined
+function resolveActiveAccount(): string | null {
+  if (_activeAccount !== undefined) return _activeAccount
+  _activeAccount = null
+  if (!tmuxCtx) return _activeAccount
   const agentName = deriveAgentName(tmuxCtx.target)
-  if (!agentName) return false
-
-  // Which account is this agent on right now?
-  let active = ''
+  if (!agentName) return _activeAccount
   try {
     const rg = spawnSync('sudo', ['-n', '5dive', '--json', 'agent', 'rotation', 'get', agentName], {
       encoding: 'utf8',
-      // Short timeout: both reads run sequentially BEFORE the DM/rotate, and a
-      // killed hook (10s budget) recovers nothing. These fire under the same
-      // high-load condition that can slow the CLI, so keep the worst case well
-      // under budget; a timeout just returns false → existing rotate behavior.
+      // Short timeout: this runs sequentially BEFORE the DM/rotate, and a killed
+      // hook (10s budget) recovers nothing. It fires under the same high-load
+      // condition that can slow the CLI, so keep the worst case well under
+      // budget; a timeout just leaves the account null (fail-safe).
       timeout: 3500,
     })
     const j = JSON.parse((rg.stdout || '').trim())
-    if (!j?.ok) return false
-    active = String(j.data?.active ?? '')
+    if (j?.ok) _activeAccount = String(j.data?.active ?? '') || null
   } catch {
-    return false
+    /* keep null */
   }
+  return _activeAccount
+}
+
+function activeAccountHasHeadroom(): boolean {
+  if (!tmuxCtx) return false
+
+  // Which account is this agent on right now?
+  const active = resolveActiveAccount()
   if (!active) return false
 
   // Freshest measured usage per account (reads each account's newest agent

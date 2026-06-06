@@ -47,6 +47,12 @@ const transcriptPath = process.argv[7] ?? ''
 const MAX_WAIT_SEC = 30 * 3600 // trust a future reset epoch up to 30h (5h rolling + weekly cap)
 const MAX_RETRY_SEC = 6 * 3600 // after wait/blind, poll-retry for this long before giving up
 const RETRY_INTERVAL_SEC = 300 // back-off between blind resume attempts
+// DIVE-122: when we have NO trustworthy reset epoch, hold the parked menu for
+// this long before the first "continue" attempt. Waking claude immediately into
+// a still-active limit makes it re-limit and, when it exits instead of
+// re-parking, feeds the systemd respawn loop. Bounded so we never wedge — Phase
+// 3's verified retry runs after it.
+const BLIND_PARK_SEC = 300
 const VERIFY_POLLS = 6 // after a "continue", watch this many times…
 const VERIFY_STEP_MS = 4000 // …at this cadence (~24s) for claude to pick up
 
@@ -93,6 +99,32 @@ async function sleepHeartbeat(totalMs: number): Promise<void> {
 }
 
 const MENU_RE = /\b\d\.\s*Stop and wait/i
+
+// parkHold — keep claude parked on the "Stop and wait" menu for up to totalMs,
+// re-pressing "1" whenever the menu is showing (a respawn may have redrawn it)
+// and heartbeating the dedup lock throughout. Used for the DIVE-122 blind wait
+// when we have no trustworthy reset epoch: holding the menu keeps the session
+// ALIVE instead of waking it into the live limit (which can make claude exit and
+// trigger a systemd respawn). Returns early — never wedges — if the menu is gone
+// and the pane shows no limit banner (claude looks clear, let Phase 3 verify).
+async function parkHold(totalMs: number): Promise<void> {
+  const STEP_MS = 30 * 1000
+  let left = totalMs
+  while (left > 0) {
+    if (ctx) {
+      const pane = capturePaneFor(ctx)
+      if (MENU_RE.test(pane)) {
+        sendKeys(ctx, '1', 'Enter')
+      } else if (!paneStillLimited(pane)) {
+        return // menu gone and no limit banner — don't keep holding
+      }
+    }
+    const chunk = Math.min(STEP_MS, left)
+    await sleep(chunk)
+    left -= chunk
+    heartbeat()
+  }
+}
 
 // Narrow "still limited" signal for the pane fallback: the transient parked
 // menu or an active limit banner. Deliberately specific — generic "usage
@@ -176,7 +208,14 @@ try {
     } else if (resetEpoch > 0) {
       log(`phase2 reset epoch out of trusted window (delta=${delta}s) — going to retry loop`)
     } else {
-      log('phase2 no reset epoch — going to retry loop')
+      // DIVE-122: no trustworthy reset epoch. Don't fall straight into Phase 3's
+      // "continue" (it wakes claude into the still-active limit → re-limit →
+      // possible exit → systemd respawn loop). Hold the parked menu for a bounded
+      // blind interval first, then let the verified retry loop take over.
+      // Rotation isn't our concern here: the hook only spawns us AFTER its own
+      // rotate attempt declined, and every respawn re-evaluates rotation.
+      log(`phase2 no reset epoch — blind park-hold ${BLIND_PARK_SEC}s before retry loop`)
+      await parkHold(BLIND_PARK_SEC * 1000)
     }
   }
 
