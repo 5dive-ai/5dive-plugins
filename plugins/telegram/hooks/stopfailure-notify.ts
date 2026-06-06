@@ -84,6 +84,14 @@ let isTransientApiError =
   (isTransientRateLimit ||
     /overloaded|API Error:\s*(?:5(?:0[234]|29))\b|"type":\s*"(?:overloaded|api)_error"/i.test(transientHaystack))
 
+// Memoized active-account cache for resolveActiveAccount(). Declared here at
+// module top — NOT next to its function below — because resolveActiveAccount is
+// called from top-level code (the headroom check + the DIVE-122 dedup gate) that
+// runs before that function's textual position; a `let` beside the function
+// would be in the temporal dead zone at call time (ReferenceError). undefined =
+// not yet fetched; null = fetched-but-unknown; string = the account name.
+let _activeAccount: string | null | undefined
+
 // Resolve an unlock/reset epoch. Order: payload → transcript → message text → pane.
 let resetEpoch: number | null = null
 
@@ -358,8 +366,9 @@ function deriveAgentName(target: string): string | null {
 // resolveActiveAccount — which named account is this agent on right now? Memoized
 // (one `sudo -n 5dive agent rotation get` per hook run) because both the
 // headroom check and the DIVE-122 notify-dedup key need it. Returns null on any
-// uncertainty (no tmux, CLI failure, non-ok JSON, unknown active).
-let _activeAccount: string | null | undefined
+// uncertainty (no tmux, CLI failure, non-ok JSON, unknown active). The
+// _activeAccount memo it uses is declared at module top (see the note there) to
+// avoid a temporal-dead-zone error from the top-level callers.
 function resolveActiveAccount(): string | null {
   if (_activeAccount !== undefined) return _activeAccount
   _activeAccount = null
