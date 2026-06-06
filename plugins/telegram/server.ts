@@ -2386,6 +2386,65 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // Tap-to-answer for a human-gate ping (DIVE-117). The DIVE-105 notify DM
+  // carries inline buttons for decision(--options)/approval gates; a tap lands
+  // here as `tna:<taskId>:<token>` — token is the option INDEX for a decision
+  // (resolved against the LIVE need_options, never the tapped payload: dodges
+  // the 64-byte callback_data cap AND can't be tampered to inject a value) or
+  // 'approved'/'denied' for an approval. The DB is the source of truth: re-read
+  // the gate first so a dashboard/CLI answer (or a double-tap) between ping and
+  // tap doesn't double-answer. Fully fail-soft — a stale/deleted task, a
+  // restarted agent, or any CLI error just acks the callback with a nudge and
+  // never throws out of the handler.
+  const tnaM = /^tna:(\d+):(.+)$/.exec(data)
+  if (tnaM) {
+    const taskId = tnaM[1]!
+    const token = tnaM[2]!
+    try {
+      const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
+      const task = JSON.parse(show.stdout).data?.task
+      if (!task || !task.need_type) {
+        await ctx.answerCallbackQuery({ text: 'This task no longer has a gate.' }).catch(() => {})
+        await ctx.editMessageReplyMarkup().catch(() => {})
+        return
+      }
+      // Already answered (dashboard/CLI/double-tap won the race)? Don't re-answer.
+      if (task.need_answered_at) {
+        const prior = task.need_type === 'secret' ? '(provided)' : (task.need_answer ?? '—')
+        await ctx.answerCallbackQuery({ text: 'Already answered.' }).catch(() => {})
+        await ctx.editMessageText(`✅ already answered: ${prior}`).catch(() => {})
+        return
+      }
+      // Resolve the value from the live gate, not the payload.
+      let value: string | undefined
+      if (task.need_type === 'decision') {
+        const opts = String(task.need_options ?? '')
+          .split('|')
+          .map((s: string) => s.trim())
+          .filter(Boolean)
+        value = opts[Number(token)]
+      } else if (task.need_type === 'approval') {
+        value = token === 'approved' || token === 'denied' ? token : undefined
+      }
+      if (value === undefined) {
+        await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
+        await ctx.editMessageReplyMarkup().catch(() => {})
+        return
+      }
+      // `task answer` clears the gate, records the value, and pings the owning
+      // agent to resume (DIVE-103). It also drops out of the inbox.
+      await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, `--value=${value}`], { timeout: 8000 })
+      await ctx.answerCallbackQuery({ text: `Answered: ${value}` }).catch(() => {})
+      await ctx.editMessageText(`✅ answered: ${value}`).catch(() => {})
+    } catch {
+      // Stale message, deleted task, restarted agent, or a CLI/sudo failure (incl.
+      // a gate that got answered between our show and answer). Ack softly so
+      // Telegram clears the tap spinner; never throw.
+      await ctx.answerCallbackQuery({ text: "Couldn't apply — open the dashboard." }).catch(() => {})
+    }
+    return
+  }
+
   if (data === 'model:noop' || data === 'effort:noop') {
     await ctx.answerCallbackQuery({ text: 'Already active.' }).catch(() => {})
     return
