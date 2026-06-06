@@ -2450,19 +2450,22 @@ bot.on('callback_query:data', async ctx => {
   }
 
   // Context-handoff nudge buttons (DIVE-114). The context-nudge Stop hook DMs
-  // "Handoff now / Not yet" as the window fills. `ho:now` types /handoff into
-  // the agent's TUI so it writes a structured carryover; `ho:skip` just dismisses
-  // (the hook's per-tier dedupe already prevents this tier re-firing, so a later
-  // tier can still escalate). Fail-soft: strip the keyboard either way so the
-  // buttons can't be tapped twice.
+  // "Handoff now / Not yet" as the window fills. `ho:now` types the handoff
+  // command into the agent's TUI so it writes a structured carryover; `ho:skip`
+  // just dismisses (the hook's per-tier dedupe already prevents this tier
+  // re-firing, so a later tier can still escalate). Fail-soft: strip the
+  // keyboard either way so the buttons can't be tapped twice.
+  //
+  // NB: plugin slash commands are namespaced `/<plugin>:<command>`, so this MUST
+  // be `/telegram:handoff` — bare `/handoff` resolves to "Unknown command".
   if (data === 'ho:now') {
-    const dispatched = proxyToClaudeTUI('/handoff')
-    await ctx.answerCallbackQuery({ text: dispatched ? 'Writing handoff…' : 'Run /handoff in your session' }).catch(() => {})
+    const dispatched = proxyToClaudeTUI('/telegram:handoff')
+    await ctx.answerCallbackQuery({ text: dispatched ? 'Writing handoff…' : 'Run /telegram:handoff in your session' }).catch(() => {})
     await ctx
       .editMessageText(
         dispatched
           ? 'Writing the handoff carryover — start a fresh session when I confirm.'
-          : "Couldn't reach the session from here — type /handoff in your terminal to save the carryover.",
+          : "Couldn't reach the session from here — type /telegram:handoff in your terminal to save the carryover.",
       )
       .catch(() => {})
     return
