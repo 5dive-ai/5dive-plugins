@@ -39,7 +39,18 @@ const raw = JSON.stringify(payload)
 // throttle). Detect the transient phrasing first and exclude it from the
 // usage-limit branch; it's routed to the transient-API-error recovery instead.
 const isTransientRateLimit = /not your usage limit|temporarily limiting requests/i.test(raw)
-const isRateLimit = !isTransientRateLimit && /rate_limit|usage.limit/i.test(raw)
+// `let`, not `const`: the confirmed-headroom check below (activeAccountHasHeadroom)
+// may reclassify a transient burst 429 out of the rate-limit branch.
+let isRateLimit = !isTransientRateLimit && /rate_limit|usage.limit/i.test(raw)
+
+// Headroom thresholds for the burst-vs-quota reclassification below. A real
+// quota exhaustion reports ~100% on the account's 5h/7d window; a transient
+// burst (many agents sharing one account momentarily exceed the per-minute
+// cap) leaves it well below. Require a recent sample — a stale cache can't
+// disprove a fresh spike — so we only suppress rotation on positively-fresh,
+// positively-low usage and otherwise fail safe to the existing behavior.
+const HEADROOM_PCT = 90
+const FRESH_USAGE_MAX_AGE_S = 15 * 60
 
 const transcriptPath = payload.transcript_path
 let entries = transcriptPath ? readEntries(transcriptPath) : []
@@ -66,7 +77,8 @@ const pane = capturePane()
 // backoff. Match the API status line in the pane ("API Error: Overloaded",
 // "API Error: 529 …") and the raw payload ("overloaded_error" etc).
 const transientHaystack = `${raw}\n${pane}`
-const isTransientApiError =
+// `let`: the headroom check below may add a burst 429 to this bucket.
+let isTransientApiError =
   !isRateLimit &&
   (isTransientRateLimit ||
     /overloaded|API Error:\s*(?:5(?:0[234]|29))\b|"type":\s*"(?:overloaded|api)_error"/i.test(transientHaystack))
@@ -134,6 +146,24 @@ if (resetEpoch !== null) {
 }
 
 const tmuxCtx = getTmuxContext()
+
+// --- Burst-vs-quota reclassification -------------------------------------
+// A short-term burst 429 (`rate_limit_error` — several agents sharing one
+// account momentarily exceed the per-minute request cap) and a real 5h/7d
+// quota exhaustion BOTH stringify to a payload matching the usage-limit regex
+// above. Only the latter actually parks the account; the burst clears in
+// seconds. Rotating on a burst falsely cools a healthy account, mis-attributes
+// a stray reset time (e.g. a subprocess's "session limit · resets 4am" line
+// scraped from the pane), and cascades across accounts as each freshly-swapped
+// one keeps bursting. So when we can POSITIVELY confirm the active account
+// still has real headroom, treat it as a transient error: retry 'continue'
+// with backoff instead of rotating / waiting out a reset we'll never hit.
+// Uncertain (CLI error, stale/missing sample, at-limit) → leave as a rate
+// limit and fall through to the existing rotate/wait behavior.
+if (isRateLimit && tmuxCtx && activeAccountHasHeadroom()) {
+  isRateLimit = false
+  isTransientApiError = true
+}
 
 // Build the DM text. Advertise auto-resume only when BOTH reset epoch AND
 // tmux context are present — that's when the resume fork below will run.
@@ -281,6 +311,64 @@ function deriveAgentName(target: string): string | null {
   const sess = target.split(':')[0] ?? ''
   const m = sess.match(/^agent-(.+)$/)
   return m && m[1] ? m[1] : null
+}
+
+// activeAccountHasHeadroom — returns true ONLY when we can positively confirm
+// this agent's current account is fresh-sampled AND below HEADROOM_PCT on both
+// its 5h and 7d windows (i.e. a rate-limit signal can't be real quota
+// exhaustion — it's a transient burst). Any uncertainty (no tmux, CLI failure,
+// non-ok JSON, unknown active account, missing/stale sample, at-or-near limit)
+// returns false so the caller falls back to the existing rotate-on-limit path.
+// Two cheap CLI reads, well within the hook's 10s budget; same `sudo -n 5dive`
+// privilege the rotation rotate call already relies on.
+function activeAccountHasHeadroom(): boolean {
+  if (!tmuxCtx) return false
+  const agentName = deriveAgentName(tmuxCtx.target)
+  if (!agentName) return false
+
+  // Which account is this agent on right now?
+  let active = ''
+  try {
+    const rg = spawnSync('sudo', ['-n', '5dive', '--json', 'agent', 'rotation', 'get', agentName], {
+      encoding: 'utf8',
+      // Short timeout: both reads run sequentially BEFORE the DM/rotate, and a
+      // killed hook (10s budget) recovers nothing. These fire under the same
+      // high-load condition that can slow the CLI, so keep the worst case well
+      // under budget; a timeout just returns false → existing rotate behavior.
+      timeout: 3500,
+    })
+    const j = JSON.parse((rg.stdout || '').trim())
+    if (!j?.ok) return false
+    active = String(j.data?.active ?? '')
+  } catch {
+    return false
+  }
+  if (!active) return false
+
+  // Freshest measured usage per account (reads each account's newest agent
+  // statusline cache; shape: data[].usage.{fiveHour,sevenDay}.pct + asOf).
+  let rows: any[] = []
+  try {
+    const au = spawnSync('sudo', ['-n', '5dive', '--json', 'account', 'usage'], {
+      encoding: 'utf8',
+      timeout: 3500, // see note above; sub-second normally, fail-safe on timeout
+    })
+    const j = JSON.parse((au.stdout || '').trim())
+    if (!j?.ok || !Array.isArray(j.data)) return false
+    rows = j.data
+  } catch {
+    return false
+  }
+
+  const u = rows.find(r => r?.name === active)?.usage
+  if (!u) return false
+  // Require a recent sample — a stale cache can't disprove a fresh spike.
+  const asOf = typeof u.asOf === 'number' ? u.asOf : 0
+  if (!asOf || Math.floor(Date.now() / 1000) - asOf > FRESH_USAGE_MAX_AGE_S) return false
+  // Missing window → assume worst (no headroom) so we don't suppress wrongly.
+  const five = typeof u.fiveHour?.pct === 'number' ? u.fiveHour.pct : 100
+  const seven = typeof u.sevenDay?.pct === 'number' ? u.sevenDay.pct : 100
+  return five < HEADROOM_PCT && seven < HEADROOM_PCT
 }
 
 // tryRotate — arm the one-shot resume marker, then ask the CLI to swap to the
