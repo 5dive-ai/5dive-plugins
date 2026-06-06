@@ -2073,6 +2073,13 @@ const commandHandlers: Record<string, CommandHandler> = {
     await ctx.reply(await buildTaskList())
   },
 
+  // /heartbeat — per-agent heartbeat schedule from `5dive heartbeat ls`.
+  // Read-only mirror of /tasks; paired-5dive (wraps a `sudo 5dive` subcommand,
+  // so it's hidden + no-ops on upstream-only hosts).
+  heartbeat: async ctx => {
+    await ctx.reply(await buildHeartbeatList())
+  },
+
   // /task add <title> — create a task on the shared queue. Bare /task (or any
   // non-`add` subcommand) prints usage. created_by is attributed to the
   // Telegram sender's @handle. Title is passed after `--` so a leading dash
@@ -2319,6 +2326,33 @@ async function buildTaskList(): Promise<string> {
   })
   const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more)` : ''
   return `Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`
+}
+
+// --- /heartbeat: per-agent heartbeat schedule (`5dive heartbeat ls`) ---
+// Read-only mirror of buildTaskList: one line per agent with its cadence,
+// queued-task depth, and time-to-next tick. Emoji reflects heartbeat state —
+// ⚪ disabled, 🟢 enabled+active, 🟡 enabled+inactive.
+async function buildHeartbeatList(): Promise<string> {
+  let j: any
+  try {
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'heartbeat', 'ls', '--json'], { timeout: 8000 })
+    j = JSON.parse(stdout)
+  } catch (err) {
+    return `Failed to list heartbeats: ${err instanceof Error ? err.message : String(err)}`
+  }
+  if (!j.ok || !Array.isArray(j.data?.agents)) return '5dive returned unexpected output.'
+  const agents = j.data.agents
+  if (agents.length === 0) return 'No agents with a heartbeat schedule.'
+  const lines = agents.map((a: any) => {
+    const emoji = !a.enabled ? '⚪' : a.running === 'active' ? '🟢' : '🟡'
+    const next = !a.enabled
+      ? 'off'
+      : a.nextInSec > 0
+        ? `${Math.round(a.nextInSec / 60)}m`
+        : 'due now'
+    return `${emoji} ${a.name} — every ${a.everyMin}m · ${a.todo} queued · next ${next} (${a.running})`
+  })
+  return `Heartbeat schedule:\n\n${lines.join('\n')}`
 }
 
 async function buildTaskDetail(id: number): Promise<string> {

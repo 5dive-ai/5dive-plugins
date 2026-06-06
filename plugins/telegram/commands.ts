@@ -88,6 +88,11 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     scope: 'paired-5dive',
   },
   {
+    name: 'heartbeat',
+    description: 'Heartbeat schedule',
+    scope: 'paired-5dive',
+  },
+  {
     // `/task add <title>` creates; bare `/task` prints usage. List lives at
     // /tasks (mirrors the `5dive task ls` vs `add` split).
     name: 'task',
