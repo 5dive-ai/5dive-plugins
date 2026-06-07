@@ -1116,31 +1116,67 @@ function renderContextBar(pct: number, width: number = 20): string {
 // permitted by the agent's sudoers entry (see /agents handler).
 type FiveDiveAgentEntry = {
   name: string
+  // The agent's CLI type (claude/codex/grok/…). Used to scope the /account
+  // picker to same-type accounts — a claude agent can only bind a profile
+  // that holds claude credentials, so listing codex/grok-only profiles just
+  // confuses (DIVE-150). Matches the `types` entries on FiveDiveAccountEntry.
+  type?: string
   authProfile?: string
 }
 
-async function read5diveAgentList(): Promise<FiveDiveAgentEntry[] | null> {
+// Run `sudo -n 5dive <args>` and return the parsed JSON envelope from STDOUT,
+// tolerating a nonzero exit. execFileP rejects on any nonzero exit and throws
+// the captured stdout away — but the CLI writes a valid {ok,data} envelope to
+// stdout even when a stray stderr warning flips the process exit code on some
+// boxes (the DIVE-125 "Failed to list accounts" repro: `account list` emits
+// valid JSON yet exits nonzero). The envelope's own `ok` flag is the real
+// success signal, so parse stdout regardless and only give up when there's no
+// valid JSON at all. (Mirrors the run5dive() helper the codex/grok/agy variants
+// already use — this brings the claude plugin to parity.)
+async function read5diveJson(args: string[], timeout: number): Promise<any | null> {
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'agent', 'list', '--json'], { timeout: 3000 })
-    const j = JSON.parse(stdout)
-    if (j?.ok && Array.isArray(j.data)) return j.data as FiveDiveAgentEntry[]
-    return null
-  } catch {
-    return null
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', ...args], { timeout })
+    return JSON.parse(stdout)
+  } catch (e) {
+    const out = String((e as { stdout?: unknown })?.stdout ?? '')
+    try { return JSON.parse(out) } catch { return null }
   }
+}
+
+async function read5diveAgentList(): Promise<FiveDiveAgentEntry[] | null> {
+  const j = await read5diveJson(['agent', 'list', '--json'], 3000)
+  return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAgentEntry[]) : null
 }
 
 type FiveDiveAccountEntry = { name: string; types?: string[]; agents?: string[] }
 
 async function read5diveAccountList(): Promise<FiveDiveAccountEntry[] | null> {
-  try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'account', 'list', '--json'], { timeout: 3000 })
-    const j = JSON.parse(stdout)
-    if (j?.ok && Array.isArray(j.data)) return j.data as FiveDiveAccountEntry[]
-    return null
-  } catch {
-    return null
-  }
+  const j = await read5diveJson(['account', 'list', '--json'], 3000)
+  return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAccountEntry[]) : null
+}
+
+// Scope the account list to profiles this agent can actually bind: ones whose
+// `types` include the agent's own CLI type (DIVE-150 — a claude agent's
+// /account was listing codex/grok-only profiles too). Mirrors the dashboard
+// Switch-account modal's `a.types.includes(row.connector.id)` filter.
+// Defensive: with no known type, or an account that carries no `types` array
+// (older CLI), we keep the entry rather than hide everything. `keep` always
+// survives the filter so the currently-bound account stays visible even if it
+// somehow doesn't match this agent's type.
+function scopeAccountsToType(
+  accounts: FiveDiveAccountEntry[],
+  myType: string | undefined,
+  keep?: string,
+): FiveDiveAccountEntry[] {
+  if (!myType) return accounts
+  return accounts.filter(
+    a => a.name === keep || !a.types || a.types.includes(myType),
+  )
+}
+
+// This agent's CLI type from `agent list --json`, used to scope /account.
+function agentTypeOf(agents: FiveDiveAgentEntry[] | null, me: string): string | undefined {
+  return agents?.find(a => a.name === me)?.type
 }
 
 type FiveDiveUsageWindow = { pct: number; resetsAt: number } | null
@@ -1160,14 +1196,8 @@ type FiveDiveAccountUsage = {
 // failure (e.g. a CLI without the `usage` subcommand yet) so callers degrade
 // to "no usage" rather than erroring.
 async function read5diveAccountUsage(): Promise<FiveDiveAccountUsage[] | null> {
-  try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'account', 'usage', '--json'], { timeout: 5000 })
-    const j = JSON.parse(stdout)
-    if (j?.ok && Array.isArray(j.data)) return j.data as FiveDiveAccountUsage[]
-    return null
-  } catch {
-    return null
-  }
+  const j = await read5diveJson(['account', 'usage', '--json'], 5000)
+  return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAccountUsage[]) : null
 }
 
 type FiveDiveRotation = {
@@ -1184,14 +1214,8 @@ type FiveDiveRotation = {
 // null on any failure (e.g. an older CLI without the `rotation` subcommand) so
 // the picker just hides the rotation row rather than erroring.
 async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
-  try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', '--json', 'agent', 'rotation', 'get', me], { timeout: 3000 })
-    const j = JSON.parse(stdout)
-    if (j?.ok && j.data) return j.data as FiveDiveRotation
-    return null
-  } catch {
-    return null
-  }
+  const j = await read5diveJson(['--json', 'agent', 'rotation', 'get', me], 3000)
+  return j?.ok && j.data ? (j.data as FiveDiveRotation) : null
 }
 
 // Write the rotation config via `agent rotation set`. accountsArg is passed to
@@ -1397,6 +1421,10 @@ async function buildAccountMenu(
     return { error: `No accounts configured.\n\nAdd one with: sudo 5dive account add <name>` }
   }
   const current = agents?.find(a => a.name === me)?.authProfile || 'default'
+  const scoped = scopeAccountsToType(accounts, agentTypeOf(agents, me), current)
+  if (scoped.length === 0) {
+    return { error: `No accounts hold credentials for this agent's type.\n\nSign one in with: sudo 5dive account add <name>` }
+  }
   const usageByName = new Map((usage ?? []).map(u => [u.name, u.usage]))
   const suffixFor = (name: string): string => {
     const u = usageByName.get(name)
@@ -1405,7 +1433,7 @@ async function buildAccountMenu(
     const five = u?.fiveHour?.pct
     return five != null ? ` ${dot} ${Math.round(five)}%` : ` ${dot}`
   }
-  const kb = accountKeyboard(accounts.map(a => a.name), current, suffixFor)
+  const kb = accountKeyboard(scoped.map(a => a.name), current, suffixFor)
   // Auto-rotate entry button — only when the CLI supports `rotation get`
   // (read5diveRotation returned non-null). Older CLIs just omit the row.
   if (rotation) {
@@ -1424,12 +1452,16 @@ async function buildAccountMenu(
 async function buildRotationMenu(
   me: string,
 ): Promise<{ text: string; keyboard: InlineKeyboard } | null> {
-  const [accounts, usage, rot] = await Promise.all([
+  const [accounts, agents, usage, rot] = await Promise.all([
     read5diveAccountList(),
+    read5diveAgentList(),
     read5diveAccountUsage(),
     read5diveRotation(me),
   ])
   if (!accounts || !rot) return null
+  // Same-type scoping as the picker: the rotation pool can only cycle profiles
+  // that hold this agent's credentials (DIVE-150).
+  const scoped = scopeAccountsToType(accounts, agentTypeOf(agents, me))
   const usageByName = new Map((usage ?? []).map(u => [u.name, u.usage]))
   const suffixFor = (name: string): string => {
     const dot = usageDot(usageByName.get(name))
@@ -1437,7 +1469,7 @@ async function buildRotationMenu(
   }
   return {
     text: rotationBody(rot),
-    keyboard: rotationKeyboard(accounts.map(a => a.name), rot, suffixFor),
+    keyboard: rotationKeyboard(scoped.map(a => a.name), rot, suffixFor),
   }
 }
 
@@ -1993,9 +2025,10 @@ const commandHandlers: Record<string, CommandHandler> = {
 
     if (parts.length === 0) {
       try {
-        const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'agent', 'list', '--json'])
-        const j = JSON.parse(stdout)
-        if (!j.ok || !Array.isArray(j.data)) {
+        // Exit-tolerant read (DIVE-125): a stray stderr warning can flip the
+        // CLI's exit code even with a valid envelope on stdout — honor the data.
+        const j = await read5diveJson(['agent', 'list', '--json'], 3000)
+        if (!j || !j.ok || !Array.isArray(j.data)) {
           await ctx.reply(`5dive returned unexpected output.`)
           return
         }
@@ -2350,7 +2383,8 @@ async function buildHeartbeatList(): Promise<string> {
       : a.nextInSec > 0
         ? `${Math.round(a.nextInSec / 60)}m`
         : 'due now'
-    return `${emoji} ${a.name} — every ${a.everyMin}m · ${a.todo} queued · next ${next} (${a.running})`
+    const freshTag = a.enabled ? ` · ${a.fresh ? 'fresh' : 'no-fresh'}` : ''
+    return `${emoji} ${a.name} — every ${a.everyMin}m${freshTag} · ${a.todo} queued · next ${next} (${a.running})`
   })
   return `Heartbeat schedule:\n\n${lines.join('\n')}`
 }
@@ -2861,6 +2895,69 @@ async function handleInbound(
   // posts in a supergroup's General channel. Surfaced in inbound meta so the
   // agent can thread its reply back into the same topic.
   const threadId = ctx.message?.message_thread_id
+
+  // Reply-to-answer for a button-less human gate (DIVE-145). When this message
+  // replies to one of our own "🙋 [DIVE-N] needs you" alerts, treat the reply
+  // text as the gate's answer and clear it via `5dive task answer`, instead of
+  // relaying it as ordinary chat. Only MANUAL gates take this path: decision and
+  // approval carry tap buttons (the tna: callback flow above), and SECRET must
+  // NEVER be answered over chat — the raw value would persist in Telegram's
+  // history and we deliberately never store secrets in the task db. The LIVE gate
+  // is the source of truth (re-read here, never the alert text), so a dashboard
+  // or CLI answer that lands between the alert and this reply can't double-answer.
+  // Fully fail-soft: any miss replies a nudge and returns; it never throws or
+  // leaks the message into the agent's chat stream.
+  const repliedMsg = ctx.message?.reply_to_message
+  const repliedText = repliedMsg?.text ?? repliedMsg?.caption
+  const gateM =
+    repliedMsg?.from?.username === botUsername && repliedText
+      ? /\[DIVE-(\d+)\]\s+needs you/.exec(repliedText)
+      : null
+  if (gateM) {
+    const taskId = gateM[1]!
+    try {
+      const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
+      const task = JSON.parse(show.stdout).data?.task
+      if (!task || !task.need_type) {
+        await ctx.reply(`DIVE-${taskId} no longer has an open gate — nothing to answer.`).catch(() => {})
+      } else if (task.need_answered_at) {
+        await ctx.reply(`DIVE-${taskId} was already answered.`).catch(() => {})
+      } else if (task.need_type === 'secret') {
+        // Carve-out: a secret must not enter chat history. Redirect, never store.
+        await ctx
+          .reply(
+            `🔒 DIVE-${taskId} needs a secret — don't send it here (Telegram keeps chat history). ` +
+            `Place it out-of-band, then run \`5dive task answer DIVE-${taskId}\` (no --value) to mark it provided.`,
+          )
+          .catch(() => {})
+      } else if (task.need_type !== 'manual') {
+        // decision/approval are answered by tapping the alert's inline buttons.
+        await ctx
+          .reply(`DIVE-${taskId} is a ${task.need_type} gate — tap a button on the alert to answer it.`)
+          .catch(() => {})
+      } else {
+        const value = text.trim()
+        if (!value) {
+          await ctx.reply(`Reply with the answer text for DIVE-${taskId}.`).catch(() => {})
+        } else {
+          // `task answer` records the value, clears the gate, and pings the owning
+          // agent to resume (same path as the tna: button flow).
+          await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, `--value=${value}`], { timeout: 8000 })
+          if (msgId != null) {
+            void bot.api
+              .setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '✅' as ReactionTypeEmoji['emoji'] }])
+              .catch(() => {})
+          }
+          await ctx.reply(`✅ Answered DIVE-${taskId} — the owning agent has been pinged to resume.`).catch(() => {})
+        }
+      }
+    } catch {
+      // Stale message, deleted task, restarted agent, or a CLI/sudo failure (incl.
+      // a gate answered between our show and answer). Nudge softly; never throw.
+      await ctx.reply(`Couldn't answer DIVE-${taskId} from here — try the dashboard.`).catch(() => {})
+    }
+    return
+  }
 
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
