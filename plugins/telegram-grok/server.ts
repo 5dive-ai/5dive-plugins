@@ -1649,6 +1649,15 @@ function startRearmWatchdog(): void {
   const timer = setInterval(() => {
     // Parked in wait_for_message → loop is armed and healthy.
     if (waiters.length > 0) { rearmKicks = 0; clearStallAlert(); return }
+    // DIVE-165: a re-arm exists ONLY to hand the agent a message it's currently
+    // out of the loop to receive. With nothing queued there is nothing to
+    // deliver, so kicking an idle agent here just forces an empty model turn
+    // (wait_for_message → times out → turn ends → kicked again) — the 24/7 idle
+    // quota burn. Skip when the inbox is empty; the kick fires the moment a real
+    // inbound lands with no waiter parked (enqueueInbound pushes to inboxQueue).
+    // Stall state is left untouched: during a genuine wedge the undelivered
+    // message keeps the queue non-empty, so escalation still works.
+    if (inboxQueue.length === 0) return
     const now = Date.now()
     // Liveness = the most recent of a Telegram-MCP call OR a real agent turn.
     // markActivity() only fires on Telegram tool calls, so an agent heads-down
