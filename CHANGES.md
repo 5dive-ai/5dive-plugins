@@ -3,6 +3,61 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.70
+
+### Added — bot-to-bot loop + rate guards (DIVE-162)
+
+- Mandatory backend safety layer before any cross-box auto-reply ships. Bot API
+  10.0 lets bots see and reply to each other; two auto-replying bots in one group
+  would otherwise ping-pong forever, and a chatty mesh blows Telegram's
+  ~20-msg/min/group cap.
+- `gate()` now branches on `from.is_bot` **before** the normal allowlist/pairing
+  path, so a bot sender can never trigger a pairing code or a DM auto-reply.
+- New `botToBot` access config (`enabled`, `allowFrom`, `maxPerMin`,
+  `dedupeWindowMs`). **Default-deny**: with no config, every bot-sender message is
+  dropped. When enabled, a bot must still be allowlisted for its chat, and passes
+  only within dedupe (identical chat+sender+text inside the window = loop echo)
+  and a per-group rolling-minute rate cap (default 12/min, the circuit breaker).
+- Guard logic lives in a pure, dependency-free `botguard.ts` so it's unit-tested
+  without booting the long-polling server (`test/botguard.test.ts`, incl.
+  ping-pong simulations). Forks (codex/grok/agy) can adopt it when cross-box
+  auto-reply lands there.
+
+## v0.4.67
+
+### Added — reply to a button-less gate alert to answer it (DIVE-145)
+
+- A `🙋 [DIVE-N] needs you` alert for a **manual** gate carries no tap buttons
+  (only decision/approval do), so answering used to mean a dashboard trip. Now
+  replying to the alert in Telegram with the answer text clears the gate: the
+  inbound handler detects a reply whose replied-to message is one of our own
+  gate alerts, extracts `DIVE-N`, and runs `5dive task answer DIVE-N --value=<reply>`,
+  then the CLI pings the owning agent to resume (same path as the `tna:` buttons).
+- **Carve-out:** `secret` gates are **never** answerable over chat — the raw
+  value would persist in Telegram history and we deliberately never store
+  secrets in the task db. A reply to a secret gate gets redirected to the
+  out-of-band `5dive task answer DIVE-N` (no `--value`) flow instead.
+- Source of truth is the **live** gate (re-read via `task show`), never the
+  alert text, so a dashboard/CLI answer landing between alert and reply can't
+  double-answer. decision/approval replies are nudged toward their buttons.
+  Fully fail-soft: any miss replies a one-line nudge and never leaks the reply
+  into the agent's chat stream.
+
+## v0.4.66
+
+### Fixed — /account "Failed to list accounts" when the CLI exits nonzero (DIVE-125)
+
+- The `/account` menu read `5dive account list --json` (and agent-list /
+  usage / rotation) via raw `execFileP`, which **rejects on any nonzero exit
+  and discards stdout**. On some boxes a stray stderr warning flips the CLI's
+  exit code even though it wrote a valid `{ok,data}` envelope to stdout — so the
+  plugin threw the good data away and surfaced "Failed to list accounts. Try:
+  sudo 5dive account list", despite the CLI working. The four readers now go
+  through a shared `read5diveJson()` helper that **parses stdout regardless of
+  exit code** (the envelope's `ok` flag is the real success signal), giving up
+  only when there's no valid JSON — matching the tolerant `run5dive()` the
+  codex/grok/agy variants already use.
+
 ## v0.4.40
 
 ### Added — auto-resume on transient API errors
