@@ -682,37 +682,38 @@ function taskAssignedToMe(assignee: string | null | undefined): boolean {
   return assignee === me || assignee === `agent-${me}`
 }
 
-async function buildTaskList(): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+// Telegram inline-button labels are centered and silently clipped, so the list
+// is plain left-aligned text with a tappable /task_<id> deep link per row
+// (handled by the bot.hears below). Rows assigned to THIS agent are starred.
+// Read-only; mutations go through /task add + dashboard/CLI.
+async function buildTaskList(): Promise<string> {
   let j: any
   try {
     j = await run5dive(['task', 'ls', '--json'])
   } catch (err) {
-    return { error: `⚠️ Failed to list tasks: ${err instanceof Error ? err.message : String(err)}` }
+    return `Failed to list tasks: ${err instanceof Error ? err.message : String(err)}`
   }
-  if (!j.ok || !Array.isArray(j.data?.tasks)) return { error: '⚠️ `5dive task ls` returned unexpected output.' }
+  if (!j.ok || !Array.isArray(j.data?.tasks)) return '5dive returned unexpected output.'
   const tasks = j.data.tasks
-  if (tasks.length === 0) return { error: 'No open tasks.\n\nAdd one with `/task add <title>`.' }
-  const kb = new InlineKeyboard()
-  const MAX = 30
-  for (const t of tasks.slice(0, MAX)) {
+  if (tasks.length === 0) return 'No open tasks.\n\nAdd one with /task add <title>.'
+  const MAX = 40
+  const lines = tasks.slice(0, MAX).map((t: any) => {
     const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
     const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
-    let label = `${mine}${flag}${t.ident}  ${t.title}`
-    if (label.length > 56) label = label.slice(0, 55) + '…'
-    kb.text(label, `task:${t.id}`).row()
-  }
-  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more, see the dashboard)` : ''
-  return { text: `Open tasks (tap to view) · ⭐ = assigned to you${more}`, keyboard: kb }
+    return `${mine}${flag}${t.ident} · ${t.title}  /task_${t.id}`
+  })
+  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more)` : ''
+  return `Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`
 }
 
-async function buildTaskDetail(id: number): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+async function buildTaskDetail(id: number): Promise<string> {
   let j: any
   try {
     j = await run5dive(['task', 'show', String(id), '--json'])
   } catch (err) {
-    return { error: `⚠️ Failed to load task: ${err instanceof Error ? err.message : String(err)}` }
+    return `Failed to load task: ${err instanceof Error ? err.message : String(err)}`
   }
-  if (!j.ok || !j.data?.task) return { error: 'Task not found.' }
+  if (!j.ok || !j.data?.task) return 'Task not found.'
   const t = j.data.task
   const mine = taskAssignedToMe(t.assignee) ? ' ⭐' : ''
   const lines = [
@@ -730,8 +731,8 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard: In
     lines.push('', body)
   }
   if (t.result) lines.push('', `result: ${t.result}`)
-  const kb = new InlineKeyboard().text('‹ Back to tasks', 'task:list')
-  return { text: lines.join('\n'), keyboard: kb }
+  lines.push('', 'back to list: /tasks')
+  return lines.join('\n')
 }
 
 async function addTask(arg: string, from: string): Promise<string> {
@@ -854,10 +855,9 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
       case 'model': await md(await handleModelCommand(cmdArg)); return true
       case 'agents': await md(await listAgents()); return true
       case 'tasks': {
-        const r = await buildTaskList()
-        if ('error' in r) { await md(r.error); return true }
-        await bot.api.sendMessage(chat_id, r.text, {
-          reply_markup: r.keyboard,
+        // Plain text (no parse_mode) so the /task_N deep links stay tappable and
+        // titles aren't mangled by Markdown.
+        await bot.api.sendMessage(chat_id, await buildTaskList(), {
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         })
         return true
@@ -952,6 +952,17 @@ async function ingest(ctx: Context, text: string): Promise<void> {
 const runIngest = (ctx: Context, text: string) =>
   void ingest(ctx, text).catch(err => process.stderr.write(`telegram-opencode: ingest failed: ${err}\n`))
 
+// /task_<id> — tappable deep link from the /tasks list. Opens the single-task
+// detail. Registered BEFORE the message bridge so the tap is handled here and
+// NOT forwarded to the agent as a normal message (no next()). Gated on allowFrom.
+bot.hears(/^\/task_(\d+)\b/, async ctx => {
+  const senderId = String(ctx.from?.id ?? '')
+  if (!loadAccess().allowFrom.includes(senderId)) return
+  const m = /^\/task_(\d+)\b/.exec(ctx.message?.text ?? '')
+  if (!m) return
+  await ctx.reply(await buildTaskDetail(Number(m[1])))
+})
+
 bot.on('message:text', ctx => { runIngest(ctx, ctx.message.text) })
 bot.on('message:photo', ctx => {
   // Image understanding via file parts is a follow-up; for now forward the caption.
@@ -991,25 +1002,8 @@ async function postPermissionPrompt(ev: any): Promise<void> {
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data ?? ''
 
-  // /tasks tappable list <-> single-task detail. task:list re-renders the list;
-  // task:<id> opens that task with a Back button. Read-only, but re-gate the
-  // tapper against allowFrom so a leaked button-share link can't read the queue.
-  const isTaskList = data === 'task:list'
-  const taskM = /^task:(\d+)$/.exec(data)
-  if (isTaskList || taskM) {
-    const senderId = String(ctx.from.id)
-    if (!loadAccess().allowFrom.includes(senderId)) {
-      await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
-      return
-    }
-    const r = isTaskList ? await buildTaskList() : await buildTaskDetail(Number(taskM![1]))
-    await ctx.answerCallbackQuery().catch(() => {})
-    await ctx.editMessageText('error' in r ? r.error : r.text, {
-      reply_markup: 'error' in r ? undefined : r.keyboard,
-    }).catch(() => {})
-    return
-  }
-
+  // Permission-approval buttons (the /tasks list is now plain text + /task_<id>
+  // deep links, handled by the bot.hears below — no task callbacks remain).
   const m = data.match(/^ocperm:(once|always|reject):(.+)$/)
   if (!m) return
   const response = m[1] as 'once' | 'always' | 'reject'

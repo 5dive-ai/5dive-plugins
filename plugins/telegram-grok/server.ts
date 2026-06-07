@@ -22,7 +22,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, statSync,
@@ -703,37 +703,38 @@ function taskAssignedToMe(assignee: string | null | undefined): boolean {
   return assignee === me || assignee === `agent-${me}`
 }
 
-async function buildTaskList(): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+// Telegram inline-button labels are centered and silently clipped, so the list
+// is plain left-aligned text with a tappable /task_<id> deep link per row
+// (handled by the bot.hears below). Rows assigned to THIS agent are starred.
+// Read-only; mutations go through /task add + dashboard/CLI.
+async function buildTaskList(): Promise<string> {
   let j: any
   try {
     j = await run5dive(['task', 'ls', '--json'])
   } catch (err) {
-    return { error: `⚠️ Failed to list tasks: ${err instanceof Error ? err.message : String(err)}` }
+    return `Failed to list tasks: ${err instanceof Error ? err.message : String(err)}`
   }
-  if (!j.ok || !Array.isArray(j.data?.tasks)) return { error: '⚠️ `5dive task ls` returned unexpected output.' }
+  if (!j.ok || !Array.isArray(j.data?.tasks)) return '5dive returned unexpected output.'
   const tasks = j.data.tasks
-  if (tasks.length === 0) return { error: 'No open tasks.\n\nAdd one with `/task add <title>`.' }
-  const kb = new InlineKeyboard()
-  const MAX = 30
-  for (const t of tasks.slice(0, MAX)) {
+  if (tasks.length === 0) return 'No open tasks.\n\nAdd one with /task add <title>.'
+  const MAX = 40
+  const lines = tasks.slice(0, MAX).map((t: any) => {
     const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
     const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
-    let label = `${mine}${flag}${t.ident}  ${t.title}`
-    if (label.length > 56) label = label.slice(0, 55) + '…'
-    kb.text(label, `task:${t.id}`).row()
-  }
-  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more, see the dashboard)` : ''
-  return { text: `Open tasks (tap to view) · ⭐ = assigned to you${more}`, keyboard: kb }
+    return `${mine}${flag}${t.ident} · ${t.title}  /task_${t.id}`
+  })
+  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more)` : ''
+  return `Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`
 }
 
-async function buildTaskDetail(id: number): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
+async function buildTaskDetail(id: number): Promise<string> {
   let j: any
   try {
     j = await run5dive(['task', 'show', String(id), '--json'])
   } catch (err) {
-    return { error: `⚠️ Failed to load task: ${err instanceof Error ? err.message : String(err)}` }
+    return `Failed to load task: ${err instanceof Error ? err.message : String(err)}`
   }
-  if (!j.ok || !j.data?.task) return { error: 'Task not found.' }
+  if (!j.ok || !j.data?.task) return 'Task not found.'
   const t = j.data.task
   const mine = taskAssignedToMe(t.assignee) ? ' ⭐' : ''
   const lines = [
@@ -751,8 +752,8 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard: In
     lines.push('', body)
   }
   if (t.result) lines.push('', `result: ${t.result}`)
-  const kb = new InlineKeyboard().text('‹ Back to tasks', 'task:list')
-  return { text: lines.join('\n'), keyboard: kb }
+  lines.push('', 'back to list: /tasks')
+  return lines.join('\n')
 }
 
 // /task add <title> — create a task on the shared queue.
@@ -943,10 +944,9 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         return true
       }
       case 'tasks': {
-        const r = await buildTaskList()
-        if ('error' in r) { await md(r.error); return true }
-        await bot.api.sendMessage(chat_id, r.text, {
-          reply_markup: r.keyboard,
+        // Plain text (no parse_mode) so the /task_N deep links stay tappable and
+        // titles aren't mangled by Markdown.
+        await bot.api.sendMessage(chat_id, await buildTaskList(), {
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         })
         return true
@@ -1039,6 +1039,75 @@ async function ingest(
   })
 }
 
+// /task_<id> — tappable deep link from the /tasks list. Opens the single-task
+// detail. Registered BEFORE the message bridge so the tap is handled here and
+// NOT forwarded to the agent as a normal message (no next()). Gated on allowFrom.
+bot.hears(/^\/task_(\d+)\b/, async ctx => {
+  const senderId = String(ctx.from?.id ?? '')
+  if (!loadAccess().allowFrom.includes(senderId)) return
+  const m = /^\/task_(\d+)\b/.exec(ctx.message?.text ?? '')
+  if (!m) return
+  await ctx.reply(await buildTaskDetail(Number(m[1])))
+})
+
+// Tap-to-answer for a human-gate ping (DIVE-117 parity, DIVE-118). The DIVE-105
+// notify DM carries inline buttons for decision(--options)/approval gates; a tap
+// lands here as `tna:<taskId>:<token>` — token is the option INDEX for a decision
+// (resolved against the LIVE need_options, never the tapped payload: dodges the
+// 64-byte callback_data cap AND can't be tampered to inject a value) or
+// 'approved'/'denied' for an approval. The DB is the source of truth: re-read the
+// gate first so a dashboard/CLI answer (or a double-tap) between ping and tap
+// doesn't double-answer. Fully fail-soft — a stale/deleted task or any CLI error
+// just acks the callback with a nudge and never throws. Only `tna:` callbacks are
+// claimed; anything else falls through. (Emit is type-gated CLI-side; this lands
+// dormant until task_need_notify enables buttons for this runtime — DIVE-118.)
+bot.on('callback_query:data', async ctx => {
+  const data = ctx.callbackQuery.data ?? ''
+  const senderId = String(ctx.from?.id ?? '')
+  if (!loadAccess().allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const tnaM = /^tna:(\d+):(.+)$/.exec(data)
+  if (!tnaM) return
+  const taskId = tnaM[1]!
+  const token = tnaM[2]!
+  try {
+    const show = await run5dive(['task', 'show', taskId, '--json'], 5000)
+    const task = show.ok ? show.data?.task : undefined
+    if (!task || !task.need_type) {
+      await ctx.answerCallbackQuery({ text: 'This task no longer has a gate.' }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+      return
+    }
+    // Already answered (dashboard/CLI/double-tap won the race)? Don't re-answer.
+    if (task.need_answered_at) {
+      const prior = task.need_type === 'secret' ? '(provided)' : (task.need_answer ?? '—')
+      await ctx.answerCallbackQuery({ text: 'Already answered.' }).catch(() => {})
+      await ctx.editMessageText(`✅ already answered: ${prior}`).catch(() => {})
+      return
+    }
+    // Resolve the value from the live gate, not the payload.
+    let value: string | undefined
+    if (task.need_type === 'decision') {
+      const opts = String(task.need_options ?? '').split('|').map((s: string) => s.trim()).filter(Boolean)
+      value = opts[Number(token)]
+    } else if (task.need_type === 'approval') {
+      value = token === 'approved' || token === 'denied' ? token : undefined
+    }
+    if (value === undefined) {
+      await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+      return
+    }
+    await run5dive(['task', 'answer', taskId, `--value=${value}`, '--json'], 8000)
+    await ctx.answerCallbackQuery({ text: `Answered: ${value}` }).catch(() => {})
+    await ctx.editMessageText(`✅ answered: ${value}`).catch(() => {})
+  } catch {
+    await ctx.answerCallbackQuery({ text: "Couldn't apply — open the dashboard." }).catch(() => {})
+  }
+})
+
 bot.on('message:text', async ctx => {
   await ingest(ctx, ctx.message.text, undefined)
 })
@@ -1105,28 +1174,6 @@ bot.on('message:sticker', async ctx => {
   await ingest(ctx, `(sticker${emoji})`, undefined, {
     kind: 'sticker', file_id: s.file_id, size: s.file_size,
   })
-})
-
-// /tasks tappable list <-> single-task detail. task:list re-renders the list;
-// task:<id> opens that task with a Back button. Read-only, but re-gate the
-// tapper against allowFrom so a leaked button-share link can't read the queue.
-bot.on('callback_query:data', async ctx => {
-  const data = ctx.callbackQuery.data ?? ''
-  const isList = data === 'task:list'
-  const taskM = /^task:(\d+)$/.exec(data)
-  if (!isList && !taskM) return
-
-  const senderId = String(ctx.from.id)
-  if (!loadAccess().allowFrom.includes(senderId)) {
-    await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
-    return
-  }
-
-  const r = isList ? await buildTaskList() : await buildTaskDetail(Number(taskM![1]))
-  await ctx.answerCallbackQuery().catch(() => {})
-  await ctx.editMessageText('error' in r ? r.error : r.text, {
-    reply_markup: 'error' in r ? undefined : r.keyboard,
-  }).catch(() => {})
 })
 
 bot.catch(err => {
