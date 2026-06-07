@@ -56,12 +56,12 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     name: 'restart',
-    description: 'Respawn claude',
+    description: 'New session — full restart',
     scope: 'paired',
   },
   {
     name: 'clear',
-    description: 'Clear context',
+    description: 'Clear context (same session)',
     scope: 'paired',
   },
   {

@@ -1814,20 +1814,43 @@ const commandHandlers: Record<string, CommandHandler> = {
     }
   },
 
-  // /restart — kill the claude process; systemd's respawn loop brings it back
-  // within ~2s. Useful when claude is stuck in an error state.
+  // /restart — "New session": a full agent restart, deliberately distinct from
+  // /clear (DIVE-156). /clear wipes context in the SAME process — cheap, warm,
+  // reloads memory + CLAUDE.md, no restart tax; it's the heartbeat/task loop's
+  // default. /restart tears the whole unit down and back up via systemd
+  // (~20-30s): fresh PID, fresh session, re-reads settings.json, and picks up a
+  // just-shipped CLI version — for a one-off hard reset or force-loading an
+  // update without waiting for nightly. (To pull new *plugin* code first, use
+  // /update, which refreshes then restarts.) Same deferred-restart shape as
+  // /resume and /update: the ack must land before SIGTERM, so we schedule a
+  // transient systemd-run unit that fires ~1s later and survives this process's
+  // teardown. This replaces the older raw process.kill respawn — a full unit
+  // restart is the documented `5dive agent restart` path and re-reads settings
+  // cleanly, where a bare SIGTERM only re-execs within the same unit.
   restart: async ctx => {
-    const session = findActiveSession()
-    if (!session) {
-      await ctx.reply(`No active claude session to restart.`)
+    const me = thisAgentName()
+    if (!me) {
+      await ctx.reply(`Can't determine this agent's name (not running as agent-* user).`)
       return
     }
-    try {
-      process.kill(session.pid, 'SIGTERM')
-      await ctx.reply(`Killed claude (pid=${session.pid}). systemd respawns it immediately — back in ~20-30s once the new session loads.`)
-    } catch (err) {
-      await ctx.reply(`Failed to kill: ${err instanceof Error ? err.message : String(err)}`)
-    }
+    const chatId = ctx.chat?.id ?? Number(ctx.from?.id)
+    await ctx.reply(
+      `🔄 New session — full restart (~20-30s).\n` +
+        `Reloads everything: fresh process + context, re-reads settings, latest CLI.\n\n` +
+        `(Just need a clean slate in the same process? Use /clear — instant, keeps the running session.)`,
+    )
+    void execFileP(
+      SUDO,
+      ['-n', 'systemd-run', '--on-active=1', '--collect',
+        '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+      { timeout: 5000 },
+    ).catch((err: any) => {
+      const stderr = err?.stderr ? String(err.stderr).trim() : ''
+      void bot.api.sendMessage(
+        chatId,
+        `❌ Failed to restart: ${stderr || (err instanceof Error ? err.message : String(err))}`,
+      ).catch(() => {})
+    })
   },
 
   // /checkpoint [label] — pin the current claude session so /resume can
