@@ -115,11 +115,27 @@ let botUsername = ''
 // crashes and never replies, so we don't loop forever).
 const TYPING_INTERVAL_MS = 4_000
 const TYPING_CEILING_MS = 5 * 60 * 1000
+// The Stop hook (hooks/stop-reply-check.ts) bumps this file's mtime when a
+// turn ends, since auto-relays are sent from a separate process and never
+// reach the reply tool that would otherwise stop the loop. See DIVE-146.
+const TYPING_STOP_FILE = join(STATE_DIR, 'typing-stop')
 const typingLoops = new Map<string, ReturnType<typeof setInterval>>()
 function startTypingLoop(chat_id: string) {
   stopTypingLoop(chat_id)
+  const startedAt = Date.now()
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
   const handle = setInterval(() => {
+    // Stop if the hook signalled turn-end after this loop began. Wrapped in
+    // try/catch so a missing/unreadable file falls back to the prior
+    // ceiling-only behavior.
+    try {
+      if (statSync(TYPING_STOP_FILE).mtimeMs > startedAt) {
+        stopTypingLoop(chat_id)
+        return
+      }
+    } catch {
+      // file absent → keep prior behavior
+    }
     void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
   }, TYPING_INTERVAL_MS)
   typingLoops.set(chat_id, handle)
