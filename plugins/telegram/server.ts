@@ -25,6 +25,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
+import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 
 // Plugin version is sourced from .claude-plugin/plugin.json — the same
 // manifest the Claude Code plugin system reads, so /status can never
@@ -177,6 +178,13 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /**
+   * Bot-to-bot comms (Bot API 10.0). Senders with from.is_bot are DROPPED by
+   * default — two auto-replying bots in one group otherwise ping-pong forever
+   * (DIVE-162). Opt in per fleet, and even then dedupe + a per-group rate cap
+   * keep a runaway loop from blowing Telegram's ~20-msg/min/group limit.
+   */
+  botToBot?: BotToBotConfig
 }
 
 function defaultAccess(): Access {
@@ -221,6 +229,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      botToBot: parsed.botToBot,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -439,6 +448,30 @@ function gate(ctx: Context): GateResult {
   if (!from) return { action: 'drop' }
   const senderId = String(from.id)
   const chatType = ctx.chat?.type
+
+  // Bot-to-bot loop guard. Applies to any chat type and runs BEFORE the normal
+  // allowlist/pairing/mention logic so a bot sender can never trigger pairing
+  // codes or DM auto-replies. Default-deny: bots only pass when explicitly
+  // enabled, and then only within dedupe + rate limits.
+  if (from.is_bot) {
+    const chatKey = ctx.chat ? String(ctx.chat.id) : senderId
+    const senderKey = from.username ?? senderId
+    const text = ctx.message?.text ?? ctx.message?.caption ?? ''
+    if (botGuardShouldDrop(access.botToBot, chatKey, senderKey, text)) return { action: 'drop' }
+    // Survived the guards. Reuse the same per-chat-type access checks below,
+    // but bots never pair and must already be allowlisted for their chat.
+    if (chatType === 'private') {
+      return access.allowFrom.includes(senderId) ? { action: 'deliver', access } : { action: 'drop' }
+    }
+    if (chatType === 'group' || chatType === 'supergroup') {
+      const policy = access.groups[String(ctx.chat!.id)]
+      if (!policy) return { action: 'drop' }
+      const groupAllowFrom = policy.allowFrom ?? []
+      if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return { action: 'drop' }
+      return { action: 'deliver', access }
+    }
+    return { action: 'drop' }
+  }
 
   if (chatType === 'private') {
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
