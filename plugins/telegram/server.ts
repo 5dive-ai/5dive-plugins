@@ -65,6 +65,13 @@ try {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
+// DIVE-159 team-bot: when an agent is a member of the shared team bot, it runs
+// SEND-ONLY against the team token — it MUST NOT poll getUpdates (Telegram allows
+// exactly one consumer per token; a second poller = 409 = dead channel for the
+// whole fleet). Inbound is instead handed to us by the single listener as atomic
+// JSON file-drops in relay-in/ (see the watcher below). Opt-in: unset = pure old
+// per-agent behavior, nothing changes.
+const SEND_ONLY = process.env.TELEGRAM_SEND_ONLY === '1'
 
 if (!TOKEN) {
   process.stderr.write(
@@ -82,15 +89,19 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+// The PID file guards the single getUpdates slot. SEND_ONLY never polls, so it
+// must NOT claim the slot (doing so would fight the listener / a per-agent bot).
+if (!SEND_ONLY) {
+  try {
+    const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (stale > 1 && stale !== process.pid) {
+      process.kill(stale, 0)
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+      process.kill(stale, 'SIGTERM')
+    }
+  } catch {}
+  writeFileSync(PID_FILE, String(process.pid))
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -586,7 +597,7 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
+if (!STATIC && !SEND_ONLY) setInterval(checkApprovals, 5000).unref()
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
@@ -912,6 +923,67 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 })
 
 await mcp.connect(new StdioServerTransport())
+
+// DIVE-159 team-bot inbound: in SEND_ONLY mode we never poll, so the single
+// listener (sole getUpdates consumer of the shared team token) hands us inbound
+// as atomic JSON file-drops in relay-in/. Contract with the listener:
+//   - write a temp file then rename to <id>.json (atomic; we only read *.json,
+//     never a half-written temp)
+//   - one message per file: { id, chat_id, message_thread_id?, content,
+//     message_id?, user?, user_id?, ts?, image_path? }
+// We process oldest-first by mtime (deterministic ordering), emit the SAME
+// channel notification the poll path uses, then delete the file (ack) so
+// relay-in/ never grows. A short dir-poll avoids fs.watch edge cases; volume
+// is tiny. `seen` dedups defensively if a delete ever fails.
+if (SEND_ONLY) {
+  const RELAY_IN_DIR = join(STATE_DIR, 'relay-in')
+  mkdirSync(RELAY_IN_DIR, { recursive: true, mode: 0o700 })
+  const seen = new Set<string>()
+  const drainRelayIn = () => {
+    let paths: string[]
+    try {
+      paths = readdirSync(RELAY_IN_DIR)
+        .filter(f => f.endsWith('.json'))
+        .map(f => join(RELAY_IN_DIR, f))
+        .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
+    } catch {
+      return
+    }
+    for (const path of paths) {
+      let p: any
+      try {
+        p = JSON.parse(readFileSync(path, 'utf8'))
+      } catch {
+        try { rmSync(path) } catch {} // unparseable — drop it, don't wedge the queue
+        continue
+      }
+      const id = String(p.id ?? path)
+      if (!seen.has(id)) {
+        seen.add(id)
+        mcp.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content: String(p.content ?? ''),
+            meta: {
+              chat_id: String(p.chat_id),
+              ...(p.message_id != null ? { message_id: String(p.message_id) } : {}),
+              ...(p.message_thread_id != null ? { message_thread_id: String(p.message_thread_id) } : {}),
+              user: String(p.user ?? 'team'),
+              ...(p.user_id != null ? { user_id: String(p.user_id) } : {}),
+              ts: String(p.ts ?? new Date().toISOString()),
+              ...(p.image_path ? { image_path: String(p.image_path) } : {}),
+            },
+          },
+        }).catch((err: unknown) => {
+          process.stderr.write(`telegram channel: relay-in deliver failed: ${err}\n`)
+        })
+      }
+      try { rmSync(path) } catch {} // ack: drop right after emit
+    }
+    if (seen.size > 1000) seen.clear() // keep the dedup set bounded
+  }
+  setInterval(drainRelayIn, 1500).unref()
+}
 
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the bot keeps polling forever as a zombie, holding the token and blocking
@@ -3110,7 +3182,15 @@ bot.catch(err => {
 // returned, and polling stopped permanently while the process stayed alive
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
-void (async () => {
+// DIVE-159 (D): in SEND_ONLY mode the poll loop is STRUCTURALLY ABSENT — bot.start()
+// is never invoked, so this plugin can never become a second getUpdates consumer on
+// the shared team token (a 2nd poller = 409 = dead channel for the whole fleet). The
+// single listener is the sole poller; inbound arrives via the relay-in watcher above.
+if (SEND_ONLY) {
+  process.stderr.write(
+    `telegram channel: SEND_ONLY — getUpdates disabled (team-bot member; the listener is the sole poller)\n`,
+  )
+} else void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({

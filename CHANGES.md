@@ -3,6 +3,24 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.71
+
+### Added — team-bot send-only mode + relay-in inbound (DIVE-159)
+
+- Opt-in team-bot membership: with `TELEGRAM_SEND_ONLY=1` the plugin sends via a
+  shared team-bot token (its own topic via `message_thread_id`) but NEVER polls
+  getUpdates — the single team-bot listener is the sole consumer of that token, so
+  N agents can share one bot without fighting over Telegram's one-getUpdates-per-
+  token slot (a second poller = 409 = dead channel).
+- Structural no-poll guard: in send-only mode `bot.start()` is never invoked, and
+  the PID-slot takeover + `checkApprovals` are skipped (listener-only concerns).
+- Inbound arrives as atomic JSON file-drops in `<state>/relay-in/` (dir-poll,
+  oldest-first, id-dedup, ack-by-delete), emitted to the agent as the standard
+  `<channel … message_thread_id=…>` notification — reusing the existing deliver
+  path. Replies go back into the agent's own topic via the team token.
+- Fully opt-in: with `TELEGRAM_SEND_ONLY` unset, behavior is byte-for-byte the old
+  per-agent bot — provisioning never requires a team token.
+
 ## v0.4.70
 
 ### Added — bot-to-bot loop + rate guards (DIVE-162)
