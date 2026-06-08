@@ -243,7 +243,25 @@ function readAccessFile(): Access {
       botToBot: parsed.botToBot,
     }
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return defaultAccess()
+    // A filesystem READ error (EACCES/EBUSY/EISDIR/etc.) is NOT corruption — the
+    // file may be perfectly valid but momentarily unreadable (wrong ownership
+    // after a root edit, a mid-write rename race, a transient IO hiccup). The old
+    // code treated every non-ENOENT error as corrupt JSON: it moved the file
+    // aside (DESTROYING a valid allowlist) and fell back to empty access, which
+    // silently denies EVERY chat ("not allowlisted"). That's data loss + a
+    // misleading failure. So on an fs read error, preserve the file and surface
+    // it loudly instead of empty-denying. (DIVE-159: a `sudo` root edit of
+    // access.json caused exactly this — EACCES → wiped allowlist → dead sends.)
+    if (code) {
+      throw new Error(
+        `telegram channel: cannot read ${ACCESS_FILE} (${code}) — check ownership/permissions. ` +
+          `Refusing to fall back to empty access (would deny all). File left untouched.`,
+      )
+    }
+    // No fs error code ⇒ JSON.parse threw ⇒ the file really is corrupt. Only now
+    // is it safe to move it aside and start fresh.
     try {
       renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`)
     } catch {}

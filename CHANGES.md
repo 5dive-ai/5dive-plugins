@@ -3,6 +3,24 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.72
+
+### Fixed — access.json read errors no longer wipe the allowlist (DIVE-159)
+
+- `readAccessFile` treated EVERY non-ENOENT error as corrupt JSON: it renamed
+  the file aside (`.corrupt-<ts>`) and fell back to EMPTY access, which silently
+  denies every chat ("not allowlisted"). A filesystem READ error (EACCES from a
+  root-owned edit, a mid-write rename race, a transient IO hiccup) is NOT
+  corruption — the allowlist is valid, just momentarily unreadable.
+- Now: ENOENT → fresh default (unchanged); an fs read error (has an errno code)
+  → preserve the file and THROW a clear "cannot read access.json (CODE) — check
+  ownership/permissions" instead of empty-denying; only a genuine JSON parse
+  error (no errno) moves the file aside. Prevents data loss + the misleading
+  "not allowlisted" on a permissions glitch.
+- Surfaced by the team-bot dogfood: a `sudo` root edit of an agent's access.json
+  made it unreadable to the agent user → wiped allowlist → dead sends. Fix the
+  edit path (use `5dive agent telegram-access set`) AND harden the reader.
+
 ## v0.4.71
 
 ### Added — team-bot send-only mode + relay-in inbound (DIVE-159)
