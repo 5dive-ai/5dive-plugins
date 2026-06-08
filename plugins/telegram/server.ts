@@ -1779,6 +1779,73 @@ async function confirmMenuIfPresent(paneTarget: string, re: RegExp): Promise<voi
   }
 }
 
+// Newest mtime (ms) among carryover_*.md files across this agent's memory dirs,
+// or 0. Used by the "Remember & clear" nudge button to detect when
+// /telegram:carryover has actually written the carryover before we send /clear —
+// so we never reset the context before the save lands. homedir() is the agent
+// user's home, so this is scoped to this agent's own memories. (DIVE-180)
+function newestCarryoverMtime(): number {
+  let newest = 0
+  try {
+    const projects = join(homedir(), '.claude', 'projects')
+    for (const proj of readdirSync(projects, { withFileTypes: true })) {
+      if (!proj.isDirectory()) continue
+      let files: string[]
+      try {
+        files = readdirSync(join(projects, proj.name, 'memory'))
+      } catch {
+        continue
+      }
+      for (const f of files) {
+        if (!/^carryover_.*\.md$/.test(f)) continue
+        try {
+          const m = statSync(join(projects, proj.name, 'memory', f)).mtimeMs
+          if (m > newest) newest = m
+        } catch {
+          /* skip unreadable file */
+        }
+      }
+    }
+  } catch {
+    /* no projects dir — return 0 */
+  }
+  return newest
+}
+
+// "Remember & clear" (DIVE-180): after /telegram:carryover is dispatched, wait
+// for the carryover file to (re)appear, then for the turn to settle (pane stable
+// across two samples), and only THEN /clear — the fresh session auto-reloads the
+// carryover from memory. Bounded + best-effort: if the save never lands we leave
+// the context alone (the user can /clear themselves).
+async function clearAfterCarryover(paneTarget: string, baselineMtime: number): Promise<void> {
+  const saveDeadline = Date.now() + 150000
+  let saved = false
+  while (Date.now() < saveDeadline) {
+    await new Promise((r) => setTimeout(r, 2000))
+    if (newestCarryoverMtime() > baselineMtime) {
+      saved = true
+      break
+    }
+  }
+  if (!saved) return
+  let prev = ''
+  let stable = 0
+  const idleDeadline = Date.now() + 30000
+  while (Date.now() < idleDeadline) {
+    let cur = ''
+    try {
+      cur = (await execFileP(TMUX, ['capture-pane', '-t', paneTarget, '-p'])).stdout
+    } catch {
+      break
+    }
+    stable = cur === prev ? stable + 1 : 0
+    prev = cur
+    if (stable >= 2) break
+    await new Promise((r) => setTimeout(r, 1500))
+  }
+  await execFileP(TMUX, ['send-keys', '-t', paneTarget, '/clear', 'Enter']).catch(() => {})
+}
+
 function formatDuration(ms: number): string {
   const sec = Math.floor(ms / 1000)
   if (sec < 60) return `${sec}s`
@@ -2682,26 +2749,47 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  // Context carry-over nudge buttons (DIVE-114). The context-nudge Stop hook DMs
-  // "Carry over / Not yet" as the window fills. `ho:now` types the carryover
-  // command into the agent's TUI so it writes a structured carryover; `ho:skip`
-  // just dismisses (the hook's per-tier dedupe already prevents this tier
-  // re-firing, so a later tier can still escalate). Fail-soft: strip the
-  // keyboard either way so the buttons can't be tapped twice. (The `ho:`
-  // callback prefix is an internal id — kept stable so live buttons don't break.)
+  // Context carry-over nudge buttons (DIVE-114, DIVE-180). The context-nudge Stop
+  // hook DMs "Clear now / Remember & clear / Not yet" as the window fills.
+  //   ho:clear → /clear immediately, no save (lose this session's context).
+  //   ho:now   → /telegram:carryover writes a structured carryover, then we
+  //              /clear once the file lands (clearAfterCarryover) so the fresh
+  //              session auto-reloads it from memory — continuity without a full
+  //              restart (Mark's DIVE-180 call: A = light /clear).
+  //   ho:skip  → dismiss (per-tier dedupe already prevents this tier re-firing,
+  //              so a later tier can still escalate).
+  // Fail-soft: strip/replace the keyboard so buttons can't be tapped twice. The
+  // `ho:` callback prefix is an internal id — kept stable so live buttons don't break.
   //
   // NB: plugin slash commands are namespaced `/<plugin>:<command>`, so this MUST
   // be `/telegram:carryover` — bare `/carryover` resolves to "Unknown command".
-  if (data === 'ho:now') {
-    const dispatched = proxyToClaudeTUI('/telegram:carryover')
-    await ctx.answerCallbackQuery({ text: dispatched ? 'Carrying over…' : 'Run /telegram:carryover in your session' }).catch(() => {})
+  if (data === 'ho:clear') {
+    const dispatched = proxyToClaudeTUI('/clear')
+    await ctx.answerCallbackQuery({ text: dispatched ? 'Clearing…' : 'Type /clear in your session' }).catch(() => {})
     await ctx
       .editMessageText(
         dispatched
-          ? 'Saving the carryover — start a fresh session when I confirm.'
-          : "Couldn't reach the session from here — type /telegram:carryover in your terminal to save the carryover.",
+          ? 'Cleared the context now — nothing saved.'
+          : "Couldn't reach the session from here — type /clear in your terminal.",
       )
       .catch(() => {})
+    return
+  }
+  if (data === 'ho:now') {
+    const baseline = newestCarryoverMtime()
+    const dispatched = proxyToClaudeTUI('/telegram:carryover')
+    await ctx.answerCallbackQuery({ text: dispatched ? 'Saving, then clearing…' : 'Run /telegram:carryover in your session' }).catch(() => {})
+    await ctx
+      .editMessageText(
+        dispatched
+          ? 'Saving the carryover, then clearing — the fresh session reloads it from memory.'
+          : "Couldn't reach the session from here — type /telegram:carryover then /clear in your terminal.",
+      )
+      .catch(() => {})
+    if (dispatched) {
+      const user = process.env.USER ?? process.env.LOGNAME ?? ''
+      if (user.startsWith('agent-')) void clearAfterCarryover(`${user}:0`, baseline)
+    }
     return
   }
   if (data === 'ho:skip') {

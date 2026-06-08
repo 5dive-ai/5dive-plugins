@@ -105,17 +105,19 @@ const caller = getCallerChat(entries)
 const target: CallerChat | null = caller ?? (getAllowedChatIds().map(chatId => ({ chatId }))[0] ?? null)
 if (!target) process.exit(0)
 
-// --- Send the nudge with a one-tap button -----------------------------------
-// ho:now  → run /carryover in the agent's TUI (writes the carryover)
-// ho:skip → dismiss; the per-tier dedupe already prevents this tier re-firing,
-//           so a later tier can still escalate if the user keeps going.
+// --- Send the nudge with one-tap buttons -------------------------------------
+// ho:clear → /clear now, no save (lose this session's context).
+// ho:now   → save a structured carryover, then /clear (server.ts reloads it from
+//            memory on the fresh session — continuity without a full restart).
+// ho:skip  → dismiss; the per-tier dedupe already prevents this tier re-firing,
+//            so a later tier can still escalate if the user keeps going.
+// Full-width rows (one button each) — Telegram renders single-column buttons wide.
 const token = getToken()!
 const reply_markup = {
   inline_keyboard: [
-    [
-      { text: 'Carry over', callback_data: 'ho:now' },
-      { text: 'Not yet', callback_data: 'ho:skip' },
-    ],
+    [{ text: 'Clear now', callback_data: 'ho:clear' }],
+    [{ text: 'Remember & clear', callback_data: 'ho:now' }],
+    [{ text: 'Not yet', callback_data: 'ho:skip' }],
   ],
 }
 try {

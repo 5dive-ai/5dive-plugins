@@ -3,6 +3,22 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.75
+
+### Changed — carryover nudge: "Clear now" + "Remember & clear" (DIVE-180)
+
+- The context carry-over nudge now offers three full-width buttons instead of the
+  vague "Carry over / Not yet": **Clear now** (`/clear` immediately, no save — lose
+  this session's context), **Remember & clear** (save a structured carryover, then
+  `/clear`), and **Not yet** (dismiss).
+- "Remember & clear" chains the reset safely: after dispatching
+  `/telegram:carryover`, the server waits for the carryover file to actually land
+  in memory (`newestCarryoverMtime`), then for the turn to settle (pane stable),
+  and only THEN sends `/clear`. The fresh session auto-reloads the carryover from
+  memory, so continuity holds without a heavier full restart (Mark's call: light
+  `/clear` over restart). Bounded + best-effort: if the save never lands we leave
+  the context alone.
+
 ## v0.4.74
 
 ### Changed — /task hidden from menu + /agents status dots
