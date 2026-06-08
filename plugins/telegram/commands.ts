@@ -25,6 +25,10 @@ export interface CommandDef {
   scope: CommandScope
   /** Hide from /help and the BotFather `/` picker. Telegram already auto-includes /start. */
   hidden?: boolean
+  /** Hide from the BotFather `/` picker only, but keep listed in /help. Use for
+   *  commands that read confusingly in the featured menu yet are worth documenting
+   *  (e.g. a bare verb that overlaps a sibling command). Ignored if `hidden` is set. */
+  menuHidden?: boolean
 }
 
 export const COMMAND_REGISTRY: CommandDef[] = [
@@ -94,13 +98,13 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     // `/task add <title>` creates; bare `/task` prints usage. List lives at
-    // /tasks (mirrors the `5dive task ls` vs `add` split). Hidden from the
+    // /tasks (mirrors the `5dive task ls` vs `add` split). menuHidden: off the
     // BotFather featured menu (the bare verb is confusing next to /tasks) but
-    // still fully functional — /task add keeps working.
+    // still listed in /help and fully functional — /task add keeps working.
     name: 'task',
     description: 'Add a task — /task add <title>',
     scope: 'paired-5dive',
-    hidden: true,
+    menuHidden: true,
   },
   {
     name: 'org',
@@ -194,6 +198,11 @@ export function botFatherCommands(
   fiveDivePresent: boolean = true,
 ): BotCommand[] {
   return registry
-    .filter(c => !c.hidden && (fiveDivePresent || c.scope !== 'paired-5dive'))
+    .filter(
+      c =>
+        !c.hidden &&
+        !c.menuHidden &&
+        (fiveDivePresent || c.scope !== 'paired-5dive'),
+    )
     .map(c => ({ command: c.name, description: c.description }))
 }
