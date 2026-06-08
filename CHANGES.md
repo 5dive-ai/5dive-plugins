@@ -3,6 +3,17 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.73
+
+### Added — ToS warning on the auto-rotate menu
+
+- The `/account` rotation submenu body now appends an experimental / use-at-
+  your-own-risk warning: rotating between Anthropic accounts on a usage limit
+  may conflict with Anthropic's usage terms, and the user is responsible for
+  complying with their account provider's terms. Mirrors the same copy added to
+  the dashboard Auto-rotate toggle (app repo). Shifts compliance responsibility
+  to the operator for an OSS CLI feature.
+
 ## v0.4.72
 
 ### Fixed — access.json read errors no longer wipe the allowlist (DIVE-159)

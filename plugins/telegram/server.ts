@@ -1540,6 +1540,7 @@ function rotationBody(rot: { enabled: boolean; allAccounts?: boolean; accounts: 
     }
     lines.push(`Tap accounts in priority order. The turn that hits the limit is lost on resume.`)
   }
+  lines.push(`⚠️ Experimental, use at your own risk. Rotating between Anthropic accounts on a usage limit may conflict with Anthropic's usage terms; you are responsible for complying with your account provider's terms.`)
   return lines.join('\n')
 }
 
