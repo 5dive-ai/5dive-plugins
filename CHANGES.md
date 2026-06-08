@@ -3,6 +3,17 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.74
+
+### Changed — /task hidden from menu + /agents status dots
+
+- `/task` is now `hidden: true` in the command registry — removed from the
+  BotFather featured menu (the bare verb read confusingly next to `/tasks`). The
+  command still works fully: `/task add <title>` creates as before; only the menu
+  entry is gone. Parity golden baseline menu updated to match.
+- `/agents` now shows each agent's status as a round color dot instead of the
+  word — 🟢 active / ⚪ otherwise — for a faster scan.
+
 ## v0.4.73
 
 ### Added — ToS warning on the auto-rotate menu

@@ -2205,7 +2205,9 @@ const commandHandlers: Record<string, CommandHandler> = {
           if (a.channels === 'telegram' && a.botUsername) ch = ` @${a.botUsername}`
           else if (a.channels && a.channels !== 'none') ch = ` [${a.channels}]`
           const profile = a.authProfile && a.authProfile !== '-' ? ` (${a.authProfile})` : ''
-          return `• ${a.name} · ${a.type}${ch}${profile} · ${a.active}${marker}`
+          // Status as a round color dot instead of the word (🟢 active / ⚪ otherwise).
+          const dot = a.active === 'active' ? '🟢' : '⚪'
+          return `• ${a.name} · ${a.type}${ch}${profile} · ${dot}${marker}`
         })
         await ctx.reply(`Agents on this host:\n\n${lines.join('\n')}`)
       } catch (err) {

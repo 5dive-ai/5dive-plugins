@@ -94,10 +94,13 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     // `/task add <title>` creates; bare `/task` prints usage. List lives at
-    // /tasks (mirrors the `5dive task ls` vs `add` split).
+    // /tasks (mirrors the `5dive task ls` vs `add` split). Hidden from the
+    // BotFather featured menu (the bare verb is confusing next to /tasks) but
+    // still fully functional — /task add keeps working.
     name: 'task',
     description: 'Add a task — /task add <title>',
     scope: 'paired-5dive',
+    hidden: true,
   },
   {
     name: 'org',
