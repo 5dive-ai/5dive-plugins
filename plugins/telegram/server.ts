@@ -177,6 +177,8 @@ type PendingEntry = {
 type GroupPolicy = {
   requireMention: boolean
   allowFrom: string[]
+  // DIVE-159: bind a group entry to one forum topic — the agent only responds there.
+  message_thread_id?: number
 }
 
 type Access = {
@@ -559,6 +561,14 @@ function gate(ctx: Context): GateResult {
     if (!policy) return { action: 'drop' }
     const groupAllowFrom = policy.allowFrom ?? []
     const requireMention = policy.requireMention ?? true
+    // DIVE-159: if this group entry is bound to a forum topic, only respond IN
+    // that topic (the agent's own lane). Messages in other topics / the General
+    // channel are dropped — lets one personal bot sit in a multi-agent team group
+    // and speak only in its own topic.
+    if (typeof policy.message_thread_id === 'number' &&
+        ctx.message?.message_thread_id !== policy.message_thread_id) {
+      return { action: 'drop' }
+    }
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
       return { action: 'drop' }
     }

@@ -3,6 +3,15 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.78
+
+### Added — per-topic gating for team groups (DIVE-159)
+`GroupPolicy.message_thread_id`: when a group access entry is bound to a forum
+topic, the agent only responds IN that topic and drops messages from other
+topics / the General channel. Lets one agent's bot live in a multi-agent team
+group (topic per agent) and speak only in its own lane, replying without an
+@mention.
+
 ## v0.4.75
 
 ### Changed — carryover nudge: "Clear now" + "Remember & clear" (DIVE-180)
