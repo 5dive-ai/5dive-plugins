@@ -42,6 +42,11 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const SILENCE_FILE = join(STATE_DIR, 'silence.json')
 const GOAL_FILE = join(STATE_DIR, 'goal.json')
+// Opt-in flag for the context carry-over nudge (DIVE-114). The /nudges command
+// writes {enabled} here; the context-nudge Stop hook reads it and stays silent
+// unless enabled===true. Default OFF — the nudge only fires after the user opts
+// in for this agent. Path mirrors hooks/lib/paths.ts NUDGE_FILE.
+const NUDGE_FILE = join(STATE_DIR, 'context-nudge.json')
 // /checkpoint bookkeeping: the saved session id + label. /resume reads this.
 const CHECKPOINT_FILE = join(STATE_DIR, 'checkpoint.json')
 // One-shot handoff to 5dive-agent-start: /resume writes the bare session id
@@ -381,6 +386,22 @@ function readGoal(): GoalState | null {
 }
 function clearGoal(): void {
   try { rmSync(GOAL_FILE, { force: true }) } catch {}
+}
+
+// Context carry-over nudge opt-in (DIVE-114). OFF unless the file says so —
+// any read error or missing file reads as off, matching the hook's own gate.
+function readNudgeEnabled(): boolean {
+  try {
+    return JSON.parse(readFileSync(NUDGE_FILE, 'utf8')).enabled === true
+  } catch {
+    return false
+  }
+}
+function writeNudgeEnabled(enabled: boolean): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  const tmp = NUDGE_FILE + '.tmp'
+  writeFileSync(tmp, JSON.stringify({ enabled }, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, NUDGE_FILE)
 }
 function writeGoal(g: GoalState): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
@@ -1977,6 +1998,22 @@ const commandHandlers: Record<string, CommandHandler> = {
   // out: this handler reads from the statusline cache, which carries the
   // real context_window_size emitted by claude.
   context: async ctx => {
+    // Folded-in carry-over nudge toggle (DIVE-114). `/context on|off` flips the
+    // per-agent opt-in; the inline button under the usage bar does the same with
+    // one tap. Nudges are OFF by default, so the bare `/context` both reports
+    // usage and exposes the switch in the one place context-fill is shown.
+    const arg = (ctx.match ?? '').trim().toLowerCase()
+    if (['on', 'enable', 'enabled', 'yes', 'start'].includes(arg)) {
+      writeNudgeEnabled(true)
+      await ctx.reply(`🔔 Context nudges ON.\n\nAs the window fills (~45/60/75%) I'll nudge you once (escalating if ignored) with a one-tap carry-over button. Turn off with /context off.`)
+      return
+    }
+    if (['off', 'disable', 'disabled', 'no', 'stop'].includes(arg)) {
+      writeNudgeEnabled(false)
+      await ctx.reply(`🔕 Context nudges OFF.\n\nI won't prompt you to carry over as context fills. You can still carry over any time with /telegram:carryover. Re-enable with /context on.`)
+      return
+    }
+
     const session = findActiveSession()
     if (!session) {
       await ctx.reply(`No active claude session detected.`)
@@ -2000,7 +2037,19 @@ const commandHandlers: Record<string, CommandHandler> = {
     if (header) lines.push(header, '')
     lines.push(`${bar}  ${pct}%`)
     lines.push(`${usedStr} / ${totalStr} tokens`)
-    await ctx.reply(lines.join('\n'))
+    // Carry-over nudge state + one-tap toggle. Button shows the OPPOSITE action
+    // so a tap always does the obvious thing. Callback handled in the
+    // callback_query:data router (nudge:on / nudge:off).
+    const nudgeOn = readNudgeEnabled()
+    lines.push('', `Carry-over nudges: ${nudgeOn ? '🔔 on' : '🔕 off'}`)
+    const reply_markup = {
+      inline_keyboard: [[
+        nudgeOn
+          ? { text: '🔕 Turn nudges off', callback_data: 'nudge:off' }
+          : { text: '🔔 Turn nudges on', callback_data: 'nudge:on' },
+      ]],
+    }
+    await ctx.reply(lines.join('\n'), { reply_markup })
   },
 
   // /stop — interrupt the agent's current task. Sends C-c to the tmux pane
@@ -2795,6 +2844,32 @@ bot.on('callback_query:data', async ctx => {
   if (data === 'ho:skip') {
     await ctx.answerCallbackQuery({ text: 'Okay, carrying on.' }).catch(() => {})
     await ctx.editMessageReplyMarkup().catch(() => {})
+    return
+  }
+
+  // Context-nudge opt-in toggle from the /context button (DIVE-114). Flip the
+  // per-agent flag, then rewrite the message body + button to the new state so a
+  // second tap does the opposite. Fail-soft like the other callbacks.
+  if (data === 'nudge:on' || data === 'nudge:off') {
+    const enabled = data === 'nudge:on'
+    writeNudgeEnabled(enabled)
+    await ctx.answerCallbackQuery({ text: enabled ? 'Nudges on' : 'Nudges off' }).catch(() => {})
+    await ctx
+      .editMessageText(
+        enabled
+          ? "🔔 Context nudges ON.\n\nAs the window fills (~45/60/75%) I'll nudge you once, escalating if ignored, with a one-tap carry-over button."
+          : "🔕 Context nudges OFF.\n\nI won't prompt you to carry over as context fills. You can still carry over any time with /telegram:carryover.",
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              enabled
+                ? { text: '🔕 Turn nudges off', callback_data: 'nudge:off' }
+                : { text: '🔔 Turn nudges on', callback_data: 'nudge:on' },
+            ]],
+          },
+        },
+      )
+      .catch(() => {})
     return
   }
 

@@ -32,7 +32,21 @@ import { readPayload } from './lib/payload'
 import { readEntries } from './lib/transcript'
 import { getToken } from './lib/telegram'
 import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
+import { NUDGE_FILE } from './lib/paths'
 import type { HookPayload } from './lib/types'
+
+// Opt-in gate: the carry-over nudge is OFF by default and only fires once the
+// user has turned it on for this agent with `/context on` (writes
+// {enabled:true} to NUDGE_FILE). Absent file, unreadable file, or any value
+// other than enabled===true → stay silent. Cheapest possible check, done first.
+function nudgeEnabled(): boolean {
+  try {
+    return JSON.parse(readFileSync(NUDGE_FILE, 'utf8')).enabled === true
+  } catch {
+    return false
+  }
+}
+if (!nudgeEnabled()) process.exit(0)
 
 // Tier thresholds (percent of context window used) in ascending order, each
 // with the copy shown when it fires. Order matters: we walk high→low to find

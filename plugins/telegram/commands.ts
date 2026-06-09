@@ -50,7 +50,7 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     name: 'context',
-    description: 'Context-window usage',
+    description: 'Context usage + carry-over nudges',
     scope: 'paired',
   },
   {
