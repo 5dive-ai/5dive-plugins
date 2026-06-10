@@ -114,6 +114,11 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 2. Set `groups[<groupId>] = { requireMention: !hasFlag("--no-mention"),
    allowFrom: parsedAllowList }`.
 3. Write.
+4. Remind the user: unless the bot is a group admin, BotFather's Group
+   Privacy must be OFF for it to see regular group messages (@BotFather →
+   Bot Settings → Group Privacy → Turn off), and the change only applies
+   after removing and re-adding the bot. Enabling Topics migrates the
+   group to a new id, which then needs `group add` again.
 
 ### `group rm <groupId>`
 

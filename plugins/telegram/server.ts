@@ -3151,25 +3151,57 @@ bot.on('my_chat_member', async ctx => {
   entry.type = chat.type
   delete entry.removedAt
 
-  if (chatId in access.groups || entry.announcedAt !== undefined) {
-    saveAccess(access) // already approved or already announced — stay quiet
+  const lines: string[] = []
+  const announce = !(chatId in access.groups) && entry.announcedAt === undefined
+  if (announce) {
+    lines.push(
+      `👋 Hi! I've been added to "${entry.title}" — group id: ${chatId}. ` +
+        `I'll stay quiet until this group is approved: use the 5dive dashboard ` +
+        `(agent → Telegram access) or run /telegram:access in the agent terminal.`,
+    )
+  }
+
+  // DIVE-246: a non-admin bot with BotFather's Group Privacy ON (the default)
+  // receives NO regular group messages — Telegram withholds them before they
+  // ever reach us, so the bot just looks dead (cost ~2h live during PH demo
+  // prep). getMe's can_read_all_group_messages is the live privacy bit
+  // (true = privacy off); admins receive everything regardless. Warn on every
+  // join while the condition holds — a re-add without the BotFather fix should
+  // warn again, and a re-add after the fix goes quiet on its own.
+  if (ctx.myChatMember.new_chat_member.status !== 'administrator') {
+    try {
+      const me = await bot.api.getMe()
+      if (!me.can_read_all_group_messages) {
+        lines.push(
+          `⚠️ Heads-up: my Group Privacy is ON, so Telegram hides regular group ` +
+            `messages from me — I'd only see @mentions. To fix: (1) @BotFather → ` +
+            `Bot Settings → Group Privacy → Turn off, (2) then remove me from this ` +
+            `group and add me back — Telegram only applies the change on re-join. ` +
+            `Making me a group admin also works. Note: enabling Topics moves the ` +
+            `group to a new id, which then needs approving again.`,
+        )
+      }
+    } catch {
+      // getMe hiccup — skip the hint rather than guess.
+    }
+  }
+
+  if (lines.length === 0) {
+    saveAccess(access)
     return
   }
-  const line =
-    `👋 Hi! I've been added to "${entry.title}" — group id: ${chatId}. ` +
-    `I'll stay quiet until this group is approved: use the 5dive dashboard ` +
-    `(agent → Telegram access) or run /telegram:access in the agent terminal.`
+  const text = lines.join('\n\n')
   try {
-    // The group isn't allowlisted yet, so this bypasses the outbound gate on
-    // purpose — it's the one message that makes allowlisting possible.
-    await bot.api.sendMessage(chat.id, line)
-    entry.announcedAt = Date.now()
+    // The group may not be allowlisted yet, so this bypasses the outbound gate
+    // on purpose — it's the one message that makes allowlisting possible.
+    await bot.api.sendMessage(chat.id, text)
+    if (announce) entry.announcedAt = Date.now()
   } catch {
     // Group may block bot posts — fall back to DMing the paired owner(s).
     for (const uid of access.allowFrom) {
       try {
-        await bot.api.sendMessage(uid, line)
-        entry.announcedAt = Date.now()
+        await bot.api.sendMessage(uid, text)
+        if (announce) entry.announcedAt = Date.now()
         break
       } catch {}
     }
