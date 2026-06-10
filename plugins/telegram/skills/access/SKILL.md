@@ -43,9 +43,20 @@ Arguments passed: `$ARGUMENTS`
       "createdAt": <ms>, "expiresAt": <ms>
     }
   },
+  "discovered": {
+    "<groupId>": {
+      "title": "...", "type": "group|supergroup",
+      "firstSeenAt": <ms>, "announcedAt": <ms>, "removedAt": <ms>
+    }
+  },
   "mentionPatterns": ["@mybot"]
 }
 ```
+
+`discovered` is written by the channel server when the bot is added to a
+group: the group's name + id, awaiting approval. Entries with `removedAt`
+set mean the bot was since kicked — skip those when listing. Never edit
+`announcedAt` (it's the server's send-once guard).
 
 Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
 
@@ -59,7 +70,9 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 1. Read `~/.claude/channels/telegram/access.json` (handle missing file).
 2. Show: dmPolicy, allowFrom count and list, pending count with codes +
-   sender IDs + age, groups count.
+   sender IDs + age, groups count, and any discovered groups (title + id)
+   that are not yet in `groups` and have no `removedAt` — these are groups
+   the bot sits in awaiting `group add <groupId>`.
 
 ### `pair <code>`
 

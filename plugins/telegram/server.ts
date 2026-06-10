@@ -181,11 +181,29 @@ type GroupPolicy = {
   message_thread_id?: number
 }
 
+// DIVE-242: a group the bot was added to but that isn't allowlisted yet.
+// Written by the my_chat_member handler; read by /telegram:access and the
+// dashboard access modal so the owner can approve a group without hunting
+// for its id. Entries persist across re-adds (announcedAt = send-once guard).
+type DiscoveredGroup = {
+  title: string
+  type: 'group' | 'supergroup'
+  /** user id of whoever added the bot, when Telegram includes it */
+  addedBy?: string
+  firstSeenAt: number
+  /** set after the one-time announce — never announce this group again */
+  announcedAt?: number
+  /** set when the bot is removed; cleared on re-add (UIs hide removed entries) */
+  removedAt?: number
+}
+
 type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
   groups: Record<string, GroupPolicy>
   pending: Record<string, PendingEntry>
+  /** DIVE-242: groups the bot sits in that await approval (not in `groups` yet) */
+  discovered?: Record<string, DiscoveredGroup>
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
   /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
@@ -242,6 +260,7 @@ function readAccessFile(): Access {
       allowFrom: parsed.allowFrom ?? [],
       groups: parsed.groups ?? {},
       pending: parsed.pending ?? {},
+      discovered: parsed.discovered,
       mentionPatterns: parsed.mentionPatterns,
       ackReaction: parsed.ackReaction,
       replyToMode: parsed.replyToMode,
@@ -3091,6 +3110,71 @@ bot.hears(/^\/task_(\d+)\b/, async ctx => {
   const m = /^\/task_(\d+)\b/.exec(ctx.message?.text ?? '')
   if (!m) return
   await ctx.reply(await buildTaskDetail(Number(m[1])))
+})
+
+// DIVE-242: adding the bot to a group leaves the user with no way to learn the
+// group id Telegram's UI never shows (it's needed for approval — Mark ended up
+// hunting @userinfobot during PH demo prep). On join, record the group under
+// access.discovered and post ONE line with the name + id + approval hint.
+// Send-once per group: announcedAt persists across kicks and re-adds, so
+// re-adding never spams. /telegram:access and the dashboard access modal read
+// `discovered` to offer approval without the id hunt.
+const JOINED_STATUSES = new Set(['member', 'administrator', 'restricted'])
+bot.on('my_chat_member', async ctx => {
+  const chat = ctx.chat
+  if (chat.type !== 'group' && chat.type !== 'supergroup') return
+  const wasIn = JOINED_STATUSES.has(ctx.myChatMember.old_chat_member.status)
+  const isIn = JOINED_STATUSES.has(ctx.myChatMember.new_chat_member.status)
+  if (wasIn === isIn) return // promotion/restriction shuffle, not a join/leave
+  const chatId = String(chat.id)
+  const access = loadAccess()
+  const discovered = (access.discovered ??= {})
+
+  if (!isIn) {
+    // Removed. Keep the entry (it carries the send-once guard) but mark it so
+    // the access UIs stop listing a group the bot can no longer speak in.
+    const gone = discovered[chatId]
+    if (gone) {
+      gone.removedAt = Date.now()
+      saveAccess(access)
+    }
+    return
+  }
+
+  const entry = (discovered[chatId] ??= {
+    title: chat.title ?? chatId,
+    type: chat.type,
+    addedBy: ctx.from ? String(ctx.from.id) : undefined,
+    firstSeenAt: Date.now(),
+  })
+  entry.title = chat.title ?? entry.title
+  entry.type = chat.type
+  delete entry.removedAt
+
+  if (chatId in access.groups || entry.announcedAt !== undefined) {
+    saveAccess(access) // already approved or already announced — stay quiet
+    return
+  }
+  const line =
+    `👋 Hi! I've been added to "${entry.title}" — group id: ${chatId}. ` +
+    `I'll stay quiet until this group is approved: use the 5dive dashboard ` +
+    `(agent → Telegram access) or run /telegram:access in the agent terminal.`
+  try {
+    // The group isn't allowlisted yet, so this bypasses the outbound gate on
+    // purpose — it's the one message that makes allowlisting possible.
+    await bot.api.sendMessage(chat.id, line)
+    entry.announcedAt = Date.now()
+  } catch {
+    // Group may block bot posts — fall back to DMing the paired owner(s).
+    for (const uid of access.allowFrom) {
+      try {
+        await bot.api.sendMessage(uid, line)
+        entry.announcedAt = Date.now()
+        break
+      } catch {}
+    }
+  }
+  saveAccess(access)
 })
 
 bot.on('message:text', async ctx => {
