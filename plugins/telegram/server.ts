@@ -874,7 +874,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        // DIVE-249: in SEND_ONLY mode several agents post through ONE shared
+        // bot, so a group message carries no sender identity of its own (Mark
+        // hit this live: mixed views/notifications read as one anonymous bot).
+        // Prefix the agent name on group sends — EXCEPT into the agent's own
+        // teamTopic thread, where the topic name is already the attribution.
+        // DMs and personal-bot (non-SEND_ONLY) mode stay untouched.
+        const senderPrefix = (() => {
+          if (!SEND_ONLY || !chat_id.startsWith('-')) return ''
+          const me = (process.env.USER ?? '').replace(/^agent-/, '')
+          if (!me) return ''
+          const ownThread = access.groups[chat_id]?.message_thread_id
+          if (typeof ownThread === 'number' && message_thread_id === ownThread) return ''
+          if (format === 'markdownv2') {
+            // Escape per MarkdownV2 rules — agent names can carry '-' etc.
+            return `*${me.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1')}:* `
+          }
+          return `${me}: `
+        })()
+        const chunks = chunk(senderPrefix + text, limit, mode)
         const sentIds: number[] = []
 
         try {
