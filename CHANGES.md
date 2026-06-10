@@ -3,6 +3,14 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.4.79
+
+### Added — Claude Fable 5 in the /model picker (DIVE-212)
+`fable` (→ `claude-fable-5`) is now a selectable tier in `/model`, alongside
+opus and sonnet. Opt-in only — no agent's configured model changes. The picker
+keyboard, callback router, and write path are all generic over `MODEL_ALIASES`,
+so the one-line alias addition lights up the button automatically.
+
 ## v0.4.78
 
 ### Added — per-topic gating for team groups (DIVE-159)

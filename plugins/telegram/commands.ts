@@ -152,6 +152,7 @@ export const COMMAND_REGISTRY: CommandDef[] = [
 export const MODEL_ALIASES: Record<string, string> = {
   opus: 'claude-opus-4-7',
   sonnet: 'claude-sonnet-4-6',
+  fable: 'claude-fable-5',
 }
 
 /** Effort levels accepted by Claude Code's settings.json. */
