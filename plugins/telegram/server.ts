@@ -41,6 +41,11 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const SILENCE_FILE = join(STATE_DIR, 'silence.json')
+// Where the human last talked to this agent (DIVE-259/261). The CLI's
+// _task_send_owner reads this to route gate/approve alerts to the live
+// conversation — but only if the chat is still allowlisted in access.json,
+// so a stale or hand-edited pointer can never widen the audience.
+const LAST_HUMAN_CHAT_FILE = join(STATE_DIR, 'last-human-chat.json')
 const GOAL_FILE = join(STATE_DIR, 'goal.json')
 // Opt-in flag for the context carry-over nudge (DIVE-114). The /nudges command
 // writes {enabled} here; the context-nudge Stop hook reads it and stays silent
@@ -376,6 +381,23 @@ function markReplySent(): void {
 }
 function markInbound(): void {
   writeSilence({ lastInboundAt: Math.floor(Date.now() / 1000) })
+}
+
+// DIVE-261: remember where the human last spoke so task-gate alerts follow the
+// conversation (Mark's DIVE-259 decision). Humans only — bot-to-bot (DIVE-161)
+// traffic must not steal routing. DMs carry messageThreadId: null. Best-effort:
+// a routing hint, never worth failing message handling over.
+function recordLastHumanChat(chatId: string, messageThreadId: number | null): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = LAST_HUMAN_CHAT_FILE + '.tmp'
+    writeFileSync(
+      tmp,
+      JSON.stringify({ chatId, messageThreadId, at: new Date().toISOString() }) + '\n',
+      { mode: 0o600 },
+    )
+    renameSync(tmp, LAST_HUMAN_CHAT_FILE)
+  } catch {}
 }
 
 // /goal state — one standing goal per agent (we don't multiplex across chats;
@@ -3367,6 +3389,15 @@ async function handleInbound(
   // posts in a supergroup's General channel. Surfaced in inbound meta so the
   // agent can thread its reply back into the same topic.
   const threadId = ctx.message?.message_thread_id
+
+  // Accepted human message → update the last-human-chat routing pointer
+  // (DIVE-261). Bots reaching this point via the bot-to-bot path are excluded.
+  // Record threadId only for real forum topics: replies in non-forum
+  // supergroups also carry message_thread_id (the reply-thread root), and a
+  // send targeting that as a topic would fail. DMs record null.
+  if (!from.is_bot) {
+    recordLastHumanChat(chat_id, ctx.message?.is_topic_message ? threadId ?? null : null)
+  }
 
   // Reply-to-answer for a button-less human gate (DIVE-145). When this message
   // replies to one of our own "🙋 [DIVE-N] needs you" alerts, treat the reply
