@@ -2798,6 +2798,8 @@ for (const def of COMMAND_REGISTRY) {
 //   perm:allow|deny|more:<id>  → permission flow (declared upstream)
 //   model:<alias>              → /model picker
 //   effort:<level>             → /effort picker
+//   anything else              → bridged to the session as a channel inbound
+//                                (DIVE-279: agent-sent custom keyboards)
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
@@ -3095,6 +3097,35 @@ bot.on('callback_query:data', async ctx => {
 
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
+    // DIVE-279: not one of ours — it's a button from an agent-sent inline
+    // keyboard (raw Bot API sendMessage+reply_markup). Bridge the tap into the
+    // session as a channel inbound instead of dropping it, so the agent sees
+    // which button was pressed. The allowFrom gate at the top of this handler
+    // already vetted the sender. data goes in content (it's what the agent
+    // keyed the buttons on); chat/message/sender identity rides in meta like a
+    // normal text message.
+    const msg = ctx.callbackQuery.message
+    const chatId = String(msg?.chat.id ?? ctx.from.id)
+    markInbound()
+    startTypingLoop(chatId)
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `[callback_query data=${data}]`,
+        meta: {
+          chat_id: chatId,
+          ...(msg ? { message_id: String(msg.message_id) } : {}),
+          ...(msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+            ? { message_thread_id: String(msg.message_thread_id) }
+            : {}),
+          user: ctx.from.username ?? String(ctx.from.id),
+          user_id: String(ctx.from.id),
+          ts: new Date().toISOString(),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`telegram channel: failed to deliver callback_query to Claude: ${err}\n`)
+    })
     await ctx.answerCallbackQuery().catch(() => {})
     return
   }
