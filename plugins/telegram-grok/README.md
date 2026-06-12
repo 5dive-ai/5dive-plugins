@@ -33,7 +33,7 @@ relay) and a `notify-user` comms-playbook skill.
 **1. Install the server**
 
 ```sh
-git clone https://github.com/5dive-com/5dive-plugins
+git clone https://github.com/5dive-ai/5dive-plugins
 cd 5dive-plugins/plugins/telegram-grok
 bun install
 ```

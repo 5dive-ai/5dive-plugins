@@ -496,7 +496,7 @@ function helpText(): string {
     ...BOT_COMMANDS.map(c => `  /${c.command} — ${c.description}`),
     ``,
     `everything else you send routes to Grok via wait_for_message.`,
-    `docs: github.com/5dive-com/5dive-plugins/tree/main/plugins/telegram-grok`,
+    `docs: github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram-grok`,
   ]
   return lines.join('\n')
 }

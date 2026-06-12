@@ -560,7 +560,7 @@ function helpText(): string {
     ...BOT_COMMANDS.map(c => `  /${c.command} — ${c.description}`),
     ``,
     `everything else you send is forwarded to opencode as a prompt.`,
-    `docs: github.com/5dive-com/5dive-plugins/tree/main/plugins/telegram-opencode`,
+    `docs: github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram-opencode`,
   ].join('\n')
 }
 

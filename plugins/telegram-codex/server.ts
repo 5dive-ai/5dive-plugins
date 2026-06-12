@@ -498,7 +498,7 @@ function helpText(): string {
     ...BOT_COMMANDS.map(c => `  /${c.command} — ${c.description}`),
     ``,
     `everything else you send routes to Codex via wait_for_message.`,
-    `docs: github.com/5dive-com/5dive-plugins/tree/main/plugins/telegram-codex`,
+    `docs: github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram-codex`,
   ]
   return lines.join('\n')
 }

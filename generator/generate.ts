@@ -235,7 +235,7 @@ function writeManifest(cfg: RuntimeConfig, t: Tokens, outDir: string): void {
       + `Sibling to the telegram (Claude Code) and telegram-codex plugins, maintained by 5dive.`,
     version: cfg.version,
     author: { name: '5dive', email: 'support@5dive.com' },
-    homepage: `https://github.com/5dive-com/5dive-plugins/tree/main/plugins/telegram-${t.slug}`,
+    homepage: `https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram-${t.slug}`,
     keywords: ['telegram', 'messaging', 'channel', 'mcp', t.slug, cfg.manifestKeyword ?? t.vendor.toLowerCase()],
   }
   const j = (o: unknown) => JSON.stringify(o, null, 2) + '\n'

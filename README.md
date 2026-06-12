@@ -24,7 +24,7 @@ an MCP fork (see its README + [the spike](./plugins/telegram-opencode-SPIKE.md))
 ## Install
 
 ```text
-/plugin marketplace add 5dive-com/5dive-plugins
+/plugin marketplace add 5dive-ai/5dive-plugins
 /plugin install telegram@5dive-plugins
 ```
 

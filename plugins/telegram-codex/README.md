@@ -29,7 +29,7 @@ Five MCP tools available to Codex:
 **1. Install the server**
 
 ```sh
-git clone https://github.com/5dive-com/5dive-plugins
+git clone https://github.com/5dive-ai/5dive-plugins
 cd 5dive-plugins/plugins/telegram-codex
 bun install
 ```

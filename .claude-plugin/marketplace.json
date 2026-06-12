@@ -12,7 +12,7 @@
       "description": "Telegram messaging bridge for Claude Code with access control, multi-agent routing, and bundled lifecycle hooks. Fork of Anthropic's official telegram plugin extended with 5dive auto-relay, stop-reply checks, and ask-user-question routing.",
       "category": "productivity",
       "source": "./plugins/telegram",
-      "homepage": "https://github.com/5dive-com/5dive-plugins/tree/main/plugins/telegram"
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram"
     }
   ]
 }
