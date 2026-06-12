@@ -129,6 +129,24 @@ process.on('uncaughtException', err => {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
+
+// Telegram rejects sendMessage/editMessageText text over 4096 chars
+// (400: message is too long). A rejected ctx.reply only surfaces in
+// bot.catch — the sender sees nothing (DIVE-313: /tasks went silent).
+// The MCP reply tool chunks before sending; this API-layer guard covers
+// every other path (slash-command handlers, button callbacks) by degrading
+// an oversized send to a truncated one. parse_mode is dropped on truncation
+// because a cut MarkdownV2 entity would itself 400 on unbalanced markup.
+bot.api.config.use((prev, method, payload, signal) => {
+  if (method === 'sendMessage' || method === 'editMessageText') {
+    const p = payload as { text?: string; parse_mode?: string }
+    if (typeof p.text === 'string' && p.text.length > MAX_CHUNK_LIMIT) {
+      p.text = p.text.slice(0, MAX_CHUNK_LIMIT - 32) + '\n…(message truncated)'
+      delete p.parse_mode
+    }
+  }
+  return prev(method, payload, signal)
+})
 let botUsername = ''
 
 // Telegram clears the "typing…" indicator ~5s after each sendChatAction.
@@ -337,6 +355,47 @@ function saveAccess(a: Access): void {
   const tmp = ACCESS_FILE + '.tmp'
   writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
   renameSync(tmp, ACCESS_FILE)
+}
+
+// DIVE-243: enabling Topics (or hitting other supergroup-upgrade triggers)
+// migrates a plain group to a NEW chat id and the old id goes dead. Without
+// this, the `groups` access entry keyed on the old id silently stops matching
+// and the bot goes deaf to the group — DMs fine, group dead, no trace (cost
+// ~2h live during PH demo prep). Move config to the new id; in STATIC mode
+// the in-memory mutation still applies for the session, saveAccess no-ops.
+function migrateGroupChatId(oldId: string, newId: string): void {
+  const access = loadAccess()
+  let moved = false
+  if (access.groups[oldId] && !access.groups[newId]) {
+    access.groups[newId] = access.groups[oldId]
+    delete access.groups[oldId]
+    moved = true
+  }
+  const discovered = access.discovered
+  if (discovered?.[oldId] && !discovered[newId]) {
+    discovered[newId] = discovered[oldId]
+    delete discovered[oldId]
+    moved = true
+  }
+  if (moved) saveAccess(access)
+  process.stderr.write(
+    `telegram channel: group ${oldId} migrated to supergroup ${newId}` +
+      (moved ? ' — access config moved to the new id\n' : ' (no access entry to move)\n'),
+  )
+}
+
+// DIVE-243: an unconfigured group used to drop with zero trace. Log it so
+// "bot is deaf in group X" is greppable in stderr; rate-limited per chat so a
+// busy unapproved group can't flood the log.
+const unknownGroupLoggedAt = new Map<string, number>()
+function logUnknownGroupDrop(chatId: string): void {
+  const now = Date.now()
+  if (now - (unknownGroupLoggedAt.get(chatId) ?? 0) < 10 * 60 * 1000) return
+  unknownGroupLoggedAt.set(chatId, now)
+  process.stderr.write(
+    `telegram channel: dropping message from group ${chatId} — no groups entry in access.json ` +
+      `(if Topics were just enabled the group id changed; re-approve via /telegram:access)\n`,
+  )
 }
 
 // Silence-watchdog state shared with hooks/silence-watchdog.sh. Both sides
@@ -2690,6 +2749,23 @@ function taskAssignedToMe(assignee: string | null | undefined): boolean {
   return assignee === me || assignee === `agent-${me}`
 }
 
+// Keep whole lines under a 4000-char budget (Telegram rejects sends > 4096;
+// see the api.config guard) and report dropped rows as "(+N more)" so a long
+// list degrades visibly instead of the send failing. `total` lets callers
+// that pre-capped their lines count the pre-cap remainder in the tail too.
+function clampList(header: string, lines: string[], total = lines.length): string {
+  const BUDGET = 4000
+  let used = header.length
+  const kept: string[] = []
+  for (const line of lines) {
+    if (used + line.length + 1 > BUDGET) break
+    kept.push(line)
+    used += line.length + 1
+  }
+  const hidden = total - kept.length
+  return header + kept.join('\n') + (hidden > 0 ? `\n(+${hidden} more)` : '')
+}
+
 async function buildTaskList(): Promise<string> {
   let j: any
   try {
@@ -2702,13 +2778,15 @@ async function buildTaskList(): Promise<string> {
   const tasks = j.data.tasks
   if (tasks.length === 0) return 'No open tasks.\n\nAdd one with /task add <title>.'
   const MAX = 40
+  const TITLE_MAX = 80
   const lines = tasks.slice(0, MAX).map((t: any) => {
     const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
     const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
-    return `${mine}${flag}${t.ident} · ${t.title}  /task_${t.id}`
+    let title = String(t.title ?? '')
+    if (title.length > TITLE_MAX) title = title.slice(0, TITLE_MAX - 1) + '…'
+    return `${mine}${flag}${t.ident} · ${title}  /task_${t.id}`
   })
-  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more)` : ''
-  return `Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`
+  return clampList('Open tasks · ⭐ = yours · tap /task_N to open:\n\n', lines, tasks.length)
 }
 
 // --- /heartbeat: per-agent heartbeat schedule (`5dive heartbeat ls`) ---
@@ -2736,7 +2814,7 @@ async function buildHeartbeatList(): Promise<string> {
     const freshTag = a.enabled ? ` · ${a.fresh ? 'fresh' : 'no-fresh'}` : ''
     return `${emoji} ${a.name} — every ${a.everyMin}m${freshTag} · ${a.todo} queued · next ${next} (${a.running})`
   })
-  return `Heartbeat schedule:\n\n${lines.join('\n')}`
+  return clampList('Heartbeat schedule:\n\n', lines)
 }
 
 async function buildTaskDetail(id: number): Promise<string> {
