@@ -81,7 +81,7 @@ const BASE_TOKENS = {
 // runtime's single `version` knob in BOTH package.json and the plugin manifest,
 // so the two can never drift (the bug this replaces: grok's manifest sat at
 // 0.1.15 while its package.json had moved to 0.1.23).
-const BASE_VERSION = '0.1.30'
+const BASE_VERSION = '0.1.31'
 
 type Tokens = typeof BASE_TOKENS
 type Edit = { find: string; replace: string; files?: string[]; optional?: boolean }

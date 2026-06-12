@@ -1225,7 +1225,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         + "Call this whenever you're idle waiting on user input — it replaces the "
         + "Grok CLI's normal stdin prompt for chats routed through this bot. "
         + "Returns a <telegram chat_id=... message_id=... user=...> block with the "
-        + "message body. Use the chat_id and message_id in subsequent reply/react calls. "
+        + "message body — or, when several messages queued up while you were busy, a "
+        + "<telegram-batch> of such blocks; answer each as appropriate (they may be from "
+        + "different chats). Use the chat_id and message_id in subsequent reply/react calls. "
         + "If no message arrives before the timeout, returns <telegram timeout=true/> — "
         + "loop and call again immediately; idle polling is cheap.",
       inputSchema: {
@@ -1332,11 +1334,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!msg) {
           return { content: [{ type: 'text', text: `<telegram timeout=true seconds=${seconds}/>` }] }
         }
+        // Drain the rest of a queued burst into the SAME turn — each extra
+        // message would otherwise cost a full model turn (~30s apiece of reply
+        // latency for the sender). Capped so a backlog flood after a stall
+        // can't blow the context window. Metadata stays per-message, so the
+        // agent can still answer each chat/thread individually.
+        const batch = [msg]
+        while (inboxQueue.length > 0 && batch.length < BATCH_DRAIN_MAX) {
+          batch.push(inboxQueue.shift()!)
+        }
         // Grok now has a message to work on — keep "typing…" visible until
         // it sends `reply` (or the 5min ceiling).
         startTypingLoop(msg.chat_id)
         try { writeFileSync(LAST_INBOUND_FILE, String(Date.now())) } catch {}
-        return { content: [{ type: 'text', text: formatInbound(msg) }] }
+        if (batch.length === 1) {
+          return { content: [{ type: 'text', text: formatInbound(msg) }] }
+        }
+        const blocks = batch.map(formatInbound).join('\n')
+        return { content: [{ type: 'text', text:
+          `<telegram-batch count=${batch.length} note="messages queued while you were busy; answer each as appropriate">\n${blocks}\n</telegram-batch>` }] }
       }
 
       case 'reply': {
@@ -1473,6 +1489,8 @@ const REARM_DISABLED = process.env.TELEGRAM_REARM_DISABLED === '1'
 const REARM_IDLE_MS = Math.max(20_000, Math.min(600_000,
   Number(process.env.TELEGRAM_REARM_IDLE_MS ?? 180_000)))
 const REARM_CHECK_MS = 15_000
+// Max queued messages handed to one wait_for_message return (burst batching).
+const BATCH_DRAIN_MAX = 10
 const REARM_KICK_TEXT =
   'Resume your Telegram listen loop: call wait_for_message now and keep looping '
   + '(on each message reply, then call wait_for_message again; on timeout call it '
