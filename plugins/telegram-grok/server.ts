@@ -959,10 +959,12 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         return true
       case 'start':
         await md(
-          'This bot bridges Telegram to an xAI Grok session.\n\n' +
-          'To pair:\n' +
-          '1. Run `bun pair.ts` in the telegram-grok plugin dir to get your user id allowlisted\n' +
-          '2. After that, messages here reach that Grok session.\n\n' +
+          'This bot bridges Telegram to your xAI Grok session.\n\n' +
+          'Already paired? Just type. Messages here reach the Grok session.\n\n' +
+          'Not paired yet? Send me a message to get a pairing code, then have the ' +
+          'server operator run `5dive agent pair <agent> --code=<code>`. You can also ' +
+          'be added from the 5dive dashboard (Telegram access). Standalone installs ' +
+          'without 5dive: `bun pair.ts` in the telegram-grok plugin dir.\n\n' +
           'Try `/help` for the full command list.',
         )
         return true

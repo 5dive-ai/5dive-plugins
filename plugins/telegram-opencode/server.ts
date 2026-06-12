@@ -866,10 +866,12 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
       case 'org': await md(await orgTree(cmdArg)); return true
       case 'start':
         await md(
-          'This bot bridges Telegram to an opencode session.\n\n' +
-          'To pair:\n' +
-          '1. Run `bun pair.ts` in the telegram-opencode plugin dir to get your user id allowlisted\n' +
-          '2. After that, messages here are forwarded to opencode.\n\n' +
+          'This bot bridges Telegram to your opencode session.\n\n' +
+          'Already paired? Just type. Messages here reach the opencode session.\n\n' +
+          'Not paired yet? Send me a message to get a pairing code, then have the ' +
+          'server operator run `5dive agent pair <agent> --code=<code>`. You can also ' +
+          'be added from the 5dive dashboard (Telegram access). Standalone installs ' +
+          'without 5dive: `bun pair.ts` in the telegram-opencode plugin dir.\n\n' +
           'Try `/help` for the full command list.')
         return true
     }
