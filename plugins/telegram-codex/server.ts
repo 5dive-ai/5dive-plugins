@@ -344,7 +344,28 @@ function enqueueInbound(msg: InboundMsg) {
     next.resolve(msg)
   } else {
     inboxQueue.push(msg)
+    kickOnEnqueue()
   }
+}
+
+// A message queued with no waiter parked means the agent is out of its listen
+// loop. Without this, delivery waits for the re-arm watchdog to see
+// REARM_IDLE_MS (default 180s) of measured idle — minutes of dead air on a
+// freshly created agent or right after a turn ends. Kick the loop the moment
+// the message lands instead. Never mid-turn (the live turn would be abandoned;
+// its trailing wait_for_message drains the queue anyway), and at most once per
+// REARM_CHECK_MS so a burst can't spam kicks. The consts live below the boot
+// section but are initialized long before the first poller callback can fire.
+let lastEnqueueKickMs = 0
+function kickOnEnqueue(): void {
+  if (REARM_DISABLED) return
+  if (agentName() === 'unknown') return
+  const now = Date.now()
+  if (now - lastEnqueueKickMs < REARM_CHECK_MS) return
+  if (turnInFlight()) return
+  lastEnqueueKickMs = now
+  process.stderr.write('telegram-codex: inbound queued with no waiter parked, kicking listen loop\n')
+  kickListenLoop()
 }
 
 function dequeueOrWait(timeoutMs: number): Promise<InboundMsg | null> {
