@@ -22,7 +22,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { Bot, GrammyError, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, statSync,
@@ -1084,6 +1084,27 @@ bot.hears(/^\/task_(\d+)\b/, async ctx => {
 // just acks the callback with a nudge and never throws. Only `tna:` callbacks are
 // claimed; anything else falls through. (Emit is type-gated CLI-side; this lands
 // dormant until task_need_notify enables buttons for this runtime — DIVE-118.)
+// DIVE-332/335: auto-render a Yes/No inline keyboard when a reply ends in a
+// single yes/no-style question, so the user taps instead of typing "yes". Fire
+// ONLY when, after trimming, the text ends in exactly one '?', that is the ONLY
+// '?' in the message, and the trailing question isn't an "A or B?" choice
+// (false buttons on rhetorical/multi-part prompts are worse than a missed one).
+// Opt-out: a trailing `<!-- no-buttons -->` (or `<!-- no-yn -->`), stripped from
+// the outgoing text either way.
+const YN_SUPPRESS = /\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i
+function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboard } {
+  if (YN_SUPPRESS.test(text)) return { stripped: text.replace(YN_SUPPRESS, '') }
+  const trimmed = text.trimEnd()
+  if (!trimmed.endsWith('?')) return { stripped: text }
+  if ((trimmed.match(/\?/g) ?? []).length !== 1) return { stripped: text }
+  const lastQ = trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? ''
+  if (/\bor\b/i.test(lastQ)) return { stripped: text }
+  return {
+    stripped: text,
+    keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),
+  }
+}
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data ?? ''
   const senderId = String(ctx.from?.id ?? '')
@@ -1091,6 +1112,33 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
     return
   }
+
+  // DIVE-332/335: tap on an auto-rendered Yes/No question button (the reply
+  // tool appends `yn:yes`/`yn:no` when a reply ends in a single yes/no
+  // question). Inject the plain 'yes'/'no' as a synthetic inbound — the exact
+  // path a typed reply takes (enqueueInbound) — so the agent's next
+  // wait_for_message just sees the answer. Sender already vetted above; drop
+  // the keyboard so it can't be double-tapped, leaving the question text intact.
+  const ynM = /^yn:(yes|no)$/.exec(data)
+  if (ynM) {
+    const value = ynM[1]!
+    const msg = ctx.callbackQuery.message
+    enqueueInbound({
+      chat_id: String(msg?.chat.id ?? ctx.from?.id ?? ''),
+      message_id: msg ? String(msg.message_id) : '0',
+      ...(msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+        ? { message_thread_id: String(msg.message_thread_id) }
+        : {}),
+      user: ctx.from?.username ?? String(ctx.from?.id ?? ''),
+      user_id: String(ctx.from?.id ?? ''),
+      text: value,
+      ts: new Date().toISOString(),
+    })
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
+    return
+  }
+
   const tnaM = /^tna:(\d+):(.+)$/.exec(data)
   if (!tnaM) return
   const taskId = tnaM[1]!
@@ -1377,16 +1425,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         const accessForReply = loadAccess()
-        const chunks = chunkForTelegram(text, accessForReply.textChunkLimit ?? TG_MAX_MESSAGE_CHARS)
+        // DIVE-332/335: auto-render a Yes/No keyboard when the reply ends in a
+        // single yes/no question (opt-out marker stripped either way). The tap
+        // rides the callback path below, injecting a clean 'yes'/'no' inbound.
+        const { stripped: ynText, keyboard: ynKeyboard } = yesNoButtons(text)
+        const chunks = chunkForTelegram(ynText, accessForReply.textChunkLimit ?? TG_MAX_MESSAGE_CHARS)
         const sentIds: number[] = []
         try {
           for (let i = 0; i < chunks.length; i++) {
             // Thread reply_to only on the first chunk — subsequent chunks
-            // would all quote the same inbound, which is noisy.
+            // would all quote the same inbound, which is noisy. The Yes/No
+            // keyboard attaches to the LAST chunk only.
+            const isLastChunk = i === chunks.length - 1
             const sent = await bot.api.sendMessage(chat_id, chunks[i]!, {
               ...(i === 0 && reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(message_thread_id != null ? { message_thread_id } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
+              ...(isLastChunk && ynKeyboard ? { reply_markup: ynKeyboard } : {}),
             })
             sentIds.push(sent.message_id)
           }
