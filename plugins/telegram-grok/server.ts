@@ -26,7 +26,7 @@ import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'gramm
 import type { ReactionTypeEmoji } from 'grammy/types'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, statSync,
-  realpathSync, renameSync, existsSync, unlinkSync,
+  realpathSync, renameSync, existsSync, unlinkSync, readdirSync, watch,
 } from 'fs'
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
@@ -364,6 +364,71 @@ function kickOnEnqueue(): void {
   lastEnqueueKickMs = now
   process.stderr.write('telegram-grok: inbound queued with no waiter parked, kicking listen loop\n')
   kickListenLoop()
+}
+
+// ============================================================================
+// Same-box agent inbox (DIVE-343) — fs-watched drop dir
+// ============================================================================
+// An agent parked in wait_for_message is DEAF to tmux-typed input: a same-box
+// `agent-send` delivered by send-keys lands in the TUI's native queue, which
+// only drains when the current turn ends — but the turn can't end while parked.
+// Deadlock. So same-box agent-send drops a JSON file here instead; we watch the
+// dir and feed it to enqueueInbound, which resolves the parked waiter
+// IMMEDIATELY (or kicks the loop if none is parked) — the exact path a real
+// Telegram message takes. Reuses the DIVE-285 wake machinery, no pane-scraping.
+//
+// Drop-file contract (one JSON object per file, name ending in `.json`):
+//   { "text": "the message body",   // REQUIRED, non-empty
+//     "from": "agent-main",          // optional sender label -> user/user_id
+//     "chat_id": "433634012",        // optional reply-routing target (default "agent-send")
+//     "message_thread_id": "5",      // optional forum topic for the reply
+//     "ts": "2026-06-13T15:00:00Z" } // optional ISO timestamp (default: now)
+// Writers MUST write atomically — write a temp name, then rename into the dir
+// (or to a trailing `.json`) — so the watcher never reads a half-written file.
+const AGENT_INBOX_DIR = join(STATE_DIR, 'agent-inbox')
+mkdirSync(AGENT_INBOX_DIR, { recursive: true, mode: 0o700 })
+
+function ingestInboxFile(name: string): void {
+  if (!name.endsWith('.json')) return
+  const full = join(AGENT_INBOX_DIR, name)
+  let raw: string
+  try { raw = readFileSync(full, 'utf8') } catch { return }   // already consumed / mid-rename
+  // Unlink first so a malformed file (or a duplicate fs.watch event) can't be
+  // reprocessed in a loop.
+  try { unlinkSync(full) } catch {}
+  let obj: any
+  try { obj = JSON.parse(raw) } catch {
+    process.stderr.write(`telegram-grok: bad agent-inbox file ${name}: not JSON\n`); return
+  }
+  const text = typeof obj?.text === 'string' ? obj.text : ''
+  if (!text.trim()) {
+    process.stderr.write(`telegram-grok: agent-inbox file ${name} has no text\n`); return
+  }
+  const from = typeof obj?.from === 'string' && obj.from ? obj.from : 'agent-send'
+  enqueueInbound({
+    chat_id: typeof obj?.chat_id === 'string' && obj.chat_id ? obj.chat_id : 'agent-send',
+    message_id: '0',
+    ...(typeof obj?.message_thread_id === 'string' && obj.message_thread_id
+      ? { message_thread_id: obj.message_thread_id } : {}),
+    user: from,
+    user_id: from,
+    text,
+    ts: typeof obj?.ts === 'string' && obj.ts ? obj.ts : new Date().toISOString(),
+  })
+  process.stderr.write(`telegram-grok: agent-inbox delivered ${name} (from ${from})\n`)
+}
+
+// Drain any files dropped while the server was down, then watch for new ones.
+// fs.watch can coalesce or double-fire events; ingestInboxFile unlinks first so
+// a duplicate event is a harmless no-op and a missed event is caught by the next.
+function startAgentInbox(): void {
+  try { for (const f of readdirSync(AGENT_INBOX_DIR)) ingestInboxFile(f) } catch {}
+  try {
+    watch(AGENT_INBOX_DIR, (_evt, fname) => { if (fname) ingestInboxFile(String(fname)) })
+    process.stderr.write(`telegram-grok: watching agent-inbox at ${AGENT_INBOX_DIR}\n`)
+  } catch (err) {
+    process.stderr.write(`telegram-grok: agent-inbox watch failed: ${err}\n`)
+  }
 }
 
 function dequeueOrWait(timeoutMs: number): Promise<InboundMsg | null> {
@@ -1813,6 +1878,7 @@ process.on('SIGINT',  shutdown)
 await mcp.connect(new StdioServerTransport())
 
 startRearmWatchdog()
+startAgentInbox()
 
 void (async () => {
   for (let attempt = 1; ; attempt++) {
