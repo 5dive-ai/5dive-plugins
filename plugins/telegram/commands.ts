@@ -87,6 +87,12 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     scope: 'paired-5dive',
   },
   {
+    // Alias for /agents — same handler, same scope.
+    name: 'team',
+    description: 'Team (alias for /agents)',
+    scope: 'paired-5dive',
+  },
+  {
     name: 'tasks',
     description: 'List open tasks',
     scope: 'paired-5dive',

@@ -2547,6 +2547,10 @@ const commandHandlers: Record<string, CommandHandler> = {
     )
   },
 
+  // /team — alias for /agents (same handler, registered separately so it
+  // shows in /help and the BotFather picker).
+  team: (ctx) => commandHandlers.agents(ctx),
+
   // /tasks — list open tasks from the host-shared queue (`5dive task ls`).
   // Read-only; mutations go through /task add (create) — status changes stay
   // on the dashboard / CLI for now.

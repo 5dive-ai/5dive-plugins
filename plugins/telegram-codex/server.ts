@@ -547,6 +547,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'stop',    description: 'Interrupt task' },
   { command: 'restart', description: 'Respawn codex' },
   { command: 'agents',  description: 'Team' },
+  { command: 'team',    description: 'Team (alias for /agents)' },
   { command: 'tasks',   description: 'List open tasks' },
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
@@ -1024,6 +1025,7 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         if (r.switchTo) await restartAgent(agentName(), updateId)
         return true
       }
+      case 'team':
       case 'agents': {
         const list = await listAgents()
         await bot.api.sendMessage(chat_id, list, {

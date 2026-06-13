@@ -575,6 +575,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'stop',    description: 'Abort current turn' },
   { command: 'restart', description: 'Respawn opencode' },
   { command: 'agents',  description: 'Team' },
+  { command: 'team',    description: 'Team (alias for /agents)' },
   { command: 'tasks',   description: 'List open tasks' },
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
@@ -883,6 +884,7 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         return true
       }
       case 'model': await md(await handleModelCommand(cmdArg)); return true
+      case 'team':
       case 'agents': await md(await listAgents()); return true
       case 'tasks': {
         // Plain text (no parse_mode) so the /task_N deep links stay tappable and
