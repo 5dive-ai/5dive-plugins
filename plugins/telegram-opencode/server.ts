@@ -395,6 +395,26 @@ function chunkForTelegram(text: string, limit = TG_MAX_MESSAGE_CHARS): string[] 
   return out
 }
 
+// DIVE-341 (port of DIVE-332/335): auto-render a Yes/No inline keyboard when an
+// assistant reply ends in a single yes/no question. Conservative on purpose — we
+// only attach when there's exactly one '?' in the message, and the trailing
+// question isn't an "A or B?" choice (false buttons on rhetorical/multi-part
+// prompts are worse than a missed one). Opt-out: a trailing `<!-- no-buttons -->`
+// (or `<!-- no-yn -->`), stripped from the outgoing text either way.
+const YN_SUPPRESS = /\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i
+function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboard } {
+  if (YN_SUPPRESS.test(text)) return { stripped: text.replace(YN_SUPPRESS, '') }
+  const trimmed = text.trimEnd()
+  if (!trimmed.endsWith('?')) return { stripped: text }
+  if ((trimmed.match(/\?/g) ?? []).length !== 1) return { stripped: text }
+  const lastQ = trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? ''
+  if (/\bor\b/i.test(lastQ)) return { stripped: text }
+  return {
+    stripped: text,
+    keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),
+  }
+}
+
 // Send a (possibly long) reply to a chat, chunked. Reused by the relay and commands.
 async function sendReply(chat_id: string, text: string, opts?: { reply_to?: number; thread?: number }): Promise<void> {
   const limit = loadAccess().textChunkLimit ?? TG_MAX_MESSAGE_CHARS
@@ -524,11 +544,21 @@ async function flushStream(s: StreamState): Promise<void> {
 // so the final Telegram state always matches opencode's response exactly even
 // if some stream events were missed.
 async function finalizeStream(s: StreamState, finalText: string): Promise<void> {
-  s.finalText = finalText.trim() ? finalText : (renderStream(s) || '(opencode returned no text)')
+  const text = finalText.trim() ? finalText : (renderStream(s) || '(opencode returned no text)')
+  // DIVE-341: render the authoritative text minus any opt-out marker, then (after
+  // the final flush) attach the Yes/No keyboard to the LAST chunk's message — the
+  // streaming equivalent of the forks' last-chunk reply_markup.
+  const { stripped, keyboard } = yesNoButtons(text)
+  s.finalText = stripped
   s.finalized = true
   if (s.timer) { clearTimeout(s.timer); s.timer = null }
   await flushStream(s)
   if (s.dirty) { await new Promise(r => setTimeout(r, 50)); await flushStream(s) }
+  if (keyboard && s.msgIds.length) {
+    const lastId = s.msgIds[s.msgIds.length - 1]!
+    await bot.api.editMessageReplyMarkup(s.chat_id, lastId, { reply_markup: keyboard })
+      .catch((err: any) => process.stderr.write(`telegram-opencode: yn keyboard attach failed: ${err?.message}\n`))
+  }
   streams.delete(s.ses)
   stopTypingLoop(s.chat_id)
 }
@@ -911,6 +941,14 @@ async function ingest(ctx: Context, text: string): Promise<void> {
     void bot.api.setMessageReaction(chat_id, reply_to, [{ type: 'emoji', emoji: ack as ReactionTypeEmoji['emoji'] }]).catch(() => {})
   }
 
+  await runPrompt(chat_id, text, { reply_to, thread: threadId })
+}
+
+// Forward one prompt to opencode and relay the streamed reply back. Split out of
+// ingest() so a synthetic prompt (e.g. a Yes/No button tap, DIVE-341) rides the
+// exact same session/stream/finalize path a typed message takes.
+async function runPrompt(chat_id: string, text: string, opts: { reply_to?: number; thread?: number }): Promise<void> {
+  const { reply_to, thread } = opts
   startTypingLoop(chat_id)
   lastPromptByChat.set(chat_id, text)
   let ses = ''
@@ -921,7 +959,7 @@ async function ingest(ctx: Context, text: string): Promise<void> {
     if (model) body.model = model
     // Register a stream so the SSE relay can edit a Telegram message in place as
     // assistant text parts arrive during this turn.
-    const stream = newStream(chat_id, ses, reply_to, threadId)
+    const stream = newStream(chat_id, ses, reply_to, thread)
     // Synchronous prompt: resolves with the assistant message once the turn
     // ends. Permission/question interrupts that arrive mid-turn are handled
     // concurrently by the SSE relay below.
@@ -929,7 +967,7 @@ async function ingest(ctx: Context, text: string): Promise<void> {
     if (!r.ok) {
       dropStream(ses)
       stopTypingLoop(chat_id)
-      await sendReply(chat_id, `⚠️ opencode error: HTTP ${r.status}`, { reply_to, thread: threadId })
+      await sendReply(chat_id, `⚠️ opencode error: HTTP ${r.status}`, { reply_to, thread })
       return
     }
     const msg = (await r.json()) as { parts?: any[]; info?: any }
@@ -940,7 +978,7 @@ async function ingest(ctx: Context, text: string): Promise<void> {
     if (ses) dropStream(ses)
     stopTypingLoop(chat_id)
     await sendReply(chat_id, `⚠️ failed to reach opencode: ${err instanceof Error ? err.message : String(err)}`,
-      { reply_to, thread: threadId })
+      { reply_to, thread })
   }
 }
 
@@ -1003,6 +1041,31 @@ async function postPermissionPrompt(ev: any): Promise<void> {
 
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data ?? ''
+
+  // DIVE-341 (port of DIVE-332/335): tap on an auto-rendered Yes/No question
+  // button (attached in finalizeStream when a reply ends in a single yes/no
+  // question). Inject the plain 'yes'/'no' through the SAME prompt path a typed
+  // reply takes (runPrompt) — so opencode's next turn just sees the answer.
+  // Fire async (do NOT await) for the same deadlock reason ingest does. Drop the
+  // keyboard so it can't be double-tapped, leaving the question text intact.
+  const ynM = /^yn:(yes|no)$/.exec(data)
+  if (ynM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+      return
+    }
+    const value = ynM[1]!
+    const msg = ctx.callbackQuery.message
+    const chat_id = String(msg?.chat.id ?? ctx.from.id)
+    const thread = msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+      ? msg.message_thread_id : undefined
+    void runPrompt(chat_id, value, { thread }).catch(err =>
+      process.stderr.write(`telegram-opencode: yn ingest failed: ${err}\n`))
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
+    return
+  }
 
   // Permission-approval buttons (the /tasks list is now plain text + /task_<id>
   // deep links, handled by the bot.hears below — no task callbacks remain).
