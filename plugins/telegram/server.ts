@@ -617,7 +617,10 @@ function gate(ctx: Context): GateResult {
     }
     if (chatType === 'group' || chatType === 'supergroup') {
       const policy = access.groups[String(ctx.chat!.id)]
-      if (!policy) return { action: 'drop' }
+      if (!policy) {
+        logUnknownGroupDrop(String(ctx.chat!.id))
+        return { action: 'drop' }
+      }
       const groupAllowFrom = policy.allowFrom ?? []
       if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return { action: 'drop' }
       return { action: 'deliver', access }
@@ -658,7 +661,10 @@ function gate(ctx: Context): GateResult {
   if (chatType === 'group' || chatType === 'supergroup') {
     const groupId = String(ctx.chat!.id)
     const policy = access.groups[groupId]
-    if (!policy) return { action: 'drop' }
+    if (!policy) {
+      logUnknownGroupDrop(groupId)
+      return { action: 'drop' }
+    }
     const groupAllowFrom = policy.allowFrom ?? []
     const requireMention = policy.requireMention ?? true
     // DIVE-159: if this group entry is bound to a forum topic, only respond IN
@@ -922,6 +928,34 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
+// DIVE-332: auto-render a Yes/No inline keyboard when an agent reply ends in a
+// single yes/no-style question, so the user taps instead of typing "yes, agree"
+// (Mark repeatedly misses prose questions and reads them as notifications). The
+// tap rides the existing DIVE-117/279 callback path: `yn:yes`/`yn:no` injects a
+// clean 'yes'/'no' text inbound (handled in the callback_query router below).
+//
+// Conservative by design — false buttons on rhetorical/multi-part prompts are
+// worse than a missed button (the missed case just falls back to typing). So we
+// fire ONLY when, after trimming: the text ends in exactly one '?', that is the
+// ONLY '?' in the whole message, and the trailing question isn't an "A or B?"
+// choice (where Yes/No is nonsensical — those belong in a structured gate).
+// Opt-out: an agent can append `<!-- no-buttons -->` (or `<!-- no-yn -->`) to
+// suppress; the marker is stripped from the outgoing text either way.
+const YN_SUPPRESS = /\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i
+function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboard } {
+  if (YN_SUPPRESS.test(text)) return { stripped: text.replace(YN_SUPPRESS, '') }
+  const trimmed = text.trimEnd()
+  if (!trimmed.endsWith('?')) return { stripped: text }
+  if ((trimmed.match(/\?/g) ?? []).length !== 1) return { stripped: text }
+  // Isolate the trailing question (last sentence/line) and skip "... or ...?".
+  const lastQ = trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? ''
+  if (/\bor\b/i.test(lastQ)) return { stripped: text }
+  return {
+    stripped: text,
+    keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),
+  }
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
@@ -973,7 +1007,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
           return `${me}: `
         })()
-        const chunks = chunk(senderPrefix + text, limit, mode)
+        // DIVE-332: detect a trailing yes/no question and strip any opt-out
+        // marker. The Yes/No keyboard attaches to the LAST text chunk only.
+        const { stripped, keyboard: ynKeyboard } = yesNoButtons(text)
+        const chunks = chunk(senderPrefix + stripped, limit, mode)
         const sentIds: number[] = []
 
         try {
@@ -982,10 +1019,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            const isLastChunk = i === chunks.length - 1
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(message_thread_id != null ? { message_thread_id } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
+              ...(isLastChunk && ynKeyboard ? { reply_markup: ynKeyboard } : {}),
             })
             rememberAnchor(chat_id, sent.message_id, chunks[i])
             sentIds.push(sent.message_id)
@@ -2944,6 +2983,42 @@ bot.on('callback_query:data', async ctx => {
       // Telegram clears the tap spinner; never throw.
       await ctx.answerCallbackQuery({ text: "Couldn't apply — open the dashboard." }).catch(() => {})
     }
+    return
+  }
+
+  // DIVE-332: tap on an auto-rendered Yes/No question button (the reply tool
+  // appends `yn:yes`/`yn:no` when an agent message ends in a single yes/no
+  // question). Inject the plain 'yes'/'no' as a channel inbound — the same shape
+  // a typed reply would take — so the agent just sees the answer and proceeds.
+  // allowFrom already vetted the sender at the top of the handler. Drop the
+  // keyboard so it can't be double-tapped; the question text stays intact.
+  const ynM = /^yn:(yes|no)$/.exec(data)
+  if (ynM) {
+    const value = ynM[1]!
+    const msg = ctx.callbackQuery.message
+    const chatId = String(msg?.chat.id ?? ctx.from.id)
+    markInbound()
+    startTypingLoop(chatId)
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: value,
+        meta: {
+          chat_id: chatId,
+          ...(msg ? { message_id: String(msg.message_id) } : {}),
+          ...(msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+            ? { message_thread_id: String(msg.message_thread_id) }
+            : {}),
+          user: ctx.from.username ?? String(ctx.from.id),
+          user_id: String(ctx.from.id),
+          ts: new Date().toISOString(),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`telegram channel: failed to deliver yes/no tap to Claude: ${err}\n`)
+    })
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
     return
   }
 
