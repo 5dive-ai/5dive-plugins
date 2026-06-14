@@ -84,7 +84,7 @@ const has = (src: string, sym: string) => new RegExp(`\\b${sym}\\b`).test(src)
 
 // Ordered — the BotFather menu shows commands in array order.
 const GOLDEN_FORK_COMMANDS = [
-  'help', 'status', 'stop', 'restart', 'agents', 'team', 'tasks', 'task', 'org', 'model', 'ping', 'start',
+  'help', 'status', 'stop', 'restart', 'agents', 'team', 'tasks', 'task', 'org', 'model', 'login', 'ping', 'start',
 ]
 const GOLDEN_FORK_MCP_TOOLS = ['wait_for_message', 'reply', 'edit_message', 'react', 'download_attachment']
 const GOLDEN_BASELINE_MCP_TOOLS = ['reply', 'react', 'download_attachment', 'edit_message']
@@ -93,7 +93,7 @@ const GOLDEN_ACCESS_FIELDS = ['allowFrom', 'groups', 'pending', 'dmPolicy']
 // may need a new command or a description sync.
 const GOLDEN_BASELINE_MENU = [
   'help', 'status', 'context', 'stop', 'restart', 'clear', 'checkpoint', 'resume',
-  'agents', 'team', 'tasks', 'heartbeat', 'task', 'org', 'update', 'model', 'account', 'usage', 'goal',
+  'agents', 'team', 'tasks', 'heartbeat', 'task', 'org', 'update', 'model', 'account', 'login', 'usage', 'goal',
 ]
 const WATCHDOG_COMMON = ['startRearmWatchdog', 'REARM_IDLE_MS', 'markActivity', 'lastServerActivity']
 const TURN_LIVENESS = 'newestTurnMtimeMs' // codex+grok; agy pending DIVE-14

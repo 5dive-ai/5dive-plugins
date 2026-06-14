@@ -145,6 +145,14 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     scope: 'paired-5dive',
   },
   {
+    // /login — self-serve coding-CLI auth from chat (DIVE-380). Wraps the
+    // on-box `5dive agent auth` device-code flow; paired-5dive so it hides +
+    // no-ops on non-5dive hosts.
+    name: 'login',
+    description: 'Authenticate your coding-CLI',
+    scope: 'paired-5dive',
+  },
+  {
     name: 'usage',
     description: '5h/1w limit usage',
     scope: 'paired-5dive',

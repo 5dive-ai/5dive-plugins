@@ -551,6 +551,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string; menuHidden?: b
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
   { command: 'model',   description: 'Pick model' },
+  { command: 'login',   description: 'Authenticate your coding-CLI' },
   { command: 'ping',    description: 'Liveness check' },
   { command: 'start',   description: 'Pair this chat' },
 ]
@@ -976,6 +977,49 @@ async function handleModelCommand(arg: string): Promise<{ text: string; switchTo
   return { text: `🔁 model → \`${name}\`\nrestarting ${CLI_LABEL} (~2s) to apply…` }
 }
 
+// ── /login (DIVE-380): self-serve coding-CLI auth (self-poll types) ──────────
+// Wraps the on-box device-code flow (`5dive agent auth start|poll|cancel`). The
+// CLI type is resolved at RUNTIME via `agent info` — never hardcoded — so this
+// is identical across forks and dodges the generator's name-sweep. grok/codex/
+// openclaw self-poll (CLI completes on its own); antigravity is v2 (deferred).
+type AuthState = { state?: string; url?: string; code?: string; error?: string; type?: string }
+async function authPollFork(sid: string): Promise<AuthState | null> {
+  const j = await run5dive(['agent', 'auth', 'poll', sid, '--json'], 8000)
+  return j?.ok && j.data ? (j.data as AuthState) : null
+}
+async function pollAuthUntilFork(
+  sid: string,
+  done: (s: AuthState) => boolean,
+  deadline: number,
+): Promise<AuthState | null> {
+  const backoff = [2000, 3000, 5000, 8000, 12000, 15000]
+  let i = 0
+  let last: AuthState | null = null
+  while (Date.now() < deadline) {
+    const s = await authPollFork(sid)
+    if (s) {
+      last = s
+      if (s.state === 'ok' || s.state === 'error' || s.state === 'expired') return s
+      if (done(s)) return s
+    }
+    const wait = backoff[Math.min(i, backoff.length - 1)]!
+    i++
+    if (Date.now() + wait >= deadline) break
+    await new Promise(r => setTimeout(r, wait))
+  }
+  return last
+}
+async function reportLoginFork(sid: string, chatId: string, s: AuthState | null): Promise<void> {
+  if (s?.state === 'ok') {
+    await bot.api.sendMessage(chatId, '✅ Authenticated — your agent is ready.').catch(() => {})
+  } else if (s?.state === 'error') {
+    await bot.api.sendMessage(chatId, `⚠️ Login failed: ${s.error ?? 'unknown error'}. Tap /login to retry.`).catch(() => {})
+  } else {
+    await run5dive(['agent', 'auth', 'cancel', sid, '--json'], 5000)
+    await bot.api.sendMessage(chatId, '⏱️ Login timed out — tap /login to start over.').catch(() => {})
+  }
+}
+
 // Returns true if this message was handled as a slash command (caller
 // should NOT enqueue it for Grok).
 async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> {
@@ -1047,6 +1091,45 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         const r = await handleModelCommand(cmdArg)
         await md(r.text)
         if (r.switchTo) await restartAgent(agentName(), updateId)
+        return true
+      }
+      case 'login': {
+        const info = await run5dive(['agent', 'info', agentName(), '--json'])
+        const type = info?.data?.type
+        if (!type) {
+          await bot.api.sendMessage(chat_id, "Couldn't detect your coding-CLI type — use the dashboard.")
+          return true
+        }
+        if (type === 'antigravity') {
+          await bot.api.sendMessage(
+            chat_id,
+            `/login doesn't support ${type} yet — use the dashboard or \`5dive agent auth start ${type}\`.`,
+          )
+          return true
+        }
+        await bot.api.sendMessage(chat_id, `🔐 Starting ${type} login…`)
+        const started = await run5dive(['agent', 'auth', 'start', type, '--json'], 15000)
+        const sid = started?.data?.sessionId
+        if (!sid) {
+          await bot.api.sendMessage(chat_id, `Couldn't start login: ${started?.error?.message ?? 'failed'}.`)
+          return true
+        }
+        const s = await pollAuthUntilFork(sid, st => !!st.url, Date.now() + 90_000)
+        if (s?.state === 'ok') {
+          await reportLoginFork(sid, chat_id, s)
+          return true
+        }
+        if (!s?.url) {
+          await run5dive(['agent', 'auth', 'cancel', sid, '--json'], 5000)
+          await bot.api.sendMessage(chat_id, 'No auth link in time — tap /login to retry.')
+          return true
+        }
+        const codeLine = s.code ? `\n\nDevice code: ${s.code}` : ''
+        await bot.api.sendMessage(
+          chat_id,
+          `Open this link, sign in and approve:\n${s.url}${codeLine}\n\nI'll confirm here when it completes — nothing to send back.`,
+        )
+        void pollAuthUntilFork(sid, () => false, Date.now() + 3600_000).then(fin => reportLoginFork(sid, chat_id, fin))
         return true
       }
       case 'team':

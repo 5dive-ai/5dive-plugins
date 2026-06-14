@@ -2087,6 +2087,107 @@ type CommandHandler = (
   gate: { access: Access; senderId: string },
 ) => Promise<void>
 
+// ── /login (DIVE-380): self-serve coding-CLI auth from the agent's DM ──────────
+// Wraps the existing on-box device-code flow (`5dive agent auth start|poll|
+// submit|cancel`, cmd_auth.sh) — no auth logic is reimplemented. The CLI type is
+// resolved at RUNTIME from the registry (agentTypeOf), never hardcoded, so this
+// code is identical across every bridge fork AND dodges the grok→fork generator
+// name-sweep: the only type literals here are 'claude' and 'antigravity', neither
+// a grok base token.
+//   claude                     → code flow: show url, user pastes the callback
+//                                code back, `auth submit --code`, poll to ok.
+//   codex/hermes/openclaw/grok → self-poll: show url+code, the CLI completes on
+//                                its own, poll to ok. No code capture.
+//   antigravity                → v2 (Google inline-paste TUI, no displayed code).
+const LOGIN_CODE_FLOW_TYPES = new Set(['claude'])
+const LOGIN_DEFERRED_TYPES = new Set(['antigravity'])
+
+// Armed code-capture: after the operator taps "I approved" on a claude /login,
+// the NEXT DM text is consumed as the callback code (handleInbound intercept),
+// not relayed to the agent. Keyed by senderId; one arm per sender; 5-min TTL,
+// independent of (and shorter than) the 1h auth-session TTL.
+interface ArmedLogin { sessionId: string; type: string; chatId: string; expiresAt: number }
+const armedLogins = new Map<string, ArmedLogin>()
+const LOGIN_ARM_TTL_MS = 5 * 60 * 1000
+
+// Tight, anchored validation so a normal DM in the 5-min window is very unlikely
+// to be mistaken for a code. claude's setup-token callback is a long URL-safe-
+// base64 string (optionally `code#state`). A valid-shaped-but-wrong code just
+// fails `auth submit` cleanly.
+function loginCodeValid(type: string, code: string): boolean {
+  if (type === 'claude') return /^[A-Za-z0-9._-]{16,}(#[A-Za-z0-9._-]+)?$/.test(code)
+  return false
+}
+
+type AuthState = { state?: string; url?: string; code?: string; error?: string; type?: string }
+
+// Thin wrappers over `sudo -n 5dive agent auth …`. read5diveJson fail-softs to
+// null and re-parses stdout on non-zero exit.
+async function authStart(type: string): Promise<{ sessionId?: string; error?: string }> {
+  const j = await read5diveJson(['agent', 'auth', 'start', type, '--json'], 15000)
+  if (j?.ok && j.data?.sessionId) return { sessionId: String(j.data.sessionId) }
+  return { error: j?.error?.message ?? 'auth start failed' }
+}
+async function authPoll(sid: string): Promise<AuthState | null> {
+  const j = await read5diveJson(['agent', 'auth', 'poll', sid, '--json'], 8000)
+  return j?.ok && j.data ? (j.data as AuthState) : null
+}
+async function authSubmit(sid: string, code: string): Promise<AuthState | null> {
+  const j = await read5diveJson(['agent', 'auth', 'submit', sid, `--code=${code}`, '--json'], 10000)
+  if (j?.ok && j.data) return j.data as AuthState
+  return j?.error ? { error: j.error.message } : null
+}
+async function authCancel(sid: string): Promise<void> {
+  await read5diveJson(['agent', 'auth', 'cancel', sid, '--json'], 5000)
+}
+
+// Poll `auth poll` on a backoff until `done` is satisfied, a terminal state is
+// reached, or `deadline` (epoch ms — the 1h session TTL) passes. Returns the
+// last AuthState (or null). Never an unbounded loop.
+async function pollAuthUntil(
+  sid: string,
+  done: (s: AuthState) => boolean,
+  deadline: number,
+): Promise<AuthState | null> {
+  const backoff = [2000, 3000, 5000, 8000, 12000, 15000]
+  let i = 0
+  let last: AuthState | null = null
+  while (Date.now() < deadline) {
+    const s = await authPoll(sid)
+    if (s) {
+      last = s
+      if (s.state === 'ok' || s.state === 'error' || s.state === 'expired') return s
+      if (done(s)) return s
+    }
+    const wait = backoff[Math.min(i, backoff.length - 1)]!
+    i++
+    if (Date.now() + wait >= deadline) break
+    await new Promise(r => setTimeout(r, wait))
+  }
+  return last
+}
+
+// Terminal-state reporter for both flows. ok → ✅; error → reason; otherwise
+// (expired, or our bounded poll hit the deadline) → cancel + the timeout message.
+async function reportLoginTerminal(sid: string, chatId: string, s: AuthState | null): Promise<void> {
+  if (s?.state === 'ok') {
+    await bot.api.sendMessage(chatId, '✅ Authenticated — your agent is ready.').catch(() => {})
+  } else if (s?.state === 'error') {
+    await bot.api.sendMessage(chatId, `⚠️ Login failed: ${s.error ?? 'unknown error'}. Tap /login to retry.`).catch(() => {})
+  } else {
+    await authCancel(sid)
+    await bot.api.sendMessage(chatId, '⏱️ Login timed out — tap /login to start over.').catch(() => {})
+  }
+}
+
+// Drive a self-poller (codex/hermes/openclaw/grok) to a terminal state in the
+// background after we've DM'd the url, then report. claude takes the code-capture
+// path instead and never runs this.
+async function watchSelfPollLogin(sid: string, chatId: string, deadline: number): Promise<void> {
+  const s = await pollAuthUntil(sid, () => false, deadline)
+  await reportLoginTerminal(sid, chatId, s)
+}
+
 const commandHandlers: Record<string, CommandHandler> = {
   start: async ctx => {
     await ctx.reply(
@@ -2654,6 +2755,76 @@ const commandHandlers: Record<string, CommandHandler> = {
     }
   },
 
+  // /login — self-serve coding-CLI auth from chat (DIVE-380). Detects this
+  // agent's CLI type from the registry, starts the on-box device-code flow, DMs
+  // the auth URL (+ device code), then either captures the pasted callback code
+  // (claude) or polls the self-completing flow to done. Reuses cmd_auth.sh.
+  login: async (ctx, gate) => {
+    const me = thisAgentName()
+    if (!me) {
+      await ctx.reply(`Can't determine this agent (not running as an agent-* user).`)
+      return
+    }
+    const agents = await read5diveJson(['agent', 'list', '--json'], 5000)
+    const type = agentTypeOf(agents?.ok && Array.isArray(agents.data) ? agents.data : null, me)
+    if (!type) {
+      await ctx.reply(`Couldn't detect your coding-CLI type — try the dashboard or \`5dive agent auth\`.`)
+      return
+    }
+    if (LOGIN_DEFERRED_TYPES.has(type)) {
+      await ctx.reply(
+        `/login doesn't support ${type} yet — authenticate from the dashboard or ` +
+        `\`5dive agent auth start ${type}\` for now.`,
+      )
+      return
+    }
+    const chatId = String(ctx.chat!.id)
+    await ctx.reply(`🔐 Starting ${type} login…`)
+    const started = await authStart(type)
+    if (!started.sessionId) {
+      await ctx.reply(`Couldn't start login: ${started.error}. Try again in a moment.`)
+      return
+    }
+    const sid = started.sessionId
+    const sessionDeadline = Date.now() + 60 * 60 * 1000 // mirror the 1h session TTL
+    // Wait for the auth URL to materialize (pending_url → awaiting_code).
+    const s = await pollAuthUntil(sid, st => !!st.url, Date.now() + 90_000)
+    if (s?.state === 'ok') {
+      await reportLoginTerminal(sid, chatId, s) // already authed (cached creds)
+      return
+    }
+    if (!s || !s.url) {
+      await authCancel(sid)
+      await ctx.reply(`Login didn't produce an auth link in time — tap /login to retry.`)
+      return
+    }
+    const codeLine = s.code ? `\n\nDevice code: ${s.code}` : ''
+    if (LOGIN_CODE_FLOW_TYPES.has(type)) {
+      armedLogins.delete(gate.senderId) // a fresh /login replaces any prior arm
+      const kb = new InlineKeyboard()
+        .text('✅ I approved — send the code', `login:arm:${sid}`)
+        .row()
+        .text('✕ Cancel', `login:cancel:${sid}`)
+      await ctx.reply(
+        `Open this link, sign in and approve:\n${s.url}${codeLine}\n\n` +
+        `Then tap the button below and paste the code the page gives you.`,
+        { reply_markup: kb },
+      )
+    } else {
+      // Self-poll path on the BASE bridge. NOTE: currently unreachable in prod —
+      // only claude-type agents run this base plugin (hermes/openclaw use their
+      // own gateway, codex/grok/etc use the fork bridges), and claude is the sole
+      // code-flow type, so `type` here is always 'claude' and never reaches this
+      // branch. Kept as harmless defensive coverage if a non-claude type ever
+      // binds the base bridge. (The live self-poll path is exercised by the forks.)
+      await ctx.reply(
+        `Open this link, sign in and approve:\n${s.url}${codeLine}\n\n` +
+        `I'll confirm here as soon as it completes — nothing to send back.`,
+      )
+      void watchSelfPollLogin(sid, chatId, sessionDeadline)
+    }
+  },
+
   // /account — show or switch the auth profile bound to THIS agent. Lists
   // every account known to `sudo -n 5dive account list` and renders one
   // button per name (plus a "default" button that clears the binding,
@@ -3040,6 +3211,45 @@ bot.on('callback_query:data', async ctx => {
     })
     await ctx.editMessageReplyMarkup().catch(() => {})
     await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
+    return
+  }
+
+  // /login (DIVE-380): arm/cancel the callback-code capture. allowFrom already
+  // vetted the sender at the top of the handler. `arm` re-polls the live session
+  // for its type so the capture validates the code against the right shape;
+  // `cancel` tears the auth session down. Both consume the buttons so a stale tap
+  // can't re-fire.
+  const loginM = /^login:(arm|cancel):([0-9a-fA-F]+)$/.exec(data)
+  if (loginM) {
+    const action = loginM[1]!
+    const sid = loginM[2]!
+    const chatId = String(ctx.callbackQuery.message?.chat.id ?? ctx.from.id)
+    if (action === 'cancel') {
+      armedLogins.delete(senderId)
+      await authCancel(sid)
+      await ctx.editMessageReplyMarkup().catch(() => {})
+      await ctx.answerCallbackQuery({ text: 'Login cancelled.' }).catch(() => {})
+      return
+    }
+    const st = await authPoll(sid)
+    if (!st || st.state === 'expired' || st.state === 'error') {
+      armedLogins.delete(senderId)
+      await ctx.editMessageReplyMarkup().catch(() => {})
+      await ctx.answerCallbackQuery({ text: 'That login expired — tap /login again.' }).catch(() => {})
+      return
+    }
+    armedLogins.set(senderId, {
+      sessionId: sid,
+      type: st.type ?? 'claude',
+      chatId,
+      expiresAt: Date.now() + LOGIN_ARM_TTL_MS,
+    })
+    // Leave only a Cancel button so the user can still bail; the arm button is gone.
+    await ctx
+      .editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text('✕ Cancel', `login:cancel:${sid}`) })
+      .catch(() => {})
+    await ctx.answerCallbackQuery({ text: 'Paste the code now.' }).catch(() => {})
+    await bot.api.sendMessage(chatId, '👍 Now paste just the code here.').catch(() => {})
     return
   }
 
@@ -3687,6 +3897,36 @@ async function handleInbound(
       ]).catch(() => {})
     }
     return
+  }
+
+  // /login (DIVE-380) callback-code capture. If this sender armed a login (tapped
+  // "I approved"), the next DM text is the OAuth callback code: submit it and
+  // NEVER relay it to the agent, echo it, or log it. Self-poll types don't arm,
+  // so they never reach here. An expired arm falls through to a normal message.
+  const armed = armedLogins.get(String(from.id))
+  if (armed && ctx.chat?.type === 'private') {
+    if (Date.now() > armed.expiresAt) {
+      armedLogins.delete(String(from.id)) // stale — treat this as ordinary chat
+    } else {
+      const code = text.trim()
+      if (!loginCodeValid(armed.type, code)) {
+        // Keep the arm so a typo is recoverable within the TTL; never submit garbage.
+        await ctx
+          .reply(`That doesn't look like the code — paste just the code from the auth page, or tap Cancel.`)
+          .catch(() => {})
+        return
+      }
+      armedLogins.delete(String(from.id))
+      await ctx.reply('🔐 Submitting…').catch(() => {})
+      const sub = await authSubmit(armed.sessionId, code)
+      if (sub?.error) {
+        await ctx.reply(`⚠️ ${sub.error} — tap /login to try again.`).catch(() => {})
+        return
+      }
+      const fin = await pollAuthUntil(armed.sessionId, () => false, Date.now() + 60 * 60 * 1000)
+      await reportLoginTerminal(armed.sessionId, chat_id, fin)
+      return
+    }
   }
 
   // Typing indicator — re-sent every 4s until the next outbound reply.
