@@ -541,13 +541,13 @@ let lastInboundTs: string | null = null
 // Codex itself owns commands that need to manipulate its session (model
 // switching, stop, restart, checkpoint). Those would require IPC into the
 // running session and are out of scope here.
-const BOT_COMMANDS: Array<{ command: string; description: string }> = [
+const BOT_COMMANDS: Array<{ command: string; description: string; menuHidden?: boolean }> = [
   { command: 'help',    description: 'Show commands' },
   { command: 'status',  description: 'Pairing, usage, model' },
   { command: 'stop',    description: 'Interrupt task' },
   { command: 'restart', description: 'Respawn codex' },
   { command: 'agents',  description: 'Team' },
-  { command: 'team',    description: 'Team (alias for /agents)' },
+  { command: 'team',    description: 'Team (alias for /agents)', menuHidden: true },
   { command: 'tasks',   description: 'List open tasks' },
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
@@ -555,6 +555,10 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'ping',    description: 'Liveness check' },
   { command: 'start',   description: 'Pair this chat' },
 ]
+
+// /team is a hidden alias: still dispatched and shown in /help, but kept off
+// the BotFather command-menu picker — Mark: don't list both /agents and /team.
+const MENU_COMMANDS = BOT_COMMANDS.filter(c => !c.menuHidden)
 
 function helpText(): string {
   const lines = [
@@ -2022,7 +2026,7 @@ void (async () => {
           // all_private_chats menu that would otherwise shadow the default one
           // in DMs (Telegram resolves the most specific scope per chat).
           for (const scope of [undefined, { type: 'all_private_chats' as const }]) {
-            void bot.api.setMyCommands(BOT_COMMANDS, scope ? { scope } : undefined).catch(err => {
+            void bot.api.setMyCommands(MENU_COMMANDS, scope ? { scope } : undefined).catch(err => {
               process.stderr.write(`telegram-codex: setMyCommands(${scope?.type ?? 'default'}) failed: ${err}\n`)
             })
           }

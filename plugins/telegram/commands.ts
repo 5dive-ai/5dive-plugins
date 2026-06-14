@@ -87,10 +87,13 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     scope: 'paired-5dive',
   },
   {
-    // Alias for /agents — same handler, same scope.
+    // Alias for /agents — same handler, same scope. menuHidden: off the
+    // BotFather picker (Mark: don't list both /agents and /team in the menu)
+    // but still routed by the dispatcher and listed in /help as the alias.
     name: 'team',
     description: 'Team (alias for /agents)',
     scope: 'paired-5dive',
+    menuHidden: true,
   },
   {
     name: 'tasks',
