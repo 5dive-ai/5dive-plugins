@@ -2960,27 +2960,37 @@ bot.on('callback_query:data', async ctx => {
         await ctx.editMessageText(`✅ already answered: ${prior}`).catch(() => {})
         return
       }
-      // Resolve the value from the live gate, not the payload.
-      let value: string | undefined
+      // Resolve the answer from the live gate, not the payload. `answerArgs` is
+      // the extra argv for `task answer` (a secret takes NO --value — the key is
+      // never carried in chat/DB); `ack` is the human-facing confirmation word.
+      let answerArgs: string[] | undefined
+      let ack: string | undefined
       if (task.need_type === 'decision') {
         const opts = String(task.need_options ?? '')
           .split('|')
           .map((s: string) => s.trim())
           .filter(Boolean)
-        value = opts[Number(token)]
+        const value = opts[Number(token)]
+        if (value !== undefined) { answerArgs = [`--value=${value}`]; ack = value }
       } else if (task.need_type === 'approval') {
-        value = token === 'approved' || token === 'denied' ? token : undefined
+        if (token === 'approved' || token === 'denied') { answerArgs = [`--value=${token}`]; ack = token }
+      } else if (task.need_type === 'secret') {
+        // DIVE-356: secret gate cleared with no value (CLI rejects --value here).
+        if (token === 'provided') { answerArgs = []; ack = 'provided' }
+      } else if (task.need_type === 'manual') {
+        // DIVE-356: manual gate cleared as done.
+        if (token === 'done') { answerArgs = ['--value=done']; ack = 'done' }
       }
-      if (value === undefined) {
+      if (answerArgs === undefined) {
         await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
         await ctx.editMessageReplyMarkup().catch(() => {})
         return
       }
       // `task answer` clears the gate, records the value, and pings the owning
       // agent to resume (DIVE-103). It also drops out of the inbox.
-      await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, `--value=${value}`], { timeout: 8000 })
-      await ctx.answerCallbackQuery({ text: `Answered: ${value}` }).catch(() => {})
-      await ctx.editMessageText(`✅ answered: ${value}`).catch(() => {})
+      await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...answerArgs], { timeout: 8000 })
+      await ctx.answerCallbackQuery({ text: `Answered: ${ack}` }).catch(() => {})
+      await ctx.editMessageText(`✅ answered: ${ack}`).catch(() => {})
     } catch {
       // Stale message, deleted task, restarted agent, or a CLI/sudo failure (incl.
       // a gate that got answered between our show and answer). Ack softly so

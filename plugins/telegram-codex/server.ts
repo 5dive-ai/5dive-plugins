@@ -1376,21 +1376,30 @@ bot.on('callback_query:data', async ctx => {
         await ctx.editMessageText(`✅ already answered: ${prior}`).catch(() => {})
         return
       }
-      let value: string | undefined
+      // Resolve the answer from the live gate, not the payload. DIVE-356: a
+      // secret takes NO --value (the key never travels through chat/DB — answer
+      // records only need_answered_at); manual answers --value=done.
+      let answerArgs: string[] | undefined
+      let ack: string | undefined
       if (task.need_type === 'decision') {
         const opts = String(task.need_options ?? '').split('|').map((s: string) => s.trim()).filter(Boolean)
-        value = opts[Number(token)]
+        const v = opts[Number(token)]
+        if (v !== undefined) { answerArgs = [`--value=${v}`]; ack = v }
       } else if (task.need_type === 'approval') {
-        value = token === 'approved' || token === 'denied' ? token : undefined
+        if (token === 'approved' || token === 'denied') { answerArgs = [`--value=${token}`]; ack = token }
+      } else if (task.need_type === 'secret') {
+        if (token === 'provided') { answerArgs = []; ack = 'provided' }
+      } else if (task.need_type === 'manual') {
+        if (token === 'done') { answerArgs = ['--value=done']; ack = 'done' }
       }
-      if (value === undefined) {
+      if (answerArgs === undefined) {
         await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
         await ctx.editMessageReplyMarkup().catch(() => {})
         return
       }
-      await run5dive(['task', 'answer', taskId, `--value=${value}`, '--json'], 8000)
-      await ctx.answerCallbackQuery({ text: `Answered: ${value}` }).catch(() => {})
-      await ctx.editMessageText(`✅ answered: ${value}`).catch(() => {})
+      await run5dive(['task', 'answer', taskId, ...answerArgs, '--json'], 8000)
+      await ctx.answerCallbackQuery({ text: `Answered: ${ack}` }).catch(() => {})
+      await ctx.editMessageText(`✅ answered: ${ack}`).catch(() => {})
     } catch {
       await ctx.answerCallbackQuery({ text: "Couldn't apply — open the dashboard." }).catch(() => {})
     }
