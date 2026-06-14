@@ -787,6 +787,19 @@ function taskAssignedToMe(assignee: string | null | undefined): boolean {
 // is plain left-aligned text with a tappable /task_<id> deep link per row
 // (handled by the bot.hears below). Rows assigned to THIS agent are starred.
 // Read-only; mutations go through /task add + dashboard/CLI.
+// Render one task row: ⭐ if mine, a status flag, ident · title, assignee, link.
+// `needTag` appends the gate type (e.g. " [approval]") for the Needs-you section.
+function taskRow(t: any, needTag = false): string {
+  const TITLE_MAX = 80
+  const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
+  const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
+  let title = String(t.title ?? '')
+  if (title.length > TITLE_MAX) title = title.slice(0, TITLE_MAX - 1) + '…'
+  const tag = needTag && t.need_type ? ` [${t.need_type}]` : ''
+  const who = t.assignee ? ` (${String(t.assignee).replace(/^agent-/, '')})` : ''
+  return `${mine}${flag}${t.ident} · ${title}${tag}${who}  /task_${t.id}`
+}
+
 async function buildTaskList(): Promise<string> {
   let j: any
   try {
@@ -798,13 +811,22 @@ async function buildTaskList(): Promise<string> {
   const tasks = j.data.tasks
   if (tasks.length === 0) return 'No open tasks.\n\nAdd one with /task add <title>.'
   const MAX = 40
-  const lines = tasks.slice(0, MAX).map((t: any) => {
-    const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
-    const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
-    return `${mine}${flag}${t.ident} · ${t.title}  /task_${t.id}`
-  })
-  const more = tasks.length > MAX ? `\n(+${tasks.length - MAX} more)` : ''
-  return `Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`
+  // Human-gated tasks (a pending need awaiting a person) float to their own
+  // "Needs you" section on top; `task ls` carries need_type only while the gate
+  // is unanswered, so its presence is a clean "needs a human" flag.
+  const needsYou = tasks.filter((t: any) => t.need_type)
+  const rest = tasks.filter((t: any) => !t.need_type)
+  const sections: string[] = []
+  if (needsYou.length) {
+    const lines = needsYou.map((t: any) => taskRow(t, true))
+    sections.push(`🔔 Needs you (${needsYou.length}) · tap /task_N to act:\n\n${lines.join('\n')}`)
+  }
+  if (rest.length) {
+    const lines = rest.slice(0, MAX).map((t: any) => taskRow(t))
+    const more = rest.length > MAX ? `\n(+${rest.length - MAX} more)` : ''
+    sections.push(`Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`)
+  }
+  return sections.join('\n\n')
 }
 
 async function buildTaskDetail(id: number): Promise<string> {

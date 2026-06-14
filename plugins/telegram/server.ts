@@ -2810,6 +2810,20 @@ function clampList(header: string, lines: string[], total = lines.length): strin
   return header + kept.join('\n') + (hidden > 0 ? `\n(+${hidden} more)` : '')
 }
 
+// Render one task row: ⭐ if mine, a status flag, the ident · title, deep link.
+// `needTag` appends the gate type (e.g. " [approval]") for the Needs-you section.
+function taskRow(t: any, needTag = false): string {
+  const TITLE_MAX = 80
+  const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
+  const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
+  let title = String(t.title ?? '')
+  if (title.length > TITLE_MAX) title = title.slice(0, TITLE_MAX - 1) + '…'
+  const tag = needTag && t.need_type ? ` [${t.need_type}]` : ''
+  // Show the assignee (bare agent name) so it's clear who owns each row.
+  const who = t.assignee ? ` (${String(t.assignee).replace(/^agent-/, '')})` : ''
+  return `${mine}${flag}${t.ident} · ${title}${tag}${who}  /task_${t.id}`
+}
+
 async function buildTaskList(): Promise<string> {
   let j: any
   try {
@@ -2822,15 +2836,24 @@ async function buildTaskList(): Promise<string> {
   const tasks = j.data.tasks
   if (tasks.length === 0) return 'No open tasks.\n\nAdd one with /task add <title>.'
   const MAX = 40
-  const TITLE_MAX = 80
-  const lines = tasks.slice(0, MAX).map((t: any) => {
-    const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
-    const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
-    let title = String(t.title ?? '')
-    if (title.length > TITLE_MAX) title = title.slice(0, TITLE_MAX - 1) + '…'
-    return `${mine}${flag}${t.ident} · ${title}  /task_${t.id}`
-  })
-  return clampList('Open tasks · ⭐ = yours · tap /task_N to open:\n\n', lines, tasks.length)
+  // Partition: human-gated tasks (a pending need awaiting a person) float to
+  // their own "Needs you" section on top; everything else is the open list.
+  // `task ls` carries need_type only while the gate is unanswered, so its
+  // presence is a clean "needs a human" flag.
+  const needsYou = tasks.filter((t: any) => t.need_type)
+  const rest = tasks.filter((t: any) => !t.need_type)
+  const sections: string[] = []
+  if (needsYou.length) {
+    const lines = needsYou.map((t: any) => taskRow(t, true))
+    // Needs-you rows are the whole point of pinning them — keep them all
+    // (clamp protects the send) rather than capping at MAX.
+    sections.push(clampList(`🔔 Needs you (${needsYou.length}) · tap /task_N to act:\n\n`, lines))
+  }
+  if (rest.length) {
+    const lines = rest.slice(0, MAX).map((t: any) => taskRow(t))
+    sections.push(clampList('Open tasks · ⭐ = yours · tap /task_N to open:\n\n', lines, rest.length))
+  }
+  return sections.join('\n\n')
 }
 
 // --- /heartbeat: per-agent heartbeat schedule (`5dive heartbeat ls`) ---
