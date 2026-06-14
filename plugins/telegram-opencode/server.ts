@@ -965,7 +965,15 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
           await bot.api.sendMessage(chat_id, "Couldn't detect your coding-CLI type — use the dashboard.")
           return true
         }
-        if (type === 'antigravity') {
+        // 0.5.0 ships /login for claude ONLY. Every fork (self-poll) type is
+        // DEFERRED until DIVE-382 verifies each one's cred-path: a fork /login
+        // that auths then boots a REVOKED token leaves the agent dead (codex hit
+        // exactly this), which is worse than no /login — so the self-poll path
+        // below is intentionally unreachable in this release. No swept type
+        // literals here, so this stays identical across forks; flip per-type
+        // (re-enable the self-poll) once DIVE-382 proves each type.
+        const LOGIN_SELF_POLL_ENABLED = false
+        if (!LOGIN_SELF_POLL_ENABLED || type === 'antigravity') {
           await bot.api.sendMessage(
             chat_id,
             `/login doesn't support ${type} yet — use the dashboard or \`5dive agent auth start ${type}\`.`,
