@@ -2169,9 +2169,13 @@ async function pollAuthUntil(
 
 // Terminal-state reporter for both flows. ok → ✅; error → reason; otherwise
 // (expired, or our bounded poll hit the deadline) → cancel + the timeout message.
-async function reportLoginTerminal(sid: string, chatId: string, s: AuthState | null): Promise<void> {
+async function reportLoginTerminal(sid: string, chatId: string, s: AuthState | null, opts?: { restarting?: boolean }): Promise<void> {
   if (s?.state === 'ok') {
-    await bot.api.sendMessage(chatId, '✅ Authenticated — your agent is ready.').catch(() => {})
+    // Copy matches the action: a fresh code-flow auth restarts to apply the creds;
+    // an already-authed (cached) result changes nothing, so it must NOT say "restarting".
+    await bot.api.sendMessage(chatId, opts?.restarting
+      ? '✅ Authenticated — restarting to apply (~20-30s).'
+      : '✅ Already authenticated — your agent is ready.').catch(() => {})
   } else if (s?.state === 'error') {
     await bot.api.sendMessage(chatId, `⚠️ Login failed: ${s.error ?? 'unknown error'}. Tap /login to retry.`).catch(() => {})
   } else {
@@ -2800,14 +2804,23 @@ const commandHandlers: Record<string, CommandHandler> = {
     }
     const codeLine = s.code ? `\n\nDevice code: ${s.code}` : ''
     if (LOGIN_CODE_FLOW_TYPES.has(type)) {
-      armedLogins.delete(gate.senderId) // a fresh /login replaces any prior arm
-      const kb = new InlineKeyboard()
-        .text('✅ I approved — send the code', `login:arm:${sid}`)
-        .row()
-        .text('✕ Cancel', `login:cancel:${sid}`)
+      // Arm the code-capture NOW — the instant the link is shown — so the code is
+      // consumed and NEVER relayed to the agent even when the user pastes it
+      // straight away. DIVE-380 leak fix: arming used to wait for an "I approved"
+      // tap, so a code pasted before the tap fell through to the agent session
+      // (the secret OAuth code reached the model). Arming at start closes that
+      // window; the only button left is Cancel.
+      armedLogins.set(gate.senderId, {
+        sessionId: sid,
+        type,
+        chatId,
+        expiresAt: Date.now() + LOGIN_ARM_TTL_MS,
+      })
+      const kb = new InlineKeyboard().text('✕ Cancel', `login:cancel:${sid}`)
       await ctx.reply(
         `Open this link, sign in and approve:\n${s.url}${codeLine}\n\n` +
-        `Then tap the button below and paste the code the page gives you.`,
+        `Then paste the code the page gives you straight here — I capture it ` +
+        `privately and never pass it to the agent.`,
         { reply_markup: kb },
       )
     } else {
@@ -3924,7 +3937,29 @@ async function handleInbound(
         return
       }
       const fin = await pollAuthUntil(armed.sessionId, () => false, Date.now() + 60 * 60 * 1000)
-      await reportLoginTerminal(armed.sessionId, chat_id, fin)
+      const authedOk = fin?.state === 'ok'
+      await reportLoginTerminal(armed.sessionId, chat_id, fin, { restarting: authedOk })
+      // Apply the new creds: claude reads auth only at boot, and a fresh login can
+      // revoke the live session's prior token — so restart to come back live on the
+      // new creds (DIVE-380). Mirror /model's deferred systemd-run restart: the ack
+      // above is on the wire first, then the transient unit restarts us ~1s later.
+      if (authedOk) {
+        const me = thisAgentName()
+        if (me) {
+          void execFileP(
+            SUDO,
+            ['-n', 'systemd-run', '--on-active=1', '--collect',
+              '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+            { timeout: 5000 },
+          ).catch((err: any) => {
+            const stderr = err?.stderr ? String(err.stderr).trim() : ''
+            void bot.api.sendMessage(
+              chat_id,
+              `❌ Failed to restart to apply login: ${stderr || (err instanceof Error ? err.message : String(err))}`,
+            ).catch(() => {})
+          })
+        }
+      }
       return
     }
   }

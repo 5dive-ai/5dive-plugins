@@ -45,6 +45,7 @@ const BASE_DIR = join(PLUGINS, BASE)
 // so we never copy them.
 const COPY_FILES = [
   'server.ts',
+  'tna.ts',
   'pair.ts',
   'package.json',
   'AGENTS.md',
@@ -81,7 +82,7 @@ const BASE_TOKENS = {
 // runtime's single `version` knob in BOTH package.json and the plugin manifest,
 // so the two can never drift (the bug this replaces: grok's manifest sat at
 // 0.1.15 while its package.json had moved to 0.1.23).
-const BASE_VERSION = '0.1.35'
+const BASE_VERSION = '0.1.37'
 
 type Tokens = typeof BASE_TOKENS
 type Edit = { find: string; replace: string; files?: string[]; optional?: boolean }
@@ -175,6 +176,12 @@ function generate(slug: string, outDir: string): void {
     const src = join(BASE_DIR, file)
     if (!existsSync(src)) return null
     let text = readFileSync(src, 'utf8')
+    // tna.ts is the shared tap-resolver, kept BYTE-IDENTICAL across the base and
+    // every fork (the parity test asserts it; the only per-runtime difference lives
+    // in server.ts). Copy it verbatim: the generic name-sweep would otherwise
+    // rewrite "grok" inside its own "byte-identical across base + grok/codex/agy
+    // forks" comment into nonsense ("agy/codex/agy"), breaking that byte-identity.
+    if (file === 'tna.ts') return text
     // Mechanical token subs + bare-cliBin sweep FIRST, so the text now reads as
     // the target runtime everywhere the knobs reach. Structural blocks run AFTER,
     // so their find-strings match the already-tokenized text and their replace

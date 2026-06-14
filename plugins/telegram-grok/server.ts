@@ -1009,9 +1009,13 @@ async function pollAuthUntilFork(
   }
   return last
 }
-async function reportLoginFork(sid: string, chatId: string, s: AuthState | null): Promise<void> {
+async function reportLoginFork(sid: string, chatId: string, s: AuthState | null, opts?: { restarting?: boolean }): Promise<void> {
   if (s?.state === 'ok') {
-    await bot.api.sendMessage(chatId, '✅ Authenticated — your agent is ready.').catch(() => {})
+    // Copy must match the action: fresh auth restarts to apply the creds; an
+    // already-authed (cached) result changes nothing, so it must NOT say "restarting".
+    await bot.api.sendMessage(chatId, opts?.restarting
+      ? '✅ Authenticated — restarting to apply (~2s).'
+      : '✅ Already authenticated — your agent is ready.').catch(() => {})
   } else if (s?.state === 'error') {
     await bot.api.sendMessage(chatId, `⚠️ Login failed: ${s.error ?? 'unknown error'}. Tap /login to retry.`).catch(() => {})
   } else {
@@ -1116,7 +1120,7 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         }
         const s = await pollAuthUntilFork(sid, st => !!st.url, Date.now() + 90_000)
         if (s?.state === 'ok') {
-          await reportLoginFork(sid, chat_id, s)
+          await reportLoginFork(sid, chat_id, s) // already authed (cached creds) — no cred change, no restart
           return true
         }
         if (!s?.url) {
@@ -1129,7 +1133,16 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
           chat_id,
           `Open this link, sign in and approve:\n${s.url}${codeLine}\n\nI'll confirm here when it completes — nothing to send back.`,
         )
-        void pollAuthUntilFork(sid, () => false, Date.now() + 3600_000).then(fin => reportLoginFork(sid, chat_id, fin))
+        // Background-poll the device flow to completion, then APPLY the new creds by
+        // restarting: a coding-CLI only reads auth at boot, and a fresh device-login
+        // revokes the live session's prior token — so without a restart /login would
+        // falsely report ok while the agent stays dead/on-old-creds. Restart reloads
+        // creds AND re-enters the listen loop (mirrors the /model self-restart,
+        // DIVE-380). Only on success; failure/timeout leaves the session untouched.
+        void pollAuthUntilFork(sid, () => false, Date.now() + 3600_000).then(async fin => {
+          await reportLoginFork(sid, chat_id, fin, { restarting: fin?.state === 'ok' })
+          if (fin?.state === 'ok') await restartAgent(agentName())
+        })
         return true
       }
       case 'team':
