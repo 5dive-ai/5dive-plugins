@@ -26,6 +26,7 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
+import { TNA_RE, resolveTnaAnswer } from './tna'
 
 // Plugin version is sourced from .claude-plugin/plugin.json — the same
 // manifest the Claude Code plugin system reads, so /status can never
@@ -2941,56 +2942,39 @@ bot.on('callback_query:data', async ctx => {
   // tap doesn't double-answer. Fully fail-soft — a stale/deleted task, a
   // restarted agent, or any CLI error just acks the callback with a nudge and
   // never throws out of the handler.
-  const tnaM = /^tna:(\d+):(.+)$/.exec(data)
+  const tnaM = TNA_RE.exec(data)
   if (tnaM) {
     const taskId = tnaM[1]!
     const token = tnaM[2]!
     try {
       const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
       const task = JSON.parse(show.stdout).data?.task
-      if (!task || !task.need_type) {
+      // All branch logic (no-gate / already-answered / invalid-token / resolve the
+      // answer incl. the secret no-value path) lives in resolveTnaAnswer (DIVE-369),
+      // exercised headless by test/tna-harness.test.ts. This handler is the thin
+      // I/O adapter: fetch the live gate, then act on the resolution.
+      const r = resolveTnaAnswer(task, token)
+      if (r.kind === 'nogate') {
         await ctx.answerCallbackQuery({ text: 'This task no longer has a gate.' }).catch(() => {})
         await ctx.editMessageReplyMarkup().catch(() => {})
         return
       }
-      // Already answered (dashboard/CLI/double-tap won the race)? Don't re-answer.
-      if (task.need_answered_at) {
-        const prior = task.need_type === 'secret' ? '(provided)' : (task.need_answer ?? '—')
+      if (r.kind === 'already') {
+        // Answered by dashboard/CLI/double-tap between ping and tap — don't re-answer.
         await ctx.answerCallbackQuery({ text: 'Already answered.' }).catch(() => {})
-        await ctx.editMessageText(`✅ already answered: ${prior}`).catch(() => {})
+        await ctx.editMessageText(`✅ already answered: ${r.prior}`).catch(() => {})
         return
       }
-      // Resolve the answer from the live gate, not the payload. `answerArgs` is
-      // the extra argv for `task answer` (a secret takes NO --value — the key is
-      // never carried in chat/DB); `ack` is the human-facing confirmation word.
-      let answerArgs: string[] | undefined
-      let ack: string | undefined
-      if (task.need_type === 'decision') {
-        const opts = String(task.need_options ?? '')
-          .split('|')
-          .map((s: string) => s.trim())
-          .filter(Boolean)
-        const value = opts[Number(token)]
-        if (value !== undefined) { answerArgs = [`--value=${value}`]; ack = value }
-      } else if (task.need_type === 'approval') {
-        if (token === 'approved' || token === 'denied') { answerArgs = [`--value=${token}`]; ack = token }
-      } else if (task.need_type === 'secret') {
-        // DIVE-356: secret gate cleared with no value (CLI rejects --value here).
-        if (token === 'provided') { answerArgs = []; ack = 'provided' }
-      } else if (task.need_type === 'manual') {
-        // DIVE-356: manual gate cleared as done.
-        if (token === 'done') { answerArgs = ['--value=done']; ack = 'done' }
-      }
-      if (answerArgs === undefined) {
+      if (r.kind === 'invalid') {
         await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
         await ctx.editMessageReplyMarkup().catch(() => {})
         return
       }
       // `task answer` clears the gate, records the value, and pings the owning
       // agent to resume (DIVE-103). It also drops out of the inbox.
-      await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...answerArgs], { timeout: 8000 })
-      await ctx.answerCallbackQuery({ text: `Answered: ${ack}` }).catch(() => {})
-      await ctx.editMessageText(`✅ answered: ${ack}`).catch(() => {})
+      await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs], { timeout: 8000 })
+      await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
+      await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
     } catch {
       // Stale message, deleted task, restarted agent, or a CLI/sudo failure (incl.
       // a gate that got answered between our show and answer). Ack softly so

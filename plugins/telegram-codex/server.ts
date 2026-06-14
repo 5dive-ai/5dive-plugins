@@ -31,6 +31,7 @@ import {
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { TNA_RE, resolveTnaAnswer } from './tna'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -1353,7 +1354,7 @@ bot.on('callback_query:data', async ctx => {
   // double-answer. Claimed here before the tgcodex permission-button match below;
   // fully fail-soft. (Emit is type-gated CLI-side — lands dormant until
   // task_need_notify enables buttons for codex; DIVE-118.)
-  const tnaM = /^tna:(\d+):(.+)$/.exec(data)
+  const tnaM = TNA_RE.exec(data)
   if (tnaM) {
     const senderId = String(ctx.from.id)
     if (!loadAccess().allowFrom.includes(senderId)) {
@@ -1365,41 +1366,27 @@ bot.on('callback_query:data', async ctx => {
     try {
       const show = await run5dive(['task', 'show', taskId, '--json'], 5000)
       const task = show.ok ? show.data?.task : undefined
-      if (!task || !task.need_type) {
+      // Branch logic lives in resolveTnaAnswer (DIVE-369, byte-identical across
+      // base+forks, pinned headless by test/tna-harness.test.ts). Thin I/O adapter.
+      const r = resolveTnaAnswer(task, token)
+      if (r.kind === 'nogate') {
         await ctx.answerCallbackQuery({ text: 'This task no longer has a gate.' }).catch(() => {})
         await ctx.editMessageReplyMarkup().catch(() => {})
         return
       }
-      if (task.need_answered_at) {
-        const prior = task.need_type === 'secret' ? '(provided)' : (task.need_answer ?? '—')
+      if (r.kind === 'already') {
         await ctx.answerCallbackQuery({ text: 'Already answered.' }).catch(() => {})
-        await ctx.editMessageText(`✅ already answered: ${prior}`).catch(() => {})
+        await ctx.editMessageText(`✅ already answered: ${r.prior}`).catch(() => {})
         return
       }
-      // Resolve the answer from the live gate, not the payload. DIVE-356: a
-      // secret takes NO --value (the key never travels through chat/DB — answer
-      // records only need_answered_at); manual answers --value=done.
-      let answerArgs: string[] | undefined
-      let ack: string | undefined
-      if (task.need_type === 'decision') {
-        const opts = String(task.need_options ?? '').split('|').map((s: string) => s.trim()).filter(Boolean)
-        const v = opts[Number(token)]
-        if (v !== undefined) { answerArgs = [`--value=${v}`]; ack = v }
-      } else if (task.need_type === 'approval') {
-        if (token === 'approved' || token === 'denied') { answerArgs = [`--value=${token}`]; ack = token }
-      } else if (task.need_type === 'secret') {
-        if (token === 'provided') { answerArgs = []; ack = 'provided' }
-      } else if (task.need_type === 'manual') {
-        if (token === 'done') { answerArgs = ['--value=done']; ack = 'done' }
-      }
-      if (answerArgs === undefined) {
+      if (r.kind === 'invalid') {
         await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
         await ctx.editMessageReplyMarkup().catch(() => {})
         return
       }
-      await run5dive(['task', 'answer', taskId, ...answerArgs, '--json'], 8000)
-      await ctx.answerCallbackQuery({ text: `Answered: ${ack}` }).catch(() => {})
-      await ctx.editMessageText(`✅ answered: ${ack}`).catch(() => {})
+      await run5dive(['task', 'answer', taskId, ...r.answerArgs, '--json'], 8000)
+      await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
+      await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
     } catch {
       await ctx.answerCallbackQuery({ text: "Couldn't apply — open the dashboard." }).catch(() => {})
     }
