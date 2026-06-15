@@ -1528,6 +1528,39 @@ async function read5diveAccountUsage(): Promise<FiveDiveAccountUsage[] | null> {
   return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAccountUsage[]) : null
 }
 
+// `5dive usage --json` — per-agent / per-task token burn over the last 24h.
+// Subscription tokens only (these agents run on the plan, not the metered API),
+// so there are deliberately no dollar figures. Best-effort: null on any failure
+// (e.g. a CLI too old to have the `usage` subcommand) so /usage still renders
+// the account-limit board below.
+type FiveDiveUsageAgent = {
+  name: string
+  account: string | null
+  total: number
+  output: number
+  cacheRead: number
+  fiveHourPct: number | null
+  sevenDayPct: number | null
+  models: Record<string, { in: number; out: number; cc: number; cr: number; turns: number }>
+}
+type FiveDiveUsageTask = {
+  ident: string
+  title: string
+  assignee: string
+  total: number
+  output: number
+  turns: number
+}
+type FiveDiveUsageBoard = { agents: FiveDiveUsageAgent[]; tasks: FiveDiveUsageTask[] }
+async function read5diveUsageBoard(): Promise<FiveDiveUsageBoard | null> {
+  const j = await read5diveJson(['usage', '--json'], 8000)
+  if (!j?.ok || !j.data || !Array.isArray(j.data.agents)) return null
+  return {
+    agents: j.data.agents as FiveDiveUsageAgent[],
+    tasks: (j.data.tasks ?? []) as FiveDiveUsageTask[],
+  }
+}
+
 type FiveDiveRotation = {
   active: string
   enabled: boolean
@@ -2863,7 +2896,7 @@ const commandHandlers: Record<string, CommandHandler> = {
   // switcher buttons). null usage for an account means no bound agent
   // rendered a statusline recently, so there are no live numbers to show.
   usage: async ctx => {
-    const usage = await read5diveAccountUsage()
+    const [board, usage] = await Promise.all([read5diveUsageBoard(), read5diveAccountUsage()])
     if (!usage) {
       await ctx.reply(`Couldn't read usage — your 5dive CLI may be out of date. Update to the latest 5dive CLI, then try again.`)
       return
@@ -2876,7 +2909,36 @@ const commandHandlers: Record<string, CommandHandler> = {
     const STALE_MS = 20 * 60 * 1000
     const fmtReset = (resetsAt?: number): string =>
       resetsAt ? formatDuration(Math.max(0, resetsAt * 1000 - now)) : '?'
-    const lines: string[] = ['Account usage', '']
+    const fmtTok = (n: number): string =>
+      n >= 1_000_000 ? Math.floor(n / 100_000) / 10 + 'M'
+      : n >= 1_000 ? Math.floor(n / 100) / 10 + 'k'
+      : String(n)
+    const shortModel = (m: string): string =>
+      m ? m.replace(/^claude-/, '').replace(/-20\d+$/, '') : '-'
+    const lines: string[] = []
+    if (board && board.agents.length) {
+      // per-account token totals → each agent's share of its account's 1w limit.
+      const acctTotal = new Map<string, number>()
+      for (const a of board.agents)
+        acctTotal.set(a.account ?? '-', (acctTotal.get(a.account ?? '-') ?? 0) + a.total)
+      lines.push('\u{1F4CA} Token burn \u2014 last 24h  (subscription, no $)', '', 'Top agents')
+      for (const a of [...board.agents].sort((x, y) => y.total - x.total).slice(0, 6)) {
+        const at = acctTotal.get(a.account ?? '-') ?? 0
+        const share = a.sevenDayPct != null && at > 0 ? Math.round((a.total / at) * a.sevenDayPct) : null
+        const sd = a.sevenDayPct
+        const dot = sd == null ? '\u25AB\uFE0F' : sd >= 90 ? '\u{1F534}' : sd >= 70 ? '\u{1F7E1}' : '\u{1F7E2}'
+        const model = Object.entries(a.models).sort((x, y) => y[1].out - x[1].out)[0]?.[0]
+        lines.push(`${dot} ${a.name} \u00B7 ${fmtTok(a.total)} \u00B7 ${shortModel(model ?? '')}${share != null ? ` \u00B7 ${share}% wk` : ''}`)
+      }
+      const topTasks = [...board.tasks].sort((x, y) => y.total - x.total).slice(0, 6)
+      if (topTasks.length) {
+        lines.push('', 'Top tasks')
+        for (const t of topTasks)
+          lines.push(`${t.ident} \u00B7 ${t.assignee} \u00B7 ${fmtTok(t.total)} \u2014 ${t.title.length > 30 ? t.title.slice(0, 29) + '\u2026' : t.title}`)
+      }
+      lines.push('')
+    }
+    lines.push('Account limits', '')
     for (const a of usage) {
       const u = a.usage
       if (!u || (u.fiveHour == null && u.sevenDay == null)) {
