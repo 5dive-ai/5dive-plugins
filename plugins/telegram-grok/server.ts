@@ -799,6 +799,21 @@ function taskAssignedToMe(assignee: string | null | undefined): boolean {
 // is plain left-aligned text with a tappable /task_<id> deep link per row
 // (handled by the bot.hears below). Rows assigned to THIS agent are starred.
 // Read-only; mutations go through /task add + dashboard/CLI.
+// Clamp a list section to a ~4000-char budget so a long /tasks never exceeds
+// Telegram's 4096 send limit (DIVE-313); appends "(+N more)" for the remainder.
+function clampList(header: string, lines: string[], total = lines.length): string {
+  const BUDGET = 4000
+  let used = header.length
+  const kept: string[] = []
+  for (const line of lines) {
+    if (used + line.length + 1 > BUDGET) break
+    kept.push(line)
+    used += line.length + 1
+  }
+  const hidden = total - kept.length
+  return header + kept.join('\n') + (hidden > 0 ? `\n(+${hidden} more)` : '')
+}
+
 // Render one task row: ⭐ if mine, a status flag, ident · title, assignee, link.
 // `needTag` appends the gate type (e.g. " [approval]") for the Needs-you section.
 function taskRow(t: any, needTag = false): string {
@@ -831,12 +846,11 @@ async function buildTaskList(): Promise<string> {
   const sections: string[] = []
   if (needsYou.length) {
     const lines = needsYou.map((t: any) => taskRow(t, true))
-    sections.push(`🔔 Needs you (${needsYou.length}) · tap /task_N to act:\n\n${lines.join('\n')}`)
+    sections.push(clampList(`🔔 Needs you (${needsYou.length}) · tap /task_N to act:\n\n`, lines))
   }
   if (rest.length) {
     const lines = rest.slice(0, MAX).map((t: any) => taskRow(t))
-    const more = rest.length > MAX ? `\n(+${rest.length - MAX} more)` : ''
-    sections.push(`Open tasks · ⭐ = yours · tap /task_N to open:\n\n${lines.join('\n')}${more}`)
+    sections.push(clampList('Open tasks · ⭐ = yours · tap /task_N to open:\n\n', lines, rest.length))
   }
   return sections.join('\n\n')
 }
