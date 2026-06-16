@@ -551,7 +551,6 @@ const BOT_COMMANDS: Array<{ command: string; description: string; menuHidden?: b
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
   { command: 'model',   description: 'Pick model' },
-  { command: 'login',   description: 'Authenticate your coding-CLI' },
   { command: 'ping',    description: 'Liveness check' },
   { command: 'start',   description: 'Pair this chat' },
 ]

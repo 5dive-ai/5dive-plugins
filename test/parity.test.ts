@@ -83,8 +83,10 @@ const has = (src: string, sym: string) => new RegExp(`\\b${sym}\\b`).test(src)
 // ---- golden specs (the intended contract) ----
 
 // Ordered — the BotFather menu shows commands in array order.
+// /login is claude-base-only for 0.5.0 (DIVE-378/380) — the forks self-poll and
+// have no verified cred-path, so the command is stripped from their menus.
 const GOLDEN_FORK_COMMANDS = [
-  'help', 'status', 'stop', 'restart', 'agents', 'team', 'tasks', 'task', 'org', 'model', 'login', 'ping', 'start',
+  'help', 'status', 'stop', 'restart', 'agents', 'team', 'tasks', 'task', 'org', 'model', 'ping', 'start',
 ]
 const GOLDEN_FORK_MCP_TOOLS = ['wait_for_message', 'reply', 'edit_message', 'react', 'download_attachment']
 const GOLDEN_BASELINE_MCP_TOOLS = ['reply', 'react', 'download_attachment', 'edit_message']
