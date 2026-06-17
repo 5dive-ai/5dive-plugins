@@ -858,14 +858,14 @@ async function buildTaskList(): Promise<string> {
   return sections.join('\n\n')
 }
 
-async function buildTaskDetail(id: number): Promise<string> {
+async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: InlineKeyboard }> {
   let j: any
   try {
     j = await run5dive(['task', 'show', String(id), '--json'])
   } catch (err) {
-    return `Failed to load task: ${err instanceof Error ? err.message : String(err)}`
+    return { text: `Failed to load task: ${err instanceof Error ? err.message : String(err)}` }
   }
-  if (!j.ok || !j.data?.task) return 'Task not found.'
+  if (!j.ok || !j.data?.task) return { text: 'Task not found.' }
   const t = j.data.task
   const mine = taskAssignedToMe(t.assignee) ? ' ⭐' : ''
   const lines = [
@@ -884,7 +884,15 @@ async function buildTaskDetail(id: number): Promise<string> {
   }
   if (t.result) lines.push('', `result: ${t.result}`)
   lines.push('', 'back to list: /tasks')
-  return lines.join('\n')
+  // DIVE-449: an "Escalate" button (semantics A — flag for attention: bumps
+  // priority a tier + pings the owning agent & the paired human). Only for OPEN
+  // tasks — a done/cancelled task has nothing to get eyes on. The tap lands in
+  // the callback router as `esc:<id>` (mirrors the tna: tap-to-answer flow).
+  let keyboard: InlineKeyboard | undefined
+  if (t.status !== 'done' && t.status !== 'cancelled') {
+    keyboard = new InlineKeyboard().text('🔺 Escalate', `esc:${t.id}`)
+  }
+  return { text: lines.join('\n'), keyboard }
 }
 
 // /task add <title> — create a task on the shared queue.
@@ -1284,7 +1292,8 @@ bot.hears(/^\/task_(\d+)\b/, async ctx => {
   if (!loadAccess().allowFrom.includes(senderId)) return
   const m = /^\/task_(\d+)\b/.exec(ctx.message?.text ?? '')
   if (!m) return
-  await ctx.reply(await buildTaskDetail(Number(m[1])))
+  const detail = await buildTaskDetail(Number(m[1]))
+  await ctx.reply(detail.text, detail.keyboard ? { reply_markup: detail.keyboard } : undefined)
 })
 
 bot.on('message:text', async ctx => {
@@ -1481,6 +1490,31 @@ bot.on('callback_query:data', async ctx => {
     })
     await ctx.editMessageReplyMarkup().catch(() => {})
     await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
+    return
+  }
+
+  // DIVE-449: tap on the "Escalate" button under a /task_<id> detail view.
+  // Semantics A (Mark, 2026-06-17): flag for attention — `task escalate` bumps
+  // the task priority a tier (capped at urgent) and pings the owning agent + the
+  // paired human. Re-gate the tapper (a leaked button could otherwise let a
+  // stranger escalate); drop the button so it can't double-fire. Re-open
+  // /task_<id> to escalate again (high -> urgent); detail re-renders the button.
+  const escM = /^esc:(\d+)$/.exec(data)
+  if (escM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const taskId = escM[1]!
+    try {
+      const r = await run5dive(['task', 'escalate', taskId, '--json'], 8000)
+      const pri = r.ok ? (r.data?.priority ?? 'high') : 'high'
+      await ctx.answerCallbackQuery({ text: `🔺 Escalated — priority ${pri}` }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+    } catch {
+      await ctx.answerCallbackQuery({ text: "Couldn't escalate — open the dashboard." }).catch(() => {})
+    }
     return
   }
 

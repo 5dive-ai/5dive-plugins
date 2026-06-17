@@ -3,6 +3,17 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.5.2
+
+### Added — Escalate button on the `/task_<id>` detail view (DIVE-449)
+The single-task detail (`/task_<id>`) now carries an inline 🔺 Escalate button
+for open tasks. A tap runs `5dive task escalate` (semantics A, Mark's call):
+flag for attention — bump priority a tier (cap urgent) + ping the owning agent
+and the paired human. Mirrors the `tna:` tap-to-answer flow: re-gated sender,
+fail-soft, the button drops after one tap (re-open `/task_<id>` to go high →
+urgent). Ported across base + all forks (grok/codex/agy via generator parity,
+opencode hand-fork SSE arch). Lockstep version bump 0.5.1 → 0.5.2.
+
 ## v0.4.79
 
 ### Added — Claude Fable 5 in the /model picker (DIVE-212)
