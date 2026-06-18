@@ -3205,6 +3205,36 @@ for (const def of COMMAND_REGISTRY) {
   })
 }
 
+// DIVE-518: mint a human-proof token for an approval/secret gate answer.
+// The CLI (DIVE-519) requires a --proof token to clear an approval or secret
+// gate, so an agent that runs `sudo 5dive task answer` directly can no longer
+// silently self-clear one (the DIVE-516 hole / DIVE-391 incident class). This is
+// only ever called from the callback handler below, AFTER allowFrom has verified
+// the tapper is an allowlisted HUMAN. We mint via the root-only `5dive gate-proof`
+// helper, which reads the 0400 root key and HMACs taskid:needtype:nonce:exp.
+//
+// LIMITATION (by design — this is bar-raising, NOT airtight): an on-box agent
+// with sudo is root-equivalent and could call this same helper, sudo-cat the key,
+// or write the task DB directly. The point is to turn a one-line self-answer into
+// an explicit, AUDITED sudo escalation (the CLI audit-logs every approval/secret
+// answer attempt). The airtight variant (re-home this bridge off the agent uid +
+// sudoers arg-deny) is a deferred opt-in (DIVE-516 Option B), same wire format.
+//
+// Best-effort during rollout: the CLI does not REQUIRE the proof until both sides
+// ship, and the helper may not be deployed yet — so a mint failure returns null
+// and the caller answers without --proof (current behavior). Once both land, a
+// missing/forged proof fails closed in the CLI.
+async function mintGateProof(taskId: string, needType: string | undefined): Promise<string | null> {
+  if (needType !== 'approval' && needType !== 'secret') return null
+  try {
+    const r = await execFileP(SUDO, ['-n', '5dive', 'gate-proof', taskId, needType], { timeout: 5000 })
+    const tok = (r.stdout ?? '').trim()
+    return tok || null
+  } catch {
+    return null
+  }
+}
+
 // Inline-button handler. Routes:
 //   perm:allow|deny|more:<id>  → permission flow (declared upstream)
 //   model:<alias>              → /model picker
@@ -3261,7 +3291,16 @@ bot.on('callback_query:data', async ctx => {
       }
       // `task answer` clears the gate, records the value, and pings the owning
       // agent to resume (DIVE-103). It also drops out of the inbox.
-      await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs], { timeout: 8000 })
+      // DIVE-518: this tap is a verified human (allowFrom gate above), so mark it
+      // --human (provenance) and, for an approval/secret gate, attach a --proof the
+      // CLI requires — see mintGateProof. decision/manual need neither.
+      const extraArgs: string[] = []
+      if (task?.need_type === 'approval' || task?.need_type === 'secret') {
+        extraArgs.push('--human')
+        const proof = await mintGateProof(taskId, task.need_type)
+        if (proof) extraArgs.push(`--proof=${proof}`)
+      }
+      await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], { timeout: 8000 })
       await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
       await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
     } catch {
