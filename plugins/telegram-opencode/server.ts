@@ -809,7 +809,19 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: I
   // the callback router as `esc:<id>` (mirrors the tna: tap-to-answer flow).
   let keyboard: InlineKeyboard | undefined
   if (t.status !== 'done' && t.status !== 'cancelled') {
-    keyboard = new InlineKeyboard().text('🔺 Escalate', `esc:${t.id}`)
+    // DIVE-503: "▶️ Do now" (Mark, 2026-06-18) — the ACTIVE counterpart to
+    // Escalate. Escalate is passive (bump priority + notify, agent decides when);
+    // Do now pings the assigned agent to pick this up immediately and flips the
+    // task to in_progress. Only rendered when there's an assignee (nothing to
+    // ping otherwise); sits left of 🔺 Escalate. Routes as `donow:<id>`.
+    keyboard = new InlineKeyboard()
+    if (t.assignee) keyboard.text('▶️ Do now', `donow:${t.id}`)
+    keyboard.text('🔺 Escalate', `esc:${t.id}`)
+    // DIVE-503: second row — close the task out. ✅ Done is one-tap (reversible
+    // by reopening); 🚫 Cancel is two-tap (tap once to arm → confirm) so a
+    // fat-finger can't kill a task. Only shown while the task is still open.
+    keyboard.row()
+    keyboard.text('✅ Done', `tdone:${t.id}`).text('🚫 Cancel', `tcancel:${t.id}`)
   }
   return { text: lines.join('\n'), keyboard }
 }
@@ -1239,10 +1251,116 @@ bot.on('callback_query:data', async ctx => {
       const r = await run5dive(['task', 'escalate', taskId, '--json'], 8000)
       const pri = r.ok ? (r.data?.priority ?? 'high') : 'high'
       await ctx.answerCallbackQuery({ text: `🔺 Escalated — priority ${pri}` }).catch(() => {})
-      await ctx.editMessageReplyMarkup().catch(() => {})
+      // DIVE-503: after escalating, swap the keyboard for a single "▶️ Do now"
+      // (Mark's "when I press escalate" flow) so a priority bump leads straight
+      // into kicking the agent off, instead of the buttons just vanishing.
+      await ctx.editMessageReplyMarkup({
+        reply_markup: new InlineKeyboard().text('▶️ Do now', `donow:${taskId}`),
+      }).catch(() => {})
     } catch {
       await ctx.answerCallbackQuery({ text: "Couldn't escalate — open the dashboard." }).catch(() => {})
     }
+    return
+  }
+
+  // DIVE-503: "▶️ Do now" tap (Mark, 2026-06-18). Active interrupt — distinct
+  // from Escalate's passive priority bump. Resolves the task's assignee and pings
+  // that agent directly to pick it up immediately, then flips to in_progress.
+  // Re-gate the tapper (mirrors esc:); refuses if unassigned; fail-soft + drops
+  // the button after a successful tap.
+  const dnM = /^donow:(\d+)$/.exec(data)
+  if (dnM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+      return
+    }
+    const taskId = dnM[1]!
+    try {
+      const show = await run5dive(['task', 'show', taskId, '--json'], 5000)
+      const task = show.ok ? show.data?.task : undefined
+      const assignee = task?.assignee ? String(task.assignee).replace(/^agent-/, '') : ''
+      if (!assignee) {
+        await ctx.answerCallbackQuery({ text: 'No assignee — assign it first.' }).catch(() => {})
+        return
+      }
+      const ident = task?.ident ?? `task ${taskId}`
+      // Flip to in_progress (idempotent; ignore if already started), then ping.
+      await run5dive(['task', 'start', taskId, '--json'], 8000).catch(() => {})
+      const msg = `▶️ Mark wants ${ident} done now — please pick it up immediately. Details: /task_${taskId}`
+      await run5dive(['agent', 'send', assignee, msg, '--json'], 8000)
+      await ctx.answerCallbackQuery({ text: `▶️ Pinged ${assignee} — on it now` }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+    } catch {
+      await ctx.answerCallbackQuery({ text: "Couldn't kick it off — open the dashboard." }).catch(() => {})
+    }
+    return
+  }
+
+  // DIVE-503: ✅ Done (one-tap) / 🚫 Cancel (two-tap confirm) for /task_<id>.
+  // Done completes; Cancel arms a confirm pair first so an accidental tap can't
+  // kill a task. Re-gate the tapper on each; all fail-soft like esc:/donow:.
+  const tdM = /^tdone:(\d+)$/.exec(data)
+  if (tdM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+      return
+    }
+    const taskId = tdM[1]!
+    try {
+      await run5dive(['task', 'done', taskId, '--json'], 8000)
+      await ctx.answerCallbackQuery({ text: '✅ Marked done' }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+    } catch {
+      await ctx.answerCallbackQuery({ text: "Couldn't mark done — open the dashboard." }).catch(() => {})
+    }
+    return
+  }
+  // First tap on Cancel — arm the confirm rather than cancelling outright.
+  const tcM = /^tcancel:(\d+)$/.exec(data)
+  if (tcM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+      return
+    }
+    const taskId = tcM[1]!
+    await ctx.answerCallbackQuery({ text: 'Tap "Confirm cancel" to cancel this task.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup({
+      reply_markup: new InlineKeyboard()
+        .text('⚠️ Confirm cancel', `tcancelc:${taskId}`)
+        .text('↩︎ Keep', `tkeep:${taskId}`),
+    }).catch(() => {})
+    return
+  }
+  // Confirmed cancel.
+  const tccM = /^tcancelc:(\d+)$/.exec(data)
+  if (tccM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+      return
+    }
+    const taskId = tccM[1]!
+    try {
+      await run5dive(['task', 'cancel', taskId, '--json'], 8000)
+      await ctx.answerCallbackQuery({ text: '🚫 Cancelled' }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+    } catch {
+      await ctx.answerCallbackQuery({ text: "Couldn't cancel — open the dashboard." }).catch(() => {})
+    }
+    return
+  }
+  // "Keep" — back out of the cancel-confirm by rebuilding the full detail keyboard.
+  const tkM = /^tkeep:(\d+)$/.exec(data)
+  if (tkM) {
+    const taskId = tkM[1]!
+    try {
+      const detail = await buildTaskDetail(Number(taskId))
+      await ctx.editMessageText(detail.text, { reply_markup: detail.keyboard }).catch(() => {})
+    } catch {}
+    await ctx.answerCallbackQuery().catch(() => {})
     return
   }
 
