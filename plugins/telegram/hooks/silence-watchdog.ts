@@ -13,7 +13,7 @@
 // Triggers (PostToolUse, after every tool call) when ALL of:
 //   - access.json has at least one allowFrom entry (paired)
 //   - silence.json shows recent TG activity (inbound within last hour)
-//   - EITHER (now - lastReplyAt > 90s) OR (toolCallsSinceReply >= 5)
+//   - EITHER (now - lastReplyAt > FIRST_FIRE_SECONDS) OR (toolCallsSinceReply >= 5)
 //
 // Re-firing policy (avoids one-shot fatigue without spamming):
 //   - First time after a reply: fire immediately when threshold crossed
@@ -26,6 +26,13 @@ import { emitPostToolContext } from './lib/output'
 
 // Drain stdin so claude's pipe doesn't hang. We don't need the payload.
 await readPayload()
+
+// First-fire silence threshold (seconds since last reply). Lower = the agent
+// is forced to ack sooner; higher = quieter but more perceived silence. The
+// single retune knob for the ack/annoyance balance. Stepped down 90 -> 60
+// gradually 2026-06-22 (Mark) — quick tasks finish under it and never ack,
+// long tasks cross it and buzz exactly once. Candidate next step: 45.
+const FIRST_FIRE_SECONDS = 60
 
 const access = loadAccess()
 if (!access.allowFrom || access.allowFrom.length === 0) process.exit(0)
@@ -57,7 +64,7 @@ if (lastReply > 0) {
 let shouldFire = false
 if (inConversation) {
   const crossedCount = calls >= 5
-  const crossedTime = sinceReply > 90
+  const crossedTime = sinceReply > FIRST_FIRE_SECONDS
   if (crossedCount || crossedTime) {
     if (lastReminder === 0 || lastReminder < lastReply || lastReminder < lastInbound) {
       // First time crossing the threshold since the last reply/inbound.
