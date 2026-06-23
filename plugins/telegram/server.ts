@@ -2348,12 +2348,23 @@ const commandHandlers: Record<string, CommandHandler> = {
     // callback_query:data router (nudge:on / nudge:off).
     const nudgeOn = readNudgeEnabled()
     lines.push('', `Carry-over nudges: ${nudgeOn ? '🔔 on' : '🔕 off'}`)
+    // Two one-tap actions for when you're staring at a full bar, plus the nudge
+    // toggle. The carry-over button reuses the SAME callback (`ho:now`) the
+    // context-nudge fires — save a structured carryover, then /clear so the
+    // fresh session reloads it (light continuity, same process). Restart is the
+    // hard reset: full systemd restart (`ho:restart`), distinct from /clear.
     const reply_markup = {
-      inline_keyboard: [[
-        nudgeOn
-          ? { text: '🔕 Turn nudges off', callback_data: 'nudge:off' }
-          : { text: '🔔 Turn nudges on', callback_data: 'nudge:on' },
-      ]],
+      inline_keyboard: [
+        [
+          { text: '💾 Remember & clear', callback_data: 'ho:now' },
+          { text: '🔄 Restart now', callback_data: 'ho:restart' },
+        ],
+        [
+          nudgeOn
+            ? { text: '🔕 Turn nudges off', callback_data: 'nudge:off' }
+            : { text: '🔔 Turn nudges on', callback_data: 'nudge:on' },
+        ],
+      ],
     }
     await ctx.reply(lines.join('\n'), { reply_markup })
   },
@@ -3540,6 +3551,38 @@ bot.on('callback_query:data', async ctx => {
   if (data === 'ho:skip') {
     await ctx.answerCallbackQuery({ text: 'Okay, carrying on.' }).catch(() => {})
     await ctx.editMessageReplyMarkup().catch(() => {})
+    return
+  }
+  // ho:restart → full agent restart from the /context button. Same deferred
+  // systemd-run shape as the /restart command (ack lands before SIGTERM; the
+  // transient unit fires ~1s later and survives this process's teardown). The
+  // hard reset, distinct from ho:now's light carryover+/clear: fresh process,
+  // re-reads settings, picks up a just-shipped CLI — at the cost of this
+  // session's context (carry over first if you want continuity).
+  if (data === 'ho:restart') {
+    const me = thisAgentName()
+    if (!me) {
+      await ctx.answerCallbackQuery({ text: 'Run /restart in your session' }).catch(() => {})
+      await ctx.editMessageText("Couldn't determine this agent's name — type /restart in your terminal.").catch(() => {})
+      return
+    }
+    const chatId = ctx.chat?.id ?? Number(ctx.callbackQuery.from.id)
+    await ctx.answerCallbackQuery({ text: 'Restarting…' }).catch(() => {})
+    await ctx
+      .editMessageText('🔄 New session — full restart (~20-30s). Fresh process + context, re-reads settings, latest CLI.')
+      .catch(() => {})
+    void execFileP(
+      SUDO,
+      ['-n', 'systemd-run', '--on-active=1', '--collect',
+        '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+      { timeout: 5000 },
+    ).catch((err: any) => {
+      const stderr = err?.stderr ? String(err.stderr).trim() : ''
+      void bot.api.sendMessage(
+        chatId,
+        `❌ Failed to restart: ${stderr || (err instanceof Error ? err.message : String(err))}`,
+      ).catch(() => {})
+    })
     return
   }
 
