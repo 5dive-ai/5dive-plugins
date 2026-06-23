@@ -162,6 +162,15 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     description: 'Self-paced goal',
     scope: 'paired',
   },
+  {
+    // /digest (DIVE-624) — toggle the per-box daily standup digest. Shells to
+    // `5dive digest on|off|status` (off by default; the hourly digest-tick cron
+    // honours the per-box pref). paired-5dive: hides + no-ops on non-5dive hosts
+    // where the subcommand doesn't exist.
+    name: 'digest',
+    description: 'Daily standup digest on/off/at',
+    scope: 'paired-5dive',
+  },
 ]
 
 /** Short model alias → full Claude Code model ID. Add new tiers here.

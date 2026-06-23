@@ -1299,6 +1299,25 @@ async function read5diveVersion(): Promise<string | null> {
   }
 }
 
+// True when the installed 5dive CLI is >= `min` (numeric dotted compare). Used to
+// gate commands whose CLI subcommand only exists from a known version. Tolerant:
+// a missing/unparseable version returns false, so a gated command degrades to a
+// "update your CLI" message rather than firing against a binary that lacks it.
+// Strips any pre-release suffix (e.g. "0.4.2-rc1" → "0.4.2").
+async function fiveDiveVersionAtLeast(min: string): Promise<boolean> {
+  const cur = await read5diveVersion()
+  if (!cur) return false
+  const norm = (v: string) => v.split('-')[0].split('.').map(n => parseInt(n, 10) || 0)
+  const a = norm(cur)
+  const b = norm(min)
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (x !== y) return x > y
+  }
+  return true
+}
+
 // Read the rate-limit snapshot the statusline script wrote to disk on its
 // last invocation. Claude holds rate_limits in-process and only emits it
 // when statusline renders, so this file is our only readable mirror. Stale
@@ -2225,6 +2244,23 @@ async function watchSelfPollLogin(sid: string, chatId: string, deadline: number)
   await reportLoginTerminal(sid, chatId, s)
 }
 
+// Parse a /digest time argument into an hour 0-23 (the CLI's --at takes an hour).
+// Accepts "8", "08", "8am", "8pm", "8:00", "08:30", "20:00", "8:30pm". Minutes are
+// parsed only to validate the form — the CLI is hour-granular, so they're dropped.
+// Returns null on anything unparseable or out of range so the caller can show usage.
+function parseDigestHour(raw: string): number | null {
+  const s = raw.trim().toLowerCase().replace(/\s+/g, '')
+  const m = s.match(/^(\d{1,2})(?::([0-5]\d))?(am|pm)?$/)
+  if (!m) return null
+  let h = parseInt(m[1], 10)
+  const mer = m[3]
+  if (mer) {
+    if (h < 1 || h > 12) return null
+    h = mer === 'am' ? (h === 12 ? 0 : h) : (h === 12 ? 12 : h + 12)
+  }
+  return h >= 0 && h <= 23 ? h : null
+}
+
 const commandHandlers: Record<string, CommandHandler> = {
   start: async ctx => {
     await ctx.reply(
@@ -2367,6 +2403,77 @@ const commandHandlers: Record<string, CommandHandler> = {
       ],
     }
     await ctx.reply(lines.join('\n'), { reply_markup })
+  },
+
+  // /digest — toggle the per-box daily standup digest (DIVE-624). Thin wrapper
+  // over the `5dive digest` CLI: all state (off-by-default, the per-box pref, the
+  // hourly digest-tick gating) lives CLI-side; the plugin only parses the verb,
+  // shells out, then re-reads `digest status --json` to confirm canonical state
+  // back to the user. Forms:
+  //   /digest            → status only
+  //   /digest on         → 5dive digest on            (default 07:00 box-local)
+  //   /digest at 8am     → 5dive digest on --at=8      (enable + set hour 0-23)
+  //   /digest off        → 5dive digest off
+  digest: async ctx => {
+    // The `digest status|on|off` subcommands land in 5dive 0.4.2 (0.4.1 had only a
+    // bare `digest`; pre-0.4.1 has none). Gate so an older box gets a clear
+    // "update your CLI" rather than a raw subcommand error. paired-5dive scope
+    // already hides this on non-5dive hosts; this catches the stale-CLI case.
+    const DIGEST_MIN_VERSION = '0.4.2'
+    if (!(await fiveDiveVersionAtLeast(DIGEST_MIN_VERSION))) {
+      await ctx.reply(
+        `/digest needs the 5dive CLI ≥ ${DIGEST_MIN_VERSION}. This box is on an older build — ` +
+          `it auto-updates on the next nightly, so try again tomorrow (or ask an admin to upgrade the CLI now).`,
+      )
+      return
+    }
+    const arg = (ctx.match ?? '').trim()
+    const lower = arg.toLowerCase()
+    const ON = ['on', 'enable', 'enabled', 'yes', 'start']
+    const OFF = ['off', 'disable', 'disabled', 'no', 'stop']
+
+    // The CLI may return the {ok,data} envelope or a bare object — tolerate both.
+    const stateFrom = (j: any): { enabled: boolean; hour?: number; lastSent?: string } | null => {
+      const d = j && typeof j.enabled !== 'undefined' ? j : j?.data
+      return d && typeof d.enabled !== 'undefined' ? d : null
+    }
+    const fmtHour = (h: unknown): string =>
+      typeof h === 'number' && h >= 0 && h <= 23 ? `${String(h).padStart(2, '0')}:00` : '07:00'
+
+    // Run an optional mutation, then re-read status and report canonical state.
+    const report = async (mutate: string[] | null): Promise<void> => {
+      if (mutate) await read5diveJson(['digest', ...mutate], 8000)
+      const st = stateFrom(await read5diveJson(['digest', 'status', '--json'], 5000))
+      if (!st) {
+        await ctx.reply(`Couldn't read digest state from the 5dive CLI — try again in a moment.`)
+        return
+      }
+      const last = st.lastSent ? `\nLast sent: ${st.lastSent}` : ''
+      await ctx.reply(
+        st.enabled
+          ? `🔔 Daily standup digest is ON — sends ~${fmtHour(st.hour)} box-local.${last}\n\nChange the time with /digest at 8am, or turn off with /digest off.`
+          : `🔕 Daily standup digest is OFF.${last}\n\nEnable with /digest on (sends ~07:00 box-local), or pick a time with /digest at 8am.`,
+      )
+    }
+
+    if (lower === '') { await report(null); return }
+    if (ON.includes(lower)) { await report(['on']); return }
+    if (OFF.includes(lower)) { await report(['off']); return }
+
+    // Time form: "at 8am" / "at 08:00", or a bare "8am" / "20:00".
+    const timeStr = lower.startsWith('at') ? arg.replace(/^at\b/i, '').trim() : arg
+    const hour = parseDigestHour(timeStr)
+    if (hour === null) {
+      await ctx.reply(
+        `Usage:\n` +
+          `/digest — show current state\n` +
+          `/digest on — enable (default 07:00 box-local)\n` +
+          `/digest at 8am — enable at a set hour (0–23)\n` +
+          `/digest off — disable`,
+      )
+      return
+    }
+    await report(['on', `--at=${hour}`])
   },
 
   // /stop — interrupt the agent's current task. Sends C-c to the tmux pane

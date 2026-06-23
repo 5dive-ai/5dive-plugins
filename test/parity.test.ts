@@ -96,6 +96,9 @@ const GOLDEN_ACCESS_FIELDS = ['allowFrom', 'groups', 'pending', 'dmPolicy']
 const GOLDEN_BASELINE_MENU = [
   'help', 'status', 'context', 'stop', 'restart', 'clear', 'checkpoint', 'resume',
   'agents', 'team', 'tasks', 'heartbeat', 'task', 'org', 'update', 'model', 'account', 'login', 'usage', 'goal',
+  // DIVE-624: /digest is baseline-first (claude plugin). Forks track it in a follow-up
+  // port; until then it's an intended baseline-only addition to the menu.
+  'digest',
 ]
 const WATCHDOG_COMMON = ['startRearmWatchdog', 'REARM_IDLE_MS', 'markActivity', 'lastServerActivity']
 const TURN_LIVENESS = 'newestTurnMtimeMs' // codex+grok; agy pending DIVE-14
