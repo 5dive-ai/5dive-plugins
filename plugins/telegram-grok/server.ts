@@ -31,7 +31,7 @@ import {
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { TNA_RE, resolveTnaAnswer } from './tna'
+import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions } from './tna'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -1361,6 +1361,42 @@ function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboa
   }
 }
 
+// DIVE-708/717: when a reply presents a lettered/numbered CHOICE list (a) … b) …
+// or 1. 2. 3.), render one tappable button per option instead of the Yes/No
+// pair, so the user taps the actual choice. Detection (sequence + cue gate) is
+// the pure optionChoices() in tna.ts; here we just build the keyboard. One
+// button per row — option labels read better stacked than side-by-side.
+// callback_data is `opt:<index>`; the chosen label is re-resolved from the
+// tapped message at tap time (parseOptions), so it never has to fit the 64-byte
+// callback cap. Shares the YN opt-out marker (`<!-- no-buttons -->`).
+const OPT_BTN_MAX = 56 // keep button text to one tidy line in the Telegram UI
+function optionButtons(text: string): { keyboard?: InlineKeyboard; labels?: string[] } {
+  if (YN_SUPPRESS.test(text)) return {}
+  const opts = optionChoices(text)
+  if (!opts.length) return {}
+  const kb = new InlineKeyboard()
+  opts.forEach((o, i) => {
+    const label = o.label.length > OPT_BTN_MAX ? o.label.slice(0, OPT_BTN_MAX - 1).trimEnd() + '…' : o.label
+    kb.text(`${o.marker.toUpperCase()}) ${label}`, `opt:${i}`).row()
+  })
+  // Inject the FULL label (not the truncated button text) on tap.
+  return { keyboard: kb, labels: opts.map(o => o.label) }
+}
+
+// DIVE-708/717: remember a sent message's option labels so an `opt:<index>` tap
+// resolves the exact choice text. Robust to the sender-prefix/chunking that
+// would make re-parsing the displayed message unreliable. Bounded cache.
+const OPTION_CAP = 200
+const optionLabelsByMsg = new Map<number, string[]>()
+function rememberOptions(message_id: number, labels: string[]): void {
+  if (optionLabelsByMsg.has(message_id)) return
+  if (optionLabelsByMsg.size >= OPTION_CAP) {
+    const oldest = optionLabelsByMsg.keys().next().value
+    if (oldest != null) optionLabelsByMsg.delete(oldest)
+  }
+  optionLabelsByMsg.set(message_id, labels)
+}
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data ?? ''
   const senderId = String(ctx.from?.id ?? '')
@@ -1392,6 +1428,42 @@ bot.on('callback_query:data', async ctx => {
     })
     await ctx.editMessageReplyMarkup().catch(() => {})
     await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
+    return
+  }
+
+  // DIVE-708/717: tap on an auto-rendered choice-list button (`opt:<index>`).
+  // Resolve the chosen label from the cache the send path stored against this
+  // message; fall back to re-parsing the message text if the cache was lost
+  // (e.g. a plugin restart between send and tap). Inject the label as a synthetic
+  // inbound — the exact path a typed reply takes (enqueueInbound) — so the
+  // agent's next wait_for_message just sees the choice. Sender already vetted
+  // above; drop the keyboard so it can't be double-tapped, message text intact.
+  const optM = OPT_RE.exec(data)
+  if (optM) {
+    const idx = Number(optM[1])
+    const msg = ctx.callbackQuery.message
+    const labels = (msg ? optionLabelsByMsg.get(msg.message_id) : undefined)
+      ?? (msg && 'text' in msg && typeof msg.text === 'string' ? parseOptions(msg.text).map(o => o.label) : [])
+    const value = labels[idx]
+    if (value == null) {
+      await ctx.answerCallbackQuery({ text: 'That option is no longer available.' }).catch(() => {})
+      return
+    }
+    enqueueInbound({
+      chat_id: String(msg?.chat.id ?? ctx.from?.id ?? ''),
+      message_id: msg ? String(msg.message_id) : '0',
+      ...(msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+        ? { message_thread_id: String(msg.message_thread_id) }
+        : {}),
+      user: ctx.from?.username ?? String(ctx.from?.id ?? ''),
+      user_id: String(ctx.from?.id ?? ''),
+      text: value,
+      ts: new Date().toISOString(),
+    })
+    if (msg) optionLabelsByMsg.delete(msg.message_id)
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    const ackLabel = value.length > 40 ? value.slice(0, 39) + '…' : value
+    await ctx.answerCallbackQuery({ text: `✓ ${ackLabel}` }).catch(() => {})
     return
   }
 
@@ -1794,19 +1866,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // rides the callback path below, injecting a clean 'yes'/'no' inbound.
         const { stripped: ynText, keyboard: ynKeyboard } = yesNoButtons(text)
         const chunks = chunkForTelegram(ynText, accessForReply.textChunkLimit ?? TG_MAX_MESSAGE_CHARS)
+        // DIVE-708/717: a choice-list keyboard takes precedence over Yes/No, but
+        // only when the whole reply is a single chunk — the tap resolves the
+        // option from the message it's attached to, so every option must live in
+        // it.
+        const optRes = chunks.length === 1 ? optionButtons(text) : {}
+        const lastKeyboard = optRes.keyboard ?? ynKeyboard
         const sentIds: number[] = []
         try {
           for (let i = 0; i < chunks.length; i++) {
             // Thread reply_to only on the first chunk — subsequent chunks
-            // would all quote the same inbound, which is noisy. The Yes/No
-            // keyboard attaches to the LAST chunk only.
+            // would all quote the same inbound, which is noisy. The keyboard
+            // (choice-list or Yes/No) attaches to the LAST chunk only.
             const isLastChunk = i === chunks.length - 1
             const sent = await bot.api.sendMessage(chat_id, chunks[i]!, {
               ...(i === 0 && reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(message_thread_id != null ? { message_thread_id } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
-              ...(isLastChunk && ynKeyboard ? { reply_markup: ynKeyboard } : {}),
+              ...(isLastChunk && lastKeyboard ? { reply_markup: lastKeyboard } : {}),
             })
+            // DIVE-708/717: cache the option labels against the message the
+            // keyboard rides on, so its taps resolve to the right choice text.
+            if (isLastChunk && optRes.keyboard && optRes.labels) {
+              rememberOptions(sent.message_id, optRes.labels)
+            }
             sentIds.push(sent.message_id)
           }
         } catch (err) {

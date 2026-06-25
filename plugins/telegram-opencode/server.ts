@@ -24,6 +24,7 @@
 
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
+import { OPT_RE, optionChoices, parseOptions } from './tna'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, statSync,
   realpathSync, renameSync, existsSync, unlinkSync,
@@ -415,6 +416,41 @@ function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboa
   }
 }
 
+// DIVE-708/717: when a reply presents a lettered/numbered CHOICE list (a) … b) …
+// or 1. 2. 3.), render one tappable button per option instead of the Yes/No
+// pair, so the user taps the actual choice. Detection (sequence + cue gate) is
+// the pure optionChoices() in tna.ts; here we just build the keyboard. One
+// button per row. callback_data is `opt:<index>`; the chosen label is re-resolved
+// from the tapped message at tap time, so it never has to fit the 64-byte cap.
+// Shares the YN opt-out marker (`<!-- no-buttons -->`).
+const OPT_BTN_MAX = 56 // keep button text to one tidy line in the Telegram UI
+function optionButtons(text: string): { keyboard?: InlineKeyboard; labels?: string[] } {
+  if (YN_SUPPRESS.test(text)) return {}
+  const opts = optionChoices(text)
+  if (!opts.length) return {}
+  const kb = new InlineKeyboard()
+  opts.forEach((o, i) => {
+    const label = o.label.length > OPT_BTN_MAX ? o.label.slice(0, OPT_BTN_MAX - 1).trimEnd() + '…' : o.label
+    kb.text(`${o.marker.toUpperCase()}) ${label}`, `opt:${i}`).row()
+  })
+  // Inject the FULL label (not the truncated button text) on tap.
+  return { keyboard: kb, labels: opts.map(o => o.label) }
+}
+
+// DIVE-708/717: remember a sent message's option labels so an `opt:<index>` tap
+// resolves the exact choice text, robust to the streaming/chunking that would
+// make re-parsing the displayed message unreliable. Bounded cache.
+const OPTION_CAP = 200
+const optionLabelsByMsg = new Map<number, string[]>()
+function rememberOptions(message_id: number, labels: string[]): void {
+  if (optionLabelsByMsg.has(message_id)) return
+  if (optionLabelsByMsg.size >= OPTION_CAP) {
+    const oldest = optionLabelsByMsg.keys().next().value
+    if (oldest != null) optionLabelsByMsg.delete(oldest)
+  }
+  optionLabelsByMsg.set(message_id, labels)
+}
+
 // Send a (possibly long) reply to a chat, chunked. Reused by the relay and commands.
 async function sendReply(chat_id: string, text: string, opts?: { reply_to?: number; thread?: number }): Promise<void> {
   const limit = loadAccess().textChunkLimit ?? TG_MAX_MESSAGE_CHARS
@@ -548,16 +584,23 @@ async function finalizeStream(s: StreamState, finalText: string): Promise<void> 
   // DIVE-341: render the authoritative text minus any opt-out marker, then (after
   // the final flush) attach the Yes/No keyboard to the LAST chunk's message — the
   // streaming equivalent of the forks' last-chunk reply_markup.
-  const { stripped, keyboard } = yesNoButtons(text)
+  const { stripped, keyboard: ynKeyboard } = yesNoButtons(text)
   s.finalText = stripped
   s.finalized = true
   if (s.timer) { clearTimeout(s.timer); s.timer = null }
   await flushStream(s)
   if (s.dirty) { await new Promise(r => setTimeout(r, 50)); await flushStream(s) }
+  // DIVE-708/717: a choice-list keyboard takes precedence over Yes/No, but only
+  // when the reply landed as a single chunk — the tap resolves the option from
+  // the message it rides on, so every option must live in it.
+  const optRes = s.msgIds.length === 1 ? optionButtons(text) : {}
+  const keyboard = optRes.keyboard ?? ynKeyboard
   if (keyboard && s.msgIds.length) {
     const lastId = s.msgIds[s.msgIds.length - 1]!
     await bot.api.editMessageReplyMarkup(s.chat_id, lastId, { reply_markup: keyboard })
-      .catch((err: any) => process.stderr.write(`telegram-opencode: yn keyboard attach failed: ${err?.message}\n`))
+      .catch((err: any) => process.stderr.write(`telegram-opencode: keyboard attach failed: ${err?.message}\n`))
+    // Cache the option labels against the message the keyboard rides on.
+    if (optRes.keyboard && optRes.labels) rememberOptions(lastId, optRes.labels)
   }
   streams.delete(s.ses)
   stopTypingLoop(s.chat_id)
@@ -1230,6 +1273,41 @@ bot.on('callback_query:data', async ctx => {
       process.stderr.write(`telegram-opencode: yn ingest failed: ${err}\n`))
     await ctx.editMessageReplyMarkup().catch(() => {})
     await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
+    return
+  }
+
+  // DIVE-708/717: tap on an auto-rendered choice-list button (`opt:<index>`,
+  // attached in finalizeStream when a reply is a single-chunk choice list).
+  // Resolve the chosen label from the cache the send path stored against this
+  // message; fall back to re-parsing the message text if the cache was lost.
+  // Inject the label through the SAME prompt path a typed reply takes (runPrompt),
+  // fire async (do NOT await) for the same deadlock reason ingest does. Re-gate
+  // the tapper; drop the keyboard after so it can't be double-tapped.
+  const optM = OPT_RE.exec(data)
+  if (optM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+      return
+    }
+    const idx = Number(optM[1])
+    const msg = ctx.callbackQuery.message
+    const labels = (msg ? optionLabelsByMsg.get(msg.message_id) : undefined)
+      ?? (msg && 'text' in msg && typeof msg.text === 'string' ? parseOptions(msg.text).map(o => o.label) : [])
+    const value = labels[idx]
+    if (value == null) {
+      await ctx.answerCallbackQuery({ text: 'That option is no longer available.' }).catch(() => {})
+      return
+    }
+    const chat_id = String(msg?.chat.id ?? ctx.from.id)
+    const thread = msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+      ? msg.message_thread_id : undefined
+    void runPrompt(chat_id, value, { thread }).catch(err =>
+      process.stderr.write(`telegram-opencode: opt ingest failed: ${err}\n`))
+    if (msg) optionLabelsByMsg.delete(msg.message_id)
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    const ackLabel = value.length > 40 ? value.slice(0, 39) + '…' : value
+    await ctx.answerCallbackQuery({ text: `✓ ${ackLabel}` }).catch(() => {})
     return
   }
 
