@@ -94,25 +94,46 @@ if (!TOKEN) {
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
+// Liveness beacon for the single getUpdates slot (DIVE-818). The active poller
+// bumps this file's mtime every HEARTBEAT_MS; a newcomer treats the slot as HELD
+// only while the beacon is fresh. Acquisition happens in the poll bootstrap at
+// the bottom of the file.
+const HEARTBEAT_FILE = join(STATE_DIR, 'bot.heartbeat')
+const HEARTBEAT_MS = 3000
+// 3 missed beats — how long a newcomer waits before deciding the incumbent died.
+const HEARTBEAT_STALE_MS = 9000
 
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-// The PID file guards the single getUpdates slot. SEND_ONLY never polls, so it
-// must NOT claim the slot (doing so would fight the listener / a per-agent bot).
-if (!SEND_ONLY) {
-  try {
-    const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-    if (stale > 1 && stale !== process.pid) {
-      process.kill(stale, 0)
-      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-      process.kill(stale, 'SIGTERM')
-    }
-  } catch {}
-  writeFileSync(PID_FILE, String(process.pid))
+
+// DIVE-818: Telegram allows exactly one getUpdates consumer per token; a SECOND
+// consumer 409-conflicts the live one. The recurring failure was a TRANSIENT
+// spawn — `claude mcp list`, or an overlapping respawn — running this same
+// server.ts: the old code eagerly SIGTERM'd whatever PID held the slot and
+// claimed it, then (for `mcp list`) died milliseconds later, leaving NO poller.
+// The channel went deaf (inbound backed up) and the MCP reply tool vanished
+// until a manual `systemctl restart`.
+//
+// Fix: never stomp a HEALTHY incumbent. The eager kill is gone; acquisition is
+// deferred to the poll bootstrap, which waits out a fresh heartbeat and only
+// reclaims the slot once the beacon goes stale (incumbent actually dead). A
+// transient spawn parks harmlessly and is killed by its parent before it polls.
+// SEND_ONLY never polls and never touches the slot.
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch { return false }
 }
+function heartbeatFresh(): boolean {
+  try { return Date.now() - statSync(HEARTBEAT_FILE).mtimeMs < HEARTBEAT_STALE_MS } catch { return false }
+}
+// A live, actively-polling incumbent owns the slot iff its PID is alive AND its
+// heartbeat is fresh. A stale/absent beacon means we may take over.
+function incumbentHolds(): boolean {
+  try {
+    const pid = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    return pid > 1 && pid !== process.pid && pidAlive(pid) && heartbeatFresh()
+  } catch { return false }
+}
+// Set once this process becomes the active poller; cleared on shutdown.
+let heartbeatTimer: ReturnType<typeof setInterval> | undefined
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -1247,7 +1268,12 @@ function shutdown(): void {
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
   try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+    // Only the active poller owns these files — never clear an incumbent's.
+    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) {
+      rmSync(PID_FILE)
+      if (heartbeatTimer) clearInterval(heartbeatTimer)
+      try { rmSync(HEARTBEAT_FILE) } catch {}
+    }
   } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
@@ -4504,6 +4530,37 @@ if (SEND_ONLY) {
     `telegram channel: SEND_ONLY — getUpdates disabled (team-bot member; the listener is the sole poller)\n`,
   )
 } else void (async () => {
+  // DIVE-818 single-flight acquisition: wait until no HEALTHY incumbent holds
+  // the slot, then claim it. A transient enumeration spawn (`claude mcp list`)
+  // parks here harmlessly and is killed by its parent before it ever polls, so
+  // it can no longer evict the live poller.
+  async function acquireSlot(): Promise<void> {
+    for (;;) {
+      if (shuttingDown) return
+      if (!incumbentHolds()) {
+        // Slot free, or held by a DEAD pid. SIGTERM a stale-but-present holder
+        // (no-op if already gone), then take ownership of the PID file.
+        try {
+          const prev = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+          if (prev > 1 && prev !== process.pid && pidAlive(prev)) {
+            process.stderr.write(`telegram channel: reclaiming stale poller pid=${prev}\n`)
+            process.kill(prev, 'SIGTERM')
+          }
+        } catch {}
+        writeFileSync(PID_FILE, String(process.pid))
+        return
+      }
+      // Healthy incumbent is polling — do NOT stomp it. Re-check next beat.
+      await new Promise(r => setTimeout(r, HEARTBEAT_MS))
+    }
+  }
+  const bumpHeartbeat = () => { try { writeFileSync(HEARTBEAT_FILE, String(Date.now())) } catch {} }
+  const startHeartbeat = () => { bumpHeartbeat(); heartbeatTimer = setInterval(bumpHeartbeat, HEARTBEAT_MS) }
+
+  await acquireSlot()
+  if (shuttingDown) return
+  startHeartbeat()
+
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
@@ -4530,11 +4587,20 @@ if (SEND_ONLY) {
       if (err instanceof Error && err.message === 'Aborted delay') return
       const is409 = err instanceof GrammyError && err.error_code === 409
       if (is409 && attempt >= 8) {
+        // Another consumer is holding the token. Don't die into a zombie (the
+        // old behavior left the process alive but permanently deaf). Yield the
+        // slot and re-acquire — this waits out a healthy incumbent, or reclaims
+        // the slot once that consumer goes away.
         process.stderr.write(
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+          `yielding the slot and waiting to re-acquire.\n`,
         )
-        return
+        if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined }
+        await acquireSlot()
+        if (shuttingDown) return
+        startHeartbeat()
+        attempt = 0
+        continue
       }
       const delay = Math.min(1000 * attempt, 15000)
       const detail = is409
