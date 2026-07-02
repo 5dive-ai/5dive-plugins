@@ -280,6 +280,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 })
 
 await mcp.connect(new StdioServerTransport())
-startAgentInbox()
-void drainPending()
+// Claude Code registers channel-notification handling shortly AFTER the MCP
+// connection comes up ("Channel notifications registered", ~20-50ms later) —
+// a notification pushed inside that window is silently dropped (observed
+// live: a pending-drain at connect+0ms acked a message the session never
+// displayed). No ready signal is exposed, so give the harness a generous
+// head start before the first drains. Mid-session paths (fs.watch, sweeps)
+// are unaffected.
+setTimeout(() => {
+  startAgentInbox()
+  void drainPending()
+}, 5_000)
 setInterval(() => void drainPending(), 5 * 60_000).unref()
