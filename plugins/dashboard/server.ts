@@ -27,7 +27,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync } from 'fs'
+import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync, copyFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -54,6 +54,10 @@ try {
 } catch {}
 
 const API_BASE = (process.env.DASHBOARD_API_BASE ?? 'https://api.5dive.com').replace(/\/+$/, '')
+// Shared, claude-group-writable dir the box's file server can read back from
+// (install/update.sh create it 2775 claude:claude). Reply attachments are
+// copied here so the dashboard download always resolves.
+const OUTBOX_DIR = process.env.DASHBOARD_OUTBOX ?? '/home/claude/chat-downloads'
 
 // The box's connectord token authenticates outbound replies to the control
 // plane. Standard location is /etc/5dive/connectord.env (root:claude 640;
@@ -255,9 +259,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const text = typeof args.text === 'string' ? args.text : ''
   if (!text.trim()) throw new Error('text is required')
   const chatId = typeof args.chat_id === 'string' && args.chat_id ? args.chat_id : 'dashboard'
-  const files = Array.isArray(args.files)
+  // Attached files must be readable by the dashboard's file server, which
+  // runs as the `claude` user — a path inside this agent's 0700 home dir
+  // downloads as "failed" in the chat (lodar hit exactly that). Copy each
+  // file into the shared group-writable outbox and attach the copy; if the
+  // copy fails (outbox missing on an old box), fall back to the original
+  // path so behavior degrades to today's, not worse.
+  const rawFiles = Array.isArray(args.files)
     ? args.files.filter((f): f is string => typeof f === 'string' && f.startsWith('/')).slice(0, 10)
     : []
+  const files = rawFiles.map(f => {
+    try {
+      const dest = join(OUTBOX_DIR, `${AGENT}-${Date.now()}-${f.split('/').pop() ?? 'file'}`)
+      copyFileSync(f, dest)
+      chmodSync(dest, 0o664)
+      return dest
+    } catch (err) {
+      process.stderr.write(`dashboard channel: outbox copy failed for ${f}: ${err}\n`)
+      return f
+    }
+  })
 
   const res = await fetch(`${API_BASE}/server/messages/event`, {
     method: 'POST',
