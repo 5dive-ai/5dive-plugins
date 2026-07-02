@@ -12,7 +12,7 @@
     "timeoutKey": "MCP tool timeout",
     "pkgScope": "@5dive/telegram-agy-mcp"
   },
-  "version": "0.5.6",
+  "version": "0.5.7",
   "manifest": "root",
   "manifestKeyword": "gemini",
   "blocks": [

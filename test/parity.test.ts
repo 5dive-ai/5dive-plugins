@@ -160,6 +160,24 @@ describe('cross-fork consistency', () => {
   })
 })
 
+// ---- gate-tap failure fallback (DIVE-894 / DIVE-900) ----
+//
+// A failed tna gate tap must point at the on-box CLI (works on every box), never at
+// a dashboard the box may not have. The tna catch-block copy sits outside the
+// command/tool extractors above, so it drifted silently once (DIVE-900); this pins it
+// on the baseline and all forks.
+
+describe('gate-tap failure fallback (DIVE-894)', () => {
+  const ALL = [BASELINE, ...FORKS] as const
+
+  test.each(ALL)('%s: tna catch sends the on-box answer line, not a dashboard pointer', plugin => {
+    const src = read(plugin)
+    expect(src).toContain("Couldn't apply — fallback sent in chat.")
+    expect(src).toContain('sudo 5dive task answer ${taskId} --value=')
+    expect(src).not.toContain("Couldn't apply — open the dashboard.")
+  })
+})
+
 // ---- fork-vs-baseline relationship: the delta is exactly what we intend ----
 
 describe('fork vs Claude baseline delta', () => {

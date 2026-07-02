@@ -1629,7 +1629,16 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
     await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
   } catch {
-    await ctx.answerCallbackQuery({ text: "Couldn't apply — open the dashboard." }).catch(() => {})
+    // DIVE-894: don't point at a dashboard the box may not have — the on-box
+    // answer line works everywhere (run as a human login, claude/root).
+    await ctx.answerCallbackQuery({ text: "Couldn't apply — fallback sent in chat." }).catch(() => {})
+    await ctx
+      .reply(
+        `Couldn't apply that tap for DIVE-${taskId}. On the box (as claude/root):\n` +
+        `sudo 5dive task answer ${taskId} --value="<your choice>"` +
+        `  (approval: approved|denied · secret gate: omit --value)`,
+      )
+      .catch(() => {})
   }
 })
 
