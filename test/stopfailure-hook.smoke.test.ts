@@ -64,7 +64,7 @@ describe('DIVE-122 stopfailure-notify executes on a usage limit (TDZ regression)
     const r = fireHook(payload)
     expect(r.stderr).not.toMatch(/ReferenceError|SyntaxError|TypeError|before initialization/)
     expect(r.code).toBe(0)
-    expect(r.stderr).toContain('usage-limit dedup: SEND (first)')
+    expect(r.stderr).toContain('ratelimit dedup: SEND (first)')
   })
 
   test('a 5x StopFailure storm collapses to exactly one SEND', () => {
@@ -80,10 +80,58 @@ describe('DIVE-122 stopfailure-notify executes on a usage limit (TDZ regression)
     for (let i = 0; i < 5; i++) {
       const r = fireHook(payload)
       expect(r.code).toBe(0)
-      if (/usage-limit dedup: SEND/.test(r.stderr)) sends++
-      if (/usage-limit dedup: suppress/.test(r.stderr)) suppress++
+      if (/ratelimit dedup: SEND/.test(r.stderr)) sends++
+      if (/ratelimit dedup: suppress/.test(r.stderr)) suppress++
     }
     expect(sends).toBe(1)
     expect(suppress).toBe(4)
+  })
+
+  // DIVE-901: the transient-API-error path used to DM unconditionally on every
+  // respawn (only usage-limit was dedup-gated), which fired ~550 identical
+  // "Transient API throttle" DMs in one incident. It must now collapse the same
+  // way, under its own 'transient' kind key.
+  test('a transient-API-error storm collapses to exactly one SEND', () => {
+    const payload = {
+      // "temporarily limiting requests" + "not your usage limit" → isTransientRateLimit
+      // → transient path, NOT the usage-limit branch.
+      message: 'API Error: temporarily limiting requests. This is not your usage limit.',
+      reason: 'api_error',
+      stopReason: 'rate_limit',
+      transcript_path: writeTranscript(),
+    }
+    let sends = 0
+    let suppress = 0
+    for (let i = 0; i < 5; i++) {
+      const r = fireHook(payload)
+      expect(r.code).toBe(0)
+      expect(r.stderr).toContain('transient dedup:')
+      if (/transient dedup: SEND/.test(r.stderr)) sends++
+      if (/transient dedup: suppress/.test(r.stderr)) suppress++
+    }
+    expect(sends).toBe(1)
+    expect(suppress).toBe(4)
+  })
+
+  // A different failure KIND within the same window must still notify — the
+  // dedup partitions by kind, so a transient error doesn't silence a subsequent
+  // usage limit (or vice versa).
+  test('distinct kinds each get their own SEND', () => {
+    const transientPayload = {
+      message: 'API Error: temporarily limiting requests. This is not your usage limit.',
+      reason: 'api_error',
+      transcript_path: writeTranscript(),
+    }
+    const ratePayload = {
+      message: 'usage limit reached',
+      reason: 'usage_limit',
+      stopReason: 'rate_limit',
+      resetsAt: 1_999_999_999,
+      transcript_path: writeTranscript(),
+    }
+    const a = fireHook(transientPayload)
+    const b = fireHook(ratePayload)
+    expect(a.stderr).toMatch(/transient dedup: SEND/)
+    expect(b.stderr).toMatch(/ratelimit dedup: SEND/)
   })
 })

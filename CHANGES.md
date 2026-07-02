@@ -3,6 +3,30 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.5.11
+
+### Fixed — transient-API-error DM storm: dedup every StopFailure kind, not just usage limits (DIVE-901)
+A sustained transient API error (Overloaded / "temporarily limiting requests")
+under the systemd respawn loop fired ~550 identical "Transient API throttle …"
+DMs at one user in a ~4-minute window. Two independent respawn-storm vectors:
+
+1. **Opening DM sent unconditionally.** The DIVE-122 respawn-surviving notify
+   stamp gated ONLY the usage-limit path; the transient-error and generic-stop
+   paths re-DMed on every respawn. Now every DM path claims a helper-independent
+   stamp keyed by episode KIND (`ratelimit` | `transient` | `stop`), so any one
+   kind's storm collapses to one DM per cooldown window while a genuinely
+   different kind still notifies.
+2. **Non-exclusive stale-lock reclaim.** `tryAcquireResumeLock`'s stale-reclaim
+   used a plain `'w'` open, so a thundering herd of queued StopFailures all
+   passed the staleness check and all re-created the lock → all spawned a resume
+   helper (observed: 520 helpers, each firing an end-ping). Reclaim is now
+   unlink-then-`O_EXCL`, single-winner.
+
+Base plugin only — the grok/codex/agy forks use the `notify-stop.ts` path and
+carry no `stopfailure-notify.ts`/resume-helper code, so no fork port. Regression
+coverage added in `test/stopfailure-hook.smoke.test.ts` (transient storm → 1
+SEND; distinct kinds each SEND).
+
 ## v0.5.2
 
 ### Added — Escalate button on the `/task_<id>` detail view (DIVE-449)

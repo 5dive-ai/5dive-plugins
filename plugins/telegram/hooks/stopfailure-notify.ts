@@ -271,19 +271,28 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
   }
 }
 
-// DIVE-122: dedup the usage-limit DM across respawns. claude runs under a
-// systemd unit (KillMode=control-group + Restart=on-failure/RestartSec=3): on a
-// usage limit it exits, systemd tears down the cgroup — killing the detached
-// resume helper — and respawns claude, which re-hits the limit and re-fires this
-// hook. The resume.lock above only dedups while a helper is ALIVE heartbeating
-// it, so once it's killed every respawn re-DMs. This stamp is helper-independent
-// — the respawns themselves are the heartbeat — so it collapses the storm to ONE
-// DM per episode (keyed account+resetEpoch; stable 'noepoch' token + sliding
-// window when no reset time is readable). Only the usage-limit text is spammed by
-// the respawn loop, so we gate just that path; transient-error / generic-stop
-// DMs send unconditionally.
+// DIVE-122 / DIVE-901: dedup the StopFailure DM across respawns. claude runs
+// under a systemd unit (KillMode=control-group + Restart=on-failure/RestartSec=3):
+// on a stop it exits, systemd tears down the cgroup — killing the detached resume
+// helper — and respawns claude, which re-hits the SAME failure and re-fires this
+// hook. The resume.lock above only dedups while a helper is ALIVE heartbeating it,
+// so once it's killed every respawn re-DMs. This stamp is helper-independent — the
+// respawns themselves are the heartbeat — so it collapses the storm to ONE DM per
+// episode (sliding window; keyed account+resetEpoch for usage limits).
+//
+// DIVE-901: this originally gated ONLY the usage-limit path. A persistent
+// transient API error (or a hard crash) respawn-loops identically — the transient
+// path acquires a fresh resume.lock each respawn (the prior helper was cgroup-
+// killed, so the lock is stale/gone), re-DMs, and spawns another helper. That
+// fired ~550 identical "Transient API throttle" DMs in a 4-min window. So gate
+// EVERY DM path here, keyed by episode KIND ('ratelimit' | 'transient' | 'stop')
+// so a genuinely different failure kind still notifies, while any single kind's
+// respawn storm collapses to one DM per cooldown window. Kept message-independent
+// (like the usage-limit key already was): distinct errors of the same kind within
+// the window collapse — an acceptable tradeoff against a 550-message storm.
+const notifyKind = isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : 'stop'
 let shouldSend = true
-if (isRateLimit) {
+{
   let dir = resumeLogDir
   if (!dir) {
     dir = join(homedir(), '.cache', '5dive-telegram', 'resume')
@@ -294,11 +303,14 @@ if (isRateLimit) {
     }
   }
   const account = resolveActiveAccount() ?? (tmuxCtx ? deriveAgentName(tmuxCtx.target) : null) ?? 'unknown'
-  const stamp = notifyStampPath(dir, account, resetEpoch)
+  // resetEpoch only meaningfully partitions usage-limit episodes; other kinds
+  // ride the stable 'noepoch' sliding window. Fold the kind into the account
+  // token so the three kinds get independent stamps.
+  const stamp = notifyStampPath(dir, `${account}:${notifyKind}`, isRateLimit ? resetEpoch : null)
   const res = claimNotify(stamp, Date.now())
   shouldSend = res.send
   // One-line stderr trace (lands in the resume log) so we can see hits vs sends.
-  console.error(`[stopfailure-notify] usage-limit dedup: ${res.send ? 'SEND' : 'suppress'} (${res.reason}) account=${account} reset=${resetEpoch ?? 'null'}`)
+  console.error(`[stopfailure-notify] ${notifyKind} dedup: ${res.send ? 'SEND' : 'suppress'} (${res.reason}) account=${account} reset=${resetEpoch ?? 'null'}`)
   if (res.send) pruneStaleNotifyStamps(dir, Date.now())
 }
 
@@ -523,8 +535,20 @@ function tryAcquireResumeLock(lockPath: string): boolean {
     } catch {
       /* lock vanished mid-check — fall through and try to (re)create it */
     }
+    // DIVE-901: reclaim a STALE lock atomically. This path previously used a
+    // non-exclusive 'w' open, so when the lock went stale a thundering herd of
+    // queued StopFailures ALL passed the staleness check above and ALL re-created
+    // it → every one returned true → every one spawned a resume helper (observed:
+    // 520 helpers in ~4min, each firing an end-ping). Unlink-then-O_EXCL makes the
+    // reclaim single-winner: only the racer whose exclusive create succeeds owns
+    // the lock; the rest fail and stay silent.
     try {
-      const fd = openSync(lockPath, 'w')
+      unlinkSync(lockPath)
+    } catch {
+      /* already gone — another racer reclaimed it; our wx below will lose */
+    }
+    try {
+      const fd = openSync(lockPath, 'wx')
       writeSync(fd, `${process.pid} ${Date.now()}`)
       closeSync(fd)
       return true
