@@ -1,6 +1,6 @@
 # 5dive-plugins
 
-Claude Code plugin marketplace maintained by [5dive](https://5dive.com).
+Claude Code plugin marketplace maintained by [5dive](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-plugins-readme).
 
 The `telegram` plugin pairs an agent CLI with a Telegram bot — DM the bot, the
 agent answers. The original targets Claude Code; the **runtime forks** below
