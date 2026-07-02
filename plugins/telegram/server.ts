@@ -3497,7 +3497,16 @@ bot.on('callback_query:data', async ctx => {
       // Stale message, deleted task, restarted agent, or a CLI/sudo failure (incl.
       // a gate that got answered between our show and answer). Ack softly so
       // Telegram clears the tap spinner; never throw.
-      await ctx.answerCallbackQuery({ text: "Couldn't apply — open the dashboard." }).catch(() => {})
+      // DIVE-894: don't point at a dashboard the box may not have — the on-box
+      // answer line works everywhere (run as a human login, claude/root).
+      await ctx.answerCallbackQuery({ text: "Couldn't apply — fallback sent in chat." }).catch(() => {})
+      await ctx
+        .reply(
+          `Couldn't apply that tap for DIVE-${taskId}. On the box (as claude/root):\n` +
+          `sudo 5dive task answer ${taskId} --value="<your choice>"` +
+          `  (approval: approved|denied · secret gate: omit --value)`,
+        )
+        .catch(() => {})
     }
     return
   }
@@ -4385,7 +4394,12 @@ async function handleInbound(
     } catch {
       // Stale message, deleted task, restarted agent, or a CLI/sudo failure (incl.
       // a gate answered between our show and answer). Nudge softly; never throw.
-      await ctx.reply(`Couldn't answer DIVE-${taskId} from here — try the dashboard.`).catch(() => {})
+      await ctx
+        .reply(
+          `Couldn't answer DIVE-${taskId} from here. On the box (as claude/root): ` +
+          `sudo 5dive task answer ${taskId} --value="<answer>"`,
+        )
+        .catch(() => {})
     }
     return
   }
