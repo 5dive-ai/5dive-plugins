@@ -166,6 +166,63 @@ function startAgentInbox(): void {
   setInterval(drain, 15_000).unref()
 }
 
+// DIVE-848 offline heal: a message sent while this box was unreachable never
+// produced a drop file — it sits in the control plane with delivered_at NULL.
+// Pull those on boot (and on a slow sweep), push them into the session, then
+// ack so they stamp delivered. Ack only AFTER the notifications are sent; a
+// crash in between redelivers rather than losing the message. A row whose
+// drop landed but whose delivered-stamp write failed may arrive twice — rare
+// and preferable to silence.
+async function drainPending(): Promise<void> {
+  let items: Array<{ id: number; text: string; from?: string; chat_id?: string; ts?: string; image_path?: string }>
+  try {
+    const res = await fetch(`${API_BASE}/server/messages/pending?agent=${encodeURIComponent(AGENT)}`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    })
+    if (!res.ok) throw new Error(`${res.status}`)
+    items = ((await res.json()) as { pending?: typeof items }).pending ?? []
+  } catch (err) {
+    process.stderr.write(`dashboard channel: pending fetch failed: ${err}\n`)
+    return
+  }
+  if (items.length === 0) return
+  const acked: number[] = []
+  for (const m of items) {
+    if (typeof m?.text !== 'string' || !m.text.trim()) { acked.push(m.id); continue }
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content: m.text,
+          meta: {
+            chat_id: typeof m.chat_id === 'string' && m.chat_id ? m.chat_id : 'dashboard',
+            message_id: '0',
+            user: m.from ?? 'dashboard',
+            user_id: m.from ?? 'dashboard',
+            ts: m.ts ?? new Date().toISOString(),
+            ...(typeof m.image_path === 'string' && m.image_path.startsWith('/')
+              ? { image_path: m.image_path } : {}),
+          },
+        },
+      })
+      acked.push(m.id)
+    } catch (err) {
+      process.stderr.write(`dashboard channel: pending deliver failed for ${m.id}: ${err}\n`)
+    }
+  }
+  if (acked.length === 0) return
+  try {
+    await fetch(`${API_BASE}/server/messages/pending/ack`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ agent: AGENT, ids: acked }),
+    })
+    process.stderr.write(`dashboard channel: healed ${acked.length} undelivered message(s)\n`)
+  } catch (err) {
+    process.stderr.write(`dashboard channel: pending ack failed (will redeliver next boot): ${err}\n`)
+  }
+}
+
 // --- Outbound: reply tool -> control-plane messages API --------------------
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -224,3 +281,5 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 startAgentInbox()
+void drainPending()
+setInterval(() => void drainPending(), 5 * 60_000).unref()
