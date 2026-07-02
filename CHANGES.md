@@ -5,7 +5,9 @@ Tracks the diff between `plugins/telegram/` and upstream
 
 ## v0.5.11
 
-### Fixed — transient-API-error DM storm: dedup every StopFailure kind, not just usage limits (DIVE-901)
+### Fixed — transient-API-error DM storm: dedup every StopFailure kind, not just usage limits (DIVE-902)
+_(commit 0198c81's message mislabels this DIVE-901; the tracking task is DIVE-902.)_
+
 A sustained transient API error (Overloaded / "temporarily limiting requests")
 under the systemd respawn loop fired ~550 identical "Transient API throttle …"
 DMs at one user in a ~4-minute window. Two independent respawn-storm vectors:
