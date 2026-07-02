@@ -1,0 +1,11 @@
+{
+  "name": "dashboard",
+  "description": "5dive dashboard chat channel — talk to this agent from the web dashboard (and mobile app). Native-push inbound via the box agent-inbox drop-dir, outbound replies via the control-plane messages API.",
+  "version": "0.1.0",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "homepage": "https://5dive.ai",
+  "keywords": ["dashboard", "chat", "channel", "5dive"]
+}

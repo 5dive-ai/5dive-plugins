@@ -13,6 +13,13 @@
       "category": "productivity",
       "source": "./plugins/telegram",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram"
+    },
+    {
+      "name": "dashboard",
+      "description": "5dive dashboard chat channel — talk to your agent from the authenticated web dashboard (and mobile app). Native-push inbound via the box agent-inbox drop-dir, outbound via the control-plane messages API.",
+      "category": "productivity",
+      "source": "./plugins/dashboard",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/dashboard"
     }
   ]
 }
