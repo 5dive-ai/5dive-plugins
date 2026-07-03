@@ -803,29 +803,10 @@ function run5dive(args: string[], timeout = 8000): Promise<{ ok: boolean; data?:
   })
 }
 
-// DIVE-518: mint a human-proof token for an approval/secret gate answer. The CLI
-// (DIVE-519) requires a --proof token to clear an approval/secret gate, so an
-// agent running `sudo 5dive task answer` directly can no longer silently
-// self-clear one (the DIVE-516 hole). Called from the tna: tap handler AFTER
-// allowFrom has verified the tapper is an allowlisted HUMAN. Mints via the
-// root-only `5dive gate-proof` helper (reads the 0400 root key + HMACs
-// taskid:needtype:nonce:exp). NOT run5dive: gate-proof prints a RAW token, not a
-// JSON envelope. LIMITATION (by design — bar-raise, not airtight): a sudo-capable
-// agent could call the same helper; that's an explicit, AUDITED escalation, not a
-// one-liner. Best-effort during rollout: a mint failure (helper not deployed yet,
-// enforcement still off) returns null and the caller answers without --proof.
-function mintGateProof(taskId: string, needType: string | undefined): Promise<string | null> {
-  if (needType !== 'approval' && needType !== 'secret') return Promise.resolve(null)
-  return new Promise(resolve => {
-    require('child_process').execFile('sudo', ['-n', '5dive', 'gate-proof', taskId, needType], { timeout: 5000 },
-      (err: any, stdout: string) => {
-        if (err && !stdout) return resolve(null)
-        const tok = (stdout ?? '').trim()
-        resolve(tok || null)
-      },
-    )
-  })
-}
+// DIVE-950: the DIVE-518/519 `mintGateProof` helper is REMOVED. Its --proof token
+// (evidence-form b) was agent-forgeable — `5dive gate-proof` mint is require_root
+// only, so any sudo-capable agent could mint a valid token and self-clear a gate.
+// The verified-human tap now clears via the per-gate --human-proof nonce (form a).
 
 // --- /tasks: tappable list + single-task detail (host-shared queue) ---
 // Open tasks render as one button each (tap -> detail); rows assigned to THIS
@@ -1799,16 +1780,12 @@ bot.on('callback_query:data', async ctx => {
       // DIVE-518/916: a verified human tap (allowFrom gate above) — mark --human
       // and attach human-evidence for a hard human gate. DIVE-916 folds in `manual`
       // (now human-enforced) and forwards --human-proof (the per-gate nonce) as the
-      // tap-path evidence (SUDO_UID here is the agent). DIVE-519 --proof is still
-      // minted for approval/secret (back-compat). Any one form suffices; decision none.
+      // tap-path evidence (SUDO_UID here is the agent). DIVE-950 dropped the old
+      // --proof form (agent-forgeable). Any one accepted form suffices; decision none.
       const extraArgs: string[] = []
       if (task?.need_type === 'approval' || task?.need_type === 'secret' || task?.need_type === 'manual') {
         extraArgs.push('--human')
         if (humanProof) extraArgs.push(`--human-proof=${humanProof}`)
-        if (task.need_type === 'approval' || task.need_type === 'secret') {
-          const proof = await mintGateProof(taskId, task.need_type)
-          if (proof) extraArgs.push(`--proof=${proof}`)
-        }
       }
       await run5dive(['task', 'answer', taskId, ...r.answerArgs, ...extraArgs, '--json'], 8000)
       await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})

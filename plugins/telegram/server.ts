@@ -3395,35 +3395,11 @@ for (const def of COMMAND_REGISTRY) {
   })
 }
 
-// DIVE-518: mint a human-proof token for an approval/secret gate answer.
-// The CLI (DIVE-519) requires a --proof token to clear an approval or secret
-// gate, so an agent that runs `sudo 5dive task answer` directly can no longer
-// silently self-clear one (the DIVE-516 hole / DIVE-391 incident class). This is
-// only ever called from the callback handler below, AFTER allowFrom has verified
-// the tapper is an allowlisted HUMAN. We mint via the root-only `5dive gate-proof`
-// helper, which reads the 0400 root key and HMACs taskid:needtype:nonce:exp.
-//
-// LIMITATION (by design — this is bar-raising, NOT airtight): an on-box agent
-// with sudo is root-equivalent and could call this same helper, sudo-cat the key,
-// or write the task DB directly. The point is to turn a one-line self-answer into
-// an explicit, AUDITED sudo escalation (the CLI audit-logs every approval/secret
-// answer attempt). The airtight variant (re-home this bridge off the agent uid +
-// sudoers arg-deny) is a deferred opt-in (DIVE-516 Option B), same wire format.
-//
-// Best-effort during rollout: the CLI does not REQUIRE the proof until both sides
-// ship, and the helper may not be deployed yet — so a mint failure returns null
-// and the caller answers without --proof (current behavior). Once both land, a
-// missing/forged proof fails closed in the CLI.
-async function mintGateProof(taskId: string, needType: string | undefined): Promise<string | null> {
-  if (needType !== 'approval' && needType !== 'secret') return null
-  try {
-    const r = await execFileP(SUDO, ['-n', '5dive', 'gate-proof', taskId, needType], { timeout: 5000 })
-    const tok = (r.stdout ?? '').trim()
-    return tok || null
-  } catch {
-    return null
-  }
-}
+// DIVE-950: the DIVE-518/519 `mintGateProof` helper is REMOVED. Its --proof token
+// (evidence-form b) was agent-forgeable — `5dive gate-proof` mint is require_root
+// only, so any sudo-capable agent could mint a valid token and self-clear a gate,
+// no higher a bar than the sudo it already had. The verified-human tap now clears
+// via the per-gate --human-proof nonce (form a) carried in the callback_data.
 
 // Inline-button handler. Routes:
 //   perm:allow|deny|more:<id>  → permission flow (declared upstream)
@@ -3488,11 +3464,11 @@ bot.on('callback_query:data', async ctx => {
       // DIVE-518/916: this tap is a verified human (allowFrom gate above), so mark
       // it --human (provenance) and attach human-evidence the CLI accepts for a
       // hard human gate. DIVE-916 folds `manual` in (now human-enforced) and adds
-      // --human-proof (the per-gate nonce from callback_data) as the primary
-      // evidence for the tap path — whose SUDO_UID is the agent, so it can't rely
-      // on the non-agent-SUDO_UID form. The DIVE-519 --proof is still minted for
-      // approval/secret (unchanged, back-compat during rollout). Any ONE of the
-      // forms suffices; decision needs none.
+      // --human-proof (the per-gate nonce from callback_data) as the evidence
+      // for the tap path — whose SUDO_UID is the agent, so it can't rely on the
+      // non-agent-SUDO_UID form. DIVE-950 dropped the old DIVE-519 --proof form
+      // (it was agent-forgeable); the nonce is now the sole tap-path evidence.
+      // Any ONE accepted form suffices; decision needs none.
       const extraArgs: string[] = []
       if (task?.need_type === 'approval' || task?.need_type === 'secret' || task?.need_type === 'manual') {
         extraArgs.push('--human')
@@ -3500,10 +3476,6 @@ bot.on('callback_query:data', async ctx => {
         // gate minted by a nonce-aware CLI). This gates it to same-box new-CLI
         // answers, so an older CLI never sees an unknown flag.
         if (humanProof) extraArgs.push(`--human-proof=${humanProof}`)
-        if (task.need_type === 'approval' || task.need_type === 'secret') {
-          const proof = await mintGateProof(taskId, task.need_type)
-          if (proof) extraArgs.push(`--proof=${proof}`)
-        }
       }
       await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], { timeout: 8000 })
       await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
