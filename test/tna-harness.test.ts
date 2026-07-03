@@ -88,14 +88,20 @@ describe('tna.ts parity across base + forks', () => {
 describe('TNA_RE callback_data parsing', () => {
   for (const mod of mods) {
     test(`${mod.name}: parses tna:<id>:<token>, rejects foreign data`, () => {
-      expect(mod.TNA_RE.exec('tna:42:provided')?.slice(1, 3)).toEqual(['42', 'provided'])
-      expect(mod.TNA_RE.exec('tna:7:2')?.slice(1, 3)).toEqual(['7', '2'])
-      // Tokens with separators survive (decision values can contain colons/spaces).
-      expect(mod.TNA_RE.exec('tna:9:ship it: now')?.slice(1, 3)).toEqual(['9', 'ship it: now'])
+      // No-nonce taps (decision index / approval / secret / manual) — 3rd group undefined.
+      expect(mod.TNA_RE.exec('tna:42:provided')?.slice(1, 4)).toEqual(['42', 'provided', undefined])
+      expect(mod.TNA_RE.exec('tna:7:2')?.slice(1, 4)).toEqual(['7', '2', undefined])
+      // DIVE-916: a hard-gate tap carries the per-gate nonce as an optional 3rd
+      // field (32 lowercase hex); the token itself stays colon-free.
+      expect(mod.TNA_RE.exec('tna:9:approved:0123456789abcdef0123456789abcdef')?.slice(1, 4))
+        .toEqual(['9', 'approved', '0123456789abcdef0123456789abcdef'])
+      expect(mod.TNA_RE.exec('tna:3:provided:00112233445566778899aabbccddeeff')?.[3])
+        .toBe('00112233445566778899aabbccddeeff')
       expect(mod.TNA_RE.exec('yn:yes')).toBeNull()
       expect(mod.TNA_RE.exec('model:opus')).toBeNull()
-      expect(mod.TNA_RE.exec('tna:abc:x')).toBeNull() // non-numeric id
-      expect(mod.TNA_RE.exec('tna:1:')).toBeNull()    // empty token
+      expect(mod.TNA_RE.exec('tna:abc:x')).toBeNull()       // non-numeric id
+      expect(mod.TNA_RE.exec('tna:1:')).toBeNull()          // empty token
+      expect(mod.TNA_RE.exec('tna:9:approved:notavalidnonce')).toBeNull() // malformed nonce → fail closed
     })
   }
 })

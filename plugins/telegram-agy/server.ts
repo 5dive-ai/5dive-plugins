@@ -1567,6 +1567,8 @@ bot.on('callback_query:data', async ctx => {
   if (!tnaM) return
   const taskId = tnaM[1]!
   const token = tnaM[2]!
+  // DIVE-916: per-gate HUMAN nonce from callback_data → forwarded as --human-proof.
+  const humanProof = tnaM[3]
   try {
     const show = await run5dive(['task', 'show', taskId, '--json'], 5000)
     const task = show.ok ? show.data?.task : undefined
@@ -1588,14 +1590,19 @@ bot.on('callback_query:data', async ctx => {
       await ctx.editMessageReplyMarkup().catch(() => {})
       return
     }
-    // DIVE-518: a verified human tap (allowFrom gate above) — mark --human
-    // (provenance) and, for an approval/secret gate, attach the CLI-required
-    // --proof (see mintGateProof). decision/manual need neither.
+    // DIVE-518/916: a verified human tap (allowFrom gate above) — mark --human
+    // and attach human-evidence for a hard human gate. DIVE-916 folds in `manual`
+    // (now human-enforced) and forwards --human-proof (the per-gate nonce) as the
+    // tap-path evidence (SUDO_UID here is the agent). DIVE-519 --proof is still
+    // minted for approval/secret (back-compat). Any one form suffices; decision none.
     const extraArgs: string[] = []
-    if (task?.need_type === 'approval' || task?.need_type === 'secret') {
+    if (task?.need_type === 'approval' || task?.need_type === 'secret' || task?.need_type === 'manual') {
       extraArgs.push('--human')
-      const proof = await mintGateProof(taskId, task.need_type)
-      if (proof) extraArgs.push(`--proof=${proof}`)
+      if (humanProof) extraArgs.push(`--human-proof=${humanProof}`)
+      if (task.need_type === 'approval' || task.need_type === 'secret') {
+        const proof = await mintGateProof(taskId, task.need_type)
+        if (proof) extraArgs.push(`--proof=${proof}`)
+      }
     }
     await run5dive(['task', 'answer', taskId, ...r.answerArgs, ...extraArgs, '--json'], 8000)
     await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})

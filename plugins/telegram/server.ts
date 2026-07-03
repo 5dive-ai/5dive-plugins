@@ -3455,6 +3455,10 @@ bot.on('callback_query:data', async ctx => {
   if (tnaM) {
     const taskId = tnaM[1]!
     const token = tnaM[2]!
+    // DIVE-916: per-gate HUMAN nonce carried in the callback_data (approval/
+    // secret/manual taps). Forwarded as --human-proof so the CLI can clear the
+    // gate for a real tap whose SUDO_UID is the spawning agent.
+    const humanProof = tnaM[3]
     try {
       const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
       const task = JSON.parse(show.stdout).data?.task
@@ -3481,14 +3485,25 @@ bot.on('callback_query:data', async ctx => {
       }
       // `task answer` clears the gate, records the value, and pings the owning
       // agent to resume (DIVE-103). It also drops out of the inbox.
-      // DIVE-518: this tap is a verified human (allowFrom gate above), so mark it
-      // --human (provenance) and, for an approval/secret gate, attach a --proof the
-      // CLI requires — see mintGateProof. decision/manual need neither.
+      // DIVE-518/916: this tap is a verified human (allowFrom gate above), so mark
+      // it --human (provenance) and attach human-evidence the CLI accepts for a
+      // hard human gate. DIVE-916 folds `manual` in (now human-enforced) and adds
+      // --human-proof (the per-gate nonce from callback_data) as the primary
+      // evidence for the tap path — whose SUDO_UID is the agent, so it can't rely
+      // on the non-agent-SUDO_UID form. The DIVE-519 --proof is still minted for
+      // approval/secret (unchanged, back-compat during rollout). Any ONE of the
+      // forms suffices; decision needs none.
       const extraArgs: string[] = []
-      if (task?.need_type === 'approval' || task?.need_type === 'secret') {
+      if (task?.need_type === 'approval' || task?.need_type === 'secret' || task?.need_type === 'manual') {
         extraArgs.push('--human')
-        const proof = await mintGateProof(taskId, task.need_type)
-        if (proof) extraArgs.push(`--proof=${proof}`)
+        // Only send --human-proof when the callback actually carried a nonce (a
+        // gate minted by a nonce-aware CLI). This gates it to same-box new-CLI
+        // answers, so an older CLI never sees an unknown flag.
+        if (humanProof) extraArgs.push(`--human-proof=${humanProof}`)
+        if (task.need_type === 'approval' || task.need_type === 'secret') {
+          const proof = await mintGateProof(taskId, task.need_type)
+          if (proof) extraArgs.push(`--proof=${proof}`)
+        }
       }
       await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], { timeout: 8000 })
       await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})

@@ -9,10 +9,15 @@
 // parity test asserts it. The only per-runtime difference lives in server.ts (how
 // the gate is fetched: execFileP+JSON.parse on base, run5dive on the forks).
 
-// A tapped inline button lands as `tna:<numericTaskId>:<token>`. Numeric id + a
-// short token keeps callback_data under Telegram's 64-byte cap; the value is
-// always re-resolved from the live gate below, never trusted from the payload.
-export const TNA_RE = /^tna:(\d+):(.+)$/
+// A tapped inline button lands as `tna:<numericTaskId>:<token>` and, on a hard
+// human gate (approval/secret/manual), an optional `:<nonce>` — the DIVE-916
+// per-gate HUMAN proof the CLI composed as root into this callback_data (the
+// agent LLM never sees it). server.ts forwards it as `--human-proof` so
+// `task answer` can tell a real tap (SUDO_UID=agent, but carries the nonce) from
+// an agent forging one. Numeric id + short token + 32-hex nonce stays under
+// Telegram's 64-byte cap; the answer VALUE is still re-resolved from the live
+// gate below, never trusted from the payload.
+export const TNA_RE = /^tna:(\d+):([^:]+)(?::([0-9a-f]{32}))?$/
 
 // The fields resolveTnaAnswer reads off a live `5dive task show` gate. Loosely
 // typed on purpose — it's whatever the CLI emits, narrowed to what we use.
