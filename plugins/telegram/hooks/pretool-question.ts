@@ -60,6 +60,19 @@ if (tool !== 'AskUserQuestion' && tool !== 'ExitPlanMode') {
   stampAndExit()
 }
 
+// DIVE-1027 hotfix (CC v2.1.201): plan mode was reworked — ExitPlanMode approval
+// is now a NATIVE dialog. The inline-keyboard bridge path for ExitPlanMode could
+// fail to post/emit a clean decision, letting Claude Code fall through to that
+// local dialog and HANG a Telegram-paired session on a keypress the user can
+// never make (verified live on creative, plugin 0.5.12). The proven pre-bridge
+// behaviour — a plain PreToolUse deny that tells the agent to inline the plan as
+// a numbered Telegram message — never touches the network/file handshake and
+// never reaches the native dialog. Force ExitPlanMode down that clean path here,
+// BEFORE any throw-prone bridge work (token/transcript/post), so it can never
+// crash-into-fail-open either. AskUserQuestion — verified good end-to-end — keeps
+// the full inline-keyboard bridge below. Full ExitPlanMode bridge = follow-up.
+if (tool === 'ExitPlanMode') legacyDeny(tool)
+
 // Translate the tool_input into a bridge spec; unsupported shapes fall back.
 const spec = buildBridge(tool!, payload.tool_input ?? {})
 if (!spec) legacyDeny(tool!)
