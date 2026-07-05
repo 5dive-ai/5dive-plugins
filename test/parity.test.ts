@@ -89,7 +89,10 @@ const GOLDEN_FORK_COMMANDS = [
   'help', 'status', 'stop', 'restart', 'agents', 'team', 'tasks', 'task', 'org', 'model', 'ping', 'start',
 ]
 const GOLDEN_FORK_MCP_TOOLS = ['wait_for_message', 'reply', 'edit_message', 'react', 'download_attachment']
-const GOLDEN_BASELINE_MCP_TOOLS = ['reply', 'react', 'download_attachment', 'edit_message']
+// DIVE-1028: recent_messages (rolling message-log recovery) is a baseline-only
+// addition — the wait_for_message forks have a different inbound path and are a
+// tracked follow-up port.
+const GOLDEN_BASELINE_MCP_TOOLS = ['reply', 'react', 'download_attachment', 'edit_message', 'recent_messages']
 const GOLDEN_ACCESS_FIELDS = ['allowFrom', 'groups', 'pending', 'dmPolicy']
 // Baseline menu (non-hidden registry commands, in order) — drift here signals the forks
 // may need a new command or a description sync.
@@ -187,9 +190,12 @@ describe('fork vs Claude baseline delta', () => {
     expect(baselineMenuCommands()).toEqual(GOLDEN_BASELINE_MENU)
   })
 
-  test('baseline MCP tools = fork tools minus wait_for_message', () => {
+  test('baseline MCP tools = fork tools minus wait_for_message, plus baseline-only recent_messages (DIVE-1028)', () => {
     expect(sorted(mcpTools(baseSrc))).toEqual(sorted(GOLDEN_BASELINE_MCP_TOOLS))
-    expect(sorted(GOLDEN_FORK_MCP_TOOLS.filter(t => t !== 'wait_for_message')))
+    // Forks add wait_for_message; baseline adds recent_messages (DIVE-1028, the
+    // rolling message-log recovery tool). Both deltas are intentional and pinned
+    // here so any OTHER drift still fails the guard.
+    expect(sorted([...GOLDEN_FORK_MCP_TOOLS.filter(t => t !== 'wait_for_message'), 'recent_messages']))
       .toEqual(sorted(GOLDEN_BASELINE_MCP_TOOLS))
   })
 
