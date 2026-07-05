@@ -27,6 +27,7 @@ import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions } from './tna'
+import { resolveQuestionTap } from './hooks/lib/question-bridge'
 
 // Plugin version is sourced from .claude-plugin/plugin.json — the same
 // manifest the Claude Code plugin system reads, so /status can never
@@ -62,6 +63,14 @@ const CHECKPOINT_FILE = join(STATE_DIR, 'checkpoint.json')
 // TELEGRAM_STATE_DIR override (tests only) won't reach the real launcher —
 // intentional: resume is a production-runtime feature, not a test path.
 const RESUME_MARKER_FILE = join(STATE_DIR, 'resume-next')
+// DIVE-1027: filesystem handshake for bridging the native picker tools
+// (AskUserQuestion / ExitPlanMode) to a Telegram inline keyboard. The
+// pretool-question PreToolUse hook drops `<reqid>.req.json` here and posts the
+// keyboard; a `q:<reqid>:<idx>` tap lands in the callback_query router below,
+// which resolves the idx against the persisted labels and writes
+// `<reqid>.ans.json` — the hook polls for that and returns it as the tool
+// result. Mirrors hooks/lib/paths.ts QUESTION_DIR.
+const QUESTION_DIR = join(STATE_DIR, 'questions')
 
 // Load ~/.claude/channels/telegram/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
@@ -3427,6 +3436,61 @@ bot.on('callback_query:data', async ctx => {
   // tap doesn't double-answer. Fully fail-soft — a stale/deleted task, a
   // restarted agent, or any CLI error just acks the callback with a nudge and
   // never throws out of the handler.
+  // DIVE-1027: tap on a bridged native-picker keyboard (AskUserQuestion /
+  // ExitPlanMode). `q:<reqid>:<idx>` — resolve idx against the labels the
+  // pretool-question hook persisted in `<reqid>.req.json`, then write
+  // `<reqid>.ans.json` for the (still-blocking) hook to pick up. Fully
+  // fail-soft: a missing/expired request just acks softly and drops the
+  // keyboard so it can't be re-tapped.
+  const qM = /^q:([0-9-]+):(\d+)$/.exec(data)
+  if (qM) {
+    const reqid = qM[1]!
+    const reqFile = join(QUESTION_DIR, `${reqid}.req.json`)
+    const ansFile = join(QUESTION_DIR, `${reqid}.ans.json`)
+    // Thin I/O adapter over the pure resolveQuestionTap (headless-tested).
+    let reqRaw: string | null = null
+    try {
+      reqRaw = readFileSync(reqFile, 'utf8')
+    } catch {
+      reqRaw = null
+    }
+    let ansExists = false
+    try {
+      readFileSync(ansFile, 'utf8')
+      ansExists = true
+    } catch {
+      ansExists = false
+    }
+    const r = resolveQuestionTap(data, reqRaw, ansExists)
+    if (r.kind === 'answer') {
+      try {
+        const tmp = `${ansFile}.tmp.${process.pid}`
+        writeFileSync(tmp, JSON.stringify({ idx: r.idx, answer: r.answer, at: Date.now() }), { mode: 0o600 })
+        renameSync(tmp, ansFile)
+        const short = r.answer.length > 48 ? r.answer.slice(0, 47) + '…' : r.answer
+        await ctx.answerCallbackQuery({ text: `Sent: ${short}` }).catch(() => {})
+        await ctx.editMessageText(`✅ ${short}`).catch(() => {})
+      } catch {
+        await ctx.answerCallbackQuery({ text: "Couldn't record — reply in chat." }).catch(() => {})
+      }
+      return
+    }
+    if (r.kind === 'already') {
+      await ctx.answerCallbackQuery({ text: 'Already answered.' }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+      return
+    }
+    if (r.kind === 'invalid') {
+      await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+      return
+    }
+    // expired: request file gone — hook timed out and cleaned up, or a restart.
+    await ctx.answerCallbackQuery({ text: 'This prompt has expired.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    return
+  }
+
   const tnaM = TNA_RE.exec(data)
   if (tnaM) {
     const taskId = tnaM[1]!

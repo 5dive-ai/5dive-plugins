@@ -8,6 +8,7 @@
 
 export type HookPayload = {
   tool_name?: string
+  tool_input?: Record<string, unknown>
   transcript_path?: string
   stop_hook_active?: boolean
   message?: string

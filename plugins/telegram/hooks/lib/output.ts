@@ -20,6 +20,20 @@ export function emitDenyTool(toolName: string, reason: string): void {
   void toolName
 }
 
+// DIVE-1027: allow the native tool to run (e.g. approve ExitPlanMode). Unlike
+// deny, this lets the tool execute — used when a Telegram tap approves.
+export function emitAllowTool(reason: string): void {
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'allow',
+        permissionDecisionReason: reason,
+      },
+    }),
+  )
+}
+
 export function emitPostToolContext(reason: string): void {
   process.stdout.write(
     JSON.stringify({

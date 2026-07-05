@@ -19,6 +19,16 @@ export const NUDGE_FILE = join(STATE_DIR, 'context-nudge.json')
 // startTypingLoop and DIVE-146.
 export const TYPING_STOP_FILE = join(STATE_DIR, 'typing-stop')
 
+// DIVE-1027: filesystem handshake dir for bridging the native picker tools
+// (AskUserQuestion / ExitPlanMode) to a Telegram inline keyboard. The
+// PreToolUse hook drops `<reqid>.req.json` (the option labels) here and posts
+// the keyboard; the MCP server's callback_query router resolves a tap into
+// `<reqid>.ans.json`; the hook polls for that answer file. Only the server
+// consumes getUpdates (DIVE-818 lock), so the tap can only be seen there —
+// hence the two-process file relay rather than the hook awaiting the tap
+// itself.
+export const QUESTION_DIR = join(STATE_DIR, 'questions')
+
 // Prefix of the MCP tools the plugin exposes. Used by stop-reply-check
 // (and the silence watchdog indirectly) to recognize "agent talked to
 // the proper channel" vs "agent talked to the transcript" turns.
