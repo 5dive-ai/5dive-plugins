@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun ${CLAUDE_PLUGIN_ROOT}/hooks/request-permission.ts",
+            "timeout": 180,
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}

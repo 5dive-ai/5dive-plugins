@@ -1,0 +1,20 @@
+{
+  "name": "5dive-plugins",
+  "interface": {
+    "displayName": "5dive"
+  },
+  "plugins": [
+    {
+      "name": "telegram-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/telegram-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

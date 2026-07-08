@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "bun",
+      "args": ["x", "@5dive/telegram-codex-mcp@0.5.7"]
+    }
+  }
+}

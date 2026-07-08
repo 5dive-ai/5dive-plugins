@@ -1,0 +1,46 @@
+{
+  "name": "telegram-codex",
+  "version": "0.5.7",
+  "description": "Telegram bridge for OpenAI Codex CLI: DM or group-chat your Codex session, get turn-complete pings, and approve risky commands from your phone.",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com",
+    "url": "https://5dive.com"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram-codex",
+  "repository": "https://github.com/5dive-ai/5dive-plugins",
+  "license": "Apache-2.0",
+  "keywords": [
+    "telegram",
+    "codex",
+    "chat",
+    "notifications",
+    "approvals",
+    "remote-control",
+    "mobile"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Telegram for Codex",
+    "shortDescription": "Steer Codex from Telegram: chat, turn pings, and command approvals.",
+    "longDescription": "Bridge OpenAI Codex to a Telegram bot. Codex can wait for your messages, reply, edit prior messages, react, and pull attachments, so you can drive a session from your phone. Optional hooks ping you when a turn completes and route risky-command approvals to inline allow/deny buttons. Access is allowlisted per user and per group. Requires a Telegram bot token and the Bun runtime.",
+    "developerName": "5dive",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://5dive.com",
+    "privacyPolicyURL": "https://5dive.com/privacy-policy",
+    "termsOfServiceURL": "https://5dive.com/terms-of-service",
+    "defaultPrompt": [
+      "Wait for a Telegram message, then act on it.",
+      "Ping me on Telegram when this turn is done.",
+      "Ask me on Telegram before running anything risky."
+    ],
+    "brandColor": "#229ED9"
+  }
+}
