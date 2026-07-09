@@ -64,6 +64,13 @@ try {
 } catch {}
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
+// DIVE-1087 team-bot: a member of the shared team bot runs SEND-ONLY against the
+// shared token — it MUST NOT poll getUpdates (Telegram allows one consumer per
+// token; a 2nd poller = 409 = the listener goes deaf and inline approval taps are
+// silently lost fleet-wide). The single team-bot listener is the sole poller; the
+// MCP send tools stay live. Opt-in via TELEGRAM_SEND_ONLY=1 in the bridge .env;
+// unset = unchanged per-agent polling.
+const SEND_ONLY = process.env.TELEGRAM_SEND_ONLY === '1'
 if (!TOKEN) {
   process.stderr.write(
     `telegram-opencode: TELEGRAM_BOT_TOKEN required\n` +
@@ -1586,7 +1593,11 @@ loadSessions()
 await ensureServer()
 void startEventRelay()
 
-void (async () => {
+if (SEND_ONLY) {
+  process.stderr.write(
+    `telegram-opencode: SEND_ONLY — getUpdates disabled (team-bot member; the shared listener is the sole poller)\n`,
+  )
+} else void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({

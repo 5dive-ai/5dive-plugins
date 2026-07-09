@@ -70,6 +70,13 @@ try {
 } catch {}
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
+// DIVE-1087 team-bot: a member of the shared team bot runs SEND-ONLY against the
+// shared token — it MUST NOT poll getUpdates (Telegram allows one consumer per
+// token; a 2nd poller = 409 = the listener goes deaf and inline approval taps are
+// silently lost fleet-wide). The single team-bot listener is the sole poller; the
+// MCP send tools stay live. Opt-in via TELEGRAM_SEND_ONLY=1 in the bridge .env;
+// unset = unchanged per-agent polling.
+const SEND_ONLY = process.env.TELEGRAM_SEND_ONLY === '1'
 if (!TOKEN) {
   process.stderr.write(
     `telegram-agy: TELEGRAM_BOT_TOKEN required\n` +
@@ -2207,7 +2214,14 @@ await mcp.connect(new StdioServerTransport())
 startRearmWatchdog()
 startAgentInbox()
 
-void (async () => {
+if (SEND_ONLY) {
+  // DIVE-1087: in SEND_ONLY mode the poll loop is STRUCTURALLY ABSENT — acquireSlot
+  // + bot.start() are never invoked, so this bridge can never become a 2nd
+  // getUpdates consumer on the shared team token. The listener is the sole poller.
+  process.stderr.write(
+    `telegram-agy: SEND_ONLY — getUpdates disabled (team-bot member; the shared listener is the sole poller)\n`,
+  )
+} else void (async () => {
   // DIVE-818 single-flight acquisition: wait until no HEALTHY incumbent holds
   // the slot, then claim it. A transient enumeration spawn (`claude mcp list`)
   // parks here harmlessly and is killed by its parent before it ever polls.
