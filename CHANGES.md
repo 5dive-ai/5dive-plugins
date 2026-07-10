@@ -3,6 +3,17 @@
 Tracks the diff between `plugins/telegram/` and upstream
 `anthropics/claude-plugins-official/external_plugins/telegram/`.
 
+## v0.5.15
+
+### Changed — /tasks pins the calling agent's own tasks on top
+
+`/tasks` now renders three sections top-to-bottom: **⭐ Your tasks** (the calling
+agent's own unblocked, non-gated rows), then **🔔 Needs you** (human-gated), then
+the open list. Previously an agent's own queued/active tasks were scattered
+mid-list and easy to lose (e.g. main's two queued tasks). `buildTaskList`
+partitions into three disjoint buckets keyed off `taskAssignedToMe` +
+`status !== 'blocked'`; blocked-mine rows stay in the open list.
+
 ## v0.5.11
 
 ### Fixed — transient-API-error DM storm: dedup every StopFailure kind, not just usage limits (DIVE-902)

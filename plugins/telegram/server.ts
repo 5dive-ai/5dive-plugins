@@ -3338,13 +3338,27 @@ async function buildTaskList(): Promise<string> {
   const tasks = j.data.tasks
   if (tasks.length === 0) return 'No open tasks.\n\nAdd one with /task add <title>.'
   const MAX = 40
-  // Partition: human-gated tasks (a pending need awaiting a person) float to
-  // their own "Needs you" section on top; everything else is the open list.
-  // `task ls` carries need_type only while the gate is unanswered, so its
-  // presence is a clean "needs a human" flag.
+  // Partition into three disjoint buckets, rendered top-to-bottom:
+  //   1. "Your tasks" — the CALLING agent's own actionable (unblocked, non-gated)
+  //      rows, pinned first so an agent sees its own queue instead of hunting for
+  //      it in the full list (Mark: main's queued tasks were lost mid-list).
+  //   2. "Needs you" — human-gated tasks (a pending need awaiting a person).
+  //      `task ls` carries need_type only while the gate is unanswered, so its
+  //      presence is a clean "needs a human" flag.
+  //   3. "Open tasks" — everything else (incl. this agent's blocked rows).
   const needsYou = tasks.filter((t: any) => t.need_type)
-  const rest = tasks.filter((t: any) => !t.need_type)
+  const mine = tasks.filter(
+    (t: any) => !t.need_type && taskAssignedToMe(t.assignee) && t.status !== 'blocked',
+  )
+  const mineIds = new Set(mine.map((t: any) => t.id))
+  const rest = tasks.filter((t: any) => !t.need_type && !mineIds.has(t.id))
   const sections: string[] = []
+  if (mine.length) {
+    const lines = mine.map((t: any) => taskRow(t))
+    // Small by design — the whole point is to surface them, so keep them all
+    // (clamp protects the send) rather than capping at MAX.
+    sections.push(clampList(`⭐ Your tasks (${mine.length}) · tap /task_N to open:\n\n`, lines))
+  }
   if (needsYou.length) {
     const lines = needsYou.map((t: any) => taskRow(t, true))
     // Needs-you rows are the whole point of pinning them — keep them all
