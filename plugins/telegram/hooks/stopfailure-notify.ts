@@ -22,7 +22,7 @@ import { getAllowedChatIds, getGroupTopics, getCallerChat, type CallerChat } fro
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
 import { parseResetEpoch } from './lib/time'
-import { claimNotify, notifyStampPath, pruneStaleNotifyStamps } from './lib/notify-dedup'
+import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
 
 const payload = await readPayload<HookPayload>()
@@ -330,7 +330,20 @@ if (shouldSend) {
 // when General/DM) so the detached helper threads its resume ping back into
 // the same forum topic. chat ids never contain ':' so a plain split is safe
 // even for negative supergroup ids.
-if (needsRecovery && tmuxCtx && lockPath) {
+// DIVE-1107: gate the SPAWN on the same per-episode dedup as the DM (shouldSend
+// / claimNotify, 30min sliding window). The resume.lock only serializes
+// CONCURRENT helpers; it does NOT stop a rapid SEQUENTIAL re-trigger. A helper
+// that exits early — e.g. a BYO/OpenRouter provider whose limit isn't tagged
+// error==='rate_limit', so resumedSince() false-positives and Phase 4 fires a
+// "resumed" banner — releases the lock, claude immediately re-stops (still
+// limited), and the re-fired hook re-acquired the FREED lock and spawned another
+// helper → another banner. One claude process (no systemd respawn) looped this
+// ~100+ times, spamming the banner (agent-marketing, 2026-07-10). Gating on
+// shouldSend collapses it to one recovery chain + one banner per episode,
+// immune to the release/re-trigger loop (and to concurrency — the O_EXCL stamp
+// is the arbiter). Tradeoff: a second genuine limit within the window is not
+// auto-resumed and stays parked until the window clears — acceptable vs a storm.
+if (needsRecovery && tmuxCtx && lockPath && shouldSend) {
   const chatsCsv = targets.map(t => (t.threadId ? `${t.chatId}:${t.threadId}` : t.chatId)).join(',')
   const resumeHelper = isRateLimit
     ? join(import.meta.dir, 'resume-after-reset.ts')
@@ -339,6 +352,9 @@ if (needsRecovery && tmuxCtx && lockPath) {
     ? [resumeHelper, String(resetEpoch ?? 0), tmuxCtx.socket, tmuxCtx.target, chatsCsv, lockPath, transcriptPath ?? '']
     : [resumeHelper, tmuxCtx.socket, tmuxCtx.target, chatsCsv, lockPath, transcriptPath ?? '']
   if (existsSync(resumeHelper)) {
+    // DIVE-1107: the log dir was never pruned (725 accrued). Sweep old logs on
+    // spawn so an idle agent stops accruing without a dedicated cron.
+    pruneOldResumeLogs(resumeLogDir, Date.now())
     const logFile = join(resumeLogDir, `resume-${Math.floor(Date.now() / 1000)}-${process.pid}.log`)
     const out = openSync(logFile, 'a')
     const child = spawn('bun', helperArgs, {
@@ -355,6 +371,16 @@ if (needsRecovery && tmuxCtx && lockPath) {
     } catch {
       /* noop */
     }
+  }
+} else if (needsRecovery && lockPath && !shouldSend) {
+  // Suppressed duplicate episode (DIVE-1107): we acquired the resume.lock above
+  // but won't spawn a helper to heartbeat it. Release it now — a stale-mtime
+  // lock left behind would block the NEXT genuine episode for up to
+  // RESUME_LOCK_TTL_MS (10min).
+  try {
+    unlinkSync(lockPath)
+  } catch {
+    /* already gone */
   }
 }
 

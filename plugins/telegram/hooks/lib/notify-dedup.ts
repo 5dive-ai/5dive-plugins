@@ -135,3 +135,39 @@ export function pruneStaleNotifyStamps(dir: string, nowMs: number, retentionMs: 
   }
   return pruned
 }
+
+// The detached recovery helpers write a per-spawn `resume-<ts>-<pid>.log` in the
+// same dir and NOTHING ever removed them, so the dir grew unbounded (DIVE-1107:
+// 725 logs accrued over ~6 weeks; a banner storm inflates it fast). Prune logs
+// older than retentionMs by mtime. Kept generous (default 3 days) so a recent
+// storm's logs survive for post-mortem. Call on SPAWN so a genuinely idle agent
+// stops accruing without a dedicated cron. Returns the count pruned.
+export const RESUME_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
+const RESUME_LOG_PREFIX = 'resume-'
+const RESUME_LOG_SUFFIX = '.log'
+export function pruneOldResumeLogs(
+  dir: string,
+  nowMs: number,
+  retentionMs: number = RESUME_LOG_RETENTION_MS,
+): number {
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return 0
+  }
+  let pruned = 0
+  for (const name of names) {
+    if (!name.startsWith(RESUME_LOG_PREFIX) || !name.endsWith(RESUME_LOG_SUFFIX)) continue
+    const p = join(dir, name)
+    try {
+      if (nowMs - statSync(p).mtimeMs > retentionMs) {
+        unlinkSync(p)
+        pruned++
+      }
+    } catch {
+      /* racing unlink — skip */
+    }
+  }
+  return pruned
+}

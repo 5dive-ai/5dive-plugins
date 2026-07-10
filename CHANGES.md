@@ -1,3 +1,32 @@
+## v0.5.16
+
+### Fixed — resume-helper spawn storm: gate the spawn (not just the DM) per episode (DIVE-1107)
+
+agent-marketing spammed ~100 "Usage limit reset — agent resumed." banners into
+its topic in ~20 min. One claude process, NO systemd respawn: a BYO/OpenRouter
+profile whose limit isn't tagged `error==='rate_limit'` made the resume helper's
+`resumedSince()` false-positive, so it declared a resume, fired the Phase-4
+banner, released the resume.lock, and exited. claude was still limited, re-stopped
+immediately, and the re-fired StopFailure hook re-acquired the FREED lock and
+spawned another helper -> another banner. The resume.lock only serializes
+CONCURRENT helpers; it never stopped this rapid SEQUENTIAL re-trigger. The
+per-episode `claimNotify` dedup already capped the DM to one, but the helper
+SPAWN was ungated.
+
+- Gate the helper spawn on the same `shouldSend` per-episode stamp as the DM
+  (30-min sliding window, exit- and concurrency-independent). One episode now
+  yields one recovery chain + one banner. When suppressed, the lock we acquired
+  is released so it can't block the next genuine episode. Anthropic-limit agents
+  are unaffected — they get a real reset epoch and wait parked on the menu, so
+  the spawn gate is never exercised; only no-epoch BYO false-resume loops were
+  storming. Tradeoff: a second genuine limit within the window is not
+  auto-resumed and stays parked until the window clears.
+- Prune `resume-*.log` on spawn (`pruneOldResumeLogs`, 3-day retention). The dir
+  was never pruned and had grown unbounded fleet-wide (community 10k+, main 7k+).
+- Base plugin only; forks share this hook path via generator parity. Regression
+  coverage in `hooks/lib/notify-dedup.test.ts` (rapid re-trigger -> 1 send;
+  new-episode-after-window -> re-send; log prune keeps recent).
+
 # Changes from upstream
 
 Tracks the diff between `plugins/telegram/` and upstream
