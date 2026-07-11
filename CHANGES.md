@@ -1,3 +1,28 @@
+## v0.5.17
+
+### Fixed — telegram taps record human provenance on every gate type, not just hard gates (DIVE-1115)
+
+A Telegram button tap on a `decision` (and `manual`) gate recorded a bare AGENT
+name in `need_answered_by` instead of `human:<actor>`. The tap handler only
+appended `--human` when the gate was `approval`/`secret`/`manual`, so decision
+taps fell through with no provenance mark. Two consequences: (1) the digest's
+zero-human KPI counts only `human:*` provenance, so real human taps (e.g. lodar
+answering a tier-2 gate) were INVISIBLE — undercounting human touches and
+overstating autonomy on the public badge; (2) tier-2 answers were unprovable as
+human.
+
+- Every verified-human tap now marks `--human`. `allowFrom` has already vetted
+  the tapper as an allow-listed human upstream, so the gate type is irrelevant to
+  provenance. `--human-proof` (the per-gate nonce) still rides along only for
+  hard gates that mint one.
+- Extracted the decision into a pure `tapEvidenceArgs()` in `tna.ts` (shared,
+  byte-identical across base + grok/codex/agy) and covered it in the tna harness.
+- Caught a latent drift: `telegram-agy` still gated `--human` on
+  approval/secret/manual and would have kept recording bare-agent decision taps.
+
+Historical `need_answered_by` rows are left intact (audit trail). Affected idents
+observed pre-fix: OSS-16 (task 1152), DIVE-1099.
+
 ## v0.5.16
 
 ### Fixed — resume-helper spawn storm: gate the spawn (not just the DM) per episode (DIVE-1107)

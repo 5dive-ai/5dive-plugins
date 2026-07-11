@@ -26,7 +26,7 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
-import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions } from './tna'
+import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs } from './tna'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import {
   appendMessage as msglogAppend,
@@ -3604,14 +3604,10 @@ bot.on('callback_query:data', async ctx => {
       // non-agent-SUDO_UID form. DIVE-950 dropped the old DIVE-519 --proof form
       // (it was agent-forgeable); the nonce is now the sole tap-path evidence.
       // Any ONE accepted form suffices; decision needs none.
-      const extraArgs: string[] = []
-      if (task?.need_type === 'approval' || task?.need_type === 'secret' || task?.need_type === 'manual') {
-        extraArgs.push('--human')
-        // Only send --human-proof when the callback actually carried a nonce (a
-        // gate minted by a nonce-aware CLI). This gates it to same-box new-CLI
-        // answers, so an older CLI never sees an unknown flag.
-        if (humanProof) extraArgs.push(`--human-proof=${humanProof}`)
-      }
+      // DIVE-1115: mark EVERY verified-human tap --human (allowFrom vetted the
+      // tapper above) so decision/manual taps no longer record a bare agent name,
+      // which was invisible to the zero-human KPI. See tapEvidenceArgs.
+      const extraArgs = tapEvidenceArgs(humanProof)
       await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], { timeout: 8000 })
       await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
       await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})

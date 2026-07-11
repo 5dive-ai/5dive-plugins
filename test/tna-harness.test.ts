@@ -193,3 +193,31 @@ describe('security invariants the tap line must hold', () => {
     })
   }
 })
+
+// DIVE-1115: the evidence flags a verified-human tap attaches to `task answer`.
+// The bug this guards: the tap handler used to push --human ONLY for
+// approval/secret/manual, so a `decision`/`manual` tap recorded a BARE AGENT
+// name in need_answered_by — invisible to the digest's zero-human KPI (it counts
+// only `human:*`) and unprovable as human on tier-2 gates. The fix marks EVERY
+// tap --human (allowFrom already vetted the tapper as a human upstream).
+describe('DIVE-1115: tapEvidenceArgs — every verified-human tap is --human', () => {
+  for (const mod of mods) {
+    test(`${mod.name}: exports tapEvidenceArgs`, () => {
+      expect(typeof mod.tapEvidenceArgs, mod.name).toBe('function')
+    })
+
+    test(`${mod.name}: a decision tap (no nonce) still carries --human`, () => {
+      // The regression: decision gates mint no nonce, so humanProof is empty.
+      // Pre-fix this produced [] → bare agent provenance. Post-fix: ['--human'].
+      for (const noNonce of [undefined, null, '']) {
+        expect(mod.tapEvidenceArgs(noNonce), `humanProof=${JSON.stringify(noNonce)}`)
+          .toEqual(['--human'])
+      }
+    })
+
+    test(`${mod.name}: a hard gate tap forwards --human-proof alongside --human`, () => {
+      const nonce = '0123456789abcdef0123456789abcdef'
+      expect(mod.tapEvidenceArgs(nonce)).toEqual(['--human', `--human-proof=${nonce}`])
+    })
+  }
+})

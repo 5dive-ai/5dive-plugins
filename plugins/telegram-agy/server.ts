@@ -31,7 +31,7 @@ import {
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions } from './tna'
+import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs } from './tna'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -1583,11 +1583,12 @@ bot.on('callback_query:data', async ctx => {
     // (now human-enforced) and forwards --human-proof (the per-gate nonce) as the
     // tap-path evidence (SUDO_UID here is the agent). DIVE-950 dropped the old
     // --proof form (agent-forgeable). Any one accepted form suffices; decision none.
-    const extraArgs: string[] = []
-    if (task?.need_type === 'approval' || task?.need_type === 'secret' || task?.need_type === 'manual') {
-      extraArgs.push('--human')
-      if (humanProof) extraArgs.push(`--human-proof=${humanProof}`)
-    }
+    // DIVE-1115: mark EVERY verified-human tap --human (allowFrom vetted the
+    // tapper above) so decision/manual taps no longer record a bare agent name,
+    // which was invisible to the zero-human KPI. Previously this fork gated
+    // --human on approval/secret/manual and skipped it for decision. See
+    // tapEvidenceArgs.
+    const extraArgs = tapEvidenceArgs(humanProof)
     await run5dive(['task', 'answer', taskId, ...r.answerArgs, ...extraArgs, '--json'], 8000)
     await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
     await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})

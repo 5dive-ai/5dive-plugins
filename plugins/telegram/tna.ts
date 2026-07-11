@@ -112,3 +112,18 @@ export function optionChoices(text: string): ParsedOption[] {
   if (!opts.length) return []
   return CHOICE_CUE_RE.test(text ?? '') ? opts : []
 }
+
+// DIVE-1115: evidence flags a verified-human tap attaches to `5dive task answer`.
+// The caller (server.ts callback handler) only reaches here AFTER allowFrom has
+// vetted the tapper as an allow-listed human, so EVERY tap is marked --human for
+// provenance — including `decision`/`manual` gates, which previously fell through
+// and recorded a bare AGENT name in need_answered_by. That hid real human taps
+// from the zero-human KPI (digest counts only `human:*`) and left tier-2 answers
+// unprovable as human. --human-proof rides along ONLY when the callback carried a
+// per-gate nonce (hard gates mint one; decision mints none), so an older CLI on
+// the same box never sees an unknown flag.
+export function tapEvidenceArgs(humanProof?: string | null): string[] {
+  const args = ['--human']
+  if (humanProof) args.push(`--human-proof=${humanProof}`)
+  return args
+}
