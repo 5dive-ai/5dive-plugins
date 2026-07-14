@@ -386,10 +386,40 @@ function kickOnEnqueue(): void {
   if (agentName() === 'unknown') return
   const now = Date.now()
   if (now - lastEnqueueKickMs < REARM_CHECK_MS) return
-  if (turnInFlight()) return
+  // Mid-turn: kicking now would abandon the live turn, so we can't deliver yet.
+  // But the Phase-1 idle fix (DIVE-1180) ends the turn instead of immediately
+  // re-entering wait_for_message, so nothing drains the queue when the turn
+  // closes — delivery would otherwise wait out the ~180s idle re-arm watchdog.
+  // Arm a short poller that re-fires the moment the turn ends instead (DIVE-1183).
+  if (turnInFlight()) { armTurnEndKick(); return }
   lastEnqueueKickMs = now
   process.stderr.write('telegram-agy: inbound queued with no waiter parked, kicking listen loop\n')
   kickListenLoop()
+}
+
+// Poll for the in-flight turn to end so a message queued mid-turn is delivered
+// the instant the turn closes, rather than waiting out the idle re-arm watchdog
+// (REARM_IDLE_MS, default 180s). Cheap: only runs while a message is queued with
+// a turn in flight, and turnInFlight() self-caps at TURN_MAX_MS so a wedged turn
+// still eventually releases the kick. A no-op on forks where turnInFlight() is
+// always false (they take the immediate-kick path above and never arm this).
+let pendingTurnEndKick: ReturnType<typeof setInterval> | null = null
+const TURN_END_POLL_MS = 3_000
+function armTurnEndKick(): void {
+  if (pendingTurnEndKick) return   // already polling
+  pendingTurnEndKick = setInterval(() => {
+    // A waiter re-parked (loop came back on its own) or the queue drained → done.
+    if (waiters.length > 0 || inboxQueue.length === 0) { disarmTurnEndKick(); return }
+    if (turnInFlight()) return       // turn still running — keep waiting
+    disarmTurnEndKick()
+    lastEnqueueKickMs = Date.now()
+    process.stderr.write('telegram-agy: turn ended with inbound still queued, waking listen loop\n')
+    kickListenLoop()
+  }, TURN_END_POLL_MS)
+  pendingTurnEndKick.unref?.()
+}
+function disarmTurnEndKick(): void {
+  if (pendingTurnEndKick) { clearInterval(pendingTurnEndKick); pendingTurnEndKick = null }
 }
 
 // ============================================================================
