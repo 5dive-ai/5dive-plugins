@@ -42,6 +42,16 @@ const PLUGIN_VERSION = (() => {
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
   ?? join(homedir(), '.codex', 'channels', 'telegram')
+// DIVE-1212: codex writes generated graphics to ~/.codex/generated_images/<uuid>/
+// (outside STATE_DIR). Since codex now owns ALL graphics, allow-list that dir
+// (and an optional operator-supplied extra) so image DMs don't need a manual
+// `cp` into the state dir first. Comma-separated absolute paths in the env var.
+const SEND_ALLOWED_DIRS = [
+  STATE_DIR,
+  join(homedir(), '.codex', 'generated_images'),
+  ...(process.env.TELEGRAM_SEND_ALLOWED_DIRS ?? '')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+]
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const PERMS_DIR = join(STATE_DIR, 'permissions')
@@ -217,18 +227,20 @@ function pruneExpired(a: AccessJson): boolean {
   return changed
 }
 
-// Refuse to refer to anything outside STATE_DIR — defense in depth, the
-// server's own paths are the only ones it should ever read by alias.
+// Refuse to refer to anything outside an allowed root — defense in depth, the
+// server's own state dir plus codex's generated_images output (DIVE-1212) are
+// the only paths it should ever send by alias.
 function assertInStateDir(path: string) {
   let real: string
-  let stateReal: string
   try {
     real = realpathSync(path)
-    stateReal = realpathSync(STATE_DIR)
   } catch { return }
-  if (real !== stateReal && !real.startsWith(stateReal + sep)) {
-    throw new Error(`refusing to send file outside state dir: ${path}`)
+  for (const dir of SEND_ALLOWED_DIRS) {
+    let root: string
+    try { root = realpathSync(dir) } catch { continue }
+    if (real === root || real.startsWith(root + sep)) return
   }
+  throw new Error(`refusing to send file outside state dir: ${path}`)
 }
 
 // chat_id may be a DM (== from.id) or a group/channel id (negative). We
