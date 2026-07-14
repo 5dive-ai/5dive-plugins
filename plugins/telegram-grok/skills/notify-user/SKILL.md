@@ -35,8 +35,9 @@ The loop is simple: `wait_for_message` → do the work → `reply` →
 - **Default `timeout_seconds=50`** for `wait_for_message`. Grok kills any
   MCP tool call past its `tool_timeout_sec` (default 60s), so higher
   timeouts drop messages arriving near the boundary. If
-  `<telegram timeout=true/>` comes back, loop and call `wait_for_message`
-  again immediately.
+  `<telegram timeout=true/>` comes back, END YOUR TURN; do not re-call
+  `wait_for_message` to keep polling. The server re-arms you when the next
+  message is queued.
 
 ## Hard rules
 

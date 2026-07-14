@@ -35,7 +35,8 @@ The loop is simple: `wait_for_message` → do the work → `reply` →
 - **Default `timeout_seconds=90`** for `wait_for_message`. Codex's MCP
   layer kills any tool call past ~120s, so higher timeouts drop
   messages arriving near the boundary. If `<telegram timeout=true/>`
-  comes back, loop and call `wait_for_message` again immediately.
+  comes back, END YOUR TURN; do not re-call `wait_for_message` to keep
+  polling. The server re-arms you when the next message is queued.
 
 ## Hard rules
 

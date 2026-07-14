@@ -1703,8 +1703,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         + "message body — or, when several messages queued up while you were busy, a "
         + "<telegram-batch> of such blocks; answer each as appropriate (they may be from "
         + "different chats). Use the chat_id and message_id in subsequent reply/react calls. "
-        + "If no message arrives before the timeout, returns <telegram timeout=true/> — "
-        + "loop and call again immediately; idle polling is cheap.",
+        + "If no message arrives before the timeout, returns <telegram timeout=true/>: "
+        + "END YOUR TURN. Do NOT call wait_for_message again just to keep polling on an empty "
+        + "inbox — that burns a model turn every cycle. The server re-arms this loop the moment "
+        + "a real message is queued, so no inbound is ever missed.",
       inputSchema: {
         type: 'object',
         properties: {
@@ -1714,8 +1716,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
               "Max seconds to wait before returning <telegram timeout=true/>. Default 50, max 50 — "
               + "capped to stay under Antigravity's default 60s MCP tool timeout (MCP tool timeout), past "
               + "which the call is killed and an inbound that arrived near the boundary is dropped. "
-              + "Loop and call again instead of asking for longer (raise MCP tool timeout for this "
-              + "server in ~/.gemini/config.toml if you want longer polls).",
+              + "Keep the default instead of asking for longer (raise MCP tool timeout for this "
+              + "server in ~/.gemini/config.toml if you genuinely need longer polls).",
           },
         },
       },
@@ -1982,9 +1984,10 @@ const REARM_CHECK_MS = 15_000
 // Max queued messages handed to one wait_for_message return (burst batching).
 const BATCH_DRAIN_MAX = 10
 const REARM_KICK_TEXT =
-  'Resume your Telegram listen loop: call wait_for_message now and keep looping '
-  + '(on each message reply, then call wait_for_message again; on timeout call it '
-  + 'again immediately). This is an automated re-arm — do not send a Telegram reply about it.'
+  'A Telegram message is waiting: call wait_for_message now to receive it, then reply. '
+  + 'After handling any queued messages, if wait_for_message returns <telegram timeout=true/>, '
+  + 'END YOUR TURN — the server re-arms you when the next message arrives. '
+  + 'This is an automated re-arm; do not send a Telegram reply about it.'
 
 // Bumped on every MCP tool call. A working agent (not parked in wait_for_message)
 // still acks/edits within ~30s, so recent activity means "busy, leave alone";

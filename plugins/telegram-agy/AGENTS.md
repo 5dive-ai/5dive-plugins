@@ -12,8 +12,9 @@ back — anything you print to the terminal never reaches the user's phone.
   max `timeout_seconds` is 50 — Antigravity kills any MCP tool call that runs
   past its `MCP tool timeout` (default 60s), so asking for longer drops
   messages that arrive near the boundary. On timeout returns
-  `<telegram timeout=true …/>`; loop and call again immediately. Idle
-  polling is cheap.
+  `<telegram timeout=true …/>`; END YOUR TURN. Do not call again just to
+  keep polling an empty inbox; that burns a model turn per cycle. The
+  server re-arms this loop the moment a real message is queued.
 - **`reply`** — send a new message. Required: `chat_id`, `text`.
   Optional: `reply_to` (thread under an inbound message_id), `files`
   (absolute paths, max 50MB), `format` (`text` or `markdownv2`).
