@@ -241,3 +241,24 @@ describe('turn-based re-arm liveness', () => {
     expect(has(read(plugin), TURN_LIVENESS)).toBe(true)
   })
 })
+
+// ---- oversized-send guard: /tasks must not go silently dark (DIVE-313 / DIVE-1191) ----
+//
+// Telegram 400s any sendMessage/editMessageText over 4096 chars, and a rejected send
+// only surfaces in bot.catch — the user sees nothing. clampList caps each /tasks section
+// to ~4000, but a two-section list (Needs-you + Open) can still JOIN past 4096, and
+// other slash/button paths send unchunked. The base plugin degrades any oversized send
+// to a truncated one via an API-layer `bot.api.config.use` guard; DIVE-1191 was that
+// guard missing from the forks, so codex's /tasks went dark on a long queue. Assert
+// every fork (and the baseline) carries it so a fork can't silently drop it again.
+describe.each([BASELINE, ...FORKS])('%s: oversized-send guard (DIVE-313/DIVE-1191)', plugin => {
+  const src = read(plugin)
+  test('installs an API-layer sendMessage/editMessageText length guard', () => {
+    expect(src).toMatch(/bot\.api\.config\.use\(/)
+    expect(src).toMatch(/method === 'sendMessage' \|\| method === 'editMessageText'/)
+  })
+  test('truncates oversized text instead of letting the send 400', () => {
+    expect(src).toMatch(/message truncated/)
+    expect(src).toMatch(/delete p\.parse_mode/)
+  })
+})

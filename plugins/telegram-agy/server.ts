@@ -523,6 +523,27 @@ function formatInbound(msg: InboundMsg): string {
 // ============================================================================
 
 const bot = new Bot(TOKEN)
+
+// Telegram rejects sendMessage/editMessageText text over 4096 chars
+// (400: message is too long). A rejected send only surfaces in bot.catch —
+// the user sees nothing (DIVE-313: /tasks went silent; DIVE-1191: recurred
+// on the forks). chunkForTelegram/clampList cover the reply paths, but a
+// multi-section /tasks (each section clamped to ~4000) can still join past
+// 4096, and other slash/button paths send unchunked. This API-layer guard
+// degrades any oversized send to a truncated one. parse_mode is dropped on
+// truncation because a cut MarkdownV2 entity would itself 400 on unbalanced
+// markup.
+const TG_HARD_MESSAGE_LIMIT = 4096
+bot.api.config.use((prev, method, payload, signal) => {
+  if (method === 'sendMessage' || method === 'editMessageText') {
+    const p = payload as { text?: string; parse_mode?: string }
+    if (typeof p.text === 'string' && p.text.length > TG_HARD_MESSAGE_LIMIT) {
+      p.text = p.text.slice(0, TG_HARD_MESSAGE_LIMIT - 32) + '\n…(message truncated)'
+      delete p.parse_mode
+    }
+  }
+  return prev(method, payload, signal)
+})
 let botUsername = ''
 let shuttingDown = false
 
