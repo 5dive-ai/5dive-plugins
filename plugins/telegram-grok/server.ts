@@ -2336,6 +2336,24 @@ function shutdown() {
 process.on('SIGTERM', shutdown)
 process.on('SIGINT',  shutdown)
 
+// DIVE-1251: exit when our MCP parent (the grok/TUI session) disconnects. On
+// /clear, the TUI RE-INITS its MCP servers — it disconnects this server.ts and
+// spawns a fresh one — so our stdin hits EOF. The MCP SDK's StdioServerTransport
+// only wires stdin 'data'/'error', never 'end'/'close', so without this the
+// orphaned pre-/clear process lingers forever: it keeps holding the getUpdates
+// slot (heartbeat still fresh) while the NEW spawn parks in acquireSlot() behind
+// it and never exits — one leaked bun process per fresh heartbeat nudge. Exiting
+// on EOF frees the slot so the current MCP-connected spawn acquires it.
+// shutdown() only unlinks the PID/heartbeat files it actually owns, so a parked
+// spawn exiting here can never stomp the incumbent's slot.
+const onParentDisconnect = () => {
+  if (shuttingDownExit) return
+  process.stderr.write('telegram-grok: MCP parent disconnected (stdin EOF) — exiting orphaned bridge\n')
+  shutdown()
+}
+process.stdin.once('end', onParentDisconnect)
+process.stdin.once('close', onParentDisconnect)
+
 await mcp.connect(new StdioServerTransport())
 
 startRearmWatchdog()
