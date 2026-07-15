@@ -88,17 +88,35 @@ if (!TOKEN) {
   process.exit(1)
 }
 
-// Telegram allows exactly one getUpdates consumer per token. Replace any
-// stale poller left over from a crashed prior run.
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram-pi: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+// Liveness beacon for the single getUpdates slot (DIVE-818/DIVE-819, ported to
+// pi per DIVE-1241). The active poller bumps this file's mtime every
+// HEARTBEAT_MS; a newcomer treats the slot as HELD only while the beacon is
+// fresh. Acquisition happens in the poll bootstrap at the bottom of the file.
+const HEARTBEAT_FILE = join(STATE_DIR, 'bot.heartbeat')
+const HEARTBEAT_MS = 3000
+// 3 missed beats — how long a newcomer waits before deciding the incumbent died.
+const HEARTBEAT_STALE_MS = 9000
+
+// DIVE-818: a TRANSIENT spawn running this server.ts (an overlapping respawn, or
+// a shared-checkout enumeration) used to eagerly SIGTERM whatever PID held the
+// slot and claim it, then die — leaving NO poller (channel deaf, relay gone
+// until a manual restart). Fix: never stomp a HEALTHY incumbent; acquisition is
+// deferred to the poll bootstrap, which waits out a fresh heartbeat and only
+// reclaims the slot once the beacon goes stale (incumbent actually dead).
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch { return false }
+}
+function heartbeatFresh(): boolean {
+  try { return Date.now() - statSync(HEARTBEAT_FILE).mtimeMs < HEARTBEAT_STALE_MS } catch { return false }
+}
+function incumbentHolds(): boolean {
+  try {
+    const pid = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    return pid > 1 && pid !== process.pid && pidAlive(pid) && heartbeatFresh()
+  } catch { return false }
+}
+// Set once this process becomes the active poller; cleared on shutdown.
+let heartbeatTimer: ReturnType<typeof setInterval> | undefined
 
 process.on('unhandledRejection', err => {
   process.stderr.write(`telegram-pi: unhandled rejection: ${err}\n`)
@@ -1273,10 +1291,49 @@ bot.on('callback_query:data', async ctx => {
 // Boot
 // ============================================================================
 
-process.on('SIGTERM', () => { shuttingDown = true; bot.stop().catch(() => {}); for (const id of [...engines.keys()]) void disposeEngine(id) })
-process.on('SIGINT',  () => { shuttingDown = true; bot.stop().catch(() => {}); for (const id of [...engines.keys()]) void disposeEngine(id) })
+function shutdown() {
+  shuttingDown = true
+  try {
+    // Only the active poller owns these files — never clear an incumbent's.
+    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) {
+      unlinkSync(PID_FILE)
+      if (heartbeatTimer) clearInterval(heartbeatTimer)
+      try { unlinkSync(HEARTBEAT_FILE) } catch {}
+    }
+  } catch {}
+  bot.stop().catch(() => {})
+  for (const id of [...engines.keys()]) void disposeEngine(id)
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT',  shutdown)
 
 void (async () => {
+  // DIVE-818 single-flight acquisition (ported per DIVE-1241): wait until no
+  // HEALTHY incumbent holds the slot, then claim it. A transient enumeration
+  // spawn parks here harmlessly and is killed by its parent before it ever polls.
+  async function acquireSlot(): Promise<void> {
+    for (;;) {
+      if (shuttingDown) return
+      if (!incumbentHolds()) {
+        try {
+          const prev = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+          if (prev > 1 && prev !== process.pid && pidAlive(prev)) {
+            process.stderr.write(`telegram-pi: reclaiming stale poller pid=${prev}\n`)
+            process.kill(prev, 'SIGTERM')
+          }
+        } catch {}
+        writeFileSync(PID_FILE, String(process.pid))
+        return
+      }
+      await new Promise(r => setTimeout(r, HEARTBEAT_MS))
+    }
+  }
+  const bumpHeartbeat = () => { try { writeFileSync(HEARTBEAT_FILE, String(Date.now())) } catch {} }
+  await acquireSlot()
+  if (shuttingDown) return
+  bumpHeartbeat()
+  heartbeatTimer = setInterval(bumpHeartbeat, HEARTBEAT_MS)
+
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
@@ -1305,10 +1362,17 @@ void (async () => {
         `telegram-pi: polling error attempt ${attempt}${is409 ? ' (409 Conflict)' : ''}: `
         + `${err instanceof Error ? err.message : String(err)}; retrying in ${wait}ms\n`)
       await new Promise(r => setTimeout(r, wait))
+      // DIVE-1239: a 409 means another process is already polling this bot
+      // token. Re-run single-flight acquisition so we PARK behind a HEALTHY
+      // incumbent (fresh heartbeat) instead of thrashing getUpdates against it
+      // forever. Without this, a second server.ts spawned by an overlapping
+      // respawn fights the boot poller indefinitely — two live pollers on one
+      // token = permanent 409 = the plugin goes deaf.
+      if (is409) await acquireSlot()
     }
   }
 })()
 
 // Touch unused imports/helpers kept for parity with the fork family / future use.
-void InputFile; void statSync; void unlinkSync; void existsSync; void assertInStateDir
+void InputFile; void existsSync; void assertInStateDir
 void assertAllowedChat; void PHOTO_EXTS; void MAX_ATTACHMENT_BYTES; void loginHint; void lastInboundTs
