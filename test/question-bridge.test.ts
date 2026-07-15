@@ -47,6 +47,23 @@ describe('buildBridge — AskUserQuestion (single-select)', () => {
     expect(aq.buttons[0].answer).toBe('The user selected: "Postgres" (sql)')
     expect(aq.buttons[1].answer).toBe('The user selected: "Mongo"')
     expect(aq.prompt).toBe('❓ DB\nWhich db?')
+    expect(aq.vertical).toBe(false)
+  })
+
+  test('marks and leads with a recommended option', () => {
+    const aq = buildBridge('AskUserQuestion', {
+      questions: [{ question: 'Which db?', options: [{ label: 'Postgres (Recommended)' }, { label: 'Mongo' }] }],
+    })!
+    expect(aq.recommendedIndex).toBe(0)
+    expect(aq.prompt).toContain('✅ Recommended: Postgres')
+    expect(buttonText(aq.buttons[0]!.label, 0, true, true)).toBe('⭐ A) Postgres')
+  })
+
+  test('stacks more than three options vertically', () => {
+    const aq = buildBridge('AskUserQuestion', {
+      questions: [{ question: 'Pick', options: ['A', 'B', 'C', 'D'].map(label => ({ label })) }],
+    })!
+    expect(aq.vertical).toBe(true)
   })
 
   test('no header → bare ❓ marker line', () => {

@@ -31,7 +31,7 @@
 
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { OPT_RE, optionChoices, parseOptions } from './tna'
+import { OPT_RE, parseOptions, questionRenderSpec } from './tna'
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -451,35 +451,41 @@ function chunkForTelegram(text: string, limit = TG_MAX_MESSAGE_CHARS): string[] 
 // a single yes/no question. Conservative — only when there's exactly one '?' and
 // the trailing question isn't an "A or B?" choice. Opt-out: a trailing
 // `<!-- no-buttons -->` (or `<!-- no-yn -->`), stripped either way.
-const YN_SUPPRESS = /\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i
-function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboard } {
-  if (YN_SUPPRESS.test(text)) return { stripped: text.replace(YN_SUPPRESS, '') }
-  const trimmed = text.trimEnd()
-  if (!trimmed.endsWith('?')) return { stripped: text }
-  if ((trimmed.match(/\?/g) ?? []).length !== 1) return { stripped: text }
-  const lastQ = trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? ''
-  if (/\bor\b/i.test(lastQ)) return { stripped: text }
-  return {
-    stripped: text,
-    keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),
-  }
+// DIVE-1272: render actual choices, boolean Yes/No, or a typed ForceReply from
+// the shared pure classifier. This thin adapter is the only grammY-specific bit.
+type QuestionUi = {
+  stripped: string
+  keyboard?: InlineKeyboard
+  labels?: string[]
+  forceReply?: { force_reply: true; input_field_placeholder: string }
 }
-
-// DIVE-708/717: render one tappable button per option when a reply presents a
-// lettered/numbered choice list. Detection is optionChoices() in tna.ts; here we
-// build the keyboard. callback_data is `opt:<index>`; the label is re-resolved
-// from the tapped message at tap time. Shares the YN opt-out marker.
-const OPT_BTN_MAX = 56
-function optionButtons(text: string): { keyboard?: InlineKeyboard; labels?: string[] } {
-  if (YN_SUPPRESS.test(text)) return {}
-  const opts = optionChoices(text)
-  if (!opts.length) return {}
+const forceReply = (placeholder: string): QuestionUi['forceReply'] => ({
+  force_reply: true,
+  input_field_placeholder: placeholder.slice(0, 64),
+})
+function questionUi(text: string): QuestionUi {
+  const spec = questionRenderSpec(text)
+  if (spec.kind === 'boolean') {
+    return {
+      stripped: spec.stripped,
+      keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),
+    }
+  }
+  if (spec.kind === 'free_text') {
+    return { stripped: spec.stripped, forceReply: forceReply(spec.placeholder) }
+  }
+  if (spec.kind !== 'options') return { stripped: spec.stripped }
   const kb = new InlineKeyboard()
-  opts.forEach((o, i) => {
-    const label = o.label.length > OPT_BTN_MAX ? o.label.slice(0, OPT_BTN_MAX - 1).trimEnd() + '…' : o.label
-    kb.text(`${o.marker.toUpperCase()}) ${label}`, `opt:${i}`).row()
+  spec.options.forEach((o, i) => {
+    const marker = o.marker.toUpperCase()
+    const recommended = spec.recommendation === o.label
+    const prefix = `${recommended ? '⭐ ' : ''}${marker}) `
+    const room = 56 - prefix.length
+    const label = o.label.length > room ? o.label.slice(0, room - 1).trimEnd() + '…' : o.label
+    kb.text(`${prefix}${label}`, `opt:${i}`)
+    if (spec.vertical && i < spec.options.length - 1) kb.row()
   })
-  return { keyboard: kb, labels: opts.map(o => o.label) }
+  return { stripped: spec.stripped, keyboard: kb, labels: spec.options.map(o => o.label) }
 }
 
 const OPTION_CAP = 200
@@ -607,21 +613,29 @@ async function finalizeStream(s: StreamState, finalText: string): Promise<void> 
   const text = finalText.trim() ? finalText : (s.text.trim() || '(pi returned no text)')
   // DIVE-341: render the authoritative text minus any opt-out marker, then attach
   // the Yes/No keyboard to the LAST chunk's message after the final flush.
-  const { stripped, keyboard: ynKeyboard } = yesNoButtons(text)
-  s.finalText = stripped
+  const qUi = questionUi(text)
+  s.finalText = qUi.stripped
   s.finalized = true
   if (s.timer) { clearTimeout(s.timer); s.timer = null }
   await flushStream(s)
   if (s.dirty) { await new Promise(r => setTimeout(r, 50)); await flushStream(s) }
   // DIVE-708/717: a choice-list keyboard takes precedence over Yes/No, but only
   // when the reply landed as a single chunk (the tap resolves from that message).
-  const optRes = s.msgIds.length === 1 ? optionButtons(text) : {}
-  const keyboard = optRes.keyboard ?? ynKeyboard
+  const keyboard = qUi.labels && s.msgIds.length !== 1 ? undefined : qUi.keyboard
   if (keyboard && s.msgIds.length) {
     const lastId = s.msgIds[s.msgIds.length - 1]!
     await bot.api.editMessageReplyMarkup(s.chat_id, lastId, { reply_markup: keyboard })
       .catch((err: any) => process.stderr.write(`telegram-pi: keyboard attach failed: ${err?.message}\n`))
-    if (optRes.keyboard && optRes.labels) rememberOptions(lastId, optRes.labels)
+    if (qUi.labels) rememberOptions(lastId, qUi.labels)
+  }
+  const typedReply = qUi.forceReply
+    ?? (qUi.labels && s.msgIds.length !== 1
+      ? forceReply(`Reply with an option number (1-${qUi.labels.length})`) : undefined)
+  if (typedReply) {
+    await bot.api.sendMessage(s.chat_id, '↩️ Reply to this message with your answer.', {
+      ...(s.thread != null ? { message_thread_id: s.thread } : {}),
+      reply_markup: typedReply,
+    }).catch((err: any) => process.stderr.write(`telegram-pi: force-reply prompt failed: ${err?.message}\n`))
   }
   streams.delete(s.chat_id)
   stopTypingLoop(s.chat_id)

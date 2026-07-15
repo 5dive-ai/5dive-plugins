@@ -102,9 +102,11 @@ try {
   legacyDeny(tool!)
 }
 
-const inline_keyboard = spec!.buttons.map((b, i) => [
-  { text: buttonText(b.label, i, spec!.markers), callback_data: `q:${reqid}:${i}` },
-])
+const renderedButtons = spec!.buttons.map((b, i) => ({
+  text: buttonText(b.label, i, spec!.markers, spec!.recommendedIndex === i),
+  callback_data: `q:${reqid}:${i}`,
+}))
+const inline_keyboard = spec!.vertical ? renderedButtons.map(b => [b]) : [renderedButtons]
 
 async function post(): Promise<boolean> {
   try {

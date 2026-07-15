@@ -76,7 +76,19 @@ export function resolveTnaAnswer(task: TnaGate | null | undefined, token: string
 // AND only when the message carries a choice cue (a '?' or a word like
 // choose/pick/which/option), which plain instructions almost never do.
 
-export interface ParsedOption { marker: string; label: string }
+export interface ParsedOption { marker: string; label: string; recommended?: boolean }
+
+export type QuestionRenderSpec =
+  | { kind: 'none'; stripped: string }
+  | { kind: 'boolean'; stripped: string }
+  | {
+      kind: 'options'
+      stripped: string
+      options: ParsedOption[]
+      vertical: boolean
+      recommendation?: string
+    }
+  | { kind: 'free_text'; stripped: string; placeholder: string }
 
 // callback_data stays tiny (`opt:<index>`); the label is re-resolved from the
 // tapped message at tap time, so it never has to fit Telegram's 64-byte cap.
@@ -85,23 +97,38 @@ export const OPT_RE = /^opt:(\d+)$/
 const OPTION_LINE_RE = /^\s*(?:[-*>•]\s*)?([a-zA-Z]|\d{1,2})[).]\s+(\S.*?)\s*$/
 const CHOICE_CUE_RE = /\?|\b(choose|choices?|pick|select|which|option|options|prefer|either)\b/i
 const MAX_OPTION_LABEL = 90
+const MAX_INLINE_OPTIONS = 8
+const MAX_PARSED_OPTIONS = 20
+const RECOMMENDED_SUFFIX_RE = /\s*(?:\((?:recommended|best choice)\)|\[(?:recommended|best choice)\])\s*$/i
+const EXPLICIT_RECOMMENDATION_RE = /(?:^|\n)\s*(?:✅\s*)?recommended\s*:\s*([^\n]+)/i
+const BOOLEAN_QUESTION_RE = /^(?:(?:is|are|am|was|were|do|does|did|can|could|will|would|should|shall|may|might|must|have|has|had)\b|(?:yes\s+or\s+no|true\s+or\s+false)\b)/i
 
-// Parse the raw option lines (no cue gate) — exported for the tap-side resolve.
-// Returns [] unless the markers form a clean a,b,c… OR 1,2,3… sequence of 2–8
-// entries, each a single short line. Letters are lowercased; order = display order.
-export function parseOptions(text: string): ParsedOption[] {
+function scanOptions(text: string): ParsedOption[] {
   const opts: ParsedOption[] = []
   for (const line of (text ?? '').split('\n')) {
     const m = OPTION_LINE_RE.exec(line)
-    if (m) opts.push({ marker: m[1]!.toLowerCase(), label: m[2]! })
+    if (!m) continue
+    const rawLabel = m[2]!
+    const recommended = RECOMMENDED_SUFFIX_RE.test(rawLabel)
+    const label = recommended ? rawLabel.replace(RECOMMENDED_SUFFIX_RE, '').trimEnd() : rawLabel
+    opts.push({ marker: m[1]!.toLowerCase(), label, ...(recommended ? { recommended: true } : {}) })
   }
-  if (opts.length < 2 || opts.length > 8) return []
-  if (opts.some(o => o.label.length > MAX_OPTION_LABEL)) return []
+  if (opts.length < 2 || opts.length > MAX_PARSED_OPTIONS) return []
   const numeric = /^\d+$/.test(opts[0]!.marker)
   for (let i = 0; i < opts.length; i++) {
     const expected = numeric ? String(i + 1) : String.fromCharCode(97 + i)
     if (opts[i]!.marker !== expected) return []
   }
+  return opts
+}
+
+// Parse the raw option lines (no cue gate) — exported for the tap-side resolve.
+// Returns [] unless the markers form a clean a,b,c… OR 1,2,3… sequence of 2–8
+// entries, each a single short line. Letters are lowercased; order = display order.
+export function parseOptions(text: string): ParsedOption[] {
+  const opts = scanOptions(text)
+  if (opts.length < 2 || opts.length > MAX_INLINE_OPTIONS) return []
+  if (opts.some(o => o.label.length > MAX_OPTION_LABEL)) return []
   return opts
 }
 
@@ -111,6 +138,52 @@ export function optionChoices(text: string): ParsedOption[] {
   const opts = parseOptions(text)
   if (!opts.length) return []
   return CHOICE_CUE_RE.test(text ?? '') ? opts : []
+}
+
+// DIVE-1272: one pure decision point shared by every Telegram bridge. Structured
+// options win; Yes/No is reserved for genuinely boolean grammar; a free-text
+// question gets Telegram ForceReply instead of two invented answers. Large or
+// overlong option lists intentionally fall back to a numbered typed reply.
+export function questionRenderSpec(text: string): QuestionRenderSpec {
+  const stripped = (text ?? '').replace(/\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i, '')
+  if (stripped !== (text ?? '')) return { kind: 'none', stripped }
+
+  const scanned = scanOptions(stripped)
+  if (scanned.length && CHOICE_CUE_RE.test(stripped)) {
+    if (scanned.length > MAX_INLINE_OPTIONS || scanned.some(o => o.label.length > MAX_OPTION_LABEL)) {
+      return {
+        kind: 'free_text',
+        stripped,
+        placeholder: `Reply with an option number (1-${scanned.length})`,
+      }
+    }
+    const explicit = EXPLICIT_RECOMMENDATION_RE.exec(stripped)?.[1]?.trim()
+    const recommended = scanned.find(o => o.recommended)
+      ?? (explicit ? scanned.find(o => o.label.toLowerCase() === explicit.toLowerCase()) : undefined)
+    const recommendation = recommended?.label
+    const withRecommendation = recommendation && !explicit
+      ? `${stripped}\n\n✅ Recommended: ${recommendation}`
+      : stripped
+    return {
+      kind: 'options',
+      stripped: withRecommendation,
+      options: scanned,
+      vertical: scanned.length > 3 || scanned.some(o => o.label.length > 24),
+      ...(recommendation ? { recommendation } : {}),
+    }
+  }
+
+  const trimmed = stripped.trimEnd()
+  if (!trimmed.endsWith('?')) return { kind: 'none', stripped }
+  if ((trimmed.match(/\?/g) ?? []).length !== 1) {
+    return { kind: 'free_text', stripped, placeholder: 'Reply to this message with your answer' }
+  }
+  const lastQuestion = trimmed.split(/[\n.!]/).filter(s => s.trim()).pop()?.trim() ?? ''
+  const explicitBooleanPair = /\b(?:yes\s+or\s+no|true\s+or\s+false)\b/i.test(lastQuestion)
+  if (BOOLEAN_QUESTION_RE.test(lastQuestion) && (!/\bor\b/i.test(lastQuestion) || explicitBooleanPair)) {
+    return { kind: 'boolean', stripped }
+  }
+  return { kind: 'free_text', stripped, placeholder: 'Reply to this message with your answer' }
 }
 
 // DIVE-1115: evidence flags a verified-human tap attaches to `5dive task answer`.

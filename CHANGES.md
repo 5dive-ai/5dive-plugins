@@ -1,3 +1,17 @@
+## Unreleased
+
+### Fixed — Telegram question controls reflect the question being asked (DIVE-1272)
+
+- All six bridges now share one parity-pinned question classifier: discrete
+  options render their actual labels, Yes/No appears only for boolean grammar,
+  and open-ended prompts use Telegram ForceReply.
+- Recommendations lead with `✅ Recommended` and star the matching button.
+  Short sets share a row; more than three or long labels stack vertically;
+  oversized lists fall back to a numbered typed reply.
+- Claude's native `AskUserQuestion` bridge follows the same recommendation and
+  keyboard-layout rules. The golden test checks the shared renderer across
+  claude, codex, grok, agy, opencode, and pi.
+
 ## v0.5.17
 
 ### Fixed — telegram taps record human provenance on every gate type, not just hard gates (DIVE-1115)

@@ -12,7 +12,13 @@
 // agent stuck in plan mode, re-calling the tool in a loop); AskUserQuestion
 // always deny-with-answer (allowing it would render the dead tmux picker).
 export type BridgeButton = { label: string; answer: string; permit?: 'allow' }
-export type BridgeSpec = { prompt: string; buttons: BridgeButton[]; markers: boolean }
+export type BridgeSpec = {
+  prompt: string
+  buttons: BridgeButton[]
+  markers: boolean
+  vertical: boolean
+  recommendedIndex?: number
+}
 
 const BTN_MAX = 56
 
@@ -27,6 +33,7 @@ export function buildBridge(toolName: string, input: Record<string, unknown>): B
       // ExitPlanMode is the simple 2-button approve/revise case. Labels carry
       // their own emoji, so no A)/B) marker.
       markers: false,
+      vertical: false,
       buttons: [
         {
           label: '✅ Approve — proceed',
@@ -54,14 +61,36 @@ export function buildBridge(toolName: string, input: Record<string, unknown>): B
     if (!question) return null
     const prompt = [header ? `❓ ${header}` : '❓', question].filter(Boolean).join('\n')
     const buttons: BridgeButton[] = []
+    let recommendedIndex = -1
     for (const o of opts) {
       const oo = o as Record<string, unknown>
-      const label = typeof oo.label === 'string' ? oo.label : ''
+      const rawLabel = typeof oo.label === 'string' ? oo.label : ''
+      const suffixRecommended = /\s*(?:\(recommended\)|\[recommended\])\s*$/i.test(rawLabel)
+      const label = suffixRecommended
+        ? rawLabel.replace(/\s*(?:\(recommended\)|\[recommended\])\s*$/i, '').trimEnd()
+        : rawLabel
       if (!label) return null
       const desc = typeof oo.description === 'string' && oo.description ? ` (${oo.description})` : ''
+      if (suffixRecommended || oo.recommended === true) recommendedIndex = buttons.length
       buttons.push({ label, answer: `The user selected: "${label}"${desc}` })
     }
-    return { prompt, buttons, markers: true }
+    const recommendation = typeof q.recommend === 'string' ? q.recommend
+      : typeof q.recommended === 'string' ? q.recommended
+        : typeof input.recommend === 'string' ? input.recommend : ''
+    if (recommendation) {
+      const idx = buttons.findIndex(b => b.label.toLowerCase() === recommendation.trim().toLowerCase())
+      if (idx >= 0) recommendedIndex = idx
+    }
+    const finalPrompt = recommendedIndex >= 0
+      ? `${prompt}\n\n✅ Recommended: ${buttons[recommendedIndex]!.label}`
+      : prompt
+    return {
+      prompt: finalPrompt,
+      buttons,
+      markers: true,
+      vertical: buttons.length > 3 || buttons.some(b => b.label.length > 24),
+      ...(recommendedIndex >= 0 ? { recommendedIndex } : {}),
+    }
   }
 
   return null
@@ -103,8 +132,8 @@ export function resolveQuestionTap(
 
 // Inline-keyboard button caption: kept to one tidy line. When markers is on we
 // prefix a letter (A, B, C…) mirroring DIVE-708's lettered choice buttons.
-export function buttonText(label: string, index: number, markers: boolean): string {
-  const prefix = markers ? `${String.fromCharCode(65 + index)}) ` : ''
+export function buttonText(label: string, index: number, markers: boolean, recommended = false): string {
+  const prefix = `${recommended ? '⭐ ' : ''}${markers ? `${String.fromCharCode(65 + index)}) ` : ''}`
   const room = BTN_MAX - prefix.length
   const clipped = label.length > room ? label.slice(0, room - 1).trimEnd() + '…' : label
   return `${prefix}${clipped}`

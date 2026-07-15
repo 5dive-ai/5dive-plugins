@@ -7,7 +7,7 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parseOptions, optionChoices, OPT_RE } from '../plugins/telegram/tna'
+import { parseOptions, optionChoices, questionRenderSpec, OPT_RE } from '../plugins/telegram/tna'
 
 describe('parseOptions — raw sequence detection', () => {
   test('lettered a/b/c list', () => {
@@ -62,6 +62,56 @@ describe('optionChoices — cue gate (false-positive guard)', () => {
   })
 })
 
+describe('questionRenderSpec — semantic question UX (DIVE-1272)', () => {
+  test('uses actual options instead of synthesizing Yes/No', () => {
+    const r = questionRenderSpec('Which environment?\nA) Staging\nB) Production')
+    expect(r.kind).toBe('options')
+    if (r.kind === 'options') expect(r.options.map(o => o.label)).toEqual(['Staging', 'Production'])
+  })
+
+  test('Yes/No appears only for a genuinely boolean question', () => {
+    expect(questionRenderSpec('Should I deploy now?').kind).toBe('boolean')
+    expect(questionRenderSpec('What time should I deploy?').kind).toBe('free_text')
+    expect(questionRenderSpec('Which database should I use?').kind).toBe('free_text')
+    expect(questionRenderSpec('Should I use Postgres or Mongo?').kind).toBe('free_text')
+  })
+
+  test('open-ended question requests a typed ForceReply', () => {
+    const r = questionRenderSpec('What should the release note say?')
+    expect(r).toEqual({
+      kind: 'free_text',
+      stripped: 'What should the release note say?',
+      placeholder: 'Reply to this message with your answer',
+    })
+  })
+
+  test('recommendation leads the prompt and stars the matching option', () => {
+    const r = questionRenderSpec('Pick one:\n1. Postgres (Recommended)\n2. Mongo')
+    expect(r.kind).toBe('options')
+    if (r.kind === 'options') {
+      expect(r.recommendation).toBe('Postgres')
+      expect(r.stripped).toContain('✅ Recommended: Postgres')
+      expect(r.options[0]!.recommended).toBe(true)
+    }
+  })
+
+  test('small short choices share a row; >3 or long choices stack', () => {
+    const small = questionRenderSpec('Pick one:\n1. A\n2. B\n3. C')
+    const many = questionRenderSpec('Pick one:\n1. A\n2. B\n3. C\n4. D')
+    const long = questionRenderSpec(`Pick one:\n1. ${'long label '.repeat(4)}\n2. B`)
+    expect(small.kind === 'options' && small.vertical).toBe(false)
+    expect(many.kind === 'options' && many.vertical).toBe(true)
+    expect(long.kind === 'options' && long.vertical).toBe(true)
+  })
+
+  test('long lists use a numbered typed-reply fallback', () => {
+    const list = Array.from({ length: 9 }, (_, i) => `${i + 1}. option ${i + 1}`).join('\n')
+    const r = questionRenderSpec(`Choose one:\n${list}`)
+    expect(r.kind).toBe('free_text')
+    if (r.kind === 'free_text') expect(r.placeholder).toContain('1-9')
+  })
+})
+
 describe('OPT_RE — callback_data shape', () => {
   test('matches opt:<index>', () => {
     expect(OPT_RE.exec('opt:0')?.[1]).toBe('0')
@@ -77,5 +127,19 @@ describe('tna.ts parity — base and forks byte-identical', () => {
   test('all forks match base', () => {
     const base = read('telegram')
     for (const p of PLUGINS.slice(1)) expect(read(p)).toBe(base)
+  })
+})
+
+describe('question renderer golden parity — all six bridges', () => {
+  const PLUGINS = ['telegram', 'telegram-grok', 'telegram-codex', 'telegram-agy', 'telegram-opencode', 'telegram-pi']
+  const sharedQuestionSource = (p: string) => {
+    const src = readFileSync(join(import.meta.dir, '..', 'plugins', p, 'tna.ts'), 'utf8')
+    const start = src.indexOf('export interface ParsedOption')
+    const end = src.indexOf('// DIVE-1115:', start)
+    return src.slice(start, end >= 0 ? end : undefined).trim()
+  }
+  test('shared question-render code is byte-identical', () => {
+    const golden = sharedQuestionSource(PLUGINS[0]!)
+    for (const p of PLUGINS.slice(1)) expect(sharedQuestionSource(p)).toBe(golden)
   })
 })
