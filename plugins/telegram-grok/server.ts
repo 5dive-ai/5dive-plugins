@@ -2412,6 +2412,13 @@ if (SEND_ONLY) {
         + `${err instanceof Error ? err.message : String(err)}; retrying in ${wait}ms\n`,
       )
       await new Promise(r => setTimeout(r, wait))
+      // DIVE-1239: a 409 means another process is already polling this bot
+      // token. Re-run single-flight acquisition so we PARK behind a HEALTHY
+      // incumbent (fresh heartbeat) instead of thrashing getUpdates against it
+      // forever. Without this, a second server.ts spawned by the heartbeat/
+      // task/session re-arm path fights the boot poller indefinitely — two live
+      // pollers on one token = permanent 409 = the plugin goes deaf.
+      if (is409) await acquireSlot()
     }
   }
 })()

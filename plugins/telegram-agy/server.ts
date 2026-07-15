@@ -1636,9 +1636,7 @@ bot.on('callback_query:data', async ctx => {
     // --proof form (agent-forgeable). Any one accepted form suffices; decision none.
     // DIVE-1115: mark EVERY verified-human tap --human (allowFrom vetted the
     // tapper above) so decision/manual taps no longer record a bare agent name,
-    // which was invisible to the zero-human KPI. Previously this fork gated
-    // --human on approval/secret/manual and skipped it for decision. See
-    // tapEvidenceArgs.
+    // which was invisible to the zero-human KPI. See tapEvidenceArgs.
     const extraArgs = tapEvidenceArgs(humanProof)
     await run5dive(['task', 'answer', taskId, ...r.answerArgs, ...extraArgs, '--json'], 8000)
     await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
@@ -2340,6 +2338,13 @@ if (SEND_ONLY) {
         + `${err instanceof Error ? err.message : String(err)}; retrying in ${wait}ms\n`,
       )
       await new Promise(r => setTimeout(r, wait))
+      // DIVE-1239: a 409 means another process is already polling this bot
+      // token. Re-run single-flight acquisition so we PARK behind a HEALTHY
+      // incumbent (fresh heartbeat) instead of thrashing getUpdates against it
+      // forever. Without this, a second server.ts spawned by the heartbeat/
+      // task/session re-arm path fights the boot poller indefinitely — two live
+      // pollers on one token = permanent 409 = the plugin goes deaf.
+      if (is409) await acquireSlot()
     }
   }
 })()
