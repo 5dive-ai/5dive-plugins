@@ -262,3 +262,25 @@ describe.each([BASELINE, ...FORKS])('%s: oversized-send guard (DIVE-313/DIVE-119
     expect(src).toMatch(/delete p\.parse_mode/)
   })
 })
+
+// ---- orphaned-bridge exit on MCP parent disconnect (DIVE-1251) ----
+//
+// On /clear, a non-Claude TUI (codex/grok/agy) RE-INITS its MCP servers: it
+// disconnects this server.ts and spawns a fresh one, so the old process's stdin
+// hits EOF. The MCP SDK's StdioServerTransport only wires stdin 'data'/'error',
+// never 'end'/'close', so without an explicit EOF handler the orphaned pre-/clear
+// process lingers forever — it keeps holding the getUpdates slot while the NEW
+// spawn parks in acquireSlot() behind it and never exits (one leaked bun process
+// per fresh heartbeat nudge). Each fork must exit its bridge on stdin EOF so the
+// slot frees for the current MCP-connected spawn. The baseline (Claude) is exempt:
+// Claude Code's /clear keeps MCP servers running, so it never respawns this bridge.
+describe.each(FORKS)('%s: exits orphaned bridge on MCP parent disconnect (DIVE-1251)', plugin => {
+  const src = read(plugin)
+  test('listens for stdin EOF (end/close) after wiring shutdown', () => {
+    expect(src).toMatch(/process\.stdin\.once\('end',/)
+    expect(src).toMatch(/process\.stdin\.once\('close',/)
+  })
+  test('the EOF handler routes through shutdown() (ownership-safe slot release)', () => {
+    expect(src).toMatch(/onParentDisconnect[\s\S]{0,200}?shutdown\(\)/)
+  })
+})
