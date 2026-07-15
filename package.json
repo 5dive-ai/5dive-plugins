@@ -1,0 +1,17 @@
+{
+  "name": "telegram-pi-bridge",
+  "version": "0.1.0",
+  "description": "Run your pi coding agent on Telegram — a long-running relay that hosts pi via its in-process SDK, with a permission gate on every mutating tool (bash/write/edit).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": { "telegram-pi-bridge": "./server.ts", "telegram-pi-pair": "./pair.ts" },
+  "scripts": {
+    "start": "bun install --no-summary && bun server.ts",
+    "typecheck": "bun build ./server.ts ./pair.ts --target bun --outdir /tmp/tpi-build >/dev/null",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "grammy": "^1.21.0",
+    "@earendil-works/pi-coding-agent": "^0.80.6"
+  }
+}
