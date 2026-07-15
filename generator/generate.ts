@@ -41,8 +41,11 @@ const BASE = 'telegram-grok'
 const BASE_DIR = join(PLUGINS, BASE)
 
 // Files the generator owns and asserts byte-exact in --check. node_modules /
-// bun.lock are produced by `bun install` at boot (package.json `start` runs it),
-// so we never copy them.
+// bun.lock are produced by `bun install --production` at STAGE time (install.sh,
+// as the claude user), NOT at boot — the `start` script is just `bun server.ts`
+// (DIVE-1266: a boot-time `bun install` run as the agent user EEXIST-fails on the
+// claude-owned node_modules and blocks server.ts, so the bridge never boots).
+// Either way we never copy node_modules/bun.lock.
 const COPY_FILES = [
   'server.ts',
   'tna.ts',
