@@ -27,6 +27,7 @@ import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs } from './tna'
+import { startsWithWhInterrogative } from './yes-no'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import {
   appendMessage as msglogAppend,
@@ -1003,6 +1004,9 @@ function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboa
   // Isolate the trailing question (last sentence/line) and skip "... or ...?".
   const lastQ = trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? ''
   if (/\bor\b/i.test(lastQ)) return { stripped: text }
+  // Open wh-questions cannot be answered Yes/No. Without this guard, friendly
+  // closers such as "What can I help you with?" received nonsensical buttons.
+  if (startsWithWhInterrogative(lastQ)) return { stripped: text }
   return {
     stripped: text,
     keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),

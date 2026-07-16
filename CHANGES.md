@@ -1,5 +1,14 @@
 ## v0.5.18
 
+### Fixed — auto Yes/No buttons skip open wh-questions (DIVE-1335)
+
+The DIVE-332 detector treated any reply ending in one question mark as a
+yes/no-style prompt, so conversational closers such as "What can I help you
+with?" received nonsensical Yes/No buttons. The trailing-question guard now
+rejects `what/which/who/whom/whose/where/when/why/how` while retaining existing
+single-question, `or`, and opt-out behavior. Covered by a focused unit matrix
+that also pins true yes/no starters (`is/are/do/can/should`).
+
 ### Fixed — auto-resume prompt gates its "reply to the latest message" clause on a real unanswered inbound (DIVE-1332)
 
 The three Telegram resume paths (usage-limit reset, transient API error, account
