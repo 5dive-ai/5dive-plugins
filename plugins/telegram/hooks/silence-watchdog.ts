@@ -23,9 +23,12 @@ import { readPayload } from './lib/payload'
 import { loadAccess } from './lib/access'
 import { loadSilence, saveSilence } from './lib/state'
 import { emitPostToolContext } from './lib/output'
+import { readEntries, analyzeTurn } from './lib/transcript'
+import { TG_TOOL_PREFIX } from './lib/paths'
 
-// Drain stdin so claude's pipe doesn't hang. We don't need the payload.
-await readPayload()
+// Drain stdin. We only need transcript_path (for the DIVE-1323 a2a-turn
+// check below); the rest is unused.
+const payload = await readPayload<{ transcript_path?: string }>()
 
 // First-fire silence threshold (seconds since last reply). Lower = the agent
 // is forced to ack sooner; higher = quieter but more perceived silence. The
@@ -74,6 +77,22 @@ if (inConversation) {
     } else if (now - lastReminder >= 60) {
       shouldFire = true
     }
+  }
+}
+
+// DIVE-1323: never nag the agent to DM the human on an inter-agent (a2a)
+// turn — its reply belongs on the a2a channel (`5dive agent send`), not the
+// paired human's DM. The read is gated on shouldFire so we only touch the
+// transcript when a nag is actually imminent (this hook runs after EVERY tool
+// call). Fail-open: if we can't read/parse, keep the existing nag so the
+// human-liveness ack is never silently dropped.
+if (shouldFire && payload.transcript_path) {
+  try {
+    if (analyzeTurn(readEntries(payload.transcript_path), TG_TOOL_PREFIX).a2aTurn) {
+      shouldFire = false
+    }
+  } catch {
+    // ignore — fall through and fire as before
   }
 }
 

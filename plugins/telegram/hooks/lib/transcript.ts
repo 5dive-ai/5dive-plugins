@@ -95,7 +95,21 @@ export type TurnAnalysis = {
   lastChatId: string | null
   lastMessageId: string | null
   lastThreadId: string | null
+  // DIVE-1323: this turn was triggered by an inter-agent (a2a) envelope
+  // `[5dive-msg from=X ...]` (injected via UserPromptSubmit, carries no
+  // telegram <channel> tag) AND no human telegram inbound landed in the turn.
+  // Such a turn's reply belongs back on the a2a channel (`5dive agent send`),
+  // NOT the paired human's DM — so both the silence-watchdog nag and the
+  // stop-reply-check relay must be suppressed for it. A MIXED turn (a2a start
+  // + a human DM arriving mid-turn) sets hadInbound=true → a2aTurn=false, so
+  // the human is still answered.
+  a2aTurn: boolean
 }
+
+// Matches the inter-agent envelope prefix that `5dive agent send` injects as
+// the turn's opening user prompt, e.g. `[5dive-msg from=main id=abc tier=...]`.
+// Anchored to `from=` so a stray literal in human prose can't false-positive.
+const A2A_ENVELOPE_RE = /\[5dive-msg\s+from=\S+/
 
 export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnAnalysis {
   // Find turn start.
@@ -108,6 +122,15 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
     }
   }
   const turn = entries.slice(turnStart)
+
+  // DIVE-1323: capture the turn-opening prompt string to detect an a2a
+  // envelope. turnStart is the most-recent type=user with STRING content —
+  // exactly where `5dive agent send` drops its `[5dive-msg from=X]` header.
+  const turnStartContent =
+    typeof entries[turnStart]?.message?.content === 'string'
+      ? (entries[turnStart].message!.content as string)
+      : ''
+  const a2aTurnStart = A2A_ENVELOPE_RE.test(turnStartContent)
 
   // Match the full opening tag, then pull chat_id / message_id /
   // message_thread_id from within it. chat_id is -?\d+ so negative group
@@ -160,7 +183,11 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
     }
   }
 
-  return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId, lastThreadId }
+  // a2a turn = opened by an a2a envelope AND no human telegram inbound landed
+  // anywhere in the turn (a mid-turn human DM flips hadInbound → still reply).
+  const a2aTurn = a2aTurnStart && !hadInbound
+
+  return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId, lastThreadId, a2aTurn }
 }
 
 // Scan transcript entries past a given line index for any telegram tool

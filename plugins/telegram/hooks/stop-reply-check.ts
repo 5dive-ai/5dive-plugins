@@ -204,6 +204,14 @@ if (payload.stop_hook_active === true) {
 // Normal path: analyze current turn.
 const a = analyzeTurn(entries, TG_TOOL_PREFIX)
 
+// DIVE-1323: an inter-agent (a2a) turn's reply belongs on the a2a channel
+// (`5dive agent send`), never the paired human's DM — so never auto-relay its
+// transcript text or block the Stop for a "missing" human reply. hadInbound is
+// already false for such a turn (the guard below would exit too), but assert
+// it explicitly so the golden tripwire can lock the invariant against a future
+// analyzeTurn refactor that might change turn-boundary detection.
+if (a.a2aTurn) process.exit(0)
+
 // Proceed only if there was a Telegram inbound this turn and we know which
 // chat to send to.
 if (!a.hadInbound || !a.lastChatId || !getToken()) process.exit(0)
