@@ -21,6 +21,7 @@ import { readEntries, findRateLimitText } from './lib/transcript'
 import { getAllowedChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
+import { resumePrompt } from './lib/resume-prompt'
 import { parseResetEpoch } from './lib/time'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
@@ -484,17 +485,17 @@ function tryRotate(resetEpoch: number | null): { from: string; to: string } | nu
   // so without line 2 the swapped-in account would carry full context yet never
   // answer the in-flight turn. 5dive-agent-start reads line 2 and appends it as
   // the first interactive prompt, so the new account picks up automatically.
-  // The prompt is "continue and reply to the latest message", not a bare
-  // "continue": when the interrupted turn was an unanswered user DM (not a
-  // multi-step task), bare "continue" makes the model hunt for in-progress work,
-  // find none, and stay silent — so it never answers the user. The explicit
-  // "reply to the latest message" covers both cases (finish the task AND answer
-  // the pending message). Manual /resume omits line 2 and stays idle (unchanged).
+  // Line 2 is resumePrompt(): "continue and reply to the latest message" only
+  // when there is a genuine unanswered inbound (lastInbound > lastReply), else a
+  // bare "continue". When the interrupted turn was an unanswered user DM, the
+  // reply clause makes the swapped-in account answer it; when it was autonomous
+  // work with an empty inbox, the bare "continue" avoids the phantom-prompt
+  // escalation (DIVE-1332/1316). Manual /resume omits line 2 and stays idle.
   const marker = join(STATE_DIR, 'resume-next')
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     const tmp = `${marker}.tmp.${process.pid}`
-    writeFileSync(tmp, sessionId + '\ncontinue and reply to the latest message\n', { mode: 0o600 })
+    writeFileSync(tmp, sessionId + '\n' + resumePrompt() + '\n', { mode: 0o600 })
     renameSync(tmp, marker)
   } catch {
     return null

@@ -1,4 +1,24 @@
-## v0.5.17
+## v0.5.18
+
+### Fixed — auto-resume prompt gates its "reply to the latest message" clause on a real unanswered inbound (DIVE-1332)
+
+The three Telegram resume paths (usage-limit reset, transient API error, account
+rotation) all typed the hardcoded string "continue and reply to the latest
+message" into claude on recovery, even when the interrupted turn was autonomous
+work with NO pending DM. With no message to answer, the model escalated hunting
+for a referent — the phantom-prompt bug diagnosed in DIVE-1316, which hit
+community and olivia on 2026-07-16 (driven by the blind-resume retry loop,
+independent of heartbeat interval).
+
+- New shared `resumePrompt()` helper (`hooks/lib/resume-prompt.ts`) reads the
+  silence state the plugin already tracks: it returns "continue and reply to the
+  latest message" only when `lastInboundAt > lastReplyAt` (a genuine unanswered
+  message), else a bare "continue".
+- Applied at all three sites: `resume-after-reset.ts`, `resume-after-error.ts`,
+  and `stopfailure-notify.ts` (the `resume-next` marker line 2).
+- Covered by `test/resume-prompt.test.ts` (empty inbox, already-replied, equal
+  stamps, and genuine-unanswered cases). Claude-Code-only hooks — forks
+  unaffected; generator parity stays green.
 
 ### Fixed — telegram taps record human provenance on every gate type, not just hard gates (DIVE-1115)
 

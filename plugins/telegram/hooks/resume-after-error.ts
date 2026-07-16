@@ -23,6 +23,7 @@ import { unlinkSync, utimesSync } from 'fs'
 import { capturePaneFor, sendKeys, type TmuxCtx } from './lib/tmux'
 import { sendMessage } from './lib/telegram'
 import { readEntries } from './lib/transcript'
+import { resumePrompt } from './lib/resume-prompt'
 
 const socket = process.argv[2] ?? ''
 const target = process.argv[3] ?? ''
@@ -97,7 +98,7 @@ function paneStillErrored(pane: string): boolean {
 async function attemptResume(): Promise<boolean> {
   if (!ctx) return false
   const baseline = transcriptLen()
-  sendKeys(ctx, 'continue and reply to the latest message', 'Enter')
+  sendKeys(ctx, resumePrompt(), 'Enter')
   for (let i = 0; i < VERIFY_POLLS; i++) {
     await sleep(VERIFY_STEP_MS)
     if (transcriptPath) {

@@ -32,6 +32,7 @@ import { capturePaneFor, sendKeys, type TmuxCtx } from './lib/tmux'
 import { sendMessage } from './lib/telegram'
 import { readEntries } from './lib/transcript'
 import { parseResetEpoch } from './lib/time'
+import { resumePrompt } from './lib/resume-prompt'
 
 const resetEpoch = parseInt(process.argv[2] ?? '0', 10) || 0
 const socket = process.argv[3] ?? ''
@@ -163,7 +164,7 @@ async function attemptResume(): Promise<boolean> {
     sendKeys(ctx, '1', 'Enter')
     await sleep(2000)
   }
-  sendKeys(ctx, 'continue and reply to the latest message', 'Enter')
+  sendKeys(ctx, resumePrompt(), 'Enter')
   for (let i = 0; i < VERIFY_POLLS; i++) {
     await sleep(VERIFY_STEP_MS)
     if (transcriptPath) {
