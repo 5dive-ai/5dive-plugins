@@ -101,6 +101,15 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     scope: 'paired-5dive',
   },
   {
+    // /inbox (DIVE-1334) — list PENDING human gates so none slip. Read-only
+    // card list wrapping `5dive task inbox`; each row deep-links to /task_<id>
+    // and the footer points at the DIVE-1305 channel-proof clear ("approve
+    // DIVE-N" / "go with recs"). paired-5dive: hides + no-ops on non-5dive hosts.
+    name: 'inbox',
+    description: 'Pending human gates awaiting you',
+    scope: 'paired-5dive',
+  },
+  {
     name: 'heartbeat',
     description: 'Heartbeat schedule',
     scope: 'paired-5dive',

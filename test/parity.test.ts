@@ -98,7 +98,7 @@ const GOLDEN_ACCESS_FIELDS = ['allowFrom', 'groups', 'pending', 'dmPolicy']
 // may need a new command or a description sync.
 const GOLDEN_BASELINE_MENU = [
   'help', 'status', 'context', 'stop', 'restart', 'clear', 'checkpoint', 'resume',
-  'agents', 'team', 'tasks', 'heartbeat', 'task', 'org', 'update', 'model', 'account', 'login', 'usage', 'goal',
+  'agents', 'team', 'tasks', 'inbox', 'heartbeat', 'task', 'org', 'update', 'model', 'account', 'login', 'usage', 'goal',
   // DIVE-624: /digest is baseline-first (claude plugin). Forks track it in a follow-up
   // port; until then it's an intended baseline-only addition to the menu.
   'digest',

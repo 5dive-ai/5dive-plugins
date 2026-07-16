@@ -2953,6 +2953,18 @@ const commandHandlers: Record<string, CommandHandler> = {
     await ctx.reply(await buildTaskList())
   },
 
+  // /inbox (DIVE-1334) — list PENDING human gates so lodar never misses one.
+  // Read-only card list from `5dive task inbox`; each card carries a tappable
+  // /task_<id> deep link (opens the detail) and the footer points at the
+  // DIVE-1305 channel-proof clear ("approve DIVE-N" / "go with recs") which
+  // clears tier<2 gates. Per-gate tap-to-act rides those existing verified
+  // handlers rather than re-minting the DIVE-916 per-gate nonce (not derivable
+  // here); tier-2 hard gates (money/secret/destructive/brand) keep their own
+  // per-gate button tap or a "clear on dashboard" note.
+  inbox: async ctx => {
+    await ctx.reply(await buildInboxList())
+  },
+
   // /heartbeat — per-agent heartbeat schedule from `5dive heartbeat ls`.
   // Read-only mirror of /tasks; paired-5dive (wraps a `sudo 5dive` subcommand,
   // so it's hidden + no-ops on upstream-only hosts).
@@ -3370,6 +3382,61 @@ async function buildTaskList(): Promise<string> {
     sections.push(clampList('Open tasks · ⭐ = yours · tap /task_N to open:\n\n', lines, rest.length))
   }
   return sections.join('\n\n')
+}
+
+// --- /inbox (DIVE-1334): pending human gates so none are missed ---
+// Renders one compact card per PENDING human gate from `5dive task inbox`.
+// A gate is "pending" when it carries a need_type and has not been answered
+// (need_answer null/absent) — mirrors the `task ls` need_type flag used by the
+// /tasks "Needs you" section, but sourced from the dedicated inbox view. Every
+// gate here awaits the paired human (they all ping lodar), so we don't filter
+// by assignee. Read-only: acting on a gate rides /task_<id> (deep link) or the
+// DIVE-1305 channel-proof replies. clampList keeps the send under 4096.
+function inboxCard(t: any): string {
+  const flag = '⛔ '
+  const type = t.need_type ? ` [${t.need_type}]` : ''
+  const who = t.assignee ? ` (${String(t.assignee).replace(/^agent-/, '')})` : ''
+  let title = String(t.title ?? '')
+  if (title.length > 70) title = title.slice(0, 69) + '…'
+  const parts = [`${flag}${t.ident}${type} · ${title}${who}`]
+  if (t.recommend) parts.push(`   ⭐ rec: ${String(t.recommend)}`)
+  if (t.need_options) parts.push(`   options: ${String(t.need_options)}`)
+  if (t.ask) {
+    let ask = String(t.ask).replace(/\s+/g, ' ').trim()
+    if (ask.length > 200) ask = ask.slice(0, 199) + '…'
+    parts.push(`   ${ask}`)
+  }
+  parts.push(`   → /task_${t.id}`)
+  return parts.join('\n')
+}
+
+async function buildInboxList(): Promise<string> {
+  let j: any
+  try {
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'inbox', '--json'], { timeout: 8000 })
+    j = JSON.parse(stdout)
+  } catch (err) {
+    return `Failed to load inbox: ${err instanceof Error ? err.message : String(err)}`
+  }
+  if (!j.ok || !Array.isArray(j.data?.inbox)) return '5dive returned unexpected output.'
+  const pending = j.data.inbox.filter((t: any) => t.need_type && !t.need_answer)
+  if (pending.length === 0) {
+    return 'No pending gates 🎉\n\nNothing needs a human right now. You\'re all caught up.'
+  }
+  // Trailing "\n" per card → clampList's single-"\n" join yields a blank line
+  // between cards, so multi-line cards read as distinct blocks.
+  const cards = pending.map((t: any) => inboxCard(t) + '\n')
+  const header =
+    `🔔 ${pending.length} gate${pending.length === 1 ? '' : 's'} awaiting you. Tap /task_N to open one:\n\n`
+  // DIVE-1334 list + DIVE-1305 quick-clear. clear-recs is live on the host
+  // (CLI 0.9.23), so the bulk-clear handler below is armed: replying "go with
+  // recs" applies each tier<2 gate's recommendation. Tier-2 hard gates
+  // (money/secret/destructive/brand) still keep their per-gate button tap.
+  const footer =
+    `\n\nReply "go with recs" to apply the ⭐ recommendation on every clearable gate, ` +
+    `or "approve DIVE-N" for one. Hard gates (money/secret/destructive/brand) keep ` +
+    `their per-gate Approve/Deny tap. You can also act on the dashboard.`
+  return clampList(header, cards, pending.length) + footer
 }
 
 // --- /heartbeat: per-agent heartbeat schedule (`5dive heartbeat ls`) ---
@@ -4189,6 +4256,53 @@ bot.on('callback_query:data', async ctx => {
   if (msg && 'text' in msg && msg.text) {
     await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
   }
+})
+
+// DIVE-1305: paired-human bulk-clear. When the paired human types "go with recs"
+// (or "approve DIVE-1234" / "approve all") in their OWN DM, honor it as a human
+// clear of the pending gates — applying each gate's --recommend — instead of
+// making them tap every gate. The sender being in allowFrom (a paired DM) IS the
+// human proof: we pass the verified chat_id to `task clear-recs --channel-proof`,
+// which re-verifies it against access.json and clears ONLY tier<2 agent-clearable
+// gates (tier-2 hard money/destructive/secret/brand gates keep their per-gate
+// tap, lodar's DIVE-1305 decision). Private chat only — "own channel" is a DM,
+// not a group. Registered BEFORE the message bridge so it isn't forwarded to the
+// agent as a normal message. Anchored patterns (^…$) so we never hijack a
+// sentence that merely contains "approve".
+const BULK_RECS_RE = /^\s*(?:go with (?:the |your )?recs(?:ommendations)?|approve all|clear all(?: gates)?)\s*[.!]?\s*$/i
+const APPROVE_ONE_RE = /^\s*approve\s+(DIVE-\d+|\d+)\s*[.!]?\s*$/i
+bot.hears([BULK_RECS_RE, APPROVE_ONE_RE], async ctx => {
+  if (ctx.chat?.type !== 'private') return // "your own channel" = a DM, never a group
+  const senderId = String(ctx.from?.id ?? '')
+  if (!loadAccess().allowFrom.includes(senderId)) return
+  if (!(await read5diveVersion())) return // 5dive-only surface; no-op on OSS hosts
+  const text = ctx.message?.text ?? ''
+  const one = APPROVE_ONE_RE.exec(text)
+  const args = ['task', 'clear-recs', `--channel-proof=${senderId}`, '--json']
+  if (one) args.push(`--only=${one[1]}`)
+  const j = await read5diveJson(args, 8000)
+  if (!j?.ok) {
+    await ctx.reply(
+      one
+        ? `Couldn't clear ${one[1]} — it may be a hard gate (money/destructive/secret/brand) that still needs a button tap, or already answered. Open it: /task_${String(one[1]).replace(/^DIVE-/, '')}`
+        : `Couldn't apply recommendations right now. ${String(j?.error?.message ?? '').slice(0, 160)}`.trim(),
+    )
+    return
+  }
+  const cleared = Number(j.data?.cleared ?? 0)
+  const gates: string[] = Array.isArray(j.data?.gates) ? j.data.gates : []
+  if (cleared === 0) {
+    await ctx.reply(
+      one
+        ? `Nothing to clear on ${one[1]} — it's either already answered or a hard gate that keeps its per-gate tap.`
+        : `No agent-clearable gates pending. (Hard money/destructive/secret/brand gates keep their per-gate tap — open /tasks to act on those.)`,
+    )
+    return
+  }
+  await ctx.reply(
+    `✅ Applied your recommendations to ${cleared} gate${cleared === 1 ? '' : 's'}: ${gates.join(', ')}.` +
+      `\n\nHard gates (money/destructive/secret/brand), if any, still need a per-gate tap — see /tasks.`,
+  )
 })
 
 // /task_<id> — tappable deep link from the /tasks list. Opens the single-task

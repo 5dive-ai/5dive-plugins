@@ -1,3 +1,20 @@
+## v0.5.19
+
+### Added — /inbox lists pending human gates, with one-reply quick-clear (DIVE-1334 / DIVE-1356)
+
+`/inbox` renders one compact card per PENDING human gate from `5dive task inbox`
+so the paired human never misses one: ident, type, the ⭐ recommendation, options,
+an ask snippet, and a tappable `/task_<id>` deep link. Empty inbox reads
+`No pending gates 🎉`. Sourced read-only via `sudo 5dive task inbox --json`,
+`paired-5dive`-scoped so it hides and no-ops on non-5dive hosts.
+
+Ships together with the DIVE-1305 channel-proof bulk-clear handler (now unblocked:
+clear-recs is live in CLI 0.9.23): replying "go with recs" / "approve all" in the
+paired DM applies each tier<2 gate's `--recommend`, and "approve DIVE-N" clears one.
+The paired-DM sender IS the human proof (re-verified against access.json via
+`--channel-proof`). Tier-2 hard gates (money/secret/destructive/brand) keep their
+per-gate Approve/Deny button tap.
+
 ## v0.5.18
 
 ### Fixed — auto-resume prompt gates its "reply to the latest message" clause on a real unanswered inbound (DIVE-1332)
