@@ -1,7 +1,7 @@
 {
   "name": "telegram-pi",
   "description": "Telegram channel for the pi CLI (earendil-works/pi-coding-agent) — a long-running relay that HOSTS pi in-process via its SDK (createAgentSession), with access control, pairing, streaming edit-in-place, and a sandboxed-by-default permission gate. pi ships no permission system of its own, so every mutating tool (bash/write/edit) is gated behind a Telegram once/always/reject tap via pi's extension tool_call block-hook. A fourth run-model distinct from claude (--channels), codex/grok/agy (MCP+config), and opencode (HTTP relay). Maintained by 5dive.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": { "name": "5dive", "email": "support@5dive.com" },
   "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram-pi",
   "keywords": ["telegram", "messaging", "channel", "pi", "pi-coding-agent", "relay", "sdk", "sandbox"]

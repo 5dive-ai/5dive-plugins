@@ -86,7 +86,7 @@ const has = (src: string, sym: string) => new RegExp(`\\b${sym}\\b`).test(src)
 // /login is claude-base-only for 0.5.0 (DIVE-378/380) — the forks self-poll and
 // have no verified cred-path, so the command is stripped from their menus.
 const GOLDEN_FORK_COMMANDS = [
-  'help', 'status', 'stop', 'restart', 'agents', 'team', 'tasks', 'task', 'org', 'model', 'ping', 'start',
+  'help', 'status', 'stop', 'restart', 'agents', 'team', 'tasks', 'inbox', 'task', 'org', 'model', 'ping', 'start',
 ]
 const GOLDEN_FORK_MCP_TOOLS = ['wait_for_message', 'reply', 'edit_message', 'react', 'download_attachment']
 // DIVE-1028: recent_messages (rolling message-log recovery) is a baseline-only

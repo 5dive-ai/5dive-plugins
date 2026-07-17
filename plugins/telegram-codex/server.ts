@@ -638,6 +638,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string; menuHidden?: b
   { command: 'agents',  description: 'Team' },
   { command: 'team',    description: 'Team (alias for /agents)', menuHidden: true },
   { command: 'tasks',   description: 'List open tasks' },
+  { command: 'inbox',   description: 'Pending human gates awaiting you' },
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
   { command: 'model',   description: 'Pick model' },
@@ -1299,6 +1300,14 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         })
         return true
       }
+      case 'inbox': {
+        // /inbox (DIVE-1334/1371) — list PENDING human gates so none slip.
+        // Plain text (no parse_mode) so the /task_N deep links stay tappable.
+        await bot.api.sendMessage(chat_id, await buildInboxList(), {
+          ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+        })
+        return true
+      }
       case 'task':
         await md(await addTask(cmdArg, ctx.from?.username || 'telegram'))
         return true
@@ -1388,6 +1397,107 @@ async function ingest(
     ...(attachment ? { attachment } : {}),
   })
 }
+
+// --- /inbox (DIVE-1334/1371): pending human gates so none are missed ---
+// Renders one compact card per PENDING human gate from `5dive task inbox`.
+// A gate is "pending" when it carries a need_type and has not been answered
+// (need_answer null/absent). Every gate here awaits the paired human, so we
+// don't filter by assignee. Read-only: acting on a gate rides /task_<id> (deep
+// link) or the DIVE-1305 channel-proof replies below. clampList keeps < 4096.
+function inboxCard(t: any): string {
+  const flag = '⛔ '
+  const type = t.need_type ? ` [${t.need_type}]` : ''
+  const who = t.assignee ? ` (${String(t.assignee).replace(/^agent-/, '')})` : ''
+  let title = String(t.title ?? '')
+  if (title.length > 70) title = title.slice(0, 69) + '…'
+  const parts = [`${flag}${t.ident}${type} · ${title}${who}`]
+  if (t.recommend) parts.push(`   ⭐ rec: ${String(t.recommend)}`)
+  if (t.need_options) parts.push(`   options: ${String(t.need_options)}`)
+  if (t.ask) {
+    let ask = String(t.ask).replace(/\s+/g, ' ').trim()
+    if (ask.length > 200) ask = ask.slice(0, 199) + '…'
+    parts.push(`   ${ask}`)
+  }
+  parts.push(`   → /task_${t.id}`)
+  return parts.join('\n')
+}
+
+async function buildInboxList(): Promise<string> {
+  let j: { ok: boolean; data?: any; error?: { message?: string } }
+  try {
+    j = await run5dive(['task', 'inbox', '--json'])
+  } catch (err) {
+    return `Failed to load inbox: ${err instanceof Error ? err.message : String(err)}`
+  }
+  if (!j.ok || !Array.isArray(j.data?.inbox)) return '5dive returned unexpected output.'
+  const pending = j.data.inbox.filter((t: any) => t.need_type && !t.need_answer)
+  if (pending.length === 0) {
+    return 'No pending gates 🎉\n\nNothing needs a human right now. You\'re all caught up.'
+  }
+  // Trailing "\n" per card → clampList's single-"\n" join yields a blank line
+  // between cards, so multi-line cards read as distinct blocks.
+  const cards = pending.map((t: any) => inboxCard(t) + '\n')
+  const header =
+    `🔔 ${pending.length} gate${pending.length === 1 ? '' : 's'} awaiting you. Tap /task_N to open one:\n\n`
+  // To ANSWER a gate: use its original alert's Approve/Deny buttons, the
+  // dashboard, or the one-tap quick-clear below ("go with recs" / "approve
+  // DIVE-N") which clears tier<2 gates via DIVE-1305 channel-proof.
+  const footer =
+    `\n\nTo clear the tier<2 gates fast, reply "go with recs" (or "approve DIVE-N"). ` +
+    `Hard money/destructive/secret/brand gates keep their per-gate button tap.`
+  return clampList(header, cards, pending.length) + footer
+}
+
+// DIVE-1305: paired-human bulk-clear. When the paired human types "go with recs"
+// (or "approve DIVE-1234" / "approve all") in their OWN DM, honor it as a human
+// clear of the pending gates — applying each gate's --recommend — instead of
+// making them tap every gate. The sender being in allowFrom (a paired DM) IS the
+// human proof: we pass the verified chat_id to `task clear-recs --channel-proof`,
+// which re-verifies it against access.json and clears ONLY tier<2 agent-clearable
+// gates (tier-2 hard money/destructive/secret/brand gates keep their per-gate
+// tap). Private chat only — "own channel" is a DM, not a group. Registered
+// BEFORE the message bridge so it isn't forwarded to the agent as a normal
+// message. Anchored patterns (^…$) so we never hijack a sentence that merely
+// contains "approve". run5dive reject (no 5dive on host / OSS) → stay silent.
+const BULK_RECS_RE = /^\s*(?:go with (?:the |your )?recs(?:ommendations)?|approve all|clear all(?: gates)?)\s*[.!]?\s*$/i
+const APPROVE_ONE_RE = /^\s*approve\s+(DIVE-\d+|\d+)\s*[.!]?\s*$/i
+bot.hears([BULK_RECS_RE, APPROVE_ONE_RE], async ctx => {
+  if (ctx.chat?.type !== 'private') return // "your own channel" = a DM, never a group
+  const senderId = String(ctx.from?.id ?? '')
+  if (!loadAccess().allowFrom.includes(senderId)) return
+  const text = ctx.message?.text ?? ''
+  const one = APPROVE_ONE_RE.exec(text)
+  const args = ['task', 'clear-recs', `--channel-proof=${senderId}`, '--json']
+  if (one) args.push(`--only=${one[1]}`)
+  let j: { ok: boolean; data?: any; error?: { message?: string } }
+  try {
+    j = await run5dive(args, 8000)
+  } catch {
+    return // no 5dive on this host (OSS/standalone) — stay silent
+  }
+  if (!j?.ok) {
+    await ctx.reply(
+      one
+        ? `Couldn't clear ${one[1]} — it may be a hard gate (money/destructive/secret/brand) that still needs a button tap, or already answered. Open it: /task_${String(one[1]).replace(/^DIVE-/, '')}`
+        : `Couldn't apply recommendations right now. ${String(j?.error?.message ?? '').slice(0, 160)}`.trim(),
+    )
+    return
+  }
+  const cleared = Number(j.data?.cleared ?? 0)
+  const gates: string[] = Array.isArray(j.data?.gates) ? j.data.gates : []
+  if (cleared === 0) {
+    await ctx.reply(
+      one
+        ? `Nothing to clear on ${one[1]} — it's either already answered or a hard gate that keeps its per-gate tap.`
+        : `No agent-clearable gates pending. (Hard money/destructive/secret/brand gates keep their per-gate tap — open /tasks to act on those.)`,
+    )
+    return
+  }
+  await ctx.reply(
+    `✅ Applied your recommendations to ${cleared} gate${cleared === 1 ? '' : 's'}: ${gates.join(', ')}.` +
+      `\n\nHard gates (money/destructive/secret/brand), if any, still need a per-gate tap — see /tasks.`,
+  )
+})
 
 // /task_<id> — tappable deep link from the /tasks list. Opens the single-task
 // detail. Registered BEFORE the message bridge so the tap is handled here and
