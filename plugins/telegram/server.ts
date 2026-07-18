@@ -1276,48 +1276,80 @@ if (SEND_ONLY) {
   const RELAY_IN_DIR = join(STATE_DIR, 'relay-in')
   mkdirSync(RELAY_IN_DIR, { recursive: true, mode: 0o700 })
   const seen = new Set<string>()
-  const drainRelayIn = () => {
-    let paths: string[]
+  let draining = false
+  const drainRelayIn = async () => {
+    if (draining) return // never overlap: a slow clear-recs shell must not double-drain
+    draining = true
     try {
-      paths = readdirSync(RELAY_IN_DIR)
-        .filter(f => f.endsWith('.json'))
-        .map(f => join(RELAY_IN_DIR, f))
-        .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
-    } catch {
-      return
-    }
-    for (const path of paths) {
-      let p: any
+      let paths: string[]
       try {
-        p = JSON.parse(readFileSync(path, 'utf8'))
+        paths = readdirSync(RELAY_IN_DIR)
+          .filter(f => f.endsWith('.json'))
+          .map(f => join(RELAY_IN_DIR, f))
+          .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
       } catch {
-        try { rmSync(path) } catch {} // unparseable — drop it, don't wedge the queue
-        continue
+        return
       }
-      const id = String(p.id ?? path)
-      if (!seen.has(id)) {
-        seen.add(id)
-        mcp.notification({
-          method: 'notifications/claude/channel',
-          params: {
-            content: String(p.content ?? ''),
-            meta: {
-              chat_id: String(p.chat_id),
-              ...(p.message_id != null ? { message_id: String(p.message_id) } : {}),
-              ...(p.message_thread_id != null ? { message_thread_id: String(p.message_thread_id) } : {}),
-              user: String(p.user ?? 'team'),
-              ...(p.user_id != null ? { user_id: String(p.user_id) } : {}),
-              ts: String(p.ts ?? new Date().toISOString()),
-              ...(p.image_path ? { image_path: String(p.image_path) } : {}),
-            },
-          },
-        }).catch((err: unknown) => {
-          process.stderr.write(`telegram channel: relay-in deliver failed: ${err}\n`)
-        })
+      for (const path of paths) {
+        let p: any
+        try {
+          p = JSON.parse(readFileSync(path, 'utf8'))
+        } catch {
+          try { rmSync(path) } catch {} // unparseable — drop it, don't wedge the queue
+          continue
+        }
+        const id = String(p.id ?? path)
+        if (!seen.has(id)) {
+          seen.add(id)
+          // DIVE-1428: honor a registered human's gate-clear reply ("go with recs"
+          // / "approve DIVE-N") sent in the team-bot RELAY chat. In SEND_ONLY mode
+          // the bot never polls, so the bot.hears trigger never runs here — without
+          // this the reply is forwarded to the agent and dies (the agent is barred
+          // from self-clearing gates, anti-forge). Proof = p.user_id in allowFrom
+          // (the human's Telegram id, re-verified CLI-side) — NOT the group chat_id.
+          // A handled reply is posted back and NOT forwarded to the agent.
+          let handledReply: string | null = null
+          if (p.user_id != null) {
+            try {
+              handledReply = await handleGateClearReply(String(p.content ?? ''), String(p.user_id))
+            } catch (err) {
+              process.stderr.write(`telegram channel: relay gate-clear failed: ${err}\n`)
+            }
+          }
+          if (handledReply) {
+            void bot.api
+              .sendMessage(String(p.chat_id), handledReply, {
+                ...(p.message_thread_id != null ? { message_thread_id: Number(p.message_thread_id) } : {}),
+              })
+              .catch((err: unknown) => {
+                process.stderr.write(`telegram channel: relay gate-clear reply failed: ${err}\n`)
+              })
+          } else {
+            mcp.notification({
+              method: 'notifications/claude/channel',
+              params: {
+                content: String(p.content ?? ''),
+                meta: {
+                  chat_id: String(p.chat_id),
+                  ...(p.message_id != null ? { message_id: String(p.message_id) } : {}),
+                  ...(p.message_thread_id != null ? { message_thread_id: String(p.message_thread_id) } : {}),
+                  user: String(p.user ?? 'team'),
+                  ...(p.user_id != null ? { user_id: String(p.user_id) } : {}),
+                  ts: String(p.ts ?? new Date().toISOString()),
+                  ...(p.image_path ? { image_path: String(p.image_path) } : {}),
+                },
+              },
+            }).catch((err: unknown) => {
+              process.stderr.write(`telegram channel: relay-in deliver failed: ${err}\n`)
+            })
+          }
+        }
+        try { rmSync(path) } catch {} // ack: drop right after emit
       }
-      try { rmSync(path) } catch {} // ack: drop right after emit
+      if (seen.size > 1000) seen.clear() // keep the dedup set bounded
+    } finally {
+      draining = false
     }
-    if (seen.size > 1000) seen.clear() // keep the dedup set bounded
   }
   setInterval(drainRelayIn, 1500).unref()
 }
@@ -4268,38 +4300,47 @@ bot.on('callback_query:data', async ctx => {
 // sentence that merely contains "approve".
 const BULK_RECS_RE = /^\s*(?:go with (?:the |your )?recs(?:ommendations)?|approve all|clear all(?: gates)?)\s*[.!]?\s*$/i
 const APPROVE_ONE_RE = /^\s*approve\s+(DIVE-\d+|\d+)\s*[.!]?\s*$/i
-bot.hears([BULK_RECS_RE, APPROVE_ONE_RE], async ctx => {
-  if (ctx.chat?.type !== 'private') return // "your own channel" = a DM, never a group
-  const senderId = String(ctx.from?.id ?? '')
-  if (!loadAccess().allowFrom.includes(senderId)) return
-  if (!(await read5diveVersion())) return // 5dive-only surface; no-op on OSS hosts
-  const text = ctx.message?.text ?? ''
+
+// DIVE-1428: the clear-reply logic, shared between the polled bot.hears path (a
+// paired DM) and the SEND_ONLY team-bot RELAY path (drainRelayIn). Returns the
+// reply text to post back, or null if this message is not a gate-clear trigger,
+// the sender is not a registered human, or the host is not a 5dive box. The
+// `senderId` MUST be the human's Telegram *user* id — its membership in
+// access.json allowFrom IS the human proof (an agent can't forge it), and it is
+// re-verified CLI-side by `clear-recs --channel-proof`, which only ever clears
+// tier<2 gates (tier-2 money/destructive/secret/brand keep their per-gate tap).
+// A function declaration so it hoists above drainRelayIn, which is defined earlier
+// but only invokes it at interval time.
+async function handleGateClearReply(text: string, senderId: string): Promise<string | null> {
   const one = APPROVE_ONE_RE.exec(text)
+  if (!one && !BULK_RECS_RE.test(text)) return null // not a clear trigger
+  if (!senderId || !loadAccess().allowFrom.includes(senderId)) return null // not a registered human
+  if (!(await read5diveVersion())) return null // 5dive-only surface; no-op on OSS hosts
   const args = ['task', 'clear-recs', `--channel-proof=${senderId}`, '--json']
   if (one) args.push(`--only=${one[1]}`)
   const j = await read5diveJson(args, 8000)
   if (!j?.ok) {
-    await ctx.reply(
-      one
-        ? `Couldn't clear ${one[1]} — it may be a hard gate (money/destructive/secret/brand) that still needs a button tap, or already answered. Open it: /task_${String(one[1]).replace(/^DIVE-/, '')}`
-        : `Couldn't apply recommendations right now. ${String(j?.error?.message ?? '').slice(0, 160)}`.trim(),
-    )
-    return
+    return one
+      ? `Couldn't clear ${one[1]} — it may be a hard gate (money/destructive/secret/brand) that still needs a button tap, or already answered. Open it: /task_${String(one[1]).replace(/^DIVE-/, '')}`
+      : `Couldn't apply recommendations right now. ${String(j?.error?.message ?? '').slice(0, 160)}`.trim()
   }
   const cleared = Number(j.data?.cleared ?? 0)
   const gates: string[] = Array.isArray(j.data?.gates) ? j.data.gates : []
   if (cleared === 0) {
-    await ctx.reply(
-      one
-        ? `Nothing to clear on ${one[1]} — it's either already answered or a hard gate that keeps its per-gate tap.`
-        : `No agent-clearable gates pending. (Hard money/destructive/secret/brand gates keep their per-gate tap — open /tasks to act on those.)`,
-    )
-    return
+    return one
+      ? `Nothing to clear on ${one[1]} — it's either already answered or a hard gate that keeps its per-gate tap.`
+      : `No agent-clearable gates pending. (Hard money/destructive/secret/brand gates keep their per-gate tap — open /tasks to act on those.)`
   }
-  await ctx.reply(
+  return (
     `✅ Applied your recommendations to ${cleared} gate${cleared === 1 ? '' : 's'}: ${gates.join(', ')}.` +
-      `\n\nHard gates (money/destructive/secret/brand), if any, still need a per-gate tap — see /tasks.`,
+    `\n\nHard gates (money/destructive/secret/brand), if any, still need a per-gate tap — see /tasks.`
   )
+}
+
+bot.hears([BULK_RECS_RE, APPROVE_ONE_RE], async ctx => {
+  if (ctx.chat?.type !== 'private') return // "your own channel" = a DM, never a group
+  const reply = await handleGateClearReply(ctx.message?.text ?? '', String(ctx.from?.id ?? ''))
+  if (reply) await ctx.reply(reply)
 })
 
 // /task_<id> — tappable deep link from the /tasks list. Opens the single-task
