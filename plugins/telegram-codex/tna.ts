@@ -113,6 +113,25 @@ export function optionChoices(text: string): ParsedOption[] {
   return CHOICE_CUE_RE.test(text ?? '') ? opts : []
 }
 
+// DIVE-332 / DIVE-1429: pure core of the Yes/No detector (sibling of optionChoices).
+// True when a message reads as a POLAR (yes/no) question, so server.ts should attach
+// the ✅Yes / ❌No keyboard. Fires ONLY on a single trailing '?', with no "A or B?"
+// choice and no wh-word opener (what/which/who/where/when/why/how). Wh-questions are
+// OPEN — a Yes/No answer can't address them — so 'here. what's up?' must NOT get
+// buttons (DIVE-1429: lodar hit that false keyboard three times). The suppress marker
+// (<!-- no-buttons -->) is handled by the caller, which strips it around this check.
+const WH_OPENER_RE = /^(what|which|who|whom|whose|where|when|why|how)\b/i
+export function yesNoChoice(text: string): boolean {
+  const trimmed = (text ?? '').trimEnd()
+  if (!trimmed.endsWith('?')) return false
+  if ((trimmed.match(/\?/g) ?? []).length !== 1) return false
+  // Isolate the trailing question (last sentence/line) and skip "... or ...?".
+  const lastQ = (trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? '').trim()
+  if (/\bor\b/i.test(lastQ)) return false
+  if (WH_OPENER_RE.test(lastQ)) return false
+  return true
+}
+
 // DIVE-1115: evidence flags a verified-human tap attaches to `5dive task answer`.
 // The caller (server.ts callback handler) only reaches here AFTER allowFrom has
 // vetted the tapper as an allow-listed human, so EVERY tap is marked --human for

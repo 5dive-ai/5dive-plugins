@@ -31,7 +31,7 @@
 
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { OPT_RE, optionChoices, parseOptions } from './tna'
+import { OPT_RE, optionChoices, parseOptions , yesNoChoice} from './tna'
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -454,11 +454,9 @@ function chunkForTelegram(text: string, limit = TG_MAX_MESSAGE_CHARS): string[] 
 const YN_SUPPRESS = /\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i
 function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboard } {
   if (YN_SUPPRESS.test(text)) return { stripped: text.replace(YN_SUPPRESS, '') }
-  const trimmed = text.trimEnd()
-  if (!trimmed.endsWith('?')) return { stripped: text }
-  if ((trimmed.match(/\?/g) ?? []).length !== 1) return { stripped: text }
-  const lastQ = trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? ''
-  if (/\bor\b/i.test(lastQ)) return { stripped: text }
+  // DIVE-1429: pure polar-question detection lives in tna.ts (yesNoChoice); it
+  // excludes wh-questions ("what's up?") that a Yes/No answer can't address.
+  if (!yesNoChoice(text)) return { stripped: text }
   return {
     stripped: text,
     keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),

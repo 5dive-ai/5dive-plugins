@@ -26,7 +26,7 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
-import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs } from './tna'
+import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import {
   appendMessage as msglogAppend,
@@ -997,12 +997,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 const YN_SUPPRESS = /\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i
 function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboard } {
   if (YN_SUPPRESS.test(text)) return { stripped: text.replace(YN_SUPPRESS, '') }
-  const trimmed = text.trimEnd()
-  if (!trimmed.endsWith('?')) return { stripped: text }
-  if ((trimmed.match(/\?/g) ?? []).length !== 1) return { stripped: text }
-  // Isolate the trailing question (last sentence/line) and skip "... or ...?".
-  const lastQ = trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? ''
-  if (/\bor\b/i.test(lastQ)) return { stripped: text }
+  // DIVE-1429: pure polar-question detection lives in tna.ts (yesNoChoice); it
+  // excludes wh-questions ("what's up?") that a Yes/No answer can't address.
+  if (!yesNoChoice(text)) return { stripped: text }
   return {
     stripped: text,
     keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),
