@@ -1311,9 +1311,15 @@ if (SEND_ONLY) {
           let handledReply: string | null = null
           if (p.user_id != null) {
             try {
-              handledReply = await handleGateClearReply(String(p.content ?? ''), String(p.user_id))
+              // DIVE-1428 gate-clear reply, then DIVE-1489 actionable /inbox — both
+              // ride the same verified-human proof (p.user_id ∈ allowFrom) and are
+              // handled here (never forwarded to the agent) because bot.hears/
+              // bot.command never fire in SEND_ONLY relay mode.
+              handledReply =
+                (await handleGateClearReply(String(p.content ?? ''), String(p.user_id))) ??
+                (await handleInboxRequest(String(p.content ?? ''), String(p.user_id)))
             } catch (err) {
-              process.stderr.write(`telegram channel: relay gate-clear failed: ${err}\n`)
+              process.stderr.write(`telegram channel: relay gate-clear/inbox failed: ${err}\n`)
             }
           }
           if (handledReply) {
@@ -2991,7 +2997,12 @@ const commandHandlers: Record<string, CommandHandler> = {
   // here); tier-2 hard gates (money/secret/destructive/brand) keep their own
   // per-gate button tap or a "clear on dashboard" note.
   inbox: async ctx => {
-    await ctx.reply(await buildInboxList())
+    // DIVE-1489: prefer the actionable digest (tap buttons for every gate type,
+    // incl tier-2) via the DIVE-1499 root-side send verb; fall back to the
+    // read-only card list on OSS hosts / unregistered senders (handler returns
+    // null there).
+    const sent = await handleInboxRequest('/inbox', String(ctx.from?.id ?? ''))
+    await ctx.reply(sent ?? await buildInboxList())
   },
 
   // /heartbeat — per-agent heartbeat schedule from `5dive heartbeat ls`.
@@ -4342,6 +4353,41 @@ bot.hears([BULK_RECS_RE, APPROVE_ONE_RE], async ctx => {
   const reply = await handleGateClearReply(ctx.message?.text ?? '', String(ctx.from?.id ?? ''))
   if (reply) await ctx.reply(reply)
 })
+
+// DIVE-1489: actionable /inbox. The read-only card list (buildInboxList) can't
+// mint per-gate tap buttons for tier-2 gates — the DIVE-916 human nonce isn't
+// derivable in-plugin, and an agent-readable nonce would be agent-forgeable
+// (the DIVE-950 hole). So the actionable path shells the DIVE-1499 root-side
+// verb `5dive task inbox --send`, which mints a FRESH nonce per hard gate,
+// embeds it ONLY in Telegram callback_data, and DMs the paired owner ONE digest
+// with WORKING tap buttons for EVERY gate type (approval/secret/manual included)
+// — then rotates the stored hash after confirmed delivery. The plugin passes the
+// requesting human's id as --channel-proof; the verb re-verifies it against
+// access.json allowFrom before sending. Shared between the polled bot.command
+// path and the SEND_ONLY team-bot RELAY path (drainRelayIn), exactly like the
+// gate-clear reply. Returns the ack to post back, or null when this isn't an
+// /inbox trigger, the sender isn't a registered human, or the host isn't a
+// 5dive box (OSS hosts fall back to the read-only list).
+const INBOX_CMD_RE = /^\s*\/inbox\b/i
+async function handleInboxRequest(text: string, senderId: string): Promise<string | null> {
+  if (!INBOX_CMD_RE.test(text)) return null // not an /inbox trigger
+  if (!senderId || !loadAccess().allowFrom.includes(senderId)) return null // not a registered human
+  if (!(await read5diveVersion())) return null // 5dive-only surface; OSS hosts use buildInboxList
+  const j = await read5diveJson(['task', 'inbox', '--send', `--channel-proof=${senderId}`, '--json'], 10000)
+  if (!j?.ok) {
+    return `Couldn't send your gate inbox right now. ${String(j?.error?.message ?? '').slice(0, 160)}`.trim()
+  }
+  if (j.data?.sent === false) {
+    return 'No pending gates 🎉\n\nNothing needs a human right now. You\'re all caught up.'
+  }
+  const gates = Number(j.data?.gates ?? 0)
+  const total = Number(j.data?.total ?? gates)
+  const more = total > gates ? ` (${total - gates} more — see /tasks or the dashboard)` : ''
+  return (
+    `📬 Sent your gate inbox with tap buttons for ${gates} pending gate${gates === 1 ? '' : 's'}${more}. ` +
+    `Approve/deny right here — money/secret/destructive/brand gates included, no dashboard needed.`
+  )
+}
 
 // /task_<id> — tappable deep link from the /tasks list. Opens the single-task
 // detail. Registered BEFORE the message bridge so the tap is handled here and
