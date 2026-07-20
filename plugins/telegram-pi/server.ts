@@ -32,7 +32,7 @@
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { OPT_RE, optionChoices, parseOptions , yesNoChoice} from './tna'
-import { summarizeNeeds, reconcileBanner, type BannerState } from './banner'
+import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -1486,6 +1486,17 @@ function writeBannerStore(store: Record<string, BannerState>): void {
 // sight. Runs on a slow timer (below) in personal-bot/polled mode; 5dive-only
 // (the inbox verb is a 5dive surface). Never throws into the timer.
 let reconcilingBanner = false
+// DIVE-1568: the resolved org coordinator (5dive task coordinator, DIVE-333):
+// the sole role='coordinator', else the lone org root, else '' (ambiguous/no org
+// — nobody pins). Returns null on a lookup error so the caller can skip the tick
+// rather than unpin a live banner on a transient blip.
+async function read5diveCoordinator(): Promise<string | null> {
+  let j: { ok: boolean; data?: any }
+  try { j = await run5dive(['task', 'coordinator', '--json']) } catch { return null }
+  if (!j?.ok) return null
+  return typeof j.data?.coordinator === 'string' ? j.data.coordinator : ''
+}
+
 async function reconcileNeedsBanner(): Promise<void> {
   if (reconcilingBanner) return // never overlap: a slow inbox read must not double-run
   reconcilingBanner = true
@@ -1493,14 +1504,26 @@ async function reconcileNeedsBanner(): Promise<void> {
     if (!(await read5diveInfo())) return // OSS/standalone host: no inbox verb, no banner
     const dmChats = loadAccess().allowFrom // DM chat_id == user id (see access notes)
     if (dmChats.length === 0) return
-    let j: { ok: boolean; data?: any }
-    try {
-      j = await run5dive(['task', 'inbox', '--json'])
-    } catch {
-      return // read error — do NOTHING, never unpin a live backlog on a transient blip
+    // DIVE-1568: pin on ONE agent only — the resolved org coordinator. Otherwise
+    // the founder gets the SAME open-gate reminder pinned across every paired
+    // agent's DM (base + forks). A non-coordinator never pins, and unpins any
+    // banner it left behind. Empty/ambiguous org resolves to nobody (fail-quiet).
+    const coordinator = await read5diveCoordinator()
+    if (coordinator === null) return // lookup failed: do nothing, never flicker a live pin
+    const iAmCoordinator = coordinator !== '' && coordinator === agentName()
+    let summary: NeedSummary
+    if (iAmCoordinator) {
+      let j: { ok: boolean; data?: any }
+      try {
+        j = await run5dive(['task', 'inbox', '--json'])
+      } catch {
+        return // read error — do NOTHING, never unpin a live backlog on a transient blip
+      }
+      if (!j?.ok || !Array.isArray(j.data?.inbox)) return
+      summary = summarizeNeeds(j.data.inbox)
+    } else {
+      summary = { count: 0, oldestCreatedAt: null } // force unpin of any stale banner
     }
-    if (!j?.ok || !Array.isArray(j.data?.inbox)) return
-    const summary = summarizeNeeds(j.data.inbox)
     const now = Date.now()
     const store = readBannerStore()
     let dirty = false

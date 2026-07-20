@@ -1,3 +1,20 @@
+## v0.5.27
+
+### Changed — scope the needs-you banner to the org coordinator (DIVE-1568)
+
+The DIVE-1503/1558 pinned "needs-you" banner reconciled + pinned in EVERY paired agent's DM (base
+plus every fork), so the founder got the SAME open-gate reminder pinned across N DMs. The banner now
+pins on exactly ONE agent: the resolved org coordinator. Each `server.ts` `reconcileNeedsBanner`
+first resolves the coordinator via the new read-only `5dive task coordinator --json` verb (DIVE-333
+`_task_resolve_coordinator`: the sole `role='coordinator'`, else the lone org root, else empty).
+Unless the resolved coordinator equals this agent, it never pins and unpins any banner it left
+behind; an empty/ambiguous org resolves to nobody (fail-quiet, no bare-box spam); a lookup error
+skips the tick so a live pin never flickers. `banner.ts` is untouched (stays byte-identical across
+all forks). New `test/banner.test.ts` tripwire asserts the gate is present in base + all 5 forks so
+a fork can never silently drop it. Applies to base `telegram` + grok/codex/agy/pi/opencode
+(agy regenerated from the grok base). Generalizes to customer boxes: each box's org defines its
+coordinator. Requires 5dive CLI >= 0.11.35 (the `task coordinator` verb).
+
 ## v0.5.26
 
 ### Added — needs-you banner fork parity + relay-mode decision (DIVE-1558)

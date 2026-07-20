@@ -149,3 +149,28 @@ describe('fork parity', () => {
     expect(base.length).toBeGreaterThan(0)
   })
 })
+
+// DIVE-1568: the banner must pin on exactly ONE agent — the resolved org
+// coordinator — or the founder gets the same open-gate reminder pinned across
+// every paired agent's DM (base + forks). The gate lives at the reconcile call
+// in each server.ts (banner.ts stays pure), so it can't live in banner.ts's
+// byte-identity check above. This tripwire asserts every server.ts that arms the
+// banner still carries the coordinator gate, so a fork can never silently drop
+// it and re-spam the founder.
+describe('DIVE-1568 coordinator gate', () => {
+  const SERVERS = [
+    'telegram', 'telegram-grok', 'telegram-codex', 'telegram-agy',
+    'telegram-pi', 'telegram-opencode',
+  ] as const
+  const srv = (p: string) => join(import.meta.dir, '..', 'plugins', p, 'server.ts')
+  for (const p of SERVERS) {
+    test(`${p}/server.ts gates the banner on the resolved coordinator`, () => {
+      const src = readFileSync(srv(p), 'utf8')
+      // resolves the coordinator, compares it to this agent, and never pins when
+      // it isn't the coordinator (empty summary → unpin any stale banner).
+      expect(src).toContain('read5diveCoordinator')
+      expect(src).toContain('iAmCoordinator')
+      expect(src).toMatch(/task['"],\s*['"]coordinator/)
+    })
+  }
+})
