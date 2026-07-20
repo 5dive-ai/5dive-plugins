@@ -27,7 +27,7 @@ import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
-import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS } from './council'
+import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap } from './council'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import {
   appendMessage as msglogAppend,
@@ -3751,6 +3751,40 @@ bot.on('callback_query:data', async ctx => {
           `  (approval: approved|denied · secret gate: omit --value)`,
         )
         .catch(() => {})
+    }
+    return
+  }
+
+  // DIVE-1546: the AUTHENTICATED founder-veto TAP (DIVE-1494 #2). The one-time nonce arrives
+  // ONLY inside this callback_data — the council source never prints it to chat (rail B), and
+  // `_tg_veto_offer` delivered the button founder-chat-only. Tapping shells the authenticated
+  // exercise `council veto exercise --receipt=<d> --nonce=<n>`; the NONCE IS THE AUTHENTICATION
+  // (the CLI refuses an unauthenticated exercise, and only the founder ever received the nonce).
+  // Defense in depth: allowFrom vetted the tapper at the router top, AND we require a private chat
+  // (a veto button must never live in a group). The nonce is NEVER echoed back — the message is
+  // edited to a nonce-free confirmation and the keyboard stripped so a one-time nonce can't be
+  // re-tapped. Success is the CLI exit code (execFileP rejects on the CLI's refuse-nonzero), so a
+  // closed window / already-resolved / bad nonce all land in the soft catch. Fully fail-soft.
+  const vetoTap = parseVetoTap(data)
+  if (vetoTap) {
+    if (ctx.chat?.type !== 'private') {
+      await ctx.answerCallbackQuery({ text: 'Veto can only be exercised from your DM.' }).catch(() => {})
+      return
+    }
+    await ctx.answerCallbackQuery({ text: 'Recording veto…' }).catch(() => {})
+    try {
+      await execFileP(
+        SUDO,
+        ['-n', '5dive', 'council', 'veto', 'exercise', `--receipt=${vetoTap.receipt}`, `--nonce=${vetoTap.nonce}`],
+        { timeout: 10000 },
+      )
+      // Exit 0 = the authenticated exercise sealed a veto record (the pass flips to blocked).
+      await ctx.editMessageText('🛑 Veto recorded — the sealed pass is blocked, execution halted.').catch(() => {})
+    } catch {
+      // Refused (bad/expired nonce, window closed, already resolved) or a CLI/sudo error. Never
+      // reveal the nonce; just drop the keyboard so it can't be re-tapped and ack softly.
+      await ctx.answerCallbackQuery({ text: 'Veto not applied — the window may have closed or it was already resolved.' }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
     }
     return
   }

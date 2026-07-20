@@ -117,3 +117,17 @@ export const COUNCIL_BUTTONS: Array<{ text: string; callback_data: string }> = [
   { text: '🔗 Lineage', callback_data: 'cl:lin' },
   { text: '✅ Verify', callback_data: 'cl:ver' },
 ]
+
+// DIVE-1546: the AUTHENTICATED founder-veto TAP. Unlike the read-only cl:* verbs, this
+// callback_data carries the one-time veto nonce — it rides ONLY here (the council source never
+// prints it to chat, rail B) and the button is delivered founder-chat-only. Format:
+// `veto:<receiptPrefix>:<nonce>`. Telegram caps callback_data at 64 bytes; a full base64url sealed
+// digest (43) + a 32-char nonce would be 81, so `_tg_veto_offer` carries a unique receipt PREFIX
+// (the CLI's `veto exercise --receipt` resolves a unique prefix, fail-closed on miss/ambiguity).
+// `veto:` (5) + prefix (≤26) + `:` (1) + nonce (32 = `openssl rand -hex 16`) stays ≤ 64. The
+// length anchors reject a truncated / malformed payload; the nonce group is hex-only.
+export const VETO_RE = /^veto:([A-Za-z0-9_-]{8,26}):([0-9a-f]{16,40})$/
+export function parseVetoTap(data: string): { receipt: string; nonce: string } | null {
+  const m = VETO_RE.exec(data)
+  return m ? { receipt: m[1]!, nonce: m[2]! } : null
+}

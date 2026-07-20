@@ -5,7 +5,7 @@
 // (the founder-veto TAP is a separate authenticated path, DIVE-1546).
 import { describe, test, expect } from 'bun:test'
 import {
-  renderRoster, renderLog, renderLineage, renderVerify, shortDigest, COUNCIL_BUTTONS,
+  renderRoster, renderLog, renderLineage, renderVerify, shortDigest, COUNCIL_BUTTONS, parseVetoTap,
 } from '../plugins/telegram/council'
 
 const ROSTER = {
@@ -102,6 +102,32 @@ describe('read-only safety (no nonce / no mutating tap)', () => {
       // no long hex run that could be a leaked bearer token / nonce
       expect(d).not.toMatch(/[0-9a-f]{16,}/)
     }
+  })
+})
+
+describe('parseVetoTap (DIVE-1546 authenticated founder-veto tap)', () => {
+  const NONCE = '0123456789abcdef0123456789abcdef' // openssl rand -hex 16 shape (32 hex)
+  const PREFIX = 'dQtU1Z_iCpWu'                    // 12-char unique receipt prefix
+  test('parses veto:<receiptPrefix>:<nonce>', () => {
+    const r = parseVetoTap(`veto:${PREFIX}:${NONCE}`)
+    expect(r).toEqual({ receipt: PREFIX, nonce: NONCE })
+  })
+  test('the read-only cl:* verbs are NOT parsed as a veto (no nonce confusion)', () => {
+    for (const b of COUNCIL_BUTTONS) expect(parseVetoTap(b.callback_data)).toBeNull()
+  })
+  test('rejects malformed / truncated payloads (fail-closed)', () => {
+    expect(parseVetoTap('veto:onlyreceipt')).toBeNull()        // no nonce
+    expect(parseVetoTap('veto::' + NONCE)).toBeNull()          // empty receipt
+    expect(parseVetoTap(`veto:${PREFIX}:`)).toBeNull()         // empty nonce
+    expect(parseVetoTap(`veto:${PREFIX}:NOTHEXNOTHEXNOTHEXNOTHEXNOTHEX00`)).toBeNull() // non-hex nonce
+    expect(parseVetoTap('tna:1234:abcde')).toBeNull()          // a different tap prefix
+    expect(parseVetoTap('')).toBeNull()
+  })
+  test('the whole callback_data (prefix form) stays under Telegram\'s 64-byte cap', () => {
+    // A full base64url digest (43) + nonce (32) would be 81 bytes > 64 — hence the receipt PREFIX.
+    const data = `veto:${PREFIX}:${NONCE}`
+    expect(Buffer.byteLength(data, 'utf8')).toBeLessThanOrEqual(64)
+    expect(parseVetoTap(data)).not.toBeNull()
   })
 })
 

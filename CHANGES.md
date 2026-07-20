@@ -1,3 +1,26 @@
+## v0.5.24
+
+### Added — founder-veto TAP handler: authenticated one-tap veto from the founder's DM (DIVE-1494 #2, plugin half)
+
+The callback router now handles a `veto:<receiptPrefix>:<nonce>` tap — the authenticated
+founder-veto button that pairs with the council-source rail B (`_council_veto_ping` →
+`_tg_veto_offer`, 5dive-cli). The one-time nonce rides ONLY in the tapped `callback_data`
+(the council source never prints it to chat) and the button is delivered founder-chat-only;
+tapping shells `sudo 5dive council veto exercise --receipt=<prefix> --nonce=<nonce>`. The
+NONCE is the authentication (the CLI refuses an unauthenticated exercise, and only the
+founder ever received it); defense in depth adds the router's `allowFrom` gate plus a
+private-chat requirement (a veto button must never live in a group). The nonce is never
+echoed back — on success the message is edited to a nonce-free confirmation and the keyboard
+stripped so a one-time nonce can't be re-tapped. Fully fail-soft (a closed window / already-
+resolved / bad nonce acks softly).
+
+Telegram caps `callback_data` at 64 bytes; a full base64url sealed digest (43) + nonce (32)
+is 81, so the button carries a unique receipt PREFIX (the CLI resolves it, fail-closed on
+miss/ambiguity). Pure parse logic in `plugins/telegram/council.ts` (`parseVetoTap` / `VETO_RE`),
+unit-tested in `test/council.test.ts` (rejects malformed/truncated/non-hex payloads, confirms
+the read-only `cl:*` verbs are never mistaken for a veto, asserts the prefix form fits 64 bytes).
+Baseline-first (claude plugin); the forks track it in a follow-up parity port.
+
 ## v0.5.23
 
 ### Added — /council: read-only Council view over the sealed governance record (DIVE-1494 #3)
