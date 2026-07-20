@@ -1,3 +1,18 @@
+## v0.5.28
+
+### Changed — /inbox renders inline tap-to-clear buttons where the banner points (DIVE-1572)
+
+The DIVE-1568 needs-you banner tells the founder to "tap /inbox to review and clear it," but /inbox
+only shelled the DIVE-1499 send-verb to DM a *separate* tap-button digest — the buttons weren't where
+the banner pointed. Now /inbox renders an actionable reply IN PLACE: each pending tier<2 gate that has
+a recommendation gets a one-tap `✅ <ident>: <rec>` button that applies the rec via the DIVE-1305
+`clear-recs --channel-proof` rail (the allowFrom-vetted sender id is the human proof — re-enforced
+CLI-side, tier<2 only; no DIVE-916 nonce needed). Tapping clears the gate in place and rebuilds the
+list so the button drops. tier-2 hard gates (money/secret/destructive/brand) can't be button-minted
+in-plugin (the nonce isn't derivable — the DIVE-950 hole), so those still fire the `--send` nonce
+digest, noted inline. Sourced from `task ls --json` (which exposes `tier` + `recommend`, unlike the
+`task inbox --json` view). Ported across canonical `telegram` + `telegram-{grok,agy,codex,pi}`.
+
 ## v0.5.27
 
 ### Changed — scope the needs-you banner to the org coordinator (DIVE-1568)

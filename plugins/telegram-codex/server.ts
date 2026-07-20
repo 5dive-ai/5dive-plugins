@@ -1306,13 +1306,15 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         return true
       }
       case 'inbox': {
-        // /inbox (DIVE-1334/1371 read-only → DIVE-1489/1504 actionable). Prefer
-        // the DIVE-1499 send-verb (tap buttons for every gate); fall back to the
-        // read-only card list on OSS hosts or unregistered senders.
+        // /inbox (DIVE-1572): actionable — tap buttons live IN the reply. tier<2
+        // gates (with a rec) render as one-tap ✅ Apply-rec buttons; tier-2 hard
+        // gates shell the DIVE-1499 send-verb for a nonce-buttoned digest. Falls
+        // back to the read-only card list on OSS hosts / unregistered senders.
         // Plain text (no parse_mode) so the /task_N deep links stay tappable.
-        const sent = await handleInboxRequest(String(ctx.from?.id ?? ''))
-        await bot.api.sendMessage(chat_id, sent ?? (await buildInboxList()), {
+        const view = await buildActionableInbox(String(ctx.from?.id ?? ''))
+        await bot.api.sendMessage(chat_id, view.text, {
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+          ...(view.keyboard ? { reply_markup: view.keyboard } : {}),
         })
         return true
       }
@@ -1454,6 +1456,84 @@ async function buildInboxList(): Promise<string> {
     `\n\nTo clear the tier<2 gates fast, reply "go with recs" (or "approve DIVE-N"). ` +
     `Hard money/destructive/secret/brand gates keep their per-gate button tap.`
   return clampList(header, cards, pending.length) + footer
+}
+
+// --- /inbox (DIVE-1572): ACTIONABLE gate inbox — tap buttons inline ---
+// The DIVE-1568 needs-you banner points the founder at /inbox, so the buttons
+// must live IN the /inbox reply, not only in a separate digest DM (lodar's
+// DIVE-1525 complaint). Sourced from `task ls --json` — which exposes `tier` +
+// `recommend` (the `task inbox --json` view does NOT). A tier<2 gate WITH a
+// recommendation is plugin-clearable: render a one-tap `✅ <ident>: <rec>` button
+// that applies the rec in place via the DIVE-1305 `clear-recs --channel-proof`
+// rail (the allowFrom-vetted sender id IS the human proof — an agent can't forge
+// it — re-enforced CLI-side, tier<2 only; no DIVE-916 nonce needed). tier-2 hard
+// gates (money/secret/destructive/brand) can't be button-minted in-plugin (the
+// nonce isn't derivable — the DIVE-950 hole), so we shell the DIVE-1499 `task
+// inbox --send` verb to DM a nonce-buttoned digest for those and note it inline.
+// Falls back to the read-only list on OSS hosts / unregistered senders.
+async function buildActionableInbox(
+  senderId: string,
+): Promise<{ text: string; keyboard?: InlineKeyboard }> {
+  if (!senderId || !loadAccess().allowFrom.includes(senderId)) {
+    return { text: await buildInboxList() }
+  }
+  let j: { ok: boolean; data?: any }
+  try {
+    j = await run5dive(['task', 'ls', '--json'])
+  } catch {
+    return { text: await buildInboxList() } // no 5dive on this host (OSS) — read-only fallback
+  }
+  if (!j.ok || !Array.isArray(j.data?.tasks)) return { text: '5dive returned unexpected output.' }
+  // `task ls` carries need_type only while a gate is unanswered, so its presence
+  // is a clean pending-gate flag (mirrors the /tasks "Needs you" section).
+  const pending = j.data.tasks.filter((t: any) => t.need_type)
+  if (pending.length === 0) {
+    return { text: "No pending gates 🎉\n\nNothing needs a human right now. You're all caught up." }
+  }
+  const tierOf = (t: any) => Number.parseInt(String(t.tier ?? ''), 10)
+  const soft = pending.filter((t: any) => {
+    const tr = tierOf(t)
+    return Number.isFinite(tr) && tr < 2 && !!t.recommend
+  })
+  const hardCount = pending.filter((t: any) => {
+    const tr = tierOf(t)
+    return Number.isFinite(tr) && tr >= 2
+  }).length
+  const cards = pending.map((t: any) => inboxCard(t) + '\n')
+
+  // One ✅ button per tier<2 clearable gate, each on its own row so the ident +
+  // rec label stays readable. Routes as `gclear:<id>` (numeric task id).
+  let keyboard: InlineKeyboard | undefined
+  if (soft.length) {
+    keyboard = new InlineKeyboard()
+    soft.forEach((t: any, i: number) => {
+      const recLabel = String(t.recommend).replace(/\s+/g, ' ').trim()
+      const recShort = recLabel.length > 24 ? recLabel.slice(0, 23) + '…' : recLabel
+      keyboard!.text(`✅ ${t.ident}: ${recShort}`, `gclear:${t.id}`)
+      if (i < soft.length - 1) keyboard!.row()
+    })
+  }
+
+  // tier-2 hard gates → DM the nonce-buttoned digest (only the CLI mints those).
+  // Fire it ONLY when a hard gate is actually pending, so the common all-soft
+  // case never triggers a redundant second DM.
+  let digestNote = ''
+  if (hardCount > 0) {
+    const sent = await handleInboxRequest(senderId)
+    digestNote =
+      sent && sent.startsWith('📬')
+        ? `\n\n🔒 ${hardCount} hard gate${hardCount === 1 ? '' : 's'} (money/secret/destructive/brand) sent as a tap-button digest DM above — approve/deny there.`
+        : `\n\n🔒 ${hardCount} hard gate${hardCount === 1 ? '' : 's'} need a per-gate tap — see /tasks or the dashboard.`
+  }
+  const header =
+    `🔔 ${pending.length} gate${pending.length === 1 ? '' : 's'} awaiting you.` +
+    (soft.length
+      ? ' Tap a ✅ below to apply its ⭐ recommendation and clear it in place.'
+      : ' Tap /task_N to open one.') +
+    '\n\n'
+  const footer =
+    '\n\nOr reply "go with recs" to clear every tier<2 gate at once. You can also act on the dashboard.'
+  return { text: clampList(header, cards, pending.length) + digestNote + footer, keyboard }
 }
 
 // DIVE-1489 (propagated via DIVE-1504): actionable /inbox. The read-only card
@@ -1957,6 +2037,42 @@ bot.on('callback_query:data', async ctx => {
       await ctx.editMessageText(detail.text, { reply_markup: detail.keyboard }).catch(() => {})
     } catch {}
     await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
+  // DIVE-1572: ✅ inline gate-clear tap from the actionable /inbox. Applies the
+  // tier<2 gate's ⭐ recommendation in place via the DIVE-1305 clear-recs
+  // channel-proof rail — the verified sender id (allowFrom-vetted at the top of
+  // this handler) is the human proof, re-enforced CLI-side (tier<2 only). On
+  // success we rebuild the inbox so the cleared gate's button drops; a tier-2 /
+  // already-answered gate acks softly (its buttons live in the --send digest).
+  const gcM = /^gclear:(\d+)$/.exec(data)
+  if (gcM) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const taskId = gcM[1]!
+    try {
+      const cj = await run5dive(
+        ['task', 'clear-recs', `--channel-proof=${senderId}`, `--only=${taskId}`, '--json'],
+        8000,
+      )
+      if (cj?.ok && Number(cj.data?.cleared ?? 0) > 0) {
+        await ctx.answerCallbackQuery({ text: '✅ Applied your recommendation' }).catch(() => {})
+        const view = await buildActionableInbox(senderId)
+        await ctx
+          .editMessageText(view.text, view.keyboard ? { reply_markup: view.keyboard } : undefined)
+          .catch(() => {})
+      } else {
+        await ctx
+          .answerCallbackQuery({ text: '🔒 Hard gate or already answered — use the digest tap or the dashboard.' })
+          .catch(() => {})
+      }
+    } catch {
+      await ctx.answerCallbackQuery({ text: "Couldn't clear — open the dashboard." }).catch(() => {})
+    }
     return
   }
 
