@@ -27,6 +27,7 @@ import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
+import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS } from './council'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import {
   appendMessage as msglogAppend,
@@ -2649,6 +2650,24 @@ const commandHandlers: Record<string, CommandHandler> = {
     await report(['on', `--at=${hour}`])
   },
 
+  // DIVE-1494 (3): read-only Council view. Render the roster header (who sits, the
+  // pass rule, the founder-veto holder, the sealed lineage head) and carry three
+  // tap buttons for the sealed governance record — log / lineage / verify. All
+  // read-only: no nonce, no mutate (the founder-veto TAP is a separate authenticated
+  // path, DIVE-1546). paired-5dive scope hides this on non-5dive hosts.
+  council: async ctx => {
+    const j = await read5diveJson(['council', 'roster', '--json'], 5000)
+    if (!j) {
+      await ctx.reply(`Couldn't read the Council from the 5dive CLI — try again in a moment.`)
+      return
+    }
+    // Tolerate the {ok,data} envelope or a bare object (mirrors the digest handler).
+    const data = j?.data ?? j
+    await ctx.reply(renderRoster(data), {
+      reply_markup: { inline_keyboard: [COUNCIL_BUTTONS] },
+    })
+  },
+
   // /stop — interrupt the agent's current task. Sends C-c to the tmux pane
   // the running claude session lives in. Same effect as the user pressing
   // Esc / Ctrl-C in the local terminal.
@@ -4066,6 +4085,37 @@ bot.on('callback_query:data', async ctx => {
           },
         },
       )
+      .catch(() => {})
+    return
+  }
+
+  // DIVE-1494 (3): read-only Council taps from the /council header. cl:log / cl:lin /
+  // cl:ver shell `sudo 5dive council {log,lineage ls,verify} --json` and edit the
+  // message in place with a formatted summary. READ-ONLY — no nonce, no mutation
+  // (the authenticated founder-veto tap is a separate path, DIVE-1546). The allowFrom
+  // gate at the top of this router already vetted the tapper. Fully fail-soft.
+  if (data === 'cl:log' || data === 'cl:lin' || data === 'cl:ver') {
+    await ctx.answerCallbackQuery({ text: 'Reading the sealed record…' }).catch(() => {})
+    let body: string
+    try {
+      if (data === 'cl:ver') {
+        const j = await read5diveJson(['council', 'verify', '--json'], 8000)
+        body = renderVerify(j?.data ?? j)
+      } else if (data === 'cl:lin') {
+        const j = await read5diveJson(['council', 'lineage', 'ls', '--json'], 8000)
+        body = renderLineage((j?.data ?? j)?.entries)
+      } else {
+        const j = await read5diveJson(['council', 'log', '--limit=5', '--json'], 8000)
+        body = renderLog((j?.data ?? j)?.entries)
+      }
+    } catch {
+      body = "Couldn't read the Council record from the 5dive CLI — try /council again in a moment."
+    }
+    // Re-attach the same read-only keyboard so the user can hop between views without
+    // re-running /council. A grammy "message is not modified" (identical body) is
+    // swallowed by the catch so a double-tap on the same view doesn't error.
+    await ctx
+      .editMessageText(body, { reply_markup: { inline_keyboard: [COUNCIL_BUTTONS] } })
       .catch(() => {})
     return
   }

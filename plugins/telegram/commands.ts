@@ -180,6 +180,13 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     description: 'Daily standup digest on/off/at',
     scope: 'paired-5dive',
   },
+  {
+    // DIVE-1494 (3): read-only Council view — roster + tap-to-see log / lineage /
+    // verify. Baseline-first (like digest); the forks track it in a follow-up port.
+    name: 'council',
+    description: 'Council roster + sealed governance record',
+    scope: 'paired-5dive',
+  },
 ]
 
 /** Short model alias → full Claude Code model ID. Add new tiers here.
