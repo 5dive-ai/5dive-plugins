@@ -27,7 +27,7 @@ import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
-import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap } from './council'
+import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import {
@@ -3979,6 +3979,45 @@ bot.on('callback_query:data', async ctx => {
       // Refused (bad/expired nonce, window closed, already resolved) or a CLI/sudo error. Never
       // reveal the nonce; just drop the keyboard so it can't be re-tapped and ack softly.
       await ctx.answerCallbackQuery({ text: 'Veto not applied — the window may have closed or it was already resolved.' }).catch(() => {})
+      await ctx.editMessageReplyMarkup().catch(() => {})
+    }
+    return
+  }
+
+  // DIVE-1566: the AUTHENTICATED human-as-seat BALLOT TAP (DIVE-1548 #4, mirrors the DIVE-1546 veto
+  // tap above). A council seat held by a human votes by tapping Approve/Reject/Abstain on the ballot
+  // message the CLI dispatch (DIVE-1564) emitted. The one-time DIVE-916 nonce arrives ONLY inside this
+  // callback_data — the ballot task body stores only its sha256 digest, and the message text is blind.
+  // Tapping shells the DIVE-1565 bridge `council ballot-tap --ref=<prefix> --vote=<a|r|e> --nonce=<n>`,
+  // which prefix-accepts the unique OPEN human ballot, sha256-verifies the nonce against the stored
+  // digest (fail-closed on miss/ambiguity/mismatch), then CLOSES that same CNCL-18 ballot task with the
+  // COUNCIL-VOTE line the convener already polls — NOT a second write path. The NONCE IS THE
+  // AUTHENTICATION (the bridge refuses a mismatch, and only the seat-holder ever received the raw nonce).
+  // Defense in depth: allowFrom vetted the tapper at the router top, AND we require a private chat (a
+  // ballot button must never live in a group). The nonce is NEVER echoed back — the message is edited
+  // to a nonce-free confirmation and the keyboard stripped so a one-time nonce can't be re-tapped.
+  // Success is the CLI exit code (execFileP rejects on the bridge's exit 5), so a closed ballot /
+  // already-voted / bad nonce all land in the soft catch. Fully fail-soft.
+  const cvoteTap = parseCvoteTap(data)
+  if (cvoteTap) {
+    if (ctx.chat?.type !== 'private') {
+      await ctx.answerCallbackQuery({ text: 'Your ballot can only be cast from your DM.' }).catch(() => {})
+      return
+    }
+    const label = cvoteTap.code === 'a' ? 'Approve' : cvoteTap.code === 'r' ? 'Reject' : 'Abstain'
+    await ctx.answerCallbackQuery({ text: `Recording your vote: ${label}…` }).catch(() => {})
+    try {
+      await execFileP(
+        SUDO,
+        ['-n', '5dive', 'council', 'ballot-tap', `--ref=${cvoteTap.ref}`, `--vote=${cvoteTap.code}`, `--nonce=${cvoteTap.nonce}`],
+        { timeout: 10000 },
+      )
+      // Exit 0 = the bridge closed the ballot task with the COUNCIL-VOTE line (the convener tallies it).
+      await ctx.editMessageText(`🗳️ Vote recorded: ${label}. Your council ballot is in.`).catch(() => {})
+    } catch {
+      // Refused (bad/expired nonce, already voted, ambiguous ref) or a CLI/sudo error. Never reveal the
+      // nonce; just drop the keyboard so it can't be re-tapped and ack softly.
+      await ctx.answerCallbackQuery({ text: 'Vote not recorded — the ballot may have closed or already been cast.' }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
     }
     return

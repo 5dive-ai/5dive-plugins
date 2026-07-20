@@ -131,3 +131,20 @@ export function parseVetoTap(data: string): { receipt: string; nonce: string } |
   const m = VETO_RE.exec(data)
   return m ? { receipt: m[1]!, nonce: m[2]! } : null
 }
+
+// DIVE-1566 (sub-task 4/4 of DIVE-1548): the AUTHENTICATED human-as-seat BALLOT TAP. A council
+// seat held by a human votes by tapping Approve/Reject/Abstain on the ballot message the CLI
+// dispatch (DIVE-1564) emitted; that button's callback_data carries the one-time DIVE-916 nonce —
+// it rides ONLY here (the ballot body stores only the sha256 DIGEST, never the raw nonce; the task
+// text is blind), and the button is delivered to the seat-holder's chat only. Format:
+// `cvote:<ref>:<code>:<nonce>`, where `ref` is the ballot TASK-id prefix (≤12 chars, DIVE-1564
+// slices `taskId.slice(0,12)`), `code` ∈ {a,r,e} → approve/reject/abstain, and `nonce` is
+// `randomBytes(16).toString('hex')` = exactly 32 hex chars. Telegram caps callback_data at 64 bytes:
+// `cvote:`(6) + ref(≤12) + `:`(1) + code(1) + `:`(1) + nonce(32) ≤ 53 — always fits, no prefixing of
+// the nonce needed (unlike the veto's PREFIX'd digest). The length/charset anchors reject a truncated
+// or malformed payload; the nonce group is hex-only, the code group is exactly one of a|r|e.
+export const CVOTE_RE = /^cvote:([A-Za-z0-9_-]{1,12}):([are]):([0-9a-f]{32})$/
+export function parseCvoteTap(data: string): { ref: string; code: 'a' | 'r' | 'e'; nonce: string } | null {
+  const m = CVOTE_RE.exec(data)
+  return m ? { ref: m[1]!, code: m[2]! as 'a' | 'r' | 'e', nonce: m[3]! } : null
+}

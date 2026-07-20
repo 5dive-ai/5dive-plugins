@@ -1,3 +1,23 @@
+## v0.5.29
+
+### Added — council human-as-seat ballot tap handler (DIVE-1566)
+
+The final sub-task (4/4) of DIVE-1548 human-as-seat voting. When a council seat is held by a human,
+the CLI dispatch (DIVE-1564) emits a blind ballot message with Approve/Reject/Abstain buttons whose
+`callback_data` is `cvote:<ballot-ref>:<a|r|e>:<nonce>` — the one-time DIVE-916 nonce rides ONLY in
+the button (the ballot task body stores just its sha256 digest, the text is blind). This adds the
+plugin half that makes those buttons live: a `parseCvoteTap` pure parser in `council.ts` (length +
+charset anchored, fits Telegram's 64-byte cap without prefixing since ref≤12 + nonce=32) and a
+`callback_query` handler in `server.ts` that mirrors the shipped DIVE-1546 founder-veto tap —
+private-chat-only + allowFrom-vetted, shells `sudo 5dive council ballot-tap --ref --vote --nonce`
+(the DIVE-1565 bridge, which prefix-accepts the unique open ballot, verifies the nonce against the
+stored digest fail-closed, and closes that same CNCL-18 ballot task with the COUNCIL-VOTE line the
+convener already polls — no second write path), then edits the message to a nonce-free confirmation
+and strips the keyboard so a one-time nonce can't be re-tapped. Fully fail-soft; the raw nonce is
+never echoed back. Inert until a `cvote:` button is delivered. Baseline `telegram` only — the
+fork-parity port to telegram-{grok,agy,codex,pi} follows the DIVE-1371/1558 pattern (same deferral as
+the DIVE-1546 veto tap, which is also baseline-only).
+
 ## v0.5.28
 
 ### Changed — /inbox renders inline tap-to-clear buttons where the banner points (DIVE-1572)
