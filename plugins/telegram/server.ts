@@ -29,6 +29,7 @@ import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
+import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import {
   appendMessage as msglogAppend,
@@ -1415,6 +1416,24 @@ await mcp.connect(new StdioServerTransport())
 if (SEND_ONLY) {
   const RELAY_IN_DIR = join(STATE_DIR, 'relay-in')
   mkdirSync(RELAY_IN_DIR, { recursive: true, mode: 0o700 })
+  // DIVE-1514: startup age-gate. drainRelayIn dedups only in-memory, so a drop
+  // left across a restart/roll is replayed by this fresh process. Quarantine any
+  // drop older than the TTL into a dead-letter dir (never silent-delete: a stale
+  // legit send vanishing is the availability twin of the leak) BEFORE the drain
+  // interval arms, so an orphaned drop is never delivered.
+  const RELAY_DEAD_DIR = join(STATE_DIR, 'relay-dead')
+  const RELAY_IN_TTL_MS = Number(process.env.TELEGRAM_RELAY_IN_TTL_MS) || 5 * 60_000
+  try {
+    const stale = sweepStaleRelayIn(RELAY_IN_DIR, RELAY_DEAD_DIR, RELAY_IN_TTL_MS, Date.now())
+    for (const q of stale) {
+      process.stderr.write(
+        `telegram channel: relay-in quarantined stale drop ${q.file} ` +
+          `(age ${Math.round(q.ageMs / 1000)}s > ttl ${Math.round(RELAY_IN_TTL_MS / 1000)}s) -> ${q.dest}\n`,
+      )
+    }
+  } catch (err) {
+    process.stderr.write(`telegram channel: relay-in startup sweep failed: ${err}\n`)
+  }
   const seen = new Set<string>()
   let draining = false
   const drainRelayIn = async () => {
