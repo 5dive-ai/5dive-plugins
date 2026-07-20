@@ -1,3 +1,23 @@
+## v0.5.23
+
+### Added — /council: read-only Council view over the sealed governance record (DIVE-1494 #3)
+
+`/council` renders the Council roster (seats + chair, the pass threshold + quorum,
+the founder-veto holder, and the sealed lineage head) and carries three tappable
+buttons for the tamper-evident record: 📜 Log (recent sealed verdicts), 🔗 Lineage
+(the hash-chain summary), and ✅ Verify (the integrity check, green or fail-closed
+with the failing leg named). Sourced read-only via `sudo 5dive council
+{roster,log,lineage ls,verify} --json`. Everything here is READ-ONLY: the buttons
+carry a static verb in `callback_data` with no nonce and no mutation. The
+authenticated founder-veto TAP (which must carry a one-time nonce inside the
+callback) is a separate path, DIVE-1546.
+
+Pure formatting lives in `plugins/telegram/council.ts`, unit-tested headless in
+`test/council.test.ts` (12 cases, incl. a read-only-safety assertion that no
+button `callback_data` can carry a long-hex nonce, and that the resolved veto
+recipient id never renders). Baseline-first (claude plugin), like `/digest`; the
+wait_for_message forks track it in a follow-up parity port.
+
 ## v0.5.19
 
 ### Added — /inbox lists pending human gates, with one-reply quick-clear (DIVE-1334 / DIVE-1356)

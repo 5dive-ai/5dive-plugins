@@ -102,6 +102,9 @@ const GOLDEN_BASELINE_MENU = [
   // DIVE-624: /digest is baseline-first (claude plugin). Forks track it in a follow-up
   // port; until then it's an intended baseline-only addition to the menu.
   'digest',
+  // DIVE-1494 (3): /council (read-only governance view) is baseline-first, same as
+  // digest — the wait_for_message forks track it in a follow-up parity port.
+  'council',
 ]
 const WATCHDOG_COMMON = ['startRearmWatchdog', 'REARM_IDLE_MS', 'markActivity', 'lastServerActivity']
 const TURN_LIVENESS = 'newestTurnMtimeMs' // codex+grok; agy pending DIVE-14
