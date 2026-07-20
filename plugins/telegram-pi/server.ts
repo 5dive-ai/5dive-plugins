@@ -989,9 +989,12 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         return true
       }
       case 'inbox': {
-        // /inbox (DIVE-1334/1371) — list PENDING human gates so none slip.
+        // /inbox (DIVE-1334/1371 read-only → DIVE-1489/1504 actionable). Prefer
+        // the DIVE-1499 send-verb (tap buttons for every gate); fall back to the
+        // read-only card list on OSS hosts or unregistered senders.
         // Plain text (no parse_mode) so the /task_N deep links stay tappable.
-        await bot.api.sendMessage(chat_id, await buildInboxList(), {
+        const sent = await handleInboxRequest(String(ctx.from?.id ?? ''))
+        await bot.api.sendMessage(chat_id, sent ?? (await buildInboxList()), {
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         })
         return true
@@ -1128,6 +1131,44 @@ async function buildInboxList(): Promise<string> {
     `\n\nTo clear the tier<2 gates fast, reply "go with recs" (or "approve DIVE-N"). ` +
     `Hard money/destructive/secret/brand gates keep their per-gate button tap.`
   return clampList(header, cards, pending.length) + footer
+}
+
+// DIVE-1489 (propagated via DIVE-1504): actionable /inbox. The read-only card
+// list (buildInboxList) can't mint per-gate tap buttons for tier-2 gates — the
+// DIVE-916 human nonce isn't derivable in-plugin, and an agent-readable nonce
+// would be agent-forgeable (the DIVE-950 hole). So the actionable path shells the
+// DIVE-1499 root-side verb `5dive task inbox --send`, which mints a FRESH nonce
+// per hard gate, embeds it ONLY in Telegram callback_data, and DMs the paired
+// owner ONE digest with WORKING tap buttons for EVERY gate type (approval/secret/
+// manual included), then rotates the stored hash after confirmed delivery. We
+// pass the requesting human's id as --channel-proof; the verb re-verifies it
+// against access.json allowFrom before sending. This fork is polling-only (no
+// SEND_ONLY relay-in drain path exists in this lineage — cf DIVE-1428, which is
+// therefore N/A here), so this is wired solely into the `case 'inbox'` command
+// handler. Returns the ack to post back, or null when the sender isn't a
+// registered human or the host isn't a 5dive box (run5dive rejects → the caller
+// falls back to the read-only buildInboxList).
+async function handleInboxRequest(senderId: string): Promise<string | null> {
+  if (!senderId || !loadAccess().allowFrom.includes(senderId)) return null // not a registered human
+  let j: { ok: boolean; data?: any; error?: { message?: string } }
+  try {
+    j = await run5dive(['task', 'inbox', '--send', `--channel-proof=${senderId}`, '--json'], 10000)
+  } catch {
+    return null // no 5dive on this host (OSS/standalone) — caller falls back to buildInboxList
+  }
+  if (!j.ok) {
+    return `Couldn't send your gate inbox right now. ${String(j?.error?.message ?? '').slice(0, 160)}`.trim()
+  }
+  if (j.data?.sent === false) {
+    return 'No pending gates 🎉\n\nNothing needs a human right now. You\'re all caught up.'
+  }
+  const gates = Number(j.data?.gates ?? 0)
+  const total = Number(j.data?.total ?? gates)
+  const more = total > gates ? ` (${total - gates} more — see /tasks or the dashboard)` : ''
+  return (
+    `📬 Sent your gate inbox with tap buttons for ${gates} pending gate${gates === 1 ? '' : 's'}${more}. ` +
+    `Approve/deny right here — money/secret/destructive/brand gates included, no dashboard needed.`
+  )
 }
 
 // DIVE-1305: paired-human bulk-clear. When the paired human types "go with recs"
