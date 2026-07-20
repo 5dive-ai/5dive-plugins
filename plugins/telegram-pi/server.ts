@@ -32,6 +32,7 @@
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { OPT_RE, optionChoices, parseOptions , yesNoChoice} from './tna'
+import { summarizeNeeds, reconcileBanner, type BannerState } from './banner'
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -64,6 +65,10 @@ const PI_PROJECT_DIR = process.env.PI_PROJECT_DIR ?? process.cwd()
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
   ?? join(process.env.PI_HOME ?? join(homedir(), '.pi'), 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
+// DIVE-1503/1558: per-DM pinned "needs-you" banner bookkeeping. Maps a paired DM
+// chat id → { messageId, fingerprint } so each reconcile edits the existing pin
+// instead of posting a fresh banner (the DIVE-1107 banner-storm lesson).
+const NEEDS_BANNER_FILE = join(STATE_DIR, 'needs-banner.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
@@ -1455,6 +1460,93 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown)
 process.on('SIGINT',  shutdown)
+
+// DIVE-1503/1558 pinned-banner store I/O. Heuristic state: a lost read/write only
+// costs one redundant banner send, never worth failing anything over.
+function readBannerStore(): Record<string, BannerState> {
+  try {
+    const j = JSON.parse(readFileSync(NEEDS_BANNER_FILE, 'utf8')) as Record<string, BannerState>
+    return j && typeof j === 'object' ? j : {}
+  } catch {
+    return {}
+  }
+}
+function writeBannerStore(store: Record<string, BannerState>): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = NEEDS_BANNER_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(store) + '\n', { mode: 0o600 })
+    renameSync(tmp, NEEDS_BANNER_FILE)
+  } catch {}
+}
+
+// DIVE-1503/1558: reconcile the pinned "needs-you" banner in every paired DM
+// against the current gate backlog. Pin on the first gate, edit in place as the
+// backlog changes, unpin at zero — so a pending gate can never scroll out of
+// sight. Runs on a slow timer (below) in personal-bot/polled mode; 5dive-only
+// (the inbox verb is a 5dive surface). Never throws into the timer.
+let reconcilingBanner = false
+async function reconcileNeedsBanner(): Promise<void> {
+  if (reconcilingBanner) return // never overlap: a slow inbox read must not double-run
+  reconcilingBanner = true
+  try {
+    if (!(await read5diveInfo())) return // OSS/standalone host: no inbox verb, no banner
+    const dmChats = loadAccess().allowFrom // DM chat_id == user id (see access notes)
+    if (dmChats.length === 0) return
+    let j: { ok: boolean; data?: any }
+    try {
+      j = await run5dive(['task', 'inbox', '--json'])
+    } catch {
+      return // read error — do NOTHING, never unpin a live backlog on a transient blip
+    }
+    if (!j?.ok || !Array.isArray(j.data?.inbox)) return
+    const summary = summarizeNeeds(j.data.inbox)
+    const now = Date.now()
+    const store = readBannerStore()
+    let dirty = false
+    for (const chat of dmChats) {
+      const act = reconcileBanner(store[chat], summary, now)
+      try {
+        if (act.kind === 'send') {
+          const m = await bot.api.sendMessage(chat, act.text)
+          await bot.api.pinChatMessage(chat, m.message_id, { disable_notification: true }).catch(() => {})
+          store[chat] = { messageId: m.message_id, fingerprint: act.fingerprint }
+          dirty = true
+        } else if (act.kind === 'edit') {
+          await bot.api.editMessageText(chat, act.messageId, act.text)
+          store[chat] = { messageId: act.messageId, fingerprint: act.fingerprint }
+          dirty = true
+        } else if (act.kind === 'unpin') {
+          await bot.api.unpinChatMessage(chat, act.messageId).catch(() => {})
+          await bot.api.editMessageText(chat, act.messageId, act.clearText).catch(() => {})
+          delete store[chat]
+          dirty = true
+        }
+      } catch (err) {
+        // If the pinned message is gone (user deleted it), forget it so the next
+        // tick re-sends a fresh pin. Other errors are transient — retry next tick.
+        const msg = String((err as { description?: unknown })?.description ?? err)
+        if (/message to edit not found|message can't be edited|MESSAGE_ID_INVALID|to unpin not found/i.test(msg)) {
+          delete store[chat]
+          dirty = true
+        }
+      }
+    }
+    if (dirty) writeBannerStore(store)
+  } catch {
+    // heuristic surface — a timer must never crash the bot
+  } finally {
+    reconcilingBanner = false
+  }
+}
+
+// DIVE-1503/1558: keep the pinned "needs-you" banner in sync with the gate
+// backlog. This lineage is polling-only (no SEND_ONLY team-bot relay mode — cf
+// DIVE-1428), so the banner always arms in the paired DM. Slow cadence — a pin
+// only needs to survive scroll, not tick in real time; first run deferred so
+// bot.api + access.json are settled.
+setTimeout(() => void reconcileNeedsBanner(), 3000).unref()
+setInterval(() => void reconcileNeedsBanner(), 60_000).unref()
 
 void (async () => {
   // DIVE-818 single-flight acquisition (ported per DIVE-1241): wait until no

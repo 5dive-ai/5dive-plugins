@@ -1,3 +1,25 @@
+## v0.5.26
+
+### Added — needs-you banner fork parity + relay-mode decision (DIVE-1558)
+
+Propagated the DIVE-1503 pinned "needs-you" banner from canonical `telegram` to every poll-based
+fork: `telegram-grok` (the generator BASE, hand-edited), `telegram-agy` (regenerated), and
+`telegram-codex` / `telegram-pi` / `telegram-opencode` (hand-edited). Each imports
+`plugins/telegram/banner.ts` byte-identical (the `test/banner.test.ts` fork-parity tripwire now arms
+across all five) and runs the same 60s reconcile in `server.ts`, adapted to each fork's helpers
+(`read5diveInfo` host-gate, `run5dive` inbox read, grammy `bot.api` pin/edit/unpin). The generator
+now copies `banner.ts` verbatim (added to `COPY_FILES`, exempt from token subs like `tna.ts`) so
+codex/agy can never drift; `banner.ts`'s self-reference comment was reworded off the literal
+`telegram-grok` token so the generator's stray-token lint stays clean.
+
+Relay mode (SEND_ONLY): decided (with Marcus) to keep the banner OFF under one shared team-bot — a
+proactive per-agent timer would pin N banners into the one owner DM (DIVE-249), and relay users
+already have the on-demand `/inbox` digest. So the fork banner is gated `!SEND_ONLY` exactly like v1
+(pi is polling-only in its lineage, so it arms unconditionally). A listener-aggregated single
+consolidated pin is tracked as a follow-up only if relay users report missed gates.
+
+Versions: telegram 0.5.26, grok/codex/agy 0.5.13, pi 0.1.4, opencode 0.5.6.
+
 ## v0.5.25
 
 ### Added — pinned self-updating "needs-you" banner: a pending gate can never scroll out of sight (DIVE-1503)
