@@ -1,3 +1,27 @@
+## v0.5.25
+
+### Added — pinned self-updating "needs-you" banner: a pending gate can never scroll out of sight (DIVE-1503)
+
+The bot now keeps ONE pinned message per paired DM that always reflects the current human-gate
+backlog: it pins the banner when the first gate opens, edits it in place as gates open and clear
+(`N gate(s) need you, oldest <age> old. Tap /inbox to review and clear them.`), and unpins it at
+zero (editing the old message to "All caught up"). A pinned message survives scroll, so a gate can
+no longer fall off the bottom of the chat unseen — the 3rd recurrence of that class after DIVE-1428
+/ DIVE-1489.
+
+A slow reconcile (60s) reads `5dive task inbox --json`, mirrors buildInboxList's pending filter,
+and drives a pure state machine in `plugins/telegram/banner.ts` (`summarizeNeeds` / `reconcileBanner`
+/ `formatNeedsBanner`). It is 5dive-only and armed in personal-bot/polled mode (the SEND_ONLY
+shared-team-bot banner, with its per-agent dedup, rides with the fork follow-up). Edits
+fire only when the backlog size, the oldest gate, or its coarse age label changes — no per-tick edit
+storm (the DIVE-1107 lesson) — and a read error never unpins a live backlog. Per-DM `{messageId,
+fingerprint}` is persisted in `needs-banner.json`; a user-deleted pin is detected and re-sent next tick.
+
+banner.ts is pure + import-safe (server.ts long-polls on import), unit-tested end-to-end in
+`test/banner.test.ts` with a present-only fork-parity tripwire. Canonical `telegram` only this pass;
+fork propagation (grok base → generator regen codex/agy → hand-edit pi/opencode) is the split
+follow-up.
+
 ## v0.5.24
 
 ### Added — founder-veto TAP handler: authenticated one-tap veto from the founder's DM (DIVE-1494 #2, plugin half)

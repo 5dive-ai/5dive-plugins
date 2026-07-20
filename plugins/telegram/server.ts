@@ -29,6 +29,7 @@ import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap } from './council'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
+import { summarizeNeeds, reconcileBanner, type BannerState } from './banner'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -64,6 +65,10 @@ const GOAL_FILE = join(STATE_DIR, 'goal.json')
 const NUDGE_FILE = join(STATE_DIR, 'context-nudge.json')
 // /checkpoint bookkeeping: the saved session id + label. /resume reads this.
 const CHECKPOINT_FILE = join(STATE_DIR, 'checkpoint.json')
+// DIVE-1503: per-DM pinned "needs-you" banner bookkeeping. Maps a paired DM
+// chat id → { messageId, fingerprint } so each reconcile edits the existing pin
+// instead of posting a fresh banner (the DIVE-1107 banner-storm lesson).
+const NEEDS_BANNER_FILE = join(STATE_DIR, 'needs-banner.json')
 // One-shot handoff to 5dive-agent-start: /resume writes the bare session id
 // here; the launcher reads it on the next unit start, adds `--resume <id>`
 // to the claude invocation, and deletes it. The launcher hardcodes the
@@ -502,6 +507,81 @@ function recordLastHumanChat(chatId: string, messageThreadId: number | null): vo
   } catch {}
 }
 
+// DIVE-1503 pinned-banner store I/O. Heuristic state: a lost read/write only
+// costs one redundant banner send, never worth failing anything over.
+function readBannerStore(): Record<string, BannerState> {
+  try {
+    const j = JSON.parse(readFileSync(NEEDS_BANNER_FILE, 'utf8')) as Record<string, BannerState>
+    return j && typeof j === 'object' ? j : {}
+  } catch {
+    return {}
+  }
+}
+function writeBannerStore(store: Record<string, BannerState>): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = NEEDS_BANNER_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(store) + '\n', { mode: 0o600 })
+    renameSync(tmp, NEEDS_BANNER_FILE)
+  } catch {}
+}
+
+// DIVE-1503: reconcile the pinned "needs-you" banner in every paired DM against
+// the current gate backlog. Pin on the first gate, edit in place as the backlog
+// changes, unpin at zero — so a pending gate can never scroll out of sight. Runs
+// on a slow timer (below) in personal-bot/polled mode; 5dive-only (the inbox
+// verb is a 5dive surface). Never throws into the timer.
+let reconcilingBanner = false
+async function reconcileNeedsBanner(): Promise<void> {
+  if (reconcilingBanner) return // never overlap: a slow inbox read must not double-run
+  reconcilingBanner = true
+  try {
+    if (!(await read5diveVersion())) return // OSS host: no inbox verb, no banner
+    const dmChats = loadAccess().allowFrom // DM chat_id == user id (see access notes)
+    if (dmChats.length === 0) return
+    const j = await read5diveJson(['task', 'inbox', '--json'], 8000)
+    // On a read error, do NOTHING — never unpin a live backlog on a transient blip.
+    if (!j?.ok || !Array.isArray(j.data?.inbox)) return
+    const summary = summarizeNeeds(j.data.inbox)
+    const now = Date.now()
+    const store = readBannerStore()
+    let dirty = false
+    for (const chat of dmChats) {
+      const act = reconcileBanner(store[chat], summary, now)
+      try {
+        if (act.kind === 'send') {
+          const m = await bot.api.sendMessage(chat, act.text)
+          await bot.api.pinChatMessage(chat, m.message_id, { disable_notification: true }).catch(() => {})
+          store[chat] = { messageId: m.message_id, fingerprint: act.fingerprint }
+          dirty = true
+        } else if (act.kind === 'edit') {
+          await bot.api.editMessageText(chat, act.messageId, act.text)
+          store[chat] = { messageId: act.messageId, fingerprint: act.fingerprint }
+          dirty = true
+        } else if (act.kind === 'unpin') {
+          await bot.api.unpinChatMessage(chat, act.messageId).catch(() => {})
+          await bot.api.editMessageText(chat, act.messageId, act.clearText).catch(() => {})
+          delete store[chat]
+          dirty = true
+        }
+      } catch (err) {
+        // If the pinned message is gone (user deleted it), forget it so the next
+        // tick re-sends a fresh pin. Other errors are transient — retry next tick.
+        const msg = String((err as { description?: unknown })?.description ?? err)
+        if (/message to edit not found|message can't be edited|MESSAGE_ID_INVALID|to unpin not found/i.test(msg)) {
+          delete store[chat]
+          dirty = true
+        }
+      }
+    }
+    if (dirty) writeBannerStore(store)
+  } catch {
+    // heuristic surface — a timer must never crash the bot
+  } finally {
+    reconcilingBanner = false
+  }
+}
+
 // /goal state — one standing goal per agent (we don't multiplex across chats;
 // a single Claude session can only work on one thing at a time anyway). The
 // file is the source of truth for /goal status — Claude's own /loop state
@@ -796,6 +876,19 @@ function checkApprovals(): void {
 }
 
 if (!STATIC && !SEND_ONLY) setInterval(checkApprovals, 5000).unref()
+
+// DIVE-1503: keep the pinned "needs-you" banner in sync with the gate backlog.
+// Gated to the personal-bot / polled mode (same as checkApprovals). NOT armed in
+// SEND_ONLY: there one shared team-bot serves several agents (DIVE-249), each
+// with its own STATE_DIR + banner store, so a proactive per-agent timer would
+// pin several banners into the one owner DM. The relay-mode banner (with shared-
+// bot dedup) rides with the fork-parity + live-relay-verify follow-up. Slow
+// cadence — a pin only needs to survive scroll, not tick in real time. First run
+// is deferred so the bot/api and access.json are settled.
+if (!STATIC && !SEND_ONLY) {
+  setTimeout(() => void reconcileNeedsBanner(), 3000).unref()
+  setInterval(() => void reconcileNeedsBanner(), 60_000).unref()
+}
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
