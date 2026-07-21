@@ -1107,7 +1107,7 @@ function inboxCard(t: any): string {
   if (t.need_options) parts.push(`   options: ${String(t.need_options)}`)
   if (t.ask) {
     let ask = String(t.ask).replace(/\s+/g, ' ').trim()
-    if (ask.length > 200) ask = ask.slice(0, 199) + '…'
+    if (!t.need_options && ask.length > 200) ask = ask.slice(0, 199) + '…'
     parts.push(`   ${ask}`)
   }
   parts.push(`   → /task_${t.id}`)
