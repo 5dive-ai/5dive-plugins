@@ -1,6 +1,6 @@
 {
   "name": "telegram-codex",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "Telegram bridge for OpenAI Codex CLI: DM or group-chat your Codex session, get turn-complete pings, and approve risky commands from your phone.",
   "author": {
     "name": "5dive",
