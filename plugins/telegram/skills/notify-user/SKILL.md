@@ -43,10 +43,22 @@ Telegram message MUST get a `reply` before the turn ends, even if it's just
   telegram-paired sessions. Inline the question or plan into a normal
   reply and wait for the next inbound.
 
+## Attaching files
+
+If your reply references or links a local file — a `.md` note, log,
+screenshot, generated asset, or a path you'd otherwise paste — **attach it
+via the `reply` tool's `files=` param** (an array of absolute paths). Never
+send a bare path or filename: the paired user has **no terminal or
+filesystem access**, so a path is a dead link — the file itself is the
+deliverable. Images send as inline photos, other types as documents (≤50MB
+each). Two caveats: don't attach secrets, and don't attach a file you
+haven't read (attaching distributes it).
+
 ## Presenting choices
 
 Use Telegram inline-keyboard buttons, not a numbered list. The `reply`
-MCP tool only sends plain text — hit the Bot API directly:
+MCP tool sends text and file attachments (see above) but **not** inline
+keyboards — for buttons, hit the Bot API directly:
 
 ```bash
 CHAT_ID=$(jq -r '.allowFrom[0]' ~/.claude/channels/telegram/access.json)
