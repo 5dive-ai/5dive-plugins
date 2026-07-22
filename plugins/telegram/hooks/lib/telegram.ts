@@ -16,6 +16,16 @@ export function getToken(): string | undefined {
 export async function sendMessage(chatId: string, text: string, threadId?: string): Promise<void> {
   const token = getToken()
   if (!token || !chatId) return
+  // DIVE-1674: never deliver a bare 'undefined'/empty payload to the user.
+  // A caller passing undefined (or a template that stringified to the literal
+  // string 'undefined') must be dropped at this choke point, not sent. Guard
+  // defensively so the symptom dies regardless of which caller slipped up.
+  if (text == null || text.trim() === '' || text.trim() === 'undefined') {
+    process.stderr.write(
+      `telegram sendMessage: refusing to send empty/undefined text to ${chatId}\n`,
+    )
+    return
+  }
   const trimmed =
     text.length > TELEGRAM_TEXT_MAX
       ? text.slice(0, TELEGRAM_TEXT_MAX - 40) + '… [truncated; see journalctl on the host]'
