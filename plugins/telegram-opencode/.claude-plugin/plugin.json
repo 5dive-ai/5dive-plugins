@@ -1,7 +1,7 @@
 {
   "name": "telegram-opencode",
   "description": "Telegram channel for the opencode CLI — a long-running relay over opencode's headless HTTP server (opencode serve) and /event SSE stream, with access control and pairing. Unlike the codex/grok/agy MCP forks it needs no wait_for_message loop, re-arm watchdog, or file-IPC permission bridge (server.heartbeat/session.idle/permission.asked are first-class API). Maintained by 5dive.",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "author": { "name": "5dive", "email": "support@5dive.com" },
   "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/telegram-opencode",
   "keywords": ["telegram", "messaging", "channel", "opencode", "relay", "sse"]

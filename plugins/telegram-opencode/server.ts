@@ -386,6 +386,19 @@ function extractText(parts: any[]): string {
 // ============================================================================
 
 const bot = new Bot(TOKEN)
+// DIVE-1674: never deliver a bare 'undefined'/empty payload to the user.
+// This is the single transport choke point every send flows through, so a
+// guard here kills the symptom regardless of which caller passed undefined
+// (or a template that stringified to the literal string 'undefined').
+bot.api.config.use((prev, method, payload, signal) => {
+  if (method === 'sendMessage' || method === 'editMessageText') {
+    const p = payload as { text?: string }
+    if (p.text == null || p.text.trim() === '' || p.text.trim() === 'undefined') {
+      throw new Error(`telegram ${method}: refusing to send empty/undefined text`)
+    }
+  }
+  return prev(method, payload, signal)
+})
 let botUsername = ''
 let shuttingDown = false
 

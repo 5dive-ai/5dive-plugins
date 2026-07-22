@@ -556,6 +556,13 @@ const TG_HARD_MESSAGE_LIMIT = 4096
 bot.api.config.use((prev, method, payload, signal) => {
   if (method === 'sendMessage' || method === 'editMessageText') {
     const p = payload as { text?: string; parse_mode?: string }
+    // DIVE-1674: never deliver a bare 'undefined'/empty payload to the user.
+    // This is the single transport choke point every send flows through, so a
+    // guard here kills the symptom regardless of which caller passed undefined
+    // (or a template that stringified to the literal string 'undefined').
+    if (p.text == null || p.text.trim() === '' || p.text.trim() === 'undefined') {
+      throw new Error(`telegram ${method}: refusing to send empty/undefined text`)
+    }
     if (typeof p.text === 'string' && p.text.length > TG_HARD_MESSAGE_LIMIT) {
       p.text = p.text.slice(0, TG_HARD_MESSAGE_LIMIT - 32) + '\n…(message truncated)'
       delete p.parse_mode

@@ -188,6 +188,13 @@ const bot = new Bot(TOKEN)
 bot.api.config.use((prev, method, payload, signal) => {
   if (method === 'sendMessage' || method === 'editMessageText') {
     const p = payload as { text?: string; parse_mode?: string }
+    // DIVE-1674: never deliver a bare 'undefined'/empty payload to the user.
+    // This is the single transport choke point every send flows through, so a
+    // guard here kills the symptom regardless of which caller passed undefined
+    // (or a template that stringified to the literal string 'undefined').
+    if (p.text == null || p.text.trim() === '' || p.text.trim() === 'undefined') {
+      throw new Error(`telegram ${method}: refusing to send empty/undefined text`)
+    }
     if (typeof p.text === 'string' && p.text.length > MAX_CHUNK_LIMIT) {
       p.text = p.text.slice(0, MAX_CHUNK_LIMIT - 32) + '\n…(message truncated)'
       delete p.parse_mode
@@ -1164,7 +1171,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const chat_id = args.chat_id as string
-        const text = args.text as string
+        let text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         // Forum-topic routing. When the inbound came from a non-General topic
         // in a supergroup, the agent passes message_thread_id through so the
@@ -1175,6 +1182,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+
+        // DIVE-1674: never deliver a bare 'undefined'/empty text to the user.
+        // Drop it at the choke point and surface a clear error to the caller
+        // (the agent) so it sees what went wrong — UNLESS files are attached,
+        // where a text-less reply is a legitimate files-only send (the text
+        // message is then skipped entirely below).
+        const textMissing =
+          text == null || text.trim() === '' || text.trim() === 'undefined'
+        if (textMissing) {
+          if (files.length === 0) {
+            throw new Error(
+              "reply: `text` was missing, empty, or the literal string 'undefined' — nothing sent. Pass non-empty text, or attach files for a files-only reply.",
+            )
+          }
+          text = ''
+        }
 
         assertAllowedChat(chat_id)
         stopTypingLoop(chat_id)
@@ -1212,7 +1235,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // DIVE-332: detect a trailing yes/no question and strip any opt-out
         // marker. The Yes/No keyboard attaches to the LAST text chunk only.
         const { stripped, keyboard: ynKeyboard } = yesNoButtons(text)
-        const chunks = chunk(senderPrefix + stripped, limit, mode)
+        // textMissing → files-only reply: emit no text message at all.
+        const chunks = textMissing ? [] : chunk(senderPrefix + stripped, limit, mode)
         // DIVE-708: a choice-list keyboard takes precedence over Yes/No, but only
         // when the whole reply is a single chunk — the tap resolves the option
         // from the message it's attached to, so every option must live in it.
