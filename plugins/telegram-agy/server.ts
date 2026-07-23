@@ -1036,11 +1036,15 @@ async function restartAgent(name: string, ackUpdateId?: number): Promise<void> {
     try { await bot.api.getUpdates({ offset: ackUpdateId + 1, limit: 1, timeout: 0 }) } catch {}
   }
   await new Promise<void>(resolve => {
-    // `sudo 5dive agent restart <name>` is the canonical path — it
-    // touches the systemd unit, not the tmux session directly, so the
-    // unit's audit log and restart counter stay consistent.
+    // DIVE-1813: `sudo 5dive agent _self_restart` is the canonical path — on a
+    // standard-isolation box the agent's scoped sudoers grants exactly this
+    // (there is NO `agent restart <name>` grant), and it restarts ONLY the
+    // caller's own unit (derived from SUDO_USER, never argv). Deferred
+    // internally so the ack lands before the respawn. Touches the systemd unit,
+    // not the tmux session, so the unit's audit log + restart counter stay
+    // consistent.
     require('child_process').execFile('sudo',
-      ['-n', '5dive', 'agent', 'restart', name],
+      ['-n', '5dive', 'agent', '_self_restart'],
       { timeout: 10_000 },
       () => resolve(),
     )
