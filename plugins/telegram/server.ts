@@ -2200,8 +2200,7 @@ function applyModel(alias: string, chatId: number): ApplyResult {
     after: () => {
       void execFileP(
         SUDO,
-        ['-n', 'systemd-run', '--on-active=1', '--collect',
-          '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+        ['-n', '5dive', 'agent', '_self_restart'],
         { timeout: 5000 },
       ).catch((err: any) => {
         const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -2275,8 +2274,7 @@ function applyEffort(level: string, chatId: number): ApplyResult {
     after: () => {
       void execFileP(
         SUDO,
-        ['-n', 'systemd-run', '--on-active=1', '--collect',
-          '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+        ['-n', '5dive', 'agent', '_self_restart'],
         { timeout: 5000 },
       ).catch((err: any) => {
         const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -2852,8 +2850,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     )
     void execFileP(
       SUDO,
-      ['-n', 'systemd-run', '--on-active=1', '--collect',
-        '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+      ['-n', '5dive', 'agent', '_self_restart'],
       { timeout: 5000 },
     ).catch((err: any) => {
       const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -2923,8 +2920,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     // optimistic ack with a fresh reply.
     void execFileP(
       SUDO,
-      ['-n', 'systemd-run', '--on-active=1', '--collect',
-        '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+      ['-n', '5dive', 'agent', '_self_restart'],
       { timeout: 5000 },
     ).catch((err: any) => {
       const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -2984,8 +2980,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     await ctx.reply(`${summary}\n\n⚠️  Restarting to apply — back in ~20-30s once the new session loads.`)
     void execFileP(
       SUDO,
-      ['-n', 'systemd-run', '--on-active=1', '--collect',
-        '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+      ['-n', '5dive', 'agent', '_self_restart'],
       { timeout: 5000 },
     ).catch((err: any) => {
       const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -4380,8 +4375,7 @@ bot.on('callback_query:data', async ctx => {
       .catch(() => {})
     void execFileP(
       SUDO,
-      ['-n', 'systemd-run', '--on-active=1', '--collect',
-        '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+      ['-n', '5dive', 'agent', '_self_restart'],
       { timeout: 5000 },
     ).catch((err: any) => {
       const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -5158,8 +5152,7 @@ async function handleInbound(
         if (me) {
           void execFileP(
             SUDO,
-            ['-n', 'systemd-run', '--on-active=1', '--collect',
-              '/bin/systemctl', 'restart', `5dive-agent@${me}.service`],
+            ['-n', '5dive', 'agent', '_self_restart'],
             { timeout: 5000 },
           ).catch((err: any) => {
             const stderr = err?.stderr ? String(err.stderr).trim() : ''
