@@ -4206,6 +4206,36 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // DIVE-1505: bulk 'Clear all recommended (sub-T2)' tap from the gate-inbox
+  // digest (CLI `task inbox --send`). Same rail as the per-gate gclear: tap but
+  // with no --only, so the CLI clears EVERY agent-clearable (blocked, tier<2,
+  // has a rec, not lead-routed) gate at once — the verified sender is the
+  // --channel-proof, re-verified CLI-side; tier-2 hard gates are untouched and
+  // keep their per-gate taps. Fully fail-soft.
+  if (data === 'gclearall') {
+    try {
+      const { stdout } = await execFileP(
+        SUDO,
+        ['-n', '5dive', 'task', 'clear-recs', `--channel-proof=${senderId}`, '--from=telegram', '--json'],
+        { timeout: 15000 },
+      )
+      const j = JSON.parse(stdout)
+      const cleared = Number(j?.data?.cleared ?? 0)
+      if (j?.ok && cleared > 0) {
+        await ctx.answerCallbackQuery({ text: `✅ Cleared ${cleared} recommended gate${cleared === 1 ? '' : 's'}` }).catch(() => {})
+        // Drop the whole keyboard — the digest's gates are resolved/re-scoped now.
+        await ctx.editMessageReplyMarkup().catch(() => {})
+      } else {
+        await ctx
+          .answerCallbackQuery({ text: 'Nothing cleared — hard gates need their per-gate tap, or all were answered.' })
+          .catch(() => {})
+      }
+    } catch {
+      await ctx.answerCallbackQuery({ text: "Couldn't clear — tap a gate or open the dashboard." }).catch(() => {})
+    }
+    return
+  }
+
   // DIVE-332: tap on an auto-rendered Yes/No question button (the reply tool
   // appends `yn:yes`/`yn:no` when an agent message ends in a single yes/no
   // question). Inject the plain 'yes'/'no' as a channel inbound — the same shape
