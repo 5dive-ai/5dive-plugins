@@ -24,7 +24,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, EFFORT_LEVELS } from './commands'
+import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, applyModelAliases, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
@@ -1820,6 +1820,34 @@ async function read5diveJson(args: string[], timeout: number): Promise<any | nul
     const out = String((e as { stdout?: unknown })?.stdout ?? '')
     try { return JSON.parse(out) } catch { return null }
   }
+}
+
+// DIVE-1883: pull the alias -> model-id map from the CLI's single source of
+// truth (`5dive models --json` -> src/lib/models.sh) and merge it into
+// MODEL_ALIASES in place. Every read of MODEL_ALIASES happens inside a handler,
+// well after boot, so mutating the imported object is enough — no call site
+// needs to change. Best-effort by design: on an upstream host with no 5dive CLI
+// (or an older one without `models`), read5diveJson returns null and the baked
+// defaults in commands.ts stand. The merge itself lives in commands.ts so it is
+// unit-testable without importing this module (which long-polls on import).
+async function refreshModelAliases(): Promise<void> {
+  // Try unprivileged FIRST: `models` reads no state and needs no root, and a
+  // standard (non-admin) agent's sudoers grant is scoped to _deliver/_capture/
+  // _audit_append — `sudo -n 5dive models` would be denied there, silently
+  // stranding those agents on the baked defaults. Fall back to the sudo path
+  // for hosts where the bare binary isn't on PATH for this uid.
+  let data: unknown = null
+  try {
+    const { stdout } = await execFileP(FIVEDIVE, ['models', '--json'], { timeout: 3000 })
+    const j = JSON.parse(stdout)
+    if (j?.ok) data = j.data
+  } catch { /* fall through to the sudo path */ }
+  if (data == null) {
+    const j = await read5diveJson(['models', '--json'], 3000)
+    if (!j?.ok) return
+    data = j.data
+  }
+  applyModelAliases(data)
 }
 
 async function read5diveAgentList(): Promise<FiveDiveAgentEntry[] | null> {
@@ -5344,6 +5372,9 @@ if (SEND_ONLY) {
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          // DIVE-1883: resolve the /model picker against the CLI's model
+          // catalogue so it can't drift a version behind agent-create again.
+          void refreshModelAliases()
           // BotFather menu reflects host capabilities at startup. read5diveVersion()
           // shells out to `5dive --version` — fast (<100ms) but async, so do it
           // outside the synchronous bot.api call.

@@ -1,3 +1,33 @@
+## v0.5.36
+
+### Fixed — /model picker resolves against the CLI's model catalogue, + fable (DIVE-1883)
+
+`MODEL_ALIASES` was a hand-maintained copy of the same alias→id map the 5dive CLI keeps for
+agent-create, and the two had drifted apart: the plugin pinned `opus` to `claude-opus-4-7` while
+the CLI pinned `claude-opus-4-8`, so `/model opus` over Telegram and `5dive compose` handed you
+different models. Both were stale — `claude-opus-5` appeared in neither.
+
+The CLI now owns a single source of truth (`src/lib/models.sh`, exposed as `5dive models --json`).
+At boot the plugin calls `refreshModelAliases()`, which fetches that map and hands it to a new pure
+`applyModelAliases()` in `commands.ts` that replaces `MODEL_ALIASES` in place. Every read of the map
+happens inside a handler, well after boot, so no call site changed. It tries the bare binary before
+`sudo` — `models` reads no state, and a standard agent's sudoers grant is scoped to
+`_deliver`/`_capture`/`_audit_append`, so the sudo path alone would strand those agents.
+
+Fail-closed throughout: a missing CLI (upstream host), an older CLI without `models`, or a
+malformed payload leaves the baked defaults standing rather than emptying the picker; non-string
+rows are dropped individually. An alias the CLI knows and the plugin does not is added, so a newly
+mapped family appears in the picker without a plugin release.
+
+The baked defaults are now current and gain `fable` and `haiku`: opus `claude-opus-5`, sonnet
+`claude-sonnet-5`, fable `claude-fable-5`, haiku `claude-haiku-4-5-20251001`. `telegram-pi`'s
+`/model` help line also stopped advertising `anthropic/claude-sonnet-4-5` as its example.
+
+Tests: `test/model-aliases.test.ts` — 7 cases covering the baked map (full ids only, never a bare
+alias, which Claude Code's startup migration strips on a fresh config dir per DIVE-506), replace-not-
+merge semantics, unknown-family adoption, fail-closed on null/empty/array/string/number payloads, and
+per-row rejection of non-string ids. Full suite 330 pass / 0 fail.
+
 ## v0.5.29
 
 ### Added — council human-as-seat ballot tap handler (DIVE-1566)

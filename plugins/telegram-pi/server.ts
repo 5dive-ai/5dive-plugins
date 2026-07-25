@@ -926,7 +926,7 @@ async function handleModelCommand(chat_id: string, arg: string): Promise<string>
   if (!name) {
     const cur = currentModel()
     return `*model* — pi\n\ncurrent: \`${cur ? `${cur.providerID}/${cur.modelID}` : '(pi default)'}\`\n\n`
-      + `Switch with \`/model <provider>/<modelId>\` (e.g. \`anthropic/claude-sonnet-4-5\`) — applies to your next message.`
+      + `Switch with \`/model <provider>/<modelId>\` (e.g. \`anthropic/claude-sonnet-5\`) — applies to your next message.`
   }
   const slash = name.indexOf('/')
   if (!/^[A-Za-z0-9._:\/-]+$/.test(name) || slash <= 0) {
