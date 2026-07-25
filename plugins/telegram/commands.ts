@@ -189,12 +189,43 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
 ]
 
-/** Short model alias → full Claude Code model ID. Add new tiers here.
- *  Keys here are also the picker button labels, so order is the display order. */
+/** Short model alias → full Claude Code model ID.
+ *  Keys here are also the picker button labels, so order is the display order.
+ *
+ *  DIVE-1883: these are FALLBACK defaults only. On a 5dive host the map is
+ *  refreshed at boot from `5dive models --json` (see refreshModelAliases() in
+ *  server.ts), which reads the CLI's single source of truth in
+ *  src/lib/models.sh. Do NOT bump a model here on its own — that is exactly how
+ *  this map ended up a whole version behind the CLI (opus pointed at 4.7 while
+ *  the CLI pinned 4.8, so /model opus and agent-create disagreed). Change
+ *  models.sh; this map only matters on upstream hosts with no 5dive CLI. */
 export const MODEL_ALIASES: Record<string, string> = {
-  opus: 'claude-opus-4-7',
-  sonnet: 'claude-sonnet-4-6',
+  opus: 'claude-opus-5',
+  sonnet: 'claude-sonnet-5',
   fable: 'claude-fable-5',
+  haiku: 'claude-haiku-4-5-20251001',
+}
+
+/** DIVE-1883: replace MODEL_ALIASES in place from the CLI's catalogue
+ *  (`5dive models --json` -> data). Pure and side-effect-free apart from the
+ *  mutation, so it is unit-testable without importing server.ts (which
+ *  long-polls Telegram on import). Returns true when the map was replaced.
+ *
+ *  Fail-closed: a null/empty/malformed payload leaves the baked defaults
+ *  standing rather than emptying the picker. Non-string entries are dropped
+ *  individually so one bad row can't poison the whole map. An alias the CLI
+ *  knows and we don't is ADDED, so a newly mapped family shows up in the
+ *  picker without a plugin release. */
+export function applyModelAliases(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const merged: Record<string, string> = {}
+  for (const [alias, id] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof id === 'string' && alias && id) merged[alias] = id
+  }
+  if (Object.keys(merged).length === 0) return false
+  for (const k of Object.keys(MODEL_ALIASES)) delete MODEL_ALIASES[k]
+  Object.assign(MODEL_ALIASES, merged)
+  return true
 }
 
 /** Effort levels accepted by Claude Code's settings.json. */
