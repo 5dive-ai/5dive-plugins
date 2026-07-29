@@ -24,7 +24,7 @@
 
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { OPT_RE, optionChoices, parseOptions , yesNoChoice} from './tna'
+import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs , yesNoChoice} from './tna'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import {
   readFileSync, writeFileSync, mkdirSync, chmodSync, statSync,
@@ -1480,6 +1480,71 @@ bot.on('callback_query:data', async ctx => {
       await ctx.editMessageText(detail.text, { reply_markup: detail.keyboard }).catch(() => {})
     } catch {}
     await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
+  // DIVE-2374: the `tna:` (tap-to-answer) GATE route, ported from telegram base +
+  // grok. It was not stale here, it was ABSENT: this router never matched `tna:`,
+  // so no gate of any type -- decision/approval/secret/manual, nonce or not --
+  // could ever be cleared from Telegram on this runtime. It fell through to the
+  // bottom of the handler and died silently. Guarded (not `if (!tnaM) return`)
+  // because the ocperm tool-permission branch still follows: an early return
+  // here would silently make THAT route unreachable, which is the same bug one
+  // layer over. Parse first, authorise second -- never answer a callback we do
+  // not own.
+  const tnaM = TNA_RE.exec(data)
+  if (tnaM) {
+    const tnaSender = String(ctx.from?.id ?? '')
+    if (!loadAccess().allowFrom.includes(tnaSender)) {
+      await ctx.answerCallbackQuery({ text: 'not authorised', show_alert: true }).catch(() => {})
+      return
+    }
+    const tnaTaskId = tnaM[1]!
+    const tnaToken = tnaM[2]!
+    // DIVE-916: per-gate HUMAN nonce carried in callback_data -> --human-proof.
+    const tnaProof = tnaM[3]
+    try {
+      const show = await run5dive(['task', 'show', tnaTaskId, '--json'], 5000)
+      const task = show.ok ? show.data?.task : undefined
+      // Branch logic lives in resolveTnaAnswer (DIVE-369, byte-identical across
+      // every plugin, pinned headless by test/tna-harness.test.ts). Thin I/O adapter.
+      const r = resolveTnaAnswer(task, tnaToken)
+      if (r.kind === 'nogate') {
+        await ctx.answerCallbackQuery({ text: 'This task no longer has a gate.' }).catch(() => {})
+        await ctx.editMessageReplyMarkup().catch(() => {})
+        return
+      }
+      if (r.kind === 'already') {
+        await ctx.answerCallbackQuery({ text: 'Already answered.' }).catch(() => {})
+        await ctx.editMessageText(`✅ already answered: ${r.prior}`).catch(() => {})
+        return
+      }
+      if (r.kind === 'invalid') {
+        await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
+        await ctx.editMessageReplyMarkup().catch(() => {})
+        return
+      }
+      // DIVE-1115: mark EVERY verified-human tap --human (allowFrom vetted the
+      // tapper just above) so a decision/manual tap does not record a bare AGENT
+      // name in need_answered_by -- which the zero-human KPI counts as non-human.
+      // --human-proof rides along only when the gate minted a nonce (hard gates do,
+      // decisions do not), so an older CLI on the box never sees an unknown flag.
+      const extraArgs = tapEvidenceArgs(tnaProof)
+      await run5dive(['task', 'answer', tnaTaskId, ...r.answerArgs, ...extraArgs, '--json'], 8000)
+      await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
+      await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
+    } catch {
+      // DIVE-894: don't point at a dashboard the box may not have -- the on-box
+      // answer line works everywhere (run as a human login, claude/root).
+      await ctx.answerCallbackQuery({ text: "Couldn't apply — fallback sent in chat." }).catch(() => {})
+      await ctx
+        .reply(
+          `Couldn't apply that tap for DIVE-${tnaTaskId}. On the box (as claude/root):\n` +
+          `sudo 5dive task answer ${tnaTaskId} --value="<your choice>"` +
+          `  (approval: approved|denied · secret gate: omit --value)`,
+        )
+        .catch(() => {})
+    }
     return
   }
 

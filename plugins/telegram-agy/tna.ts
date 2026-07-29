@@ -5,9 +5,15 @@
 // this module imports cleanly). server.ts stays the thin I/O adapter: re-read the
 // live gate -> resolveTnaAnswer() -> answer + ack.
 //
-// Keep this file byte-identical across telegram base + grok/codex/agy forks; the
-// parity test asserts it. The only per-runtime difference lives in server.ts (how
-// the gate is fetched: execFileP+JSON.parse on base, run5dive on the forks).
+// Keep this file byte-identical across EVERY telegram plugin. The parity test
+// GLOBS plugins/*/tna.ts instead of naming a list, because DIVE-2374 was caused
+// by a named list: telegram-pi and telegram-opencode were simply absent from it,
+// so their stale greedy TNA_RE -- and the far worse fact that their server.ts
+// never routed `tna:` at all, i.e. no gate was tappable on those runtimes -- was
+// never observable to CI. A fence that works by NAMING its members cannot fail
+// for a member it does not name. The only per-runtime difference lives in
+// server.ts (how the gate is fetched: execFileP+JSON.parse on base, run5dive on
+// the forks).
 
 // A tapped inline button lands as `tna:<numericTaskId>:<token>` and, on a hard
 // human gate (approval/secret/manual), an optional `:<nonce>` — the DIVE-916
