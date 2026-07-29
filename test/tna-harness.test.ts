@@ -10,16 +10,37 @@
 // `5dive task answer` argv + the user-facing ack/UI text — with no bot boot, no
 // Telegram, and no live DB.
 //
-// It runs the matrix against the REAL resolver each plugin ships (telegram base +
-// grok/codex/agy forks import the same tna.ts), and asserts the four tna.ts are
-// byte-identical so a fork can never silently drift from base.
+// It runs the matrix against the REAL resolver each plugin ships (every telegram
+// plugin imports the same tna.ts), and asserts they are byte-identical so a fork
+// can never silently drift from base.
+//
+// DIVE-2374: PLUGINS is DISCOVERED, not listed. It used to be the literal
+// ['telegram','telegram-grok','telegram-codex','telegram-agy'] — so telegram-pi
+// and telegram-opencode, which also ship a tna.ts, were never asserted against.
+// Both had drifted to a greedy TNA_RE, both were missing tapEvidenceArgs, and
+// worse, neither server.ts ROUTED `tna:` at all: no gate of any type was
+// clearable from Telegram on those runtimes, and had never been. A parity fence
+// that works by naming its members cannot fail for a member it does not name,
+// which makes the omission invisible rather than red. Globbing plugins/*/tna.ts
+// means adding a plugin enrolls it in its own test; the only way out is to not
+// ship a tna.ts. See also assertRoutesTna below — file-level parity alone would
+// still have passed here, because the missing piece was in server.ts.
 
 import { describe, test, expect } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 
-const PLUGINS = ['telegram', 'telegram-grok', 'telegram-codex', 'telegram-agy'] as const
-const TNA_DIR = (p: string) => join(import.meta.dir, '..', 'plugins', p, 'tna.ts')
+const PLUGINS_DIR = join(import.meta.dir, '..', 'plugins')
+const TNA_DIR = (p: string) => join(PLUGINS_DIR, p, 'tna.ts')
+const SERVER_TS = (p: string) => join(PLUGINS_DIR, p, 'server.ts')
+
+// Every plugin that ships a tna.ts is in scope, base first so parity diffs read
+// as "fork drifted from base". Sorted for a stable test order.
+const DISCOVERED = readdirSync(PLUGINS_DIR, { withFileTypes: true })
+  .filter(d => d.isDirectory() && existsSync(TNA_DIR(d.name)))
+  .map(d => d.name)
+  .sort()
+const PLUGINS = ['telegram', ...DISCOVERED.filter(p => p !== 'telegram')] as const
 
 // Import each plugin's shipped resolver so the matrix runs against real code,
 // not a copy. (Importing server.ts is unsafe — it long-polls on import — which
@@ -69,8 +90,66 @@ const gate = (over: Record<string, unknown> = {}) => ({
   ...over,
 })
 
+// DIVE-2374: the discovery above is an INPUT to every loop in this file, so an
+// empty or wrong resolution would make the whole suite pass vacuously — a bug
+// class we have shipped before (a control that reads "I was given nothing" as
+// "there is nothing"). These two assertions are the floor: the base must be
+// found, and the plugins known to ship a tna.ts must all be enrolled. Adding a
+// plugin does NOT require touching this list; removing one from disk without
+// deleting it here is the only way to red, which is the intended direction.
+const MUST_BE_ENROLLED = [
+  'telegram', 'telegram-grok', 'telegram-codex', 'telegram-agy',
+  'telegram-pi', 'telegram-opencode',
+] as const
+
+describe('DIVE-2374: the plugin list is discovered, and discovery actually resolved', () => {
+  test('discovery found the telegram base', () => {
+    expect(DISCOVERED, 'plugins/*/tna.ts resolved to nothing — every loop below would pass vacuously')
+      .toContain('telegram')
+    expect(PLUGINS[0]).toBe('telegram')
+  })
+
+  test('every plugin known to ship a tna.ts is enrolled', () => {
+    for (const p of MUST_BE_ENROLLED) {
+      expect(PLUGINS, `${p} ships a tna.ts but is not enrolled in the tna harness`).toContain(p)
+    }
+    expect(mods.length).toBe(PLUGINS.length)
+  })
+})
+
+// DIVE-2374: file-level parity of tna.ts is NOT enough, and this is the check
+// whose absence let the real defect live. telegram-pi/opencode both shipped a
+// tna.ts, so a parity test over those files would have graded them (had they
+// been named) — but their server.ts never IMPORTED TNA_RE and never called
+// resolveTnaAnswer, so the module was dead code and every gate tap fell through
+// the callback router unanswered. Shipping the module is not wiring the route.
+// server.ts long-polls on import, so this is a deliberate STATIC assertion —
+// the strongest thing available without booting a bot.
+function assertRoutesTna(plugin: string) {
+  const src = readFileSync(SERVER_TS(plugin), 'utf8')
+  for (const symbol of ['TNA_RE', 'resolveTnaAnswer', 'tapEvidenceArgs']) {
+    expect(src.includes(symbol), `${plugin}/server.ts never references ${symbol} — the tna: gate route is not wired`)
+      .toBe(true)
+  }
+  expect(/TNA_RE\.exec\(/.test(src), `${plugin}/server.ts imports TNA_RE but never execs it`).toBe(true)
+  expect(/resolveTnaAnswer\(/.test(src), `${plugin}/server.ts never calls resolveTnaAnswer`).toBe(true)
+  expect(/tapEvidenceArgs\(/.test(src), `${plugin}/server.ts never calls tapEvidenceArgs — taps would record agent provenance`)
+    .toBe(true)
+  // The answer must be re-resolved from the LIVE gate, not the payload.
+  expect(/task['"],\s*['"]show['"]|task show/.test(src), `${plugin}/server.ts tna route never re-reads the gate`)
+    .toBe(true)
+}
+
+describe('DIVE-2374: every plugin WIRES the tna: route in server.ts, not just ships tna.ts', () => {
+  for (const p of PLUGINS) {
+    test(`${p}: server.ts routes tna: taps through the shipped resolver`, () => {
+      assertRoutesTna(p)
+    })
+  }
+})
+
 describe('tna.ts parity across base + forks', () => {
-  test('all four tna.ts are byte-identical', () => {
+  test('every plugin tna.ts is byte-identical to the base', () => {
     const texts = PLUGINS.map(p => readFileSync(TNA_DIR(p), 'utf8'))
     for (let i = 1; i < texts.length; i++) {
       expect(texts[i], `${PLUGINS[i]}/tna.ts drifted from ${PLUGINS[0]}/tna.ts`).toBe(texts[0])

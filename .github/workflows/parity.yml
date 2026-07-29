@@ -7,19 +7,21 @@ name: fork parity
 on:
   push:
     paths:
-      - 'plugins/telegram/**'
-      - 'plugins/telegram-codex/**'
-      - 'plugins/telegram-grok/**'
-      - 'plugins/telegram-agy/**'
+      # DIVE-2374: 'plugins/**', not a per-plugin allowlist. The old list named
+      # telegram/codex/grok/agy, so a change touching ONLY telegram-pi or
+      # telegram-opencode triggered no CI at all -- the same fence-by-naming that
+      # kept those two plugins out of the tna harness for their whole lifetime.
+      - 'plugins/**'
       - 'generator/**'
       - 'test/**'
       - '.github/workflows/parity.yml'
   pull_request:
     paths:
-      - 'plugins/telegram/**'
-      - 'plugins/telegram-codex/**'
-      - 'plugins/telegram-grok/**'
-      - 'plugins/telegram-agy/**'
+      # DIVE-2374: 'plugins/**', not a per-plugin allowlist. The old list named
+      # telegram/codex/grok/agy, so a change touching ONLY telegram-pi or
+      # telegram-opencode triggered no CI at all -- the same fence-by-naming that
+      # kept those two plugins out of the tna harness for their whole lifetime.
+      - 'plugins/**'
       - 'generator/**'
       - 'test/**'
       - '.github/workflows/parity.yml'
@@ -30,7 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
-      - run: bun test test/parity.test.ts
+      # DIVE-2374: the whole suite, not a named file. CI ran ONLY parity.test.ts,
+      # so test/tna-harness.test.ts -- the harness that owns the tap line -- had
+      # never executed here. A test file must not be able to be absent from CI by
+      # omission; `bun test` enrolls every file in test/ automatically.
+      - run: bun test
       # Generator drift gate (DIVE-9): every runtime config must still regenerate
       # its committed fork byte-exact. Catches a fork hand-edited without updating
       # its generator config (or the base) — the structural successor to the

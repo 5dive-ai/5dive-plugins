@@ -5,14 +5,25 @@
 // this module imports cleanly). server.ts stays the thin I/O adapter: re-read the
 // live gate -> resolveTnaAnswer() -> answer + ack.
 //
-// Keep this file byte-identical across telegram base + grok/codex/agy forks; the
-// parity test asserts it. The only per-runtime difference lives in server.ts (how
-// the gate is fetched: execFileP+JSON.parse on base, run5dive on the forks).
+// Keep this file byte-identical across EVERY telegram plugin. The parity test
+// GLOBS plugins/*/tna.ts instead of naming a list, because DIVE-2374 was caused
+// by a named list: telegram-pi and telegram-opencode were simply absent from it,
+// so their stale greedy TNA_RE -- and the far worse fact that their server.ts
+// never routed `tna:` at all, i.e. no gate was tappable on those runtimes -- was
+// never observable to CI. A fence that works by NAMING its members cannot fail
+// for a member it does not name. The only per-runtime difference lives in
+// server.ts (how the gate is fetched: execFileP+JSON.parse on base, run5dive on
+// the forks).
 
-// A tapped inline button lands as `tna:<numericTaskId>:<token>`. Numeric id + a
-// short token keeps callback_data under Telegram's 64-byte cap; the value is
-// always re-resolved from the live gate below, never trusted from the payload.
-export const TNA_RE = /^tna:(\d+):(.+)$/
+// A tapped inline button lands as `tna:<numericTaskId>:<token>` and, on a hard
+// human gate (approval/secret/manual), an optional `:<nonce>` — the DIVE-916
+// per-gate HUMAN proof the CLI composed as root into this callback_data (the
+// agent LLM never sees it). server.ts forwards it as `--human-proof` so
+// `task answer` can tell a real tap (SUDO_UID=agent, but carries the nonce) from
+// an agent forging one. Numeric id + short token + 32-hex nonce stays under
+// Telegram's 64-byte cap; the answer VALUE is still re-resolved from the live
+// gate below, never trusted from the payload.
+export const TNA_RE = /^tna:(\d+):([^:]+)(?::([0-9a-f]{32}))?$/
 
 // The fields resolveTnaAnswer reads off a live `5dive task show` gate. Loosely
 // typed on purpose — it's whatever the CLI emits, narrowed to what we use.
@@ -125,4 +136,19 @@ export function yesNoChoice(text: string): boolean {
   if (/\bor\b/i.test(lastQ)) return false
   if (WH_OPENER_RE.test(lastQ)) return false
   return true
+}
+
+// DIVE-1115: evidence flags a verified-human tap attaches to `5dive task answer`.
+// The caller (server.ts callback handler) only reaches here AFTER allowFrom has
+// vetted the tapper as an allow-listed human, so EVERY tap is marked --human for
+// provenance — including `decision`/`manual` gates, which previously fell through
+// and recorded a bare AGENT name in need_answered_by. That hid real human taps
+// from the zero-human KPI (digest counts only `human:*`) and left tier-2 answers
+// unprovable as human. --human-proof rides along ONLY when the callback carried a
+// per-gate nonce (hard gates mint one; decision mints none), so an older CLI on
+// the same box never sees an unknown flag.
+export function tapEvidenceArgs(humanProof?: string | null): string[] {
+  const args = ['--human']
+  if (humanProof) args.push(`--human-proof=${humanProof}`)
+  return args
 }
