@@ -1598,8 +1598,8 @@ bot.on('callback_query:data', async ctx => {
       return
     }
     if (r.kind === 'already') {
-      await ctx.answerCallbackQuery({ text: 'Already answered.' }).catch(() => {})
-      await ctx.editMessageText(`✅ already answered: ${r.prior}`).catch(() => {})
+      await ctx.answerCallbackQuery({ text: r.toast }).catch(() => {})
+      await ctx.editMessageText(r.edit).catch(() => {})
       return
     }
     if (r.kind === 'invalid') {

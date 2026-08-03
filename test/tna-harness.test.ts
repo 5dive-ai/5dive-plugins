@@ -64,8 +64,13 @@ function simulateTap(mod: any, gate: any, callbackData: string) {
   switch (r.kind) {
     case 'nogate':
       return { matched: true as const, taskId, kind: r.kind, toast: 'This task no longer has a gate.' }
+    // DIVE-2467: the stale-tap copy is no longer mirrored here. server.ts now
+    // renders r.toast/r.edit verbatim, so passing them through means these
+    // assertions grade the text each plugin SHIPS. A mirror can only ever pin
+    // what the test believes the adapter says (see assertRendersSettledDetail,
+    // which pins that the adapter really does defer to these fields).
     case 'already':
-      return { matched: true as const, taskId, kind: r.kind, toast: 'Already answered.', edit: `✅ already answered: ${r.prior}` }
+      return { matched: true as const, taskId, kind: r.kind, toast: r.toast, edit: r.edit }
     case 'invalid':
       return { matched: true as const, taskId, kind: r.kind, toast: 'That option is no longer valid.' }
     case 'answer':
@@ -87,6 +92,7 @@ const gate = (over: Record<string, unknown> = {}) => ({
   need_options: null,
   need_answer: null,
   need_answered_at: null,
+  need_answered_by: null,
   ...over,
 })
 
@@ -205,7 +211,7 @@ const CASES: Array<{
   expect:
     | { kind: 'answer'; answerArgs: string[]; ack: string }
     | { kind: 'nogate' | 'invalid' }
-    | { kind: 'already'; prior: string }
+    | { kind: 'already'; prior: string; edit: string; toast: string }
 }> = [
   // secret — the DIVE-356 keystone: NO --value ever (key must not enter chat/db).
   { name: 'secret + provided → answer with no --value', gate: { need_type: 'secret' }, token: 'provided',
@@ -236,10 +242,23 @@ const CASES: Array<{
   // race / lifecycle guards.
   { name: 'no gate (task closed) → nogate', gate: { need_type: null }, token: 'provided',
     expect: { kind: 'nogate' } },
-  { name: 'already answered (decision) → already w/ prior value', gate: { need_type: 'decision', need_answer: 'Ship now', need_answered_at: '2026-06-14 07:00:00' }, token: '0',
-    expect: { kind: 'already', prior: 'Ship now' } },
-  { name: 'already answered (secret) → already, prior masked', gate: { need_type: 'secret', need_answered_at: '2026-06-14 07:00:00' }, token: 'provided',
-    expect: { kind: 'already', prior: '(provided)' } },
+  // DIVE-2410/2467: a stale tap names WHEN and WHO settled the gate. These two
+  // carry need_answered_by, which is what a real `task show --json` returns
+  // alongside need_answered_at (measured on DIVE-2400: 'human:marketing').
+  { name: 'already answered (decision) → already w/ prior value, when + who', gate: { need_type: 'decision', need_answer: 'Ship now', need_answered_at: '2026-06-14 07:00:00', need_answered_by: 'human:marketing' }, token: '0',
+    expect: { kind: 'already', prior: 'Ship now',
+      toast: 'Already answered 2026-06-14 07:00 UTC by human:marketing.',
+      edit: '✅ already answered: Ship now (2026-06-14 07:00 UTC by human:marketing)' } },
+  { name: 'already answered (secret) → already, prior masked, when + who', gate: { need_type: 'secret', need_answered_at: '2026-06-14 07:00:00', need_answered_by: 'auto:ttl' }, token: 'provided',
+    expect: { kind: 'already', prior: '(provided)',
+      toast: 'Already answered 2026-06-14 07:00 UTC by auto:ttl.',
+      edit: '✅ already answered: (provided) (2026-06-14 07:00 UTC by auto:ttl)' } },
+  // A degraded row must still answer distinguishably: a gate answered before
+  // need_answered_by existed names the when alone, with no dangling 'by'.
+  { name: 'already answered, no provenance → names the when only', gate: { need_type: 'approval', need_answer: 'approved', need_answered_at: '2026-06-14 07:00:00' }, token: 'approved',
+    expect: { kind: 'already', prior: 'approved',
+      toast: 'Already answered 2026-06-14 07:00 UTC.',
+      edit: '✅ already answered: approved (2026-06-14 07:00 UTC)' } },
 ]
 
 describe('synthetic tap → resolution matrix (all plugins)', () => {
@@ -254,10 +273,79 @@ describe('synthetic tap → resolution matrix (all plugins)', () => {
           expect(tap.cliArgs).toEqual(['task', 'answer', '13', ...c.expect.answerArgs])
           expect(tap.toast).toBe(`Answered: ${c.expect.ack}`)
         } else if (c.expect.kind === 'already') {
-          expect(tap.edit).toBe(`✅ already answered: ${c.expect.prior}`)
+          // DIVE-2467: BOTH surfaces are pinned. The toast is the only thing a
+          // human who never scrolls back actually sees, and it was the surface
+          // DIVE-2410 reported as indistinguishable from silence.
+          expect(tap.edit).toBe(c.expect.edit)
+          expect(tap.toast).toBe(c.expect.toast)
+          expect(tap.edit).toContain(c.expect.prior)
         }
       })
     }
+  }
+})
+
+// DIVE-2467: settledDetail is the whole of the when/who rendering, so its edges
+// are pinned directly rather than only through the two matrix rows above. The
+// degraded cases matter most: every one of them used to be the string
+// 'Already answered.', which is what a human reads as nothing having happened.
+describe('DIVE-2467: settledDetail names when + who, and degrades without lying', () => {
+  for (const mod of mods) {
+    test(`${mod.name}: renders, drops seconds, and labels UTC`, () => {
+      const d = mod.settledDetail as (a?: string | null, b?: string | null) => string
+      // The CLI's own format (date -u '+%Y-%m-%d %H:%M:%S'), measured on DIVE-2400.
+      expect(d('2026-07-30 04:28:04', 'human:marketing')).toBe('2026-07-30 04:28 UTC by human:marketing')
+      // Either half alone still says something a human can act on.
+      expect(d('2026-07-30 04:28:04', null)).toBe('2026-07-30 04:28 UTC')
+      expect(d(null, 'auto:reject')).toBe('by auto:reject')
+      // Nothing to say → empty, so the caller falls back to the bare sentence
+      // rather than emitting a dangling '()' or the word 'by' with no subject.
+      expect(d(null, null)).toBe('')
+      expect(d('   ', '  ')).toBe('')
+      // A shape we did NOT verify as UTC is passed through verbatim: labelling an
+      // unknown timestamp ' UTC' would be inventing a fact about the record.
+      expect(d('yesterday', 'human:olivia')).toBe('yesterday by human:olivia')
+      expect(d('2026-07-30T04:28:04Z', 'human:olivia')).toBe('2026-07-30 04:28 UTC by human:olivia')
+      // The raw provenance prefix survives: 'human:marketing' must not become
+      // 'marketing', which would credit the relaying agent with the human's answer.
+      expect(d('2026-07-30 04:28:04', 'human:marketing')).toContain('human:')
+    })
+
+    test(`${mod.name}: a long provenance token cannot blow the 200-char toast cap`, () => {
+      // answerCallbackQuery rejects text over 200 chars and every call site is
+      // .catch(() => {}) — an over-long toast would restore the exact silence
+      // this change removes, so the truncation is load-bearing, not cosmetic.
+      const r = mod.resolveTnaAnswer(
+        gate({ need_type: 'approval', need_answer: 'approved', need_answered_at: '2026-07-30 04:28:04', need_answered_by: `lead:standing:${'x'.repeat(300)}` }),
+        'approved',
+      )
+      expect(r.kind).toBe('already')
+      expect(r.toast.length).toBeLessThanOrEqual(200)
+      expect(r.toast).toContain('2026-07-30 04:28 UTC')
+    })
+  }
+})
+
+// DIVE-2467: the copy now lives in tna.ts, which only helps if every adapter
+// actually defers to it. Same reasoning as assertRoutesTna — shipping the module
+// is not wiring it — applied to rendering: a fork that quietly reverted to the
+// hardcoded 'Already answered.' would pass the whole matrix above, because the
+// matrix drives tna.ts directly and never reads server.ts.
+function assertRendersSettledDetail(plugin: string) {
+  const src = readFileSync(SERVER_TS(plugin), 'utf8')
+  expect(src.includes('text: r.toast'), `${plugin}/server.ts stale-tap toast does not use r.toast — the when/who detail is dropped`)
+    .toBe(true)
+  expect(src.includes('ctx.editMessageText(r.edit)'), `${plugin}/server.ts stale-tap edit does not use r.edit`)
+    .toBe(true)
+  expect(src.includes('`✅ already answered: ${r.prior}`'), `${plugin}/server.ts still formats the stale-tap message itself — it drifted back off the shared copy`)
+    .toBe(false)
+}
+
+describe('DIVE-2467: every plugin RENDERS the stale-tap detail, not just resolves it', () => {
+  for (const p of PLUGINS) {
+    test(`${p}: server.ts defers the stale-tap copy to the shared resolver`, () => {
+      assertRendersSettledDetail(p)
+    })
   }
 })
 

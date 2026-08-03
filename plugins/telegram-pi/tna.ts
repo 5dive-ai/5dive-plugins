@@ -32,13 +32,54 @@ export interface TnaGate {
   need_options?: string | null
   need_answer?: string | null
   need_answered_at?: string | null
+  // DIVE-2467: provenance of the settling answer — `human:<agent>` for a verified
+  // human path, `lead:*` for a lead clear, `auto:t0|precedent|reject|ttl` for a
+  // machine one, or a bare agent name on the legacy path. `task show --json` is a
+  // `SELECT *`, so this rides along with need_answered_at at no fetch cost.
+  need_answered_by?: string | null
 }
 
 export type TnaResolution =
   | { kind: 'nogate' }                              // task gone or gate already cleared of its type
-  | { kind: 'already'; prior: string }             // answered by dashboard/CLI/double-tap mid-flight
+  // answered by dashboard/CLI/double-tap mid-flight. toast/edit are the FINAL
+  // user-facing copy (see settledDetail) rather than data the caller formats,
+  // so all six server.ts adapters render a stale tap identically and the parity
+  // test pins the wording itself, not just the branch.
+  | { kind: 'already'; prior: string; toast: string; edit: string }
   | { kind: 'invalid' }                            // token doesn't map to a valid answer for this gate
   | { kind: 'answer'; answerArgs: string[]; ack: string } // ready to `task answer ...answerArgs`
+
+// DIVE-2410/2467: a stale tap must name WHEN and WHO settled the gate, not just
+// that it is settled. "Already answered." tells a human their tap did nothing but
+// leaves them unable to tell a gate they themselves cleared minutes ago from one
+// an auto-rule closed on their behalf — which is the same believed-vs-recorded
+// divergence DIVE-2410 was filed for, one step further in.
+//
+// The CLI stamps need_answered_at as UTC `YYYY-MM-DD HH:MM:SS` (`date -u`), so the
+// ' UTC' label is asserted, not assumed — but only when the value actually parses
+// as that shape; anything else passes through verbatim rather than being labelled
+// with a zone we did not verify. Seconds are dropped: this is a "was it already
+// settled when I tapped" read, not forensics.
+//
+// `who` is the RAW provenance token (`human:marketing`, not `marketing`): the
+// prefix is the decision-relevant half — a person answered vs a timeout did — and
+// stripping it would attribute a human's answer to the agent whose channel relayed
+// it. Capped so a long token cannot push the toast past Telegram's 200-char limit,
+// where answerCallbackQuery would fail and .catch(() => {}) would restore exactly
+// the silence this fixes.
+const SETTLED_TS_RE = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::\d{2})?/
+const MAX_SETTLED_BY = 48
+
+export function settledDetail(at?: string | null, by?: string | null): string {
+  const rawAt = String(at ?? '').trim()
+  const m = SETTLED_TS_RE.exec(rawAt)
+  const when = m ? `${m[1]} ${m[2]} UTC` : rawAt
+  let who = String(by ?? '').trim()
+  if (who.length > MAX_SETTLED_BY) who = `${who.slice(0, MAX_SETTLED_BY - 1)}…`
+  if (when && who) return `${when} by ${who}`
+  if (when) return when
+  return who ? `by ${who}` : ''
+}
 
 // Resolve a tapped token against the LIVE gate (never the payload). A secret
 // answers with NO --value (the key never enters chat/DB — `answer` only records
@@ -46,10 +87,20 @@ export type TnaResolution =
 // by index into need_options; approval takes approved/denied. Anything else is
 // 'invalid'. Pure: same inputs -> same output, no I/O — the unit the harness pins.
 export function resolveTnaAnswer(task: TnaGate | null | undefined, token: string): TnaResolution {
+  // DIVE-2467: 'nogate' deliberately stays generic. It fires when the task is gone
+  // or the gate was WITHDRAWN, and withdraw NULLs need_answer/at/by together (one
+  // UPDATE in the CLI) — so on this branch there is no when/who to name. Measured
+  // on DIVE-2407, a withdrawn gate: need_type and all three need_answered_* absent.
   if (!task || !task.need_type) return { kind: 'nogate' }
   if (task.need_answered_at) {
     const prior = task.need_type === 'secret' ? '(provided)' : (task.need_answer ?? '—')
-    return { kind: 'already', prior }
+    const detail = settledDetail(task.need_answered_at, task.need_answered_by)
+    return {
+      kind: 'already',
+      prior,
+      toast: detail ? `Already answered ${detail}.` : 'Already answered.',
+      edit: detail ? `✅ already answered: ${prior} (${detail})` : `✅ already answered: ${prior}`,
+    }
   }
   if (task.need_type === 'decision') {
     const opts = String(task.need_options ?? '')
