@@ -176,6 +176,17 @@ describe('TNA_RE callback_data parsing', () => {
         .toEqual(['9', 'approved', '0123456789abcdef0123456789abcdef'])
       expect(mod.TNA_RE.exec('tna:3:provided:00112233445566778899aabbccddeeff')?.[3])
         .toBe('00112233445566778899aabbccddeeff')
+      // DIVE-2369: the same shape with a numeric OPTION INDEX as the token — what a
+      // tier-2 `decision` tap actually sends since the CLI began appending the nonce
+      // to the decision buttons too. Every case above pairs the nonce with a WORD
+      // token (approved/provided), and an index parsed correctly without a nonce, so
+      // no assertion here ever pinned index-AND-nonce together. That is precisely the
+      // combination the old greedy `/^tna:(\d+):(.+)$/` got wrong: it yields the token
+      // '0:<nonce>', which resolves against no option and silently drops the tap.
+      expect(mod.TNA_RE.exec('tna:42:0:0123456789abcdef0123456789abcdef')?.slice(1, 4))
+        .toEqual(['42', '0', '0123456789abcdef0123456789abcdef'])
+      expect(mod.TNA_RE.exec('tna:42:11:00112233445566778899aabbccddeeff')?.slice(1, 4))
+        .toEqual(['42', '11', '00112233445566778899aabbccddeeff'])
       expect(mod.TNA_RE.exec('yn:yes')).toBeNull()
       expect(mod.TNA_RE.exec('model:opus')).toBeNull()
       expect(mod.TNA_RE.exec('tna:abc:x')).toBeNull()       // non-numeric id
