@@ -326,6 +326,37 @@ describe('DIVE-2467: settledDetail names when + who, and degrades without lying'
   }
 })
 
+// DIVE-2623: base shells `task answer` via execFileP, which REJECTS the promise
+// on any non-zero exit, so its catch block (the fallback that DIVE-2260 taught
+// to render the closed-row detail) fires correctly. The 5 run5dive-based forks
+// instead call a local helper that RESOLVES with the CLI's {ok:false,...} JSON
+// envelope even on a refusal (`fail()` in 5dive-cli writes it to stdout under
+// --json) — so a bare `await run5dive(['task','answer',...])` with no result
+// check swallows every task-answer failure and tells the human "✅ answered" as
+// if the tap succeeded, with the catch block never running. Static fence, same
+// reasoning as assertRoutesTna: server.ts long-polls on import, so this is the
+// strongest check available without booting a bot.
+const RUN5DIVE_PLUGINS = PLUGINS.filter(p => p !== 'telegram')
+
+function assertChecksAnswerResult(plugin: string) {
+  const src = readFileSync(SERVER_TS(plugin), 'utf8')
+  const idx = src.indexOf("run5dive(['task', 'answer'")
+  expect(idx, `${plugin}/server.ts has no run5dive(['task','answer'...]) call`).toBeGreaterThan(-1)
+  const window = src.slice(idx, idx + 300)
+  expect(/\.ok\)\s*throw/.test(window),
+    `${plugin}/server.ts calls run5dive(['task','answer'...]) but never checks .ok and throws — ` +
+    `a CLI refusal resolves as success and the tna catch block never fires`)
+    .toBe(true)
+}
+
+describe('DIVE-2623: every run5dive-based plugin throws on an ok:false task-answer envelope', () => {
+  for (const p of RUN5DIVE_PLUGINS) {
+    test(`${p}: server.ts checks .ok after run5dive(['task','answer'...]) so the catch block can fire`, () => {
+      assertChecksAnswerResult(p)
+    })
+  }
+})
+
 // DIVE-2467: the copy now lives in tna.ts, which only helps if every adapter
 // actually defers to it. Same reasoning as assertRoutesTna — shipping the module
 // is not wiring it — applied to rendering: a fork that quietly reverted to the

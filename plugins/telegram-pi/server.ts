@@ -1613,7 +1613,12 @@ bot.on('callback_query:data', async ctx => {
     // --human-proof rides along only when the gate minted a nonce (hard gates do,
     // decisions do not), so an older CLI on the box never sees an unknown flag.
     const extraArgs = tapEvidenceArgs(tnaProof)
-    await run5dive(['task', 'answer', tnaTaskId, ...r.answerArgs, ...extraArgs, '--json'], 8000)
+    // DIVE-2623: run5dive() RESOLVES (never rejects) on a CLI refusal in --json
+    // mode, unlike base's execFileP. Without this check an ok:false envelope
+    // (e.g. a task_answer_closed_row refusal, DIVE-2228) fell through as if the
+    // answer succeeded and the catch block below never ran.
+    const answered = await run5dive(['task', 'answer', tnaTaskId, ...r.answerArgs, ...extraArgs, '--json'], 8000)
+    if (!answered.ok) throw new Error(answered.error?.message || 'task answer failed')
     await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
     await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
   } catch {
