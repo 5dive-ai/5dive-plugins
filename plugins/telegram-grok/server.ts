@@ -441,7 +441,7 @@ function disarmTurnEndKick(): void {
 // Drop-file contract (one JSON object per file, name ending in `.json`):
 //   { "text": "the message body",   // REQUIRED, non-empty
 //     "from": "agent-main",          // optional sender label -> user/user_id
-//     "chat_id": "433634012",        // optional reply-routing target (default "agent-send")
+//     "chat_id": "1234567890",       // optional reply-routing target (default "agent-send")
 //     "message_thread_id": "5",      // optional forum topic for the reply
 //     "ts": "2026-06-13T15:00:00Z" } // optional ISO timestamp (default: now)
 // Writers MUST write atomically — write a temp name, then rename into the dir

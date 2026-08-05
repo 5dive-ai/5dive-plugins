@@ -34,7 +34,7 @@ const assistantText = (text: string): TranscriptEntry =>
 
 const A2A_PROMPT = '[5dive-msg from=main id=34e2756e tier=admin] please rebase and ship'
 const HUMAN_INBOUND =
-  '<channel source="plugin:telegram:telegram" chat_id="433634012" message_id="10">what is the ETA?</channel>'
+  '<channel source="plugin:telegram:telegram" chat_id="1234567890" message_id="10">what is the ETA?</channel>'
 
 describe('DIVE-1323: analyzeTurn a2a-turn detection', () => {
   test('pure a2a turn → a2aTurn=true, hadInbound=false (SUPPRESS the human-DM reflex)', () => {
@@ -47,7 +47,7 @@ describe('DIVE-1323: analyzeTurn a2a-turn detection', () => {
     const a = analyzeTurn([userStr(HUMAN_INBOUND), assistantText('~5 min')], TG_PREFIX)
     expect(a.a2aTurn).toBe(false)
     expect(a.hadInbound).toBe(true)
-    expect(a.lastChatId).toBe('433634012')
+    expect(a.lastChatId).toBe('1234567890')
   })
 
   test('MIXED: a human DM arriving after an a2a envelope → a2aTurn=false (human still answered)', () => {
@@ -60,7 +60,7 @@ describe('DIVE-1323: analyzeTurn a2a-turn detection', () => {
     )
     expect(a.a2aTurn).toBe(false)
     expect(a.hadInbound).toBe(true)
-    expect(a.lastChatId).toBe('433634012')
+    expect(a.lastChatId).toBe('1234567890')
   })
 
   test('autonomous / non-envelope turn → a2aTurn=false (no false positive)', () => {

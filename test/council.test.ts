@@ -15,7 +15,7 @@ const ROSTER = {
   threshold: 2,
   thresholdSpec: { rule: 'majority' },
   quorum: 2,
-  veto: { principal: 'human:main', resolved: '433634012' },
+  veto: { principal: 'human:main', resolved: '1234567890' },
   lineage: { seq: 0, headDigest: 'dQtU1Z_iCpWuT3Ggu6RyV3TnwDkWb_YdtmS1n6qXL10', records: 1 },
 }
 
@@ -33,7 +33,7 @@ describe('renderRoster', () => {
     expect(out).toContain('1 record')
   })
   test('never leaks the resolved veto recipient id (only the principal handle)', () => {
-    expect(renderRoster(ROSTER)).not.toContain('433634012')
+    expect(renderRoster(ROSTER)).not.toContain('1234567890')
   })
   test('fails soft on a null / uninitialized council', () => {
     expect(renderRoster(null)).toContain('not initialized')
