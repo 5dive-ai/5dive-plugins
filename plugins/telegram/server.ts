@@ -27,6 +27,7 @@ import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, applyModelAliases, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
+import { parseGateReply, resolveGateReply } from './gatereply'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
@@ -5114,6 +5115,68 @@ async function handleInbound(
   // or CLI answer that lands between the alert and this reply can't double-answer.
   // Fully fail-soft: any miss replies a nudge and returns; it never throws or
   // leaks the message into the agent's chat stream.
+  // DIVE-2818: REPLY-TO-CLEAR for high-stakes gates, the inbound half of the
+  // non-forgeable citation. A standalone `DIVE-N <value>` message — the exact
+  // string the CLI's high-stakes prompt prints — is answered by CITING THIS VERY
+  // MESSAGE: `--channel-proof` names the verified DM, `--channel-msg` names the
+  // human's own message inside it. The CLI re-checks both against Telegram, which
+  // is the one party the filing agent cannot speak for, so unlike the tap path
+  // nothing in flight is a credential the filer also holds.
+  //
+  // It runs BEFORE the DIVE-145 reply-to-alert block and needs no
+  // reply_to_message: the ident is in the text. That is not a convenience, it is
+  // condition 5 — the cited message must NAME the gate, so a self-contained line
+  // is the only shape that can attest anyway.
+  //
+  // FALLS THROUGH RATHER THAN INTERCEPTING, and that is the important part. People
+  // discuss ticket idents in chat constantly ("DIVE-2818 looks good to me"), and a
+  // handler that swallowed every message matching the pattern would delete
+  // ordinary conversation from the agent's stream to answer a gate nobody meant to
+  // answer. So only two outcomes stop here: a VALID answer, and a near-miss on a
+  // gate that is genuinely OPEN (where the human plainly meant to answer and
+  // deserves the exact string back). Everything else — unknown ident, no gate,
+  // already answered, CLI unreachable — relays as normal chat, silently.
+  const gateReply = parseGateReply(text)
+  if (gateReply) {
+    let handled = false
+    try {
+      const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', gateReply.ident], { timeout: 5000 })
+      const gate = JSON.parse(show.stdout).data?.task
+      const res = resolveGateReply(gateReply, gate, chat_id, msgId, text)
+      if (res.kind === 'answer') {
+        handled = true
+        try {
+          await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', ...res.answerArgs], { timeout: 15000 })
+          if (msgId != null) {
+            void bot.api
+              .setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '✅' as ReactionTypeEmoji['emoji'] }])
+              .catch(() => {})
+          }
+          await ctx.reply(res.ack).catch(() => {})
+        } catch {
+          // The citation did not attest: a stale message (the 3600s ceiling is
+          // hardcoded and nobody may widen it), a Telegram hiccup, or hidden
+          // forward origin. `task answer` fails CLOSED and the gate is still open,
+          // which is correct — but a human who typed the right thing and saw
+          // nothing happen needs to be told the button is still there. DIVE-525:
+          // a real human tap is never rejected, so the fallback always exists.
+          await ctx
+            .reply(
+              `Could not clear ${res.ident} from your message. A reply stays citable for 1 hour after you send it. ` +
+              `The buttons on the alert still work and are never rejected.`,
+            )
+            .catch(() => {})
+        }
+      } else if (res.kind === 'invalid') {
+        handled = true
+        await ctx.reply(res.reply).catch(() => {})
+      }
+    } catch {
+      // Unknown ident, deleted task, sudo/CLI failure. Not our message to claim.
+    }
+    if (handled) return
+  }
+
   const repliedMsg = ctx.message?.reply_to_message
   const repliedText = repliedMsg?.text ?? repliedMsg?.caption
   const gateM =
