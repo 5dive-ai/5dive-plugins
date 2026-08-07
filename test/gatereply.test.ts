@@ -8,7 +8,7 @@
 // answer — including the two that were missing, which is why iteration 1 shipped
 // an intercept nobody wanted with a green suite.
 import { test, expect, describe } from 'bun:test'
-import { parseGateReply, resolveGateReply, GATE_REPLY_RE } from '../plugins/telegram/gatereply'
+import { parseGateReply, resolveGateReply, gateAlertIdent, GATE_REPLY_RE } from '../plugins/telegram/gatereply'
 
 // Reserved fakes only (repo rule): chat id 1234567890, never a real one.
 const CHAT = '1234567890'
@@ -232,6 +232,31 @@ describe('resolveGateReply — what it must NOT claim', () => {
       CHAT, MSG, 'DIVE-1 approved', replyTo('DIVE-1'),
     )
     expect(res.kind).toBe('already')
+  })
+})
+
+describe('gateAlertIdent — the reply_to half of the narrowing', () => {
+  // This signal is HALF the rule that decides intercept vs fall through, and it
+  // used to be derived inline in server.ts, which no test can import (it
+  // long-polls on boot). A load-bearing signal with no arm is the exact shape
+  // that let the over-broad intercept ship green.
+  const BOT = 'local_Dr3bot'
+  test('reads the ident out of our own alert', () => {
+    expect(gateAlertIdent(BOT, '🙋 [DIVE-2818] needs you — approve the push?', BOT)).toBe('DIVE-2818')
+  })
+  test('a reply to someone ELSE quoting the alert text is not our alert', () => {
+    // Otherwise anyone could mint the signal by pasting the alert into a message
+    // and getting the human to reply to it.
+    expect(gateAlertIdent('someone_else', '🙋 [DIVE-2818] needs you', BOT)).toBeNull()
+  })
+  test('a reply to one of our OTHER messages is not a gate alert', () => {
+    expect(gateAlertIdent(BOT, 'deploy finished, 441 pass', BOT)).toBeNull()
+  })
+  test('not a reply at all', () => {
+    expect(gateAlertIdent(undefined, undefined, BOT)).toBeNull()
+  })
+  test('unknown bot username fails closed rather than matching everything', () => {
+    expect(gateAlertIdent(BOT, '🙋 [DIVE-2818] needs you', undefined)).toBeNull()
   })
 })
 

@@ -30,7 +30,7 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 // DIVE-2846: aliased so the durable tap-failure record needs no surgery on
 // (or collision with) whatever each plugin already imports from 'fs'.
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
-import { parseGateReply, resolveGateReply } from './gatereply'
+import { parseGateReply, resolveGateReply, gateAlertIdent } from './gatereply'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
@@ -5193,11 +5193,7 @@ async function handleInbound(
   // was meant as an answer, and it is the same condition DIVE-145 uses further
   // down. One read, two consumers.
   const repliedMsg = ctx.message?.reply_to_message
-  const repliedText = repliedMsg?.text ?? repliedMsg?.caption
-  const gateM =
-    repliedMsg?.from?.username === botUsername && repliedText
-      ? /\[DIVE-(\d+)\]\s+needs you/.exec(repliedText)
-      : null
+  const alertIdent = gateAlertIdent(repliedMsg?.from?.username, repliedMsg?.text ?? repliedMsg?.caption, botUsername)
 
   // DMs only. `_gate_channel_proof_ok` takes `^[0-9]+$` and a group id is
   // negative, so no group message can ever produce a citation that attests —
@@ -5206,7 +5202,7 @@ async function handleInbound(
   // boolean short-circuits here so a group ident-chat costs no subprocess.
   const gateReplyCtx = {
     isDirect: ctx.chat?.type === 'private',
-    repliesToAlertFor: gateM ? `DIVE-${gateM[1]}` : null,
+    repliesToAlertFor: alertIdent,
   }
   const gateReply = parseGateReply(text)
   if (gateReply && gateReplyCtx.isDirect) {
@@ -5249,8 +5245,11 @@ async function handleInbound(
     if (handled) return
   }
 
-  if (gateM) {
-    const taskId = gateM[1]!
+  if (alertIdent) {
+    // Exactly what gateM[1] carried: the bare digits. DIVE-145's copy and its
+    // `task show` argument both want the number, not the ident, and this block's
+    // behaviour is unchanged — only the derivation moved, so there is now one.
+    const taskId = alertIdent.slice('DIVE-'.length)
     try {
       const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
       const task = JSON.parse(show.stdout).data?.task

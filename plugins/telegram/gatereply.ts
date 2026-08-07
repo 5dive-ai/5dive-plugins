@@ -86,6 +86,30 @@ export type GateReplyResolution =
 
 export interface ParsedGateReply { ident: string; value: string }
 
+/**
+ * The ident of the gate alert a message is replying to, or null.
+ *
+ * Lives here rather than inline in server.ts for one reason: it is half of the
+ * narrowing rule above — "replied straight to the alert" is one of the two ways a
+ * message earns an interception — and server.ts long-polls on import, so anything
+ * left in it has no reachable arm. A load-bearing signal with no test is the shape
+ * that let the over-broad intercept ship in the first place.
+ *
+ * Deliberately the SAME derivation the DIVE-145 reply-to-alert block uses, and
+ * server.ts now feeds both consumers from this one call. Two copies of "is this a
+ * reply to our alert" is the drift this avoids.
+ */
+export function gateAlertIdent(
+  fromUsername: string | undefined,
+  replyText: string | undefined,
+  botUsername: string | undefined,
+): string | null {
+  if (!fromUsername || !replyText || !botUsername) return null
+  if (fromUsername !== botUsername) return null
+  const m = /\[DIVE-(\d+)\]\s+needs you/.exec(replyText)
+  return m ? `DIVE-${m[1]}` : null
+}
+
 export function parseGateReply(text: string): ParsedGateReply | null {
   const m = GATE_REPLY_RE.exec(text ?? '')
   if (!m) return null
