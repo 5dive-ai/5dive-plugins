@@ -5184,17 +5184,37 @@ async function handleInbound(
   // discuss ticket idents in chat constantly ("DIVE-2818 looks good to me"), and a
   // handler that swallowed every message matching the pattern would delete
   // ordinary conversation from the agent's stream to answer a gate nobody meant to
-  // answer. So only two outcomes stop here: a VALID answer, and a near-miss on a
-  // gate that is genuinely OPEN (where the human plainly meant to answer and
-  // deserves the exact string back). Everything else — unknown ident, no gate,
-  // already answered, CLI unreachable — relays as normal chat, silently.
+  // answer. Only an UNAMBIGUOUS aim at an open gate stops here — see
+  // `resolveGateReply`, which owns that call and is where the arms live. Everything
+  // else, conversation included, relays as normal chat, silently.
+  //
+  // The reply_to lookup below is hoisted above this block on purpose: a reply
+  // aimed straight at "🙋 [DIVE-N] needs you" is one of the signals that a message
+  // was meant as an answer, and it is the same condition DIVE-145 uses further
+  // down. One read, two consumers.
+  const repliedMsg = ctx.message?.reply_to_message
+  const repliedText = repliedMsg?.text ?? repliedMsg?.caption
+  const gateM =
+    repliedMsg?.from?.username === botUsername && repliedText
+      ? /\[DIVE-(\d+)\]\s+needs you/.exec(repliedText)
+      : null
+
+  // DMs only. `_gate_channel_proof_ok` takes `^[0-9]+$` and a group id is
+  // negative, so no group message can ever produce a citation that attests —
+  // running the rail there could only refuse, and would eat the message doing it.
+  // resolveGateReply enforces this itself (that is the tested rule); the same
+  // boolean short-circuits here so a group ident-chat costs no subprocess.
+  const gateReplyCtx = {
+    isDirect: ctx.chat?.type === 'private',
+    repliesToAlertFor: gateM ? `DIVE-${gateM[1]}` : null,
+  }
   const gateReply = parseGateReply(text)
-  if (gateReply) {
+  if (gateReply && gateReplyCtx.isDirect) {
     let handled = false
     try {
       const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', gateReply.ident], { timeout: 5000 })
       const gate = JSON.parse(show.stdout).data?.task
-      const res = resolveGateReply(gateReply, gate, chat_id, msgId, text)
+      const res = resolveGateReply(gateReply, gate, chat_id, msgId, text, gateReplyCtx)
       if (res.kind === 'answer') {
         handled = true
         try {
@@ -5229,12 +5249,6 @@ async function handleInbound(
     if (handled) return
   }
 
-  const repliedMsg = ctx.message?.reply_to_message
-  const repliedText = repliedMsg?.text ?? repliedMsg?.caption
-  const gateM =
-    repliedMsg?.from?.username === botUsername && repliedText
-      ? /\[DIVE-(\d+)\]\s+needs you/.exec(repliedText)
-      : null
   if (gateM) {
     const taskId = gateM[1]!
     try {

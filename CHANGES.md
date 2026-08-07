@@ -1,3 +1,47 @@
+## v0.5.41
+
+### Fixed — the reply-to-clear handler no longer eats conversation about an open gate (DIVE-2818)
+
+0.5.37 shipped the reply-to-clear handler (below) with typing as the EXPECTED way to answer a
+high-stakes gate. Hours later, having used both paths on live gates, lodar said the opposite:
+*"but asking user to type is not good ux"*. The row was re-scoped — **tap is primary on every gate,
+this typed path is the RECOVERY path** — and that demotion inverts one call in the handler.
+
+While typing was expected, a `DIVE-N <anything>` aimed at an open gate was probably a fumbled
+answer, so replying with the exact format was a kindness. Once nobody is expected to type,
+`DIVE-2818 whats the holdup` is **conversation**, and 0.5.37 answered it with a format lecture and
+never relayed it to the agent. On the human's primary channel, that is a message deleted to service
+a gate nobody meant to answer.
+
+`resolveGateReply` now falls through unless the aim is unambiguous — the value agrees with an
+allowed answer for at least 3 leading characters, is one typo away from one, or the message is a
+`reply_to` the gate's own alert (the condition DIVE-145 already uses). Everything else returns the
+new `chatter` resolution and relays as normal chat. No synonym table: `no` still does not resolve to
+`denied`, because guessing at meaning on a rail whose whole value is the human's literal words is
+the wrong place to be clever.
+
+**Now DM-only.** The block had no chat-type guard, so it also ran in the #5dive supergroup, where
+idents are discussed all day. This was strictly worse than doing nothing: `_gate_channel_proof_ok`
+matches the chat id against `^[0-9]+$` and a Telegram group id is negative, so a group citation can
+never attest — a valid `DIVE-N done` there shelled `task answer`, was refused for a reason the copy
+could not explain, and consumed the message on the way. `server.ts` short-circuits on the same
+boolean before it spends a `task show` subprocess.
+
+One deliberate exception, stated rather than hidden: a **secret** gate still intercepts on TYPE
+rather than on aim. The live risk there is a human having just pasted a credential into permanent
+chat history, and saying so immediately is worth more than protecting a conversation we might be
+interrupting. The refusal never echoes what they sent.
+
+**No security property moved.** Narrowing *when* we listen loosens nothing about *what* we require:
+condition (2) still needs the ident in the human's own words, no value is ever coerced, and nothing
+composes that string on their behalf. A message we decline to claim is merely relayed as chat.
+
+Tests: `test/gatereply.test.ts` 21 → 39 arms. The two that were missing are why 0.5.37 shipped
+green — the old suite only covered fall-through for CLOSED and MISSING gates, never for an OPEN one,
+and had no group arm at all. `GateReplyContext` is a required parameter so a caller that forgets it
+fails to compile rather than silently re-enabling the group path. Full suite 446 pass / 0 fail,
+`generator --check` byte-exact.
+
 ## v0.5.40
 
 ### Fixed — a failed gate tap discarded the exception and named the wrong task (DIVE-2846)
@@ -25,6 +69,7 @@ across base and all five forks, pinned by the tna harness against error shapes
 measured off the real CLI); every `server.ts` is the thin adapter, and CI now
 fails any plugin whose tap catch does not bind its exception. Bumps 0.5.39 -> 0.5.40.
 
+
 ## v0.5.39
 
 ### Fixed — BotFather command menu shrinks after a slow startup (menu-robustness)
@@ -51,6 +96,29 @@ nothing. The three direct `execFileP` call sites and the shared `read5diveJson` 
 inherited the default. Raised a module-level `JSON_MAXBUFFER = 16 MiB` and applied it to the
 queue-listing reads; 16 MiB is a sane ceiling that forces the CLI to paginate rather than the
 plugin to keep lifting the limit.
+
+## v0.5.37
+
+### Added — reply-to-clear: a gate answer the filing agent cannot forge (DIVE-2818)
+
+*(Entry added retroactively in 0.5.40; the 0.5.37 release bumped the manifest only.)*
+
+`--channel-msg` cites the id of the human's OWN message and lets the CLI re-check authorship with
+Telegram, which is the one party a filing agent cannot speak for. It shipped, it verified, and it
+had **zero callers** — 0 of 94 deployed `tna.ts` emit the flag (DIVE-2799) — so the weak nonce path
+was the only reachable one. That is what allowed a real clear to record
+`answered_by=human:olivia uid=1011`, the filer's own uid (DIVE-2802).
+
+New `plugins/telegram/gatereply.ts` holds the whole decision matrix as a pure, import-safe module
+(server.ts long-polls on import, so a test that imports it boots a bot — the DIVE-369 reason tna.ts
+was extracted). A DM of the form `DIVE-N <value>` resolves against the LIVE gate, and is answered by
+citing that very message: `--channel-proof` names the verified DM, `--channel-msg` names the
+message. No `--human` is passed — the citation is the evidence and the CLI raises `human=1` itself
+once it attests; if it does not attest, `task answer` fails closed rather than degrading to the
+weaker form. Values are strict per gate type (`approved|denied`, `done`, `provided`, or the gate's
+own `need_options`), because condition 5 requires the human's text to CONTAIN the value we pass, so
+coercing `approve` to `approved` would buy a refusal they would read as a broken feature.
+
 
 ## v0.5.36
 
