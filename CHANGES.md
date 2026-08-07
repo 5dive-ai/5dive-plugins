@@ -1,3 +1,18 @@
+## v0.5.39
+
+### Fixed — BotFather command menu shrinks after a slow startup (menu-robustness)
+
+At startup each bot registers its BotFather command menu once via `setMyCommands`,
+gated on a `read5diveVersion()` probe of `5dive --version` (2s timeout). Under
+transient startup load — several agents booting at once — that probe can exceed 2s
+and return null, so `botFatherCommands` drops every `paired-5dive`-scoped command
+(~15 of them) and the bot registers a permanently reduced menu that never re-runs
+until restart. `/help` was unaffected because it re-probes 5dive live on every call,
+which is why the menu and `/help` disagreed. Now the startup probe is retried (twice,
+3s apart) before concluding 5dive is absent, so a slow boot no longer leaves a
+truncated menu stuck. The retry only fires on a miss and only blocks the
+fire-and-forget menu registration, not polling.
+
 ## v0.5.38
 
 ### Fixed — /tasks, /inbox, /needs crash with "stdout maxBuffer length exceeded" (DIVE-2875)

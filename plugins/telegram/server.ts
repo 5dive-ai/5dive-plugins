@@ -5451,7 +5451,20 @@ if (SEND_ONLY) {
           // shells out to `5dive --version` — fast (<100ms) but async, so do it
           // outside the synchronous bot.api call.
           void (async () => {
-            const fiveDivePresent = (await read5diveVersion()) !== null
+            // BotFather menu is a one-shot snapshot: setMyCommands runs once here
+            // and is never re-run until the bot restarts. read5diveVersion() has a
+            // 2s timeout and returns null on a miss, and `5dive --version` can
+            // exceed that under transient startup load (many agents booting at
+            // once). A single miss would permanently shrink the menu —
+            // botFatherCommands drops every paired-5dive command when
+            // fiveDivePresent is false — while /help stays full because it re-probes
+            // live. Retry the probe a couple of times before concluding 5dive is
+            // absent, so a slow boot doesn't leave a reduced menu stuck until restart.
+            let fiveDivePresent = (await read5diveVersion()) !== null
+            for (let i = 0; !fiveDivePresent && i < 2; i++) {
+              await new Promise(r => setTimeout(r, 3000))
+              fiveDivePresent = (await read5diveVersion()) !== null
+            }
             await bot.api.setMyCommands(
               botFatherCommands(undefined, fiveDivePresent),
               { scope: { type: 'all_private_chats' } },
