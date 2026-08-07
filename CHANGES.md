@@ -1,3 +1,15 @@
+## v0.5.38
+
+### Fixed — /tasks, /inbox, /needs crash with "stdout maxBuffer length exceeded" (DIVE-2875)
+
+Node's `execFile` caps captured stdout at 1 MiB by default. The host-shared task queue
+crossed that as JSON (`5dive task ls --json` is ~1.04 MiB and growing), so every queue-listing
+surface — `/tasks`, `/inbox`, `/needs` — threw `stdout maxBuffer length exceeded` and rendered
+nothing. The three direct `execFileP` call sites and the shared `read5diveJson` helper all
+inherited the default. Raised a module-level `JSON_MAXBUFFER = 16 MiB` and applied it to the
+queue-listing reads; 16 MiB is a sane ceiling that forces the CLI to paginate rather than the
+plugin to keep lifting the limit.
+
 ## v0.5.36
 
 ### Fixed — /model picker resolves against the CLI's model catalogue, + fable (DIVE-1883)

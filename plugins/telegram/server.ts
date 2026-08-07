@@ -1815,7 +1815,7 @@ type FiveDiveAgentEntry = {
 // already use — this brings the claude plugin to parity.)
 async function read5diveJson(args: string[], timeout: number): Promise<any | null> {
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', ...args], { timeout })
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', ...args], { timeout, maxBuffer: JSON_MAXBUFFER })
     return JSON.parse(stdout)
   } catch (e) {
     const out = String((e as { stdout?: unknown })?.stdout ?? '')
@@ -2458,6 +2458,15 @@ function formatDuration(ms: number): string {
 }
 
 const execFileP = promisify(execFile)
+
+// execFile's default maxBuffer is 1 MiB. The host-shared task queue now exceeds
+// that as JSON (`5dive task ls --json` is ~1.04 MiB and growing), so every
+// queue-listing surface (/tasks, /inbox, /needs) crashed with
+// "stdout maxBuffer length exceeded" once it crossed the line (DIVE-2875).
+// 16 MiB is a sane ceiling for any single 5dive JSON payload — the queue would
+// have to grow ~16x to hit it again, and a payload that large is itself a signal
+// the CLI should paginate, not a reason to keep raising this.
+const JSON_MAXBUFFER = 16 * 1024 * 1024
 
 // The plugin's MCP server can run with a PATH that omits /usr/bin and
 // /usr/local/bin — observed on a managed agent where /update's deferred
@@ -3583,7 +3592,7 @@ function taskRow(t: any, needTag = false): string {
 async function buildTaskList(): Promise<string> {
   let j: any
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'], { timeout: 8000 })
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
     j = JSON.parse(stdout)
   } catch (err) {
     return `Failed to list tasks: ${err instanceof Error ? err.message : String(err)}`
@@ -3659,7 +3668,7 @@ function inboxCard(t: any): string {
 async function buildInboxList(): Promise<string> {
   let j: any
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'inbox', '--json'], { timeout: 8000 })
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'inbox', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
     j = JSON.parse(stdout)
   } catch (err) {
     return `Failed to load inbox: ${err instanceof Error ? err.message : String(err)}`
@@ -3706,7 +3715,7 @@ async function buildActionableInbox(
   }
   let j: any
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'], { timeout: 8000 })
+    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
     j = JSON.parse(stdout)
   } catch (err) {
     return { text: `Failed to load inbox: ${err instanceof Error ? err.message : String(err)}` }
