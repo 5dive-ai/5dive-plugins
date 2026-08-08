@@ -16,7 +16,16 @@ the way the Telegram plugin bridges Telegram. Configuration is one JSON file
   `block/buzz`). Default location: `~/.cargo/bin/buzz`.
 - A relay URL to point at. For the Phase-1 spike: `http://178.104.35.140:3000`
   (throwaway demo box — put nothing real on it).
-- A channel UUID to watch. For the spike: `88cb6bc2-80d6-475e-9140-e7e1fb723c09`.
+- A channel UUID to watch. For the spike: `82bab6f1-c09b-4d70-ab52-fe945ad956b1`.
+
+> **The spike values above are EXAMPLES with an expiry.** That box is scheduled
+> for teardown when DIVE-2895 closes, and a relay only serves the community
+> keyed to its own `RELAY_URL` — the earlier spike channel
+> (`88cb6bc2-…`) became unreachable the moment the relay was
+> re-pointed from `ws://localhost:3000` to its external address, because a
+> different host key means a different community. If `channels list` returns a
+> `no community` error rather than `[]`, the relay's `RELAY_URL` does not match
+> the address you are dialling; fix the relay, do not hunt for the channel.
 
 ## Steps
 
@@ -37,7 +46,7 @@ the way the Telegram plugin bridges Telegram. Configuration is one JSON file
    {
      "relay_url": "http://178.104.35.140:3000",
      "private_key": "<the hex from step 1>",
-     "channels": ["88cb6bc2-80d6-475e-9140-e7e1fb723c09"],
+     "channels": ["82bab6f1-c09b-4d70-ab52-fe945ad956b1"],
      "poll_ms": 15000,
      "buzz_path": "buzz"
    }
@@ -71,7 +80,7 @@ the way the Telegram plugin bridges Telegram. Configuration is one JSON file
    ```bash
    BUZZ_RELAY_URL=http://178.104.35.140:3000 \
    BUZZ_PRIVATE_KEY=<hex> \
-   buzz messages send --channel 88cb6bc2-80d6-475e-9140-e7e1fb723c09 --content "buzz channel live"
+   buzz messages send --channel 82bab6f1-c09b-4d70-ab52-fe945ad956b1 --content "buzz channel live"
    ```
 
 The plugin reads this config at boot; restart the session (or the MCP server)

@@ -24,6 +24,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { schnorr } from '@noble/curves/secp256k1'
+import { npubEncode, encoderIsSane, mentionsUs, type BuzzEvent } from './mention.ts'
 
 const exec = promisify(execFile)
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'buzz')
@@ -62,77 +63,15 @@ function loadConfig(): Config | null {
 const cfg = loadConfig()
 
 // --- our identity (derived locally; no relay round-trip at boot) ---------
-// DECLARED here, ASSIGNED below the bech32 section on purpose: `npubEncode` is
-// a hoisted function but `BECH32` is a const, so calling the encoder above its
-// table throws a TDZ ReferenceError that this block's own catch then swallows.
-// The observable symptom was an empty OUR_NPUB and a dead NIP-27 branch — a
-// correct encoder that never gets to run. Keep the assignment last.
+// The encoder now lives in ./mention.ts, which is what makes this block safe:
+// while it was inline below, this code called `npubEncode` above the `const`
+// table it depends on, so it threw a TDZ ReferenceError that the catch below
+// swallowed and OUR_NPUB was empty for the process's whole life — a correct
+// encoder that never got to run. Importing it removes the ordering hazard
+// rather than documenting it.
 let OUR_PUBKEY_HEX = ''
 let OUR_NPUB = ''
 
-// --- bech32 encode (for our npub; only the content-mention path needs it) -
-const BECH32 = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
-function bech32Polymod(values: number[]) {
-  const G = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
-  let chk = 1
-  for (const v of values) {
-    const top = chk >> 25
-    chk = ((chk & 0x1ffffff) << 5) ^ v
-    for (let i = 0; i < 5; i++) if ((top >> i) & 1) chk ^= G[i]
-  }
-  return chk
-}
-// BIP-173 expansion: every high-bit group, then a 0 separator, then every
-// low-bit group. Interleaving the two per character (the obvious-looking
-// flatMap) yields a checksum that is wrong in only its last six characters —
-// so the npub still LOOKS like an npub, and the NIP-27 mention path silently
-// never matches. Guarded by assertEncoderSane() below.
-function bech32Expand(hrp: string) {
-  const hi = [...hrp].map(c => c.charCodeAt(0) >> 5)
-  const lo = [...hrp].map(c => c.charCodeAt(0) & 31)
-  return [...hi, 0, ...lo]
-}
-function convertBits(bytes: number[], from: number, to: number, pad = true) {
-  let acc = 0,
-    bits = 0,
-    out: number[] = []
-  const maxv = (1 << to) - 1
-  for (const b of bytes) {
-    acc = (acc << from) | b
-    bits += from
-    while (bits >= to) {
-      bits -= to
-      out.push((acc >> bits) & maxv)
-    }
-  }
-  if (pad && bits) out.push((acc << (to - bits)) & maxv)
-  return out
-}
-export function npubEncode(pubhex: string) {
-  const bytes: number[] = []
-  for (let i = 0; i < pubhex.length; i += 2) bytes.push(parseInt(pubhex.slice(i, i + 2), 16))
-  const data = convertBits(bytes, 8, 5)
-  const values = [...bech32Expand('npub'), ...data, 0, 0, 0, 0, 0, 0]
-  const mod = bech32Polymod(values) ^ 1
-  const checksum = Array.from({ length: 6 }, (_, i) => (mod >> (5 * (5 - i))) & 31)
-  return 'npub1' + [...data, ...checksum].map(v => BECH32[v]).join('')
-}
-
-// A wrong encoder does not throw — it returns a plausible npub whose checksum
-// is wrong, and the NIP-27 mention branch then never fires for the whole life
-// of the process. So encode the NIP-19 vector at boot and say so out loud if
-// it fails, rather than letting one of three detection paths go quietly dead.
-export const NIP19_VECTOR = {
-  hex: '3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d',
-  npub: 'npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6',
-}
-export function encoderIsSane(): boolean {
-  try {
-    return npubEncode(NIP19_VECTOR.hex) === NIP19_VECTOR.npub
-  } catch {
-    return false
-  }
-}
 const ENCODER_SANE = encoderIsSane()
 if (!ENCODER_SANE) {
   process.stderr.write(
@@ -188,26 +127,7 @@ function markSeen(s: SeenState, channel: string, id: string) {
   s[channel] = arr
 }
 
-// --- mention detection ----------------------------------------------------
-// dev3's DIVE-2896 settles which forms the relay actually populates; until
-// then we match all three ourselves: p-tag hex (canonical), NIP-27
-// nostr:<npub> in content, and a last-resort raw-hex-in-content fallback.
-type BuzzEvent = {
-  id: string
-  pubkey: string
-  kind: number
-  content: string
-  created_at: number
-  tags: string[][]
-}
-function mentionsUs(ev: BuzzEvent): boolean {
-  if (!OUR_PUBKEY_HEX) return false
-  if (ev.pubkey === OUR_PUBKEY_HEX) return false // never self-deliver
-  if ((ev.tags || []).some(t => t[0] === 'p' && t[1] === OUR_PUBKEY_HEX)) return true
-  if (ENCODER_SANE && OUR_NPUB && ev.content.includes('nostr:' + OUR_NPUB)) return true
-  if (ev.content.includes(OUR_PUBKEY_HEX)) return true
-  return false
-}
+// Mention detection lives in ./mention.ts (pure, dependency-free, tested).
 
 // --- MCP server -----------------------------------------------------------
 const mcp = new Server(
@@ -362,7 +282,7 @@ async function pollChannel(channel: string, seen: SeenState) {
     if (!ev || !ev.id) continue
     if ((seen[channel] || []).includes(ev.id)) continue
     markSeen(seen, channel, ev.id)
-    if (!coldStart && mentionsUs(ev)) deliver(ev, channel)
+    if (!coldStart && mentionsUs(ev, OUR_PUBKEY_HEX, OUR_NPUB, ENCODER_SANE)) deliver(ev, channel)
   }
   if (coldStart) {
     seen[channel] = seen[channel] || []
