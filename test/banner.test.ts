@@ -53,6 +53,45 @@ describe('summarizeNeeds', () => {
     expect(summarizeNeeds([])).toEqual({ count: 0, oldestCreatedAt: null })
     expect(summarizeNeeds(undefined as unknown)).toEqual({ count: 0, oldestCreatedAt: null })
   })
+
+  // DIVE-2041. The filter keyed on need_answer — the answer TEXT — while the CLI
+  // and the dashboard both key on need_answered_at. An answered SECRET gate keeps
+  // need_answer NULL BY DESIGN (the value is the secret; it is never written to
+  // the row), so this is not a hypothetical column preference: it is a whole gate
+  // type that reads as pending forever to the old predicate.
+  //
+  // The bug is invisible through the ONE current caller, which feeds this
+  // `task inbox --json` — SQL that already excludes answered rows, so the list
+  // never contains the row that would expose it. That is exactly the shape worth
+  // a test: the module's correctness rested on a query two processes away, and
+  // this arm feeds it the unfiltered list a future caller would.
+  test('an ANSWERED SECRET gate (need_answered_at set, need_answer NULL) is not pending', () => {
+    const s = summarizeNeeds([
+      gate({ created_at: '2026-07-20 09:00:00' }), // live
+      gate({
+        need_type: 'secret',
+        need_answer: null, // ← by design for a secret; the old filter saw "unanswered"
+        need_answered_at: '2026-07-20 08:30:00',
+        created_at: '2026-07-20 06:00:00', // older, so a wrong count ALSO moves the oldest
+      }),
+    ])
+    expect(s.count).toBe(1)
+    expect(s.oldestCreatedAt).toBe('2026-07-20 09:00:00')
+  })
+
+  test('need_answered_at excludes a row for every gate type, not just secret', () => {
+    for (const need_type of ['decision', 'approval', 'manual', 'secret']) {
+      const s = summarizeNeeds([gate({ need_type, need_answer: null, need_answered_at: '2026-07-20 08:30:00' })])
+      expect({ need_type, ...s }).toEqual({ need_type, count: 0, oldestCreatedAt: null })
+    }
+  })
+
+  // The disjunction can only ever exclude MORE, never fewer: withdraw NULLs
+  // need_answer/at/by together (tna.ts), so keeping need_answer costs nothing and
+  // guards a payload that carries the text without the timestamp.
+  test('need_answer alone still excludes (belt-and-braces half kept)', () => {
+    expect(summarizeNeeds([gate({ need_answer: 'yes', need_answered_at: null })]).count).toBe(0)
+  })
 })
 
 describe('humanizeAge', () => {

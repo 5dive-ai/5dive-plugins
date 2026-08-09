@@ -1,3 +1,34 @@
+## v0.5.41
+
+### Fixed — the needs-you banner said nothing while suppressing itself fleet-wide (DIVE-2041)
+
+`reconcileNeedsBanner` pins on ONE agent only, the resolved org coordinator (DIVE-1568);
+every other agent unpins any banner it left behind. When `5dive task coordinator` resolves
+to `''` — a chart with more than one root and nobody tagged — *every* agent takes the
+non-coordinator branch, so the pin is removed from every paired DM and the 60s timer
+re-asserts that forever. That was DIVE-2031: 12 pending human gates, no banner anywhere,
+for days, with every component reporting success. The outage and the healthy case are the
+same code path with a different fleet-wide precondition, which is why nothing local caught
+it. It now logs an explicit `[needs-banner] SUPPRESSED FLEET-WIDE` line naming the cause,
+the fix and the check — rate-limited to one an hour, and the timer resets when a
+coordinator resolves again so a fresh outage is loud on its first tick. The fleet-level
+witness is `5dive doctor --category=channels` (CLI side), which computes the resolution
+itself rather than asking a bot that may be down.
+
+### Fixed — `summarizeNeeds` counted an answered secret gate as pending (DIVE-2041)
+
+The banner filter keyed on `need_answer` (the answer TEXT) while the CLI and dashboard key
+on `need_answered_at`. An answered **secret** gate keeps `need_answer` NULL by design — the
+value is the secret and is never written to the row — so a whole gate type read as pending
+forever. Harmless through today's only caller, which feeds it `task inbox --json` whose SQL
+already excludes answered rows; that made the module's correctness a property of a query
+two processes away. Now keyed on `need_answered_at` (with `need_answer` kept as a
+belt-and-braces disjunct, which can only ever exclude more). `buildInboxList` in every
+server.ts is corrected the same way, so the "mirror buildInboxList EXACTLY" contract is a
+mirror again rather than a shared defect.
+
+Bumps 0.5.40 -> 0.5.41.
+
 ## v0.5.40
 
 ### Fixed — a failed gate tap discarded the exception and named the wrong task (DIVE-2846)
