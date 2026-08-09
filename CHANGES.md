@@ -1,3 +1,30 @@
+## v0.5.40
+
+### Fixed — a failed gate tap discarded the exception and named the wrong task (DIVE-2846)
+
+The `tna:` tap handler caught its failures with a bare `catch {`. Five plausible
+causes were named in a comment and not one of them was kept anywhere: nothing
+logged, and the plugin has no journal to fall back on, so when two of lodar's
+tier-2 gate taps reported "Couldn't apply" on 2026-08-06 the reason was
+unrecoverable after the fact. The fallback also printed `DIVE-<internal id>` —
+the callback carries the numeric row id, not the ident, so the message named a
+task that either does not exist or, worse, is a different real row (id 2846 is
+DIVE-2659). And it asserted the tap had failed without ever checking.
+
+Now, on any tap failure: the exception is classified (timeout / sudo refused /
+the CLI's own refusal text / missing binary / unreadable output) and written
+both to stderr and to a bounded `tap-failures.jsonl` under the plugin state dir;
+the gate is RE-READ, so the human is told whether it applied, is still open, or
+could not be confirmed — three different messages, where there used to be one
+unproven claim; and the prose names the real ident, falling back to `task #<id>`
+rather than minting an ident-shaped string. The numeric id still appears in the
+on-box command, which is what `task answer` takes.
+
+Classification, landing and copy are pure functions in `tna.ts` (byte-identical
+across base and all five forks, pinned by the tna harness against error shapes
+measured off the real CLI); every `server.ts` is the thin adapter, and CI now
+fails any plugin whose tap catch does not bind its exception. Bumps 0.5.39 -> 0.5.40.
+
 ## v0.5.39
 
 ### Fixed — BotFather command menu shrinks after a slow startup (menu-robustness)

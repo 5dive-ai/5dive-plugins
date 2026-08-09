@@ -203,3 +203,187 @@ export function tapEvidenceArgs(humanProof?: string | null): string[] {
   if (humanProof) args.push(`--human-proof=${humanProof}`)
   return args
 }
+
+// ---------------------------------------------------------------------------
+// DIVE-2846: what a FAILED tap tells the human, and what it leaves behind.
+//
+// The old catch was `catch {` with no binding: five plausible causes named in a
+// comment and not one of them kept anywhere. A tap that reported failure to a
+// human left NO record of why, and the plugin has no journal to fall back on, so
+// the cause was unrecoverable after the fact (measured 2026-08-06: two of lodar's
+// taps failed and the reason is gone for good).
+//
+// Three pure pieces, so all six server.ts adapters render a failure identically
+// and the harness can pin the wording without a bot, a box, or a live gate:
+//   describeTapError() — turn the thrown thing into a kind + one human line.
+//   tapLanding()       — what the post-failure re-read says actually happened.
+//   tapFailureCopy()   — the toast, the chat fallback, and the log row.
+// ---------------------------------------------------------------------------
+
+// A failure line must stay short enough that toast + prefix clears Telegram's
+// 200-char answerCallbackQuery cap, where a throw would be swallowed by the
+// .catch(() => {}) and restore exactly the silence this fixes.
+const MAX_TAP_REASON = 110
+
+export type TapErrorKind =
+  | 'timeout'     // execFile killed the CLI on its own timeout budget
+  | 'refused'     // the CLI ran and said no (--json ok:false, or a non-zero exit)
+  | 'sudo'        // sudo -n could not elevate at all
+  | 'missing'     // no 5dive on PATH
+  | 'unreadable'  // the CLI answered with something that is not our envelope
+  | 'error'       // anything else, message preserved verbatim
+
+export interface TapErrorInfo {
+  kind: TapErrorKind
+  /** One clause a human can act on: 'timed out', 'sudo refused', the CLI's own refusal. */
+  short: string
+  /** Everything we know, for the log row — never truncated. */
+  detail: string
+}
+
+function clampReason(s: string): string {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim()
+  return t.length <= MAX_TAP_REASON ? t : t.slice(0, MAX_TAP_REASON - 1) + '…'
+}
+
+// `5dive --json` prints its refusal as {ok:false,error:{code,class,message}} on
+// STDOUT while exiting non-zero — so on base (execFileP rejects) the useful text
+// is on the rejection's .stdout, not its .message. Measured 2026-08-09:
+// exit 4 / not_found and exit 5 / conflict both carry a full envelope.
+function envelopeError(raw: unknown): { cls: string; message: string } | null {
+  const s = String(raw ?? '')
+  const i = s.indexOf('{')
+  if (i < 0) return null
+  try {
+    const j = JSON.parse(s.slice(i))
+    if (j && j.ok === false && j.error) {
+      return { cls: String(j.error.class ?? j.error.code ?? ''), message: String(j.error.message ?? '') }
+    }
+  } catch {
+    return null // not an envelope; caller falls through to the coarser signals
+  }
+  return null
+}
+
+// Classify the thrown thing. Deliberately signal-driven rather than
+// message-sniffing where a signal exists: `killed`/`signal` is how Node reports
+// its own timeout kill, and 'ENOENT' is a code, not prose. Prose is only read
+// where nothing structured survives — notably the forks, whose run5dive() throws
+// `new Error(envelope.error.message)` (DIVE-2623) and keeps no code or stdout.
+export function describeTapError(err: unknown): TapErrorInfo {
+  const e = (err ?? {}) as Record<string, any>
+  const message = String(e?.message ?? err ?? '').trim()
+  const stdout = String(e?.stdout ?? '')
+  const stderr = String(e?.stderr ?? '')
+  const code = e?.code
+  const parts = [message, stdout && `stdout: ${stdout.trim()}`, stderr && `stderr: ${stderr.trim()}`]
+  const detail = parts.filter(Boolean).join(' | ') || 'unknown error'
+
+  if (e?.killed === true || e?.signal === 'SIGTERM' || /ETIMEDOUT|timed? ?out/i.test(message)) {
+    return { kind: 'timeout', short: 'the 5dive CLI timed out', detail }
+  }
+  if (code === 'ENOENT') {
+    return { kind: 'missing', short: 'the 5dive CLI was not found on this box', detail }
+  }
+  if (/^sudo:/m.test(stderr) || /^sudo:/m.test(message)) {
+    const line = (stderr || message).split('\n').find(l => l.startsWith('sudo:')) ?? 'sudo refused'
+    return { kind: 'sudo', short: clampReason(line), detail }
+  }
+  const env = envelopeError(stdout) ?? envelopeError(message)
+  if (env) {
+    return { kind: 'refused', short: clampReason(`5dive refused: ${env.message || env.cls || 'no reason given'}`), detail }
+  }
+  if (err instanceof SyntaxError || /JSON|Unexpected token/i.test(message)) {
+    return { kind: 'unreadable', short: 'the 5dive CLI answered with something unreadable', detail }
+  }
+  if (typeof code === 'number') {
+    const first = (stderr || message).split('\n').map(l => l.trim()).filter(Boolean)[0] ?? ''
+    const why = first.replace(/^error:\s*/i, '')
+    return { kind: 'refused', short: clampReason(why ? `5dive refused: ${why}` : `5dive exited ${code}`), detail }
+  }
+  return { kind: 'error', short: clampReason(message || 'unknown error'), detail }
+}
+
+// What the gate says AFTER the failure. 'unknown' is a first-class answer, not a
+// fallback: telling a human "did not apply" when we could not re-read is the same
+// unproven claim the old copy made, one step further in.
+export type TapLanding =
+  | 'applied' // the gate is answered now — the tap landed, the confirmation didn't
+  | 'open'    // the gate is still open and unanswered — nothing was recorded
+  | 'unknown' // the re-read failed, or the gate is gone: we cannot say either way
+
+export function tapLanding(recheckOk: boolean, task: TnaGate | null | undefined): TapLanding {
+  if (!recheckOk || !task) return 'unknown'
+  if (task.need_answered_at) return 'applied'
+  // No gate at all: withdrawn or deleted between tap and re-read. Not 'open', and
+  // not evidence the tap applied — so say so rather than pick the flattering one.
+  if (!task.need_type) return 'unknown'
+  return 'open'
+}
+
+// A task ident is what a human can look up; the numeric id is what `task answer`
+// takes. Printing `DIVE-<internal id>` conflated the two and named a task that
+// either does not exist or, worse, is a REAL DIFFERENT task: measured 2026-08-09,
+// internal id 2846 is ident DIVE-2659. So an unknown ident degrades to `task #<id>`
+// rather than minting a plausible-looking one.
+const IDENT_RE = /^[A-Z][A-Z0-9]*-\d+$/
+export function tapRef(taskId: string, ident?: string | null): string {
+  const t = String(ident ?? '').trim()
+  return IDENT_RE.test(t) ? t : `task #${taskId}`
+}
+
+export interface TapFailureCopy {
+  /** answerCallbackQuery text — under Telegram's 200-char cap by construction. */
+  toast: string
+  /** The chat fallback the human actually reads. */
+  chat: string
+  /** One line for stderr + the durable tap-failure record. */
+  log: string
+}
+
+export function tapFailureCopy(o: {
+  taskId: string
+  ident?: string | null
+  err: TapErrorInfo
+  landing: TapLanding
+  /** need_answer as re-read — only meaningful when landing === 'applied'. */
+  answer?: string | null
+  /** How the re-read itself failed, if it did. */
+  recheckDetail?: string | null
+}): TapFailureCopy {
+  const ref = tapRef(o.taskId, o.ident)
+  const onBox = `sudo 5dive task answer ${o.taskId} --value="<your choice>"` +
+    `  (approval: approved|denied · secret gate: omit --value)`
+  const value = String(o.answer ?? '').trim()
+
+  let toast: string
+  let chat: string
+  if (o.landing === 'applied') {
+    toast = 'Applied after all — details in chat.'
+    chat =
+      `✅ That tap DID land on ${ref}${value ? ` (gate now reads: ${value})` : ''} — nothing to redo.\n` +
+      `The bot lost the confirmation, not the answer: ${o.err.short}.`
+  } else if (o.landing === 'open') {
+    toast = "Couldn't apply — fallback sent in chat."
+    chat =
+      `Couldn't apply that tap for ${ref} — ${o.err.short}.\n` +
+      `Re-read just now: the gate is STILL OPEN, so nothing was recorded.\n` +
+      `On the box (as claude/root):\n${onBox}`
+  } else {
+    toast = "Couldn't confirm — fallback sent in chat."
+    chat =
+      `Couldn't apply that tap for ${ref} — ${o.err.short}.\n` +
+      `Re-reading the gate also failed, so I can't tell whether it applied — check before re-answering.\n` +
+      `On the box (as claude/root):\nsudo 5dive task show ${o.taskId}\n${onBox}`
+  }
+
+  const log = [
+    `tap failed for ${ref} (id ${o.taskId})`,
+    `kind=${o.err.kind}`,
+    `landing=${o.landing}`,
+    `err=${o.err.detail}`,
+    o.recheckDetail ? `recheck_err=${o.recheckDetail}` : '',
+  ].filter(Boolean).join(' · ')
+
+  return { toast, chat, log }
+}

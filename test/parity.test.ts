@@ -176,11 +176,27 @@ describe('cross-fork consistency', () => {
 describe('gate-tap failure fallback (DIVE-894)', () => {
   const ALL = [BASELINE, ...FORKS] as const
 
-  test.each(ALL)('%s: tna catch sends the on-box answer line, not a dashboard pointer', plugin => {
+  // DIVE-2846 moved the failure COPY out of each server.ts and into tapFailureCopy()
+  // in tna.ts, which is byte-identical across every plugin (pinned by the tna
+  // harness). So the invariant is asserted in two halves: the shared copy still
+  // points at the on-box CLI, and every adapter actually renders it. Keeping the
+  // old server.ts literal assertion would have passed only by leaving six copies
+  // of the string behind — the drift this suite exists to catch.
+  test.each(ALL)('%s: tna catch renders the shared failure copy', plugin => {
     const src = read(plugin)
-    expect(src).toContain("Couldn't apply — fallback sent in chat.")
-    expect(src).toContain('sudo 5dive task answer ${taskId} --value=')
+    expect(src).toContain('tapFailureCopy(')
     expect(src).not.toContain("Couldn't apply — open the dashboard.")
+  })
+
+  test.each(ALL)('%s: the shared copy names the on-box answer line, never a dashboard', plugin => {
+    // Scoped to the copy builder, not the whole file: tna.ts mentions the
+    // dashboard elsewhere as one of the ways a gate gets answered mid-flight,
+    // which is prose about the world, not a pointer handed to a human.
+    const body = read(plugin, 'tna.ts').split('export function tapFailureCopy(')[1] ?? ''
+    expect(body, `${plugin}/tna.ts has no tapFailureCopy — the failure copy is not shared`).not.toBe('')
+    expect(body).toContain('sudo 5dive task answer ${o.taskId} --value=')
+    expect(body).toContain('sudo 5dive task show ${o.taskId}')
+    expect(body.toLowerCase()).not.toContain('dashboard')
   })
 })
 

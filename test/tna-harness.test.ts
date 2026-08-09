@@ -430,3 +430,181 @@ describe('DIVE-1115: tapEvidenceArgs — every verified-human tap is --human', (
     })
   }
 })
+
+// ---------------------------------------------------------------------------
+// DIVE-2846: a tap that reports "Couldn't apply" must leave a record naming the
+// exception, name the REAL ident, and not assert a failure it never confirmed.
+//
+// The regression it pins: `catch {` with no binding. Two of lodar's taps failed
+// on 2026-08-06 and the cause is gone for good — no exception kept, no plugin
+// log to fall back on. The error shapes below are MEASURED (2026-08-09) off the
+// real CLI on this box, not invented: an execFile timeout kill, an ENOENT, and
+// `sudo -n 5dive --json task answer` refusing with exit 4 / not_found and exit
+// 5 / conflict, each carrying its envelope on STDOUT while exiting non-zero.
+// ---------------------------------------------------------------------------
+
+// Measured: `sudo -n 5dive --json task answer 999999 --value=zzz`
+const REFUSAL_ENVELOPE = '{"ok":false,"error":{"code":4,"class":"not_found","message":"no such task: 999999"}}\n'
+const MEASURED_REFUSAL = {
+  code: 4,
+  killed: false,
+  signal: null,
+  message: 'Command failed: sudo -n 5dive --json task answer 999999 --value=zzz\nerror: no such task: 999999\n',
+  stdout: REFUSAL_ENVELOPE,
+  stderr: 'error: no such task: 999999\n',
+}
+// Measured: execFileP('sleep', ['3'], { timeout: 300 })
+const MEASURED_TIMEOUT = { code: null, killed: true, signal: 'SIGTERM', message: 'Command failed: sleep 3', stdout: '', stderr: '' }
+// Measured: execFileP('/nonexistent/5dive', ...)
+const MEASURED_ENOENT = { code: 'ENOENT', message: "ENOENT: no such file or directory, posix_spawn '/nonexistent/5dive'", stdout: '', stderr: '' }
+
+describe('DIVE-2846: describeTapError keeps the exception and names a cause', () => {
+  for (const mod of mods) {
+    test(`${mod.name}: classifies the measured CLI failure shapes`, () => {
+      expect(mod.describeTapError(MEASURED_TIMEOUT).kind).toBe('timeout')
+      expect(mod.describeTapError(MEASURED_ENOENT).kind).toBe('missing')
+      expect(mod.describeTapError(MEASURED_REFUSAL).kind).toBe('refused')
+      expect(mod.describeTapError({ code: 1, stderr: 'sudo: a password is required\n' }).kind).toBe('sudo')
+      expect(mod.describeTapError(new SyntaxError('Unexpected token < in JSON at position 0')).kind).toBe('unreadable')
+    })
+
+    test(`${mod.name}: a refusal's short line carries the CLI's OWN reason`, () => {
+      // The whole point: 'sudo failed' vs 'gate already answered' vs 'timeout'
+      // are three different things for the human to do next.
+      expect(mod.describeTapError(MEASURED_REFUSAL).short).toContain('no such task: 999999')
+      const conflict = {
+        code: 5,
+        stdout: '{"ok":false,"error":{"code":5,"class":"conflict","message":"DIVE-2659 has no pending human gate (nothing to answer)"}}\n',
+        stderr: 'error: DIVE-2659 has no pending human gate (nothing to answer)\n',
+        message: 'Command failed',
+      }
+      expect(mod.describeTapError(conflict).short).toContain('no pending human gate')
+      expect(mod.describeTapError({ code: 1, stderr: 'sudo: a password is required\n' }).short).toContain('sudo:')
+    })
+
+    test(`${mod.name}: the forks' DIVE-2623 bare-Error shape still yields a reason`, () => {
+      // run5dive RESOLVES on ok:false, so the forks re-throw `new Error(msg)`
+      // with no code, no stdout, no stderr. A classifier that only reads
+      // structured fields would report 'unknown error' on five of six plugins.
+      const info = mod.describeTapError(new Error('DIVE-2659 has no pending human gate (nothing to answer)'))
+      expect(info.short).toContain('no pending human gate')
+      expect(info.detail).toContain('no pending human gate')
+    })
+
+    test(`${mod.name}: detail is never empty — that is the record the old catch never kept`, () => {
+      for (const e of [MEASURED_TIMEOUT, MEASURED_ENOENT, MEASURED_REFUSAL, new Error('boom'), undefined, null, 'raw string']) {
+        expect(mod.describeTapError(e).detail.length, `empty detail for ${JSON.stringify(e)}`).toBeGreaterThan(0)
+      }
+      // The envelope must survive into the log even though `short` is clamped.
+      expect(mod.describeTapError(MEASURED_REFUSAL).detail).toContain('not_found')
+    })
+  }
+})
+
+describe('DIVE-2846: tapRef never mints an ident out of an internal id', () => {
+  for (const mod of mods) {
+    test(`${mod.name}: unknown ident degrades to task #<id>, known ident is used verbatim`, () => {
+      // The measured harm: callback_data carries id 3018, and `DIVE-3018` is not
+      // that task. On this box id 2846 IS ident DIVE-2659 — a different REAL row,
+      // which is worse than a 404 because it looks up fine.
+      for (const unknown of [undefined, null, '', 'dive-2831', '2831', 'DIVE-']) {
+        expect(mod.tapRef('3018', unknown), `ident=${JSON.stringify(unknown)}`).toBe('task #3018')
+      }
+      expect(mod.tapRef('3018', 'DIVE-2831')).toBe('DIVE-2831')
+      expect(mod.tapRef('2846', 'DIVE-2659')).toBe('DIVE-2659')
+    })
+  }
+})
+
+describe('DIVE-2846: tapLanding — "did not apply" is a re-read, not an assumption', () => {
+  const open = { need_type: 'decision', need_options: 'A|B' }
+  const answered = { need_type: 'decision', need_options: 'A|B', need_answer: 'B', need_answered_at: '2026-08-06 04:01:55' }
+  for (const mod of mods) {
+    test(`${mod.name}: applied / open / unknown`, () => {
+      expect(mod.tapLanding(true, answered)).toBe('applied')
+      expect(mod.tapLanding(true, open)).toBe('open')
+      // Re-read failed → we do not know, and must not claim either way.
+      expect(mod.tapLanding(false, open)).toBe('unknown')
+      expect(mod.tapLanding(false, null)).toBe('unknown')
+      expect(mod.tapLanding(true, null)).toBe('unknown')
+      // Gate withdrawn/deleted between tap and re-read: not open, not applied.
+      expect(mod.tapLanding(true, {})).toBe('unknown')
+    })
+  }
+})
+
+describe('DIVE-2846: tapFailureCopy — three distinct outcomes, and a toast that fits', () => {
+  const err = (mod: any) => mod.describeTapError(MEASURED_TIMEOUT)
+  for (const mod of mods) {
+    test(`${mod.name}: an applied tap is never reported as a failure`, () => {
+      const c = mod.tapFailureCopy({ taskId: '3018', ident: 'DIVE-2831', err: err(mod), landing: 'applied', answer: 'B' })
+      expect(c.chat).toContain('DIVE-2831')
+      expect(c.chat).toContain('B')
+      expect(c.chat).not.toContain("Couldn't apply that tap")
+      // Must NOT push a human toward answering a gate that is already answered.
+      expect(c.chat).not.toContain('task answer 3018')
+    })
+
+    test(`${mod.name}: an open gate says it did not apply AND how to answer`, () => {
+      const c = mod.tapFailureCopy({ taskId: '3018', ident: 'DIVE-2831', err: err(mod), landing: 'open' })
+      expect(c.chat).toContain('DIVE-2831')
+      expect(c.chat).toContain('STILL OPEN')
+      expect(c.chat).toContain('sudo 5dive task answer 3018')  // id is fine in the COMMAND
+      expect(c.chat).toContain('timed out')                    // the reason, not just the failure
+    })
+
+    test(`${mod.name}: an unconfirmed tap says unknown, and does not claim failure`, () => {
+      const c = mod.tapFailureCopy({ taskId: '3018', ident: null, err: err(mod), landing: 'unknown', recheckDetail: 'recheck blew up' })
+      expect(c.chat).toContain('task #3018')
+      expect(c.chat).not.toContain('DIVE-3018')  // the exact prose bug this row was filed for
+      expect(c.chat).toContain("can't tell whether it applied")
+      expect(c.chat).toContain('sudo 5dive task show 3018')
+      expect(c.log).toContain('recheck_err=recheck blew up')
+    })
+
+    test(`${mod.name}: the three landings do not render identically`, () => {
+      const of = (landing: string) => mod.tapFailureCopy({ taskId: '3018', ident: 'DIVE-2831', err: err(mod), landing }).chat
+      expect(new Set(['applied', 'open', 'unknown'].map(of)).size).toBe(3)
+    })
+
+    test(`${mod.name}: every toast clears Telegram's 200-char answerCallbackQuery cap`, () => {
+      // Over the cap, answerCallbackQuery throws and the .catch(() => {}) around
+      // it restores exactly the silence this row exists to remove.
+      const long = mod.describeTapError({ code: 7, stderr: 'error: ' + 'x'.repeat(4000) })
+      for (const landing of ['applied', 'open', 'unknown']) {
+        const c = mod.tapFailureCopy({ taskId: '3018', ident: 'D'.repeat(300) + '-1', err: long, landing })
+        expect(c.toast.length, `${landing} toast too long`).toBeLessThanOrEqual(200)
+      }
+      expect(long.short.length).toBeLessThanOrEqual(120)
+    })
+
+    test(`${mod.name}: the log row names the exception, the landing, and the task`, () => {
+      const c = mod.tapFailureCopy({ taskId: '3018', ident: 'DIVE-2831', err: mod.describeTapError(MEASURED_REFUSAL), landing: 'open' })
+      expect(c.log).toContain('DIVE-2831')
+      expect(c.log).toContain('id 3018')
+      expect(c.log).toContain('kind=refused')
+      expect(c.log).toContain('landing=open')
+      expect(c.log).toContain('no such task: 999999')  // the exception itself, verbatim
+    })
+  }
+})
+
+// Same lesson as assertRoutesTna above: the pure module can be perfect while the
+// adapter that calls it still swallows the error. This is globbed over PLUGINS,
+// not a named list, so a new fork enrolls itself (DIVE-2374).
+describe('DIVE-2846: every plugin server.ts BINDS the tap error and records it', () => {
+  for (const p of PLUGINS) {
+    test(`${p}: the tna catch binds, re-reads, and records`, () => {
+      const src = readFileSync(SERVER_TS(p), 'utf8')
+      for (const symbol of ['describeTapError', 'tapLanding', 'tapFailureCopy', 'recordTapFailure']) {
+        expect(src.includes(symbol), `${p}/server.ts never calls ${symbol} — a failed tap leaves no record`).toBe(true)
+      }
+      // The exact regression: a bare `catch {` on the tap path keeps nothing.
+      expect(/\} catch \(err\) \{[\s\S]{0,900}?describeTapError\(err\)/.test(src),
+        `${p}/server.ts tna catch does not bind its exception`).toBe(true)
+      // And the prose bug: never format the internal id as an ident.
+      expect(src.includes('that tap for DIVE-${'), `${p}/server.ts still prints DIVE-<internal id> in the fallback`).toBe(false)
+      expect(/process\.stderr\.write\(`telegram tna: /.test(src), `${p}/server.ts never writes the failure to stderr`).toBe(true)
+    })
+  }
+})
