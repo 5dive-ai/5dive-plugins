@@ -31,7 +31,10 @@ import {
 import { randomBytes } from 'crypto'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs , yesNoChoice} from './tna'
+import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs , yesNoChoice, describeTapError, tapLanding, tapFailureCopy, type TapLanding} from './tna'
+// DIVE-2846: aliased so the durable tap-failure record needs no surgery on
+// (or collision with) whatever each plugin already imports from 'fs'.
+import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 
 const PLUGIN_VERSION = (() => {
@@ -43,6 +46,31 @@ const PLUGIN_VERSION = (() => {
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
   ?? join(process.env.GROK_HOME ?? join(homedir(), '.grok'), 'channels', 'telegram')
+
+// DIVE-2846: a tap that fails must leave a record that outlives the process.
+// stderr is captured by the harness that spawns us (measured: "Server stderr:
+// telegram channel: …" rows in Claude Code's MCP log), but that log is per
+// session and the tmux-hosted forks have only scrollback — which is why the two
+// taps that failed on 2026-08-06 could never be diagnosed. So also append a
+// bounded JSONL at a fixed path anyone can grep after the fact. Best-effort by
+// construction: a record we cannot write must never take the tap handler down.
+const TAP_FAIL_LOG = join(STATE_DIR, 'tap-failures.jsonl')
+const TAP_FAIL_MAX_BYTES = 256_000
+function recordTapFailure(line: string): void {
+  process.stderr.write(`telegram tna: ${line}\n`)
+  try {
+    tapMkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    try {
+      if (tapStatSync(TAP_FAIL_LOG).size > TAP_FAIL_MAX_BYTES) tapRenameSync(TAP_FAIL_LOG, `${TAP_FAIL_LOG}.1`)
+    } catch {
+      // no log yet (or unstatable) — nothing to rotate
+    }
+    tapAppendFileSync(TAP_FAIL_LOG, JSON.stringify({ ts: new Date().toISOString(), event: 'tap_failed', line }) + '\n', { mode: 0o600 })
+  } catch {
+    // The stderr line above is the floor; never throw out of the tap handler.
+  }
+}
+
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
@@ -1912,11 +1940,15 @@ bot.on('callback_query:data', async ctx => {
   const token = tnaM[2]!
   // DIVE-916: per-gate HUMAN nonce from callback_data → forwarded as --human-proof.
   const humanProof = tnaM[3]
+  let tnaIdent: string | null = null
   try {
     const show = await run5dive(['task', 'show', taskId, '--json'], 5000)
     const task = show.ok ? show.data?.task : undefined
     // Branch logic lives in resolveTnaAnswer (DIVE-369, byte-identical across
     // base+forks, pinned headless by test/tna-harness.test.ts). Thin I/O adapter.
+    // DIVE-2846: the ident is what a human can look up; the callback carries
+    // only the internal id. Keep it so a failure names the right task.
+    if (typeof (task as any)?.ident === 'string') tnaIdent = (task as any).ident
     const r = resolveTnaAnswer(task, token)
     if (r.kind === 'nogate') {
       await ctx.answerCallbackQuery({ text: 'This task no longer has a gate.' }).catch(() => {})
@@ -1950,17 +1982,31 @@ bot.on('callback_query:data', async ctx => {
     if (!answered.ok) throw new Error(answered.error?.message || 'task answer failed')
     await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
     await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
-  } catch {
-    // DIVE-894: don't point at a dashboard the box may not have — the on-box
-    // answer line works everywhere (run as a human login, claude/root).
-    await ctx.answerCallbackQuery({ text: "Couldn't apply — fallback sent in chat." }).catch(() => {})
-    await ctx
-      .reply(
-        `Couldn't apply that tap for DIVE-${taskId}. On the box (as claude/root):\n` +
-        `sudo 5dive task answer ${taskId} --value="<your choice>"` +
-        `  (approval: approved|denied · secret gate: omit --value)`,
-      )
-      .catch(() => {})
+  } catch (err) {
+    // DIVE-2846: bind the exception. The old `catch {` bound nothing, so a tap that
+    // told a human it failed left NO record of why anywhere, and the cause was
+    // unrecoverable after the fact. Three things now happen instead: keep and record
+    // the exception, RE-READ the gate so we report what actually landed rather than
+    // asserting a failure we never confirmed, and name the real ident — `DIVE-<id>`
+    // was the INTERNAL id, which names a different real task (id 2846 is DIVE-2659).
+    // DIVE-894 still holds: point at the on-box command, not a dashboard.
+    const info = describeTapError(err)
+    let landing: TapLanding = 'unknown'
+    let answer: string | null = null
+    let recheckDetail: string | null = null
+    try {
+      const re = await run5dive(['task', 'show', taskId, '--json'], 5000)
+      const t = re.ok ? re.data?.task : undefined
+      landing = tapLanding(re.ok === true, t)
+      if (typeof t?.ident === 'string') tnaIdent = t.ident
+      answer = t?.need_answer ?? null
+    } catch (reErr) {
+      recheckDetail = describeTapError(reErr).detail
+    }
+    const copy = tapFailureCopy({ taskId, ident: tnaIdent, err: info, landing, answer, recheckDetail })
+    recordTapFailure(copy.log)
+    await ctx.answerCallbackQuery({ text: copy.toast }).catch(() => {})
+    await ctx.reply(copy.chat).catch(() => {})
   }
 })
 

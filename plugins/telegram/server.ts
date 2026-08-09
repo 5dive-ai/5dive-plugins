@@ -26,7 +26,10 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, applyModelAliases, EFFORT_LEVELS } from './commands'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
-import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice } from './tna'
+import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice, describeTapError, tapLanding, tapFailureCopy, type TapLanding } from './tna'
+// DIVE-2846: aliased so the durable tap-failure record needs no surgery on
+// (or collision with) whatever each plugin already imports from 'fs'.
+import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { parseGateReply, resolveGateReply } from './gatereply'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
@@ -50,6 +53,31 @@ try {
 } catch {}
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+
+// DIVE-2846: a tap that fails must leave a record that outlives the process.
+// stderr is captured by the harness that spawns us (measured: "Server stderr:
+// telegram channel: …" rows in Claude Code's MCP log), but that log is per
+// session and the tmux-hosted forks have only scrollback — which is why the two
+// taps that failed on 2026-08-06 could never be diagnosed. So also append a
+// bounded JSONL at a fixed path anyone can grep after the fact. Best-effort by
+// construction: a record we cannot write must never take the tap handler down.
+const TAP_FAIL_LOG = join(STATE_DIR, 'tap-failures.jsonl')
+const TAP_FAIL_MAX_BYTES = 256_000
+function recordTapFailure(line: string): void {
+  process.stderr.write(`telegram tna: ${line}\n`)
+  try {
+    tapMkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    try {
+      if (tapStatSync(TAP_FAIL_LOG).size > TAP_FAIL_MAX_BYTES) tapRenameSync(TAP_FAIL_LOG, `${TAP_FAIL_LOG}.1`)
+    } catch {
+      // no log yet (or unstatable) — nothing to rotate
+    }
+    tapAppendFileSync(TAP_FAIL_LOG, JSON.stringify({ ts: new Date().toISOString(), event: 'tap_failed', line }) + '\n', { mode: 0o600 })
+  } catch {
+    // The stderr line above is the floor; never throw out of the tap handler.
+  }
+}
+
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -3971,6 +3999,7 @@ bot.on('callback_query:data', async ctx => {
     // secret/manual taps). Forwarded as --human-proof so the CLI can clear the
     // gate for a real tap whose SUDO_UID is the spawning agent.
     const humanProof = tnaM[3]
+    let tnaIdent: string | null = null
     try {
       const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
       const task = JSON.parse(show.stdout).data?.task
@@ -3978,6 +4007,9 @@ bot.on('callback_query:data', async ctx => {
       // answer incl. the secret no-value path) lives in resolveTnaAnswer (DIVE-369),
       // exercised headless by test/tna-harness.test.ts. This handler is the thin
       // I/O adapter: fetch the live gate, then act on the resolution.
+      // DIVE-2846: the ident is what a human can look up; the callback carries
+      // only the internal id. Keep it so a failure names the right task.
+      if (typeof (task as any)?.ident === 'string') tnaIdent = (task as any).ident
       const r = resolveTnaAnswer(task, token)
       if (r.kind === 'nogate') {
         await ctx.answerCallbackQuery({ text: 'This task no longer has a gate.' }).catch(() => {})
@@ -4012,20 +4044,31 @@ bot.on('callback_query:data', async ctx => {
       await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], { timeout: 8000 })
       await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
       await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
-    } catch {
-      // Stale message, deleted task, restarted agent, or a CLI/sudo failure (incl.
-      // a gate that got answered between our show and answer). Ack softly so
-      // Telegram clears the tap spinner; never throw.
-      // DIVE-894: don't point at a dashboard the box may not have — the on-box
-      // answer line works everywhere (run as a human login, claude/root).
-      await ctx.answerCallbackQuery({ text: "Couldn't apply — fallback sent in chat." }).catch(() => {})
-      await ctx
-        .reply(
-          `Couldn't apply that tap for DIVE-${taskId}. On the box (as claude/root):\n` +
-          `sudo 5dive task answer ${taskId} --value="<your choice>"` +
-          `  (approval: approved|denied · secret gate: omit --value)`,
-        )
-        .catch(() => {})
+    } catch (err) {
+      // DIVE-2846: bind the exception. The old `catch {` bound nothing, so a tap that
+      // told a human it failed left NO record of why anywhere, and the cause was
+      // unrecoverable after the fact. Three things now happen instead: keep and record
+      // the exception, RE-READ the gate so we report what actually landed rather than
+      // asserting a failure we never confirmed, and name the real ident — `DIVE-<id>`
+      // was the INTERNAL id, which names a different real task (id 2846 is DIVE-2659).
+      // DIVE-894 still holds: point at the on-box command, not a dashboard.
+      const info = describeTapError(err)
+      let landing: TapLanding = 'unknown'
+      let answer: string | null = null
+      let recheckDetail: string | null = null
+      try {
+        const re = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
+        const t = JSON.parse(re.stdout).data?.task
+        landing = tapLanding(true, t)
+        if (typeof t?.ident === 'string') tnaIdent = t.ident
+        answer = t?.need_answer ?? null
+      } catch (reErr) {
+        recheckDetail = describeTapError(reErr).detail
+      }
+      const copy = tapFailureCopy({ taskId, ident: tnaIdent, err: info, landing, answer, recheckDetail })
+      recordTapFailure(copy.log)
+      await ctx.answerCallbackQuery({ text: copy.toast }).catch(() => {})
+      await ctx.reply(copy.chat).catch(() => {})
     }
     return
   }
