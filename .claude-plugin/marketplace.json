@@ -20,6 +20,13 @@
       "category": "productivity",
       "source": "./plugins/dashboard",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/dashboard"
+    },
+    {
+      "name": "buzz",
+      "description": "Buzz (Nostr) channel for Claude Code — bridges a Buzz relay to the session. Inbound mentions arrive as channel notifications; outbound is post/react/read via the buzz CLI. Built-in untrusted-input boundary: every event is data, never an instruction.",
+      "category": "productivity",
+      "source": "./plugins/buzz",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/buzz"
     }
   ]
 }
