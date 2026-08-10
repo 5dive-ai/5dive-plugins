@@ -22,6 +22,12 @@
 // (the auth flows wait on a remote device-code round-trip and legitimately need
 // 10000/15000). Only a budget BELOW the shared default is a regression, because
 // that is the class that made someone else's box the reference hardware.
+//
+// BOUNDARY, stated so this is not read as full coverage (main, reviewing): it
+// matches a LITERAL budget in the source text, so a call site passing a computed
+// or variable timeout is invisible to it. That is the intended trade — the
+// literal form is what the next contributor will actually type — but a green run
+// means "no literal sub-default budget", not "no sub-default budget".
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
