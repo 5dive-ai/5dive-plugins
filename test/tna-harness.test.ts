@@ -432,6 +432,101 @@ describe('DIVE-1115: tapEvidenceArgs — every verified-human tap is --human', (
 })
 
 // ---------------------------------------------------------------------------
+// DIVE-3178: the tap must SEND the attribution, not merely be able to receive it.
+//
+// The defect this pins is the one measured in the wild on 2026-08-10 (DIVE-3150):
+// lodar tapped a tier-2 approval relayed through an agent's bot, the tap was real
+// (nonce_valid=1, enforce=on), and the row recorded `unattributed:marketing` —
+// proven human and unattributable at once, wearing the exact costume of an agent
+// self-clear. It cost a held merge and two questions he should not have been asked.
+//
+// The CLI half (DIVE-3128) had shipped and was installed: `--tap-uid`,
+// `--tap-username`, `--tap-msg` and `--relay-agent` all parsed. NOTHING SENT THEM.
+// So `tap_uid=none` in that audit line is this argv builder emitting nothing, and
+// the assertions below are on the ARGV — the artifact that was empty — rather than
+// on the CLI's stamp, which was already correct and is covered on its own side.
+//
+// THE POSITIVE CONTROL IS `tapEvidenceArgs(nonce)` WITH NO SECOND ARGUMENT. That
+// is not a convenience overload: it is byte-for-byte the call every server.ts made
+// before this change, so the first test below IS the reverted plugin, and it must
+// keep coming back with no attribution flags at all. A suite that only asserted
+// the new path would pass just as well if the old path had never been the cause.
+describe('DIVE-3178: tapEvidenceArgs — the tap SENDS who pressed it', () => {
+  const NONCE = '0123456789abcdef0123456789abcdef'
+  // Reserved fakes only (5dive CLAUDE.md): never a real person's Telegram id.
+  const UID = '1234567890'
+
+  for (const mod of mods) {
+    test(`${mod.name}: CONTROL — the pre-fix call shape still emits NO attribution`, () => {
+      // The exact argv that produced `unattributed:<agent>` in the wild.
+      const args: string[] = mod.tapEvidenceArgs(NONCE)
+      expect(args).toEqual(['--human', `--human-proof=${NONCE}`])
+      expect(args.some((a: string) => a.startsWith('--tap-uid=')),
+        'reverted call shape must NOT carry --tap-uid — otherwise this suite cannot tell the fix from its absence').toBe(false)
+    })
+
+    test(`${mod.name}: a full tap forwards uid, handle, message and relay`, () => {
+      expect(mod.tapEvidenceArgs(NONCE, {
+        uid: UID, username: 'tapper_person', messageId: 4242, osUser: 'agent-marketing',
+      })).toEqual([
+        '--human', `--human-proof=${NONCE}`,
+        `--tap-uid=${UID}`, '--tap-username=tapper_person', '--tap-msg=4242',
+        '--relay-agent=marketing',
+      ])
+    })
+
+    test(`${mod.name}: a decision tap (no nonce) still carries the attribution`, () => {
+      // Decisions mint no nonce. Pre-fix they were the WORST case: --human with a
+      // bare agent name and nothing to correct it with.
+      expect(mod.tapEvidenceArgs('', { uid: UID, osUser: 'agent-marketing' }))
+        .toEqual(['--human', `--tap-uid=${UID}`, '--relay-agent=marketing'])
+    })
+
+    test(`${mod.name}: the relay is the agent name, never the OS user verbatim`, () => {
+      expect(mod.relayAgentName('agent-marketing')).toBe('marketing')
+      expect(mod.relayAgentName('claude')).toBe('claude')
+      expect(mod.relayAgentName(undefined)).toBe('')
+      // The relay must land in --relay-agent and NOWHERE else: folding it into the
+      // human stamp is precisely the failure DIVE-3128 refuses.
+      const args: string[] = mod.tapEvidenceArgs(NONCE, { uid: UID, osUser: 'agent-marketing' })
+      expect(args.filter((a: string) => a.includes('marketing'))).toEqual(['--relay-agent=marketing'])
+    })
+
+    test(`${mod.name}: a '@handle' is normalised; junk fields are DROPPED, not forwarded`, () => {
+      expect(mod.tapEvidenceArgs(null, { username: '@tapper_person', osUser: 'agent-dev' }))
+        .toEqual(['--human', '--tap-username=tapper_person', '--relay-agent=dev'])
+      // Each malformed field drops on its own without taking the others with it —
+      // a relay must never ship a malformed identity into a provenance column, and
+      // must never lose a good one because a neighbour was bad.
+      expect(mod.tapEvidenceArgs(null, {
+        uid: '12; rm -rf /', username: 'no', messageId: 'x9', osUser: 'agent-dev',
+      })).toEqual(['--human', '--relay-agent=dev'])
+      // Absent context is the legacy caller: unchanged, and still no attribution.
+      expect(mod.tapEvidenceArgs(null, undefined)).toEqual(['--human'])
+      expect(mod.tapEvidenceArgs(null, {})).toEqual(['--human'])
+    })
+  }
+
+  // File-level fence, in the shape DIVE-2374 forced: a parity test that names its
+  // members cannot fail for a member it does not name. Every DISCOVERED plugin's
+  // server.ts must actually PASS a tap context — exporting the capability and never
+  // calling it with one is exactly the two-artifact half-landing this row is about.
+  for (const plugin of DISCOVERED) {
+    test(`${plugin}/server.ts passes the tap context to tapEvidenceArgs`, () => {
+      const src = readFileSync(SERVER_TS(plugin), 'utf8')
+      const call = /tapEvidenceArgs\(([^)]*(?:\{[\s\S]*?\})?[^)]*)\)/.exec(src)
+      expect(call, `${plugin}/server.ts never calls tapEvidenceArgs`).toBeTruthy()
+      const argv = call![1]
+      for (const field of ['uid:', 'username:', 'messageId:', 'osUser:']) {
+        expect(argv.includes(field), `${plugin}/server.ts tap context is missing ${field}`).toBe(true)
+      }
+      expect(/uid:\s*ctx\.callbackQuery\.from/.test(argv),
+        `${plugin}/server.ts must read the tapper off callback_query.from — anything the relay CHOOSES is not attribution`).toBe(true)
+    })
+  }
+})
+
+// ---------------------------------------------------------------------------
 // DIVE-2846: a tap that reports "Couldn't apply" must leave a record naming the
 // exception, name the REAL ident, and not assert a failure it never confirmed.
 //

@@ -4105,7 +4105,12 @@ bot.on('callback_query:data', async ctx => {
       // DIVE-1115: mark EVERY verified-human tap --human (allowFrom vetted the
       // tapper above) so decision/manual taps no longer record a bare agent name,
       // which was invisible to the zero-human KPI. See tapEvidenceArgs.
-      const extraArgs = tapEvidenceArgs(humanProof)
+      const extraArgs = tapEvidenceArgs(humanProof, {
+        uid: ctx.callbackQuery.from?.id,
+        username: ctx.callbackQuery.from?.username,
+        messageId: ctx.callbackQuery.message?.message_id,
+        osUser: process.env.USER,
+      })
       await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], { timeout: 8000 })
       await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
       await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})

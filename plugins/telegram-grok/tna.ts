@@ -198,9 +198,66 @@ export function yesNoChoice(text: string): boolean {
 // unprovable as human. --human-proof rides along ONLY when the callback carried a
 // per-gate nonce (hard gates mint one; decision mints none), so an older CLI on
 // the same box never sees an unknown flag.
-export function tapEvidenceArgs(humanProof?: string | null): string[] {
+//
+// DIVE-3178: WHO PRESSED IT, AND WHOSE BOT CARRIED IT — the half that SENDS.
+//
+// DIVE-3128 taught the CLI to receive `--tap-uid` / `--tap-username` / `--tap-msg`
+// / `--relay-agent`, and nothing installed ever sent them. So the CLI reached its
+// human stamp with only its own process identity — an AGENT name — correctly
+// refused to write `human:<agent>`, and had nothing to put in its place: every
+// channel-relayed tier-2 clear on this fleet recorded `unattributed:<agent>`,
+// proven human and unattributable at once (measured 2026-08-10 on DIVE-3150, a
+// real tap of lodar's that held a merge). `tap_uid=none` was the fix RECEIVING
+// NOTHING, not the fix failing — the defect lives on this side of the wire.
+//
+// The fields come off Telegram's `callback_query`, which the relaying agent does
+// not author: `.from.id` and `.from.username` are the person who pressed the
+// button, `.message.message_id` is the ping they pressed. The relay names ITSELF
+// separately, so the carrier lands in its own column (`need_answered_relay`)
+// instead of being what the `human:` prefix attaches to.
+//
+// SANITISED BEFORE THEY BECOME ARGV, on the same grammars cmd_agent_teambot.sh
+// uses: a Telegram id is digits (negative for channels), a handle is Telegram's
+// own 5-32 char rule, a message id is digits. Anything else is DROPPED rather
+// than forwarded — the CLI re-validates, but a relay must not be the thing that
+// ships a malformed identity into a provenance field. Dropping is also why a
+// missing field cannot degrade the answer: the tap still lands with exactly the
+// evidence it had before, and only the attribution is poorer.
+export interface TapContext {
+  /** `callback_query.from.id` — the human who pressed the button. */
+  uid?: string | number | null
+  /** `callback_query.from.username` — their handle, with or without a leading '@'. */
+  username?: string | null
+  /** `callback_query.message.message_id` — which ping was tapped. */
+  messageId?: string | number | null
+  /** `process.env.USER` on the box running this bridge — the RELAY, never the decider. */
+  osUser?: string | null
+}
+
+const TAP_UID_RE = /^-?\d{1,20}$/
+const TAP_USERNAME_RE = /^[A-Za-z][A-Za-z0-9_]{4,31}$/
+const TAP_MSG_RE = /^\d{1,19}$/
+const RELAY_AGENT_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/
+
+// The bridge runs as `agent-<name>` (or `claude`); the roster name is the suffix.
+// Pure and exported so the harness pins it without an environment — the six
+// server.ts adapters pass `process.env.USER` and nothing else.
+export function relayAgentName(osUser?: string | null): string {
+  return String(osUser ?? '').trim().replace(/^agent-/, '')
+}
+
+export function tapEvidenceArgs(humanProof?: string | null, tap?: TapContext | null): string[] {
   const args = ['--human']
   if (humanProof) args.push(`--human-proof=${humanProof}`)
+  if (!tap) return args
+  const uid = String(tap.uid ?? '').trim()
+  if (TAP_UID_RE.test(uid)) args.push(`--tap-uid=${uid}`)
+  const username = String(tap.username ?? '').trim().replace(/^@/, '')
+  if (TAP_USERNAME_RE.test(username)) args.push(`--tap-username=${username}`)
+  const messageId = String(tap.messageId ?? '').trim()
+  if (TAP_MSG_RE.test(messageId)) args.push(`--tap-msg=${messageId}`)
+  const relay = relayAgentName(tap.osUser)
+  if (RELAY_AGENT_RE.test(relay)) args.push(`--relay-agent=${relay}`)
   return args
 }
 
