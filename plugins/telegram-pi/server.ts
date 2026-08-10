@@ -1644,7 +1644,12 @@ bot.on('callback_query:data', async ctx => {
     // name in need_answered_by -- which the zero-human KPI counts as non-human.
     // --human-proof rides along only when the gate minted a nonce (hard gates do,
     // decisions do not), so an older CLI on the box never sees an unknown flag.
-    const extraArgs = tapEvidenceArgs(tnaProof)
+    const extraArgs = tapEvidenceArgs(tnaProof, {
+      uid: ctx.callbackQuery.from?.id,
+      username: ctx.callbackQuery.from?.username,
+      messageId: ctx.callbackQuery.message?.message_id,
+      osUser: process.env.USER,
+    })
     // DIVE-2623: run5dive() RESOLVES (never rejects) on a CLI refusal in --json
     // mode, unlike base's execFileP. Without this check an ok:false envelope
     // (e.g. a task_answer_closed_row refusal, DIVE-2228) fell through as if the

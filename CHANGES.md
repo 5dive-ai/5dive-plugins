@@ -1,3 +1,32 @@
+## Unreleased
+
+### Fixed — a channel-relayed tier-2 tap now NAMES the human who pressed it (DIVE-3178)
+
+Every channel-relayed tier-2 gate clear on the fleet recorded `unattributed:<agent>` —
+proven human and unattributable at the same time, which on inspection wears the exact
+costume of an agent self-clear. Measured in the wild 2026-08-10 on DIVE-3150: lodar
+tapped a tier-2 approval relayed through an agent's bot, `nonce_valid=1 enforce=on`, and
+the row came back `unattributed:marketing`. It held a merge and cost him two questions.
+
+The CLI was not the defect. DIVE-3128 shipped `--tap-uid` / `--tap-username` /
+`--tap-msg` / `--relay-agent` and v0.19.15 is installed and parsing them. **Nothing sent
+them.** So the CLI reached its human stamp holding only its own process identity — an
+agent name — correctly refused to write `human:<agent>`, and had nothing to put in its
+place. `tap_uid=none` in that audit line was the fix RECEIVING NOTHING.
+
+`tapEvidenceArgs()` now forwards the tap context off Telegram's `callback_query` — an id
+and a handle the relaying agent does not author — and the relay names ITSELF separately,
+so the carrier lands in `need_answered_relay` instead of being what the `human:` prefix
+attaches to. All six telegram bridges pass it. Fields are sanitised on the same grammars
+`cmd_agent_teambot.sh` already uses and DROPPED individually when malformed, so a bad
+field can neither reach a provenance column nor cost a good neighbour.
+
+The lesson is larger than the row: **a fix spanning two artifacts is not landed when its
+PR merges.** Two checks came back true — is the symbol on main, is it in the installed
+binary — and both were insufficient, because the half that PRODUCES the data lives in an
+artifact with its own release cadence. The question that works: what else has to ship for
+this to work, and does it release on the same clock?
+
 ## v0.5.42
 
 ### Fixed — one CLI-read budget instead of a per-call-site guess, so /account stops flapping on slow boxes (DIVE-3088)
