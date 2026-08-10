@@ -1163,7 +1163,7 @@ async function buildInboxList(): Promise<string> {
     return `Failed to load inbox: ${err instanceof Error ? err.message : String(err)}`
   }
   if (!j.ok || !Array.isArray(j.data?.inbox)) return '5dive returned unexpected output.'
-  const pending = j.data.inbox.filter((t: any) => t.need_type && !t.need_answer)
+  const pending = j.data.inbox.filter((t: any) => t.need_type && !t.need_answered_at && !t.need_answer) // DIVE-2041: answered is need_answered_at (an answered SECRET gate keeps need_answer NULL); banner.ts mirrors this
   if (pending.length === 0) {
     return 'No pending gates 🎉\n\nNothing needs a human right now. You\'re all caught up.'
   }
@@ -1725,6 +1725,51 @@ function writeBannerStore(store: Record<string, BannerState>): void {
 // backlog changes, unpin at zero — so a pending gate can never scroll out of
 // sight. Runs on a slow timer (below) in personal-bot/polled mode; 5dive-only
 // (the inbox verb is a 5dive surface). Never throws into the timer.
+// DIVE-2041 — SAY IT OUT LOUD WHEN THE BANNER IS SUPPRESSED FLEET-WIDE.
+//
+// The single-pinner rule (DIVE-1568) is: only the resolved org coordinator pins
+// the needs-you banner, and every other agent unpins any banner it left behind.
+// When `5dive task coordinator` resolves to '' — a multi-root chart with nobody
+// tagged — "every other agent" is ALL of them, so the else branch below runs
+// everywhere, the pin is removed from every paired DM, and the 60s timer
+// re-asserts that forever. That is exactly what DIVE-2031 was: 12 pending human
+// gates, not one banner anywhere, for days.
+//
+// Nothing said a word. Every component reported success, because from each
+// agent's point of view "I am not the coordinator, so I do not pin" is the
+// normal, correct path — the outage and the healthy case are the SAME code path
+// with a different fleet-wide precondition, which is why no local check could
+// have caught it. Same family as DIVE-1968 / DIVE-1927: the item is filed, the
+// filer believes it was surfaced, the human never sees it, and the no-op logs
+// nothing.
+//
+// Rate-limited to one line an hour, and the timestamp RESETS the moment a
+// coordinator resolves again, so a fresh outage is loud immediately instead of
+// waiting out a window from the last one. This log is the local witness; the
+// fleet-level one is `5dive doctor --category=channels`
+// (needs-banner-coordinator), which computes the resolution itself rather than
+// asking the bot — deliberately, because a bot that is down reports nothing at
+// all, and "down" is precisely the state we most need named.
+const COORDINATOR_MISS_LOG_INTERVAL_MS = 3_600_000
+let coordinatorMissLoggedAt = 0
+function noteCoordinatorSuppression(coordinator: string): void {
+  if (coordinator !== '') {
+    coordinatorMissLoggedAt = 0 // resolved again — next outage logs on its first tick
+    return
+  }
+  const now = Date.now()
+  if (coordinatorMissLoggedAt !== 0 && now - coordinatorMissLoggedAt < COORDINATOR_MISS_LOG_INTERVAL_MS) return
+  coordinatorMissLoggedAt = now
+  console.error(
+    '[needs-banner] SUPPRESSED FLEET-WIDE: `5dive task coordinator` resolved to nobody, ' +
+      'so no agent pins the needs-you banner and every paired DM has it unpinned — ' +
+      'pending human gates are invisible there until this is fixed. ' +
+      'Cause: the org chart has no agent tagged coordinator and more than one root. ' +
+      "Fix: `5dive org set <agent> --manager=<mgr>` to leave one root, or put 'coordinator' " +
+      "in one agent's role. Check: `5dive doctor --category=channels` (DIVE-2031/2041).",
+  )
+}
+
 let reconcilingBanner = false
 // DIVE-1568: the resolved org coordinator (5dive task coordinator, DIVE-333):
 // the sole role='coordinator', else the lone org root, else '' (ambiguous/no org
@@ -1750,6 +1795,7 @@ async function reconcileNeedsBanner(): Promise<void> {
     // banner it left behind. Empty/ambiguous org resolves to nobody (fail-quiet).
     const coordinator = await read5diveCoordinator()
     if (coordinator === null) return // lookup failed: do nothing, never flicker a live pin
+    noteCoordinatorSuppression(coordinator) // DIVE-2041: '' is an OUTAGE, not a quiet no-op
     const iAmCoordinator = coordinator !== '' && coordinator === agentName()
     let summary: NeedSummary
     if (iAmCoordinator) {

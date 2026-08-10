@@ -42,6 +42,28 @@ export type BannerAction =
 // Mirror buildInboxList's filter EXACTLY: a live gate needs a human iff it has a
 // need_type and has not been answered. Anything else (plain blocked tasks,
 // already-answered gates) must not inflate the banner count.
+//
+// DIVE-2041 — ANSWERED IS `need_answered_at`, NOT `need_answer`. The CLI and the
+// dashboard both key on need_answered_at (see gatereply.ts / tna.ts here, and
+// taskNeedsHuman() on the dashboard); this filter keyed on need_answer, the
+// answer TEXT. Those differ for a whole gate type: an answered SECRET gate keeps
+// need_answer NULL by design, because the value is the secret and is never
+// stored on the row. So a secret gate that a human HAS answered reads as still
+// pending to this predicate.
+//
+// It is harmless today only because the one caller feeds it `task inbox --json`,
+// whose SQL already excludes answered rows — i.e. the correctness lives in a
+// query two processes away, and the "mirror EXACTLY" contract above is the only
+// thing holding it. Any future caller handing this an unfiltered list (a `task
+// ls --all` payload, a cached inbox, a test fixture) silently over-counts, and
+// an over-counted banner is a pinned message asserting work that is already
+// done. Keyed on the CLI's own column, this module is correct on ANY list.
+//
+// need_answer stays in the disjunction as a belt-and-braces: withdraw NULLs
+// need_answer/at/by together (tna.ts), so the two can never disagree in the
+// direction that would over-count — the OR can only ever exclude MORE.
+// buildInboxList in server.ts is fixed the same way in this change, so the
+// mirror the comment claims is a mirror again rather than a shared defect.
 export function summarizeNeeds(inbox: unknown): NeedSummary {
   const rows = Array.isArray(inbox) ? inbox : []
   let count = 0
@@ -49,7 +71,7 @@ export function summarizeNeeds(inbox: unknown): NeedSummary {
   for (const t of rows) {
     if (!t || typeof t !== 'object') continue
     const row = t as Record<string, unknown>
-    if (!row.need_type || row.need_answer) continue
+    if (!row.need_type || row.need_answered_at || row.need_answer) continue
     count++
     const c = typeof row.created_at === 'string' ? row.created_at : null
     // Timestamps are fixed-width "YYYY-MM-DD HH:MM:SS", so lexical < is
