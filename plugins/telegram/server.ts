@@ -573,7 +573,7 @@ function writeBannerStore(store: Record<string, BannerState>): void {
 // — nobody pins). Returns null on a lookup error so the caller can skip the tick
 // rather than unpin a live banner on a transient blip.
 async function read5diveCoordinator(): Promise<string | null> {
-  const j = await read5diveJson(['task', 'coordinator', '--json'], 3000)
+  const j = await read5diveJson(['task', 'coordinator', '--json'])
   if (!j?.ok) return null
   return typeof j.data?.coordinator === 'string' ? j.data.coordinator : ''
 }
@@ -641,7 +641,7 @@ async function reconcileNeedsBanner(): Promise<void> {
     const iAmCoordinator = coordinator !== '' && coordinator === thisAgentName()
     let summary: NeedSummary
     if (iAmCoordinator) {
-      const j = await read5diveJson(['task', 'inbox', '--json'], 8000)
+      const j = await read5diveJson(['task', 'inbox', '--json'])
       // On a read error, do NOTHING — never unpin a live backlog on a transient blip.
       if (!j?.ok || !Array.isArray(j.data?.inbox)) return
       summary = summarizeNeeds(j.data.inbox)
@@ -1887,7 +1887,26 @@ type FiveDiveAgentEntry = {
 // success signal, so parse stdout regardless and only give up when there's no
 // valid JSON at all. (Mirrors the run5dive() helper the codex/grok/agy variants
 // already use — this brings the claude plugin to parity.)
-async function read5diveJson(args: string[], timeout: number): Promise<any | null> {
+//
+// DIVE-3088: the budget is now ONE number, not a per-call-site guess. Every
+// site used to name its own (3000 here, 5000 there, 8000 for `task inbox`)
+// picked by eye against whatever box the author was on. `/account` then flapped
+// with "Failed to list accounts" on slow VMs: `account list --json` measured
+// ~3.12s there against a 3000ms budget, and on timeout the child is killed
+// BEFORE it prints, so the DIVE-125 salvage-nonzero-exit path has an empty
+// stdout and nothing to salvage. Raising that one site would have fixed that
+// one box — measured on healthy hardware here, `agent list --json` (~2.07s,
+// three call sites, all on 3000) sits NEARER its budget than `account list`
+// (~1.58s), so on a box slower still it breaches first or alongside.
+//
+// So: 8000ms — already the house value for the heaviest reads — is the default
+// for every ordinary read. A call site names a budget only when it needs a
+// LARGER one (the auth flows, which wait on a remote device-code round-trip).
+// The cost of a generous budget falls only on the failure path; the cost of a
+// tight one falls on every user whose box is slower than the author's.
+const CLI_READ_MS = 8000
+
+async function read5diveJson(args: string[], timeout: number = CLI_READ_MS): Promise<any | null> {
   try {
     const { stdout } = await execFileP(SUDO, ['-n', '5dive', ...args], { timeout, maxBuffer: JSON_MAXBUFFER })
     return JSON.parse(stdout)
@@ -1913,12 +1932,12 @@ async function refreshModelAliases(): Promise<void> {
   // for hosts where the bare binary isn't on PATH for this uid.
   let data: unknown = null
   try {
-    const { stdout } = await execFileP(FIVEDIVE, ['models', '--json'], { timeout: 3000 })
+    const { stdout } = await execFileP(FIVEDIVE, ['models', '--json'], { timeout: CLI_READ_MS })
     const j = JSON.parse(stdout)
     if (j?.ok) data = j.data
   } catch { /* fall through to the sudo path */ }
   if (data == null) {
-    const j = await read5diveJson(['models', '--json'], 3000)
+    const j = await read5diveJson(['models', '--json'])
     if (!j?.ok) return
     data = j.data
   }
@@ -1926,14 +1945,14 @@ async function refreshModelAliases(): Promise<void> {
 }
 
 async function read5diveAgentList(): Promise<FiveDiveAgentEntry[] | null> {
-  const j = await read5diveJson(['agent', 'list', '--json'], 3000)
+  const j = await read5diveJson(['agent', 'list', '--json'])
   return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAgentEntry[]) : null
 }
 
 type FiveDiveAccountEntry = { name: string; types?: string[]; agents?: string[] }
 
 async function read5diveAccountList(): Promise<FiveDiveAccountEntry[] | null> {
-  const j = await read5diveJson(['account', 'list', '--json'], 3000)
+  const j = await read5diveJson(['account', 'list', '--json'])
   return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAccountEntry[]) : null
 }
 
@@ -1978,7 +1997,7 @@ type FiveDiveAccountUsage = {
 // failure (e.g. a CLI without the `usage` subcommand yet) so callers degrade
 // to "no usage" rather than erroring.
 async function read5diveAccountUsage(): Promise<FiveDiveAccountUsage[] | null> {
-  const j = await read5diveJson(['account', 'usage', '--json'], 5000)
+  const j = await read5diveJson(['account', 'usage', '--json'])
   return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAccountUsage[]) : null
 }
 
@@ -2007,7 +2026,7 @@ type FiveDiveUsageTask = {
 }
 type FiveDiveUsageBoard = { agents: FiveDiveUsageAgent[]; tasks: FiveDiveUsageTask[] }
 async function read5diveUsageBoard(): Promise<FiveDiveUsageBoard | null> {
-  const j = await read5diveJson(['usage', '--json'], 8000)
+  const j = await read5diveJson(['usage', '--json'])
   if (!j?.ok || !j.data || !Array.isArray(j.data.agents)) return null
   return {
     agents: j.data.agents as FiveDiveUsageAgent[],
@@ -2029,7 +2048,7 @@ type FiveDiveRotation = {
 // null on any failure (e.g. an older CLI without the `rotation` subcommand) so
 // the picker just hides the rotation row rather than erroring.
 async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
-  const j = await read5diveJson(['--json', 'agent', 'rotation', 'get', me], 3000)
+  const j = await read5diveJson(['--json', 'agent', 'rotation', 'get', me])
   return j?.ok && j.data ? (j.data as FiveDiveRotation) : null
 }
 
@@ -2623,7 +2642,7 @@ async function authStart(type: string): Promise<{ sessionId?: string; error?: st
   return { error: j?.error?.message ?? 'auth start failed' }
 }
 async function authPoll(sid: string): Promise<AuthState | null> {
-  const j = await read5diveJson(['agent', 'auth', 'poll', sid, '--json'], 8000)
+  const j = await read5diveJson(['agent', 'auth', 'poll', sid, '--json'])
   return j?.ok && j.data ? (j.data as AuthState) : null
 }
 async function authSubmit(sid: string, code: string): Promise<AuthState | null> {
@@ -2632,7 +2651,7 @@ async function authSubmit(sid: string, code: string): Promise<AuthState | null> 
   return j?.error ? { error: j.error.message } : null
 }
 async function authCancel(sid: string): Promise<void> {
-  await read5diveJson(['agent', 'auth', 'cancel', sid, '--json'], 5000)
+  await read5diveJson(['agent', 'auth', 'cancel', sid, '--json'])
 }
 
 // Poll `auth poll` on a backoff until `done` is satisfied, a terminal state is
@@ -2884,8 +2903,8 @@ const commandHandlers: Record<string, CommandHandler> = {
 
     // Run an optional mutation, then re-read status and report canonical state.
     const report = async (mutate: string[] | null): Promise<void> => {
-      if (mutate) await read5diveJson(['digest', ...mutate], 8000)
-      const st = stateFrom(await read5diveJson(['digest', 'status', '--json'], 5000))
+      if (mutate) await read5diveJson(['digest', ...mutate])
+      const st = stateFrom(await read5diveJson(['digest', 'status', '--json']))
       if (!st) {
         await ctx.reply(`Couldn't read digest state from the 5dive CLI — try again in a moment.`)
         return
@@ -2924,7 +2943,7 @@ const commandHandlers: Record<string, CommandHandler> = {
   // read-only: no nonce, no mutate (the founder-veto TAP is a separate authenticated
   // path, DIVE-1546). paired-5dive scope hides this on non-5dive hosts.
   council: async ctx => {
-    const j = await read5diveJson(['council', 'roster', '--json'], 5000)
+    const j = await read5diveJson(['council', 'roster', '--json'])
     if (!j) {
       await ctx.reply(`Couldn't read the Council from the 5dive CLI — try again in a moment.`)
       return
@@ -3187,7 +3206,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       try {
         // Exit-tolerant read (DIVE-125): a stray stderr warning can flip the
         // CLI's exit code even with a valid envelope on stdout — honor the data.
-        const j = await read5diveJson(['agent', 'list', '--json'], 3000)
+        const j = await read5diveJson(['agent', 'list', '--json'])
         if (!j || !j.ok || !Array.isArray(j.data)) {
           await ctx.reply(`5dive returned unexpected output.`)
           return
@@ -3395,7 +3414,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       await ctx.reply(`Can't determine this agent (not running as an agent-* user).`)
       return
     }
-    const agents = await read5diveJson(['agent', 'list', '--json'], 5000)
+    const agents = await read5diveJson(['agent', 'list', '--json'])
     const type = agentTypeOf(agents?.ok && Array.isArray(agents.data) ? agents.data : null, me)
     if (!type) {
       await ctx.reply(`Couldn't detect your coding-CLI type — try the dashboard or \`5dive agent auth\`.`)
@@ -4599,13 +4618,13 @@ bot.on('callback_query:data', async ctx => {
     let body: string
     try {
       if (data === 'cl:ver') {
-        const j = await read5diveJson(['council', 'verify', '--json'], 8000)
+        const j = await read5diveJson(['council', 'verify', '--json'])
         body = renderVerify(j?.data ?? j)
       } else if (data === 'cl:lin') {
-        const j = await read5diveJson(['council', 'lineage', 'ls', '--json'], 8000)
+        const j = await read5diveJson(['council', 'lineage', 'ls', '--json'])
         body = renderLineage((j?.data ?? j)?.entries)
       } else {
-        const j = await read5diveJson(['council', 'log', '--limit=5', '--json'], 8000)
+        const j = await read5diveJson(['council', 'log', '--limit=5', '--json'])
         body = renderLog((j?.data ?? j)?.entries)
       }
     } catch {
@@ -4879,7 +4898,7 @@ async function handleGateClearReply(text: string, senderId: string): Promise<str
   if (!(await read5diveVersion())) return null // 5dive-only surface; no-op on OSS hosts
   const args = ['task', 'clear-recs', `--channel-proof=${senderId}`, '--json']
   if (one) args.push(`--only=${one[1]}`)
-  const j = await read5diveJson(args, 8000)
+  const j = await read5diveJson(args)
   if (!j?.ok) {
     return one
       ? `Couldn't clear ${one[1]} — it may be a hard gate (money/destructive/secret/brand) that still needs a button tap, or already answered. Open it: /task_${String(one[1]).replace(/^DIVE-/, '')}`

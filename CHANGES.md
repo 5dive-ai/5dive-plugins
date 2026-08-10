@@ -1,5 +1,28 @@
 ## v0.5.42
 
+### Fixed — one CLI-read budget instead of a per-call-site guess, so /account stops flapping on slow boxes (DIVE-3088)
+
+`/account` intermittently rendered "Failed to list accounts". `read5diveJson` gave
+`account list --json` a 3000ms budget; on a slow VM that call measured ~3.12s, and on
+timeout the child is killed BEFORE it prints — so `e.stdout` is empty and the DIVE-125
+salvage-nonzero-exit path has nothing to salvage. Same error string as the bug DIVE-125
+fixed, different failure mode.
+
+Raising that one site would have fixed that one box. Measured on healthy hardware,
+`agent list --json` (~2.07s, three call sites, all on 3000ms) sits NEARER its budget than
+`account list --json` (~1.58s) — so on a box slower still, `agent list` breaches first or
+alongside and `/account` keeps flapping.
+
+The defect was the per-call-site number, not the value at any one site: 3000 here, 5000
+there, 8000 for `task inbox`, each picked by eye against whatever box the author was on.
+There is now a single `CLI_READ_MS = 8000` default — already the house value for the
+heaviest reads — and a call site names a budget only when it needs a LARGER one (the auth
+flows, which wait on a remote device-code round-trip). The cost of a generous budget falls
+only on the failure path; the cost of a tight one falls on every user with a slow box.
+
+The CLI-side fix that removes the ~3.1s itself ships separately (5dive-cli DIVE-3088:
+110 → 22 jq spawns in `account list`).
+
 ### Fixed — the needs-you banner said nothing while suppressing itself fleet-wide (DIVE-2041)
 
 `reconcileNeedsBanner` pins on ONE agent only, the resolved org coordinator (DIVE-1568);
