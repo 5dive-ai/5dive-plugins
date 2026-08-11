@@ -1065,11 +1065,45 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         // gates shell the DIVE-1499 send-verb for a nonce-buttoned digest. Falls
         // back to the read-only card list on OSS hosts / unregistered senders.
         // Plain text (no parse_mode) so the /task_N deep links stay tappable.
-        const view = await buildActionableInbox(String(ctx.from?.id ?? ''))
-        await bot.api.sendMessage(chat_id, view.text, {
-          ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
-          ...(view.keyboard ? { reply_markup: view.keyboard } : {}),
-        })
+        // DIVE-3279: one message per gate, sent in order. The FIRST pings and
+        // every one after it is silent (disable_notification), so N gates cost
+        // one buzz — the same trade DIVE-2712 made CLI-side. Sequential and
+        // awaited: Telegram does not guarantee ordering on concurrent sends, and
+        // an out-of-order stack is the mesh's unreadability back in another form.
+        // `reply_to` threads only the FIRST message; threading all N under one
+        // parent is noise.
+        const views = await buildActionableInbox(String(ctx.from?.id ?? ''))
+        // DIVE-3279 (main, at review): a send that throws must not abort the
+        // stack. Telegram 429s a burst, and an unguarded loop then delivers the
+        // first K gates and NO trailer — a partial inbox with nothing saying it
+        // is partial, which is the exact failure this command exists to prevent.
+        // It is a property of N, not of the render, so it only looks rare while
+        // the open set is small.
+        //
+        // Each send is caught and the run continues; a 429 names its own backoff
+        // in `parameters.retry_after`, honoured (bounded) so the REST of the
+        // stack lands instead of compounding the limit. The trailer is always
+        // last and always attempted, and reports what did not arrive — so a
+        // short stack is legible rather than silent.
+        let undelivered = 0
+        for (const [i, view] of views.entries()) {
+          const isTrailer = i === views.length - 1
+          let text = view.text
+          if (isTrailer && undelivered > 0) {
+            text += `\n\n⚠️ ${undelivered} gate message${undelivered === 1 ? '' : 's'} could not be delivered — re-run /inbox to see ${undelivered === 1 ? 'it' : 'them'}.`
+          }
+          try {
+            await bot.api.sendMessage(chat_id, text, {
+              ...(reply_to && i === 0 ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(view.keyboard ? { reply_markup: view.keyboard } : {}),
+              ...(i > 0 ? { disable_notification: true } : {}),
+            })
+          } catch (err) {
+            if (!isTrailer) undelivered++
+            const retryAfter = Number((err as any)?.parameters?.retry_after ?? 0)
+            if (retryAfter > 0 && retryAfter <= 30) await new Promise((r) => setTimeout(r, retryAfter * 1000))
+          }
+        }
         return true
       }
       case 'task': await md(await addTask(cmdArg, ctx.from?.username || 'telegram')); return true
@@ -1230,19 +1264,42 @@ async function buildInboxList(): Promise<string> {
 // host whose CLI predates DIVE-3224, `tier` is simply absent, which reads as 2 and
 // routes every gate through that nonce digest: fewer inline buttons, never a gate
 // the founder cannot reach.
+// DIVE-3279 (lodar, 2026-08-11: "need to post it one by one when i call /inbox -
+// not like a messy mesh list in one message"): this returns an ARRAY of messages —
+// ONE PER GATE — and the caller sends them in order. It used to return a single
+// {text, keyboard} built by clampList, so N gates arrived as one wall of cards with
+// one merged keyboard.
+//
+// This is the same fix DIVE-2712 made CLI-side in `_task_inbox_send`, which is why
+// the founder saw a mesh from /inbox and a clean stack from the hard-gate digest DM
+// in the SAME chat: the split only ever existed on the CLI's push path, never on
+// the plugin's pull path. The reasons carry over unchanged — a card per message is
+// readable at any N, and it makes the clear path correct BY CONSTRUCTION, since a
+// message that carries exactly one gate cannot lose another gate's button when its
+// own keyboard is retired (see the gclear handler, which no longer rebuilds).
+//
+// clampList is deliberately NOT used across gates any more: its job was to fit N
+// cards under Telegram's 4096 cap by DROPPING the overflow behind "(+N more)", so a
+// large inbox silently hid gates from the one view that exists to prevent exactly
+// that. One message per gate removes the cap pressure entirely; the only clamp left
+// is per-card, for a single pathological ask.
+//
+// THE COST IS THE PUSH COUNT, paid the same way DIVE-2712 paid it: the caller pings
+// on the first message and sends every one after it silently, so the founder gets
+// one buzz and a readable stack rather than N buzzes.
 async function buildActionableInbox(
   senderId: string,
-): Promise<{ text: string; keyboard?: InlineKeyboard }> {
+): Promise<{ text: string; keyboard?: InlineKeyboard }[]> {
   if (!senderId || !loadAccess().allowFrom.includes(senderId)) {
-    return { text: await buildInboxList() }
+    return [{ text: await buildInboxList() }]
   }
   let j: { ok: boolean; data?: any }
   try {
     j = await run5dive(['task', 'inbox', '--json'])
   } catch {
-    return { text: await buildInboxList() } // no 5dive on this host (OSS) — read-only fallback
+    return [{ text: await buildInboxList() }] // no 5dive on this host (OSS) — read-only fallback
   }
-  if (!j.ok || !Array.isArray(j.data?.inbox)) return { text: '5dive returned unexpected output.' }
+  if (!j.ok || !Array.isArray(j.data?.inbox)) return [{ text: '5dive returned unexpected output.' }]
   // NO filter here, deliberately (DIVE-3224). `inbox` is already exactly the open,
   // unanswered, non-terminal gates that are waiting on a HUMAN; anything added
   // here is a second copy of a rule the CLI owns.
@@ -1252,7 +1309,7 @@ async function buildActionableInbox(
     const quiet = routedElsewhere
       ? `\n\n${routedElsewhere} open gate${routedElsewhere === 1 ? ' is' : 's are'} routed to agent seats — not yours to answer.`
       : ''
-    return { text: "No pending gates 🎉\n\nNothing needs a human right now. You're all caught up." + quiet }
+    return [{ text: "No pending gates 🎉\n\nNothing needs a human right now. You're all caught up." + quiet }]
   }
   // An ABSENT or unparseable tier reads as 2, matching the CLI view's own
   // fail-safe: such a gate keeps its card and gets a nonce-buttoned tap via the
@@ -1263,20 +1320,30 @@ async function buildActionableInbox(
   }
   const soft = pending.filter((t: any) => tierOf(t) < 2 && !!t.recommend)
   const hardCount = pending.filter((t: any) => tierOf(t) >= 2).length
-  const cards = pending.map((t: any) => inboxCard(t) + '\n')
+  const softIds = new Set(soft.map((t: any) => String(t.id)))
 
-  // One ✅ button per tier<2 clearable gate, each on its own row so the ident +
-  // rec label stays readable. Routes as `gclear:<id>` (numeric task id).
-  let keyboard: InlineKeyboard | undefined
-  if (soft.length) {
-    keyboard = new InlineKeyboard()
-    soft.forEach((t: any, i: number) => {
+  // ONE MESSAGE PER GATE. Each carries its own card and, when that gate is the
+  // plugin-clearable kind (tier<2 WITH a rec), its own single ✅ button — so the
+  // button and the ask it answers can never be separated, and retiring one
+  // keyboard cannot touch another gate's. `gclear:<id>` is unchanged; what
+  // changed is that the callback now arrives from a message holding exactly one
+  // gate, which is what lets its handler stop rebuilding the whole view.
+  const messages: { text: string; keyboard?: InlineKeyboard }[] = pending.map((t: any, i: number) => {
+    let text = `🔔 Gate ${i + 1}/${pending.length} awaiting you:\n\n` + inboxCard(t)
+    // Per-CARD clamp only. Nothing is dropped for being the Nth gate any more —
+    // this bounds one pathological ask against Telegram's 4096 cap, and a gate
+    // whose text is truncated still keeps its /task_N link and its button.
+    if (text.length > 4000) text = text.slice(0, 3999) + '…'
+    if (softIds.has(String(t.id))) {
       const recLabel = String(t.recommend).replace(/\s+/g, ' ').trim()
       const recShort = recLabel.length > 24 ? recLabel.slice(0, 23) + '…' : recLabel
-      keyboard!.text(`✅ ${t.ident}: ${recShort}`, `gclear:${t.id}`)
-      if (i < soft.length - 1) keyboard!.row()
-    })
-  }
+      return {
+        text: text + '\n\nTap ✅ to apply the ⭐ recommendation and clear this gate.',
+        keyboard: new InlineKeyboard().text(`✅ ${t.ident}: ${recShort}`, `gclear:${t.id}`),
+      }
+    }
+    return { text }
+  })
 
   // tier-2 hard gates → DM the nonce-buttoned digest (only the CLI mints those).
   // Fire it ONLY when a hard gate is actually pending, so the common all-soft
@@ -1289,21 +1356,25 @@ async function buildActionableInbox(
         ? `\n\n🔒 ${hardCount} hard gate${hardCount === 1 ? '' : 's'} (money/secret/destructive/brand) sent as a tap-button digest DM above — approve/deny there.`
         : `\n\n🔒 ${hardCount} hard gate${hardCount === 1 ? '' : 's'} need a per-gate tap — see /tasks or the dashboard.`
   }
-  const header =
-    `🔔 ${pending.length} gate${pending.length === 1 ? '' : 's'} awaiting you.` +
-    (soft.length
-      ? ' Tap a ✅ below to apply its ⭐ recommendation and clear it in place.'
-      : ' Tap /task_N to open one.') +
-    '\n\n'
   // Counted, never listed: without this a filtered inbox is indistinguishable from
   // a fleet with no open gates, which is the same "an unnotified gate reads exactly
   // like a notified one" shape the CLI's own text render guards against.
   const routedNote = routedElsewhere
     ? `\n\n(${routedElsewhere} more open gate${routedElsewhere === 1 ? '' : 's'} routed to agent seats — not yours to answer.)`
     : ''
-  const footer =
-    '\n\nOr reply "go with recs" to clear every tier<2 gate at once. You can also act on the dashboard.'
-  return { text: clampList(header, cards, pending.length) + digestNote + routedNote + footer, keyboard }
+  // The trailer, as its own final message. These are statements about the SET —
+  // the hard-gate digest, the withheld count, the bulk-clear affordance — and
+  // hanging them off the last gate's card would make that one gate read as if they
+  // were about it. It is also the only message whose content survives a gate being
+  // cleared, so nothing here may be per-gate.
+  messages.push({
+    text:
+      `📋 ${pending.length} gate${pending.length === 1 ? '' : 's'} above.` +
+      digestNote +
+      routedNote +
+      '\n\nOr reply "go with recs" to clear every tier<2 gate at once. You can also act on the dashboard.',
+  })
+  return messages
 }
 
 // DIVE-1489 (propagated via DIVE-1504): actionable /inbox. The read-only card
@@ -1662,9 +1733,18 @@ bot.on('callback_query:data', async ctx => {
       )
       if (cj?.ok && Number(cj.data?.cleared ?? 0) > 0) {
         await ctx.answerCallbackQuery({ text: '✅ Applied your recommendation' }).catch(() => {})
-        const view = await buildActionableInbox(senderId)
+        // DIVE-3279: mark THIS message resolved and drop ITS keyboard — do not
+        // rebuild the inbox into it. Since the split, the message that carried
+        // this button holds exactly one gate, so editing it with the full
+        // rebuilt view would re-mesh every remaining gate into the message the
+        // founder just cleared — silently undoing the one-per-gate split on the
+        // very first tap, and taking the other gates' own messages out of sync
+        // with it. The remaining gates keep their own messages and their own
+        // live buttons; /inbox re-run is no longer needed to reach them, which
+        // is the DIVE-2712 property this path now inherits.
+        const prior = String((ctx.callbackQuery?.message as any)?.text ?? '')
         await ctx
-          .editMessageText(view.text, view.keyboard ? { reply_markup: view.keyboard } : undefined)
+          .editMessageText((prior ? prior + '\n\n' : '') + '✅ Cleared — your recommendation was applied.')
           .catch(() => {})
       } else {
         await ctx
