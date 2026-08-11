@@ -948,11 +948,33 @@ async function buildTaskList(): Promise<string> {
   const tasks = j.data.tasks
   if (tasks.length === 0) return 'No open tasks.\n\nAdd one with /task add <title>.'
   const MAX = 40
-  // Human-gated tasks (a pending need awaiting a person) float to their own
-  // "Needs you" section on top; `task ls` carries need_type only while the gate
-  // is unanswered, so its presence is a clean "needs a human" flag.
-  const needsYou = tasks.filter((t: any) => t.need_type)
-  const rest = tasks.filter((t: any) => !t.need_type)
+  // Gates actually waiting on a PERSON float to their own "Needs you" section on top.
+  //
+  // DIVE-3267: this used to read `t.need_type`, with a comment calling its presence
+  // "a clean needs-a-human flag". It is not: need_type present means HAS AN
+  // UNANSWERED GATE, and a gate routed to an agent seat is one of those. So "Needs
+  // you" listed every open gate in the fleet as an act-on-me row — the same defect
+  // DIVE-3224 fixed one command over in /inbox, still live here, and the false
+  // premise was written down above the line as its justification.
+  //
+  // `needs_human` is the CLI's OWN verdict on that question, computed from the one
+  // predicate in cmd_task_inbox. We partition on the answer; we do not rebuild the
+  // rule, and we must not — that copy is what produced both defects, and the rule
+  // has grown a clause since (DIVE-3228's routed-`access` case).
+  //
+  // FALLBACK, and note which way it fails. On a CLI predating DIVE-3267 the field is
+  // absent from every row, and we revert to the old `need_type` reading rather than
+  // treating "absent" as "not human" — which would EMPTY this section and hide the
+  // founder's own gates. Showing too much is recoverable; hiding a gate is the defect.
+  // The CLI guarantees the field is present and 0 (never omitted) on a non-human row,
+  // so absent-everywhere is an unambiguous version signal, not a per-row ambiguity.
+  //
+  // The SAME predicate, negated, feeds the other bucket: an agent-routed gate leaves
+  // "Needs you" and must land in "Open tasks" rather than falling out of both.
+  const hasVerdict = tasks.some((t: any) => t.needs_human !== undefined)
+  const needsHuman = (t: any) => (hasVerdict ? Number(t.needs_human) === 1 : !!t.need_type)
+  const needsYou = tasks.filter(needsHuman)
+  const rest = tasks.filter((t: any) => !needsHuman(t))
   const sections: string[] = []
   if (needsYou.length) {
     const lines = needsYou.map((t: any) => taskRow(t, true))

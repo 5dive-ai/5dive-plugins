@@ -1,5 +1,57 @@
 ## Unreleased
 
+### Fixed — /task's "Needs you" stops listing the whole fleet's gates (DIVE-3267)
+
+The other half of DIVE-3224, found by main while grading that merge. `/inbox` was one of
+two surfaces:
+
+    const needsYou = tasks.filter((t: any) => t.need_type)
+
+with a comment above it in five of the six forks calling that presence *"a clean 'needs a
+human' flag"*. It is not — `need_type` present means **has an unanswered gate**, and a
+gate routed to an agent seat is one of those. So "🔔 Needs you" listed every open gate in
+the fleet, rendered by `taskRow(t, true)` as act-on-me rows. lodar's complaint named
+`/inbox` because that is the command he typed; the same noise was one command over, and
+the false premise was written down above the line as the reason not to look.
+
+**The fix partitions on the CLI's own verdict.** 5dive-cli DIVE-3267 exports
+`needs_human` on `task ls --json` — the result of the single `human_gate` predicate in
+`cmd_task_inbox`, not its inputs. `/task` reads the answer; it does not rebuild the rule,
+and must not: that copy is what produced both defects, and the rule has grown a clause
+since (DIVE-3228's routed-`access` case).
+
+Deliberately **not** a second call to `task inbox --json` alongside the list call. Two
+calls are two snapshots with a window between them — a gate answered in that window lands
+a row in neither section or in both — and two round trips for one render.
+
+Two details that carry the change:
+
+- **The negated buckets moved with it.** `need_type` appeared three times in the base
+  fork's partition (once positive, twice negated, for "Your tasks" and "Open tasks").
+  Changing only the first would have dropped every agent-routed gate out of **all three**
+  sections — excluded from "Needs you" by the new predicate and from the others by the
+  old one — so a row belonging to an agent would have vanished from the board rather than
+  moving sections. A worse bug than the one being fixed, and invisible to any test that
+  only checks what "Needs you" now contains.
+- **The fallback fails toward showing too much.** On a CLI predating the export the field
+  is absent from every row, and the code reverts to the old `need_type` reading rather
+  than treating absent as "not human", which would empty the section and hide the
+  founder's own gates. The CLI guarantees the field is present and `0` (never omitted) on
+  a non-human row, so absent-everywhere is an unambiguous version signal.
+
+**SIX forks, not five** — `telegram-opencode` has no `/inbox` and no
+`buildActionableInbox`, so it was correctly outside DIVE-3224's scope and is inside this
+one. The counts differing is how the second surface was found: an over-broad grep for
+`filter((t: any) => t.need_type)` rather than the precise form DIVE-3224 changed. A grep
+scoped exactly to what you fixed cannot show you what you did not.
+
+New `test/task-needs-human.test.ts` (26 arms across the six forks), including an arm
+asserting the surviving `need_type` reads are all sourced from `j.data.inbox` — the CLI's
+human view — so they narrow within the human set and cannot readmit an agent-routed gate.
+Verified by positive control: reverting one fork's negated bucket to `!t.need_type` reds
+B1 and the cross-fork shape arm. Suite 658 pass / 0 fail; `generate.ts --check` byte-exact.
+Base plugin 0.5.45 -> **0.5.46**.
+
 ### Fixed — /inbox shows the founder HIS gates, not the whole fleet's (DIVE-3224)
 
 lodar, 2026-08-11: *"what about 14 gates awaiting you … this still spams my inbox every
