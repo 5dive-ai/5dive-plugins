@@ -1,5 +1,47 @@
 ## Unreleased
 
+### Fixed — /inbox shows the founder HIS gates, not the whole fleet's (DIVE-3224)
+
+lodar, 2026-08-11: *"what about 14 gates awaiting you … this still spams my inbox every
+time I press /inbox"*, minutes after *"im frustrated some tech asks still go to human
+instead of agent main"*. Two complaints, two separate defects, one symptom — this is the
+display half.
+
+Measured that morning: **12 gates listed, 3 of them his** (a CODEOWNER click, an npm
+token, customer comms). The other 9 were routed to agent seats — dev, dev2, dev3, cli,
+main2, quinn — and **each rendered a ✅ apply-the-recommendation button**. So the
+surface was not merely noisy: it invited him to answer questions already addressed to
+somebody else. DIVE-2093's gate was routed to main2 and still appeared, tappable.
+
+`buildActionableInbox` shelled `5dive task ls --json` and kept every row carrying a
+`need_type` — that is "has an unanswered gate", **not "needs a human"**. The CLI has
+owned the difference since DIVE-3117 (a gate with `routed_reviewer` waits on an agent
+seat) and grew a fourth clause in DIVE-3228 (a routed `access` gate its lead can now
+clear). This plugin never called it; it kept its own copy, and the copy predated both.
+
+The old comment is honest about why, and the reason was real: `task inbox --json` —
+the view that applies that predicate — did not expose `tier`, which the ✅ button needs
+to tell a soft gate from a hard one. CLI DIVE-3224 adds that one field, so `/inbox` now
+reads `task inbox --json` and **the local filter is deleted rather than corrected**. A
+second copy of a routing rule is what produced this bug.
+
+Two smaller changes fall out of the new source:
+
+- **An absent or unparseable `tier` now reads as 2**, matching the CLI view's own
+  fail-safe. Such a gate keeps its card and gets a nonce-buttoned tap through the
+  `inbox --send` digest instead of a plugin-minted ✅ it has not proved it may have.
+  This is also what happens on a host whose CLI predates the `tier` export: every gate
+  routes through the digest — fewer inline buttons, never an unreachable gate.
+- **The withheld gates are counted, never listed** (`routed_elsewhere`, mirroring the
+  CLI's own text render). Without it a filtered inbox and a fleet with no open gates
+  read identically, which is the failure mode this bridge has been burned by before.
+
+Applied to all five lineages (telegram, grok, agy, codex, pi); `generate.ts --check`
+byte-exact. New `test/inbox-source.test.ts` locks the source and the fail-safe per
+fork — server.ts long-polls on import, so this grades the text, in the style of
+parity.test.ts. Base plugin 0.5.44 → **0.5.45** (claude agents load a versioned
+marketplace cache; a fork edit deploys on restart).
+
 ### Fixed — the ✅ Done / 🚫 Cancel taps close the row again (DIVE-3206)
 
 Reported 2026-08-11: tapping ⚠️ Confirm cancel on a `/task_<id>` card answered
