@@ -1457,8 +1457,16 @@ async function buildInboxList(): Promise<string> {
 // --- /inbox (DIVE-1572): ACTIONABLE gate inbox — tap buttons inline ---
 // The DIVE-1568 needs-you banner points the founder at /inbox, so the buttons
 // must live IN the /inbox reply, not only in a separate digest DM (lodar's
-// DIVE-1525 complaint). Sourced from `task ls --json` — which exposes `tier` +
-// `recommend` (the `task inbox --json` view does NOT). A tier<2 gate WITH a
+// DIVE-1525 complaint). Sourced from `task inbox --json` — the CLI's own "waiting
+// on a HUMAN" view, which since DIVE-3224 also exposes `tier` beside `recommend`.
+// It used to read `task ls --json` and re-derive the human/agent split here,
+// because this view withheld `tier`; that copy of the rule filtered on `need_type`
+// alone — "has an unanswered gate", not "needs a human" — and lodar's /inbox
+// listed 12 gates of which 3 were his, the other 9 routed to agent seats and each
+// carrying a ✅ button on a question addressed to somebody else (DIVE-3224). Do
+// not rebuild that predicate here again: it lives in `cmd_task_inbox`, it has
+// grown a fourth clause since (DIVE-3228's routed-`access` case), and a second
+// copy would have missed it silently. A tier<2 gate WITH a
 // recommendation is plugin-clearable: render a one-tap `✅ <ident>: <rec>` button
 // that applies the rec in place via the DIVE-1305 `clear-recs --channel-proof`
 // rail (the allowFrom-vetted sender id IS the human proof — an agent can't forge
@@ -1466,7 +1474,10 @@ async function buildInboxList(): Promise<string> {
 // gates (money/secret/destructive/brand) can't be button-minted in-plugin (the
 // nonce isn't derivable — the DIVE-950 hole), so we shell the DIVE-1499 `task
 // inbox --send` verb to DM a nonce-buttoned digest for those and note it inline.
-// Falls back to the read-only list on OSS hosts / unregistered senders.
+// Falls back to the read-only list on OSS hosts / unregistered senders — and on a
+// host whose CLI predates DIVE-3224, `tier` is simply absent, which reads as 2 and
+// routes every gate through that nonce digest: fewer inline buttons, never a gate
+// the founder cannot reach.
 async function buildActionableInbox(
   senderId: string,
 ): Promise<{ text: string; keyboard?: InlineKeyboard }> {
@@ -1475,26 +1486,31 @@ async function buildActionableInbox(
   }
   let j: { ok: boolean; data?: any }
   try {
-    j = await run5dive(['task', 'ls', '--json'])
+    j = await run5dive(['task', 'inbox', '--json'])
   } catch {
     return { text: await buildInboxList() } // no 5dive on this host (OSS) — read-only fallback
   }
-  if (!j.ok || !Array.isArray(j.data?.tasks)) return { text: '5dive returned unexpected output.' }
-  // `task ls` carries need_type only while a gate is unanswered, so its presence
-  // is a clean pending-gate flag (mirrors the /tasks "Needs you" section).
-  const pending = j.data.tasks.filter((t: any) => t.need_type)
+  if (!j.ok || !Array.isArray(j.data?.inbox)) return { text: '5dive returned unexpected output.' }
+  // NO filter here, deliberately (DIVE-3224). `inbox` is already exactly the open,
+  // unanswered, non-terminal gates that are waiting on a HUMAN; anything added
+  // here is a second copy of a rule the CLI owns.
+  const pending = j.data.inbox
+  const routedElsewhere = Number(j.data?.routed_elsewhere ?? 0) || 0
   if (pending.length === 0) {
-    return { text: "No pending gates 🎉\n\nNothing needs a human right now. You're all caught up." }
+    const quiet = routedElsewhere
+      ? `\n\n${routedElsewhere} open gate${routedElsewhere === 1 ? ' is' : 's are'} routed to agent seats — not yours to answer.`
+      : ''
+    return { text: "No pending gates 🎉\n\nNothing needs a human right now. You're all caught up." + quiet }
   }
-  const tierOf = (t: any) => Number.parseInt(String(t.tier ?? ''), 10)
-  const soft = pending.filter((t: any) => {
-    const tr = tierOf(t)
-    return Number.isFinite(tr) && tr < 2 && !!t.recommend
-  })
-  const hardCount = pending.filter((t: any) => {
-    const tr = tierOf(t)
-    return Number.isFinite(tr) && tr >= 2
-  }).length
+  // An ABSENT or unparseable tier reads as 2, matching the CLI view's own
+  // fail-safe: such a gate keeps its card and gets a nonce-buttoned tap via the
+  // digest below, rather than a plugin-minted ✅ it has not proved it may have.
+  const tierOf = (t: any) => {
+    const tr = Number.parseInt(String(t.tier ?? ''), 10)
+    return Number.isFinite(tr) ? tr : 2
+  }
+  const soft = pending.filter((t: any) => tierOf(t) < 2 && !!t.recommend)
+  const hardCount = pending.filter((t: any) => tierOf(t) >= 2).length
   const cards = pending.map((t: any) => inboxCard(t) + '\n')
 
   // One ✅ button per tier<2 clearable gate, each on its own row so the ident +
@@ -1527,9 +1543,15 @@ async function buildActionableInbox(
       ? ' Tap a ✅ below to apply its ⭐ recommendation and clear it in place.'
       : ' Tap /task_N to open one.') +
     '\n\n'
+  // Counted, never listed: without this a filtered inbox is indistinguishable from
+  // a fleet with no open gates, which is the same "an unnotified gate reads exactly
+  // like a notified one" shape the CLI's own text render guards against.
+  const routedNote = routedElsewhere
+    ? `\n\n(${routedElsewhere} more open gate${routedElsewhere === 1 ? '' : 's'} routed to agent seats — not yours to answer.)`
+    : ''
   const footer =
     '\n\nOr reply "go with recs" to clear every tier<2 gate at once. You can also act on the dashboard.'
-  return { text: clampList(header, cards, pending.length) + digestNote + footer, keyboard }
+  return { text: clampList(header, cards, pending.length) + digestNote + routedNote + footer, keyboard }
 }
 
 // DIVE-1489 (propagated via DIVE-1504): actionable /inbox. The read-only card
