@@ -1391,9 +1391,28 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
               ...(i > 0 ? { disable_notification: true } : {}),
             })
           } catch (err) {
-            if (!isTrailer) undelivered++
             const retryAfter = Number((err as any)?.parameters?.retry_after ?? 0)
-            if (retryAfter > 0 && retryAfter <= 30) await new Promise((r) => setTimeout(r, retryAfter * 1000))
+            const backoffMs = retryAfter > 0 && retryAfter <= 30 ? retryAfter * 1000 : 0
+            if (backoffMs) await new Promise((r) => setTimeout(r, backoffMs))
+            // DIVE-3279 (main, on the residual's own residual): the TRAILER is the
+            // one message that reports the others, so losing it silently puts us
+            // straight back in the original failure mode — a partial inbox with no
+            // tell — just narrowed to a single message. Every other gate is counted
+            // and reported by it; nothing counts IT. So it alone gets one bounded
+            // retry, after its own retry_after. Still no retry for a gate message:
+            // re-sending into a limit you just hit is the worse trade, and the
+            // trailer names what is missing anyway.
+            if (isTrailer) {
+              try {
+                await bot.api.sendMessage(chat_id, text, {
+                  ...(i > 0 ? { disable_notification: true } : {}),
+                })
+              } catch {
+                /* give up: one bounded retry, then stop rather than spin on the limit */
+              }
+            } else {
+              undelivered++
+            }
           }
         }
         return true
