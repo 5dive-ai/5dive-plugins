@@ -116,11 +116,24 @@ describe.each(LINEAGES)('DIVE-3279 the split is not undone downstream (%s)', (fo
   // it is locked here rather than left to be noticed once the open set grows.
   test('a failed send does not abort the stack, and the trailer reports what was lost', () => {
     expect(src).toContain('let undelivered = 0')
-    expect(src).toContain('if (!isTrailer) undelivered++')
+    expect(src).toContain('undelivered++')
     expect(src).toContain('could not be delivered — re-run /inbox')
     // A 429 carries its own backoff; ignoring it just compounds the limit for
     // every remaining gate in the stack.
     expect(src).toContain("Number((err as any)?.parameters?.retry_after ?? 0)")
+  })
+
+  // Main, on the residual's own residual: every gate message is counted and
+  // reported by the trailer, and NOTHING counts the trailer. A 429 on it alone
+  // restores the original failure mode — a partial inbox with no tell — narrowed
+  // to one message. It is the only message that gets a retry, and deliberately so:
+  // re-sending a gate message into a limit you just hit is the worse trade.
+  test('the trailer — the message that reports the others — gets one bounded retry', () => {
+    expect(src).toContain('if (isTrailer) {')
+    expect(src).toContain('one bounded retry, then stop rather than spin on the limit')
+    // The shape that would silently drop it: counting non-trailers and doing
+    // nothing whatsoever for the trailer's own failure.
+    expect(src).not.toContain('if (!isTrailer) undelivered++\n')
   })
 })
 
@@ -136,7 +149,7 @@ test('DIVE-3279 every lineage got the same patch (no fork left behind)', () => {
       fn.includes('messages.push('),
       src.includes('for (const [i, view] of views.entries())'),
       src.includes('✅ Cleared — your recommendation was applied.'),
-      src.includes('if (!isTrailer) undelivered++'),
+      src.includes('one bounded retry, then stop rather than spin on the limit'),
     ].join('/')
   })
   expect(new Set(shapes).size).toBe(1)
