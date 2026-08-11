@@ -1,5 +1,35 @@
 ## Unreleased
 
+### Fixed — the ✅ Done / 🚫 Cancel taps close the row again (DIVE-3206)
+
+Reported 2026-08-11: tapping ⚠️ Confirm cancel on a `/task_<id>` card answered
+"Couldn't cancel — open the dashboard." The dashboard was never the problem. Both taps
+ran `5dive task done|cancel <id>` with **no `--result`**, and the CLI refuses a first
+close that would leave the result column permanently blank (DIVE-2773) — a refusal that
+says in its own text "No flag bypasses this". Every tap on every bridge had been failing.
+
+Two defects, not one, and the second is the worse:
+
+- **The baseline swallowed the reason.** A bare `catch` replaced the CLI's exact refusal
+  with a generic line naming neither the cause nor the fix, and pointing at a surface
+  that was working. `tapFailText()` now surfaces the refusal itself, clamped to
+  Telegram's 200-char callback answer.
+- **The forks reported a success that never happened.** `run5dive()` RESOLVES rather
+  than rejects on a `--json` refusal (DIVE-2623), so `await run5dive([...])` inside a
+  `try` never reached its `catch`: the tap said "✅ Marked done" while the row stayed
+  open. The forks now read `.ok` and throw on a refusal. A try/catch around a call that
+  cannot throw is not error handling, it only looks like it.
+
+The reason a tap writes is not manufactured. A button has no text field, so `tapResult()`
+records exactly what the tap establishes — a verified human closed this from the task
+detail view, attributed to their Telegram id (DIVE-3178) — and states plainly that no
+detail was captured. It is deliberately not `n/a`, which the CLI's own refusal text calls
+out as the string that satisfies a non-empty check while recording nothing.
+
+`test/task-tap-close-reason.test.ts` is the tripwire: it fails against the pre-fix source
+(verified, not assumed) on all four claims, including that no bridge re-introduces the
+placeholder reason or the bare dashboard nudge.
+
 ### Fixed — a channel-relayed tier-2 tap now NAMES the human who pressed it (DIVE-3178)
 
 Every channel-relayed tier-2 gate clear on the fleet recorded `unattributed:<agent>` —

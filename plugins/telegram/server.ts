@@ -3975,6 +3975,37 @@ for (const def of COMMAND_REGISTRY) {
 // no higher a bar than the sudo it already had. The verified-human tap now clears
 // via the per-gate --human-proof nonce (form a) carried in the callback_data.
 
+// DIVE-3206: the ✅ Done / ⚠️ Confirm cancel taps ran `5dive task done|cancel <id>`
+// with NO --result, and the CLI refuses a first close that would leave the result
+// column permanently blank (DIVE-2773 close-without-reason, and no flag bypasses
+// it). So every tap failed, and the handler's bare `catch` reported the generic
+// "open the dashboard" line — which named neither the cause nor the fix, and sent
+// the human to a surface that was never the problem.
+//
+// A tap has no text field, so the honest reason is not a manufactured one: it says
+// what the tap actually establishes (a verified human closed this from the task
+// view, attributed to their Telegram id per DIVE-3178) and states plainly that no
+// detail was captured. That is what the refusal asks for — the shape of a real
+// reason — and it is deliberately NOT "n/a", which the CLI calls out by name.
+function tapResult(verb: 'done' | 'cancel', taskId: string, senderId: string): string {
+  const how = `by a verified human tap in Telegram (sender ${senderId}) on the /task_${taskId} detail view`
+  return verb === 'cancel'
+    ? `Cancelled ${how}. Nothing here was concluded — the row was dropped, not finished, and the tap carries no text field so no further reason was captured. If the why matters, it has to be added to this row by hand.`
+    : `Closed ${how}. No detail was captured — the tap carries no text field — so this row records only that a human judged it complete; look at the work itself, not at this field.`
+}
+
+// A failed tap must say WHICH refusal fired. The CLI writes its reason to stderr
+// (policy_refuse), so surface its first line instead of swallowing it; Telegram
+// caps a callback answer at 200 chars, hence the clamp.
+function tapFailText(prefix: string, e: unknown): string {
+  const raw = String((e as { stderr?: string })?.stderr ?? (e as Error)?.message ?? '')
+  const line = raw.split('\n').map(s => s.trim()).filter(Boolean).find(s => s.length > 0) ?? ''
+  const detail = line.replace(/^error:\s*/i, '')
+  if (!detail) return `${prefix} — open the dashboard.`
+  const room = 200 - prefix.length - 3
+  return `${prefix} — ${detail.length > room ? detail.slice(0, room - 1) + '…' : detail}`
+}
+
 // Inline-button handler. Routes:
 //   perm:allow|deny|more:<id>  → permission flow (declared upstream)
 //   model:<alias>              → /model picker
@@ -4278,11 +4309,11 @@ bot.on('callback_query:data', async ctx => {
   if (tdM) {
     const taskId = tdM[1]!
     try {
-      await execFileP(SUDO, ['-n', '5dive', 'task', 'done', taskId], { timeout: 8000 })
+      await execFileP(SUDO, ['-n', '5dive', 'task', 'done', taskId, `--result=${tapResult('done', taskId, senderId)}`], { timeout: 8000 })
       await ctx.answerCallbackQuery({ text: '✅ Marked done' }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
-    } catch {
-      await ctx.answerCallbackQuery({ text: "Couldn't mark done — open the dashboard." }).catch(() => {})
+    } catch (e) {
+      await ctx.answerCallbackQuery({ text: tapFailText("Couldn't mark done", e) }).catch(() => {})
     }
     return
   }
@@ -4303,11 +4334,11 @@ bot.on('callback_query:data', async ctx => {
   if (tccM) {
     const taskId = tccM[1]!
     try {
-      await execFileP(SUDO, ['-n', '5dive', 'task', 'cancel', taskId], { timeout: 8000 })
+      await execFileP(SUDO, ['-n', '5dive', 'task', 'cancel', taskId, `--result=${tapResult('cancel', taskId, senderId)}`], { timeout: 8000 })
       await ctx.answerCallbackQuery({ text: '🚫 Cancelled' }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
-    } catch {
-      await ctx.answerCallbackQuery({ text: "Couldn't cancel — open the dashboard." }).catch(() => {})
+    } catch (e) {
+      await ctx.answerCallbackQuery({ text: tapFailText("Couldn't cancel", e) }).catch(() => {})
     }
     return
   }

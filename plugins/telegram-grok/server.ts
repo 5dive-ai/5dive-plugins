@@ -1727,6 +1727,37 @@ function rememberOptions(message_id: number, labels: string[]): void {
   optionLabelsByMsg.set(message_id, labels)
 }
 
+// DIVE-3206: the ✅ Done / ⚠️ Confirm cancel taps ran `5dive task done|cancel <id>`
+// with NO --result, and the CLI refuses a first close that would leave the result
+// column permanently blank (DIVE-2773 close-without-reason, and no flag bypasses
+// it). So every tap failed — and in --json mode run5dive RESOLVES on a refusal
+// (DIVE-2623), so the fork did not even reach its catch: it reported "✅ Marked
+// done" for a close that never happened.
+//
+// A tap has no text field, so the honest reason is not a manufactured one: it says
+// what the tap actually establishes (a verified human closed this from the task
+// view, attributed to their Telegram id per DIVE-3178) and states plainly that no
+// detail was captured. That is what the refusal asks for — the shape of a real
+// reason — and it is deliberately NOT "n/a", which the CLI calls out by name.
+function tapResult(verb: 'done' | 'cancel', taskId: string, senderId: string): string {
+  const how = `by a verified human tap in Telegram (sender ${senderId}) on the /task_${taskId} detail view`
+  return verb === 'cancel'
+    ? `Cancelled ${how}. Nothing here was concluded — the row was dropped, not finished, and the tap carries no text field so no further reason was captured. If the why matters, it has to be added to this row by hand.`
+    : `Closed ${how}. No detail was captured — the tap carries no text field — so this row records only that a human judged it complete; look at the work itself, not at this field.`
+}
+
+// A failed tap must say WHICH refusal fired, not send the human to a surface that
+// was never the problem. Telegram caps a callback answer at 200 chars, hence the
+// clamp.
+function tapFailText(prefix: string, e: unknown): string {
+  const raw = String((e as { stderr?: string })?.stderr ?? (e as Error)?.message ?? '')
+  const line = raw.split('\n').map(s => s.trim()).filter(Boolean).find(s => s.length > 0) ?? ''
+  const detail = line.replace(/^error:\s*/i, '')
+  if (!detail) return `${prefix} — open the dashboard.`
+  const room = 200 - prefix.length - 3
+  return `${prefix} — ${detail.length > room ? detail.slice(0, room - 1) + '…' : detail}`
+}
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data ?? ''
   const senderId = String(ctx.from?.id ?? '')
@@ -1858,11 +1889,12 @@ bot.on('callback_query:data', async ctx => {
   if (tdM) {
     const taskId = tdM[1]!
     try {
-      await run5dive(['task', 'done', taskId, '--json'], 8000)
+      const r = await run5dive(['task', 'done', taskId, '--json', `--result=${tapResult('done', taskId, senderId)}`], 8000)
+      if (!r.ok) throw new Error(r.error?.message ?? 'the CLI refused the close')
       await ctx.answerCallbackQuery({ text: '✅ Marked done' }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
-    } catch {
-      await ctx.answerCallbackQuery({ text: "Couldn't mark done — open the dashboard." }).catch(() => {})
+    } catch (e) {
+      await ctx.answerCallbackQuery({ text: tapFailText("Couldn't mark done", e) }).catch(() => {})
     }
     return
   }
@@ -1883,11 +1915,12 @@ bot.on('callback_query:data', async ctx => {
   if (tccM) {
     const taskId = tccM[1]!
     try {
-      await run5dive(['task', 'cancel', taskId, '--json'], 8000)
+      const r = await run5dive(['task', 'cancel', taskId, '--json', `--result=${tapResult('cancel', taskId, senderId)}`], 8000)
+      if (!r.ok) throw new Error(r.error?.message ?? 'the CLI refused the cancel')
       await ctx.answerCallbackQuery({ text: '🚫 Cancelled' }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
-    } catch {
-      await ctx.answerCallbackQuery({ text: "Couldn't cancel — open the dashboard." }).catch(() => {})
+    } catch (e) {
+      await ctx.answerCallbackQuery({ text: tapFailText("Couldn't cancel", e) }).catch(() => {})
     }
     return
   }
