@@ -107,6 +107,21 @@ describe.each(LINEAGES)('DIVE-3279 the split is not undone downstream (%s)', (fo
     // The pre-fix single send, which would now only ever deliver message[0].
     expect(src).not.toContain('await ctx.reply(view.text, view.keyboard ?')
   })
+
+  // Raised by main at review of 65975db: with one message per gate the send is a
+  // BURST, and an unguarded loop that throws on any one of them delivers the
+  // first K gates and no trailer. A partial inbox that does not say it is partial
+  // is the failure this whole command exists to prevent, and the trailer's
+  // absence is the only tell. A property of N, not of the render — which is why
+  // it is locked here rather than left to be noticed once the open set grows.
+  test('a failed send does not abort the stack, and the trailer reports what was lost', () => {
+    expect(src).toContain('let undelivered = 0')
+    expect(src).toContain('if (!isTrailer) undelivered++')
+    expect(src).toContain('could not be delivered — re-run /inbox')
+    // A 429 carries its own backoff; ignoring it just compounds the limit for
+    // every remaining gate in the stack.
+    expect(src).toContain("Number((err as any)?.parameters?.retry_after ?? 0)")
+  })
 })
 
 test('DIVE-3279 every lineage got the same patch (no fork left behind)', () => {
@@ -121,8 +136,9 @@ test('DIVE-3279 every lineage got the same patch (no fork left behind)', () => {
       fn.includes('messages.push('),
       src.includes('for (const [i, view] of views.entries())'),
       src.includes('✅ Cleared — your recommendation was applied.'),
+      src.includes('if (!isTrailer) undelivered++'),
     ].join('/')
   })
   expect(new Set(shapes).size).toBe(1)
-  expect(shapes[0]).toBe('true/true/true/true/true/true/true')
+  expect(shapes[0]).toBe('true/true/true/true/true/true/true/true')
 })

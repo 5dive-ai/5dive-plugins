@@ -1073,12 +1073,36 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         // `reply_to` threads only the FIRST message; threading all N under one
         // parent is noise.
         const views = await buildActionableInbox(String(ctx.from?.id ?? ''))
+        // DIVE-3279 (main, at review): a send that throws must not abort the
+        // stack. Telegram 429s a burst, and an unguarded loop then delivers the
+        // first K gates and NO trailer — a partial inbox with nothing saying it
+        // is partial, which is the exact failure this command exists to prevent.
+        // It is a property of N, not of the render, so it only looks rare while
+        // the open set is small.
+        //
+        // Each send is caught and the run continues; a 429 names its own backoff
+        // in `parameters.retry_after`, honoured (bounded) so the REST of the
+        // stack lands instead of compounding the limit. The trailer is always
+        // last and always attempted, and reports what did not arrive — so a
+        // short stack is legible rather than silent.
+        let undelivered = 0
         for (const [i, view] of views.entries()) {
-          await bot.api.sendMessage(chat_id, view.text, {
-            ...(reply_to && i === 0 ? { reply_parameters: { message_id: reply_to } } : {}),
-            ...(view.keyboard ? { reply_markup: view.keyboard } : {}),
-            ...(i > 0 ? { disable_notification: true } : {}),
-          })
+          const isTrailer = i === views.length - 1
+          let text = view.text
+          if (isTrailer && undelivered > 0) {
+            text += `\n\n⚠️ ${undelivered} gate message${undelivered === 1 ? '' : 's'} could not be delivered — re-run /inbox to see ${undelivered === 1 ? 'it' : 'them'}.`
+          }
+          try {
+            await bot.api.sendMessage(chat_id, text, {
+              ...(reply_to && i === 0 ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(view.keyboard ? { reply_markup: view.keyboard } : {}),
+              ...(i > 0 ? { disable_notification: true } : {}),
+            })
+          } catch (err) {
+            if (!isTrailer) undelivered++
+            const retryAfter = Number((err as any)?.parameters?.retry_after ?? 0)
+            if (retryAfter > 0 && retryAfter <= 30) await new Promise((r) => setTimeout(r, retryAfter * 1000))
+          }
         }
         return true
       }
