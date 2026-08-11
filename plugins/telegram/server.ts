@@ -3698,16 +3698,39 @@ async function buildTaskList(): Promise<string> {
   //   1. "Your tasks" — the CALLING agent's own actionable (unblocked, non-gated)
   //      rows, pinned first so an agent sees its own queue instead of hunting for
   //      it in the full list (Mark: main's queued tasks were lost mid-list).
-  //   2. "Needs you" — human-gated tasks (a pending need awaiting a person).
-  //      `task ls` carries need_type only while the gate is unanswered, so its
-  //      presence is a clean "needs a human" flag.
+  //   2. "Needs you" — gates actually waiting on a PERSON.
   //   3. "Open tasks" — everything else (incl. this agent's blocked rows).
-  const needsYou = tasks.filter((t: any) => t.need_type)
+  //
+  // DIVE-3267: this used to read `t.need_type`, with a comment calling its presence
+  // "a clean needs-a-human flag". It is not: need_type present means HAS AN
+  // UNANSWERED GATE, and a gate routed to an agent seat is one of those. So "Needs
+  // you" listed every open gate in the fleet as an act-on-me row — the same defect
+  // DIVE-3224 fixed one command over in /inbox, still live here, and the false
+  // premise was written down above the line as its justification.
+  //
+  // `needs_human` is the CLI's OWN verdict on that question, computed from the one
+  // predicate in cmd_task_inbox. We partition on the answer; we do not rebuild the
+  // rule, and we must not — that copy is what produced both defects, and the rule
+  // has grown a clause since (DIVE-3228's routed-`access` case).
+  //
+  // FALLBACK, and note which way it fails. On a CLI predating DIVE-3267 the field is
+  // absent from every row, and we revert to the old `need_type` reading rather than
+  // treating "absent" as "not human" — which would EMPTY this section and hide the
+  // founder's own gates. Showing too much is recoverable; hiding a gate is the defect.
+  // The CLI guarantees the field is present and 0 (never omitted) on a non-human row,
+  // so absent-everywhere is an unambiguous version signal, not a per-row ambiguity.
+  const hasVerdict = tasks.some((t: any) => t.needs_human !== undefined)
+  const needsHuman = (t: any) => (hasVerdict ? Number(t.needs_human) === 1 : !!t.need_type)
+  const needsYou = tasks.filter(needsHuman)
+  // The SAME predicate negated, in both other buckets. Flipping only the first would
+  // drop an agent-routed gate out of all three — it is excluded from "Needs you" and
+  // was already excluded from these two by `!t.need_type` — and a row that belongs to
+  // an agent would silently disappear from the board instead of moving sections.
   const mine = tasks.filter(
-    (t: any) => !t.need_type && taskAssignedToMe(t.assignee) && t.status !== 'blocked',
+    (t: any) => !needsHuman(t) && taskAssignedToMe(t.assignee) && t.status !== 'blocked',
   )
   const mineIds = new Set(mine.map((t: any) => t.id))
-  const rest = tasks.filter((t: any) => !t.need_type && !mineIds.has(t.id))
+  const rest = tasks.filter((t: any) => !needsHuman(t) && !mineIds.has(t.id))
   const sections: string[] = []
   if (mine.length) {
     const lines = mine.map((t: any) => taskRow(t))
