@@ -1,5 +1,41 @@
 ## Unreleased
 
+### Fixed — /inbox posts one message per gate, not one mesh (DIVE-3279), release 0.5.47
+
+lodar, 2026-08-11: *"need to post it one by one when i call /inbox - not like a messy mesh
+list in one message"*.
+
+`buildActionableInbox` returned ONE `{text, keyboard}`: every card concatenated by
+`clampList` into a single message under a single merged keyboard. It now returns an ARRAY —
+one message per gate, each with its own card and its own ✅ button — and the caller sends
+them in order, pinging on the first and silencing the rest.
+
+DIVE-2712 had already made this exact fix on the CLI's PUSH path (`_task_inbox_send`), and
+the typed `/inbox` relay path shells that same verb. So the founder saw a clean
+one-per-gate stack from the digest DM and a mesh from the slash command **in the same
+chat**: the defect was exactly one surface wide — the slash-command PULL path.
+
+Three changes the split required:
+
+* **`gclear` no longer rebuilds the view into the tapped message.** It used to answer a
+  clear by editing that message with a freshly-rebuilt FULL inbox, which after the split
+  re-meshes every remaining gate into the message the founder just cleared. The split would
+  have survived exactly one tap, and every first-render test would still have passed.
+* **`clampList` is off this view.** Its job was to fit N cards under 4096 by dropping the
+  overflow behind `(+N more)` — so the one view that exists to stop a gate being missed was
+  silently dropping gates at exactly the N where that matters.
+* **The send loop tolerates failure.** A 429 mid-stack used to abort it, delivering the
+  first K gates and no trailer — a partial inbox with nothing saying so. Each send is now
+  caught, the run continues, `retry_after` is honoured and bounded, and the trailer reports
+  what did not arrive. The trailer alone retries once: nothing else counts it.
+
+The set-level trailer (hard-gate digest note, the DIVE-3224/3228 withheld count, the
+bulk-clear affordance) is its own final message — those are statements about the SET, and
+hanging them off the last card makes that one gate read as if they were about it.
+
+Note the version bump: it is the DELIVERY, not bookkeeping. The install path is keyed on
+this string, so #31 and #32 merged green and could reach nobody until it moved.
+
 ### Fixed — /task's "Needs you" stops listing the whole fleet's gates (DIVE-3267)
 
 The other half of DIVE-3224, found by main while grading that merge. `/inbox` was one of
