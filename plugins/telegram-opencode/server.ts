@@ -930,6 +930,59 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: I
   if (t.created_by) lines.push(`created by: ${t.created_by}`)
   const subs = Array.isArray(j.data.subtasks) ? j.data.subtasks : []
   if (subs.length) lines.push(`subtasks: ${subs.length}`)
+  // DIVE-3340: SAY THAT A GATE IS PENDING, AND NAME THE ROUTE THAT ANSWERS IT.
+  //
+  // Reported from a CUSTOMER VM 2026-08-12: the box owner opened /task_<id> on a
+  // gated row and every control in front of him either did nothing or was refused.
+  // ✅ Done is refused over an open gate (DIVE-555), 🚫 Cancel is refused over one
+  // (DIVE-2773), and the CLI refusal sent him to `task need --withdraw`, which
+  // authorizes on human/filer/lead/coordinator — a person typing into a bot is none
+  // of those, because the command executes on an AGENT seat and the human's identity
+  // deliberately does not travel through the chat (DIVE-1401/DIVE-2330 fail closed on
+  // purpose). So the row read as uncloseable from every surface he could see.
+  //
+  // The answer surface existed the whole time and lived somewhere else: the gate posts
+  // its OWN message when filed, carrying the DIVE-916 per-gate human nonce in the
+  // option buttons' callback_data. This view never mentioned it — not the gate, not the
+  // ask, not the route — so if that alert had scrolled away, or the chat was re-paired,
+  // the affordance was invisible as well as unreachable.
+  //
+  // NO BUTTONS ARE MINTED HERE, deliberately. The nonce is not derivable in the plugin
+  // (DIVE-950 closed that as agent-forgeable), and a plugin-minted answer control would
+  // be a second answer surface with different provenance from the one the CLI seals.
+  // The route is named in TEXT instead, which is what the reader was missing. The same
+  // posture the gate card list already takes for tier-2 hard gates, whose buttons only
+  // the CLI can mint.
+  //
+  // The keyboard below is left intact rather than suppressed: Escalate and Do now still
+  // do their jobs on a gated row, and hiding Done/Cancel would trade a refusal a reader
+  // can act on for an absence they cannot. What was actually missing is the sentence
+  // saying WHY they refuse and what to do instead, so that is what is added.
+  if (t.need_type && !t.need_answered_at) {
+    const gIdent = t.ident || `DIVE-${t.id}`
+    // Type-shaped because the verb genuinely differs, and publishing the wrong one is
+    // the same defect one layer down: a secret must never be typed into chat (Telegram
+    // keeps history) and a manual gate records that the step was PERFORMED, so both
+    // take `task answer` with NO --value. Mirrors _gate_answer_route in the CLI.
+    const gHow =
+      t.need_type === 'secret'
+        ? `place the secret out-of-band, then run \`5dive task answer ${gIdent}\` with NO --value (it must never enter chat history)`
+        : t.need_type === 'manual'
+          ? `run \`5dive task answer ${gIdent}\` with NO --value (it records that the step was performed)`
+          : `tap a button on this gate's own alert message in this chat, or run \`5dive task answer ${gIdent} --value=<answer>\``
+    lines.push('', `⛔ PENDING ${String(t.need_type).toUpperCase()} GATE — this row is waiting on a HUMAN ANSWER, not on work.`)
+    if (t.ask) {
+      // Same clamp rule as inboxCard: an ask with options must not be truncated, or the
+      // last option is chopped off and the reader answers a question they cannot see.
+      let gAsk = String(t.ask).replace(/\s+/g, ' ').trim()
+      if (!t.need_options && gAsk.length > 300) gAsk = gAsk.slice(0, 299) + '…'
+      lines.push(`   asks: ${gAsk}`)
+    }
+    if (t.need_options) lines.push(`   options: ${String(t.need_options)}`)
+    if (t.recommend) lines.push(`   ⭐ rec: ${String(t.recommend)}`)
+    lines.push(`   to answer: ${gHow}`)
+    lines.push(`   ✅ Done and 🚫 Cancel below WILL BE REFUSED while this gate is pending — answering it is what unblocks the row.`)
+  }
   if (t.body) {
     let body = String(t.body)
     if (body.length > 1500) body = body.slice(0, 1500) + '\n…(truncated)'
