@@ -56,8 +56,14 @@ function gateBlock(fork: string): string {
   const fnStart = src.indexOf('async function buildTaskDetail(')
   expect(fnStart, `${fork}: buildTaskDetail not found`).toBeGreaterThan(-1)
   const fn = src.slice(fnStart)
-  const rel = fn.indexOf('if (t.need_type && !t.need_answered_at) {')
-  expect(rel, `${fork}: buildTaskDetail has no pending-gate block`).toBeGreaterThan(-1)
+  // DIVE-3340 iter2: the extraction starts at `const gateLive =`, not at the `if`.
+  // The block's predicate now lives in two consts above it (the CLI verdicts and
+  // their fallbacks), and slicing from the `if` alone would leave gateLive/
+  // gateNeedsHuman undefined in the executed snippet — every render would throw, or
+  // worse, a `var`-hoisted shape would render the wrong branch silently.
+  const rel = fn.indexOf('const gateLive =')
+  expect(rel, `${fork}: buildTaskDetail has no gate-verdict block`).toBeGreaterThan(-1)
+  expect(fn.indexOf('if (gateLive) {'), `${fork}: gate block is not gated on the verdict`).toBeGreaterThan(rel)
   // The block must be inside buildTaskDetail, not in whatever follows it.
   const fnEnd = fn.search(/\n(async function|function|const|\/\/ ---) /)
   expect(fnEnd === -1 || rel < fnEnd, `${fork}: the gate block is outside buildTaskDetail`).toBe(true)
@@ -155,6 +161,56 @@ describe.each(LINEAGES)('DIVE-3340 /task_<id> surfaces a pending gate (%s)', (fo
     expect(render(fork, { id: 350, ident: 'DIVE-350', need_type: null, need_answered_at: null })).toBe('')
   })
 
+  // ── THE CELL main2's ITERATION-1 GRADE FOUND, and it is LIVE, not theoretical ──
+  // 19 rows on the board today are done/cancelled with need_type set and
+  // need_answered_at NULL (DIVE-2758, DIVE-2698, DIVE-2511, DIVE-2351, DIVE-2106,
+  // DIVE-1854, …). The first cut rendered the full block on every one of them: it
+  // told the reader a CLOSED row was "waiting on a HUMAN ANSWER", promised ✅/🚫
+  // "below" on a view that renders no keyboard for a terminal row, and pointed at
+  // /inbox, which excludes terminal rows by design. Three claims, all false.
+  //
+  // Asserted through BOTH paths, because they fail differently: an up-to-date CLI
+  // supplies gate_live=0 and the verdict decides it, while an older CLI supplies
+  // nothing and the FALLBACK's status clause has to decide it. A fixture that only
+  // carried the verdict would leave the fallback — the branch a stale CLI actually
+  // takes — ungraded.
+  test.each(['done', 'cancelled'] as const)(
+    'a %s row with a lingering gate renders NOTHING (verdict path)', (status) => {
+      expect(render(fork, { ...DECISION, status, gate_live: 0, needs_human: 0 })).toBe('')
+    })
+  test.each(['done', 'cancelled'] as const)(
+    'a %s row with a lingering gate renders NOTHING (fallback path, no verdict fields)', (status) => {
+      expect(render(fork, { ...DECISION, status })).toBe('')
+    })
+  // NON-VACUITY for the two arms above: the same fixture on an OPEN status must
+  // still render, or "renders nothing" would be passing because the extractor or the
+  // fixture is broken rather than because the status clause works.
+  test('...while the SAME fixture on an open row still renders', () => {
+    expect(render(fork, { ...DECISION, status: 'todo', gate_live: 1, needs_human: 1 }))
+      .toContain('PENDING DECISION GATE')
+  })
+
+  // The verdict OVERRIDES the raw inputs, which is the whole "export the verdict,
+  // never the inputs" contract. A row the CLI says is settled must render nothing
+  // even though need_type/need_answered_at still look open to a naive reader.
+  test('gate_live=0 wins over raw need_type/need_answered_at', () => {
+    expect(render(fork, { ...DECISION, status: 'todo', gate_live: 0 })).toBe('')
+  })
+
+  // An AGENT-ROUTED gate is open — both close verbs still refuse over it — but it is
+  // not waiting on a human, and telling the reader it is sends them to /inbox, which
+  // counts it routed_elsewhere and does not list it. 0 rows hold this today; it is a
+  // branch because the shape is structurally reachable, not because it is occupied.
+  test('an agent-routed gate is announced WITHOUT claiming a human is holding it', () => {
+    const out = render(fork, { ...DECISION, status: 'todo', gate_live: 1, needs_human: 0 })
+    expect(out).toContain('PENDING DECISION GATE')
+    expect(out).not.toContain('HUMAN ANSWER')
+    expect(out).toContain('routed agent reviewer')
+    // ...and the refusal warning still stands, because the close verbs do not care
+    // who the gate is routed to.
+    expect(out).toContain('REFUSED')
+  })
+
   // An ask carrying options must not be truncated — chopping the last option makes a
   // reader answer a question they cannot see (the inboxCard rule, mirrored).
   test('a long ask WITH options is not truncated', () => {
@@ -175,6 +231,13 @@ describe.each(LINEAGES)('DIVE-3340 /task_<id> surfaces a pending gate (%s)', (fo
 describe('DIVE-3340 the /inbox recovery pointer is claude-lineage only', () => {
   test('plugins/telegram names it', () => {
     expect(render('telegram', MANUAL)).toContain('/inbox')
+  })
+  // DIVE-3340 iter2: and it is withheld on an AGENT-ROUTED gate even on the claude
+  // lineage, because /inbox deliberately does not list one. The pointer is now
+  // conditional on the HUMAN verdict, not merely on the lineage.
+  test('plugins/telegram withholds it when the gate is routed to an agent', () => {
+    expect(render('telegram', { ...MANUAL, status: 'todo', gate_live: 1, needs_human: 0 }))
+      .not.toContain('/inbox')
   })
   test.each(LINEAGES.filter((l) => l !== 'telegram'))('%s does not', (fork) => {
     expect(render(fork, MANUAL)).not.toContain('/inbox')

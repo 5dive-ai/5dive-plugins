@@ -942,7 +942,35 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: I
   // do their jobs on a gated row, and hiding Done/Cancel would trade a refusal a reader
   // can act on for an absence they cannot. What was actually missing is the sentence
   // saying WHY they refuse and what to do instead, so that is what is added.
-  if (t.need_type && !t.need_answered_at) {
+  // DIVE-3340 iter2 (main2): CONSUME THE VERDICT, NEVER THE INPUTS.
+  // This block's first cut tested `t.need_type && !t.need_answered_at` — "has an
+  // unanswered gate" — which is NOT the CLI's open-gate rule. `_task_gate_open_pred`
+  // is that plus `status NOT IN ('done','cancelled')`. On 19 live board rows that are
+  // done/cancelled with a lingering gate (DIVE-2758, DIVE-2698, DIVE-2511, …) the old
+  // predicate rendered three false claims at once: that the row waits on a human (it
+  // is closed), that ✅/🚫 sit "below" (buildTaskDetail renders no keyboard on a
+  // terminal row), and that /inbox will re-send it (cmd_task_inbox excludes terminal
+  // rows by design — "a closed task waits on no one"). Same conflation as DIVE-3224
+  // in this plugin's /inbox and DIVE-3267 one command over; `src/task/inbox.sh` states
+  // the contract as EXPORT THE VERDICT, NEVER THE INPUTS.
+  //
+  // The verdicts are now on `task show --json` — the call THIS view makes — and not
+  // only on `task ls --json`, which is why the first cut could not consume them. The
+  // `!== undefined` fallback mirrors the /tasks list's `hasVerdict` idiom: an older
+  // CLI omits the fields, and the fallback rebuilds the rule WITH the status clause
+  // rather than without it, so a stale CLI degrades to correct-but-coarse.
+  const gateLive =
+    t.gate_live !== undefined
+      ? Number(t.gate_live) === 1
+      : !!(t.need_type && !t.need_answered_at && t.status !== 'done' && t.status !== 'cancelled')
+  // A SECOND verdict, and deliberately not the same one. An agent-routed gate
+  // (a resolved reviewer, tier<2, no capability need) is OPEN — both close verbs
+  // still refuse over it — but it is NOT waiting on a human, and saying so points the
+  // reader at /inbox, which counts it as routed_elsewhere and does not list it. Zero
+  // rows hold that shape today; it is structurally live, which is why it is a branch
+  // and not a comment.
+  const gateNeedsHuman = t.needs_human !== undefined ? Number(t.needs_human) === 1 : gateLive
+  if (gateLive) {
     const gIdent = t.ident || `DIVE-${t.id}`
     // Type-shaped because the verb genuinely differs, and publishing the wrong one is
     // the same defect one layer down: a secret must never be typed into chat (Telegram
@@ -954,7 +982,12 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: I
         : t.need_type === 'manual'
           ? `run \`5dive task answer ${gIdent}\` with NO --value (it records that the step was performed)`
           : `tap a button on this gate's own alert message in this chat, or run \`5dive task answer ${gIdent} --value=<answer>\``
-    lines.push('', `⛔ PENDING ${String(t.need_type).toUpperCase()} GATE — this row is waiting on a HUMAN ANSWER, not on work.`)
+    lines.push(
+      '',
+      gateNeedsHuman
+        ? `⛔ PENDING ${String(t.need_type).toUpperCase()} GATE — this row is waiting on a HUMAN ANSWER, not on work.`
+        : `⛔ PENDING ${String(t.need_type).toUpperCase()} GATE — this row is waiting on an ANSWER from its routed agent reviewer, not on work.`,
+    )
     if (t.ask) {
       // Same clamp rule as inboxCard: an ask with options must not be truncated, or the
       // last option is chopped off and the reader answers a question they cannot see.
