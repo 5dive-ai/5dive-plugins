@@ -1,5 +1,33 @@
 ## Unreleased
 
+### Fixed — the buzz poller could pile up until every buzz tool hung (DIVE-3486)
+
+`buzz_read` and `buzz_post` through MCP ran past the client's 120s background threshold and
+never returned, on dev3 and on quinn, while the relay answered in 39ms and `/usr/local/bin/buzz`
+answered in ~30ms the same minute with the same key and channel. Measured on the graded tree,
+the hang is not in the relay, not in the CLI, and not in the tool handlers.
+
+The inbound poller was fire-and-forget under `setInterval`:
+
+    const tick = () => { for (const ch of cfg.channels) void pollChannel(ch, seen) }
+    tick(); setInterval(tick, interval)
+
+A tick fired every `interval` whether or not the previous one had finished, and every channel
+in a tick launched in parallel. Each poll spawns a `buzz` child holding ~10 descriptors, so one
+slow poll compounds without bound. Driven at a compressed cadence against the shipped code, the
+server pinned at **248 concurrent children and 1005 open descriptors** (the 1024 `RLIMIT_NOFILE`
+soft limit) and the interactive tool calls sharing that process took **15-25s or never
+returned** — the reported symptom. With the guard, the same harness at the same cadence holds
+at **one child and 17 descriptors**, and calls return in ~0.04s.
+
+The guard drops an overlapping tick rather than queueing it (queueing only defers the pile-up;
+each backlogged tick still costs a child process), and runs a cycle's channels in sequence, so
+the process holds at most one polling child at any instant no matter how slow the relay gets or
+how many channels are watched. It lives in a new pure `plugins/buzz/poller.ts` because repo CI
+runs a bare `bun test` with no plugin deps installed — a guard reachable only through
+`server.ts` could not execute there at all. `plugins/buzz/poller.test.ts` pins it, carrying an
+explicit non-vacuity control that reproduces the old stacking shape against the same instrument.
+
 ### Fixed — /inbox posts one message per gate, not one mesh (DIVE-3279), release 0.5.47
 
 lodar, 2026-08-11: *"need to post it one by one when i call /inbox - not like a messy mesh
