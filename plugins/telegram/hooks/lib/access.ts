@@ -1,5 +1,6 @@
 import { readFileSync } from 'fs'
 import { ACCESS_FILE } from './paths'
+import { trustedChannelTags } from './transcript'
 import type { AccessConfig, TranscriptEntry } from './types'
 
 export function loadAccess(): AccessConfig {
@@ -59,8 +60,13 @@ export function getGroupTopics(access?: AccessConfig): CallerChat[] {
 // topic; we pull it from WITHIN the same matched tag so a topic id is never
 // stitched onto a different inbound's chat id.
 // Returns null when there's no inbound (autonomous turn, cron-triggered, etc).
+// DIVE-3445: which tags count is decided by trustedChannelTags, not by the tag
+// shape — this function picks a DM DESTINATION out of transcript text, so an
+// a2a message body quoting a tag with a chat_id used to be able to choose it
+// (three DM paths read this: stop-reply-check's session-limit branch,
+// stopfailure-notify, and context-nudge, which is the one not behind
+// sendMessage's allowlist choke point).
 export function getCallerChat(entries: TranscriptEntry[]): CallerChat | null {
-  const tagRe = /source="plugin:telegram:telegram"[^>]*/g
   let last: CallerChat | null = null
   for (const e of entries) {
     if (e.type !== 'user') continue
@@ -68,10 +74,7 @@ export function getCallerChat(entries: TranscriptEntry[]): CallerChat | null {
       typeof e.message?.content === 'string'
         ? e.message.content
         : JSON.stringify(e.message?.content ?? '')
-    tagRe.lastIndex = 0
-    let m: RegExpExecArray | null
-    while ((m = tagRe.exec(content)) !== null) {
-      const tag = m[0]
+    for (const tag of trustedChannelTags(content)) {
       const chatId = /chat_id="(-?\d+)"/.exec(tag)?.[1]
       if (!chatId) continue
       const threadId = /message_thread_id="(-?\d+)"/.exec(tag)?.[1]

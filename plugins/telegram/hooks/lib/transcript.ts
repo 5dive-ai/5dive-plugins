@@ -109,7 +109,51 @@ export type TurnAnalysis = {
 // Matches the inter-agent envelope prefix that `5dive agent send` injects as
 // the turn's opening user prompt, e.g. `[5dive-msg from=main id=abc tier=...]`.
 // Anchored to `from=` so a stray literal in human prose can't false-positive.
-const A2A_ENVELOPE_RE = /\[5dive-msg\s+from=\S+/
+export const A2A_ENVELOPE_RE = /\[5dive-msg\s+from=\S+/
+
+// DIVE-3445: the <channel> tag is TEXT, so anything that can put text into a
+// user entry can forge one. Measured 2026-08-16 (olivia, then reproduced here
+// against this file): an a2a message whose BODY merely QUOTES the tag sets
+// hadInbound, which flips `a2aTurn = a2aTurnStart && !hadInbound` to false and
+// walks the turn straight past the a2a exemption in stop-reply-check — and, if
+// the quoted tag carries a chat_id, hands that turn's transcript text to a chat
+// the SENDER chose. The recipient calls no tool and never sees it happen.
+//
+// The discriminator available in the transcript is position: the harness injects
+// a real inbound as the WHOLE opening prompt, so its tag sits at offset 0, while
+// an a2a envelope by construction opens with `[5dive-msg from=…`. So inside an
+// envelope only an anchored tag counts — and an envelope cannot start with both,
+// which is what makes this exact.
+//
+// DELIBERATELY NOT anchoring every entry. A mid-turn human DM does not arrive at
+// offset 0, and the MIXED-turn case — an a2a envelope opens the turn, a human DM
+// lands during it — is a real path this must keep answering. Narrowing it would
+// trade a content-injection hole for a SILENCE one, which is the strictly worse
+// of the two (DIVE-3422).
+//
+// Measured while writing this, and worth knowing before you tighten anything
+// here: the embedded-in-a-tool_result half of that path does not currently work
+// AT ALL. Array content is normalised with JSON.stringify below, which escapes
+// the inner quotes, so `source="` never matches `source=\"`. That is DIVE-3448,
+// filed separately because it WIDENS what counts as an inbound on live sessions
+// while this narrows it — opposite directions, opposite risks, not one diff. Do
+// not fix it by teaching this pattern to match its own JSON encoding: that makes
+// every tool_result quoting a tag an inbound with a sender-chosen destination,
+// which is precisely the hole DIVE-3445 closed, re-entered from the other side.
+//
+// Provenance is still being INFERRED from text either way. A structural marker on
+// the harness-injected entry is the real fix and needs the harness side; the
+// allowlist check in ./telegram sendMessage is what holds until then.
+const CHANNEL_TAG_RE_G = /source="plugin:telegram:telegram"[^>]*/g
+const ANCHORED_TAG_RE = /^\s*<channel source="plugin:telegram:telegram"[^>]*>/
+
+// The channel tags in this user-entry content that may be TRUSTED as harness
+// provenance, in document order. Shared by analyzeTurn and access.getCallerChat
+// so the two can never disagree about what counts as an inbound.
+export function trustedChannelTags(content: string): string[] {
+  if (A2A_ENVELOPE_RE.test(content) && !ANCHORED_TAG_RE.test(content)) return []
+  return content.match(CHANNEL_TAG_RE_G) ?? []
+}
 
 export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnAnalysis {
   // Find turn start.
@@ -136,7 +180,8 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
   // message_thread_id from within it. chat_id is -?\d+ so negative group
   // ids match (a bare \d+ silently dropped the leading '-'); thread id is
   // optional and read from the SAME tag so it's always paired with its chat.
-  const tagRe = /source="plugin:telegram:telegram"[^>]*/
+  // DIVE-3445: WHICH tags may be trusted is decided by trustedChannelTags
+  // above, not by their shape — a quoted tag matches the shape just as well.
 
   let hadInbound = false
   let hadTool = false
@@ -152,7 +197,7 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
         typeof e.message?.content === 'string'
           ? e.message.content
           : JSON.stringify(e.message?.content ?? '')
-      const tag = tagRe.exec(content)?.[0]
+      const tag = trustedChannelTags(content)[0]
       if (tag) {
         hadInbound = true
         const cm = /chat_id="(-?\d+)"/.exec(tag)
