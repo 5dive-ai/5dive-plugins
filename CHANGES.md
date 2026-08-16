@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Fixed — the buzz poller could pile up until every buzz tool hung (DIVE-3486)
+### Fixed — the buzz poller could pile up until every buzz tool hung (DIVE-3486), buzz release 0.1.1
 
 `buzz_read` and `buzz_post` through MCP ran past the client's 120s background threshold and
 never returned, on dev3 and on quinn, while the relay answered in 39ms and `/usr/local/bin/buzz`
@@ -27,6 +27,11 @@ how many channels are watched. It lives in a new pure `plugins/buzz/poller.ts` b
 runs a bare `bun test` with no plugin deps installed — a guard reachable only through
 `server.ts` could not execute there at all. `plugins/buzz/poller.test.ts` pins it, carrying an
 explicit non-vacuity control that reproduces the old stacking shape against the same instrument.
+
+`plugins/buzz/.claude-plugin/plugin.json` goes 0.1.0 -> 0.1.1 with this fix. The install path is
+keyed on that version string, so a merged plugin change that leaves it alone resolves to
+already-installed and fetches nothing (8613e47): every hung seat would stay hung, silently, with a
+green PR saying otherwise.
 
 ### Fixed — /inbox posts one message per gate, not one mesh (DIVE-3279), release 0.5.47
 
