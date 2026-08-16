@@ -38,7 +38,7 @@ import { readPayload } from './lib/payload'
 import { readEntries, analyzeTurn, hadTelegramToolCallAfter } from './lib/transcript'
 import { sendMessage, getToken } from './lib/telegram'
 import { emitBlock } from './lib/output'
-import { TG_TOOL_PREFIX, TYPING_STOP_FILE } from './lib/paths'
+import { TG_TOOL_PREFIX, typingStopFile } from './lib/paths'
 import { getAllowedChatIds, getCallerChat, getGroupTopics, type CallerChat } from './lib/access'
 import { nextSilentRun, composeSilentRunNotice } from './lib/autonomous-silence'
 import { parseResetEpoch } from './lib/time'
@@ -264,7 +264,7 @@ const threadId = a.lastThreadId ?? undefined
 // auto-relay/diagnostic branches below bypass (separate process). Bumping
 // this file's mtime lets the server's typing loop notice and stop. DIVE-146.
 try {
-  writeFileSync(TYPING_STOP_FILE, String(Date.now()))
+  writeFileSync(typingStopFile(), String(Date.now()))
 } catch {
   // best-effort cosmetic signal — ignore write failures
 }

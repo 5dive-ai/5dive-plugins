@@ -5,8 +5,7 @@
 // transport is bytes).
 
 import { readFileSync } from 'fs'
-import { homedir } from 'os'
-import { join } from 'path'
+import { accessFile } from './paths'
 import type { AccessConfig } from './types'
 
 const TELEGRAM_TEXT_MAX = 4000
@@ -33,25 +32,17 @@ export function isAllowedChat(chatId: string, allowed: string[]): boolean {
   return allowed.includes(chatId)
 }
 
-// The allowlist, read fresh, WITHOUT importing ./access or ./paths.
-//
-// That is not tidiness — it is required. ./paths binds STATE_DIR from the
-// environment AT MODULE LOAD, and every hook's state file hangs off it. Pulling
-// it in from the send path (statically or by dynamic import) makes the FIRST
-// sendMessage call freeze STATE_DIR for the whole process, which in the shared-
-// process test runner happens before test/resume-prompt.test.ts sets
-// TELEGRAM_STATE_DIR — measured here, it reds two of its arms. Production is
-// unaffected (each hook is its own process), but a guard that reds an unrelated
-// suite is a guard that gets weakened later to make the suite green again.
-//
-// The 2-line path duplication that buys is a drift seam, so it is pinned rather
-// than trusted: test/dive3445-tag-provenance.test.ts asserts this resolves to
-// exactly paths.ACCESS_FILE under the same environment.
+// The allowlist, read fresh on every send. Still deliberately NOT via ./access:
+// that module also pulls in ./transcript, and the send path has no business
+// loading the transcript parser. It does now use ./paths, which is safe since
+// DIVE-3452 made that module resolve per call — it previously froze STATE_DIR
+// at module load, so importing it from the send path reddened whichever test
+// file set TELEGRAM_STATE_DIR later, and this function duplicated the two lines
+// to stay clear of it. That duplication (a drift seam pinned by
+// test/dive3445-tag-provenance.test.ts) is gone; the pin now reads one source.
 function allowedChatIdsFresh(): string[] {
-  const stateDir =
-    process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
   try {
-    const a = JSON.parse(readFileSync(join(stateDir, 'access.json'), 'utf8')) as AccessConfig
+    const a = JSON.parse(readFileSync(accessFile(), 'utf8')) as AccessConfig
     return [...(a.allowFrom ?? []), ...(a.groups ? Object.keys(a.groups) : [])]
   } catch {
     return []

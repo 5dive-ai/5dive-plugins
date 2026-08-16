@@ -6,11 +6,19 @@ import { mkdtempSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
+// DIVE-3452: plain static imports. These used to be `await import`s preceded by
+// the env assignment, because paths.ts froze STATE_DIR at module load — so this
+// file passed only when the runner happened to walk it before anything else
+// that imports paths.ts, which differs between a dev box and CI. paths.ts now
+// resolves per call, so setting the env before the first CALL is enough and the
+// import order of the whole suite stops mattering. Reverting paths.ts to consts
+// reds these arms again under `bun test test/dive3445-tag-provenance.test.ts
+// test/resume-prompt.test.ts` — that ordering is the mutation check.
+import { resumePrompt } from '../plugins/telegram/hooks/lib/resume-prompt'
+import { saveSilence } from '../plugins/telegram/hooks/lib/state'
+
 const dir = mkdtempSync(join(tmpdir(), 'tg-resume-'))
 process.env.TELEGRAM_STATE_DIR = dir
-
-const { resumePrompt } = await import('../plugins/telegram/hooks/lib/resume-prompt')
-const { saveSilence } = await import('../plugins/telegram/hooks/lib/state')
 
 beforeEach(() => saveSilence({}))
 

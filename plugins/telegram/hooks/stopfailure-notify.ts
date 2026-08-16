@@ -15,7 +15,7 @@ import { spawn, spawnSync } from 'child_process'
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync, writeFileSync, renameSync } from 'fs'
 import { homedir } from 'os'
 import { join, basename } from 'path'
-import { STATE_DIR } from './lib/paths'
+import { stateDir } from './lib/paths'
 import { readPayload } from './lib/payload'
 import { readEntries, findRateLimitText } from './lib/transcript'
 import { getAllowedChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
@@ -491,9 +491,9 @@ function tryRotate(resetEpoch: number | null): { from: string; to: string } | nu
   // reply clause makes the swapped-in account answer it; when it was autonomous
   // work with an empty inbox, the bare "continue" avoids the phantom-prompt
   // escalation (DIVE-1332/1316). Manual /resume omits line 2 and stays idle.
-  const marker = join(STATE_DIR, 'resume-next')
+  const marker = join(stateDir(), 'resume-next')
   try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    mkdirSync(stateDir(), { recursive: true, mode: 0o700 })
     const tmp = `${marker}.tmp.${process.pid}`
     writeFileSync(tmp, sessionId + '\n' + resumePrompt() + '\n', { mode: 0o600 })
     renameSync(tmp, marker)

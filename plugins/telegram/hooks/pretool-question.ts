@@ -25,7 +25,7 @@
 import { writeFileSync, mkdirSync, readFileSync, rmSync } from 'fs'
 import { join } from 'path'
 import { readPayload } from './lib/payload'
-import { STATE_DIR, QUESTION_DIR, TG_TOOL_PREFIX } from './lib/paths'
+import { stateDir, questionDir, TG_TOOL_PREFIX } from './lib/paths'
 import { emitDenyTool, emitAllowTool } from './lib/output'
 import { getToken } from './lib/telegram'
 import { readEntries, analyzeTurn } from './lib/transcript'
@@ -37,7 +37,7 @@ const tool = payload.tool_name
 
 function stampAndExit(): never {
   try {
-    writeFileSync(join(STATE_DIR, 'last-seen'), String(Date.now()))
+    writeFileSync(join(stateDir(), 'last-seen'), String(Date.now()))
   } catch {
     // STATE_DIR may not exist (plugin loaded but never paired). Silent skip.
   }
@@ -88,11 +88,11 @@ if (!token || !chatId) legacyDeny(tool!)
 // conflict). callback_data is `q:<reqid>:<idx>`; the server re-resolves the idx
 // against the labels we persist, so it never has to fit the 64-byte cap.
 const reqid = `${Date.now()}-${process.pid}`
-const reqFile = join(QUESTION_DIR, `${reqid}.req.json`)
-const ansFile = join(QUESTION_DIR, `${reqid}.ans.json`)
+const reqFile = join(questionDir(), `${reqid}.req.json`)
+const ansFile = join(questionDir(), `${reqid}.ans.json`)
 
 try {
-  mkdirSync(QUESTION_DIR, { recursive: true, mode: 0o700 })
+  mkdirSync(questionDir(), { recursive: true, mode: 0o700 })
   writeFileSync(
     reqFile,
     JSON.stringify({ tool, chatId, labels: spec!.buttons.map(b => b.answer), createdAt: Date.now() }),
