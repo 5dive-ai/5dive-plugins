@@ -25,6 +25,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { schnorr } from '@noble/curves/secp256k1'
 import { npubEncode, encoderIsSane, mentionsUs, type BuzzEvent } from './mention.ts'
+import { makeGuardedTick } from './poller.ts'
 
 const exec = promisify(execFile)
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'buzz')
@@ -295,11 +296,20 @@ function startPoller() {
   if (!cfg || !cfg.channels?.length || !OUR_PUBKEY_HEX) return
   const seen = loadSeen()
   const interval = cfg.poll_ms || 15000
-  const tick = () => {
-    for (const ch of cfg.channels) void pollChannel(ch, seen)
-  }
-  tick()
-  setInterval(tick, interval)
+  // DIVE-3486: the tick MUST NOT overlap itself. It used to be
+  //   const tick = () => { for (const ch of cfg.channels) void pollChannel(ch, seen) }
+  // — fire-and-forget under setInterval, which compounds one slow poll into an
+  // unbounded child-process/descriptor pile-up and starves the interactive
+  // tools sharing this process. The guard and the measurements behind it live
+  // in ./poller.ts, which is pure so repo CI (a bare `bun test`, no plugin deps
+  // installed) can actually execute it.
+  const { tick } = makeGuardedTick(cfg.channels, ch => pollChannel(ch, seen))
+  // pollChannel swallows its own relay errors, but never rely on that from a
+  // fire-and-forget call site: an unhandled rejection here would take the whole
+  // MCP server down and every tool with it.
+  const fire = () => void tick().catch(e => process.stderr.write(`buzz: poll cycle failed: ${e}\n`))
+  fire()
+  setInterval(fire, interval)
 }
 
 startPoller()
