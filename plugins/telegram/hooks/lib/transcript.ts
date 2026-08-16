@@ -131,13 +131,11 @@ export const A2A_ENVELOPE_RE = /\[5dive-msg\s+from=\S+/
 // trade a content-injection hole for a SILENCE one, which is the strictly worse
 // of the two (DIVE-3422).
 //
-// Measured while writing this, and worth knowing before you tighten anything
-// here: the embedded-in-a-tool_result half of that path does not currently work
-// AT ALL. Array content is normalised with JSON.stringify below, which escapes
-// the inner quotes, so `source="` never matches `source=\"`. That is DIVE-3448,
-// filed separately because it WIDENS what counts as an inbound on live sessions
-// while this narrows it — opposite directions, opposite risks, not one diff. Do
-// not fix it by teaching this pattern to match its own JSON encoding: that makes
+// The embedded-in-a-tool_result half of that path did not work AT ALL until
+// DIVE-3448: array content was normalised with JSON.stringify, which escapes the
+// inner quotes, so `source="` never matched `source=\"`. It is now read by
+// entryTexts below, block by block, so no escaping is in play. It was NOT fixed
+// by teaching this pattern to match its own JSON encoding — that would make
 // every tool_result quoting a tag an inbound with a sender-chosen destination,
 // which is precisely the hole DIVE-3445 closed, re-entered from the other side.
 //
@@ -153,6 +151,55 @@ const ANCHORED_TAG_RE = /^\s*<channel source="plugin:telegram:telegram"[^>]*>/
 export function trustedChannelTags(content: string): string[] {
   if (A2A_ENVELOPE_RE.test(content) && !ANCHORED_TAG_RE.test(content)) return []
   return content.match(CHANNEL_TAG_RE_G) ?? []
+}
+
+// DIVE-3448: the readable texts of a user entry, as SEPARATE documents.
+//
+// A user entry's content is either a plain string (the turn-opening prompt) or
+// an array of blocks — which is how a mid-turn human DM actually arrives: the
+// harness appends a `{type:'text'}` block holding the <system-reminder> that
+// wraps the <channel> tag. Both call sites used to normalise the array half
+// with JSON.stringify, which ESCAPES the inner quotes, so the literal `source="`
+// the pattern requires could never match `source=\"` and the embedded case that
+// analyzeTurn's docblock claims to cover has never once fired.
+//
+// Fixed by reading the blocks instead of dumping them, so no escaping is in
+// play. NOT by teaching the pattern to match its own JSON encoding — that would
+// make any tool output quoting a tag an inbound with a sender-chosen chat id,
+// which is DIVE-3445's hole re-entered from the other side. The ESCAPED-form arm
+// in test/dive3445-tag-provenance.test.ts is the anchor that keeps it shut.
+//
+// ONLY `{type:'text'}` blocks. A tool_result's payload is arbitrary command
+// output (a grep hit, a cat of this very file) and is deliberately left unread:
+// widening to it would hand every tool that prints a tag the ability to set a
+// turn's relay destination.
+export function entryTexts(content: unknown): string[] {
+  if (typeof content === 'string') return [content]
+  if (!Array.isArray(content)) return []
+  return content
+    .filter(
+      (b): b is { type: string; text: string } =>
+        !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string',
+    )
+    .map((b) => b.text)
+}
+
+// trustedChannelTags over a whole user-entry content, string or array.
+//
+// The a2a-envelope provenance rule is evaluated ACROSS the entry, not per block:
+// if any text in it opens an inter-agent envelope, every text in that entry must
+// carry its tag anchored at offset 0 to be trusted. Splitting the envelope and
+// the tag into two blocks is otherwise a way to walk around DIVE-3445 layer 1.
+// For string content this is byte-for-byte the old behaviour.
+export function trustedChannelTagsForEntry(content: unknown): string[] {
+  const texts = entryTexts(content)
+  const inEnvelope = texts.some((t) => A2A_ENVELOPE_RE.test(t))
+  const out: string[] = []
+  for (const t of texts) {
+    if (inEnvelope && !ANCHORED_TAG_RE.test(t)) continue
+    out.push(...(t.match(CHANNEL_TAG_RE_G) ?? []))
+  }
+  return out
 }
 
 export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnAnalysis {
@@ -193,11 +240,9 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
 
   for (const e of turn) {
     if (e.type === 'user') {
-      const content =
-        typeof e.message?.content === 'string'
-          ? e.message.content
-          : JSON.stringify(e.message?.content ?? '')
-      const tag = trustedChannelTags(content)[0]
+      // DIVE-3448: array content is walked block-by-block, not JSON-dumped, so
+      // a mid-turn DM embedded in a tool_result turn is actually seen.
+      const tag = trustedChannelTagsForEntry(e.message?.content ?? '')[0]
       if (tag) {
         hadInbound = true
         const cm = /chat_id="(-?\d+)"/.exec(tag)

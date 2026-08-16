@@ -29,6 +29,8 @@ const HOOKS = join(import.meta.dir, '..', 'plugins', 'telegram', 'hooks')
 // --- synthetic transcript builders (mirror claude's JSONL shapes) ---
 const userStr = (content: string): TranscriptEntry =>
   ({ type: 'user', message: { content } }) as unknown as TranscriptEntry
+const userBlocks = (blocks: unknown[]): TranscriptEntry =>
+  ({ type: 'user', message: { content: blocks } }) as unknown as TranscriptEntry
 const assistantText = (text: string): TranscriptEntry =>
   ({ type: 'assistant', message: { content: [{ type: 'text', text }] } }) as unknown as TranscriptEntry
 
@@ -58,6 +60,32 @@ describe('DIVE-1323: analyzeTurn a2a-turn detection', () => {
       [userStr(A2A_PROMPT), assistantText('working'), userStr(HUMAN_INBOUND)],
       TG_PREFIX,
     )
+    expect(a.a2aTurn).toBe(false)
+    expect(a.hadInbound).toBe(true)
+    expect(a.lastChatId).toBe('1234567890')
+  })
+
+  test('MIXED, EMBEDDED: the DM arrives inside a tool_result turn → a2aTurn=false', () => {
+    // DIVE-3448. The arm above relocates turnStart, because a fresh STRING user
+    // entry IS a new turn boundary — so it passes without ever exercising the
+    // embedded case analyzeTurn's docblock claims. The real mid-turn shape is
+    // this one: the turn is still running, so the DM lands as a system-reminder
+    // in a text block of an ARRAY-content user entry, and turnStart stays on the
+    // a2a envelope. That half was dead until DIVE-3448 — array content was
+    // JSON.stringify'd, which escapes the quotes `source="` needs — so a human
+    // writing again during a long turn was answered by nobody.
+    const a = analyzeTurn(
+      [
+        userStr(A2A_PROMPT),
+        assistantText('working'),
+        userBlocks([
+          { type: 'tool_result', content: 'ok' },
+          { type: 'text', text: `<system-reminder>${HUMAN_INBOUND}</system-reminder>` },
+        ]),
+      ],
+      TG_PREFIX,
+    )
+    expect(a.turnStart, 'turnStart must stay on the a2a envelope or this is the arm above again').toBe(0)
     expect(a.a2aTurn).toBe(false)
     expect(a.hadInbound).toBe(true)
     expect(a.lastChatId).toBe('1234567890')

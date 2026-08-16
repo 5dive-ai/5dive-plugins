@@ -1,6 +1,6 @@
 import { readFileSync } from 'fs'
 import { accessFile } from './paths'
-import { trustedChannelTags } from './transcript'
+import { trustedChannelTagsForEntry } from './transcript'
 import type { AccessConfig, TranscriptEntry } from './types'
 
 export function loadAccess(): AccessConfig {
@@ -70,11 +70,10 @@ export function getCallerChat(entries: TranscriptEntry[]): CallerChat | null {
   let last: CallerChat | null = null
   for (const e of entries) {
     if (e.type !== 'user') continue
-    const content =
-      typeof e.message?.content === 'string'
-        ? e.message.content
-        : JSON.stringify(e.message?.content ?? '')
-    for (const tag of trustedChannelTags(content)) {
+    // DIVE-3448: same entry reader as analyzeTurn — array content is walked,
+    // not JSON.stringify'd, so the two can never disagree about what is an
+    // inbound (they used to agree only by both being blind to array content).
+    for (const tag of trustedChannelTagsForEntry(e.message?.content ?? '')) {
       const chatId = /chat_id="(-?\d+)"/.exec(tag)?.[1]
       if (!chatId) continue
       const threadId = /message_thread_id="(-?\d+)"/.exec(tag)?.[1]
