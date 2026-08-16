@@ -39,7 +39,8 @@ import { readEntries, analyzeTurn, hadTelegramToolCallAfter } from './lib/transc
 import { sendMessage, getToken } from './lib/telegram'
 import { emitBlock } from './lib/output'
 import { TG_TOOL_PREFIX, TYPING_STOP_FILE } from './lib/paths'
-import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
+import { getAllowedChatIds, getCallerChat, getGroupTopics, type CallerChat } from './lib/access'
+import { nextSilentRun, composeSilentRunNotice } from './lib/autonomous-silence'
 import { parseResetEpoch } from './lib/time'
 import type { HookPayload, TranscriptEntry, TranscriptContentBlock } from './lib/types'
 
@@ -210,6 +211,45 @@ const a = analyzeTurn(entries, TG_TOOL_PREFIX)
 // already false for such a turn (the guard below would exit too), but assert
 // it explicitly so the golden tripwire can lock the invariant against a future
 // analyzeTurn refactor that might change turn-boundary detection.
+// DIVE-3422: BEFORE the a2a and inbound exits, because the case this covers
+// is the one that leaves through them. An autonomous session (cron, `/goal`,
+// any turn with no <channel> inbound) has no caller chat, so every branch
+// below correctly exits and NOTHING the agent writes reaches anyone — the
+// agent meanwhile reads its own transcript as evidence that it reported.
+// Track the run of consecutive silent turns and, past a threshold, speak once
+// into the agent's own group topic. Every arm of the decision is in
+// ./lib/autonomous-silence; the negative control (any turn that reaches the
+// channel resets the run to zero) lives there and is unit-locked.
+const silentRunFile = join(tmpdir(), `5dive-tg-silentrun-${lockKey}.count`)
+if (getToken()) {
+  const prevRun = (() => {
+    try { return parseInt(readFileSync(silentRunFile, 'utf8').trim(), 10) || 0 } catch { return 0 }
+  })()
+  const decision = nextSilentRun(prevRun, {
+    hadInbound: a.hadInbound,
+    a2aTurn: a.a2aTurn,
+    hadSend: a.hadSend,
+    hasText: a.texts.some(t => t.trim().length > 0),
+  })
+  if (decision.count !== prevRun) {
+    try { writeFileSync(silentRunFile, String(decision.count)) } catch { /* stale count only */ }
+  }
+  if (decision.notify) {
+    // The agent's own forum topic first, allowed chats only if no group is
+    // configured. An autonomous session reporting into its own topic is
+    // information; the same text in a human's DM is a nag, and a nag gets
+    // muted — which is the silence this exists to end.
+    const topics = getGroupTopics()
+    const targets: CallerChat[] = topics.length > 0
+      ? topics
+      : getAllowedChatIds().map(chatId => ({ chatId }))
+    const lastText = [...a.texts].reverse().find(t => t.trim().length > 0) ?? ''
+    const notice = composeSilentRunNotice(decision.count, lastText)
+    await Promise.all(targets.map(t => sendMessage(t.chatId, notice, t.threadId)))
+  }
+}
+
+// DIVE-1323 (continued): suppress the human-DM reflex on an inter-agent turn.
 if (a.a2aTurn) process.exit(0)
 
 // Proceed only if there was a Telegram inbound this turn and we know which
