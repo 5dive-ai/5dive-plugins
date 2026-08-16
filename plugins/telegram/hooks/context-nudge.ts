@@ -32,7 +32,7 @@ import { readPayload } from './lib/payload'
 import { readEntries } from './lib/transcript'
 import { getToken } from './lib/telegram'
 import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
-import { NUDGE_FILE } from './lib/paths'
+import { nudgeFile } from './lib/paths'
 import type { HookPayload } from './lib/types'
 
 // Opt-in gate: the carry-over nudge is OFF by default and only fires once the
@@ -41,7 +41,7 @@ import type { HookPayload } from './lib/types'
 // other than enabled===true → stay silent. Cheapest possible check, done first.
 function nudgeEnabled(): boolean {
   try {
-    return JSON.parse(readFileSync(NUDGE_FILE, 'utf8')).enabled === true
+    return JSON.parse(readFileSync(nudgeFile(), 'utf8')).enabled === true
   } catch {
     return false
   }

@@ -1,11 +1,11 @@
 import { readFileSync } from 'fs'
-import { ACCESS_FILE } from './paths'
+import { accessFile } from './paths'
 import { trustedChannelTags } from './transcript'
 import type { AccessConfig, TranscriptEntry } from './types'
 
 export function loadAccess(): AccessConfig {
   try {
-    return JSON.parse(readFileSync(ACCESS_FILE, 'utf8')) as AccessConfig
+    return JSON.parse(readFileSync(accessFile(), 'utf8')) as AccessConfig
   } catch {
     return {}
   }
