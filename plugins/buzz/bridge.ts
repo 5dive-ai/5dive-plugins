@@ -33,7 +33,7 @@ export type Verdict = {
   reason: string
   /** Seat the key maps to, when the host named one. */
   seat?: string
-  /** Provenance label the host relayed under (`buzz:<seat>`), for logging. */
+  /** Provenance label the host relayed under (`buzz-<seat>`), for logging. */
   from?: string
 }
 

@@ -17,10 +17,10 @@ const wrap = (data: unknown) => JSON.stringify({ ok: true, data })
 
 // --- positive controls ------------------------------------------------------
 test('a known teammate key is reported as delivered on the a2a rail', () => {
-  const v = readVerdict(0, wrap({ route: 'a2a', reason: 'delivered', seat: 'olivia', from: 'buzz:olivia' }))
+  const v = readVerdict(0, wrap({ route: 'a2a', reason: 'delivered', seat: 'olivia', from: 'buzz-olivia' }))
   expect(v.route).toBe('a2a')
   expect(v.seat).toBe('olivia')
-  expect(v.from).toBe('buzz:olivia')
+  expect(v.from).toBe('buzz-olivia')
   // The whole point of the a2a route: the plugin must NOT deliver it a second
   // time. A double delivery is how one teammate message becomes two.
   expect(hostAlreadyDelivered(v)).toBe(true)
@@ -100,4 +100,25 @@ test('a non-string seat/from is dropped rather than rendered', () => {
   const v = readVerdict(0, wrap({ route: 'a2a', reason: 'delivered', seat: 42, from: null }))
   expect(v.seat).toBeUndefined()
   expect(v.from).toBeUndefined()
+})
+
+// THE LABEL THE HOST RELAYS UNDER HAS TO BE SPELLABLE ON THE RAIL IT RIDES.
+// Iteration 1 shipped `buzz:<seat>`, which cmd_send's valid_sender_label
+// (^[a-z][a-z0-9-]{0,31}$) rejects, so every known-teammate inbound bounced
+// inside the host and arrived here as untrusted data instead — the feature
+// degrading to today's behaviour with a sudo round trip in front of it. The
+// plugin cannot enforce the host's validator, but it CAN refuse to describe a
+// route as a2a-delivered under a label that rail could never have accepted, and
+// this arm keeps the two halves' idea of the label from drifting apart again.
+const A2A_SENDER_LABEL = /^[a-z][a-z0-9-]{0,31}$/
+
+test('the from label the host reports is spellable as an a2a sender label', () => {
+  const v = readVerdict(0, wrap({ route: 'a2a', reason: 'delivered', seat: 'olivia', from: 'buzz-olivia' }))
+  expect(v.route).toBe('a2a')
+  expect(A2A_SENDER_LABEL.test(v.from!)).toBe(true)
+})
+
+test('NEGATIVE CONTROL: the iteration-1 colon label is not spellable on that rail', () => {
+  // Proves the arm above measures the validator rather than restating a constant.
+  expect(A2A_SENDER_LABEL.test('buzz:olivia')).toBe(false)
 })
