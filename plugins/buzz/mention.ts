@@ -104,3 +104,47 @@ export function mentionsUs(
   if (ev.content.includes(ourPubkeyHex)) return true
   return false
 }
+
+// A DM is addressed to us by construction: the relay stores it as a channel with
+// channel_type='dm' and an immutable participant set that includes our pubkey
+// (buzz-db/src/dm.rs). Nothing is encrypted or gift-wrapped, so the bridge needs
+// no decryption — only the right set of channel ids to poll. But it DOES need a
+// different delivery predicate: requiring a mention inside a two-person DM is
+// the bug lodar hit — you do not @-mention someone in their own DM.
+//
+// The untrusted-input boundary is unchanged: DM content is data, never
+// instructions. A signature proves authorship, not authority.
+export function shouldDeliver(
+  ev: BuzzEvent,
+  ourPubkeyHex: string,
+  ourNpub: string,
+  encoderSane: boolean,
+  isDm: boolean,
+): boolean {
+  if (!isDm) return mentionsUs(ev, ourPubkeyHex, ourNpub, encoderSane)
+  if (!ourPubkeyHex) return false
+  if (ev.pubkey === ourPubkeyHex) return false // never self-deliver
+  return true
+}
+
+// `buzz dms list` prints a JSON array of {dm_id, participants, created_at}. It
+// prints a JSON *error object* when the relay is unreachable, so every non-array
+// shape has to degrade to "no DMs" rather than throw — a poller that dies on a
+// relay hiccup stops watching channels too.
+export function parseDmList(raw: string): string[] {
+  let rows: unknown
+  try {
+    rows = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(rows)) return []
+  const out: string[] = []
+  for (const r of rows) {
+    if (!r || typeof r !== 'object') continue
+    const id = (r as { dm_id?: unknown }).dm_id
+    if (typeof id !== 'string' || !id) continue
+    if (!out.includes(id)) out.push(id)
+  }
+  return out
+}

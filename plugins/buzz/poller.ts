@@ -46,9 +46,9 @@ export type GuardedTick = {
  * away and each poll re-reads the last 50 events, so a skipped cycle's messages
  * are picked up by the following one.
  */
-export function makeGuardedTick(
-  channels: readonly string[],
-  poll: (channel: string) => Promise<void>,
+export function makeGuardedTick<T = string>(
+  channels: readonly T[] | (() => T[] | Promise<T[]> | readonly T[] | Promise<readonly T[]>),
+  poll: (channel: T) => Promise<void>,
 ): GuardedTick {
   let inFlight = false
   let dropped = 0
@@ -63,10 +63,36 @@ export function makeGuardedTick(
       // channel in flight at once, which is the same unbounded-spawn shape one
       // level down: two channels doubles the descriptor cost of a stuck relay,
       // ten channels multiplies it by ten.
-      for (const channel of channels) await poll(channel)
+      // DIVE-3560: the target list may be a RESOLVER, because a newly opened
+      // DM is a channel that was in no config. Resolving here — inside the
+      // guard — and not at the call site is deliberate: discovery spawns a
+      // child process of its own, so an unguarded resolve would reintroduce
+      // exactly the per-tick spawn this guard exists to bound.
+      const targets = typeof channels === 'function' ? await channels() : channels
+      for (const channel of targets) await poll(channel)
     } finally {
       inFlight = false
     }
   }
   return { tick, dropped: () => dropped, busy: () => inFlight }
+}
+
+/**
+ * DIVE-3560. Merge the configured channel uuids with the discovered DM ids into
+ * one poll set.
+ *
+ * A uuid in BOTH lists is polled once, as a DM. Polling it twice doubles the
+ * child spawns per cycle, and the channel pass would run first, mark the
+ * message seen and then drop it — nobody @-mentions anyone inside their own DM,
+ * so the DM reading is the delivering one and it wins.
+ *
+ * Lives here, not in server.ts, for the same reason the guard does: server.ts
+ * boots MCP on stdio at import, so nothing in it is reachable from `bun test`.
+ */
+export type PollTarget = { id: string; isDm: boolean }
+export function mergeTargets(channels: readonly string[], dms: readonly string[]): PollTarget[] {
+  const dmSet = new Set(dms)
+  const out: PollTarget[] = dms.map(id => ({ id, isDm: true }))
+  for (const id of channels) if (!dmSet.has(id)) out.push({ id, isDm: false })
+  return out
 }
