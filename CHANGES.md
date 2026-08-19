@@ -1,5 +1,34 @@
 ## Unreleased
 
+### Added — dashboard chat collects on a nudge instead of waiting out its 5-minute timer (DIVE-3574), dashboard release 0.4.0
+
+Dashboard chat showed "queued — this box collects every ~5 min": up to five minutes before the
+agent even saw the message. lodar, 2026-08-18: *"really slow and unusable ux"*.
+
+The collector was reachable only on a timer. It now also watches
+`~/.claude/channels/dashboard/collect-now/`, where the control plane drops a zero-byte marker via
+the box's shelld `POST /shell/collect-now`, and runs its normal collect immediately. Measured on
+the box: **nudge -> collect in 260ms**, against the 300000ms fallback timer.
+
+A separate directory from `agent-inbox` on purpose. The nudge carries no payload, so it must never
+be mistaken for a message drop-file — the collector stays the single reader and there is no second
+delivery path to reconcile. The 5-minute timer is untouched and stays load-bearing: a missed nudge
+(box asleep, inotify drop, a runtime that predates the verb) costs the old wait and nothing else.
+
+### Fixed — a nudge could deliver the same message several times over
+
+`drainPending` used to be reachable only from boot and the 5-minute timer, two callers that could
+never overlap. A nudge can fire repeatedly while someone types, and two concurrent drains fetch the
+SAME pending rows and push each message into the session twice, because the ack only lands after
+the notifications are sent. Drains are now serialised, with a single re-run for a nudge that
+arrived mid-drain so a message landing after the fetch still does not wait out the timer.
+
+Graded, not asserted: with the guard removed, `test/dashboard-collect-now.test.ts` delivers `first`
+four times instead of once. Getting that arm to bite took two corrections — a fast burst is
+swallowed by the watcher's own debounce, and a stub that re-reads its queue AFTER the response
+delay hands the second drain the state after the first one's ack, which hides the race entirely.
+
+
 ### Fixed — the buzz poller could pile up until every buzz tool hung (DIVE-3486), buzz release 0.1.1
 
 `buzz_read` and `buzz_post` through MCP ran past the client's 120s background threshold and

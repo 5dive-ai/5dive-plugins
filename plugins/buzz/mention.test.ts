@@ -47,3 +47,49 @@ test('an unsound encoder disables ONLY the NIP-27 path', () => {
   expect(mentionsUs(ev({ tags: [['p', OURS]] }), OURS, OUR_NPUB, false)).toBe(true)
   expect(mentionsUs(ev({ content: `raw ${OURS}` }), OURS, OUR_NPUB, false)).toBe(true)
 })
+
+// --- DIVE-3560: DM inbound ---------------------------------------------------
+import { shouldDeliver, parseDmList } from './mention.ts'
+
+test('a DM from someone else is delivered even with no mention markers at all', () => {
+  const plain = ev({ content: 'hey, can you look at the deploy?' })
+  // the channel path is unchanged: no mention, no delivery
+  expect(shouldDeliver(plain, OURS, OUR_NPUB, true, false)).toBe(false)
+  // the DM path: addressed to us by construction
+  expect(shouldDeliver(plain, OURS, OUR_NPUB, true, true)).toBe(true)
+})
+
+test('a DM never self-delivers our own message back into the session', () => {
+  expect(shouldDeliver(ev({ pubkey: OURS, content: 'my own reply' }), OURS, OUR_NPUB, true, true)).toBe(false)
+})
+
+test('shouldDeliver on a channel is exactly mentionsUs', () => {
+  for (const e of [ev({ tags: [['p', OURS]] }), ev({ content: 'nothing' }), ev({ pubkey: OURS, tags: [['p', OURS]] })]) {
+    expect(shouldDeliver(e, OURS, OUR_NPUB, true, false)).toBe(mentionsUs(e, OURS, OUR_NPUB, true))
+  }
+})
+
+test('parseDmList extracts dm ids and drops junk, self-only and malformed rows', () => {
+  const raw = JSON.stringify([
+    { dm_id: '539f753f-0615-4331-bd56-0a3e2b5a4724', participants: [OURS, THEIRS] },
+    { dm_id: '', participants: [THEIRS] },
+    { participants: [THEIRS] },
+    { dm_id: 'd6e3c523-f446-4d7e-871a-438368e5d07e', participants: [OURS] }, // note-to-self, still ours
+    'garbage',
+  ])
+  expect(parseDmList(raw)).toEqual([
+    '539f753f-0615-4331-bd56-0a3e2b5a4724',
+    'd6e3c523-f446-4d7e-871a-438368e5d07e',
+  ])
+})
+
+test('parseDmList on non-JSON and on a non-array returns empty, never throws', () => {
+  expect(parseDmList('{"error":"network_error"}')).toEqual([])
+  expect(parseDmList('not json at all')).toEqual([])
+  expect(parseDmList('')).toEqual([])
+})
+
+test('parseDmList dedupes a repeated dm id', () => {
+  const id = '539f753f-0615-4331-bd56-0a3e2b5a4724'
+  expect(parseDmList(JSON.stringify([{ dm_id: id }, { dm_id: id }]))).toEqual([id])
+})

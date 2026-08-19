@@ -24,8 +24,8 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { schnorr } from '@noble/curves/secp256k1'
-import { npubEncode, encoderIsSane, mentionsUs, type BuzzEvent } from './mention.ts'
-import { makeGuardedTick } from './poller.ts'
+import { npubEncode, encoderIsSane, shouldDeliver, parseDmList, type BuzzEvent } from './mention.ts'
+import { makeGuardedTick, mergeTargets, type PollTarget } from './poller.ts'
 import { readVerdict, hostAlreadyDelivered, trustLabel, type Verdict } from './bridge.ts'
 
 const exec = promisify(execFile)
@@ -37,6 +37,7 @@ type Config = {
   relay_url: string
   private_key: string // 32-byte hex (configure mints hex; the CLI also accepts nsec)
   channels: string[] // channel UUIDs to watch for mentions
+  dms?: boolean // watch DM conversations too (default true)
   poll_ms?: number // default 15000
   buzz_path?: string // default 'buzz'
 }
@@ -54,6 +55,7 @@ function loadConfig(): Config | null {
           .split(',')
           .map(s => s.trim())
           .filter(Boolean),
+        dms: process.env.BUZZ_WATCH_DMS !== '0',
         poll_ms: Number(process.env.BUZZ_POLL_MS) || 15000,
         buzz_path: process.env.BUZZ_PATH || 'buzz',
       }
@@ -319,7 +321,7 @@ function deliver(ev: BuzzEvent, channel: string, trust: 'owner' | 'unknown') {
     .catch((e: unknown) => process.stderr.write(`buzz deliver failed: ${e}\n`))
 }
 
-async function pollChannel(channel: string, seen: SeenState) {
+async function pollChannel(channel: string, seen: SeenState, isDm = false) {
   let out: string
   try {
     out = await buzz(['messages', 'get', '--channel', channel, '--limit', '50'])
@@ -347,7 +349,11 @@ async function pollChannel(channel: string, seen: SeenState) {
     if (!ev || !ev.id) continue
     if ((seen[channel] || []).includes(ev.id)) continue
     markSeen(seen, channel, ev.id)
-    if (!coldStart && mentionsUs(ev, OUR_PUBKEY_HEX, OUR_NPUB, ENCODER_SANE)) {
+    // DIVE-3560 widened the gate (DMs deliver without a mention); DIVE-3573
+    // classifies whatever passes it. shouldDeliver is a strict superset of
+    // mentionsUs — non-DM defers to it — so the bridge sees every event the
+    // pre-merge code saw, plus DMs.
+    if (!coldStart && shouldDeliver(ev, OUR_PUBKEY_HEX, OUR_NPUB, ENCODER_SANE, isDm)) {
       // Awaited, not fired off: pollChannel already runs inside the DIVE-3486
       // non-overlap guard, and that guard's whole property is at most one poll
       // in flight. A fire-and-forget classification here would put one sudo
@@ -372,8 +378,22 @@ async function pollChannel(channel: string, seen: SeenState) {
   saveSeen(seen)
 }
 
+// The DM conversation set is not static: a customer opening a NEW DM creates a
+// channel we have never heard of, so the id list has to be re-fetched, not read
+// once from config. Discovery failure is silent-and-retry for the same reason a
+// channel poll hiccup is.
+async function discoverDms(): Promise<string[]> {
+  try {
+    return parseDmList(await buzz(['dms', 'list', '--limit', '100']))
+  } catch {
+    return []
+  }
+}
+
 function startPoller() {
-  if (!cfg || !cfg.channels?.length || !OUR_PUBKEY_HEX) return
+  if (!cfg || !OUR_PUBKEY_HEX) return
+  const watchDms = cfg.dms !== false
+  if (!cfg.channels?.length && !watchDms) return
   const seen = loadSeen()
   const interval = cfg.poll_ms || 15000
   // DIVE-3486: the tick MUST NOT overlap itself. It used to be
@@ -383,7 +403,15 @@ function startPoller() {
   // tools sharing this process. The guard and the measurements behind it live
   // in ./poller.ts, which is pure so repo CI (a bare `bun test`, no plugin deps
   // installed) can actually execute it.
-  const { tick } = makeGuardedTick(cfg.channels, ch => pollChannel(ch, seen))
+  //
+  // DIVE-3560: the poll set is no longer static. A customer opening a NEW DM
+  // creates a channel that was in no config, so the targets are RESOLVED once
+  // per cycle — inside the guard, because `dms list` spawns a child of its own
+  // and resolving outside it would put one unguarded spawn per tick back.
+  const { tick } = makeGuardedTick<PollTarget>(
+    async () => mergeTargets(cfg!.channels || [], watchDms ? await discoverDms() : []),
+    t => pollChannel(t.id, seen, t.isDm),
+  )
   // pollChannel swallows its own relay errors, but never rely on that from a
   // fire-and-forget call site: an unhandled rejection here would take the whole
   // MCP server down and every tool with it.

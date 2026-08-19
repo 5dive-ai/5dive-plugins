@@ -5,7 +5,7 @@
 // bare `bun test` with no plugin deps installed, so a test that reached this
 // through server.ts could not execute here at all.
 import { expect, test } from 'bun:test'
-import { makeGuardedTick } from './poller.ts'
+import { makeGuardedTick, mergeTargets } from './poller.ts'
 
 /** A poll that blocks until released, recording peak concurrency. */
 function blockingPoll() {
@@ -113,4 +113,70 @@ test('a throwing poll releases the guard', async () => {
   // of the process and inbound messaging would go silent with no error anywhere.
   await expect(g.tick()).rejects.toThrow('relay exploded')
   expect(calls).toBe(2)
+})
+
+// DIVE-3560 — the poll set is resolved per cycle, and DMs merge into it.
+
+test('a resolver form is re-resolved every cycle, so a newly opened DM is picked up', async () => {
+  let round = 0
+  const polled: string[][] = []
+  const { tick } = makeGuardedTick<string>(
+    () => (round++ === 0 ? ['a'] : ['a', 'new-dm']),
+    async ch => {
+      polled[round - 1] = [...(polled[round - 1] || []), ch]
+    },
+  )
+  await tick()
+  await tick()
+  expect(polled).toEqual([['a'], ['a', 'new-dm']])
+})
+
+test('the resolver runs INSIDE the guard — a dropped tick never resolves', async () => {
+  let resolves = 0
+  let release!: () => void
+  const gate = new Promise<void>(r => (release = r))
+  const { tick, dropped } = makeGuardedTick<string>(
+    () => {
+      resolves++
+      return ['a']
+    },
+    async () => gate,
+  )
+  const first = tick()
+  await tick() // arrives mid-cycle
+  expect(dropped()).toBe(1)
+  expect(resolves).toBe(1) // the dropped tick did NOT spawn a discovery child
+  release()
+  await first
+})
+
+test('an async resolver that rejects surfaces to the caller and releases the guard', async () => {
+  const { tick, busy } = makeGuardedTick<string>(
+    async () => {
+      throw new Error('dms list exploded')
+    },
+    async () => {},
+  )
+  await expect(tick()).rejects.toThrow('dms list exploded')
+  expect(busy()).toBe(false)
+})
+
+test('mergeTargets flags DMs and leaves configured channels as channels', () => {
+  expect(mergeTargets(['chan-1'], ['dm-1'])).toEqual([
+    { id: 'dm-1', isDm: true },
+    { id: 'chan-1', isDm: false },
+  ])
+})
+
+test('a uuid in BOTH lists is polled once, as a DM', () => {
+  const out = mergeTargets(['both', 'chan-1'], ['both'])
+  expect(out.filter(t => t.id === 'both')).toEqual([{ id: 'both', isDm: true }])
+  expect(out).toHaveLength(2)
+})
+
+test('no DMs discovered leaves the channel poll set exactly as it was', () => {
+  expect(mergeTargets(['a', 'b'], [])).toEqual([
+    { id: 'a', isDm: false },
+    { id: 'b', isDm: false },
+  ])
 })

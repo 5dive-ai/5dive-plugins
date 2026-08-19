@@ -40,7 +40,14 @@ try {
 const STATE_DIR = process.env.DASHBOARD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'dashboard')
 const ENV_FILE = join(STATE_DIR, '.env')
 const AGENT_INBOX_DIR = join(STATE_DIR, 'agent-inbox')
+// DIVE-3574: the control plane drops a zero-byte marker here (via the box's
+// shelld POST /shell/collect-now) to say "run your pending-collect now" instead
+// of waiting out the 5-minute timer below. A SEPARATE dir from agent-inbox on
+// purpose: a nudge carries no payload and must never be mistaken for a message
+// drop-file, so the two ingesters can never read each other's files.
+const COLLECT_NOW_DIR = join(STATE_DIR, 'collect-now')
 mkdirSync(AGENT_INBOX_DIR, { recursive: true, mode: 0o700 })
+mkdirSync(COLLECT_NOW_DIR, { recursive: true, mode: 0o700 })
 
 // Load ~/.claude/channels/dashboard/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — overrides live here
@@ -170,6 +177,31 @@ function startAgentInbox(): void {
   setInterval(drain, 15_000).unref()
 }
 
+// DIVE-3574: watch the collect-now dir and drain on a nudge. The marker is
+// deliberately NOT consumed — shelld rewrites one fixed path in place, so every
+// nudge fires an inotify event whether or not the file already exists, and
+// nothing has to survive a delete race. Events are coalesced over a short
+// window because fs.watch can double-fire on a single write and a burst of
+// messages is one collect, not several.
+//
+// Best-effort by design: if this watch never installs, or inotify drops the
+// event under pressure, the unchanged 5-minute timer still collects. Nothing
+// here may become load-bearing.
+function startCollectNowWatch(): void {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const fire = () => {
+    if (timer) return
+    timer = setTimeout(() => { timer = null; void drainPending() }, 250)
+    timer.unref?.()
+  }
+  try {
+    watch(COLLECT_NOW_DIR, () => fire())
+    process.stderr.write(`dashboard channel v${PLUGIN_VERSION}: watching collect-now at ${COLLECT_NOW_DIR}\n`)
+  } catch (err) {
+    process.stderr.write(`dashboard channel: collect-now watch failed (falling back to the 5-min poll): ${err}\n`)
+  }
+}
+
 // DIVE-848 offline heal: a message sent while this box was unreachable never
 // produced a drop file — it sits in the control plane with delivered_at NULL.
 // Pull those on boot (and on a slow sweep), push them into the session, then
@@ -177,7 +209,28 @@ function startAgentInbox(): void {
 // crash in between redelivers rather than losing the message. A row whose
 // drop landed but whose delivered-stamp write failed may arrive twice — rare
 // and preferable to silence.
+// DIVE-3574: drainPending is now reachable from three places (boot, the 5-min
+// timer, and a collect nudge that can fire several times a second while someone
+// types in the dashboard) where it used to be reachable from two that could
+// never overlap. Two concurrent drains fetch the SAME pending rows and push
+// each message into the session twice, because the ack only lands after the
+// notifications are sent — so serialise. `rerun` remembers that a nudge arrived
+// mid-drain and gives it one more pass, which is what keeps a message that
+// landed after the fetch from waiting out the full timer.
+let draining = false
+let rerun = false
 async function drainPending(): Promise<void> {
+  if (draining) { rerun = true; return }
+  draining = true
+  try {
+    await drainPendingOnce()
+  } finally {
+    draining = false
+  }
+  if (rerun) { rerun = false; await drainPending() }
+}
+
+async function drainPendingOnce(): Promise<void> {
   let items: Array<{ id: number; text: string; from?: string; chat_id?: string; ts?: string; image_path?: string }>
   try {
     const res = await fetch(`${API_BASE}/server/messages/pending?agent=${encodeURIComponent(AGENT)}`, {
@@ -310,6 +363,7 @@ await mcp.connect(new StdioServerTransport())
 // are unaffected.
 setTimeout(() => {
   startAgentInbox()
+  startCollectNowWatch()
   void drainPending()
 }, 5_000)
 setInterval(() => void drainPending(), 5 * 60_000).unref()
