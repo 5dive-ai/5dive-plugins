@@ -44,7 +44,7 @@ describe('Codex dashboard adapter end to end', () => {
           const body = await req.json() as { ids: number[] }
           acknowledgements.push(body.ids)
           pending = pending.filter(message => !body.ids.includes(message.id))
-          return Response.json({ ok: true })
+          return Response.json({ ok: true, acked: body.ids.length })
         }
         if (url.pathname === '/server/messages/event') {
           outbound.push(await req.json())

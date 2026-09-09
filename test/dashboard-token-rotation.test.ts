@@ -68,7 +68,7 @@ async function start(pending: Array<{ id: number; text: string }>): Promise<Harn
       if (url.pathname === '/server/messages/pending/ack') {
         const body = (await req.json()) as { ids: number[] }
         queue = queue.filter(m => !body.ids.includes(m.id))
-        return Response.json({ ok: true })
+        return Response.json({ ok: true, acked: body.ids.length })
       }
       if (url.pathname === '/server/messages/event') {
         const body = (await req.json()) as { body: string }

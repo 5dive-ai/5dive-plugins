@@ -32,6 +32,11 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
+import {
+  loadPendingRetryState,
+  nextPendingAttempt,
+  savePendingRetryState,
+} from './pending-redelivery.ts'
 
 let PLUGIN_VERSION = '?'
 try {
@@ -63,6 +68,11 @@ const COLLECT_NOW_DIR = join(STATE_DIR, 'collect-now')
 // showed exactly one live process across that window) — it is still a real
 // race, and it is scope 3 of this row.
 const DRAIN_LOCK = join(STATE_DIR, 'pending-drain.lock')
+const PENDING_RETRY_FILE = join(STATE_DIR, 'pending-redelivery.json')
+const PENDING_RETRY_BASE_MS = (() => {
+  const raw = Number(process.env.DASHBOARD_REDELIVERY_BACKOFF_MS)
+  return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60_000
+})()
 mkdirSync(AGENT_INBOX_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(COLLECT_NOW_DIR, { recursive: true, mode: 0o700 })
 if (DISPATCHER_ADAPTER) {
@@ -431,22 +441,53 @@ async function drainPendingOnce(): Promise<void> {
     return
   }
   if (items.length === 0) return
+  const retryState = loadPendingRetryState(PENDING_RETRY_FILE)
   const acked: number[] = []
   for (const m of items) {
     if (typeof m?.text !== 'string' || !m.text.trim()) { acked.push(m.id); continue }
+    const key = String(m.id)
+    const decision = nextPendingAttempt(retryState[key], Date.now(), PENDING_RETRY_BASE_MS)
+    if (decision.kind === 'backoff') continue
+    if (decision.kind === 'park') {
+      retryState[key] = decision.next
+      if (decision.log) {
+        recordLifecycle(
+          STATE_DIR,
+          'delivery',
+          'dashboard',
+          `pending message id=${m.id} parked after ${decision.next.attempts} unacknowledged attempts`,
+        )
+        savePendingRetryState(PENDING_RETRY_FILE, retryState)
+      }
+      continue
+    }
+    // Persist BEFORE handing bytes to the harness. A process death between the
+    // notification and the ack must not erase the attempt and reopen an
+    // unbounded duplicate loop after restart.
+    retryState[key] = decision.next
+    savePendingRetryState(PENDING_RETRY_FILE, retryState)
     try {
       await deliverInbound(`dashboard:pending:${m.id}`, m.text, {
             chat_id: typeof m.chat_id === 'string' && m.chat_id ? m.chat_id : 'dashboard',
-            message_id: '0',
+            message_id: key,
             user: m.from ?? 'dashboard',
             user_id: m.from ?? 'dashboard',
             ts: m.ts ?? new Date().toISOString(),
+            delivered_at: decision.deliveredAt,
+            delivery_attempt: decision.attempt,
+            redelivery: decision.redelivery,
             ...(typeof m.image_path === 'string' && m.image_path.startsWith('/')
               ? { image_path: m.image_path } : {}),
       })
+      recordLifecycle(
+        STATE_DIR,
+        'delivery',
+        'dashboard',
+        `pending message id=${m.id} pushed attempt=${decision.attempt} redelivery=${decision.redelivery}`,
+      )
       acked.push(m.id)
     } catch (err) {
-      process.stderr.write(`dashboard channel: pending push failed for ${m.id}: ${err}\n`)
+      recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `pending push failed id=${m.id} attempt=${decision.attempt}: ${err}`)
     }
   }
   if (acked.length === 0) return
@@ -460,14 +501,25 @@ async function drainPendingOnce(): Promise<void> {
     // rows are logged as collected while the control plane still holds them
     // uncollected — the exact split this row exists to close.
     if (!ack.ok) throw new Error(`${ack.status}`)
+    const ackBody = (await ack.json().catch(() => null)) as { acked?: unknown } | null
+    if (!ackBody || ackBody.acked !== acked.length) {
+      throw new Error(`ack count ${String(ackBody?.acked ?? 'missing')} for ${acked.length} pushed row(s)`)
+    }
     // DIVE-3809: "collected", not "delivered" or "healed". This ack attests
     // that the notification's bytes entered the stdout pipe — the SDK's send()
     // has no reject path, and a client with nothing subscribed drops the
     // notification silently — so it can never say the session displayed it.
     // The control plane now re-offers a collected row whose TTL expires.
     process.stderr.write(`dashboard channel: collected ${acked.length} pending message(s) (collection is not display)\n`)
+    for (const id of acked) delete retryState[String(id)]
+    savePendingRetryState(PENDING_RETRY_FILE, retryState)
   } catch (err) {
-    process.stderr.write(`dashboard channel: pending ack failed (row stays uncollected; re-offered next sweep): ${err}\n`)
+    recordLifecycle(
+      STATE_DIR,
+      'delivery',
+      'dashboard',
+      `pending ack failed ids=${acked.join(',')} (retry state retained): ${err}`,
+    )
   }
 }
 
