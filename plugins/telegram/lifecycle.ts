@@ -108,7 +108,7 @@ export function isBootParentAlive(pid: number): boolean {
 // started, exited nor crashed — the process is healthy and every other
 // surface reads healthy with it — so without an event of its own that state
 // is recorded as `nothing`, which is the failure this file exists to refuse.
-export type LifecycleEvent = 'start' | 'exit' | 'crash' | 'auth'
+export type LifecycleEvent = 'start' | 'exit' | 'crash' | 'auth' | 'delivery'
 
 /**
  * One line, one event, parseable and human-readable.

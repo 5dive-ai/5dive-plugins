@@ -65,7 +65,7 @@ async function start(
       if (url.pathname === '/server/messages/pending/ack') {
         const body = (await req.json()) as { ids: number[] }
         queue = queue.filter(m => !body.ids.includes(m.id))
-        return Response.json({ ok: true })
+        return Response.json({ ok: true, acked: body.ids.length })
       }
       return new Response('not found', { status: 404 })
     },

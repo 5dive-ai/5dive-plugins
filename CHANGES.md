@@ -23,6 +23,23 @@ breadcrumb intact, and the shipped version at or above 0.5.50. The agent-side
 `hooks/silence-watchdog.ts` is a different mechanism and stays untouched — it nudges the agent in
 its own transcript and sends nothing to a user.
 
+### Fixed — dashboard pending retries keep message identity and stop after three failed acknowledgements (DIVE-4125), dashboard 0.4.3
+
+The dashboard pending collector emitted `message_id: "0"` for every control-plane row, so a
+redelivery was indistinguishable from a new message and downstream `(chat_id, message_id)` dedup
+could not work. It now carries the row's stable id plus a per-attempt delivery timestamp, attempt
+number, and redelivery marker.
+
+An acknowledgement failure also used to leave only a transient stderr line and permitted every
+later boot, nudge, or sweep to push the same row again. A file-backed per-row retry ledger now
+applies exponential backoff, parks a row after three unacknowledged pushes, and records pushes,
+ack failures, and parking in `lifecycle.log`. Successful acknowledgements clear their ledger rows.
+
+`test/dashboard-redelivery.test.ts` drives the real plugin against a failing-ack control plane:
+three retries share one stable identity but have distinct delivery timestamps, the fourth drain is
+parked, a genuinely new row still arrives, and the diagnostic files remain readable. Mutating the
+message id back to `"0"` or raising the cap makes the test fail.
+
 ### Fixed — pairing a phone rotated the box token and the dashboard chat plugin never re-read it (DIVE-3810), dashboard 0.4.2
 
 `plugins/dashboard/server.ts` read `CONNECTORD_TOKEN` once at module scope and held it for the life
