@@ -1,5 +1,28 @@
 ## Unreleased
 
+### Fixed — the silence notice DM'd the operator on a seat that was answering elsewhere (DIVE-4123 / #54), telegram 0.5.50
+
+lodar filed 5dive-plugins#54 from a downstream seat on telegram v0.5.49 + dashboard: the plugin DM'd
+"nothing has reached this channel for 3 turns" plus ~1200 chars of another channel's transcript,
+while that seat was replying correctly on the dashboard. The silent-run analysis was hard-scoped to
+telegram — a dashboard inbound left `hadInbound` false and a dashboard reply left `hadSend` false —
+so every correctly-answered turn counted as dark and the run reached the 3-turn threshold. Its
+destination fell back to the paired human's DM whenever no group topic was configured, which is
+every seat.
+
+That code was already deleted by DIVE-3910 in 3cfec88 (call site, `hooks/lib/autonomous-silence.ts`
+and its unit file). What was missing is the release: the plugin version stayed at 0.5.49, and an
+install resolves a version-pinned cache path, so every 0.5.49 install kept running the leaking
+build. 0.5.50 is that bump — the fix ships by being installable.
+
+Asked on the #54 gate whether to preserve the removal or resurrect the notice with sibling-channel
+suppression; lodar chose preserve (2026-09-09). `test/dive4123-silence-notice-stays-removed.test.ts`
+is the tripwire that keeps it gone across the whole telegram family: no `autonomous-silence` module,
+no import or call of the silent-run analysis, no "reached this channel" text, the DIVE-3910
+breadcrumb intact, and the shipped version at or above 0.5.50. The agent-side
+`hooks/silence-watchdog.ts` is a different mechanism and stays untouched — it nudges the agent in
+its own transcript and sends nothing to a user.
+
 ### Fixed — pairing a phone rotated the box token and the dashboard chat plugin never re-read it (DIVE-3810), dashboard 0.4.2
 
 `plugins/dashboard/server.ts` read `CONNECTORD_TOKEN` once at module scope and held it for the life
