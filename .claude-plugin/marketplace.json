@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "5dive-plugins",
-  "description": "Claude Code plugins maintained by 5dive — Telegram bridge and related agent-channel integrations.",
+  "description": "Claude Code plugins maintained by 5dive — the one registry every 5dive plugin ships from. A plugin fix or a new plugin reaches customers when it is published here, never via a CLI release.",
   "owner": {
     "name": "5dive",
     "email": "support@5dive.com"
@@ -27,6 +27,20 @@
       "category": "productivity",
       "source": "./plugins/buzz",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/buzz"
+    },
+    {
+      "name": "voice",
+      "description": "Speak with your agent and hear it talk back — local speech-to-text and text-to-speech. The reference implementation of the 5dive plugin contract: a channel-capability plugin, the shape every later channel plugin copies.",
+      "category": "channel",
+      "source": "./plugins/voice",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/voice"
+    },
+    {
+      "name": "browser",
+      "description": "Persistent human-authenticated browser sessions: you log into a site once by hand, the agent is granted the session and never the credentials, and deterministic adapters decide where to click. A security challenge is a hard stop that asks for a person.",
+      "category": "channel",
+      "source": "./plugins/browser",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/browser"
     }
   ]
 }
