@@ -22,6 +22,20 @@ now has an app-server dispatcher in addition to its generated fallback; `telegra
 is a deliberate exception: opencode's headless server makes a relay simpler than
 an MCP fork (see its README + [the spike](./plugins/telegram-opencode-SPIKE.md)).
 
+## The other 5dive plugins
+
+Not every 5dive plugin is a Telegram fork. These live here too, and this repo is the
+**one registry** they all ship from — `voice` and `browser` moved out of the CLI's own
+`plugins/` directory (DIVE-4202) so a plugin fix reaches a customer on publish rather
+than on the next CLI release.
+
+| Plugin | What it is |
+| --- | --- |
+| [`dashboard`](./plugins/dashboard) | Talk to your agent from the authenticated web dashboard (and mobile app). |
+| [`buzz`](./plugins/buzz) | Buzz (Nostr) channel — inbound mentions arrive as channel notifications. |
+| [`voice`](./plugins/voice) | Local speech-to-text and text-to-speech. The reference implementation of the 5dive plugin contract. |
+| [`browser`](./plugins/browser) | Persistent human-authenticated browser sessions — the agent is granted the session and never the credentials. |
+
 ## Install
 
 ```text
