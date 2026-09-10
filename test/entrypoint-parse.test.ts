@@ -23,7 +23,7 @@
 // of the eight plugin dirs.
 
 import { describe, test, expect } from 'bun:test'
-import { readdirSync, readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { readdirSync, readFileSync, existsSync, statSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -58,6 +58,41 @@ const PLUGIN_DIRS = readdirSync(PLUGINS, { withFileTypes: true })
   .map(e => e.name)
   .sort()
 
+// DIVE-4202 — WHAT MUST HAVE A server.ts IS DERIVED, NOT "every directory".
+//
+// The must-have set used to be PLUGIN_DIRS itself. That was true only while
+// every plugin in this repo was a bun plugin. `browser` and `voice` arrived
+// from the CLI repo as BASH plugins — `bin/<name>`, no package.json, not one
+// .ts file — so "every directory ships plugins/<d>/server.ts" went red on
+// exactly the two that are correct as they are.
+//
+// A plugin is graded as a TypeScript plugin when it DECLARES one: a
+// package.json whose `start` script is what the launcher runs, naming a .ts
+// file. That declaration is the thing that makes a server.ts owed. Deriving it
+// this way also closes a hole the directory listing had: deleting a plugin's
+// package.json used to change nothing, and now drops it out of the derived set
+// — so the floor assertions below fail if the set ever empties or shrinks
+// under the population that exists on disk. DIVE-3752 stands: the loop is not
+// deleted, and every plugin that declares a TS launcher is still asserted to
+// ship the server.ts whose broken base was invisible.
+type TsPlugin = { dir: string; entries: string[] }
+
+function declaredTsEntries(dir: string): string[] {
+  const pkgPath = join(PLUGINS, dir, 'package.json')
+  if (!existsSync(pkgPath)) return []
+  const start = String(JSON.parse(readFileSync(pkgPath, 'utf8'))?.scripts?.start ?? '')
+  return [...start.matchAll(/bun\s+([A-Za-z0-9_.\-/]+\.ts)/g)].map(m => m[1])
+}
+
+const TS_PLUGINS: TsPlugin[] = PLUGIN_DIRS
+  .map(dir => ({ dir, entries: declaredTsEntries(dir) }))
+  .filter(p => p.entries.length > 0)
+
+// The complement: a plugin that declares no TS launcher must be a real bash
+// plugin, i.e. ship an executable bin/<name>. Without this a TS plugin could
+// lose its package.json and fall silently out of TS_PLUGINS instead of failing.
+const BASH_PLUGINS = PLUGIN_DIRS.filter(d => !TS_PLUGINS.some(p => p.dir === d))
+
 // ── the gate itself ─────────────────────────────────────────────────────────
 
 describe('every plugin TypeScript file parses', () => {
@@ -65,8 +100,24 @@ describe('every plugin TypeScript file parses', () => {
 
   test('the sweep is not vacuous — it found the servers it is supposed to grade', () => {
     expect(files.length).toBeGreaterThan(20)
-    for (const d of PLUGIN_DIRS) {
-      expect(files).toContain(join(PLUGINS, d, 'server.ts'))
+    // FLOOR: an empty or collapsed derived set fails here rather than passing
+    // by grading nothing. Every plugin dir is accounted for as TS or bash.
+    expect(TS_PLUGINS.length).toBeGreaterThanOrEqual(5)
+    expect(TS_PLUGINS.length + BASH_PLUGINS.length).toBe(PLUGIN_DIRS.length)
+    for (const p of TS_PLUGINS) {
+      expect(files).toContain(join(PLUGINS, p.dir, 'server.ts'))
+      for (const rel of p.entries) expect(files).toContain(join(PLUGINS, p.dir, rel))
+    }
+  })
+
+  test('a plugin with no declared TS entry point is a real bash plugin', () => {
+    for (const d of BASH_PLUGINS) {
+      const bin = join(PLUGINS, d, 'bin', d)
+      expect(existsSync(bin)).toBe(true)
+      // executable, or the CLI's verb dispatcher refuses it (DIVE-4035)
+      expect(statSync(bin).mode & 0o111).toBeGreaterThan(0)
+      // and it really ships no TypeScript, which is why it owes no server.ts
+      expect(files.filter(f => f.startsWith(join(PLUGINS, d) + '/'))).toEqual([])
     }
   })
 
@@ -84,16 +135,11 @@ describe('every plugin TypeScript file parses', () => {
 // its entry point must not be able to fall out of this gate silently.
 
 describe('the file each plugin actually launches parses', () => {
-  for (const d of PLUGIN_DIRS) {
-    const pkgPath = join(PLUGINS, d, 'package.json')
-    if (!existsSync(pkgPath)) continue
-    const start = String(JSON.parse(readFileSync(pkgPath, 'utf8'))?.scripts?.start ?? '')
-    const named = [...start.matchAll(/bun\s+([A-Za-z0-9_.\-/]+\.ts)/g)].map(m => m[1])
+  test('at least one plugin declares a TypeScript entry point', () => {
+    expect(TS_PLUGINS.length).toBeGreaterThanOrEqual(5)
+  })
 
-    test(`${d}: start script names a .ts entry point`, () => {
-      expect(named.length).toBeGreaterThan(0)
-    })
-
+  for (const { dir: d, entries: named } of TS_PLUGINS) {
     for (const rel of named) {
       test(`${d}: ${rel} parses`, () => {
         const abs = join(PLUGINS, d, rel)
