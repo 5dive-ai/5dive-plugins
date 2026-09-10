@@ -20,6 +20,87 @@ than a detail.
 5dive browser run <site> <action> [--key=value ...]
 ```
 
+## Server mode: the browser lives on the box, you reach it through a one-time link
+
+On a managed 5dive VM there is no display and there never will be one. `auth` used to refuse
+there, and the only route past that refusal was `ssh -X` + `apt install chromium` + a hand-written
+JSON file — which is not a product a customer can use.
+
+So the browser runs **on the box**, on a persistent Xvfb display owned by the seat, and a person
+reaches it through a viewer that is handed out as a **one-time, expiring, session-bound** ticket:
+
+```
+5dive browser serve <site>                                   # persistent Chrome on its own Xvfb
+5dive browser serve <site> --stop                            # stop the browser; the profile survives
+5dive browser viewer <site> --bind=<session> [--ttl=600]     # mint a one-time link
+5dive browser viewer-redeem <site> --nonce=- --session=<id>  # the relay's gate; consumes the link
+5dive browser viewer-revoke <site>                           # kill the view, keep the login
+```
+
+A successful `viewer-redeem` prints the two things the relay needs, and prints them exactly once:
+
+```
+target=127.0.0.1:6080
+password=<the VNC credential x11vnc was started with>
+```
+
+The password is emitted **here and nowhere else**. `x11vnc` runs with `-passwdfile` inside the
+seat's `0700` profile directory — the one place the relay is deliberately unable to read — so a
+target without the password is a port that prompts for a secret nobody has. It rides the redemption
+because the redemption already has exactly the right lifetime: one use, one bound session, consumed
+in the same breath. The `-timeout` `x11vnc` is started with **is the ticket's TTL**, not a constant:
+a VNC server that gives up before its own link expires hands the customer a spent link and a dead
+port.
+
+Same length is not yet the same window, so both are measured from **one clock, stamped before
+`x11vnc` starts**. `-timeout` is a length counted from launch; `expires_at` is an instant, and it
+used to be stamped after the bridge-readiness wait — up to `VIEWER_BRIDGE_WAIT_S` later. On a slow
+bridge that made the ticket outlive the viewer it names, and the last seconds of the advertised
+window were the dead-port failure again, reached from the other end. The other available fix —
+padding `-timeout` by the wait — was rejected on purpose: it leaves a VNC server accepting a client
+after its own ticket has expired, which is a live credential with no authorization left behind it.
+The ticket may advertise no more life than the server was given, never more.
+
+`auth` on a display-less box starts server mode instead of dead-ending. A box that does not have
+the server-mode packages still refuses — and names which ones it lacks, rather than half-starting.
+
+### What protects the session while the viewer is open
+
+A viewer onto a logged-in profile is not a screenshot; it is the credential with a keyboard
+attached. Five properties, each of which fails closed:
+
+1. **Nothing listens off-box.** `Xvfb -nolisten tcp`, `x11vnc -localhost -once`, the bridge on
+   `127.0.0.1`. Redemption returns a loopback target; the customer arrives through the box's
+   already-authenticated relay, never through a port we opened.
+2. **The ticket is a nonce we do not keep.** 32 bytes of urandom, stored only as its SHA-256 — the
+   same rule the human-gate nonces use, for the same reason. The raw value exists once, in the line
+   printed to whoever asked.
+3. **It is single-use, and the replay branch is a PURE refusal.** A TTL cannot close a replay inside
+   its own window; consuming the ticket can. The spent-state check runs *before* the nonce compare,
+   so a used ticket is not an oracle — which also puts it ahead of everything that establishes who
+   is calling, so it computes, refuses, and touches nothing. A teardown on that branch would let one
+   call that names only the site kill a customer's live viewer. Reaping the view belongs to
+   `x11vnc -once`/`-timeout` and to the expiry branch, where the fact is about the ticket rather
+   than a claim about the caller.
+4. **It is bound to the session that asked.** `--bind` is mandatory; there is no implicit unbound
+   ticket, because an unbound one is a bearer credential for a live logged-in account.
+   `--bind=local` is the named escape for a hand-run on the box. A refused redemption from the
+   wrong session does not spend the ticket for the right one — and neither does a redemption that
+   finds the viewer's credential gone: it refuses, leaves the ticket open, and the same link works
+   once a viewer is running again.
+5. **The nonce never enters argv.** `/proc/<pid>/cmdline` is readable by other seats, so
+   `viewer-redeem` takes the nonce on **stdin** and refuses `--nonce=<value>` outright.
+6. **It is never minted onto a port that is not accepting yet.** The display server and the
+   websocket bridge start in the background, so "the mint returned" and "the port is bound" are
+   different moments — and the relay redeems the link the instant it gets it. `viewer` waits for
+   both loopback ports to be listening before it prints a link, and refuses (issuing no link at
+   all) if either never comes up. A one-time link onto a dead port costs the customer their single
+   redemption; no link costs them a retry. The wait reads `/proc/net/tcp` rather than connecting,
+   because connecting would itself spend the one client `x11vnc -once` admits.
+
+**Killing the viewer does not kill the browser.** The profile is the durable half; the view onto it
+is the ephemeral half. `viewer-revoke` ends the view and the session stays logged in.
+
 ## The auth model
 
 `5dive browser auth <site>` opens a browser profile dedicated to that site and you log in
@@ -102,12 +183,12 @@ someone else's maintenance schedule, so six dependencies is six adapter surfaces
 
 ## Not shipped yet, and named so nobody assumes it
 
-- **SERVER mode** — a persistent Chrome on a virtual display (Xvfb) with the 5dive extension and a
-  local relay. `auth` currently needs a display and refuses without one instead of pretending.
-- **The re-auth viewer** — exposing the session through a temporary noVNC/KasmVNC URL so a person
-  can log in or clear a challenge from a phone. That URL is **credential-grade while it is open**:
-  short TTL, single use, and never written to a log, a task body or a chat message. Decide that
-  with the flow, not after.
+- **The customer-facing FLOW.** Server mode and the viewer above are built, but they ship **dark**:
+  reachable by hand on a box that has the packages, wired to no button. The dashboard tile and the
+  relay that gates on `viewer-redeem` are DIVE-4239; the provisioning that installs
+  chromium/xvfb/x11vnc/websockify is DIVE-4238; and no human has yet logged into a real site
+  through a real viewer on a managed box. Until that end-to-end arm runs, the flow is not shipped —
+  a tile that promises a login nobody has driven is the failure DIVE-3590 named.
 - **RELAY mode** — an outbound relay to Chrome on the user's own laptop. It must target a
   **dedicated profile on that desktop, never the user's default**; reaching the default discards
   the entire reason profile-per-site is the design, turning an adapter bug into their bank and
