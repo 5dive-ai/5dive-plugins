@@ -1,5 +1,129 @@
 ## Unreleased
 
+### Added — browser server mode and a one-time re-auth viewer, so a managed box needs no ssh, no apt and no display (DIVE-4118), browser 1.1.0
+
+DIVE-4021 shipped `5dive browser auth` as "open a real Chromium, and REFUSE without a display". On a
+managed 5dive VM there is no display and there never will be, so the only route through that refusal
+was `ssh -X` plus `apt install chromium` plus a hand-written adapter JSON. lodar, 2026-09-09: *"thats
+too difficult for customers. the point was to make it easy to use for our paid customers on our
+managed vm"*.
+
+Server mode is the shape 4021's own design named as the DEFAULT and did not ship. The profile's
+Chrome now lives on a persistent Xvfb display owned by the seat, and a person reaches it — to log in
+the first time, and again when the site kills the session — through a viewer handed out as a one-time
+ticket:
+
+```
+5dive browser serve <site>                                   # persistent Chrome on its own Xvfb
+5dive browser viewer <site> --bind=<session> [--ttl=600]     # mint a one-time link
+5dive browser viewer-redeem <site> --nonce=- --session=<id>  # the relay's gate; consumes the link
+5dive browser viewer-revoke <site>                           # kill the view, keep the login
+```
+
+`auth` on a display-less box no longer dead-ends: it starts server mode and tells you to ask for a
+viewer link. The old refusal survives only where it is true — a box without the server-mode packages,
+which now says *which* ones it lacks instead of half-starting. The manifest version moves with the
+verbs (1.0.0 -> 1.1.0) because `plugin add` resolves a version-pinned cache path: a fix ships by being
+installable, not by being merged.
+
+#### The question 4021 left open: what protects the session WHILE the viewer is open
+
+A viewer onto a logged-in profile is not a screenshot. It is the credential with a keyboard attached,
+so the answer is five properties and every one of them fails closed.
+
+1. **Nothing listens off-box.** `Xvfb -nolisten tcp`, `x11vnc -localhost -once`, the websocket bridge
+   on `127.0.0.1`. Redemption hands the relay a loopback target; the customer arrives through the
+   box's already-authenticated relay, never a port we opened.
+2. **The ticket is a nonce we do not keep.** 32 bytes of urandom; the file stores only its SHA-256.
+   The raw value exists exactly once, in the line we print.
+3. **It is single-use, and the replay branch is a pure refusal.** The spent-state check runs *before*
+   the nonce compare, so a dead ticket is not an oracle — and that branch touches nothing, so a replay
+   carrying a garbage nonce cannot tear down the live viewer it was refused from.
+4. **It is bound to the session that asked.** `--bind` is mandatory; `--bind=local` is the named
+   escape for a hand-run. A wrong-session redemption is refused and does not spend the ticket for the
+   rightful holder.
+5. **The nonce never enters argv.** `/proc/<pid>/cmdline` is readable by other seats, so the nonce
+   arrives on stdin and `--nonce=<value>` is refused rather than accepted and hoped about.
+
+Killing the viewer does not kill the browser. The profile is the durable half; the view onto it is the
+ephemeral half, which is what lets the TTL be minutes.
+
+#### A link is never issued onto a bridge that is not accepting yet, and the ticket never outlives it
+
+The mint starts `x11vnc` and `websockify` in the background, so "started" and "accepting" are two
+different moments — and the product's whole shape is a one-time link handed to a relay that redeems it
+at once. `viewer` now waits (bounded, `VIEWER_BRIDGE_WAIT_S=10`) for both loopback ports to be
+accepting before it writes a ticket or prints a link, and on timeout reaps and refuses: no link at all
+costs a retry, a live link onto a dead port costs the customer their single redemption. The readiness
+probe READS `/proc/net/tcp` rather than connecting, because connecting would spend the `-once`
+admission the customer was promised. The previous ticket is revoked up front, since a mint that dies
+halfway has already killed the viewer that ticket pointed at.
+
+Both windows are then measured from **one clock, stamped before `x11vnc` starts**. `-timeout` is a
+length counted from launch; `expires_at` is an instant, and it used to be stamped *after* that wait —
+so on a slow bridge the ticket advertised up to ten seconds of life the VNC server had never been
+given, and the end of the advertised window was the dead-port failure again from the other end. The
+alternative fix (padding `-timeout` by the wait) was rejected on purpose: it leaves a VNC server
+accepting a client after its own ticket expired, which is a live credential with no authorization
+behind it.
+
+#### A profile directory that already exists is GRADED, not laundered
+
+`auth` ran `mkdir -p; chmod 700; _audit`, so on a directory that already existed the `chmod` repaired
+a group-readable profile a moment before the audit that exists to catch it — against the README's own
+rule that commands never repair. `_ensure_profile_dir` chmods only what it just created.
+
+#### Evidence
+
+`tests/browser_plugin_unit.sh`: **193 arms, 0 failed**, graded by **23 of 23 mutants killed** rather
+than by arm count. Every count below was re-derived in THIS repo at this head — the plugin changed
+repositories in DIVE-4202, so carrying forward numbers measured in the old one would be a claim about
+a tree that no longer exists.
+
+| mutant, i.e. the way the keyboard reaches the wrong person | suite |
+| --- | --- |
+| the ticket file keeps the raw nonce (compare adjusted so redemption still works: this isolates "the secret is on disk" from "redemption breaks") | 2 failed |
+| redemption does not consume the ticket (a leaked link replays) | 5 failed |
+| the expiry check is dropped | 2 failed |
+| the session binding is not checked (a pasted link works) | 3 failed |
+| a nonce in argv is accepted instead of refused | 2 failed |
+| an existing profile directory is chmod'ed instead of graded | 2 failed |
+| the package precondition is deleted | 4 failed |
+| `x11vnc` loses `-localhost` (it answers every seat on the box) | 1 failed |
+| `websockify` binds `0.0.0.0` instead of `127.0.0.1` | 1 failed |
+| `Xvfb` loses `-nolisten tcp` (the display becomes a remote keyboard) | 1 failed |
+| `x11vnc -timeout` goes back to a constant shorter than the minimum TTL | 3 failed |
+| `x11vnc -timeout` is a plausible constant (900) instead of derived from the TTL | 2 failed |
+| redemption prints the target but withholds the VNC password | 4 failed |
+| the nonce compare is moved AHEAD of the spent-state check (the oracle) | 3 failed |
+| `serve --stop` leaves the ticket open (it redeems onto a dead port) | 1 failed |
+| stopping the viewer leaves its password behind in the profile | 2 failed |
+| the replay branch tears the viewer down (a wrong nonce + a wrong session kills a live view) | 2 failed |
+| the ticket is consumed BEFORE the credential read that can refuse | 5 failed |
+| the bridge-readiness wait is deleted (a link onto a port nothing is bound to) | 8 failed |
+| the up-front revoke is dropped (a failed mint leaves the old link live onto a dead viewer) | 2 failed |
+| **new:** `expires_at` stamped AFTER the wait (the ticket outlives its own VNC server) | 1 failed |
+| **new:** `-timeout` padded by the bridge wait (the VNC server outlives its own ticket) | 3 failed |
+| **new:** the manifest version stays at the one that shipped without these verbs | 1 failed |
+
+There is no X server on a CI runner, so `Xvfb`/`x11vnc`/`websockify` are fakes on PATH — liveness is
+still the real PID check, redemption is still the real SHA-256 compare, and the only override is the X
+socket *directory*, a path, which cannot make a dead display read as live. The fakes RECORD their argv
+and BIND the port they are handed: written the first way they `exec sleep 300` and discarded `"$@"`,
+which silently deleted the surface carrying the property this design leads with. Captures are cleared
+before the mint that should rewrite them and read through a bounded non-empty wait, and every
+"does not contain" assertion over a capture is paired with a control that the capture is non-empty —
+an empty file contains no mutant string either, which is how "the flag is absent" and "the file is
+absent" rendered identically.
+
+#### Not in this change, and owed
+
+The packaging half is not here: `5dive-api scripts/install/apps.sh` does not yet preinstall
+chromium/xvfb/x11vnc/websockify or run `5dive plugin add browser` + `browser setup` at provision time
+(DIVE-4238), and the dashboard's Connect/Reconnect tile is not built (DIVE-4239). No real `x11vnc` has
+been asked to honour these flags and no human has logged into a real site through a real viewer. Server
+mode therefore ships **dark** — reachable by hand on a box that has the packages, not wired to a button.
+
 ### Fixed — the silence notice DM'd the operator on a seat that was answering elsewhere (DIVE-4123 / #54), telegram 0.5.50
 
 lodar filed 5dive-plugins#54 from a downstream seat on telegram v0.5.49 + dashboard: the plugin DM'd
