@@ -33,6 +33,7 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { parseGateReply, resolveGateReply, gateAlertIdent } from './gatereply'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
+import { planAutoAttach, autoAttachFooter, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
@@ -1062,6 +1063,59 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// DIVE-4280: the auto-attach footer rides inside the message text, so in
+// markdownv2 mode it owes the same escaping the caller owes its own text — a
+// bare '.md' or '+2' is a MarkdownV2 syntax error and the whole send 400s.
+function mdv2(t: string): string {
+  return t.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1')
+}
+
+// DIVE-4280: edits are progress updates on ONE message and the server stitches
+// a sticky header onto each, so the same named path would re-attach on every
+// edit. Remember per message what auto-attach already sent (bounded like the
+// anchor/option caches) and never send it twice for that message.
+const AUTOATTACH_MEMO_CAP = 200
+const autoAttached = new Map<number, Set<string>>()
+function autoAttachedFor(message_id: number): Set<string> {
+  let memo = autoAttached.get(message_id)
+  if (!memo) {
+    if (autoAttached.size >= AUTOATTACH_MEMO_CAP) {
+      const oldest = autoAttached.keys().next().value
+      if (oldest != null) autoAttached.delete(oldest)
+    }
+    memo = new Set<string>()
+    autoAttached.set(message_id, memo)
+  }
+  return memo
+}
+
+// DIVE-4280: ship an auto-attach plan's files. Same transport as files=
+// (images as photos, the rest as documents), but wrapped per file: a Telegram
+// rejection on a file the AGENT never asked to send must not turn an
+// already-delivered message into a tool error. assertSendable() is re-applied
+// as the second net over the channel-state dir.
+async function sendAutoAttachments(
+  chat_id: string,
+  plan: AutoAttachPlan,
+  opts: Record<string, unknown>,
+): Promise<number[]> {
+  const ids: number[] = []
+  for (const f of plan.attach) {
+    try {
+      assertSendable(f)
+      const input = new InputFile(f)
+      const sent = AUTO_PHOTO_EXTS.has(extname(f).toLowerCase())
+        ? await bot.api.sendPhoto(chat_id, input, opts)
+        : await bot.api.sendDocument(chat_id, input, opts)
+      ids.push(sent.message_id)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(`telegram auto-attach: skipped ${f}: ${msg}\n`)
+    }
+  }
+  return ids
+}
+
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
   {
@@ -1135,7 +1189,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading under a specific message, message_thread_id for posting into a forum topic, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading under a specific message, message_thread_id for posting into a forum topic, and files (absolute paths) to attach images or documents. You do not have to remember files= for a file you NAME: the server auto-attaches up to 5 readable document/media paths written in the text (.md .txt .log .json .csv .yaml .html .pdf images audio video) and appends an \'attached: <name>\' line. Credential-shaped paths and anything under ~/.claude are never auto-attached; paths inside fenced code blocks are treated as examples. files= still wins and is never doubled.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1325,6 +1379,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // DIVE-4280: a path the agent NAMES in prose is attached even when
+        // files= was not passed — the paired human has no terminal, and the
+        // CLAUDE.md rule to pass files= demonstrably does not transfer. The
+        // explicit param still wins: anything already in files= is excluded
+        // here, so nothing is sent twice. Denylist, eligible extensions and
+        // lodar's 5-file cap live in autoattach.ts.
+        const autoPlan = planAutoAttach(text, { already: files })
+        const autoFooter = autoAttachFooter(autoPlan)
+
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
@@ -1349,7 +1412,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         })()
         // DIVE-332: detect a trailing yes/no question and strip any opt-out
         // marker. The Yes/No keyboard attaches to the LAST text chunk only.
-        const { stripped, keyboard: ynKeyboard } = yesNoButtons(text)
+        const { stripped: strippedRaw, keyboard: ynKeyboard } = yesNoButtons(text)
+        // DIVE-4280: the 'attached:' footer goes on AFTER the button detectors
+        // have read the original text — otherwise it eats the trailing '?' the
+        // Yes/No and option keyboards key off. It IS part of the logical
+        // message, so it rides into the chunker and into the rolling log.
+        const stripped = autoFooter
+          ? `${strippedRaw}\n\n${parseMode ? mdv2(autoFooter) : autoFooter}`
+          : strippedRaw
         // textMissing → files-only reply: emit no text message at all.
         const chunks = textMissing ? [] : chunk(senderPrefix + stripped, limit, mode)
         // DIVE-708: a choice-list keyboard takes precedence over Yes/No, but only
@@ -1407,6 +1477,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             sentIds.push(sent.message_id)
           }
         }
+
+        // DIVE-4280: then the auto-attached ones, threaded the same way.
+        sentIds.push(...(await sendAutoAttachments(chat_id, autoPlan, {
+          ...(reply_to != null && replyMode !== 'off'
+            ? { reply_parameters: { message_id: reply_to } }
+            : {}),
+          ...(message_thread_id != null ? { message_thread_id } : {}),
+        })))
 
         markReplySent()
         // DIVE-1028: record our own reply in the rolling log too, so a
@@ -1494,13 +1572,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (anchor && body.startsWith(anchor)) {
           body = body.slice(anchor.length).replace(/^(\s*\n)+\s*(→\s+)?/, '')
         }
-        const finalText = anchor ? `${anchor}${ANCHOR_SEPARATOR}${body}` : body
+        // DIVE-4280: same auto-attach on an edit — a progress update that
+        // names the report it just wrote should carry it. Scan only the NEW
+        // body, never the stitched anchor: the anchor is the original reply's
+        // text, which already had its turn. Per-message memo on top, because
+        // the sticky header means a later edit repeats earlier prose.
+        const editMemo = autoAttachedFor(message_id)
+        const editPlan = planAutoAttach(body, { already: [...editMemo] })
+        for (const f of editPlan.attach) editMemo.add(f)
+        const editFooter = autoAttachFooter(editPlan)
+        const bodyWithFooter = editFooter
+          ? `${body}\n\n${editParseMode ? mdv2(editFooter) : editFooter}`
+          : body
+        const finalText = anchor ? `${anchor}${ANCHOR_SEPARATOR}${bodyWithFooter}` : bodyWithFooter
         const edited = await bot.api.editMessageText(
           chat_id,
           message_id,
           finalText,
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
+        await sendAutoAttachments(chat_id, editPlan, {})
         // DIVE-4276: an edit lands on a message we already sent, so it proves
         // liveness (clock reset) but cannot answer an inbound that arrived
         // AFTER it. Contact only — this used to stamp lastReplyAt, which marked
