@@ -18,7 +18,10 @@
 //     eligible: any .claude/.ssh/.config/.aws/.gnupg tree on the box (not just
 //     the running seat's — seat homes here are mutually readable), the
 //     `.claude.json` sibling file, .env, *secret*/*token* names, ssh keys,
-//     /etc/5dive, /var/lib/5dive. server.ts's assertSendable() is a second, narrower net
+//     /etc/5dive, /var/lib/5dive, /var/log. In front of all of it sits an
+//     ALLOWLIST of roots a file may live under at all (homes, /tmp, /var/tmp,
+//     the cwd), so a sensitive directory nobody listed is ineligible by
+//     default. server.ts's assertSendable() is a second, narrower net
 //     over the channel state dir; this one is the wide one.
 
 import { statSync, realpathSync } from 'node:fs'
@@ -86,16 +89,48 @@ export function deniedDirs(_home = homedir()): string[] {
   return [
     '/etc/5dive',
     '/var/lib/5dive',
+    // /var/log/5dive/agent-audit.log is 0640 root:claude — readable by every
+    // seat through the `claude` group — 20 MB (under the send cap) and it logs
+    // command ARGUMENTS, which on this box include cleartext telegram bot
+    // tokens. "the audit trail is in /var/log/5dive/agent-audit.log" is an
+    // ordinary sentence here. All of /var/log goes, not just the 5dive dir:
+    // nothing under it is an artefact an agent wrote for the human, and auth.log
+    // and cloud-init logs are the same shape of leak. (quinn, DIVE-4280.)
+    '/var/log',
     '/etc/ssh',
     '/root',
   ]
 }
 
 /**
+ * Roots an auto-attachable file may live under — the ALLOWLIST that stops the
+ * enumeration game.
+ *
+ * Three verify iterations each found one more forbidden place the denylist had
+ * not thought of (`.claude.json`, another seat's home, /var/log/5dive). That is
+ * a denylist's failure mode, not three unrelated misses: the box has more
+ * sensitive directories than anyone can list, and a new one appears whenever
+ * something is installed. So the shape is inverted — a file is eligible only
+ * when it sits somewhere agents actually WRITE artefacts for the human: a home
+ * directory, a scratch dir, or the process's own working tree. Everything else
+ * (/etc, /var/lib, /var/log, /proc, /sys, /usr, /opt, /srv, /boot, a mounted
+ * backup) is ineligible without needing to be named. The denylist stays in
+ * front of it and still carves the credential-shaped files OUT of these roots.
+ */
+export function allowedRoots(home = homedir()): string[] {
+  const roots = ['/home', '/tmp', '/var/tmp', home]
+  try { roots.push(process.cwd()) } catch { /* cwd unlinked; roots are enough */ }
+  return roots
+}
+
+/**
  * True when a path must never be auto-attached. Checked on the RESOLVED path,
  * so a symlink into any .claude tree cannot launder a token out.
  */
-export function isDenied(resolved: string, _home = homedir()): boolean {
+export function isDenied(resolved: string, home = homedir()): boolean {
+  // Allowlist first: outside the roots agents write artefacts in, nothing is
+  // eligible, whether or not this file has thought of it.
+  if (!allowedRoots(home).some(r => resolved === r || resolved.startsWith(r + sep))) return true
   for (const seg of resolved.split(sep)) {
     if (DENY_SEGMENTS.has(seg)) return true
   }

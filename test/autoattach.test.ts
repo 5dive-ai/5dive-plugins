@@ -191,6 +191,52 @@ describe('denylist: credential-shaped paths never auto-attach', () => {
     // The segment rule holds for a tree that is nobody's home at all.
     expect(isDenied('/srv/backup/home/agent-main/.claude/settings.json', HOME)).toBe(true)
   })
+
+  // quinn's third verify pass: /var/log/5dive/agent-audit.log is 0640
+  // root:claude (every seat reads it through the `claude` group), 20 MB — under
+  // the send cap — and it logs command ARGUMENTS, which on this box include
+  // cleartext telegram bot tokens. This arm names the REAL file, so it only
+  // passes because the rule denies it, not because the path is fictional.
+  test('/var/log/5dive/agent-audit.log — the real, readable, under-cap audit log', () => {
+    const real = '/var/log/5dive/agent-audit.log'
+    const p = plan(`the audit trail is in ${real}`)
+    expect(p.attach).toEqual([])
+    expect(p.overflow).toBe(0)
+    expect(autoAttachFooter(p)).toBe('')
+    expect(isDenied(real, HOME)).toBe(true)
+    expect(isDenied('/var/log/auth.log', HOME)).toBe(true)
+  })
+
+  // The structural half of the fix: three iterations each found one more place
+  // the enumeration missed, so eligibility is now an ALLOWLIST of roots. A
+  // sensitive directory nobody thought to name is ineligible for being outside
+  // them, with no entry required.
+  test('anything outside the attachable roots is ineligible without being named', () => {
+    for (const outside of [
+      '/etc/hosts.json',
+      '/etc/nginx/sites-enabled/default.json',
+      '/var/lib/postgresql/dump.csv',
+      '/var/log/5dive/agent-audit.log',
+      '/usr/share/doc/readme.txt',
+      '/opt/vendor/config.yaml',
+      '/proc/self/environ.txt',
+      '/boot/grub/grub.csv',
+    ]) {
+      expect(isDenied(outside, HOME)).toBe(true)
+    }
+  })
+
+  test('positive control: the allowlist did not swallow the feature', () => {
+    // Homes, scratch dirs and the working tree stay eligible — this is the arm
+    // that would fail if the roots were drawn too tight.
+    expect(isDenied(join(HOME, 'notes', 'summary.md'), HOME)).toBe(false)
+    expect(isDenied('/home/agent-x/report.md', HOME)).toBe(false)
+    expect(isDenied('/tmp/report.md', HOME)).toBe(false)
+    expect(isDenied('/var/tmp/report.md', HOME)).toBe(false)
+    expect(isDenied(join(process.cwd(), 'plugins', 'telegram', 'README.md'), HOME)).toBe(false)
+    // and end to end, not just through the predicate
+    expect(plan(`wrote it to ${P('report.md')}`).attach).toEqual([P('report.md')])
+  })
 })
 
 describe("lodar's cap: five tops, then say how many were skipped", () => {
