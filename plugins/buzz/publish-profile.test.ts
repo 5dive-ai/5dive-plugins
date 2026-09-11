@@ -114,16 +114,16 @@ test('only the mark tier answers 200: the mark is what gets published', () => {
 })
 
 test('when several tiers answer 200 the character pack wins over the mark', () => {
-  const r = run(['character-packs', '/plugins/buzz/marks/'])
+  const r = run(['5dive-marketplace', '/plugins/buzz/marks/'])
   expect(r.published).toHaveLength(1)
-  expect(r.published[0]).toContain('character-packs')
+  expect(r.published[0]).toContain('5dive-marketplace')
   expect(r.out).toMatch(/OK {4}testseat.*pack /)
 })
 
 test('an accepted write whose profile does not read back is a FAIL, not an OK', () => {
   // The relay behaviour this row was filed over: accepted:true, event id, and
   // an empty read. Publishing must not be reported as success on that.
-  const r = run(['character-packs'], 'empty')
+  const r = run(['5dive-marketplace'], 'empty')
   expect(r.published).toHaveLength(1) // the write was attempted and accepted
   expect(r.out).toContain('write accepted but read-back picture is')
   expect(r.out).toContain('failed=1')

@@ -10,7 +10,7 @@
 #   ./publish-profile.sh --all --dry-run     # resolve + probe, publish nothing
 #
 # Avatar resolution, first URL that actually answers 200 wins:
-#   1. character-packs  packs/<persona>/avatar.png   — the persona's card art
+#   1. 5dive-marketplace  packs/<persona>/avatar.png   — the persona's card art
 #   2. openagent        faces/<persona>.png
 #   3. this plugin      marks/<agent type>.png       — the type mark fallback
 #   4. this plugin      marks/agent.png
@@ -27,7 +27,7 @@
 # write is not evidence of a rendered avatar.
 set -uo pipefail
 
-PACK_URL='https://raw.githubusercontent.com/5dive-ai/character-packs/main/packs/%s/avatar.png'
+PACK_URL='https://raw.githubusercontent.com/5dive-ai/5dive-marketplace/main/packs/%s/avatar.png'
 FACE_URL='https://raw.githubusercontent.com/5dive-ai/openagent/main/faces/%s.png'
 # Overridable so the mark tier can be positive-controlled against a pushed
 # branch before it merges — an unreachable tier is silently skipped, so
