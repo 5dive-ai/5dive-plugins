@@ -25,6 +25,8 @@ import {
 
 let HOME: string
 let ROOT: string
+/** A SECOND seat's home, to prove the denylist is not rooted at the running seat. */
+let OTHER_HOME: string
 const P = (rel: string) => join(ROOT, rel)
 
 function touch(path: string, bytes = 16): string {
@@ -37,8 +39,10 @@ beforeAll(() => {
   const base = mkdtempSync(join(tmpdir(), 'dive4280-'))
   HOME = join(base, 'home')
   ROOT = join(base, 'work')
+  OTHER_HOME = join(base, 'home-other-seat')
   mkdirSync(HOME, { recursive: true })
   mkdirSync(ROOT, { recursive: true })
+  mkdirSync(OTHER_HOME, { recursive: true })
   touch(P('report.md'))
   touch(P('second.md'))
   touch(P('third.md'))
@@ -52,6 +56,10 @@ beforeAll(() => {
   touch(P('huge.mp4'), 0) // size faked via probe in the size arm
   touch(join(HOME, '.claude', 'channels', 'telegram', 'access.json'))
   touch(join(HOME, '.claude', 'settings.json'))
+  touch(join(HOME, '.claude.json'))
+  touch(join(OTHER_HOME, '.claude', 'channels', 'telegram', 'access.json'))
+  touch(join(OTHER_HOME, '.claude.json'))
+  touch(join(OTHER_HOME, '.ssh', 'config'))
   touch(P('.env'))
   touch(P('deploy-token.txt'))
   touch(P('id_ed25519'))
@@ -154,6 +162,34 @@ describe('denylist: credential-shaped paths never auto-attach', () => {
   })
   test('a symlink cannot launder a denied file out (checked on the resolved path)', () => {
     expect(plan(`harmless: ${P('sub/innocent.json')}`).attach).toEqual([])
+  })
+
+  // The two arms quinn's verify pass proved were missing at 2dd2f33. Both files
+  // exist, are readable by the running seat, and end in an eligible extension —
+  // only the denylist stands between them and the chat.
+  test('~/.claude.json — a SIBLING of ~/.claude, which no directory rule reaches', () => {
+    const p = plan('your config is at ~/.claude.json')
+    expect(p.attach).toEqual([])
+    expect(autoAttachFooter(p)).toBe('')
+    expect(isDenied(join(HOME, '.claude.json'), HOME)).toBe(true)
+    // …and by its absolute path, and in any other seat's home.
+    expect(plan(`see ${join(HOME, '.claude.json')}`).attach).toEqual([])
+    expect(plan(`see ${join(OTHER_HOME, '.claude.json')}`).attach).toEqual([])
+  })
+
+  test("ANOTHER seat's /home/<x>/.claude/channels/telegram/access.json", () => {
+    // Seat homes on this host are mutually readable (that file is mode 0644 and
+    // holds the paired human's chat ids), so a homedir()-rooted prefix is not a
+    // denylist — it is a denylist for one seat.
+    const theirs = join(OTHER_HOME, '.claude', 'channels', 'telegram', 'access.json')
+    const p = plan(`their token lives in ${theirs}`)
+    expect(p.attach).toEqual([])
+    expect(autoAttachFooter(p)).toBe('')
+    expect(isDenied(theirs, HOME)).toBe(true)
+    expect(isDenied(join(OTHER_HOME, '.claude', 'settings.json'), HOME)).toBe(true)
+    expect(isDenied(join(OTHER_HOME, '.ssh', 'config'), HOME)).toBe(true)
+    // The segment rule holds for a tree that is nobody's home at all.
+    expect(isDenied('/srv/backup/home/agent-main/.claude/settings.json', HOME)).toBe(true)
   })
 })
 

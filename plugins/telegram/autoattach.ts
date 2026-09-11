@@ -15,9 +15,10 @@
 //     documents on his phone.
 //   - the DENYLIST is not optional. This runs on text the agent wrote without
 //     knowing it would be sent, so anything credential-shaped must never be
-//     eligible: the whole ~/.claude tree (settings, channel access.json with
-//     the bot token), .env, *secret*/*token* names, ssh keys, /etc/5dive,
-//     /var/lib/5dive. server.ts's assertSendable() is a second, narrower net
+//     eligible: any .claude/.ssh/.config/.aws/.gnupg tree on the box (not just
+//     the running seat's — seat homes here are mutually readable), the
+//     `.claude.json` sibling file, .env, *secret*/*token* names, ssh keys,
+//     /etc/5dive, /var/lib/5dive. server.ts's assertSendable() is a second, narrower net
 //     over the channel state dir; this one is the wide one.
 
 import { statSync, realpathSync } from 'node:fs'
@@ -60,16 +61,29 @@ const PATH_RE = /(?:~|\/)[^\s`'"<>()\[\]{},;]*/g
 // Trailing sentence punctuation is not part of the path ("see /tmp/a.md." ).
 const TRAILING_JUNK_RE = /[.,;:!?]+$/
 
-const DENY_BASENAME_RE = /(^\.env($|\.)|secret|token|credential|password|^id_(ed25519|rsa|ecdsa)|\.pem$|\.key$|\.p12$|\.pfx$|^\.netrc$|^\.pgpass$|^authorized_keys$|^known_hosts$)/i
+// `.claude.json` is a sibling FILE of the `.claude` directory, so no directory
+// rule reaches it — and it is the worst single file on the box to leak: on a
+// paired seat it carries the userID, the machineID, the project list and the
+// typed prompt history. Named explicitly. (quinn, DIVE-4280 verify pass.)
+const DENY_BASENAME_RE = /(^\.env($|\.)|^\.claude\.json$|secret|token|credential|password|^id_(ed25519|rsa|ecdsa)|\.pem$|\.key$|\.p12$|\.pfx$|^\.netrc$|^\.pgpass$|^authorized_keys$|^known_hosts$)/i
 
-/** Directory prefixes that are never auto-attachable. */
-export function deniedDirs(home = homedir()): string[] {
+/**
+ * Sensitive directory NAMES, denied wherever they appear as a path segment —
+ * NOT as a prefix rooted at the running seat's homedir().
+ *
+ * This host puts every agent seat under /home/agent-<name>/, and those trees
+ * are mutually readable: `/home/agent-olivia/.claude/channels/telegram/access.json`
+ * is mode 0644 and holds the paired human's chat ids. A homedir()-rooted prefix
+ * protected only the seat the plugin happens to run as, so the exact file the
+ * row names as must-never-attach sailed through when named by another seat's
+ * absolute path. A segment rule denies every seat's tree, and every future one.
+ * (quinn, DIVE-4280 verify pass.)
+ */
+export const DENY_SEGMENTS = new Set(['.claude', '.ssh', '.config', '.aws', '.gnupg'])
+
+/** Absolute directory prefixes that are never auto-attachable. */
+export function deniedDirs(_home = homedir()): string[] {
   return [
-    join(home, '.claude'),
-    join(home, '.ssh'),
-    join(home, '.config'),
-    join(home, '.aws'),
-    join(home, '.gnupg'),
     '/etc/5dive',
     '/var/lib/5dive',
     '/etc/ssh',
@@ -79,10 +93,13 @@ export function deniedDirs(home = homedir()): string[] {
 
 /**
  * True when a path must never be auto-attached. Checked on the RESOLVED path,
- * so a symlink into ~/.claude cannot launder a token out.
+ * so a symlink into any .claude tree cannot launder a token out.
  */
-export function isDenied(resolved: string, home = homedir()): boolean {
-  for (const d of deniedDirs(home)) {
+export function isDenied(resolved: string, _home = homedir()): boolean {
+  for (const seg of resolved.split(sep)) {
+    if (DENY_SEGMENTS.has(seg)) return true
+  }
+  for (const d of deniedDirs()) {
     if (resolved === d || resolved.startsWith(d + sep)) return true
   }
   return DENY_BASENAME_RE.test(basename(resolved))
