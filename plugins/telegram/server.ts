@@ -480,7 +480,10 @@ function logUnknownGroupDrop(chatId: string): void {
 // truth. Wrapped in try/catch so a disk hiccup never blocks a Telegram send.
 type SilenceState = {
   lastInboundAt: number
+  lastInboundChatId: string
+  lastInboundMessageId: number
   lastReplyAt: number
+  lastContactAt: number
   lastReminderAt: number
   toolCallsSinceReply: number
 }
@@ -490,12 +493,26 @@ function readSilence(): SilenceState {
     const j = JSON.parse(raw) as Partial<SilenceState>
     return {
       lastInboundAt: j.lastInboundAt ?? 0,
+      lastInboundChatId: j.lastInboundChatId ?? '',
+      lastInboundMessageId: j.lastInboundMessageId ?? 0,
       lastReplyAt: j.lastReplyAt ?? 0,
+      // Back-compat: a silence.json written by a pre-DIVE-4276 plugin has no
+      // lastContactAt. A reply IS contact, so fall back to it rather than
+      // reading an established thread as never-contacted.
+      lastContactAt: j.lastContactAt ?? j.lastReplyAt ?? 0,
       lastReminderAt: j.lastReminderAt ?? 0,
       toolCallsSinceReply: j.toolCallsSinceReply ?? 0,
     }
   } catch {
-    return { lastInboundAt: 0, lastReplyAt: 0, lastReminderAt: 0, toolCallsSinceReply: 0 }
+    return {
+      lastInboundAt: 0,
+      lastInboundChatId: '',
+      lastInboundMessageId: 0,
+      lastReplyAt: 0,
+      lastContactAt: 0,
+      lastReminderAt: 0,
+      toolCallsSinceReply: 0,
+    }
   }
 }
 function writeSilence(patch: Partial<SilenceState>): void {
@@ -509,11 +526,45 @@ function writeSilence(patch: Partial<SilenceState>): void {
     // Heuristic state — losing a write is fine, never block a send for it.
   }
 }
-function markReplySent(): void {
-  writeSilence({ lastReplyAt: Math.floor(Date.now() / 1000), toolCallsSinceReply: 0 })
+// DIVE-4276: two stamps, deliberately not one.
+//
+// markContact  — "the human has a sign of life from us". Resets the silence
+//                clock (and the tool-call counter) but says NOTHING about
+//                whether their newest message has been answered.
+// markReplySent— contact AND "the newest inbound is answered". Only a real
+//                reply, or a reaction placed on the newest inbound itself,
+//                may claim this: lastReplyAt gates the resume prompt's "reply
+//                to the latest message" clause (hooks/lib/resume-prompt.ts)
+//                and the watchdog's reply-vs-edit verb, so stamping it from an
+//                edit of an OLDER message would silently bury a live question.
+function markContact(): void {
+  writeSilence({ lastContactAt: Math.floor(Date.now() / 1000), toolCallsSinceReply: 0 })
 }
-function markInbound(): void {
-  writeSilence({ lastInboundAt: Math.floor(Date.now() / 1000) })
+function markReplySent(): void {
+  const now = Math.floor(Date.now() / 1000)
+  writeSilence({ lastReplyAt: now, lastContactAt: now, toolCallsSinceReply: 0 })
+}
+// True when (chat_id, message_id) IS the newest inbound we recorded — i.e. a
+// reaction there answers the message the human is waiting on.
+function isLatestInbound(chatId: string, messageId: number): boolean {
+  const s = readSilence()
+  return (
+    s.lastInboundMessageId > 0 &&
+    s.lastInboundMessageId === messageId &&
+    s.lastInboundChatId === String(chatId)
+  )
+}
+// The identity fields are ALWAYS rewritten, never merged forward: a new inbound
+// with no usable message id (a button tap injects one) must CLEAR the previous
+// message's identity, or a reaction on that older message would be credited as
+// answering the newer one.
+function markInbound(chatId?: string, messageId?: number | null): void {
+  const known = chatId != null && messageId != null
+  writeSilence({
+    lastInboundAt: Math.floor(Date.now() / 1000),
+    lastInboundChatId: known ? String(chatId) : '',
+    lastInboundMessageId: known ? Number(messageId) : 0,
+  })
 }
 
 // DIVE-261: remember where the human last spoke so task-gate alerts follow the
@@ -1464,6 +1515,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
         ])
+        // DIVE-4276: a reaction is contact — it resets the silence clock either
+        // way. On the NEWEST inbound it is also the answer (the house rule is
+        // to react to an acknowledgement rather than reply to it), so it clears
+        // "unanswered" too; on an older message it must not.
+        if (isLatestInbound(args.chat_id as string, Number(args.message_id))) markReplySent()
+        else markContact()
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'recent_messages': {
@@ -1535,7 +1592,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
         await sendAutoAttachments(chat_id, editPlan, {})
-        markReplySent()
+        // DIVE-4276: an edit lands on a message we already sent, so it proves
+        // liveness (clock reset) but cannot answer an inbound that arrived
+        // AFTER it. Contact only — this used to stamp lastReplyAt, which marked
+        // a newer, still-unanswered question as answered.
+        markContact()
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
       }
@@ -4741,6 +4802,9 @@ bot.on('callback_query:data', async ctx => {
     const value = ynM[1]!
     const msg = ctx.callbackQuery.message
     const chatId = String(msg?.chat.id ?? ctx.from.id)
+    // No human message id: the id on hand is the BOT's keyboard message, and a
+    // reaction placed there is not an answer to this tap. Clear the identity so
+    // the react path degrades to contact-only rather than crediting a stale one.
     markInbound()
     startTypingLoop(chatId)
     mcp.notification({
@@ -4784,6 +4848,9 @@ bot.on('callback_query:data', async ctx => {
       return
     }
     const chatId = String(msg?.chat.id ?? ctx.from.id)
+    // No human message id: the id on hand is the BOT's keyboard message, and a
+    // reaction placed there is not an answer to this tap. Clear the identity so
+    // the react path degrades to contact-only rather than crediting a stale one.
     markInbound()
     startTypingLoop(chatId)
     mcp.notification({
@@ -5149,6 +5216,9 @@ bot.on('callback_query:data', async ctx => {
     // normal text message.
     const msg = ctx.callbackQuery.message
     const chatId = String(msg?.chat.id ?? ctx.from.id)
+    // No human message id: the id on hand is the BOT's keyboard message, and a
+    // reaction placed there is not an answer to this tap. Clear the identity so
+    // the react path degrades to contact-only rather than crediting a stale one.
     markInbound()
     startTypingLoop(chatId)
     mcp.notification({
@@ -5801,7 +5871,7 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  markInbound()
+  markInbound(chat_id, msgId)
 
   // DIVE-1028: persist this inbound to the bounded rolling log so a restarted
   // session can recover recent context via the `recent_messages` tool. Placed

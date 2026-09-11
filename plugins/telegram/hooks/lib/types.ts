@@ -44,7 +44,16 @@ export type AccessConfig = {
 
 export type SilenceState = {
   lastInboundAt?: number
+  // Identity of the newest inbound, so a `react` can tell whether it is
+  // answering that message (→ stamps lastReplyAt) or acknowledging an older
+  // one (→ contact only). DIVE-4276.
+  lastInboundChatId?: string
+  lastInboundMessageId?: number
   lastReplyAt?: number
+  // Any sign of life on the channel — reply, edit_message or react. Drives the
+  // silence clock; lastReplyAt drives "the newest inbound is answered".
+  // DIVE-4276.
+  lastContactAt?: number
   lastReminderAt?: number
   toolCallsSinceReply?: number
 }
