@@ -109,7 +109,7 @@ _ensure_profile_dir() {
   if [[ -d "$d" ]]; then
     _audit "$d" 700          # existed: grade it, do not launder it
   else
-    mkdir -p "$d"; chmod 700 "$d"; _audit "$d" 700
+    mkdir -p "$d"; chmod 00700 "$d"; _audit "$d" 700
   fi
 }
 
@@ -120,10 +120,10 @@ cmd_setup() {
   id -u "$seat" >/dev/null 2>&1 || die "$E_USAGE" "no unix user '$seat' — a profile is owned by a real uid or it is not isolated."
   mkdir -p "$PROFILE_ROOT" || die "$E_UNAVAILABLE" "cannot create $PROFILE_ROOT"
   chown root:root "$PROFILE_ROOT" 2>/dev/null || true
-  chmod 711 "$PROFILE_ROOT"          # traverse, do not list
+  chmod 00711 "$PROFILE_ROOT"        # traverse, do not list (5-digit: clears an inherited setgid, DIVE-4348)
   mkdir -p "$PROFILE_ROOT/$seat"
   chown "$seat" "$PROFILE_ROOT/$seat"
-  chmod 700 "$PROFILE_ROOT/$seat"    # one seat, and nobody else, reads its sessions
+  chmod 00700 "$PROFILE_ROOT/$seat"  # one seat, and nobody else, reads its sessions (5-digit, see above)
   printf 'profile store ready\n  %s  (root, 0711 — traverse, not list)\n  %s  (%s, 0700)\n\nNow, as %s:  5dive browser auth <site>\n' \
     "$PROFILE_ROOT" "$PROFILE_ROOT/$seat" "$seat" "$seat"
 }
@@ -800,6 +800,28 @@ cmd_viewer_revoke() {
   rm -f "$dir/.5dive-viewer.pw"
   printf 'viewer for %s revoked. The browser keeps running and stays logged in.\n' "$site"
 }
+
+# >>> DIVE-4348 a root caller operates the SEAT's store — as the seat
+# The dashboard reaches every verb through shelld's whitelist, which is
+# `sudo -n /usr/local/bin/5dive browser …`: root, with SUDO_USER=claude. _seat
+# resolves that to claude, but _audit compares the store's owner to `id -u`, so
+# as root every verb except setup refused with exit 77 ("owned by uid 1000, not
+# by you (uid 0)") and GET /sites read every box as unavailable — measured on
+# exact-swallow 2026-09-12. Root never operates a profile: it re-executes as the
+# seat before any store is touched. `setup` stays root's by design (it chowns).
+# runuser keeps the environment (FIVEDIVE_* overrides survive) and sets HOME/USER
+# to the seat's, which is what Chrome and the adapters need.
+if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
+  case "${1:-}" in
+    setup|-h|--help|help|"") ;;
+    *)
+      _drop="${SUDO_USER}"
+      id -u "$_drop" >/dev/null 2>&1 || die "$E_PERM" "SUDO_USER=$_drop is not a user on this box — refusing to operate a profile store as root"
+      exec runuser -u "$_drop" -- "$0" "$@"
+      ;;
+  esac
+fi
+# <<< DIVE-4348
 
 case "${1:-}" in
   -h|--help|help|"") usage ;;

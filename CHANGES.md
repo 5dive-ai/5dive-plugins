@@ -1,5 +1,21 @@
 ## Unreleased
 
+### Fixed — the dashboard's `browser ls` refused on every box, so the Connect-a-site tile could never list sites (DIVE-4348), browser 1.1.1
+
+Two defects in `bin/browser`, both found on the first real box (exact-swallow, 2026-09-12):
+
+1. **A root caller refused every verb but setup.** The dashboard reaches the plugin through shelld's
+   whitelist, `sudo -n /usr/local/bin/5dive browser …` — root, with `SUDO_USER=claude`. `_seat`
+   resolved that to `claude`, but `_audit` compared the store's owner to `id -u` (0), so `ls`,
+   `status`, `serve`, `viewer` and `viewer-redeem` all exited 77 ("owned by uid 1000, not by you
+   (uid 0)") and `GET /server/browser/sites` read every box as unavailable. Root now re-executes as
+   the seat (`runuser -u $SUDO_USER`) before any store is touched; `setup` stays root's.
+2. **Every seat store was created 2700, and the audit wants 700.** `/var/lib/5dive` is 2750 on every
+   box, a directory made under it inherits setgid, and GNU `chmod 700` preserves that bit on a
+   directory. `setup` now uses the 5-digit form (`chmod 00700` / `00711`), which clears it. An
+   existing box heals on its next daily converge (`5dive-browser-stack-install` re-runs setup).
+
+
 ### Added — browser server mode and a one-time re-auth viewer, so a managed box needs no ssh, no apt and no display (DIVE-4118), browser 1.1.0
 
 DIVE-4021 shipped `5dive browser auth` as "open a real Chromium, and REFUSE without a display". On a

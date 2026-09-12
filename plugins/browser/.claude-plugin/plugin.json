@@ -1,7 +1,7 @@
 {
   "name": "browser",
-  "version": "1.1.0",
-  "description": "Persistent human-authenticated browser sessions — log into a site once by hand, then let deterministic adapters operate it. Never solves a security challenge; it stops and asks you.",
+  "version": "1.1.1",
+  "description": "Persistent human-authenticated browser sessions \u2014 log into a site once by hand, then let deterministic adapters operate it. Never solves a security challenge; it stops and asks you.",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com",

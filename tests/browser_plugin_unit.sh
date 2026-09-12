@@ -152,6 +152,20 @@ tc 'T2c ...naming the mode'                  '750' "$ERR"
 t  'T2c ...and is NOT silently repaired'     '750' "$(stat -c '%a' "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT")"
 chmod 700 "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT"
 
+# DIVE-4348: /var/lib/5dive is 2750 on every box, a directory made under it inherits
+# setgid, and a 4-digit `chmod 700` PRESERVES that bit on a directory (GNU chmod) —
+# so setup left every seat store 2700 and _audit refused with exit 77 on every box.
+mkdir -p "$TMP/sgid-parent"; chmod 2755 "$TMP/sgid-parent"; mkdir -p "$TMP/sgid-parent/seat"; chmod 700 "$TMP/sgid-parent/seat"
+t  'T2c2 CONTROL: a 4-digit chmod keeps an inherited setgid bit' '2700' "$(stat -c '%a' "$TMP/sgid-parent/seat")"
+chmod 00700 "$TMP/sgid-parent/seat"
+t  'T2c3 the 5-digit form clears it' '700' "$(stat -c '%a' "$TMP/sgid-parent/seat")"
+t  'T2c4 setup creates the seat store with the 5-digit form' 'yes' "$(grep -q 'chmod 00700 "\$PROFILE_ROOT/\$seat"' "$ROOT/plugins/browser/bin/browser" && echo yes || echo no)"
+t  'T2c5 ...and the store root too' 'yes' "$(grep -q 'chmod 00711 "\$PROFILE_ROOT"' "$ROOT/plugins/browser/bin/browser" && echo yes || echo no)"
+# DIVE-4348: the dashboard's only path is shelld -> `sudo -n 5dive browser …` (root,
+# SUDO_USER=claude); as root every verb but setup refused. Root drops to the seat.
+t  'T2c6 a root caller with SUDO_USER re-executes as the seat before touching a store' 'yes' "$(grep -q 'exec runuser -u "\$_drop" -- "\$0" "\$@"' "$ROOT/plugins/browser/bin/browser" && echo yes || echo no)"
+t  'T2c7 ...but setup stays root'"'"'s' 'yes' "$(grep -A2 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|-h|--help|help|"") ;;' && echo yes || echo no)"
+
 # A site name becomes a directory name.
 for bad in ../etc "a/b" "" "UPPER"; do
   run "$BROWSER" auth "$bad"
