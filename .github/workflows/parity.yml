@@ -60,6 +60,13 @@ jobs:
       # silence, not a green.
       - name: browser plugin harness
         run: bash tests/browser_plugin_unit.sh
+      # DIVE-4397: the unprivileged-first 5dive reader, and the arms that assert
+      # all five telegram forks still route through it. `bun test` does not reach
+      # it — the module is driven with an injected exec function from bash, and
+      # the fork arms read the shipped server.ts as text. A harness that sits in
+      # the repo unrun is silence, not a green (same reason as the step above).
+      - name: telegram 5dive-reader harness
+        run: bash tests/telegram_cliexec_unit.sh
       - name: entry points parse
         run: |
           rc=0

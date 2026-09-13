@@ -1,5 +1,48 @@
 ## Unreleased
 
+### Fixed — the telegram plugins polled 5dive through `sudo` every 60s on scoped seats, and sudo mailed root every time: 83,898 messages / 66 MB on a customer's disk (DIVE-4397), telegram 0.5.52 · grok/agy 0.5.20 · codex 0.5.18 · opencode 0.5.11 · pi 0.1.11
+
+Reported from OUTSIDE the company, twice, by an agent on a box that is not ours (`5dive-teal-fox-cx43`):
+first on 2026-08-05 against telegram 0.5.36, again on 2026-09-13 against 0.5.51. It survived 15
+releases and 39 days. Their numbers, on their disk: `/var/mail/claude` at 66 MB / 83,898 messages,
+oldest 2026-08-05, 640 of them in one day, 12 scoped seats on the box and every one a source.
+
+**Mechanism.** Every 5dive read in the plugin spawned `sudo -n 5dive …` unconditionally. A standard
+(non-admin) agent's sudoers grant is scoped to `_deliver`/`_capture`/`_audit_append`, so that call is
+denied — and sudo mails root about a denial. `reconcileNeedsBanner` runs on a 60-second timer
+(`task coordinator`, then `task inbox`), so each scoped seat generated one root mail a minute,
+forever, with no backoff and nothing to stop it. The reader's own `catch` swallowed the rejection, so
+no component on our side ever reported a thing — it took an outside reader with shell access to see
+it. A swallowed catch on a 60s timer is the whole reason this was invisible for 39 days.
+
+**What changed.**
+
+1. **Unprivileged first.** `task coordinator`, `task inbox`, `task ls`, `task show`, `heartbeat ls`,
+   `org tree`, `agent list`, `agent info`, `usage`, `models` and `--version` are READS and need no
+   root. The bare binary now runs as the seat's own uid first; on a scoped seat that path succeeds
+   and sudo is never spawned, so no mail is generated at all. (`refreshModelAliases` had hand-rolled
+   exactly this under DIVE-1883; that strategy is now the reader's, and that site is ordinary again.)
+   A `{ok:false}` envelope from the unprivileged attempt is the one answer that still escalates.
+2. **Sudo is a fallback, and a denial is sticky.** After the first `not allowed to execute` /
+   `not in the sudoers file` / `a password is required`, no further sudo is spawned for the life of
+   the process. Even where the unprivileged path also fails, an unbounded mail stream becomes at most
+   ONE message per process start. A non-zero exit from 5dive *itself* is a product error, not a
+   refusal, and deliberately does not latch — otherwise an admin seat would silently lose root.
+3. **It says so out loud.** The denial prints one line naming the command, and a run of five
+   consecutive read failures prints one line an hour (reset on any success). Silence is what cost 39
+   days here.
+4. **All six plugins, not one.** `telegram-{grok,codex,agy,pi,opencode}` each carry the same 60s
+   banner timer over their own `run5dive`, and ship to the same customers. Fixing only `telegram`
+   would have left the mail stream running in five of the six.
+
+**Not fixed by granting sudo,** as the reporter asked and they are right: widening a seat's grant to
+silence a poll is an access change made to quiet a log, and the access would outlive the need. Sudo
+is still handed the bare word `5dive` and not an absolute path — sudoers rules on shipped boxes match
+the command as written today, and "tidying" it to a path would turn every working grant into a denial.
+
+**Existing boxes do not self-heal the mail already written.** The plugin stops adding to it on its
+next install; the 66 MB already on that customer's disk is theirs to truncate.
+
 ### Fixed — the dashboard's `browser ls` refused on every box, so the Connect-a-site tile could never list sites (DIVE-4348), browser 1.1.1
 
 Two defects in `bin/browser`, both found on the first real box (exact-swallow, 2026-09-12):

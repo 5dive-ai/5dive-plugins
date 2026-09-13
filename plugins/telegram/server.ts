@@ -33,6 +33,7 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { parseGateReply, resolveGateReply, gateAlertIdent } from './gatereply'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
+import { createFiveRunner, createFailureBreaker, type FiveRunner } from './cliexec.ts'
 import { planAutoAttach, autoAttachFooter, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
@@ -2050,14 +2051,83 @@ type FiveDiveAgentEntry = {
 // tight one falls on every user whose box is slower than the author's.
 const CLI_READ_MS = 8000
 
-async function read5diveJson(args: string[], timeout: number = CLI_READ_MS): Promise<any | null> {
+// DIVE-4397: every read below goes through ONE runner that tries the bare
+// binary as this seat's own uid before it will spawn sudo, and that stops
+// spawning sudo entirely once sudo has refused us once. See cliexec.ts for the
+// customer-box measurement that forced it (83,898 root mails, 66 MB, 39 days).
+//
+// Built lazily because SUDO/FIVEDIVE are declared further down this file and a
+// module-scope construction here would read them in their temporal dead zone.
+let FIVE_RUNNER: FiveRunner | null = null
+function fiveRunner(): FiveRunner {
+  if (FIVE_RUNNER) return FIVE_RUNNER
+  FIVE_RUNNER = createFiveRunner({
+    execFile: execFileP as any,
+    sudoBin: SUDO,
+    fiveBin: FIVEDIVE,
+    onSudoDenied: (args, stderr) => {
+      // Said once, loudly, and then never again for this process — because the
+      // saying is what was missing, and the repeating is what filled the disk.
+      console.error(
+        '[5dive] sudo refused this seat (`sudo -n 5dive ' + args.join(' ') + '`) — ' +
+          'falling back to the unprivileged binary for the rest of this process and ' +
+          'not spawning sudo again. Every further sudo attempt would only mail root ' +
+          '(DIVE-4397). Do NOT widen this seat\'s sudoers grant to silence it. ' +
+          'sudo said: ' + stderr.trim().split('\n')[0],
+      )
+    },
+  })
+  return FIVE_RUNNER
+}
+
+// A parsed 5dive envelope is only worth keeping from the unprivileged attempt
+// if the CLI did not itself say no. `{ok:false}` is the one answer that earns a
+// sudo escalation; anything else (including a shape with no `ok` at all) stands.
+function acceptFiveJson(stdout: string): boolean {
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', ...args], { timeout, maxBuffer: JSON_MAXBUFFER })
-    return JSON.parse(stdout)
-  } catch (e) {
-    const out = String((e as { stdout?: unknown })?.stdout ?? '')
-    try { return JSON.parse(out) } catch { return null }
+    const j = JSON.parse(stdout)
+    return !(j && typeof j === 'object' && (j as { ok?: unknown }).ok === false)
+  } catch {
+    return false
   }
+}
+
+// DIVE-4397: one surfaced line after a run of failures. The defect this row
+// exists for was invisible because a 60s timer swallowed its own rejection; a
+// silent reader is not allowed here again.
+const cliReadBreaker = createFailureBreaker({
+  threshold: 5,
+  intervalMs: 3_600_000,
+  now: () => Date.now(),
+  log: (m) => console.error(m),
+  label: '5dive-read',
+})
+
+async function read5diveJson(args: string[], timeout: number = CLI_READ_MS): Promise<any | null> {
+  const r = await fiveRunner().run(args, { timeout, maxBuffer: JSON_MAXBUFFER }, acceptFiveJson)
+  // DIVE-125 salvage: the CLI can print a complete envelope and still exit
+  // non-zero, so parse whatever stdout we ended up holding either way.
+  try {
+    const j = JSON.parse(r.stdout)
+    cliReadBreaker.ok()
+    return j
+  } catch {
+    const e = r.error as { message?: unknown } | undefined
+    cliReadBreaker.fail(`5dive ${args.join(' ')} — ${String(e?.message ?? 'unparseable output')}`)
+    return null
+  }
+}
+
+// Read-only surfaces that parse stdout themselves. Same unprivileged-first
+// strategy; throws on failure so each caller keeps its own user-facing message.
+async function read5diveStdout(args: string[], opts?: { timeout?: number; maxBuffer?: number }): Promise<string> {
+  const r = await fiveRunner().run(args, opts, acceptFiveJson)
+  if (!r.ok && !r.stdout) {
+    cliReadBreaker.fail(`5dive ${args.join(' ')}`)
+    throw r.error instanceof Error ? r.error : new Error(String(r.error ?? '5dive call failed'))
+  }
+  cliReadBreaker.ok()
+  return r.stdout
 }
 
 // DIVE-1883: pull the alias -> model-id map from the CLI's single source of
@@ -2069,23 +2139,13 @@ async function read5diveJson(args: string[], timeout: number = CLI_READ_MS): Pro
 // defaults in commands.ts stand. The merge itself lives in commands.ts so it is
 // unit-testable without importing this module (which long-polls on import).
 async function refreshModelAliases(): Promise<void> {
-  // Try unprivileged FIRST: `models` reads no state and needs no root, and a
-  // standard (non-admin) agent's sudoers grant is scoped to _deliver/_capture/
-  // _audit_append — `sudo -n 5dive models` would be denied there, silently
-  // stranding those agents on the baked defaults. Fall back to the sudo path
-  // for hosts where the bare binary isn't on PATH for this uid.
-  let data: unknown = null
-  try {
-    const { stdout } = await execFileP(FIVEDIVE, ['models', '--json'], { timeout: CLI_READ_MS })
-    const j = JSON.parse(stdout)
-    if (j?.ok) data = j.data
-  } catch { /* fall through to the sudo path */ }
-  if (data == null) {
-    const j = await read5diveJson(['models', '--json'])
-    if (!j?.ok) return
-    data = j.data
-  }
-  applyModelAliases(data)
+  // Unprivileged-first used to be hand-rolled here (DIVE-1883) because a
+  // standard agent's scoped sudoers grant denies `sudo -n 5dive models` and
+  // stranded those agents on the baked defaults. DIVE-4397 moved that strategy
+  // into read5diveJson itself, so this site is now ordinary.
+  const j = await read5diveJson(['models', '--json'])
+  if (!j?.ok) return
+  applyModelAliases(j.data)
 }
 
 async function read5diveAgentList(): Promise<FiveDiveAgentEntry[] | null> {
@@ -3557,7 +3617,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       return
     }
     try {
-      const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'org', 'tree', '--json'])
+      const stdout = await read5diveStdout(['org', 'tree', '--json'])
       const j = JSON.parse(stdout)
       if (!j.ok || !Array.isArray(j.data?.tree)) {
         await ctx.reply(`5dive returned unexpected output.`)
@@ -3880,7 +3940,7 @@ function taskRow(t: any, needTag = false): string {
 async function buildTaskList(): Promise<string> {
   let j: any
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'ls', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
+    const stdout = await read5diveStdout(['task', 'ls', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
     j = JSON.parse(stdout)
   } catch (err) {
     return `Failed to list tasks: ${err instanceof Error ? err.message : String(err)}`
@@ -3979,7 +4039,7 @@ function inboxCard(t: any): string {
 async function buildInboxList(): Promise<string> {
   let j: any
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'inbox', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
+    const stdout = await read5diveStdout(['task', 'inbox', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
     j = JSON.parse(stdout)
   } catch (err) {
     return `Failed to load inbox: ${err instanceof Error ? err.message : String(err)}`
@@ -4060,7 +4120,7 @@ async function buildActionableInbox(
   }
   let j: any
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'inbox', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
+    const stdout = await read5diveStdout(['task', 'inbox', '--json'], { timeout: 8000, maxBuffer: JSON_MAXBUFFER })
     j = JSON.parse(stdout)
   } catch (err) {
     return [{ text: `Failed to load inbox: ${err instanceof Error ? err.message : String(err)}` }]
@@ -4150,7 +4210,7 @@ async function buildActionableInbox(
 async function buildHeartbeatList(): Promise<string> {
   let j: any
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'heartbeat', 'ls', '--json'], { timeout: 8000 })
+    const stdout = await read5diveStdout(['heartbeat', 'ls', '--json'], { timeout: 8000 })
     j = JSON.parse(stdout)
   } catch (err) {
     return `Failed to list heartbeats: ${err instanceof Error ? err.message : String(err)}`
@@ -4174,7 +4234,7 @@ async function buildHeartbeatList(): Promise<string> {
 async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: InlineKeyboard }> {
   let j: any
   try {
-    const { stdout } = await execFileP(SUDO, ['-n', '5dive', 'task', 'show', String(id), '--json'], { timeout: 8000 })
+    const stdout = await read5diveStdout(['task', 'show', String(id), '--json'], { timeout: 8000 })
     j = JSON.parse(stdout)
   } catch (err) {
     return { text: `Failed to load task: ${err instanceof Error ? err.message : String(err)}` }

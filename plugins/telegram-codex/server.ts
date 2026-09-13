@@ -961,7 +961,7 @@ async function statusText(senderName: string): Promise<string> {
     lines.push(`${CLI_LABEL.toLowerCase()}: ${/^\d/.test(v0) ? 'v' + v0 : v0}`)
   }
   lines.push(`plugin: v${PLUGIN_VERSION}`)
-  const fiveVer = await execText('sudo', ['-n', '5dive', '--version'])
+  const fiveVer = await execText('5dive', ['--version']) // DIVE-4397: a version read needs no root
   if (fiveVer) lines.push(`5dive: ${fmtVer(fiveVer)}`)
   lines.push(`account: ${info?.authProfile || 'default'}`)
   const wd = agentWorkdir()
@@ -1030,11 +1030,65 @@ async function listAgents(): Promise<string> {
   })
 }
 
-// Run `sudo -n 5dive <args> --json` and return the parsed {ok,data,error}
+// DIVE-4397 — SUDO IS THE FALLBACK, NEVER THE FIRST TRY.
+//
+// Every 5dive read below used to spawn `sudo -n 5dive …` unconditionally, and
+// `reconcileNeedsBanner` runs one on a 60s timer. On a seat whose sudoers grant
+// is SCOPED (the standard agent: _deliver/_capture/_audit_append only) that call
+// is denied, and sudo MAILS ROOT about each denial. Measured on a customer box
+// reported from outside the company twice (`5dive-teal-fox-cx43`): /var/mail
+// at 66 MB / 83,898 messages, oldest 2026-08-05, 640 in one day, 12 scoped seats
+// and every one a source. The reader's own catch swallowed the rejection, so
+// nothing on our side ever said a word for 39 days.
+//
+// THE FIX IS NOT MORE SUDO — widening a seat's grant to silence a poll is an
+// access change made to quiet a log, and it would outlive the need. Instead:
+// try the bare binary as this seat's own uid first (`task coordinator`,
+// `task inbox`, `task ls`, `task show`, `org tree`, `agent info` are READS and
+// need no root), and once sudo has refused us once, never spawn it again for the
+// life of this process — that turns an unbounded mail stream into at most ONE
+// message per process start even where the unprivileged path also fails.
+//
+// `5dive` is handed to sudo as the bare word, deliberately: sudoers rules on
+// shipped boxes match the command as written today, and an absolute path would
+// turn a working grant into a denial on every one of them.
+let SUDO_DENIED_5DIVE = false
+const SUDO_DENIAL_RE =
+  /(is not allowed to execute|not in the sudoers file|a password is required|no tty present|a terminal is required)/i
+function exec5dive(args: string[], timeout: number, cb: (err: any, stdout: string) => void): void {
+  const cp = require('child_process')
+  const opts = { timeout, maxBuffer: 16 * 1024 * 1024 }
+  const okUnprivileged = (out: string): boolean => {
+    // `{ok:false}` is the one answer worth escalating to root for; anything else
+    // (including a shape with no `ok` at all) stands as this seat's answer.
+    try { const j = JSON.parse(out); return !(j && typeof j === 'object' && j.ok === false) } catch { return false }
+  }
+  cp.execFile('5dive', args, opts, (err: any, stdout: string) => {
+    if (!err && okUnprivileged(stdout ?? '')) return cb(null, stdout)
+    if (SUDO_DENIED_5DIVE) return cb(err ?? new Error('5dive: unprivileged read returned no usable output'), stdout ?? '')
+    cp.execFile('sudo', ['-n', '5dive', ...args], opts, (e2: any, out2: string) => {
+      if (e2 && SUDO_DENIAL_RE.test(`${String(e2?.stderr ?? '')}\n${String(e2?.message ?? '')}`)) {
+        if (!SUDO_DENIED_5DIVE) {
+          console.error(
+            '[5dive] sudo refused this seat (`sudo -n 5dive ' + args.join(' ') + '`) — using the ' +
+              'unprivileged binary for the rest of this process and not spawning sudo again. Every ' +
+              'further attempt would only mail root (DIVE-4397). Do NOT widen this seat\'s sudoers ' +
+              'grant to silence it. sudo said: ' + String(e2?.stderr ?? '').trim().split('\n')[0],
+          )
+        }
+        SUDO_DENIED_5DIVE = true
+      }
+      cb(e2, out2 ?? '')
+    })
+  })
+}
+
+// Run `5dive <args> --json` (unprivileged first, sudo only as a fallback — see
+// exec5dive above) and return the parsed {ok,data,error}
 // envelope. Rejects on spawn/exec failure so callers can show a clean error.
 function run5dive(args: string[], timeout = 8000): Promise<{ ok: boolean; data?: any; error?: { message?: string } }> {
   return new Promise((resolve, reject) => {
-    require('child_process').execFile('sudo', ['-n', '5dive', ...args], { timeout },
+    exec5dive(args, timeout,
       (err: any, stdout: string) => {
         if (err && !stdout) return reject(err)
         try { resolve(JSON.parse(stdout)) } catch (e) { reject(e) }
