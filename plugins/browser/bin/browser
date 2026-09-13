@@ -53,6 +53,10 @@ usage() {
                                       # the relay's gate: consumes the link, prints the loopback target
   5dive browser viewer-revoke <site>  # kill the view; the browser stays logged in
 
+  5dive browser doc [--append=<file>]
+                                      # print the agent-facing workflow doc (any harness),
+                                      # or install it into a seat's AGENTS.md / CLAUDE.md
+
   A security challenge (CAPTCHA, 2FA, "unusual activity") is a HARD STOP that asks
   for a person. 5dive does not attempt to solve one. What this is: persistent
   human-authenticated sessions — not anti-bot bypassing.
@@ -860,6 +864,51 @@ cmd_viewer_revoke() {
   printf 'viewer for %s revoked. The browser keeps running and stays logged in.\n' "$site"
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-4446: the workflow is the product, and a Claude skill only teaches half
+# the fleet. `doc` prints the SAME text as a plain file so a codex/grok/pi seat
+# can read it, and `--append` installs it into that seat's instruction file.
+# The block is marker-fenced and re-installing REPLACES it: an upgrade must not
+# leave two divergent copies of a rule about spending a customer's only link.
+DOC_FILE="${FIVEDIVE_BROWSER_DOC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/AGENTS.md}"
+DOC_BEGIN='<!-- 5dive:browser:begin -->'
+DOC_END='<!-- 5dive:browser:end -->'
+
+cmd_doc() {
+  local target=""
+  for a in "$@"; do
+    case "$a" in
+      --append=*) target="${a#*=}" ;;
+      -h|--help)  printf '%s doc [--append=<file>]\n' "$PROG"; return 0 ;;
+      *) die "$E_USAGE" "unknown flag for doc: $a" ;;
+    esac
+  done
+  [[ -r "$DOC_FILE" ]] || die "$E_UNAVAILABLE" "the agent doc is missing from this install ($DOC_FILE)"
+  if [[ -z "$target" ]]; then cat "$DOC_FILE"; return 0; fi
+
+  [[ -d "$(dirname "$target")" ]] || die "$E_USAGE" "no such directory: $(dirname "$target") — refusing to create one"
+  [[ -e "$target" ]] || : > "$target"
+  [[ -w "$target" ]] || die "$E_PERM" "cannot write $target as $(_seat)"
+
+  local tmp; tmp="$(mktemp "${target}.5dive.XXXXXX")" || die "$E_UNAVAILABLE" "could not stage a rewrite of $target"
+  if grep -qF "$DOC_BEGIN" "$target"; then
+    # Replace in place: everything outside the fence is the seat's own text.
+    awk -v b="$DOC_BEGIN" -v e="$DOC_END" -v f="$DOC_FILE" '
+      index($0,b) { system("cat \"" f "\""); skip=1; next }
+      index($0,e) { skip=0; next }
+      !skip { print }
+    ' "$target" > "$tmp" || { rm -f "$tmp"; die "$E_UNAVAILABLE" "rewrite of $target failed"; }
+    cat "$tmp" > "$target"; rm -f "$tmp"
+    ok_doc "refreshed the browser section in $target"
+  else
+    { cat "$target"; printf '\n'; cat "$DOC_FILE"; } > "$tmp" || { rm -f "$tmp"; die "$E_UNAVAILABLE" "append to $target failed"; }
+    cat "$tmp" > "$target"; rm -f "$tmp"
+    ok_doc "installed the browser section into $target"
+  fi
+}
+ok_doc() { printf '%s: %s\n' "$PROG" "$1"; }
+
+
 # >>> DIVE-4348 a root caller operates the SEAT's store — as the seat
 # The dashboard reaches every verb through shelld's whitelist, which is
 # `sudo -n /usr/local/bin/5dive browser …`: root, with SUDO_USER=claude. _seat
@@ -888,6 +937,7 @@ case "${1:-}" in
   auth)  shift; cmd_auth  "$@" ;;
   status) shift; _auth_status "${1:-}" ;;
   ls)    shift; cmd_ls    "$@" ;;
+  doc)   shift; cmd_doc  "$@" ;;
   run)   shift; cmd_run   "$@" ;;
   serve) shift; cmd_serve "$@" ;;
   viewer) shift; cmd_viewer "$@" ;;

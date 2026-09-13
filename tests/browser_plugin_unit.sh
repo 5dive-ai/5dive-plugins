@@ -1010,5 +1010,80 @@ run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" status served
 t 'T13c ...while an unserved profile is probed as usual' 'https://served.com/' "$(head -1 "$URLLOG")"
 kill "$SXPID" "$SCPID" 2>/dev/null
 
+# --- T14 DIVE-4446: the workflow doc, and the half of the fleet that is not Claude
+# WHY THESE ARE MUTANT-SHAPED. "A skill file exists" grades nothing: the failure
+# this row exists to prevent is an agent that runs every command correctly and
+# still burns the customer's one-time link, or a codex seat that never sees the
+# rule at all because it shipped only as a Claude skill. So each arm below is the
+# specific defect: an undeclared skill capability (the plugin installs, the skill
+# is silently never registered — contract §2), a doc that dropped the rule, and a
+# naive `cat >>` appender that stacks a second, divergent copy on every upgrade.
+SKILL="$ROOT/plugins/browser/skills/connect-site/SKILL.md"
+DOCF="$ROOT/plugins/browser/AGENTS.md"
+MANIFEST="$ROOT/plugins/browser/.claude-plugin/plugin.json"
+
+t  'T14a the connect-site skill ships with the plugin' 'yes' \
+   "$([[ -f "$SKILL" ]] && echo yes || echo no)"
+SKILLTXT="$(cat "$SKILL" 2>/dev/null)"
+tc 'T14a ...with frontmatter naming it' 'name: connect-site' "$SKILLTXT"
+# The description is the whole trigger surface: a skill that does not fire is a
+# skill that does not exist.
+tc 'T14a ...firing on "log in to <site>"' 'log in to' "$SKILLTXT"
+tc 'T14a ...firing on a seat that needs a logged-in account' 'logged-in' "$SKILLTXT"
+tc 'T14a ...and on the box-browser phrasing' 'open a browser on the box' "$SKILLTXT"
+
+# The rule the row is named after, in BOTH texts.
+for pair in "skill:$SKILL" "doc:$DOCF"; do
+  W="${pair%%:*}"; F="${pair#*:}"; TXT="$(cat "$F" 2>/dev/null)"
+  tc "T14b the $W carries the link-is-the-human's rule" 'spent by the first successful GET' "$TXT"
+  tc "T14b ...the $W says to diagnose from the journal" 'journalctl -u shelld' "$TXT"
+  tc "T14b ...naming the redeem events ($W)" 'viewer_redeemed' "$TXT"
+  tc "T14b ...naming the denial event ($W)" 'viewer_denied' "$TXT"
+  tc "T14b ...the $W has the full flow, ending in revoke" 'viewer-revoke' "$TXT"
+  tc "T14b ...the $W says --bind is mandatory" 'mandatory' "$TXT"
+  tc "T14b ...the $W keeps the not-anti-bot line" 'anti-bot bypassing' "$TXT"
+  tn "T14b ...and the $W never tells a seat to open the link itself" 'open the link to verify' "$TXT"
+done
+
+# A skills/ dir with no 'skill' capability installs clean and registers NOTHING
+# (cmd_plugin.sh warns and moves on) — the silent half-ship this arm forbids.
+t  'T14c the manifest declares the skill capability, or the skill is never registered' 'yes' \
+   "$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print("yes" if "skill" in d["fivedive"]["capabilities"] else "no")' "$MANIFEST" 2>/dev/null)"
+
+# --- the harness-agnostic path: `doc` prints, `--append` installs -------------
+run env PATH="$SPATH" "$BROWSER" doc
+t  'T14d doc prints the workflow for a non-Claude seat' 0 "$RC"
+tc 'T14d ...and it is the same text the plugin ships' 'spent by the first successful GET' "$OUT"
+
+SEATDOC="$TMP/seat/AGENTS.md"; mkdir -p "$TMP/seat"
+printf '# my seat\nkeep this line\n' > "$SEATDOC"
+run env PATH="$SPATH" "$BROWSER" doc --append="$SEATDOC"
+t  'T14e append into a seat instruction file succeeds' 0 "$RC"
+tc 'T14e ...and does not eat what was already there' 'keep this line' "$(cat "$SEATDOC")"
+tc 'T14e ...the rule is now in the seat file' 'spent by the first successful GET' "$(cat "$SEATDOC")"
+
+# The mutant: `cat >> $target` passes every arm above and fails this one.
+run env PATH="$SPATH" "$BROWSER" doc --append="$SEATDOC"
+t  'T14f a second install is idempotent — exactly one fenced block' 1 \
+   "$(grep -c '5dive:browser:begin' "$SEATDOC")"
+t  'T14f ...and exactly one closing marker' 1 "$(grep -c '5dive:browser:end' "$SEATDOC")"
+t  'T14f ...the seat text survives the rewrite' 1 "$(grep -c 'keep this line' "$SEATDOC")"
+
+# An upgraded plugin must REPLACE the block, not leave two rules disagreeing.
+NEWDOC="$TMP/newdoc.md"
+{ echo '<!-- 5dive:browser:begin -->'; echo 'RULE-V2 the link is still the human'"'"'s'; echo '<!-- 5dive:browser:end -->'; } > "$NEWDOC"
+run env PATH="$SPATH" FIVEDIVE_BROWSER_DOC="$NEWDOC" "$BROWSER" doc --append="$SEATDOC"
+t  'T14g an upgrade replaces the old block' 1 "$(grep -c 'RULE-V2' "$SEATDOC")"
+t  'T14g ...leaving no stale copy of the old one' 0 \
+   "$(grep -c 'spent by the first successful GET' "$SEATDOC")"
+t  'T14g ...still exactly one fence' 1 "$(grep -c '5dive:browser:begin' "$SEATDOC")"
+
+run env PATH="$SPATH" "$BROWSER" doc --append="$TMP/nodir/AGENTS.md"
+t  'T14h append refuses a path whose directory does not exist' 64 "$RC"
+t  'T14h ...and creates nothing' 'no' \
+   "$([[ -e "$TMP/nodir" ]] && echo yes || echo no)"
+run env PATH="$SPATH" FIVEDIVE_BROWSER_DOC="$TMP/gone.md" "$BROWSER" doc
+t  'T14i a plugin install missing its doc fails closed rather than printing nothing' 69 "$RC"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -1,6 +1,6 @@
 {
   "name": "browser",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Persistent human-authenticated browser sessions \u2014 log into a site once by hand, then let deterministic adapters operate it. Never solves a security challenge; it stops and asks you.",
   "author": {
     "name": "5dive",
@@ -9,6 +9,7 @@
   },
   "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/browser",
   "license": "MIT",
+  "skills": "./skills/",
   "keywords": [
     "browser",
     "channel",
@@ -18,7 +19,8 @@
     "contract": "1",
     "capabilities": [
       "channel",
-      "verb"
+      "verb",
+      "skill"
     ],
     "verbs": [
       {
