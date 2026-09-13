@@ -8,7 +8,6 @@ ordered by UX criticality unless noted.
 ## Still open
 
 - 5dive `--channels=telegram` codex provisioning (handed off to main).
-- ExecStopPost in 5dive's systemd unit for true crash-aware notification.
 
 ## Won't port
 
@@ -23,6 +22,13 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.13 — DIVE-3965: a restart no longer loses the thread silently. A clean
+  stop and a crash are different sentences in the chat, a stale thread says so,
+  and the recovery context rides the NEXT turn instead of replaying the
+  interrupted one. The crash-aware half now exists too: 5dive's unit gained an
+  `ExecStopPost` notifier (`5dive-agent-stop-notify`), so an OOM, a SIGKILL or a
+  permanent start failure is reported once, with its cause, by the only observer
+  that outlives the unit.
 - v0.1.0 — outbound + blocking inbound, preconfigured allowlist
 - v0.1.1 — `Stop` hook for turn-complete pings
 - v0.1.2 — `bun pair.ts` pairing CLI
