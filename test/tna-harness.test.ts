@@ -596,6 +596,90 @@ describe('DIVE-2846: describeTapError keeps the exception and names a cause', ()
   }
 })
 
+// ---------------------------------------------------------------------------
+// DIVE-4445: when the CLI dies without an error path, its OWN backstop envelope
+// says — in prose — that it has no reason, while the real cause sits on stderr.
+// Preferring that envelope is how lodar's 2026-09-13 tap reported "exited 126
+// without reporting a reason" with `/usr/bin/jq: Argument list too long` in hand
+// (DIVE-4419's incident; the row body there is corrected on DIVE-4445).
+//
+// The shapes below are MEASURED, not invented: the envelope is `_report_silent_exit
+// 126` run out of src/lib/output.sh with JSON_MODE=1, and the stderr line is what
+// bash prints when an argv entry crosses MAX_ARG_STRLEN (131072 bytes).
+// ---------------------------------------------------------------------------
+
+const JQ_E2BIG = 'bash: line 1: /usr/bin/jq: Argument list too long'
+const BACKSTOP_MSG =
+  '5dive task exited 126 without reporting a reason. This is a bug in the CLI, not a refusal: a command failed under `set -euo pipefail` and ended the run before any error path could print.'
+const BACKSTOP_ENVELOPE = `{"ok":false,"error":{"code":126,"class":"generic","message":"${BACKSTOP_MSG}"}}\n`
+// Measured shape of the rejection execFileP hands the tap catch.
+const MEASURED_SILENT_EXIT = {
+  code: 126,
+  killed: false,
+  signal: null,
+  message: `Command failed: sudo -n 5dive --json task show 4542\n${JQ_E2BIG}\nerror: ${BACKSTOP_MSG}\n`,
+  stdout: BACKSTOP_ENVELOPE,
+  stderr: `${JQ_E2BIG}\nerror: ${BACKSTOP_MSG}\n`,
+}
+
+describe('DIVE-4445: a contentless backstop envelope must not outrank the stderr cause', () => {
+  for (const mod of mods) {
+    test(`${mod.name}: the short line names the stderr cause, not "without reporting a reason"`, () => {
+      const info = mod.describeTapError(MEASURED_SILENT_EXIT)
+      expect(info.short).toContain('Argument list too long')
+      expect(info.short).not.toContain('without reporting a reason')
+      // and the human-facing message, which is the thing the row is about
+      const chat = mod.tapFailureCopy({ taskId: '4542', ident: 'DIVE-4419', err: info, landing: 'open' }).chat
+      expect(chat).toContain('Argument list too long')
+      expect(chat).not.toContain('without reporting a reason')
+    })
+
+    test(`${mod.name}: the toast still clears Telegram's 200-char cap on this shape`, () => {
+      const info = mod.describeTapError(MEASURED_SILENT_EXIT)
+      for (const landing of ['applied', 'open', 'unknown']) {
+        const c = mod.tapFailureCopy({ taskId: '4542', ident: 'DIVE-4419', err: info, landing })
+        expect(c.toast.length, `${landing} toast too long`).toBeLessThanOrEqual(200)
+      }
+    })
+
+    test(`${mod.name}: the '--json' in our own command line no longer reads as 'unreadable'`, () => {
+      // No envelope at all — the child never ran, so stderr is the ONLY evidence.
+      // /JSON|Unexpected token/i matches `--json` in the argv echoed by execFile,
+      // so this shape used to classify as 'unreadable' and drop the cause.
+      const noEnvelope = {
+        code: 126,
+        message: `Command failed: sudo -n 5dive --json task show 4542\n${JQ_E2BIG}\n`,
+        stdout: '',
+        stderr: `${JQ_E2BIG}\n`,
+      }
+      const info = mod.describeTapError(noEnvelope)
+      expect(info.kind).not.toBe('unreadable')
+      expect(info.short).toContain('Argument list too long')
+    })
+
+    test(`${mod.name}: CONTROL — a real refusal envelope still wins over stderr`, () => {
+      // The over-correction this guards: "stderr always wins" would replace the
+      // CLI's own reason with its stderr echo of the same line, and would break
+      // every envelope-carrying refusal measured in DIVE-2846.
+      expect(mod.describeTapError(MEASURED_REFUSAL).short).toContain('no such task: 999999')
+      expect(mod.describeTapError(MEASURED_REFUSAL).kind).toBe('refused')
+    })
+
+    test(`${mod.name}: CONTROL — a backstop with nothing on stderr still says what it can`, () => {
+      const bare = { code: 126, message: 'Command failed: sudo -n 5dive --json task show 4542', stdout: BACKSTOP_ENVELOPE, stderr: '' }
+      const info = mod.describeTapError(bare)
+      expect(info.short).toContain('exited 126')
+      expect(info.detail).toContain('without reporting a reason')
+    })
+
+    test(`${mod.name}: detail keeps BOTH the envelope and the stderr cause for the log`, () => {
+      const d = mod.describeTapError(MEASURED_SILENT_EXIT).detail
+      expect(d).toContain('Argument list too long')
+      expect(d).toContain('without reporting a reason')
+    })
+  }
+})
+
 describe('DIVE-2846: tapRef never mints an ident out of an internal id', () => {
   for (const mod of mods) {
     test(`${mod.name}: unknown ident degrades to task #<id>, known ident is used verbatim`, () => {

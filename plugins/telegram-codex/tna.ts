@@ -322,6 +322,28 @@ function envelopeError(raw: unknown): { cls: string; message: string } | null {
   return null
 }
 
+// DIVE-4445: the CLI's own silent-exit backstop (`_report_silent_exit`, src/lib/
+// output.sh) prints a CONTENTLESS envelope on STDOUT — measured on this box:
+// {"ok":false,"error":{"code":126,"class":"generic","message":"5dive task exited
+// 126 without reporting a reason. This is a bug in the CLI, not a refusal: …"}}
+// — while the actual cause rides on STDERR. On 2026-09-13 a >128KB row made
+// `task show --json` die with `/usr/bin/jq: Argument list too long`; the envelope
+// branch won and lodar's tap told him "exited 126 without reporting a reason"
+// with the reason in hand (DIVE-4419's incident, item 3). An envelope that states
+// it has no reason is not evidence; a stderr line is.
+const SILENT_EXIT_RE = /exited \d+ without reporting a reason/i
+
+// The first line that actually says something. Skips the backstop's own stderr
+// echo of that same contentless message (the trap prints it AFTER the real
+// cause) and execFile's `Command failed: <argv>` preamble, which is our own
+// command line, not a diagnosis.
+function firstCause(raw: unknown): string {
+  return String(raw ?? '')
+    .split('\n')
+    .map(l => l.trim().replace(/^error:\s*/i, ''))
+    .find(l => l && !SILENT_EXIT_RE.test(l) && !/^Command failed:/i.test(l)) ?? ''
+}
+
 // Classify the thrown thing. Deliberately signal-driven rather than
 // message-sniffing where a signal exists: `killed`/`signal` is how Node reports
 // its own timeout kill, and 'ENOENT' is a code, not prose. Prose is only read
@@ -347,16 +369,29 @@ export function describeTapError(err: unknown): TapErrorInfo {
     return { kind: 'sudo', short: clampReason(line), detail }
   }
   const env = envelopeError(stdout) ?? envelopeError(message)
-  if (env) {
+  const silent = !!env && SILENT_EXIT_RE.test(env.message)
+  const why = firstCause(stderr) || firstCause(message)
+  if (env && !silent) {
     return { kind: 'refused', short: clampReason(`5dive refused: ${env.message || env.cls || 'no reason given'}`), detail }
+  }
+  // DIVE-4445: a backstop envelope says, in prose, that it has no reason — so it
+  // must not outrank a stderr line that has one. This branch also has to come
+  // BEFORE the JSON sniff below: the failing command line itself contains
+  // `--json`, so /JSON/i matches every tap read and would re-bury the cause as
+  // 'something unreadable'.
+  if (why && (silent || typeof code === 'number')) {
+    return { kind: silent ? 'error' : 'refused', short: clampReason(`5dive exited ${code ?? '?'}: ${why}`), detail }
+  }
+  if (env) {
+    // A backstop envelope and no cause anywhere: its prose is all anyone has.
+    // Still ahead of the sniff below, which our own `--json` argv would trip.
+    return { kind: 'error', short: clampReason(`5dive exited ${code ?? '?'}: ${env.message || env.cls || 'no reason given'}`), detail }
   }
   if (err instanceof SyntaxError || /JSON|Unexpected token/i.test(message)) {
     return { kind: 'unreadable', short: 'the 5dive CLI answered with something unreadable', detail }
   }
   if (typeof code === 'number') {
-    const first = (stderr || message).split('\n').map(l => l.trim()).filter(Boolean)[0] ?? ''
-    const why = first.replace(/^error:\s*/i, '')
-    return { kind: 'refused', short: clampReason(why ? `5dive refused: ${why}` : `5dive exited ${code}`), detail }
+    return { kind: 'refused', short: clampReason(`5dive exited ${code}`), detail }
   }
   return { kind: 'error', short: clampReason(message || 'unknown error'), detail }
 }

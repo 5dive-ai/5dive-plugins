@@ -1,5 +1,32 @@
 ## Unreleased
 
+### Fixed — a failed gate tap said "exited 126 without reporting a reason" while the reason was in hand (DIVE-4445)
+
+When the 5dive CLI dies without reaching an error path, its own backstop
+(`_report_silent_exit`, src/lib/output.sh) prints a CONTENTLESS envelope on
+stdout — `{"ok":false,"error":{"class":"generic","message":"5dive task exited
+126 without reporting a reason. This is a bug in the CLI, not a refusal: …"}}` —
+while the actual cause rides on stderr. `describeTapError` preferred any
+envelope over stderr, so on 2026-09-13 a tier-2 gate tap on a >128KB row (the
+DIVE-4419 incident) told the human "exited 126 without reporting a reason" and
+threw away `/usr/bin/jq: Argument list too long`, which was sitting in the same
+rejection.
+
+Two orderings were wrong, not one. Skipping the backstop envelope alone would
+have landed the same tap in the `/JSON|Unexpected token/` sniff — our OWN command
+line contains `--json` — and reported "the CLI answered with something
+unreadable", burying the cause a second time. So the stderr-cause branch now
+runs ahead of both, and the backstop-with-no-stderr case is answered before the
+sniff too.
+
+A genuine refusal envelope still wins over stderr (that is what carries `no such
+task: 999999` and `no pending human gate`), and the backstop's prose is still
+reported when stderr holds nothing — both pinned as controls. `firstCause()`
+skips the backstop's own stderr echo and execFile's `Command failed: <argv>`
+preamble, neither of which is a diagnosis. Applied to all six tna.ts copies
+(byte-identical by harness rule); 12 new arms, measured red against the pre-fix
+classifier.
+
 ### Fixed — the telegram plugins polled 5dive through `sudo` every 60s on scoped seats, and sudo mailed root every time: 83,898 messages / 66 MB on a customer's disk (DIVE-4397), telegram 0.5.52 · grok/agy 0.5.20 · codex 0.5.18 · opencode 0.5.11 · pi 0.1.11
 
 Reported from OUTSIDE the company, twice, by an agent on a box that is not ours (`5dive-teal-fox-cx43`):
