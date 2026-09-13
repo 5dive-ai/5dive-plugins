@@ -334,6 +334,14 @@ if (shouldSend) {
   // reading" or "Telegram rejected it" — three symptoms with three different
   // fixes and, until now, one indistinguishable silence.
   console.error(`[stopfailure-notify] route=${routeKind} targets=${targets.map(fmtTarget).join(',') || '(none)'}`)
+  // DIVE-4401 (iteration 3): zero targets is the row's own symptom in its purest
+  // form — the hook decided to SEND, transmitted nothing, and exited 0 looking
+  // successful. There is no fallback to reach for (the all-allowed rung IS the
+  // fallback, and it came back empty), so the only thing left to do is say the
+  // notice was lost, the way the 'nowhere to fall back to' branch does.
+  if (targets.length === 0) {
+    console.error('[stopfailure-notify] no paired chat configured — usage-limit notice NOT sent (lost)')
+  }
   const results = await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
   targets.forEach((t, i) => {
     console.error(`[stopfailure-notify] send ${fmtTarget(t)}: ${results[i] ? 'ok' : 'FAILED'}`)
