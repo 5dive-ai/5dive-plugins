@@ -10,6 +10,10 @@ import {
   ChannelDispatcher, parseOutboundMessage, type DispatchMessage, type DispatchRoute,
 } from './dispatcher-core.ts'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
+import {
+  HEALTH_HEARTBEAT_MS, HEALTH_SCHEMA, writeHealth,
+  type ChannelHealth, type HealthFailure,
+} from './health.ts'
 
 const STATE_DIR = process.env.CODEX_DISPATCHER_STATE_DIR
   ?? join(homedir(), '.codex', 'channels', 'dispatcher')
@@ -23,6 +27,55 @@ const CHANNELS = new Set((process.env.CODEX_DISPATCHER_CHANNELS ?? 'telegram').s
 
 for (const dir of [STATE_DIR, INBOX_DIR, OUTBOX_DIR, join(OUTBOX_DIR, 'telegram'), join(OUTBOX_DIR, 'dashboard')]) {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
+}
+
+// ── the handshake (DIVE-3964) ───────────────────────────────────────────────
+//
+// Everything a reader needs to tell a bound bridge from a deaf one, asserted by
+// the bridge itself on an interval. `updatedAt` is the liveness signal: a
+// record that stopped moving is positive evidence of a dead bridge, which is
+// the reading the pane-banner probe could never produce. See health.ts.
+
+const BRIDGE_VERSION: string = (() => {
+  try {
+    return String(JSON.parse(readFileSync(join(import.meta.dir, 'package.json'), 'utf8')).version ?? 'unknown')
+  } catch { return 'unknown' }
+})()
+
+const health: ChannelHealth = {
+  schema: HEALTH_SCHEMA,
+  bridge: 'codex-dispatcher',
+  bridgeVersion: BRIDGE_VERSION,
+  pid: process.pid,
+  startedAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  heartbeatMs: HEALTH_HEARTBEAT_MS,
+  declared: [...CHANNELS],
+  listening: [],
+  bound: false,
+  queueDepth: 0,
+}
+
+function publishHealth(): void {
+  health.updatedAt = new Date().toISOString()
+  // Read the queue and the active turn off the dispatcher rather than
+  // maintaining a second copy: a counter that drifts from the state it claims
+  // to describe is worse than no counter.
+  try {
+    const snap = dispatcher.snapshot()
+    health.threadId = snap.threadId
+    health.queueDepth = snap.pending.length
+    health.active = snap.active
+      ? { turnId: snap.active.turnId, source: snap.active.route.source, startedAt: health.active?.turnId === snap.active.turnId ? health.active.startedAt : new Date().toISOString() }
+      : undefined
+  } catch {}
+  writeHealth(STATE_DIR, health)
+}
+
+function markFailure(channel: string, cause: string): void {
+  const failure: HealthFailure = { at: new Date().toISOString(), channel, cause }
+  health.failure = failure
+  publishHealth()
 }
 
 class JsonRpcProcess {
@@ -134,6 +187,7 @@ function stateStore() {
 let outSeq = 0
 async function publish(route: DispatchRoute, text: string, meta: Record<string, unknown>): Promise<void> {
   const outbound = parseOutboundMessage(text)
+  health.lastOutboundAt = new Date().toISOString()
   process.stdout.write(`${outbound.text}\n`)
   if (route.source === 'agent') return
   if (!outbound.text) throw new Error('dispatcher reply has no text after attachment directives')
@@ -155,6 +209,11 @@ async function initialize(): Promise<void> {
   })
   rpc.notify('initialized', {})
   await dispatcher.initialize()
+  // BOUND means a live Codex thread, not "the process started". Everything
+  // above can succeed and still leave the bridge unable to run a turn.
+  health.bound = Boolean(dispatcher.snapshot().threadId)
+  health.failure = undefined
+  publishHealth()
   process.stderr.write(`codex-dispatcher: ready thread=${dispatcher.snapshot().threadId} cwd=${WORKDIR}\n`)
 }
 
@@ -179,12 +238,15 @@ function ingest(name: string): void {
     try { unlinkSync(full) } catch {}
     return
   }
+  health.lastInboundAt = new Date().toISOString()
   void dispatcher.submit(msg).then(outcome => {
+    publishHealth()
     try { unlinkSync(full) } catch {}
     process.stderr.write(`codex-dispatcher: ${outcome} ${msg.id} source=${msg.route.source}\n`)
   }).catch(err => {
     // Keep the file: a run-loop restart will retry it after app-server recovers.
     process.stderr.write(`codex-dispatcher: dispatch failed for ${msg.id}: ${err}\n`)
+    markFailure(msg.route.source, `dispatch failed for ${msg.id}: ${err}`)
     setTimeout(() => ingest(name), 1000).unref?.()
   })
 }
@@ -197,14 +259,23 @@ function startInbox(): void {
 }
 
 const children: ChildProcessWithoutNullStreams[] = []
-function startAdapter(file: string, extraEnv: Record<string, string>): void {
+function startAdapter(file: string, channel: string, extraEnv: Record<string, string>): void {
   const child = spawn(BUN_BIN, [file], {
     cwd: WORKDIR,
     env: { ...process.env, CODEX_DISPATCHER_STATE_DIR: STATE_DIR, ...extraEnv },
     stdio: ['ignore', 'inherit', 'inherit'],
   })
   children.push(child)
+  // Listening is claimed at spawn and RETRACTED on exit. The retraction is the
+  // load-bearing half: a dead telegram adapter beside a live dispatcher is
+  // precisely the `mismatched` state, and without it the record would keep
+  // asserting a channel nobody is serving.
+  if (!health.listening.includes(channel)) health.listening.push(channel)
+  publishHealth()
   child.once('exit', (code, signal) => {
+    health.listening = health.listening.filter(c => c !== channel)
+    const why = `adapter exited code=${code ?? 'null'} signal=${signal ?? 'none'}`
+    markFailure(channel, why)
     if (!shuttingDown) fatal(`channel adapter ${file} exited code=${code ?? 'null'} signal=${signal ?? 'none'}`)
   })
 }
@@ -213,6 +284,8 @@ let shuttingDown = false
 function fatal(message: string): never {
   process.stderr.write(`codex-dispatcher: ${message}\n`)
   recordLifecycle(STATE_DIR, 'crash', 'codex-dispatcher', message)
+  health.bound = false
+  markFailure('bridge', message)
   shutdown(1)
   throw new Error(message)
 }
@@ -234,13 +307,17 @@ installLifecycle({
   cleanup: () => shutdown(0),
 })
 
+publishHealth()
+const beat = setInterval(publishHealth, HEALTH_HEARTBEAT_MS)
+beat.unref?.()
+
 await initialize()
 startInbox()
 if (CHANNELS.has('telegram')) {
-  startAdapter(join(import.meta.dir, 'server.ts'), { CODEX_DISPATCHER_ADAPTER: 'telegram' })
+  startAdapter(join(import.meta.dir, 'server.ts'), 'telegram', { CODEX_DISPATCHER_ADAPTER: 'telegram' })
 }
 if (CHANNELS.has('dashboard')) {
-  startAdapter(join(import.meta.dir, '..', 'dashboard', 'server.ts'), {
+  startAdapter(join(import.meta.dir, '..', 'dashboard', 'server.ts'), 'dashboard', {
     CODEX_DISPATCHER_ADAPTER: 'dashboard',
     DASHBOARD_STATE_DIR: process.env.DASHBOARD_STATE_DIR
       // The control plane and shelld use this compatibility path for every
