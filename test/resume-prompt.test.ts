@@ -1,7 +1,7 @@
 // Covers the DIVE-1332 fix: the auto-resume prompt gates its "reply to the
 // latest message" clause on a genuine unanswered inbound, so an autonomous-turn
 // resume with an empty inbox no longer emits the phantom reply instruction.
-import { test, expect, beforeEach } from 'bun:test'
+import { test, expect, beforeEach, afterAll } from 'bun:test'
 import { mkdtempSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -18,7 +18,20 @@ import { resumePrompt } from '../plugins/telegram/hooks/lib/resume-prompt'
 import { saveSilence } from '../plugins/telegram/hooks/lib/state'
 
 const dir = mkdtempSync(join(tmpdir(), 'tg-resume-'))
+const origStateDir = process.env.TELEGRAM_STATE_DIR
 process.env.TELEGRAM_STATE_DIR = dir
+// DIVE-4401: RESTORE it. This assignment is at module scope with no undo, so in
+// the shared-process runner it leaked into every file walked after this one —
+// and paths.ts reads the env FIRST, ahead of homedir(). Any later test that
+// isolates itself with a temp HOME alone silently read THIS directory instead;
+// that is what reddened four stopfailure-send-leg arms in CI while the same
+// file alone was green. The driver-side fix (pin TELEGRAM_STATE_DIR per child)
+// is what actually holds, but a module-scope env write with no restore is a
+// trap for the next file regardless, so it goes back.
+afterAll(() => {
+  if (origStateDir === undefined) delete process.env.TELEGRAM_STATE_DIR
+  else process.env.TELEGRAM_STATE_DIR = origStateDir
+})
 
 beforeEach(() => saveSilence({}))
 
