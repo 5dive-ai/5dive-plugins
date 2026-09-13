@@ -1,0 +1,100 @@
+---
+name: connect-site
+description: Get a human logged into a site on the box, then use that logged-in session. Use when you need a site the agent has no session for — "log in to X", "connect my X account", "the agent needs a logged-in X", "open a browser on the box", "X says I'm signed out" — or when `5dive browser status` is not `authenticated`. Not for fetching a public page (use a normal fetch) and not for anything a site's API already does.
+---
+
+# connect-site — serve, hand over the link, poll to authed
+
+You cannot log a person in. What you CAN do is put a real browser on the box, mint a
+one-time link to it, hand that link to the human over whatever channel you are paired to,
+and wait. The login they perform lands in a profile that **outlives the viewer** and that
+your later `run` calls reuse.
+
+The commands are easy. The orchestration is where seats get it wrong, and every mistake
+here is **silent** — nothing errors, the human just never gets in.
+
+## THE RULE THAT COSTS THE MOST WHEN BROKEN
+
+**The viewer link is the HUMAN'S, and it is spent by the first successful GET.** Do not
+open it, do not curl it, do not "just check that it works", do not paste it into a fetch
+tool, do not preview it. A one-time ticket verified by you is a ticket denied to them —
+they get a dead page and you get a bug report about the wrong thing. (This is not
+hypothetical: a lead seat did exactly this on 2026-09-13 while debugging.)
+
+**To check a link you already handed over, read the box journal, never the link:**
+
+```bash
+sudo journalctl -u shelld -n 200 --no-pager \
+  | grep -E 'viewer_bind|viewer_redeemed|viewer_denied|viewer_ws_connected'
+```
+
+- `viewer_bind` — the link was minted (yours).
+- `viewer_redeemed` + `viewer_ws_connected` — the human is in. Stop worrying.
+- `viewer_denied` with a `reason` — that reason is your whole diagnosis (`no live bind`,
+  `redeem refused`, malformed, wrong session).
+- nothing at all — they have not clicked yet. Wait, or re-mint after the TTL.
+
+The other safe probe is a **deliberately bad nonce**: a refusal is a pure refusal and
+spends nothing. A good nonce is the customer's only redemption.
+
+## The flow
+
+```bash
+5dive browser serve <site>                                 # 1. persistent Chrome on its own Xvfb
+5dive browser viewer <site> --bind=<session> [--ttl=600]   # 2. mint ONE-TIME link (prints it once)
+#                                                            3. HAND THE LINK TO THE HUMAN, unopened
+5dive browser status <site>                                # 4. poll until `authenticated`
+5dive browser viewer-revoke <site>                         # 5. close the view; the login survives
+```
+
+1. **`serve`** starts the browser and its display. It is idempotent per site.
+2. **`viewer`** prints the link exactly once — it stores only a SHA-256 of the nonce, so a
+   link you lose is gone and you re-mint. `--bind=<session>` is **mandatory** (an unbound
+   ticket would be a bearer credential for a live account); `--bind=local` is the named
+   escape for a hand-run on the box. Default TTL is short on purpose — mint it *when the
+   human is actually there*, not an hour ahead.
+3. **Hand it over on the channel you are already on**, with the two facts that change their
+   behaviour: it is **one-time** and it **expires**. On Telegram that is one short message —
+   the link, "log in here, one-time link, expires in ~10 min", nothing else. Do not put the
+   link in a task body, a PR, a commit, a log line or a wiki page: it is a live credential
+   for as long as it is unspent.
+4. **`status <site>`** is the only honest confirmation. Poll it every ~15–30s while they are
+   logging in (not tighter — each probe is a real page load). Terminal states:
+   - `authenticated` — done. The profile is now reusable by `5dive browser run`.
+   - `session expired` / `CHALLENGE` — a person is still needed; say what the page asks for.
+   - `UNKNOWN` — the probe could not read the page at all. This is **not** a failure to
+     report and **not** permission to act: `status` stays quiet and exits 0, and `run`
+     refuses on it. Re-probe; if it stays UNKNOWN, the browser or the box stack is the
+     problem, not the login.
+5. **`viewer-revoke`** ends the view as soon as they are in. The login is the durable half;
+   the view onto it is the ephemeral half and it is a keyboard attached to their account.
+   Leaving it open is the only part of this flow that gets *worse* with time.
+
+Then, and only then: `5dive browser run <site> <action> [--key=value ...]`.
+
+## What will actually go wrong
+
+- **`serve` fails closed on a box without the stack.** Server mode needs chromium, Xvfb,
+  x11vnc and websockify, installed box-level as root (`browser-stack.sh`) — a seat cannot
+  install them. The refusal names what is missing, and the box's DEGRADED health row names
+  the re-install command. Report that to the human; do not improvise an install.
+- **Profiles are per-seat, mode 0700, and never repaired.** Another seat's login is not
+  yours to use, and a profile with wrong ownership is refused rather than fixed. If you
+  need the session, you serve it under YOUR seat and the human logs in again.
+- **Some sites block datacenter IPs at login** ("your request has been blocked",
+  "suspicious network"). That is the site's anti-bot policy meeting a VM's IP — it is not
+  our bug, there is no flag for it, and the honest answer to the human is that this site
+  cannot be logged into from the box. Say so and stop.
+- **A challenge is classified BEFORE a logged-out state**, because a challenge page still
+  carries the login markup. Trust the label; do not re-derive it from the HTML.
+- **Sessions die on the site's schedule, not ours.** Run `status` on a schedule, not at
+  publish time — otherwise you discover the logout mid-action.
+
+## The line this capability does not cross
+
+This is **persistent human-authenticated sessions** — a person logs in, once, by hand, and
+the agent is granted permission to operate the session, never the credentials. It is not
+anti-bot bypassing. A CAPTCHA, a 2FA prompt or an "unusual activity" interstitial is a
+**hard stop that asks for a person**: surface it, do not attempt it, do not look for a way
+around it. Never ask the human for a password, never accept one, never write one down, and
+never export cookies out of a profile.

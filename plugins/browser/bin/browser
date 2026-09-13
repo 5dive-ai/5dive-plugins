@@ -53,6 +53,10 @@ usage() {
                                       # the relay's gate: consumes the link, prints the loopback target
   5dive browser viewer-revoke <site>  # kill the view; the browser stays logged in
 
+  5dive browser doc [--append=<file>]
+                                      # print the agent-facing workflow doc (any harness),
+                                      # or install it into a seat's AGENTS.md / CLAUDE.md
+
   A security challenge (CAPTCHA, 2FA, "unusual activity") is a HARD STOP that asks
   for a person. 5dive does not attempt to solve one. What this is: persistent
   human-authenticated sessions — not anti-bot bypassing.
@@ -860,6 +864,90 @@ cmd_viewer_revoke() {
   printf 'viewer for %s revoked. The browser keeps running and stays logged in.\n' "$site"
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-4446: the workflow is the product, and a Claude skill only teaches half
+# the fleet. `doc` prints the SAME text as a plain file so a codex/grok/pi seat
+# can read it, and `--append` installs it into that seat's instruction file.
+# The block is marker-fenced and re-installing REPLACES it: an upgrade must not
+# leave two divergent copies of a rule about spending a customer's only link.
+DOC_FILE="${FIVEDIVE_BROWSER_DOC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/AGENTS.md}"
+DOC_BEGIN='<!-- 5dive:browser:begin -->'
+DOC_END='<!-- 5dive:browser:end -->'
+
+# Refuse a file whose 5dive browser fence is not exactly one well-formed pair.
+# Named markers in the message, because the operator has to find them by eye.
+_doc_fence_or_die() {
+  local f="$1" nb ne lb le
+  nb="$(grep -cF -- "$DOC_BEGIN" "$f")" || nb=0
+  ne="$(grep -cF -- "$DOC_END"   "$f")" || ne=0
+  [[ "$nb" == 0 && "$ne" == 0 ]] && return 0
+  if [[ "$nb" != "$ne" ]]; then
+    local missing="$DOC_END"
+    [[ "$nb" -lt "$ne" ]] && missing="$DOC_BEGIN"
+    die "$E_USAGE" "$f has a broken browser section: found $nb x '$DOC_BEGIN' and $ne x '$DOC_END' — the '$missing' marker is missing. Repair or delete that fence by hand, then re-run; nothing was written."
+  fi
+  if [[ "$nb" -gt 1 ]]; then
+    die "$E_USAGE" "$f carries $nb copies of the browser section fence ('$DOC_BEGIN'). Leave exactly one, then re-run; nothing was written."
+  fi
+  lb="$(grep -nF -- "$DOC_BEGIN" "$f" | head -1 | cut -d: -f1)"
+  le="$(grep -nF -- "$DOC_END"   "$f" | head -1 | cut -d: -f1)"
+  if [[ "$le" -lt "$lb" ]]; then
+    die "$E_USAGE" "$f has its browser section markers inverted: '$DOC_END' is on line $le, above '$DOC_BEGIN' on line $lb. Repair or delete that fence by hand, then re-run; nothing was written."
+  fi
+  return 0
+}
+
+cmd_doc() {
+  local target=""
+  for a in "$@"; do
+    case "$a" in
+      --append=*) target="${a#*=}" ;;
+      -h|--help)  printf '%s doc [--append=<file>]\n' "$PROG"; return 0 ;;
+      *) die "$E_USAGE" "unknown flag for doc: $a" ;;
+    esac
+  done
+  [[ -r "$DOC_FILE" ]] || die "$E_UNAVAILABLE" "the agent doc is missing from this install ($DOC_FILE)"
+  if [[ -z "$target" ]]; then cat "$DOC_FILE"; return 0; fi
+
+  [[ -d "$(dirname "$target")" ]] || die "$E_USAGE" "no such directory: $(dirname "$target") — refusing to create one"
+  [[ -e "$target" ]] || : > "$target"
+  [[ -w "$target" ]] || die "$E_PERM" "cannot write $target as $(_seat)"
+
+  # DIVE-4446 iteration 2. The rewrite below is a WHOLE-FILE replace, so a broken
+  # fence is not a cosmetic problem: with a BEGIN and no END the awk skips to
+  # end-of-input and every line the seat wrote after the marker is gone — and the
+  # receipt still said "refreshed". The file class this feature targets (AGENTS.md,
+  # CLAUDE.md) is hand-edited by definition, and half a marker pair is the normal
+  # shape of a bad hand-edit. So an unbalanced or out-of-order fence is a REFUSAL,
+  # before anything is staged: the operator repairs or deletes it, we do not guess
+  # which half they meant. Appending a fresh block instead would be the worst of
+  # both — their text still deleted, plus a second divergent copy of the rule.
+  _doc_fence_or_die "$target"
+
+  local tmp; tmp="$(mktemp "${target}.5dive.XXXXXX")" || die "$E_UNAVAILABLE" "could not stage a rewrite of $target"
+  if grep -qF -- "$DOC_BEGIN" "$target"; then
+    # Replace in place: everything outside the fence is the seat's own text.
+    # The END-of-input assert is belt and braces on the guard above: if a future
+    # edit to the marker logic ever lets an unterminated fence through, awk exits
+    # non-zero and we die on the staged file rather than cat a truncated one over
+    # the seat's work.
+    awk -v b="$DOC_BEGIN" -v e="$DOC_END" -v f="$DOC_FILE" '
+      index($0,b) { system("cat \"" f "\""); skip=1; next }
+      index($0,e) { skip=0; next }
+      !skip { print }
+      END { if (skip) exit 3 }
+    ' "$target" > "$tmp" || { rm -f "$tmp"; die "$E_UNAVAILABLE" "rewrite of $target failed — the browser section is unterminated and the file was left untouched"; }
+    cat "$tmp" > "$target"; rm -f "$tmp"
+    ok_doc "refreshed the browser section in $target"
+  else
+    { cat "$target"; printf '\n'; cat "$DOC_FILE"; } > "$tmp" || { rm -f "$tmp"; die "$E_UNAVAILABLE" "append to $target failed"; }
+    cat "$tmp" > "$target"; rm -f "$tmp"
+    ok_doc "installed the browser section into $target"
+  fi
+}
+ok_doc() { printf '%s: %s\n' "$PROG" "$1"; }
+
+
 # >>> DIVE-4348 a root caller operates the SEAT's store — as the seat
 # The dashboard reaches every verb through shelld's whitelist, which is
 # `sudo -n /usr/local/bin/5dive browser …`: root, with SUDO_USER=claude. _seat
@@ -888,6 +976,7 @@ case "${1:-}" in
   auth)  shift; cmd_auth  "$@" ;;
   status) shift; _auth_status "${1:-}" ;;
   ls)    shift; cmd_ls    "$@" ;;
+  doc)   shift; cmd_doc  "$@" ;;
   run)   shift; cmd_run   "$@" ;;
   serve) shift; cmd_serve "$@" ;;
   viewer) shift; cmd_viewer "$@" ;;

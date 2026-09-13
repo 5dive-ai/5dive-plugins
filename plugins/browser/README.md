@@ -108,6 +108,25 @@ takes. A name containing a dot is used verbatim as the host. A bare label (`link
 *different* profile and its URL is guessed as `<label>.com`; that guess is a convenience, not the
 contract. An adapter's `probe.url` outranks both.
 
+## Driving this from an agent seat
+
+The commands are easy; the ORCHESTRATION is where a seat burns the customer's one-time link,
+and every mistake there is silent. The workflow ships with the plugin, twice, from one source:
+
+- **Claude seats** — the skill `skills/connect-site/SKILL.md`, which fires on "log in to
+  &lt;site&gt;", "the agent needs a logged-in &lt;site&gt;", "open a browser on the box".
+- **Every other harness** (codex, grok, pi, opencode, qwen, agy) — the same text as a plain
+  file, `AGENTS.md`, printed by `5dive browser doc` and installed into a seat's instruction
+  file by `5dive browser doc --append=<file>`. The block is marker-fenced, so re-running it
+  after an upgrade REPLACES the section instead of stacking a second, divergent copy. A
+  Claude-only skill teaches half the fleet; a plugin is a capability, not a channel.
+
+The one rule worth repeating here: **the viewer link belongs to the human and is spent by the
+first successful GET.** An agent that opens it "to check" has denied the person it was minted
+for. Diagnose a handed-over link from the box journal
+(`journalctl -u shelld | grep -E 'viewer_bind|viewer_redeemed|viewer_denied|viewer_ws_connected'`),
+or with a deliberately bad nonce — never by visiting it.
+
 ## The auth model
 
 `5dive browser auth <site>` opens a browser profile dedicated to that site and you log in

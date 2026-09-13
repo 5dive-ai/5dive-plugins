@@ -37,6 +37,45 @@ t()  { if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); prin
 tc() { if [[ "$3" == *"$2"* ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); printf 'FAIL: %s\n   expected to contain: %s\n   got: %s\n' "$1" "$2" "$3"; fi; }
 tn() { if [[ "$3" != *"$2"* ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); printf 'FAIL: %s\n   expected NOT to contain: %s\n   got: %s\n' "$1" "$2" "$3"; fi; }
 
+# DIVE-4446 iteration 2 — two readers for the doc/skill prose arms below. Both
+# flatten the markdown first: an arm that depends on where the author's editor
+# wrapped a sentence grades the wrapping, not the rule.
+# _forbidden_spend_verbs prints which of the ways of spending a one-time ticket
+# the text forbids, read out of the prose rather than matched as a fixed
+# sentence: the skill says "do not open it, do not curl it" and the doc says
+# "Never open it, curl it, fetch it", and an arm pinned to either wording grades
+# the author's line-wrapping instead of the rule.
+_forbidden_spend_verbs() {
+  python3 - "$1" <<'PY'
+import re,sys
+t=re.sub(r'\s+',' ',open(sys.argv[1]).read())
+obj=r'(?:it|the (?:viewer |one-time )?(?:link|url|ticket))'
+out=[]
+for v in ('open','curl','fetch','preview'):
+    for m in re.finditer(v+r'\s+'+obj+r'\b',t,re.I):
+        head=t[:m.start()]
+        cut=max(head.rfind('.'),head.rfind('- '))
+        if re.search(r"(?:never|do not|don't|must not)",head[cut+1:],re.I):
+            out.append(v); break
+print(' '.join(sorted(out)) or 'none')
+PY
+}
+# _instructs_spend prints the first instruction-shaped phrasing of "request the
+# one-time link in order to check it" that is NOT inside a prohibition, or the
+# string none. It is a CLASS check: the arm must not be walkable by a reword.
+_instructs_spend() {
+  python3 - "$1" <<'PY'
+import re,sys
+t=re.sub(r'\s+',' ',open(sys.argv[1]).read())
+verb=r'(?:open|GET|curl|fetch|preview|visit|load|click|hit|request|browse to)'
+obj=r'(?:it|the (?:viewer |one-time )?(?:link|url|ticket))'
+pat=re.compile(verb+r'\s+'+obj+r'\b[^.]{0,60}?(?:to |and )(?:verify|check|test|confirm|make sure|see)',re.I)
+bad=[m.group(0) for m in pat.finditer(t)
+     if not re.search(r"(?:never|do not|don't|must not|no seat)[^.]{0,100}$", t[:m.start()], re.I)]
+print(bad[0] if bad else 'none')
+PY
+}
+
 TMP="$(mktemp -d)"
 OUT=""; ERR=""; RC=0
 run() { local o="$TMP/.o" e="$TMP/.e"; "$@" >"$o" 2>"$e"; RC=$?; OUT=$(cat "$o"); ERR=$(cat "$e"); return 0; }
@@ -1009,6 +1048,162 @@ rm -f "$SERVEDIR/.5dive-serve" "$URLLOG"
 run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" status served
 t 'T13c ...while an unserved profile is probed as usual' 'https://served.com/' "$(head -1 "$URLLOG")"
 kill "$SXPID" "$SCPID" 2>/dev/null
+
+# --- T14 DIVE-4446: the workflow doc, and the half of the fleet that is not Claude
+# WHY THESE ARE MUTANT-SHAPED. "A skill file exists" grades nothing: the failure
+# this row exists to prevent is an agent that runs every command correctly and
+# still burns the customer's one-time link, or a codex seat that never sees the
+# rule at all because it shipped only as a Claude skill. So each arm below is the
+# specific defect: an undeclared skill capability (the plugin installs, the skill
+# is silently never registered — contract §2), a doc that dropped the rule, and a
+# naive `cat >>` appender that stacks a second, divergent copy on every upgrade.
+SKILL="$ROOT/plugins/browser/skills/connect-site/SKILL.md"
+DOCF="$ROOT/plugins/browser/AGENTS.md"
+MANIFEST="$ROOT/plugins/browser/.claude-plugin/plugin.json"
+
+t  'T14a the connect-site skill ships with the plugin' 'yes' \
+   "$([[ -f "$SKILL" ]] && echo yes || echo no)"
+SKILLTXT="$(cat "$SKILL" 2>/dev/null)"
+tc 'T14a ...with frontmatter naming it' 'name: connect-site' "$SKILLTXT"
+# The description is the whole trigger surface: a skill that does not fire is a
+# skill that does not exist.
+tc 'T14a ...firing on "log in to <site>"' 'log in to' "$SKILLTXT"
+tc 'T14a ...firing on a seat that needs a logged-in account' 'logged-in' "$SKILLTXT"
+tc 'T14a ...and on the box-browser phrasing' 'open a browser on the box' "$SKILLTXT"
+
+# The rule the row is named after, in BOTH texts.
+for pair in "skill:$SKILL" "doc:$DOCF"; do
+  W="${pair%%:*}"; F="${pair#*:}"; TXT="$(cat "$F" 2>/dev/null)"
+  tc "T14b the $W carries the link-is-the-human's rule" 'spent by the first successful GET' "$TXT"
+  tc "T14b ...the $W says to diagnose from the journal" 'journalctl -u shelld' "$TXT"
+  tc "T14b ...naming the redeem events ($W)" 'viewer_redeemed' "$TXT"
+  tc "T14b ...naming the denial event ($W)" 'viewer_denied' "$TXT"
+  tc "T14b ...the $W has the full flow, ending in revoke" 'viewer-revoke' "$TXT"
+  tc "T14b ...the $W says --bind is mandatory" 'mandatory' "$TXT"
+  tc "T14b ...the $W keeps the not-anti-bot line" 'anti-bot bypassing' "$TXT"
+  # DIVE-4446 iteration 2: anchored on the RULE, not on one phrasing. The old arm
+  # grepped the single literal 'open the link to verify', so a reword to 'curl the
+  # link to check' passed it. Two arms now: the prohibition must still ENUMERATE
+  # the ways of spending the ticket, and no instructing phrasing of
+  # <request> the link <to verify> may survive anywhere unnegated.
+  VERBS="$(_forbidden_spend_verbs "$F")"
+  tc "T14b ...the $W forbids OPENING the link ($W)" 'open' "$VERBS"
+  tc "T14b ...and forbids CURLing it ($W)" 'curl' "$VERBS"
+  t  "T14b ...enumerating at least three ways of spending it, not one ($W)" 'yes' \
+     "$([[ $(wc -w <<<"$VERBS") -ge 3 ]] && echo yes || echo no)"
+  t  "T14b ...and no unnegated 'spend the link to check it' instruction survives ($W)" \
+     'none' "$(_instructs_spend "$F")"
+done
+
+# A skills/ dir with no 'skill' capability installs clean and registers NOTHING
+# (cmd_plugin.sh warns and moves on) — the silent half-ship this arm forbids.
+t  'T14c the manifest declares the skill capability, or the skill is never registered' 'yes' \
+   "$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print("yes" if "skill" in d["fivedive"]["capabilities"] else "no")' "$MANIFEST" 2>/dev/null)"
+
+# --- the harness-agnostic path: `doc` prints, `--append` installs -------------
+run env PATH="$SPATH" "$BROWSER" doc
+t  'T14d doc prints the workflow for a non-Claude seat' 0 "$RC"
+tc 'T14d ...and it is the same text the plugin ships' 'spent by the first successful GET' "$OUT"
+
+SEATDOC="$TMP/seat/AGENTS.md"; mkdir -p "$TMP/seat"
+printf '# my seat\nkeep this line\n' > "$SEATDOC"
+run env PATH="$SPATH" "$BROWSER" doc --append="$SEATDOC"
+t  'T14e append into a seat instruction file succeeds' 0 "$RC"
+tc 'T14e ...and does not eat what was already there' 'keep this line' "$(cat "$SEATDOC")"
+tc 'T14e ...the rule is now in the seat file' 'spent by the first successful GET' "$(cat "$SEATDOC")"
+
+# The mutant: `cat >> $target` passes every arm above and fails this one.
+run env PATH="$SPATH" "$BROWSER" doc --append="$SEATDOC"
+t  'T14f a second install is idempotent — exactly one fenced block' 1 \
+   "$(grep -c '5dive:browser:begin' "$SEATDOC")"
+t  'T14f ...and exactly one closing marker' 1 "$(grep -c '5dive:browser:end' "$SEATDOC")"
+t  'T14f ...the seat text survives the rewrite' 1 "$(grep -c 'keep this line' "$SEATDOC")"
+
+# An upgraded plugin must REPLACE the block, not leave two rules disagreeing.
+NEWDOC="$TMP/newdoc.md"
+{ echo '<!-- 5dive:browser:begin -->'; echo 'RULE-V2 the link is still the human'"'"'s'; echo '<!-- 5dive:browser:end -->'; } > "$NEWDOC"
+run env PATH="$SPATH" FIVEDIVE_BROWSER_DOC="$NEWDOC" "$BROWSER" doc --append="$SEATDOC"
+t  'T14g an upgrade replaces the old block' 1 "$(grep -c 'RULE-V2' "$SEATDOC")"
+t  'T14g ...leaving no stale copy of the old one' 0 \
+   "$(grep -c 'spent by the first successful GET' "$SEATDOC")"
+t  'T14g ...still exactly one fence' 1 "$(grep -c '5dive:browser:begin' "$SEATDOC")"
+
+run env PATH="$SPATH" "$BROWSER" doc --append="$TMP/nodir/AGENTS.md"
+t  'T14h append refuses a path whose directory does not exist' 64 "$RC"
+t  'T14h ...and creates nothing' 'no' \
+   "$([[ -e "$TMP/nodir" ]] && echo yes || echo no)"
+run env PATH="$SPATH" FIVEDIVE_BROWSER_DOC="$TMP/gone.md" "$BROWSER" doc
+t  'T14i a plugin install missing its doc fails closed rather than printing nothing' 69 "$RC"
+
+# --- T14j DIVE-4446 iteration 2: a BROKEN FENCE IS A REFUSAL ------------------
+# The defect this arm exists for, measured on iteration 1: a target carrying a
+# BEGIN with no END made the awk skip to end-of-input, so `cat $tmp > $target`
+# wrote a file with every one of the seat's trailing lines gone — and printed
+# "refreshed the browser section in <file>", rc 0. The file class here is
+# hand-edited by definition (AGENTS.md, CLAUDE.md), and half a marker pair is the
+# normal shape of a bad hand-edit, so this is not an exotic input. The arm asserts
+# the three things that make it safe rather than merely different: non-zero rc,
+# the file BYTE-IDENTICAL, and a receipt that NAMES the missing marker — that last
+# one because the failure mode was a success message, and an operator who is told
+# "done" does not go looking.
+BROKEN="$TMP/seat/broken.md"
+_mkbroken() { printf 'KEEP ME ABOVE\n%s\nstale\nKEEP ME BELOW\nAND MY OTHER SECTION\n' "$1" > "$BROKEN"; }
+
+_mkbroken '<!-- 5dive:browser:begin -->'
+cp "$BROKEN" "$BROKEN.before"
+run env PATH="$SPATH" "$BROWSER" doc --append="$BROKEN"
+t  'T14j a BEGIN with no END is refused, not rewritten' 64 "$RC"
+t  'T14j ...and the file is byte-identical to before' 'same' \
+   "$(cmp -s "$BROKEN" "$BROKEN.before" && echo same || echo CHANGED)"
+tc 'T14j ...the refusal names the missing END marker' '5dive:browser:end' "$ERR"
+tc 'T14j ...and names the file it refused to touch' "$BROKEN" "$ERR"
+tn 'T14j ...and does NOT claim it refreshed anything' 'refreshed' "$OUT$ERR"
+t  'T14j ...the seat text below the marker is still there' 2 \
+   "$(grep -cE 'KEEP ME BELOW|AND MY OTHER SECTION' "$BROKEN")"
+
+# The symmetric hand-edit: the END survived and the BEGIN was deleted. The old
+# code took the append branch and silently dropped the orphan END line.
+printf 'KEEP ME ABOVE\n<!-- 5dive:browser:end -->\nKEEP ME BELOW\n' > "$BROKEN"
+cp "$BROKEN" "$BROKEN.before"
+run env PATH="$SPATH" "$BROWSER" doc --append="$BROKEN"
+t  'T14j an END with no BEGIN is refused too' 64 "$RC"
+t  'T14j ...and that file is byte-identical as well' 'same' \
+   "$(cmp -s "$BROKEN" "$BROKEN.before" && echo same || echo CHANGED)"
+tc 'T14j ...naming the missing BEGIN marker' '5dive:browser:begin' "$ERR"
+
+# Inverted pair: both markers present, END first. The awk would have eaten
+# everything after BEGIN.
+printf 'A\n<!-- 5dive:browser:end -->\nB\n<!-- 5dive:browser:begin -->\nKEEP ME LAST\n' > "$BROKEN"
+cp "$BROKEN" "$BROKEN.before"
+run env PATH="$SPATH" "$BROWSER" doc --append="$BROKEN"
+t  'T14j an inverted marker pair is refused' 64 "$RC"
+t  'T14j ...byte-identical' 'same' \
+   "$(cmp -s "$BROKEN" "$BROKEN.before" && echo same || echo CHANGED)"
+tc 'T14j ...and says which way round they are' 'inverted' "$ERR"
+
+# Two fences: replacing "the" block is undefined, and the old awk emitted the doc
+# twice.
+{ echo '<!-- 5dive:browser:begin -->'; echo x; echo '<!-- 5dive:browser:end -->'
+  echo mid
+  echo '<!-- 5dive:browser:begin -->'; echo y; echo '<!-- 5dive:browser:end -->'; } > "$BROKEN"
+cp "$BROKEN" "$BROKEN.before"
+run env PATH="$SPATH" "$BROWSER" doc --append="$BROKEN"
+t  'T14j two fences in one file are refused rather than guessed at' 64 "$RC"
+t  'T14j ...byte-identical' 'same' \
+   "$(cmp -s "$BROKEN" "$BROKEN.before" && echo same || echo CHANGED)"
+
+# And the guard must not have cost us the good path: a well-formed pair with the
+# seat's text on BOTH sides still refreshes in place.
+GOOD="$TMP/seat/good.md"
+{ echo 'ABOVE'; echo '<!-- 5dive:browser:begin -->'; echo 'old'
+  echo '<!-- 5dive:browser:end -->'; echo 'BELOW'; } > "$GOOD"
+run env PATH="$SPATH" "$BROWSER" doc --append="$GOOD"
+t  'T14k a well-formed fence still refreshes' 0 "$RC"
+t  'T14k ...text above survives' 1 "$(grep -c '^ABOVE$' "$GOOD")"
+t  'T14k ...text below survives' 1 "$(grep -c '^BELOW$' "$GOOD")"
+t  'T14k ...the stale body is gone' 0 "$(grep -c '^old$' "$GOOD")"
+t  'T14k ...and there is still exactly one fence' 1 \
+   "$(grep -c '5dive:browser:begin' "$GOOD")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
