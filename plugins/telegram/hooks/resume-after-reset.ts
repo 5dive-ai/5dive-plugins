@@ -176,9 +176,14 @@ async function attemptResume(): Promise<boolean> {
   return false
 }
 
+// DIVE-4401: the chats are on the start line because this log is the one
+// artifact of a wall episode that SURVIVES — the helper's log dir outlives the
+// systemd respawn that tears the hook down. Reconstructing where the 04:20Z
+// notice was routed meant re-deriving it from a transcript hours later; the
+// helper had the answer in argv the whole time and printed everything except.
 log(
   `resume-after-reset start: reset_epoch=${resetEpoch} socket=${socket} ` +
-    `target=${target} transcript=${transcriptPath ? 'yes' : 'no'}`,
+    `target=${target} chats=${chatIdsCsv || '(none)'} transcript=${transcriptPath ? 'yes' : 'no'}`,
 )
 
 let resumed = false

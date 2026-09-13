@@ -216,13 +216,25 @@ if (isRateLimit) {
 // no group is configured at all do we fan to all allowed chats — better a
 // noisy alert than a silenced one.
 let targets: CallerChat[]
+// DIVE-4401: which of the three rungs we landed on, for the route trace below.
+// Routing itself is UNCHANGED — a usage-limit notice goes exactly where a
+// Pro/Max one goes — but which rung was taken is the first thing you need to
+// know when an operator says the notice never arrived, and it was recorded
+// nowhere. On the measured 2026-09-13 04:20Z wall the two seats took two
+// different rungs (main had a telegram DM 11 minutes earlier → 'caller';
+// olivia's turn was autonomous → 'group-topics', i.e. the agent's own forum
+// topic, not the DM the operator was watching) and neither left a trace.
+let routeKind: 'caller' | 'group-topics' | 'all-allowed'
 const callerChat = getCallerChat(entries)
 if (callerChat) {
   targets = [callerChat]
+  routeKind = 'caller'
 } else {
   const topics = getGroupTopics()
   targets = topics.length ? topics : getAllowedChatIds().map(chatId => ({ chatId }))
+  routeKind = topics.length ? 'group-topics' : 'all-allowed'
 }
+const fmtTarget = (t: CallerChat) => (t.threadId ? `${t.chatId}:${t.threadId}` : t.chatId)
 
 // For a recoverable rate limit (we have a pane to drive), claim the per-agent
 // resume lock BEFORE notifying. If it's already held, a helper is mid-recovery
@@ -316,7 +328,35 @@ let shouldSend = true
 }
 
 if (shouldSend) {
-  await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
+  // DIVE-4401: trace the route and the OUTCOME of every send. Before this the
+  // hook logged its dedup decision and nothing else, so "the bot never sent it"
+  // could not be separated from "the bot sent it to a topic you were not
+  // reading" or "Telegram rejected it" — three symptoms with three different
+  // fixes and, until now, one indistinguishable silence.
+  console.error(`[stopfailure-notify] route=${routeKind} targets=${targets.map(fmtTarget).join(',') || '(none)'}`)
+  const results = await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
+  targets.forEach((t, i) => {
+    console.error(`[stopfailure-notify] send ${fmtTarget(t)}: ${results[i] ? 'ok' : 'FAILED'}`)
+  })
+  // Last-resort fallback: if EVERY routed send failed, the notice is lost and
+  // the agent is about to go quiet for hours. Retry on the paired chats we did
+  // not already try, so a dead topic (or a group the bot was removed from)
+  // degrades to a DM instead of to silence. Deliberately gated on TOTAL
+  // failure: a successful routed send must not also fan out to every paired
+  // chat — that fan-out is what the caller-narrowing above exists to prevent.
+  if (results.length > 0 && results.every(ok => !ok)) {
+    const tried = new Set(targets.map(t => t.chatId))
+    const fallback = getAllowedChatIds().filter(id => !tried.has(id))
+    if (fallback.length > 0) {
+      console.error(`[stopfailure-notify] all ${results.length} routed send(s) failed — falling back to ${fallback.join(',')}`)
+      const fbResults = await Promise.all(fallback.map(id => sendMessage(id, text)))
+      fallback.forEach((id, i) => {
+        console.error(`[stopfailure-notify] fallback send ${id}: ${fbResults[i] ? 'ok' : 'FAILED'}`)
+      })
+    } else {
+      console.error('[stopfailure-notify] all routed send(s) failed and no other paired chat to fall back to')
+    }
+  }
 }
 
 // Detach the recovery helper (we already hold the lock). Two flows share the
