@@ -19,6 +19,27 @@ export type DispatcherState = {
   seen: string[]
   pending: DispatchMessage[]
   active?: { turnId: string; routeKey: string; route: DispatchRoute; message: DispatchMessage }
+  /**
+   * Set by `markCleanShutdown()` on the way out and cleared by the next
+   * `initialize()`. Its ABSENCE is the load-bearing half: a dispatcher that was
+   * SIGKILLed, OOM-killed or died with its box never gets to write it, so
+   * "restarted" and "crashed" stop being the same sentence to the person in the
+   * chat (DIVE-3965).
+   */
+  cleanExit?: boolean
+  /**
+   * Carried across the restart and injected into the NEXT real turn, never
+   * submitted as a turn of its own — replaying the interrupted message would
+   * duplicate work Codex may already have done before it died.
+   */
+  recovery?: RecoveryContext
+}
+
+export type RecoveryContext = {
+  /** `thread-lost` is the stronger fact: no earlier conversation is in context. */
+  kind: 'interrupted' | 'thread-lost'
+  at: string
+  detail: string
 }
 
 export interface RpcPort {
@@ -52,10 +73,27 @@ function routeKey(route: DispatchRoute): string {
   return `${route.source}:${route.chat_id}:${route.message_thread_id ?? ''}`
 }
 
-function inputFor(message: DispatchMessage): Array<Record<string, unknown>> {
-  const input: Array<Record<string, unknown>> = [{ type: 'text', text: message.text, text_elements: [] }]
+/**
+ * One short line, not a transcript. It rides the next turn's input so the model
+ * learns what it lost without the dispatcher re-sending the lost message.
+ */
+export function recoveryLine(recovery: RecoveryContext): string {
+  return `[5dive recovery] Since your last turn: ${recovery.detail}. Continue from the message below; `
+    + 'do not replay the interrupted work unless the user asks for it.'
+}
+
+function inputFor(message: DispatchMessage, recovery?: RecoveryContext): Array<Record<string, unknown>> {
+  const input: Array<Record<string, unknown>> = []
+  if (recovery) input.push({ type: 'text', text: recoveryLine(recovery), text_elements: [] })
+  input.push({ type: 'text', text: message.text, text_elements: [] })
   if (message.image_path?.startsWith('/')) input.push({ type: 'localImage', path: message.image_path })
   return input
+}
+
+/** Keep a quoted snippet short enough to stay one line of context. */
+function snippet(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > 80 ? `${flat.slice(0, 79)}…` : flat
 }
 
 /**
@@ -84,14 +122,32 @@ export class ChannelDispatcher {
     return structuredClone(this.state)
   }
 
+  /**
+   * Record that this process is going down on purpose. Called from the shutdown
+   * path, synchronously, because an exit is not a place to await anything.
+   */
+  markCleanShutdown(): void {
+    if (this.state.cleanExit) return
+    this.state.cleanExit = true
+    this.persist()
+  }
+
   async initialize(): Promise<void> {
     await this.enqueueSerial(async () => {
       const interrupted = this.state.active
+      const wasClean = this.state.cleanExit === true
       this.state.active = undefined
+      this.state.cleanExit = undefined
+      let threadLost = ''
       if (this.state.threadId) {
         try {
           await this.rpc.request('thread/resume', { threadId: this.state.threadId })
-        } catch {
+        } catch (err) {
+          // A thread the app-server no longer has is not a fatal condition, but
+          // it is not a silent one either: the conversation the person on the
+          // other end is still holding in their head no longer exists here.
+          threadLost = String((err as { message?: string })?.message ?? err).replace(/\s+/g, ' ').trim().slice(0, 120)
+            || 'the app-server rejected the resume'
           this.state.threadId = undefined
         }
       }
@@ -106,11 +162,32 @@ export class ChannelDispatcher {
         if (typeof id !== 'string' || !id) throw new Error('thread/start returned no thread id')
         this.state.threadId = id
       }
-      this.persist()
+
+      const facts: string[] = []
       if (interrupted) {
+        facts.push(`the turn you were running was cut off before it finished (it was started by: "${snippet(interrupted.message.text)}")`)
+      }
+      if (threadLost) {
+        facts.push(`the previous Codex thread could not be resumed (${threadLost}), so none of the earlier conversation is in context`)
+      }
+      if (facts.length > 0) {
+        this.state.recovery = {
+          kind: threadLost ? 'thread-lost' : 'interrupted',
+          at: new Date().toISOString(),
+          detail: facts.join('; '),
+        }
+      }
+      this.persist()
+
+      if (interrupted) {
+        // Exactly once per interrupted turn: `active` is cleared and persisted
+        // above, so a second restart before any new work says nothing at all.
+        const cause = wasClean
+          ? 'The local Codex dispatcher restarted'
+          : 'The local Codex dispatcher stopped unexpectedly (crash, kill, or host reboot)'
         await this.sink.publish(
           interrupted.route,
-          'The local Codex dispatcher restarted before the previous turn completed. Please resend that message if you still need a response.',
+          `${cause} before the previous turn completed. Please resend that message if you still need a response.`,
           { turnId: interrupted.turnId, kind: 'error' },
         )
       }
@@ -186,15 +263,19 @@ export class ChannelDispatcher {
   }
 
   private async startMessage(message: DispatchMessage): Promise<void> {
+    const recovery = this.state.recovery
     const result = await this.rpc.request('turn/start', {
       threadId: this.requireThread(),
       clientUserMessageId: message.id,
       turnTrigger: `5dive:${message.route.source}`,
-      input: inputFor(message),
+      input: inputFor(message, recovery),
     })
     const turnId = result?.turn?.id
     if (typeof turnId !== 'string' || !turnId) throw new Error('turn/start returned no turn id')
     this.state.active = { turnId, routeKey: routeKey(message.route), route: message.route, message }
+    // Consumed only once the turn it rode on actually exists: a `turn/start`
+    // that threw leaves the context in state for the retry.
+    if (recovery) this.state.recovery = undefined
     this.markSeen(message.id)
     this.persist()
   }

@@ -219,6 +219,10 @@ function fatal(message: string): never {
 function shutdown(code = 0): void {
   if (!shuttingDown) {
     shuttingDown = true
+    // DIVE-3965: a deliberate stop must be distinguishable from a kill on the
+    // next boot. Synchronous and best-effort — an exit path cannot await, and a
+    // dispatcher must not fail to exit because its own state file is unwritable.
+    try { dispatcher.markCleanShutdown() } catch {}
     for (const child of children) child.kill('SIGTERM')
     rpc.stop()
   }

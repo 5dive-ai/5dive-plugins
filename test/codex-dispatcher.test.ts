@@ -7,6 +7,7 @@ import {
   parseOutboundMessage,
   type DispatchMessage,
   type DispatcherState,
+  recoveryLine,
   type RpcPort,
 } from '../plugins/telegram-codex/dispatcher-core.ts'
 import { writeDispatcherInbox } from '../plugins/dashboard/dispatcher-inbox.ts'
@@ -23,11 +24,15 @@ function harness(initial: DispatcherState | null = null) {
   const published: Array<{ route: any; text: string; meta: any }> = []
   let nextTurn = 1
   let failTurnStart = false
+  let failResume = false
   const rpc: RpcPort = {
     async request(method, params) {
       requests.push({ method, params })
       if (method === 'thread/start') return { thread: { id: 'thread-1' } }
-      if (method === 'thread/resume') return { thread: { id: params.threadId } }
+      if (method === 'thread/resume') {
+        if (failResume) throw new Error('thread not found')
+        return { thread: { id: params.threadId } }
+      }
       if (method === 'turn/start') {
         if (failTurnStart) throw new Error('app-server unavailable')
         return { turn: { id: `turn-${nextTurn++}` } }
@@ -52,6 +57,8 @@ function harness(initial: DispatcherState | null = null) {
     requests,
     published,
     setFailTurnStart(value: boolean) { failTurnStart = value },
+    setFailResume(value: boolean) { failResume = value },
+    persisted: () => saved,
   }
 }
 
@@ -117,21 +124,114 @@ describe('Codex app-server channel dispatcher', () => {
     }])
   })
 
+  const interruptedState = (): DispatcherState => ({
+    threadId: 'thread-old',
+    seen: ['tg-active'],
+    active: {
+      turnId: 'turn-old', routeKey: 'telegram:42:', route: telegram('tg-active').route,
+      message: telegram('tg-active', 'summarise the incident'),
+    },
+    pending: [{ id: 'dash-1', text: 'next', route: { source: 'dashboard', chat_id: 'dashboard' } }],
+  })
+
   test('restart resumes the thread, reports the interrupted turn, and drains queued work', async () => {
-    const h = harness({
-      threadId: 'thread-old',
-      seen: ['tg-active'],
-      active: {
-        turnId: 'turn-old', routeKey: 'telegram:42:', route: telegram('tg-active').route,
-        message: telegram('tg-active'),
-      },
-      pending: [{ id: 'dash-1', text: 'next', route: { source: 'dashboard', chat_id: 'dashboard' } }],
-    })
+    const h = harness(interruptedState())
     await h.dispatcher.initialize()
 
     expect(h.requests.map(r => r.method)).toEqual(['thread/resume', 'turn/start'])
-    expect(h.published[0]?.text).toMatch(/restarted before the previous turn completed/i)
+    expect(h.published[0]?.text).toMatch(/before the previous turn completed/i)
     expect(h.dispatcher.snapshot().active?.message.id).toBe('dash-1')
+  })
+
+  test('a clean stop and a crash are different sentences in the chat', async () => {
+    const crashed = harness(interruptedState())
+    await crashed.dispatcher.initialize()
+    expect(crashed.published[0]?.text).toMatch(/stopped unexpectedly \(crash, kill, or host reboot\)/i)
+
+    const clean = harness({ ...interruptedState(), cleanExit: true })
+    await clean.dispatcher.initialize()
+    expect(clean.published[0]?.text).toMatch(/^The local Codex dispatcher restarted before/)
+    expect(clean.published[0]?.text).not.toMatch(/unexpectedly/i)
+    // The flag must not survive its own boot, or every later crash reads clean.
+    expect(clean.dispatcher.snapshot().cleanExit).toBeUndefined()
+  })
+
+  test('markCleanShutdown persists the intent before the process exits', () => {
+    const h = harness({ threadId: 'thread-old', seen: [], pending: [] })
+    h.dispatcher.markCleanShutdown()
+    expect(h.persisted()?.cleanExit).toBe(true)
+  })
+
+  test('recovery context rides the next turn instead of replaying the lost one', async () => {
+    const h = harness(interruptedState())
+    await h.dispatcher.initialize()
+
+    const started = h.requests.filter(r => r.method === 'turn/start')
+    // Exactly one turn — the queued dashboard message. The interrupted message
+    // is NOT resubmitted, which is what "without duplicating turns" means.
+    expect(started).toHaveLength(1)
+    expect(started[0]?.params.clientUserMessageId).toBe('dash-1')
+    const input = started[0]?.params.input as Array<{ type: string; text?: string }>
+    expect(input).toHaveLength(2)
+    expect(input[0]?.text).toMatch(/^\[5dive recovery\] /)
+    expect(input[0]?.text).toContain('summarise the incident')
+    expect(input[1]?.text).toBe('next')
+    // Consumed once: the turn after it carries the user's text alone.
+    expect(h.dispatcher.snapshot().recovery).toBeUndefined()
+    await h.dispatcher.notification('turn/completed', { turn: { id: 'turn-1', status: 'completed' } })
+    await h.dispatcher.submit(telegram('tg-later', 'and now?'))
+    expect((h.requests.at(-1)?.params.input as unknown[])).toHaveLength(1)
+  })
+
+  test('a stale thread starts a fresh one and says so in the recovery context', async () => {
+    const h = harness({ threadId: 'thread-gone', seen: [], pending: [] })
+    h.setFailResume(true)
+    await h.dispatcher.initialize()
+
+    expect(h.requests.map(r => r.method)).toEqual(['thread/resume', 'thread/start'])
+    expect(h.dispatcher.snapshot().threadId).toBe('thread-1')
+    const recovery = h.dispatcher.snapshot().recovery!
+    expect(recovery.kind).toBe('thread-lost')
+    expect(recovery.detail).toContain('thread not found')
+    // Nothing to tell a channel about: no turn was in flight to interrupt.
+    expect(h.published).toEqual([])
+
+    await h.dispatcher.submit(telegram('tg-1', 'still there?'))
+    const input = h.requests.at(-1)?.params.input as Array<{ text?: string }>
+    expect(input[0]?.text).toContain('none of the earlier conversation is in context')
+  })
+
+  test('the interrupted-turn notice is sent once, not on every later restart', async () => {
+    // No pending work: after the first boot nothing is in flight, so a second
+    // boot has no interrupted turn of its OWN to report.
+    let saved: DispatcherState | null = { ...interruptedState(), pending: [] }
+    const published: string[] = []
+    const build = () => {
+      const rpc: RpcPort = {
+        async request(method, params) {
+          if (method === 'thread/resume') return { thread: { id: (params as any).threadId } }
+          if (method === 'turn/start') return { turn: { id: 'turn-x' } }
+          throw new Error(`unexpected ${method}`)
+        },
+      }
+      return new ChannelDispatcher(
+        rpc,
+        { load: () => saved ? structuredClone(saved) : null, save: s => { saved = structuredClone(s) } },
+        { publish: async (_r, text) => { published.push(text) } },
+        '/workspace',
+      )
+    }
+    await build().initialize()
+    expect(published).toHaveLength(1)
+    // Second boot, no new work: the row was cleared and persisted by the first.
+    await build().initialize()
+    expect(published).toHaveLength(1)
+  })
+
+  test('the recovery line is one line and never replays the lost message verbatim', () => {
+    const line = recoveryLine({ kind: 'interrupted', at: '2026-09-13T00:00:00.000Z', detail: 'the turn you were running was cut off' })
+    expect(line.split('\n')).toHaveLength(1)
+    expect(line).toMatch(/do not replay the interrupted work/i)
   })
 
   test('duplicate delivery ids never start or steer twice', async () => {
