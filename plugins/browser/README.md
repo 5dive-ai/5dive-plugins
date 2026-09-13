@@ -101,6 +101,13 @@ attached. Five properties, each of which fails closed:
 **Killing the viewer does not kill the browser.** The profile is the durable half; the view onto it
 is the ephemeral half. `viewer-revoke` ends the view and the session stays logged in.
 
+## `<site>` is the host
+
+`linkedin.com`, `reddit.com` — the name the dashboard passes, and the name the profile directory
+takes. A name containing a dot is used verbatim as the host. A bare label (`linkedin`) is a
+*different* profile and its URL is guessed as `<label>.com`; that guess is a convenience, not the
+contract. An adapter's `probe.url` outranks both.
+
 ## The auth model
 
 `5dive browser auth <site>` opens a browser profile dedicated to that site and you log in
@@ -141,6 +148,19 @@ without a scheduled probe the agent finds out **mid-publish**. So:
   page load a day is worth more than any adapter. It reports `authenticated`, `session expired —
   human action required`, `CHALLENGE — human action required`, or `UNKNOWN` when the probe could
   not read the page at all (no browser on the box, a load that failed).
+- **`authenticated` requires an adapter, and with no adapter the answer is `UNKNOWN`.** The only
+  evidence for a login is the adapter's `logged_out_when_dom_matches` failing to match. Without
+  one that test is skipped, so anything that merely LOADED used to be stamped `authenticated` —
+  including a profile nobody had ever logged into, which is what the dashboard's Connected-sites
+  tile then showed. A challenge is still named without an adapter (that marker has a default), so
+  the one classification that does work with no adapter is not lost.
+- **A served profile is not probed.** Chrome allows one instance per profile directory, so a probe
+  launched at a profile `serve` is holding is handed off to the running browser and returns an
+  empty document. `status` says `UNKNOWN (served on :N …)` and leaves the last real verdict
+  standing rather than reporting a load failure that did not happen. Probing *through* the served
+  browser needs a CDP endpoint, and a loopback debugging port on a logged-in profile is reachable
+  by every seat on the box — the credential the 0700 store exists to protect, handed over with no
+  file permission needed. Not a trade `status` gets to make.
 - **`UNKNOWN` is deliberately asymmetric, and both halves are load-bearing.** `status` stays
   QUIET on it and exits 0 — a network blip must not page a person, or the signal becomes noise.
   `run` **refuses** on it, because the action is the irreversible half and an unverified session

@@ -887,5 +887,128 @@ chmod 700 "$BADV"
 
 env PATH="$SPATH" "$BROWSER" serve viewsite --stop >/dev/null 2>&1 || true
 
+# =========== T11/T12/T13 the Connected-sites tile shows a state a customer can trust (DIVE-4426)
+#
+# The tile on production reads exactly what `status`/`ls` print, so every arm here
+# is a MUTANT of a way that tile lies to the person who just logged in. All three
+# were OBSERVED on exact-swallow 2026-09-13, in the order a customer meets them.
+#
+# The fixtures below need no adapter, so they must not reuse the shared PATH fake
+# from the top of the file for the URL arms — that one ignores argv, and the URL
+# IS the defect in T12. A recording fake is used there instead, and its negative
+# control (T12b) is the same fake on a bare name.
+export PATH="$FAKEBIN:$PATH"
+
+# --- T11 no adapter means no verdict -----------------------------------------
+# `authenticated` is a CLAIM about a login. The only thing that can support it is
+# the adapter's logged-out marker, and with no adapter the logged-out test is
+# skipped entirely — so before this row every page that merely LOADED was stamped
+# `authenticated`, including profiles nobody had ever logged into. The mutant is
+# not a wrong string; it is a tile that says "connected" about an empty profile.
+mkprofile noadapter "$LIVE_DOM" >/dev/null
+rm -f "$FIVEDIVE_BROWSER_ADAPTER_DIR/noadapter.json"
+run "$BROWSER" status noadapter
+t  'T11a status on a site with no adapter stays quiet at the scheduler' 0 "$RC"
+tn 'T11a ...and NEVER claims a login it cannot see' 'authenticated' "$OUT"
+tc 'T11a ...naming what it could not tell'          'UNKNOWN' "$OUT"
+tc 'T11a ...and what would fix it'                  'no adapter' "$OUT"
+
+run "$BROWSER" ls
+tn 'T11b ...and the stamp the tile reads is not "authenticated" either' 'noadapter             authenticated' "$OUT"
+tc 'T11b ...it is the honest state'                                     'unknown' "$OUT"
+
+# T11c — the fix must not blind the one classification that DOES work with no
+# adapter. The challenge marker has a built-in default, so a challenge page is
+# nameable without an adapter, and collapsing the whole no-adapter path to UNKNOWN
+# would throw that away: the customer sitting in front of a CAPTCHA would be told
+# "we cannot tell" instead of "go clear this".
+mkprofile noadapterchal "$CHALLENGE_DOM" >/dev/null
+rm -f "$FIVEDIVE_BROWSER_ADAPTER_DIR/noadapterchal.json"
+run "$BROWSER" status noadapterchal
+t  'T11c a challenge is still named with no adapter' 75 "$RC"
+tc 'T11c ...as a challenge'                          'CHALLENGE' "$OUT"
+
+# T11d — the positive control for the whole block: an adapter WITH a marker still
+# reaches `authenticated`. Without this, T11a passes on a build that simply never
+# says the word, which is a different and equally broken product.
+t 'T11d positive control: with an adapter, a live profile is still authenticated' 'authenticated' \
+  "$(run "$BROWSER" status x; printf '%s' "$OUT" | grep -o authenticated | head -1)"
+
+# --- T12 a dotted profile name is a HOST, not a label to suffix ---------------
+# `_site_url` guessed `https://<name>.com/`. The dashboard contract (GET
+# /server/browser/sites, the tile's button, the seeded profiles) uses `reddit.com`
+# — so serve opened `https://reddit.com.com/`, a parked domain that 302'd the
+# customer's viewer onto a random subreddit instead of a login page, and status
+# probed the same wrong host. The URL is not observable from status output, so
+# this fake RECORDS the address it was handed.
+URLBIN="$TMP/urlbin"; mkdir -p "$URLBIN"
+cat > "$URLBIN/google-chrome" <<'UCHROME'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in --user-data-dir=*) d="${a#*=}" ;; -*) ;; *) u="$a" ;; esac
+done
+printf '%s\n' "${u:-NONE}" >> "$URLLOG"
+cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null || echo "<html><body>feed</body></html>"
+UCHROME
+chmod +x "$URLBIN/google-chrome"
+export URLLOG="$TMP/urls.txt"
+
+mkprofile reddit.com "$LIVE_DOM" >/dev/null
+rm -f "$FIVEDIVE_BROWSER_ADAPTER_DIR/reddit.com.json" "$URLLOG"
+run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" status reddit.com
+t  'T12a a dotted name is probed as the host it names' 'https://reddit.com/' "$(head -1 "$URLLOG")"
+tn 'T12a ...and never as <name>.com.com'               '.com.com' "$(cat "$URLLOG")"
+
+# T12b — the negative control, and it is what keeps T12a from being "strip a
+# suffix": a bare label has no host in it and still gets the guess it always had.
+mkprofile bareword "$LIVE_DOM" >/dev/null
+rm -f "$FIVEDIVE_BROWSER_ADAPTER_DIR/bareword.json" "$URLLOG"
+run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" status bareword
+t 'T12b a bare label still gets the .com guess' 'https://bareword.com/' "$(head -1 "$URLLOG")"
+
+# T12c — an adapter's declared probe.url outranks both guesses. mkadapter writes
+# https://<site>.test/feed, which neither branch above could produce.
+mkprofile dotted.site "$LIVE_DOM" >/dev/null
+mkadapter dotted.site "file://$TMP/artifact.html" 'PUBLISHED'
+rm -f "$URLLOG"
+run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" status dotted.site
+t 'T12c the adapter probe.url outranks the guess' 'https://dotted.site.test/feed' "$(head -1 "$URLLOG")"
+
+# --- T13 a served profile cannot be probed by a SECOND browser ----------------
+# Chrome enforces one instance per user-data-dir (SingletonLock). The probe's
+# --headless --dump-dom hands its URL to the running instance and exits with an
+# empty document, which read as "UNKNOWN (probe did not load)" — a blank verdict
+# during EXACTLY the window in which the customer has just logged in through the
+# viewer. The mutant this arm kills: a second Chrome launched at all.
+mkprofile served "$LIVE_DOM" >/dev/null
+SERVEDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/served"
+printf '%s' 'authenticated-from-before' > "$SERVEDIR/.5dive-liveness"
+sleep 300 & SXPID=$!
+sleep 300 & SCPID=$!
+( umask 077; printf 'display=137\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+    "$SXPID" "$SCPID" "$(date -u +%s)" > "$SERVEDIR/.5dive-serve" )
+rm -f "$URLLOG"
+run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" status served
+t  'T13a status on a served profile launches NO second browser' 'none' \
+   "$([[ -s "$URLLOG" ]] && cat "$URLLOG" || echo none)"
+t  'T13a ...and stays quiet at the scheduler'  0 "$RC"
+tc 'T13a ...naming the display that holds it'  ':137' "$OUT"
+tc 'T13a ...and saying why it cannot look'     'cannot open a profile' "$OUT"
+tn 'T13a ...never claiming a login it did not check' 'authenticated (checked' "$OUT"
+
+# T13b — the served branch must not OVERWRITE the last real verdict. The liveness
+# stamp is the tile's memory; replacing "authenticated at 09:19Z" with "served"
+# would lose the only true thing we knew about this profile in order to report a
+# transient condition.
+t 'T13b ...and leaves the last real verdict standing' 'authenticated-from-before' \
+  "$(cat "$SERVEDIR/.5dive-liveness")"
+
+# T13c — the negative control: the SAME profile with the serve pidfile gone is
+# probed normally. Without it, T13a passes on a build that never probes anything.
+rm -f "$SERVEDIR/.5dive-serve" "$URLLOG"
+run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" status served
+t 'T13c ...while an unserved profile is probed as usual' 'https://served.com/' "$(head -1 "$URLLOG")"
+kill "$SXPID" "$SCPID" 2>/dev/null
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

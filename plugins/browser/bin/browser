@@ -62,6 +62,11 @@ usage() {
   A profile is a credential. Anything that can READ the directory can replay the
   session, whatever permission model sits above it — so each profile is owned by
   one seat, mode 0700, and every command here re-checks that and fails closed.
+
+  <site> IS THE HOST: `linkedin.com`, `reddit.com`. That is the name the dashboard
+  passes and the name the profile directory takes, and a name with a dot in it is
+  used verbatim. A bare label (`linkedin`) is a different profile and is guessed
+  as <label>.com, which is a guess and not the contract.
 USAGE
 }
 
@@ -149,7 +154,7 @@ cmd_auth() {
   done
   (( status )) && { _auth_status "$site"; return $?; }
 
-  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser auth linkedin"
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser auth linkedin.com"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name (lowercase letters, digits, . _ -)"
   _require_store
   local dir; dir="$(_site_dir "$site")"
@@ -181,7 +186,22 @@ cmd_auth() {
 # domain we guessed from the name). We do not choose per-site API-vs-browser paths.
 _site_url() {
   local a; a="$ADAPTER_DIR/$1.json"
-  if [[ -f "$a" ]]; then jq -r '.probe.url // empty' "$a"; else echo "https://$1.com/"; fi
+  local u=""
+  [[ -f "$a" ]] && u=$(jq -r '.probe.url // empty' "$a")
+  [[ -n "$u" ]] && { printf '%s\n' "$u"; return 0; }
+  # A NAME THAT ALREADY CONTAINS A DOT IS A HOST, and the suffix is a guess only
+  # for a bare label. This was `https://$1.com/` unconditionally, and the profile
+  # names the product actually uses come from the dashboard contract (GET
+  # /server/browser/sites, the Connected-sites tile, the seeded profiles) — which
+  # are hosts: `reddit.com`, `linkedin.com`. So `serve reddit.com` opened
+  # `https://reddit.com.com/`, a parked domain that redirected the customer's
+  # viewer onto a random subreddit instead of a login page, and `status` probed
+  # the same wrong host. One function decides this for auth, serve, status and
+  # the viewer, so there is exactly one place it can drift.
+  case "$1" in
+    *.*) echo "https://$1/" ;;
+    *)   echo "https://$1.com/" ;;
+  esac
 }
 _site_logged_out_marker() {
   local a; a="$ADAPTER_DIR/$1.json"
@@ -243,6 +263,28 @@ _auth_status() {
 #      bound is the one page we asked for.
 _probe() {
   local site="$1" dir="$2"
+  # SERVED MEANS WE CANNOT LOOK, AND SAYING SO IS THE WHOLE FIX. Chrome allows one
+  # instance per --user-data-dir (SingletonLock); a second one launched at a held
+  # profile hands its URL to the running instance and exits with an EMPTY document,
+  # which arrived here as "UNKNOWN (probe did not load)". That blank is worst
+  # exactly when it matters: server mode is how a customer logs in at all, so the
+  # window in which the profile is served is the window right after the login the
+  # tile is supposed to report. Name the condition instead of reporting a failure
+  # that did not happen — and do NOT stamp, because the liveness file is the tile's
+  # memory and the last real verdict outranks a transient "I could not look".
+  #
+  # WHY NOT PROBE THROUGH THE SERVED BROWSER (the other fix shape on the row): it
+  # needs CDP, and CDP needs a port. --remote-debugging-pipe is fd-based and dies
+  # with the process that opened it, so a later `status` in a different process
+  # cannot reach it; a loopback --remote-debugging-port is reachable by every seat
+  # on this box and hands them full control of a logged-in profile — the exact
+  # credential the 0700 audit above exists to protect, given away with no file
+  # permission needed at all. That trade is not the status command's to make.
+  local sdisp
+  if sdisp=$(_serve_running "$dir"); then
+    echo "UNKNOWN (served on :$sdisp — the probe cannot open a profile the served browser holds; ask that browser, or stop it: 5dive browser serve $site --stop)"
+    return 0
+  fi
   local chrome; chrome=$(_chrome) || { echo "UNKNOWN (no chrome on this box)"; return 0; }
   local url; url=$(_site_url "$site")
   local marker; marker=$(_site_logged_out_marker "$site")
@@ -264,6 +306,23 @@ _probe() {
     rm -f "$dom"; _stamp "$dir" expired; echo "session expired — human action required"; return 1
   fi
   rm -f "$dom"
+  # NO MARKER, NO VERDICT. `authenticated` is a claim about a LOGIN, and the only
+  # evidence for it here is the adapter's logged-out marker failing to match. With
+  # no adapter that test is skipped (`[[ -n "$marker" ]] &&`), so every page that
+  # merely LOADED was stamped `authenticated` — observed on a profile nobody had
+  # ever logged into. The only adapter shipped is example.json, which means this
+  # was the state of every real profile, and the Connected-sites tile read it.
+  # Reaching the challenge classification first is deliberate: its marker has a
+  # built-in default, so a challenge page IS nameable with no adapter, and the
+  # customer in front of a CAPTCHA still gets told to clear it rather than "we
+  # cannot tell". Quiet (rc 0) like every other UNKNOWN: a state we cannot read
+  # must not page a person. `run` still refuses on it — it accepts only
+  # `authenticated*` — which is the fail-closed half.
+  if [[ -z "$marker" ]]; then
+    _stamp "$dir" unknown
+    echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $ADAPTER_DIR/$site.json with probe.logged_out_when_dom_matches)"
+    return 0
+  fi
   _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
 }
 _stamp() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$1/.5dive-liveness" 2>/dev/null || true; }
@@ -533,7 +592,7 @@ cmd_serve() {
       *) site="$1" ;;
     esac; shift
   done
-  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser serve linkedin"
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser serve linkedin.com"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
   _require_store
   local dir; dir="$(_site_dir "$site")"
