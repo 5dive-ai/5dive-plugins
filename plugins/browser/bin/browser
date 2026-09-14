@@ -62,6 +62,12 @@ usage() {
   human-authenticated sessions — not anti-bot bypassing.
   5dive browser run <site> <action> [--key=value ...]
                                       # execute an adapter action, deterministically
+  5dive browser shot <site> <url> [--out=<png>] [--dom=<file>] [--size=WxH|--full]
+                                      # render a page INSIDE the logged-in profile:
+                                      # a PNG (and the DOM) of what you would see.
+                                      # Refuses unless the session probes authenticated —
+                                      # a screenshot of a sign-in page is a lie that
+                                      # looks exactly like evidence.
 
   A profile is a credential. Anything that can READ the directory can replay the
   session, whatever permission model sits above it — so each profile is owned by
@@ -864,6 +870,201 @@ cmd_viewer_revoke() {
   printf 'viewer for %s revoked. The browser keeps running and stays logged in.\n' "$site"
 }
 
+# ======================================================= shot (DIVE-4488)
+#
+# THE ACT HALF, verb one. `serve`/`viewer` get a human's LOGIN into a profile;
+# until now nothing could use it — `run` dies "no executor backend" on every box,
+# so a logged-in profile was a credential with no consumer. `shot` is the
+# smallest thing that consumes one: render a URL INSIDE the profile and hand back
+# a PNG (and, on request, the DOM). No adapter, no step vocabulary, no writes to
+# the site — it is a READ, which is why it can ship ahead of the executor.
+#
+# WHY THIS IS WORTH A VERB. Two consumers, both measured on the queue:
+#   1. A logged-in page of our own product. A grader or merger cannot open one
+#      (it is behind the owner's login), so "the PR carries a rendered screenshot
+#      and someone LOOKED at it" costs a human tap every single time.
+#   2. A read session on a site that shows a logged-out visitor nothing useful
+#      (x.com, reddit.com threads). The shot + DOM IS the read.
+#
+# ---- THE SINGLETON PROBLEM, and which of the two fixes this took -------------
+#
+# Chrome allows ONE instance per --user-data-dir. A second one launched at a
+# profile a served Chrome is holding hands its URL to the running instance and
+# exits with an empty document — which is why `status` refuses to probe a served
+# profile at all (see _probe). `shot` has the same wall and only two ways past:
+#
+#   (a) stop the served browser, render, start it again. The login survives — it
+#       is in the profile directory, not in the process.
+#   (b) drive the SERVED Chrome over CDP on a loopback --remote-debugging-port.
+#
+# THIS TOOK (a), and the reason is not convenience. A loopback CDP port is
+# reachable by EVERY SEAT ON THIS BOX, and CDP is full control of the browser
+# holding the session: read cookies, navigate, act. That hands away the exact
+# thing the 0700 audit exists to protect, and it hands it away with no file
+# permission needed at all — a seat that could never read the profile directory
+# would get the session anyway. The profile's 0700 mode would become decorative.
+# (a) opens NO listening socket, so the attack surface stays exactly what it
+# already was: the profile directory, already audited on both the seat dir and
+# the site dir before anything is launched. That is the proof the other seat
+# cannot reach the render — there is nothing to reach. `_shot_chrome_argv`
+# records the flags used, and the harness asserts no --remote-debugging-* among
+# them, so (b) cannot be reintroduced without reddening an arm.
+#
+# The one case (a) must NOT take: a LIVE VIEWER. That is a person at a keyboard
+# looking at this browser right now, most likely part-way through the login the
+# viewer exists for. Killing it to take a screenshot would destroy the human's
+# work to serve a machine's convenience, so a live viewer is a refusal, not a
+# stop. A serve with no viewer is nobody's session and is cycled.
+#
+# ---- WHAT IT REFUSES ---------------------------------------------------------
+#
+# Only `authenticated` renders, the same positive list `run` uses and for a
+# sharper reason: the failure mode here is not a crash, it is a PNG of the SIGN-IN
+# PAGE captioned as the artifact. A grader who is handed that has been handed a
+# lie that looks exactly like evidence. Everything else — expired, CHALLENGE,
+# UNKNOWN, no adapter to tell them apart — is a refusal.
+#
+# NO ADAPTER IS NOT A SPECIAL CASE. With no adapter, _probe cannot tell logged-in
+# from logged-out, so it says UNKNOWN and `shot` refuses. Shipping a guessed
+# logged-out marker to "unblock" a site would be worse than shipping none: a
+# marker that never matches stamps every logged-out page `authenticated`, which
+# is precisely the mutant above with our own signature on it. One adapter file
+# per site, written by someone who looked at that site's logged-out page.
+
+SHOT_SIZE_DEFAULT=1280x800
+# --full is a TALL VIEWPORT, and the name is the most it can honestly promise:
+# headless Chrome screenshots the viewport, it does not scroll-stitch a page.
+SHOT_SIZE_FULL=1280x5000
+SHOT_WAIT_DEFAULT=8000
+
+# Set by cmd_shot when it stopped a serve it must put back, and read by the EXIT
+# trap: `die` exits, so restoring only on the success path would leave a customer's
+# browser stopped by a screenshot that failed.
+_SHOT_RESTORE_SITE=""
+_shot_restore() {
+  [[ -n "$_SHOT_RESTORE_SITE" ]] || return 0
+  local s="$_SHOT_RESTORE_SITE"; _SHOT_RESTORE_SITE=""
+  cmd_serve "$s" >/dev/null 2>&1 || \
+    printf '%s: WARNING — could not restart the %s browser after the render. The profile is intact; start it again: 5dive browser serve %s\n' "$PROG" "$s" "$s" >&2
+}
+
+# A viewer is LIVE when the process that answers it is alive. The pidfile alone
+# is not the test: x11vnc is started with -once and -timeout, so it exits on its
+# own and leaves the file behind.
+_viewer_live() {
+  local f; f="$(_viewer_pidfile "$1")"
+  [[ -f "$f" ]] || return 1
+  local p; p=$(_kv "$f" vnc_pid)
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
+}
+
+# The host a profile is ALLOWED to render. A profile is a credential scoped to a
+# site by its own name, and `shot <site> <url>` with an unrelated url is either a
+# typo or a way to make one profile's name vouch for another site's page. The
+# render would be logged OUT and look like a bug in the feature; refuse instead.
+# A subdomain passes: the login lives on the registrable name (app.5dive.com is
+# reached with 5dive.com's cookies) and that is consumer 1's whole shape.
+_shot_host_ok() {  # _shot_host_ok <site> <host>
+  local base="$1" host="$2"
+  [[ "$base" == *.* ]] || base="$base.com"
+  [[ "$host" == "$base" || "$host" == *".$base" ]]
+}
+
+cmd_shot() {
+  local site="" url="" out="" domout="" size="$SHOT_SIZE_DEFAULT" wait="$SHOT_WAIT_DEFAULT"
+  while (($#)); do
+    case "$1" in
+      --out=*)  out="${1#*=}" ;;
+      --dom=*)  domout="${1#*=}" ;;
+      --size=*) size="${1#*=}" ;;
+      --full)   size="$SHOT_SIZE_FULL" ;;
+      --wait=*) wait="${1#*=}" ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; else url="$1"; fi ;;
+    esac; shift
+  done
+  [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser shot <site> <url> [--out=<png>] [--dom=<file>] [--size=WxH|--full] [--wait=<ms>]"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  [[ "$size" =~ ^[0-9]{2,5}x[0-9]{2,5}$ ]] || die "$E_USAGE" "--size takes WxH in pixels, e.g. --size=1280x800; got: $size"
+  [[ "$wait" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--wait takes milliseconds; got: $wait"
+
+  # SCHEME AND HOST, before the store is even opened. file:// and chrome:// are
+  # not pages of a site and have no business being rendered by a verb whose whole
+  # contract is "a page of the site you logged into".
+  [[ "$url" =~ ^https?://[^/]+ ]] || die "$E_USAGE" "shot renders http(s) pages; got: $url"
+  local host="${url#*://}"; host="${host%%/*}"; host="${host%%\?*}"
+  host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
+  _shot_host_ok "$site" "$host" || die "$E_USAGE" "$url is not a page of '$site' (its host is $host). A profile is a credential scoped to the site it is named for: rendering another site's page inside it produces a LOGGED-OUT screenshot that looks like a bug in this command. Use the profile for that site — or 5dive browser auth $host."
+
+  _require_store
+  local dir; dir="$(_site_dir "$site")"
+  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
+  _audit "$dir" 700
+
+  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — a render needs the same browser the profile was logged in with."
+
+  # The served browser holds the profile. Cycle it (never with a person inside).
+  local sdisp
+  if sdisp=$(_serve_running "$dir"); then
+    ! _viewer_live "$dir" || die "$E_UNAVAILABLE" "the $site browser is being viewed by a person right now (:$sdisp). Rendering means stopping that browser, which would take their session away mid-login. Wait, or end it deliberately: 5dive browser viewer-revoke $site"
+    trap '_shot_restore' EXIT
+    _SHOT_RESTORE_SITE="$site"
+    cmd_serve "$site" --stop >/dev/null
+  fi
+
+  # LIVENESS, positive list only. See the header: the failure this stops is a PNG
+  # of the sign-in page handed over as the artifact.
+  local state; state=$(_probe "$site" "$dir")
+  case "$state" in
+    authenticated*) : ;;
+    CHALLENGE*)
+      die "$E_COLD" "$site is presenting a security challenge, so anything rendered now is the challenge page and not the page you asked for. A person clears it — 5dive browser auth $site" ;;
+    session\ expired*)
+      die "$E_COLD" "$site is logged out. Refusing rather than handing back a screenshot of the sign-in page: that PNG would look exactly like evidence and would be the opposite. A person clears this — 5dive browser auth $site" ;;
+    *)
+      die "$E_COLD" "cannot confirm the $site session is live ($state), so a render now could be the sign-in page with no way for the reader to tell. Refusing." ;;
+  esac
+
+  local stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  [[ -n "$out" ]] || out="$PWD/${site}-${stamp}.png"
+  local odir; odir=$(dirname "$out")
+  [[ -d "$odir" ]] || die "$E_USAGE" "no directory $odir to write the PNG into"
+
+  local w="${size%x*}" h="${size#*x}"
+  # The flags are the security claim: --headless with NO --remote-debugging-*, so
+  # this render opens no socket any other seat could reach. See the header.
+  "$chrome" --headless --no-sandbox --disable-gpu --hide-scrollbars \
+      --user-data-dir="$dir" --window-size="$w,$h" \
+      --virtual-time-budget="$wait" --screenshot="$out" "$url" >/dev/null 2>&1
+  local rc=$?
+  if (( rc != 0 )) || [[ ! -s "$out" ]]; then
+    rm -f "$out"
+    die "$E_UNAVAILABLE" "the render produced no image (chrome exited $rc). Nothing was written — an empty or missing PNG must not be reported as a screenshot."
+  fi
+
+  # The DOM is a SECOND load on purpose: --screenshot writes a file and
+  # --dump-dom writes stdout, and asking one chrome for both gets whichever that
+  # build decided wins. Two loads, each with one job, is the only shape whose
+  # result is the same on every chrome.
+  if [[ -n "$domout" ]]; then
+    "$chrome" --headless --no-sandbox --disable-gpu \
+        --user-data-dir="$dir" --virtual-time-budget="$wait" \
+        --dump-dom "$url" >"$domout" 2>/dev/null
+    local drc=$?
+    if (( drc != 0 )) || [[ ! -s "$domout" ]]; then
+      rm -f "$domout"
+      printf '%s: WARNING — the PNG rendered but the DOM dump did not (chrome exited %s). %s was not written.\n' "$PROG" "$drc" "$domout" >&2
+    fi
+  fi
+
+  _shot_restore
+  trap - EXIT
+  printf 'rendered %s as the logged-in %s profile\n  %s  (%sx%s)\n' "$url" "$site" "$out" "$w" "$h"
+  [[ -n "$domout" && -s "$domout" ]] && printf '  %s  (DOM)\n' "$domout"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # DIVE-4446: the workflow is the product, and a Claude skill only teaches half
 # the fleet. `doc` prints the SAME text as a plain file so a codex/grok/pi seat
@@ -978,6 +1179,7 @@ case "${1:-}" in
   ls)    shift; cmd_ls    "$@" ;;
   doc)   shift; cmd_doc  "$@" ;;
   run)   shift; cmd_run   "$@" ;;
+  shot)  shift; cmd_shot  "$@" ;;
   serve) shift; cmd_serve "$@" ;;
   viewer) shift; cmd_viewer "$@" ;;
   viewer-redeem) shift; cmd_viewer_redeem "$@" ;;

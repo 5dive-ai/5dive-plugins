@@ -33,6 +33,7 @@ refusal spends nothing.
     5dive browser status <site>                                # 4. poll until `authenticated`
     5dive browser viewer-revoke <site>                         # 5. close the view; the login survives
     5dive browser run <site> <action> [--key=value ...]        # 6. only once status says authenticated
+    5dive browser shot <site> <url> [--out=<png>] [--dom=<f>]  # 6b. READ a page as the logged-in user
 
 1. `serve` is idempotent per site and fails closed on a box without the server-mode stack.
 2. `viewer` prints the link once and keeps only a SHA-256 of the nonce; lose it and you
@@ -47,6 +48,14 @@ refusal spends nothing.
    still needed. `UNKNOWN` = the probe could not read the page at all — it is not a failure
    to report and not permission to act (`status` exits 0 quietly, `run` refuses on it).
 5. Revoke as soon as they are in. A live viewer is a keyboard attached to their account.
+6b. `shot` renders a page INSIDE the profile and writes a PNG (and the DOM, with `--dom=`).
+   It is a read, not an action, so it needs no adapter ACTION — but it does need the site's
+   adapter to exist, because with none `status` cannot tell logged-in from logged-out and
+   `shot` refuses rather than hand you a screenshot of the sign-in page. That PNG is the
+   failure worth naming: it is evidence-shaped, and whoever reads it cannot tell. The URL
+   must be a page of that site (or a subdomain). If the browser is being `serve`d, `shot`
+   stops it for the render and starts it again — unless a person is inside the viewer right
+   now, which is a refusal, not a wait.
 
 ## What will actually go wrong
 

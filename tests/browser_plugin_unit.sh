@@ -1205,5 +1205,203 @@ t  'T14k ...the stale body is gone' 0 "$(grep -c '^old$' "$GOOD")"
 t  'T14k ...and there is still exactly one fence' 1 \
    "$(grep -c '5dive:browser:begin' "$GOOD")"
 
+# === T15 DIVE-4488: `shot` — the act half, verb one ==========================
+#
+# The defect each arm kills, in one line each, because "it printed a path" grades
+# nothing:
+#   T15a/b  a PNG of the SIGN-IN PAGE handed back as the artifact. That is the
+#           dangerous failure: it is not a crash, it is evidence-shaped and a
+#           grader cannot tell it from the real thing. Positive list only.
+#   T15c    a CDP port reintroduced to avoid the serve cycle — it would hand every
+#           seat on the box full control of a logged-in profile, which no file
+#           mode can take back. Measured on the argv, not on the comment.
+#   T15d    a screenshot that stops a customer's browser WHILE A PERSON is logged
+#           into it through the viewer.
+#   T15e    a serve that a failed render leaves stopped.
+#   T15f    one profile's name vouching for another site's page (a logged-out
+#           render that reads as a bug in the feature).
+#   T15g    an empty/absent PNG reported as a screenshot.
+#
+# The fake chrome here records FULL argv and, unlike the probe fakes, honours
+# --screenshot by writing a file — otherwise every arm would red on T15g's check
+# and none of the others would ever run.
+SHOTBIN="$TMP/shotbin"; mkdir -p "$SHOTBIN"
+cat > "$SHOTBIN/google-chrome" <<'SCHROME'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SHOTARGV"
+for a in "$@"; do
+  case "$a" in
+    --user-data-dir=*) d="${a#*=}" ;;
+    --screenshot=*) shot="${a#*=}" ;;
+    --dump-dom) dump=1 ;;
+    -*) ;;
+    *) u="$a" ;;
+  esac
+done
+[[ -n "${shot:-}" ]] && { [[ -n "${SHOT_CHROME_FAIL:-}" ]] || printf 'PNG %s\n' "${u:-}" > "$shot"; }
+[[ -n "${dump:-}" || -z "${shot:-}" ]] && cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null
+# FAIL is scoped to the RENDER invocation: the probe that runs first uses the
+# same binary, and a fake that failed both would red at liveness and never reach
+# the render at all — the arm would then grade nothing it claims to.
+[[ -n "${SHOT_CHROME_FAIL:-}" && -n "${shot:-}" ]] && exit 3
+exit 0
+SCHROME
+chmod +x "$SHOTBIN/google-chrome"
+export SHOTARGV="$TMP/shot-argv.txt"
+SHOTPATH="$SHOTBIN:$PATH"
+SHOTOUT="$TMP/shots"; mkdir -p "$SHOTOUT"
+
+# An adapter is what makes a verdict possible at all (T11): with none, _probe says
+# UNKNOWN and shot must refuse. Both states are exercised below on the same site.
+mkadapter shot.example.com "https://shot.example.com/x" "x"
+SHOTDIR="$(mkprofile shot.example.com "$LIVE_DOM")"
+
+# --- T15a the happy path ------------------------------------------------------
+rm -f "$SHOTARGV"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/thread/1" --out="$SHOTOUT/a.png" --dom="$SHOTOUT/a.html"
+t  'T15a a logged-in profile renders' 0 "$RC"
+t  'T15a ...and the PNG exists and is non-empty' 'yes' \
+   "$([[ -s "$SHOTOUT/a.png" ]] && echo yes || echo no)"
+tc 'T15a ...of the URL asked for' 'https://shot.example.com/thread/1' "$(cat "$SHOTOUT/a.png")"
+t  'T15a ...and the DOM was dumped too' 'yes' \
+   "$([[ -s "$SHOTOUT/a.html" ]] && echo yes || echo no)"
+tc 'T15a ...carrying the page body, which IS the read for a thread' 'posts' "$(cat "$SHOTOUT/a.html")"
+tc 'T15a ...and the render ran inside the seat profile' "--user-data-dir=$SHOTDIR" "$(cat "$SHOTARGV")"
+
+# --- T15b THE MUTANT: logged out must not render ------------------------------
+# The row's own mutant. A build that drops the liveness gate passes every other
+# arm here and fails only this one.
+printf '%s' "$DEAD_DOM" > "$SHOTDIR/.fake-dom"
+rm -f "$SHOTARGV" "$SHOTOUT/b.png"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/thread/1" --out="$SHOTOUT/b.png"
+t  'T15b a logged-OUT profile REFUSES' 75 "$RC"
+t  'T15b ...and writes no PNG at all' 'no' \
+   "$([[ -e "$SHOTOUT/b.png" ]] && echo yes || echo no)"
+tc 'T15b ...saying a sign-in screenshot is the lie, not the error' 'sign-in page' "$ERR"
+
+printf '%s' "$CHALLENGE_DOM" > "$SHOTDIR/.fake-dom"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/t" --out="$SHOTOUT/c1.png"
+t  'T15b a CHALLENGE refuses too' 75 "$RC"
+t  'T15b ...writing nothing' 'no' "$([[ -e "$SHOTOUT/c1.png" ]] && echo yes || echo no)"
+
+# No adapter -> UNKNOWN -> refusal. Not a special case: a guessed marker would
+# stamp every logged-out page `authenticated`, which is T15b with our signature.
+printf '%s' "$LIVE_DOM" > "$SHOTDIR/.fake-dom"
+mv "$FIVEDIVE_BROWSER_ADAPTER_DIR/shot.example.com.json" "$TMP/adapter.bak"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/t" --out="$SHOTOUT/c2.png"
+t  'T15b UNKNOWN (no adapter) refuses rather than rendering blind' 75 "$RC"
+t  'T15b ...writing nothing' 'no' "$([[ -e "$SHOTOUT/c2.png" ]] && echo yes || echo no)"
+mv "$TMP/adapter.bak" "$FIVEDIVE_BROWSER_ADAPTER_DIR/shot.example.com.json"
+
+# --- T15c NO DEBUG PORT. This is the security claim, measured ------------------
+rm -f "$SHOTARGV"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/t" --out="$SHOTOUT/d.png"
+t  'T15c (control) the render recorded argv' 'yes' \
+   "$([[ -s "$SHOTARGV" ]] && echo yes || echo no)"
+tn 'T15c the render OPENS NO DEBUG PORT for another seat to take the session' \
+   '--remote-debugging' "$(cat "$SHOTARGV")"
+tc 'T15c ...and it is headless' '--headless' "$(cat "$SHOTARGV")"
+
+# --- T15d a person inside the viewer is not evicted for a screenshot -----------
+sleep 300 & VXPID=$!
+sleep 300 & VCPID=$!
+sleep 300 & VVNC=$!
+( umask 077; printf 'display=311\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+    "$VXPID" "$VCPID" "$(date -u +%s)" > "$SHOTDIR/.5dive-serve" )
+( umask 077; printf 'vnc_pid=%s\nws_pid=%s\nport=1\nvnc_port=2\n' "$VVNC" "$VVNC" \
+    > "$SHOTDIR/.5dive-viewer" )
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/t" --out="$SHOTOUT/e.png"
+t  'T15d a LIVE VIEWER blocks the render instead of taking the human session away' 69 "$RC"
+tc 'T15d ...and says why'  'being viewed by a person' "$ERR"
+t  'T15d ...the serve pidfile is untouched'  'yes' \
+   "$([[ -f "$SHOTDIR/.5dive-serve" ]] && echo yes || echo no)"
+t  'T15d ...and the browser was NOT killed' 'alive' \
+   "$(kill -0 "$VCPID" 2>/dev/null && echo alive || echo dead)"
+kill "$VVNC" 2>/dev/null; wait "$VVNC" 2>/dev/null
+
+# --- T15d2 a serve with NOBODY in it is cycled, and put back -------------------
+# The vnc pid is dead now, so the viewer is not live: this is nobody's session.
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/t" --out="$SHOTOUT/f.png"
+t  'T15d2 a served profile with no viewer renders' 0 "$RC"
+t  'T15d2 ...the old browser was stopped' 'dead' \
+   "$(kill -0 "$VCPID" 2>/dev/null && echo alive || echo dead)"
+t  'T15d2 ...and a serve was put back, not left stopped' 'yes' \
+   "$([[ -f "$SHOTDIR/.5dive-serve" ]] && echo yes || echo no)"
+run env PATH="$SHOTPATH" "$BROWSER" serve shot.example.com --stop
+kill "$VXPID" 2>/dev/null
+
+# --- T15e a FAILED render still puts the serve back ---------------------------
+# The mutant: restoring only on the success path. `die` exits, so a render that
+# fails would leave the customer's browser stopped by a screenshot.
+sleep 300 & FXPID=$!
+sleep 300 & FCPID=$!
+( umask 077; printf 'display=312\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+    "$FXPID" "$FCPID" "$(date -u +%s)" > "$SHOTDIR/.5dive-serve" )
+rm -f "$SHOTOUT/g.png"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" SHOT_CHROME_FAIL=1 "$BROWSER" \
+    shot shot.example.com "https://shot.example.com/t" --out="$SHOTOUT/g.png"
+t  'T15e a render that fails is a refusal, not a half-written PNG' 69 "$RC"
+t  'T15e ...and the serve it stopped is back' 'yes' \
+   "$([[ -f "$SHOTDIR/.5dive-serve" ]] && echo yes || echo no)"
+run env PATH="$SHOTPATH" "$BROWSER" serve shot.example.com --stop
+kill "$FXPID" "$FCPID" 2>/dev/null
+
+# --- T15f the profile's name does not vouch for another site ------------------
+rm -f "$SHOTARGV"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://elsewhere.test/page" --out="$SHOTOUT/h.png"
+t  'T15f a URL on another host is refused' 64 "$RC"
+tc 'T15f ...naming the host it saw' 'elsewhere.test' "$ERR"
+t  'T15f ...and NO browser was launched to find out' 'none' \
+   "$([[ -s "$SHOTARGV" ]] && cat "$SHOTARGV" || echo none)"
+# A SUBDOMAIN is the point of consumer 1 (app.<product>.com behind the login).
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://app.shot.example.com/dash" --out="$SHOTOUT/i.png"
+t  'T15f (control) a SUBDOMAIN of the profile site renders' 0 "$RC"
+# Neither is a scheme we render.
+run env PATH="$SHOTPATH" "$BROWSER" shot shot.example.com "file:///etc/passwd"
+t  'T15f file:// is not a page of a site' 64 "$RC"
+run env PATH="$SHOTPATH" "$BROWSER" shot shot.example.com "chrome://version"
+t  'T15f chrome:// either' 64 "$RC"
+
+# --- T15g an empty PNG is never reported as a screenshot ----------------------
+# chrome exits 0 and writes nothing: the shape a "success" check on exit status
+# alone would wave through.
+cat > "$SHOTBIN/google-chrome" <<'SEMPTY'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SHOTARGV"
+for a in "$@"; do case "$a" in --user-data-dir=*) d="${a#*=}" ;; --screenshot=*) shot="${a#*=}" ;; esac; done
+[[ -n "${shot:-}" ]] && : > "$shot"
+[[ -z "${shot:-}" ]] && cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null
+exit 0
+SEMPTY
+chmod +x "$SHOTBIN/google-chrome"
+rm -f "$SHOTOUT/j.png"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/t" --out="$SHOTOUT/j.png"
+t  'T15g a zero-byte render is a failure, not a screenshot' 69 "$RC"
+t  'T15g ...and the empty file is removed, never handed over' 'no' \
+   "$([[ -e "$SHOTOUT/j.png" ]] && echo yes || echo no)"
+
+# --- T15h flags are validated before anything is launched ---------------------
+run env PATH="$SHOTPATH" "$BROWSER" shot shot.example.com
+t 'T15h a missing url is a usage error' 64 "$RC"
+run env PATH="$SHOTPATH" "$BROWSER" shot shot.example.com "https://shot.example.com/t" --size=huge
+t 'T15h --size must be WxH' 64 "$RC"
+run env PATH="$SHOTPATH" "$BROWSER" shot ../escape "https://shot.example.com/t"
+t 'T15h a traversing profile name is refused' 64 "$RC"
+
+# --- T15i the verb is reachable and documented --------------------------------
+run env PATH="$SHOTPATH" "$BROWSER" --help
+tc 'T15i --help lists shot' '5dive browser shot' "$OUT"
+tc 'T15i README documents it' 'browser shot' "$(cat "$ROOT/plugins/browser/README.md")"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -193,6 +193,56 @@ without a scheduled probe the agent finds out **mid-publish**. So:
 - Adapters **fail closed** on an unexpected logged-out state: never retry, never improvise a login,
   never fall through to a generic "click the blue button".
 
+## `browser shot` — reading a page as yourself
+
+`serve` and the viewer get a human's **login** into a profile. `shot` is the first thing that
+**uses** one:
+
+```
+5dive browser shot <site> <url> [--out=<png>] [--dom=<file>] [--size=WxH|--full] [--wait=<ms>]
+```
+
+It renders that URL inside the profile and writes a PNG — what *you* would see, logged in — plus
+the DOM on request. No adapter action, no step vocabulary, nothing written to the site: it is a
+**read**, which is why it ships ahead of the executor. Two consumers it exists for:
+
+- **A logged-in page of our own product.** A grader or a merger cannot open one, so "the PR carries
+  a rendered screenshot and someone has LOOKED at it" costs a human tap every single time.
+- **A read session on a site that shows a logged-out visitor nothing useful** — an x.com or
+  reddit.com thread. The shot plus the DOM *is* the read.
+
+**It refuses unless the session probes `authenticated`** — the same positive list `run` uses, for a
+sharper reason. The failure here is not a crash: it is a PNG **of the sign-in page**, handed over as
+the artifact. That is evidence-shaped, and the person reading it cannot tell it from the real thing.
+So `session expired`, `CHALLENGE` and every flavour of `UNKNOWN` all write no file at all. With no
+adapter the probe cannot tell logged-in from logged-out, so that is a refusal too — and shipping a
+*guessed* `logged_out_when_dom_matches` to unblock a site would be worse than shipping none, since a
+marker that never matches stamps every logged-out page `authenticated`. One adapter per site,
+written by someone who looked at that site's logged-out page.
+
+**The served browser is stopped for the render, and put back.** Chrome allows one instance per
+profile directory, so a render launched at a profile `serve` is holding comes back empty. The other
+way past that wall is CDP on a loopback debugging port — and that port is reachable by **every seat
+on this box**, handing them full control of the logged-in browser with no file permission needed,
+which would make the profile's 0700 mode decorative. `shot` opens **no socket at all**: it stops the
+serve, renders headless, and restarts the serve, including when the render fails. The login is in
+the profile directory, not in the process, so it survives. The one case it will not cycle is a
+**live viewer** — that is a person at a keyboard, probably part-way through the login the viewer
+exists for, and a screenshot does not get to take that away.
+
+**The URL must be a page of that site** (the profile's host, or a subdomain of it — `app.<product>`
+behind the login is the point). A profile is a credential scoped by its own name; pointed at an
+unrelated host it renders a logged-out page that reads as a bug in this command.
+
+`--full` is a **tall viewport**, which is the most headless Chrome's screenshot can honestly
+promise — it does not scroll-stitch a page.
+
+**The boundary on whose account this is.** A profile here is a *throwaway or role* account, never a
+person's personal login — with exactly one exception, stated so it is not quietly widened: the
+owner's own box, running the owner's own login, to their own product. That is a person granting a
+machine they own a session to a service they own. It is not a template for anyone else's account,
+and it is not a reason to log a 5dive box into a third party's personal profile.
+
 ## Adapters are data, and the vocabulary is fixed
 
 An adapter is a JSON file at `adapters/<site>.json`. Its steps come from a closed vocabulary —
