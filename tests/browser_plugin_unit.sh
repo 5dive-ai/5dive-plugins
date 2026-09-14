@@ -1164,6 +1164,7 @@ rm -f "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/scheduled.example/.5dive-liveness" "
 run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" probe-all
 t  'T13d probe-all finishes after checking every eligible profile' 0 "$RC"
 tc 'T13d ...names the profile it skipped because it is served' 'served               skipped: served' "$OUT"
+tn 'T13d ...does not fall through into the served status path' 'cannot open a profile' "$OUT"
 t  'T13d ...does not launch Chrome against the served profile' 'no' \
    "$([[ -s "$URLLOG" ]] && grep -q 'https://served.com/' "$URLLOG" && echo yes || echo no)"
 t  'T13d ...does probe an unserved profile in the same sweep' 'yes' \
