@@ -52,6 +52,31 @@ grade() {                     # grade <file> <label> -> non-zero if any check fa
 echo "== the rules are in the block that is sent to the model"
 grade "$WORK/block" "shipped"
 
+echo "== the rules stay inside their word budget (ratchet)"
+# DIVE-4481 iteration 2. lodar's constraint on the per-box CLAUDE.md was "the
+# shortest wording that still carries the four rules"; the row named the
+# 169-word hand-written block as the CEILING. These two sentences were 149
+# words and are now WORD_RATCHET. This cap is not a target picked to fit — it
+# is the achieved value, so it fires on any addition and can only ever be
+# lowered. Same rule as the section's: prose grows silently, nothing else here
+# would notice.
+WORD_RATCHET=119
+rule_words=$(grep -E "Writing here:|Cap a reply" "$WORK/block" | sed "s/^ *'//; s/',$//" | wc -w)
+if (( rule_words == 0 )); then
+  bad "could not locate the rule sentences in the shipped block — the ratchet grades nothing"
+elif (( rule_words <= WORD_RATCHET )); then
+  ok "the rule sentences are $rule_words words (ratchet $WORD_RATCHET)"
+else
+  bad "the rule sentences grew to $rule_words words — over the $WORD_RATCHET ratchet; trim, or lower it deliberately"
+fi
+
+# Negative control on the ratchet: pad the sentences and the count must exceed it.
+padded=$(grep -E "Writing here:|Cap a reply" "$WORK/block" \
+  | sed "s/^ *'//; s/',$//"; echo "one two three four five six seven eight nine ten")
+(( $(printf '%s' "$padded" | wc -w) > WORD_RATCHET )) \
+  && ok "ten added words trip the ratchet — it is not slack" \
+  || bad "ten added words do not trip the ratchet — it grades nothing"
+
 echo "== the rules are not merely somewhere in the file"
 # The array is joined with '\n' and handed to the Server constructor. If that
 # wiring goes, the block is a dead literal no matter how good its text is.
@@ -75,5 +100,5 @@ fi
 echo
 echo "== $PASS passed, $FAIL failed"
 (( FAIL == 0 )) || exit 1
-(( PASS >= 11 )) || { echo "ARM COUNT TOO LOW ($PASS) — arms were skipped, not passed"; exit 1; }
+(( PASS >= 13 )) || { echo "ARM COUNT TOO LOW ($PASS) — arms were skipped, not passed"; exit 1; }
 echo "ALL GREEN"
