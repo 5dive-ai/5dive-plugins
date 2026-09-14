@@ -49,6 +49,8 @@ _SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADAPTER_PKG_DIR="$(cd "$_SELF_DIR/.." && pwd)/adapters"
 ADAPTER_SEAT_SUBDIR=".adapters"
 READ_EXTRACTOR="${FIVEDIVE_BROWSER_EXTRACTOR:-$(cd "$_SELF_DIR/.." && pwd)/lib/extract.bundle.cjs}"
+SYSTEMD_DIR="${FIVEDIVE_BROWSER_SYSTEMD_DIR:-/etc/systemd/system}"
+SYSTEMCTL="${FIVEDIVE_BROWSER_SYSTEMCTL:-systemctl}"
 
 E_USAGE=64; E_UNAVAILABLE=69; E_PERM=77; E_COLD=75
 
@@ -65,6 +67,7 @@ usage() {
   5dive browser setup                 # one-time, as root: create the profile store
   5dive browser auth <site>           # open a browser; log in yourself, once
   5dive browser status [site]         # per-site auth state (run on a SCHEDULE)
+  5dive browser probe-all             # scheduled check; skips profiles in use
   5dive browser ls                    # profiles, and when each was last seen alive
 
   On a managed box there is no display, so the browser lives on one:
@@ -180,6 +183,50 @@ _ensure_profile_dir() {
   fi
 }
 
+_install_probe_timer() {
+  local seat="$1" five unit timer
+  five=$(command -v 5dive 2>/dev/null || true)
+  [[ "$five" == /* ]] || five=/usr/local/bin/5dive
+  unit="$SYSTEMD_DIR/5dive-browser-probe@.service"
+  timer="$SYSTEMD_DIR/5dive-browser-probe@.timer"
+  mkdir -p "$SYSTEMD_DIR" || die "$E_UNAVAILABLE" "cannot create $SYSTEMD_DIR for the browser liveness timer"
+
+  local staged_unit staged_timer
+  staged_unit=$(mktemp "$SYSTEMD_DIR/.5dive-browser-probe.service.XXXXXX") \
+    || die "$E_UNAVAILABLE" "cannot stage the browser liveness service"
+  staged_timer=$(mktemp "$SYSTEMD_DIR/.5dive-browser-probe.timer.XXXXXX") \
+    || { rm -f "$staged_unit"; die "$E_UNAVAILABLE" "cannot stage the browser liveness timer"; }
+  cat >"$staged_unit" <<EOF
+[Unit]
+Description=Probe 5dive browser profiles for %i
+
+[Service]
+Type=oneshot
+User=%i
+ExecStart=$five browser probe-all
+EOF
+  cat >"$staged_timer" <<'EOF'
+[Unit]
+Description=Probe 5dive browser profiles every six hours
+
+[Timer]
+OnBootSec=15m
+OnUnitActiveSec=6h
+RandomizedDelaySec=30m
+Persistent=true
+Unit=5dive-browser-probe@%i.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 00644 "$staged_unit" "$staged_timer"
+  mv "$staged_unit" "$unit" && mv "$staged_timer" "$timer" \
+    || { rm -f "$staged_unit" "$staged_timer"; die "$E_UNAVAILABLE" "cannot install the browser liveness timer"; }
+  "$SYSTEMCTL" daemon-reload \
+    && "$SYSTEMCTL" enable --now "5dive-browser-probe@$seat.timer" \
+    || die "$E_UNAVAILABLE" "profile store is ready, but the scheduled browser probe could not be enabled"
+}
+
 cmd_setup() {
   [[ "$(id -u)" == 0 ]] || die "$E_PERM" "setup creates a root-owned store and a seat-owned subdirectory under it. Run: $SETUP_CMD"
   local seat; seat="$(_seat)"
@@ -191,7 +238,8 @@ cmd_setup() {
   mkdir -p "$PROFILE_ROOT/$seat"
   chown "$seat" "$PROFILE_ROOT/$seat"
   chmod 00700 "$PROFILE_ROOT/$seat"  # one seat, and nobody else, reads its sessions (5-digit, see above)
-  printf 'profile store ready\n  %s  (root, 0711 — traverse, not list)\n  %s  (%s, 0700)\n\nNow, as %s:  5dive browser auth <site>\n' \
+  _install_probe_timer "$seat"
+  printf 'profile store ready\n  %s  (root, 0711 — traverse, not list)\n  %s  (%s, 0700)\n  liveness probe: every ~6h (served profiles are skipped)\n\nNow, as %s:  5dive browser auth <site>\n' \
     "$PROFILE_ROOT" "$PROFILE_ROOT/$seat" "$seat" "$seat"
 }
 
@@ -388,6 +436,27 @@ _probe() {
   _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
 }
 _stamp() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$1/.5dive-liveness" 2>/dev/null || true; }
+
+cmd_probe_all() {
+  _require_store
+  local d site output found=0
+  for d in "$(_seat_dir)"/*/; do
+    [[ -d "$d" ]] || continue
+    found=1
+    site=$(basename "$d")
+    _audit "$d" 700
+    if _serve_running "$d" >/dev/null; then
+      printf '  %-20s skipped: served\n' "$site"
+      continue
+    fi
+    output=$(_auth_status "$site" 2>&1) || true
+    printf '%s\n' "$output"
+  done
+  (( found )) || printf 'no profiles yet — 5dive browser auth <site>\n'
+  # Expired/challenge is a liveness result, not a failed timer. Every eligible
+  # profile was attempted; the stamp and journal output carry the outcome.
+  return 0
+}
 
 cmd_ls() {
   _require_store
@@ -1491,6 +1560,7 @@ case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
   auth)  shift; cmd_auth  "$@" ;;
   status) shift; _auth_status "${1:-}" ;;
+  probe-all) shift; cmd_probe_all "$@" ;;
   ls)    shift; cmd_ls    "$@" ;;
   doc)   shift; cmd_doc  "$@" ;;
   run)   shift; cmd_run   "$@" ;;

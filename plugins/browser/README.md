@@ -16,6 +16,7 @@ than a detail.
 5dive browser setup                 # once, as root: create the profile store
 5dive browser auth <site>           # a browser opens; you log in yourself
 5dive browser status                # per-site auth state; run this on a SCHEDULE
+5dive browser probe-all             # scheduled sweep; served profiles are skipped
 5dive browser ls                    # profiles, and when each was last seen alive
 5dive browser run <site> <action> [--key=value ...]
 ```
@@ -167,6 +168,15 @@ Sites invalidate sessions on their own schedule, throw device checks, re-prompt 
 interstitial on "unusual activity". A profile that worked Monday is logged out Thursday, and
 without a scheduled probe the agent finds out **mid-publish**. So:
 
+- `sudo 5dive browser setup` installs and enables a **per-seat systemd timer** which runs
+  `probe-all` about every six hours (`Persistent=true`, with a small randomized delay). Systemd,
+  rather than cron, makes a missed run catch up after reboot, keeps the seat identity explicit,
+  and puts each sweep in the journal. Re-running setup reconciles and re-enables the same units.
+- `probe-all` attempts every eligible profile, but prints `skipped: served` and leaves the
+  liveness stamp untouched when a profile is open in server mode. Holding the profile makes a
+  second Chrome probe invalid; the next timer run, or the dashboard's close-view action, checks it
+  after the served browser stops.
+
 - `5dive browser status` is a cheap liveness probe **on a schedule, not at publish time**. One
   page load a day is worth more than any adapter. It reports `authenticated`, `session expired —
   human action required`, `CHALLENGE — human action required`, or `UNKNOWN` when the probe could
@@ -196,6 +206,9 @@ without a scheduled probe the agent finds out **mid-publish**. So:
   browser can clear it.
 - Adapters **fail closed** on an unexpected logged-out state: never retry, never improvise a login,
   never fall through to a generic "click the blue button".
+- A hand-written adapter under an installed plugin directory is not durable configuration:
+  upgrading or reinstalling the plugin can replace that directory. Keep custom adapter source in
+  version control and restore/publish it after an upgrade.
 
 ## `browser shot` — reading a page as yourself
 
