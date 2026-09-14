@@ -249,6 +249,36 @@ unrelated host it renders a logged-out page that reads as a bug in this command.
 `--full` is a **tall viewport**, which is the most headless Chrome's screenshot can honestly
 promise — it does not scroll-stitch a page.
 
+### `browser read` — Markdown and provenance from the authenticated page
+
+```
+5dive browser read <site> <url> [--out=<dir>] [--json] [--wait=<ms>]
+5dive browser links <site> <url> [--out=<dir>] [--wait=<ms>]
+```
+
+`read` reuses `shot`'s site boundary, private profile audit, live-viewer refusal and positive
+authenticated-session probe. It then makes one Chrome `--dump-dom` capture and writes a private
+evidence triple: `page.html` is the exact captured bytes, `page.md` is the extracted article with
+YAML frontmatter, and `page.meta.json` carries the URLs, article metadata, links, images,
+schema.org data, word count, capture/browser/extractor versions, and the SHA-256 of `page.html`.
+With no `--out`, the directory is created mode 0700 beneath the seat's private artifact root;
+each artifact is 0600. An explicit directory must meet that same ownership and mode contract, and
+can never be the live profile or a directory beneath it. A logged-out refusal creates nothing.
+
+`--json` prints the metadata plus Markdown as one object. `links` is the same one-capture read and
+the same evidence triple, but prints only the extracted article's absolute link objects. It is not
+a second crawler path.
+
+The phrase **DOM capture** has a precise limit here: Chrome's `--dump-dom` is a post-script serialized DOM.
+It is not the server's original response bytes, not a network archive, and not a
+SingleFile snapshot with its subresources embedded. That stronger preservation belongs to a later
+snapshot verb; describing this artifact as one would overstate what can be reconstructed.
+
+Extraction is a reviewed, vendored bundle pinned to Defuddle 0.19.3 and linkedom 0.18.13. Nothing
+is resolved from npm at install or run time. Linkedom supplies Defuddle's documented Node DOM shape
+for the already-rendered document; a full browser emulation such as jsdom adds no fidelity after
+Chrome has done the scripting. Like `shot`, this path opens no CDP/debug socket.
+
 **The boundary on whose account this is.** A profile here is a *throwaway or role* account, never a
 person's personal login — with exactly one exception, stated so it is not quietly widened: the
 owner's own box, running the owner's own login, to their own product. That is a person granting a
