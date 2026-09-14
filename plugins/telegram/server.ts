@@ -39,6 +39,7 @@ import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
+import { protectTelegramViewerLinks } from './viewer-link.ts'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -233,6 +234,7 @@ bot.api.config.use((prev, method, payload, signal) => {
       p.text = p.text.slice(0, MAX_CHUNK_LIMIT - 32) + '\n…(message truncated)'
       delete p.parse_mode
     }
+    protectTelegramViewerLinks(payload)
   }
   return prev(method, payload, signal)
 })

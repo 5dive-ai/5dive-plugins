@@ -25,6 +25,12 @@ is in. `viewer_denied` carries a `reason` and that reason is the diagnosis. Noth
 they have not clicked yet. The only other safe probe is a deliberately WRONG nonce: a
 refusal spends nothing.
 
+**A chat preview is a visit.** Hand the viewer URL over only as non-unfurling code, with
+"Copy-paste this one-time link into your browser. Do not paste it back into chat." Telegram
+agents use the reply tool's MarkdownV2 code span; the Telegram transport enforces the same
+rule. Other chat adapters must use their equivalent code formatting. A web dashboard may
+offer copy-only text or a copy button, but must not prefetch the URL.
+
 ## The flow
 
     5dive browser serve <site>                                 # 1. persistent Chrome on its own Xvfb
@@ -40,9 +46,10 @@ refusal spends nothing.
    re-mint. `--bind=<session>` is mandatory (an unbound ticket is a bearer credential for a
    live account); `--bind=local` is the named escape for a hand-run on the box. Mint it when
    the human is actually there — the TTL is short on purpose.
-3. Send it on the channel you are already on, with the two facts that change their
-   behaviour: one-time, and expiring. Never write the link into a task, a PR, a commit, a
-   log or a wiki page — while unspent it is a live credential.
+3. Send it on the channel you are already on as non-unfurling code, with the two facts that
+   change their behaviour: one-time, and expiring. Tell the human to copy-paste it into a
+   browser and never back into chat. Never write the link into a task, a PR, a commit, a log
+   or a wiki page — while unspent it is a live credential.
 4. `status` is the only honest confirmation; poll every ~15–30s, not tighter (each probe is
    a real page load). `authenticated` = done. `session expired` / `CHALLENGE` = a person is
    still needed. `UNKNOWN` = the probe could not read the page at all — it is not a failure

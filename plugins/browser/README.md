@@ -127,6 +127,10 @@ for. Diagnose a handed-over link from the box journal
 (`journalctl -u shelld | grep -E 'viewer_bind|viewer_redeemed|viewer_denied|viewer_ws_connected'`),
 or with a deliberately bad nonce — never by visiting it.
 
+That includes chat previewers. Send the URL as non-unfurling code and tell the human to
+copy-paste it into their browser, never back into chat. All six Telegram adapters enforce
+this at the Bot API boundary; another chat adapter must provide the equivalent guarantee.
+
 ## The auth model
 
 `5dive browser auth <site>` opens a browser profile dedicated to that site and you log in
