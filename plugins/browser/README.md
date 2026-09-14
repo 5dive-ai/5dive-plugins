@@ -298,6 +298,20 @@ first:
 
 `FIVEDIVE_BROWSER_ADAPTER_DIR` overrides both and is then the only directory searched.
 
+**Shipped adapters, and what was measured for each.** A `logged_out_when_dom_matches` is read off
+the site's RENDERED logged-out page with the plugin's own probe command — never off a plain fetch,
+which for every site below returns a shell without the form. Each file's `_comment` says where and
+when.
+
+| site | probe url | marker | measured |
+|---|---|---|---|
+| `reddit.com` | `/login/` | `name="username"` | logged-out form in a real browser |
+| `x.com` | `/i/flow/login` | `name="username_or_email"` | logged-out form, three renders (8s, 25s, Playwright 15s); the logged-in half is unmeasured because no x.com profile exists — that gap fails SAFE (a false "expired" asks a person; never a false "authenticated") |
+| `github.com` | `/settings/profile` | `action="/session"` | BOTH halves: 3 matches on the sign-in page logged out, 0 on "Your profile" logged in |
+
+Every shipped adapter has `"actions": {}`: they classify a session, and the actions a site's owner
+wants are theirs to write in their seat's `.adapters/`.
+
 **Why two and not one.** It was one — the package's `adapters/` — and that directory is replaced
 wholesale by `5dive plugin upgrade browser@5dive-plugins`. Measured 2026-09-14: a hand-written
 `adapters/reddit.com.json` was there before the upgrade and gone after it, and `status reddit.com`
@@ -368,6 +382,14 @@ action that half happened.
 no caret: the driver speaks CDP to a Chrome holding a human's live session, and a silent minor bump
 changes the launch arguments under a credential. Install it with
 `npm install --prefix plugins/browser`; without it, `run` refuses and says so.
+
+On a managed 5dive box nobody types that command. The nightly browser-stack converger
+(`/usr/local/bin/5dive-browser-stack-install`, shipped by 5dive-api) reads the pin out of this
+`package.json`, installs it as root into the enabled package directory with `--ignore-scripts`, and
+does so again after every `plugin upgrade` replaces that directory — until then its status file reads
+`executor=absent` and its health row says `run` will refuse. A box the converger has not reached yet
+is exactly a box where `run` refuses honestly (exit 70, nothing re-read), never one where it runs a
+throwaway browser (DIVE-4538).
 
 **And it is pinned by LOCATION as well as by version.** A bare `require('playwright-core')` searches
 `node_modules` in every ancestor directory of the driver, so unpacking the plugin somewhere that

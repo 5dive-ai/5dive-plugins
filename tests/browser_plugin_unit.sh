@@ -1669,8 +1669,16 @@ run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" "$BROWSER" run x publish
 t  'T16c the browser is launched AT the seat'"'"'s logged-in profile directory' \
    "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" \
    "$(jq -rs '[.[]|select(.call=="launch")|.profile]|first' "$PWREC")"
-t  'T16c ...using the chrome this box resolved, not one the driver picked' 'google-chrome' \
+t  'T16c ...using the chrome this box resolved, not one the driver picked' \
+   "$FAKEBIN/google-chrome" \
    "$(jq -rs '[.[]|select(.call=="launch")|.executablePath]|first' "$PWREC")"
+# PLAYWRIGHT TAKES A PATH, NOT A NAME (DIVE-4538). cmd_run used to hand the driver the bare
+# word _chrome found — resolvable by bash at every exec, not by Playwright's executablePath —
+# and the first real run on a real box died "executable doesn't exist at google-chrome" after
+# clearing every refusal. The fixture's fake chrome is a name on PATH, so this arm is the only
+# thing that can see the difference here: what the driver was handed must be absolute.
+t  'T16c ...and it is an absolute PATH, which is what Playwright takes' 'absolute' \
+   "$([[ "$(jq -rs '[.[]|select(.call=="launch")|.executablePath]|first' "$PWREC")" == /* ]] && echo absolute || echo relative)"
 
 # --- T16d the vocabulary is checked BEFORE the browser opens ------------------
 # Half an action is the one outcome with no clean recovery, so a bad plan must
@@ -2041,6 +2049,36 @@ run env PATH="$READPATH" "$BROWSER" --help
 tc 'T20f --help lists read' '5dive browser read' "$OUT"
 tc 'T20f --help lists links' '5dive browser links' "$OUT"
 tc 'T20f README explains dump-dom' 'post-script serialized DOM' "$(cat "$ROOT/plugins/browser/README.md")"
+
+# === T20 the shipped x.com adapter is MEASURED, not guessed =================
+# Same contract as T19 and the same trap one step worse: x.com's login flow is
+# JS-rendered, so a plain fetch has no form at all. Measured on a real box
+# (exact-swallow, 2026-09-14, DIVE-4538) with the plugin's OWN probe command and
+# again at 25s and under Playwright 1.63 after 15s of real time — all three carry
+#   <input autocomplete="username webauthn" ... name="username_or_email">
+XADP="$PKGADP/x.com.json"
+run jq -e . "$XADP"; t 'T20a the shipped x.com adapter is valid JSON' 0 "$RC"
+XMARK="$(jq -r '.probe.logged_out_when_dom_matches' "$XADP")"
+t  'T20b it declares the login flow as the probe url' 'https://x.com/i/flow/login' "$(jq -r '.probe.url' "$XADP")"
+t  'T20c the marker MATCHES the measured logged-out form' 'match' \
+   "$(grep -qiE "$XMARK" <<<'<input autocomplete="username webauthn" inputmode="text" id="jf-input-username_or_email" type="text" value="" name="username_or_email">' && echo match || echo miss)"
+t  'T20c ...and the single-quoted spelling' 'match' \
+   "$(grep -qiE "$XMARK" <<<"<input name='username_or_email'>" && echo match || echo miss)"
+t  'T20d it does NOT match a logged-in timeline' 'miss' \
+   "$(grep -qiE "$XMARK" <<<'<html><body><div data-testid="primaryColumn"><article data-testid="tweet">hi</article></div></body></html>' && echo match || echo miss)"
+tc 'T20e the file records that the marker was measured in a browser, not fetched' 'MEASURED, NOT GUESSED' "$(cat "$XADP")"
+tc 'T20f ...and names the half it could not measure' 'UNMEASURED HALF' "$(cat "$XADP")"
+
+# === T21 the shipped github.com adapter is MEASURED on BOTH halves ==========
+GADP="$PKGADP/github.com.json"
+run jq -e . "$GADP"; t 'T21a the shipped github.com adapter is valid JSON' 0 "$RC"
+GMARK="$(jq -r '.probe.logged_out_when_dom_matches' "$GADP")"
+t  'T21b it probes a page that redirects to sign-in when logged out' 'https://github.com/settings/profile' "$(jq -r '.probe.url' "$GADP")"
+t  'T21c the marker MATCHES the sign-in form (it posts to /session)' 'match' \
+   "$(grep -qiE "$GMARK" <<<'<form action="/session" accept-charset="UTF-8" method="post"><input name="login">' && echo match || echo miss)"
+t  'T21d it does NOT match the logged-in settings page' 'miss' \
+   "$(grep -qiE "$GMARK" <<<'<title>Your profile</title><meta name="user-login" content="someone"><textarea id="user_profile_bio"></textarea>' && echo match || echo miss)"
+tc 'T21e the file records the measurement' 'MEASURED, NOT GUESSED' "$(cat "$GADP")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

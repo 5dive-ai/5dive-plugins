@@ -516,6 +516,14 @@ cmd_run() {
   # the missing-browser box is the one where an unverified session is most likely
   # to be a challenge page nobody has looked at.
   local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — an action needs the same browser the profile was logged in with."
+  # PLAYWRIGHT TAKES A PATH, NOT A NAME. _chrome answers with whatever `command -v`
+  # found first — the bare word `google-chrome` — which bash resolves through PATH
+  # at every exec and Playwright's executablePath does not. Measured on
+  # exact-swallow (DIVE-4538): a `run` that had cleared every refusal above died
+  # "Failed to launch chromium because executable doesn't exist at google-chrome",
+  # so the executor could not open a profile on any real box. Resolve it HERE,
+  # once, where the executable is chosen; the driver still gets it handed down.
+  chrome=$(command -v "$chrome" 2>/dev/null) || die "$E_UNAVAILABLE" "chrome is on this box but '$chrome' does not resolve to a path — an action needs the same browser the profile was logged in with."
 
   local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
   [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver. Set FIVEDIVE_BROWSER_DRIVER to an executable that drives a REAL Chrome profile (the Browser Hand shape: extension + local relay), or reinstall the plugin so its own driver is back. This never falls back to a throwaway browser: an action that did not run inside the profile a person logged into by hand is not the thing that was asked for."
