@@ -1,0 +1,271 @@
+#!/usr/bin/env node
+'use strict';
+// 5dive browser — the real FIVEDIVE_BROWSER_DRIVER (DIVE-4524).
+//
+// WHAT THIS IS. `5dive browser run <site> <action>` validates an adapter, checks
+// the session is live, and then hands a PLAN — {profile, steps, args} on stdin —
+// to an executor. Until now there was no executor anywhere: `run` died "no
+// executor backend" on every box, so a logged-in profile was a credential with
+// no consumer. This is that executor.
+//
+// ---- WHY PLAYWRIGHT, WHEN bin/browser USED TO REFUSE IT ----------------------
+//
+// The old refusal said: "Playwright is the right tool for BUILDING an adapter
+// and the wrong one for running it." That sentence was about a DIFFERENT
+// Playwright shape — one that launches its own throwaway browser, which would
+// have thrown the hand-logged-in profile away and made the whole design
+// pointless. It is REVERSED here, deliberately and by direction (DIVE-4488 body,
+// main, 2026-09-14), on one property that the throwaway shape does not have:
+//
+//   launchPersistentContext(<the seat's own 0700 profile dir>) speaks CDP over
+//   --remote-debugging-pipe — file descriptors 3 and 4 of the child — and opens
+//   NO LISTENING SOCKET.
+//
+// That is the same security claim `shot` makes and for the same reason: a
+// loopback --remote-debugging-port is reachable by EVERY SEAT ON THE BOX, and
+// CDP is full control of the browser holding the session. A seat that could
+// never open the 0700 profile directory would get the session anyway, with no
+// file permission needed, and the 0700 mode would be decorative. Over the pipe
+// there is nothing to reach: the only process that can speak to this browser is
+// the one that launched it. _launch_args() below REFUSES any --remote-debugging-*
+// argument, so the port cannot come back by way of a config edit either.
+//
+// ---- THE DRIVER IS NOT A PROGRAM HOST ---------------------------------------
+//
+// bin/browser already refuses a step outside the fixed vocabulary at load time.
+// This re-checks it rather than trusting its caller: the driver is an executable
+// whose path is an environment variable, so "the plan was validated upstream" is
+// an assumption about a process we do not control. There is no eval, no script
+// step, no free-text instruction — an adapter that could express anything would
+// be freeform reasoning with extra syntax.
+//
+// Arguments reach the page as VALUES through the Playwright API (fill/press/
+// selectOption take strings), never spliced into a command line or a selector.
+
+const fs = require('fs');
+const path = require('path');
+
+const PROG = '5dive browser run';
+// THE EXIT CODE IS A CONTRACT, and 70 is the load-bearing one.
+//
+// `5dive browser run` does not trust a driver's exit status — the verdict is an
+// out-of-band re-read of the artifact, because "published and reported failure"
+// is real and a blind retry on it double-posts. That re-read is only meaningful
+// if the action actually RAN. If the executor never opened the browser, the
+// re-read grades whatever was already at that URL: for an adapter whose verify
+// URL is an existing page, an executor that does not exist on this box reports
+// SUCCESS for an action nobody performed. Vacuous green, with a receipt.
+//
+// So every refusal RAISED BEFORE THE FIRST STEP exits 70, which bin/browser
+// treats as "nothing ran, there is nothing to verify". After the first step, a
+// failure is 1 and the re-read governs — that half is the whole design.
+const E_NOTHING_RAN = 70, E_FAILED = 1;
+
+// "BEFORE THE FIRST STEP" IS NOT "BEFORE THE LAUNCH", and reading it as the
+// launch is how this contract was one call short (DIVE-4524 iteration 1).
+// Guarding the launch alone leaves a window — acquiring the page, arming the
+// timeout, anything ever hoisted above the loop — in which the browser is OPEN
+// and NOT ONE STEP has run. A throw in that window used to exit 1, which is the
+// "a step failed, re-read the artifact" code, so bin/browser re-read a verify
+// URL that already existed and reported a publish nobody performed: this file's
+// own named defect, alive inside the change that exists to close it.
+//
+// The boundary is therefore a COUNTER, not a second try block. A counter is the
+// property itself ("did any step run?") rather than a place in the file that has
+// to be kept true as the file changes, so code hoisted above the loop later is
+// covered without anyone remembering this comment. It is module-scope because
+// the outermost .catch() must read the same number.
+//
+// A step COUNTS AS RUN once its await is entered, not once it returns: a goto
+// that throws may already have navigated, a click may already have posted. The
+// expensive direction of a wrong answer here is claiming nothing ran when
+// something did — that is the blind retry that double-posts.
+let stepsRun = 0;
+const stepFailure = () => (stepsRun ? E_FAILED : E_NOTHING_RAN);
+
+// The same list bin/browser enforces. Kept here as a literal on purpose: two
+// copies that must agree is the point — this one is the one that runs.
+const STEPS = {
+  goto:     ['url'],
+  fill:     ['selector', 'value'],
+  click:    ['selector'],
+  wait_for: ['selector'],
+  select:   ['selector', 'value'],
+  upload:   ['selector', 'path'],
+  press:    ['selector', 'key'],
+};
+const STEP_TIMEOUT = Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || 30000);
+
+function die(code, msg) { process.stderr.write(`${PROG}: ${msg}\n`); process.exit(code); }
+
+// {key} -> args.key, as a VALUE. A placeholder with no argument is a REFUSAL and
+// not a passthrough: the dual of this bug is already known on the verify side —
+// an uninterpolated {slug} in verify.expect can never match, so every publish
+// reads as NOT VERIFIED. On the STEP side the same slip is worse than noisy, it
+// is wrong: a fill that posts the literal text "{body}" has published garbage to
+// a real account, and the out-of-band verify cannot tell you it was garbage
+// because the artifact really is live.
+function interp(s, args, where) {
+  if (typeof s !== 'string') return s;
+  const out = s.replace(/\{([a-zA-Z0-9_]+)\}/g, (m, k) =>
+    Object.prototype.hasOwnProperty.call(args, k) ? args[k] : m);
+  const left = out.match(/\{[a-zA-Z0-9_]+\}/);
+  if (left) {
+    die(E_NOTHING_RAN, `${where} still contains ${left[0]} — no --${left[0].slice(1, -1)}=<value> was passed. ` +
+      `Refusing rather than typing the placeholder into the page: that publishes literal "${left[0]}" ` +
+      `to a real account, and the out-of-band verify would confirm it as live.`);
+  }
+  return out;
+}
+
+// THE SECURITY CLAIM, as code rather than as a comment. Anything that would open
+// a socket another seat could reach is refused here, so it cannot be
+// reintroduced by an env var or a later edit without this failing loudly.
+function launchArgs() {
+  const extra = (process.env.FIVEDIVE_BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);
+  const args = ['--no-sandbox', '--disable-gpu', '--hide-scrollbars', ...extra];
+  const bad = args.filter(a => /^--remote-debugging/.test(a));
+  if (bad.length) {
+    die(E_NOTHING_RAN, `refusing to launch with ${bad.join(' ')}. CDP here goes over --remote-debugging-pipe ` +
+      `(the child's fds 3/4), which opens no listening socket. A debug PORT is reachable by every seat on ` +
+      `this box and CDP is full control of the browser holding the session — it would hand the session to a ` +
+      `seat that could never open the 0700 profile directory.`);
+  }
+  return args;
+}
+
+// WHERE playwright-core COMES FROM IS PART OF THE SECURITY CLAIM, so it is not
+// left to ambient state. A bare require() walks `node_modules` in EVERY ancestor
+// directory of this file, and this process is the one that opens a profile
+// holding somebody's live sessions — so unpacking the plugin somewhere that
+// happens to sit under a `node_modules/playwright-core` hands the driver a
+// library nobody chose or pinned. Measured under DIVE-4524: a checkout under
+// /tmp silently loaded /tmp/node_modules/playwright-core.
+//
+// The order is fixed and short, and there is no ancestor walk:
+//   1. the directories NODE_PATH names, if any — an operator's explicit choice,
+//      and the only lever the harness uses to put a recording stub here;
+//   2. the plugin's OWN node_modules, where package.json pins it exact.
+// Nothing else resolves, so "not installed" is a fact about those two places
+// rather than about wherever the plugin happens to have been unpacked.
+function playwrightDirs() {
+  const named = (process.env.NODE_PATH || '').split(path.delimiter).filter(Boolean);
+  return [...named, path.join(__dirname, '..', 'node_modules')];
+}
+
+function loadPlaywright() {
+  for (const dir of playwrightDirs()) {
+    const cand = path.join(dir, 'playwright-core');
+    if (!fs.existsSync(cand)) continue;
+    try { return require(cand); }
+    catch (e) {
+      // It is THERE and it will not load. That is not "not installed", and
+      // saying so would send the reader to reinstall something already present.
+      die(E_NOTHING_RAN, `playwright-core at ${cand} could not be loaded: ${e.message}`);
+    }
+  }
+  {
+    die(E_NOTHING_RAN, `playwright-core is not installed for this seat, so there is no executor. ` +
+      `Install the pinned version next to the plugin:  npm install --prefix ` +
+      `${__dirname}/..  (it is pinned in plugins/browser/package.json). ` +
+      `This driver does NOT fall back to a throwaway browser: a run that is not inside the profile a ` +
+      `person logged into by hand is not the thing that was asked for.`);
+  }
+}
+
+async function main() {
+  const raw = fs.readFileSync(0, 'utf8');
+  let plan;
+  try { plan = JSON.parse(raw); } catch (e) { die(E_NOTHING_RAN, `the plan on stdin is not JSON: ${e.message}`); }
+
+  const profile = process.env.FIVEDIVE_BROWSER_PROFILE || plan.profile;
+  if (!profile) die(E_NOTHING_RAN, 'the plan names no profile directory');
+  if (!fs.existsSync(profile)) die(E_NOTHING_RAN, `no profile directory at ${profile}`);
+
+  const steps = Array.isArray(plan.steps) ? plan.steps : null;
+  if (!steps || !steps.length) die(E_NOTHING_RAN, 'the plan carries no steps');
+  const args = (plan.args && typeof plan.args === 'object') ? plan.args : {};
+
+  // VALIDATE AND INTERPOLATE THE WHOLE PLAN BEFORE THE BROWSER OPENS. Half an
+  // action is the one outcome with no clean recovery: the out-of-band verify can
+  // tell you the artifact is not live, and cannot tell you whether a draft was
+  // left behind. Substituting lazily at each step would also break this file's
+  // own contract — a missing --key on step 3 would raise "nothing ran" after
+  // steps 1 and 2 had run, and bin/browser would then skip the re-read on an
+  // action that half happened. Resolve everything first, or refuse.
+  const resolved = steps.map((s, i) => {
+    const spec = STEPS[s && s.op];
+    if (!spec) {
+      die(E_NOTHING_RAN, `step ${i + 1} uses '${s && s.op}', which is outside the fixed vocabulary ` +
+        `(${Object.keys(STEPS).join(' ')}). The vocabulary is the point: an adapter that can express ` +
+        `anything is freeform reasoning with extra syntax.`);
+    }
+    const out = { op: s.op };
+    for (const field of spec) {
+      if (typeof s[field] !== 'string' || !s[field]) {
+        die(E_NOTHING_RAN, `step ${i + 1} (${s.op}) is missing '${field}'`);
+      }
+      // A SELECTOR IS NEVER INTERPOLATED. Selectors come from the adapter, which
+      // is ours; values come from the caller, which is not. Substituting into a
+      // selector would let an argument choose which element gets clicked.
+      out[field] = field === 'selector' ? s[field] : interp(s[field], args, `step ${i + 1} (${s.op})`);
+    }
+    return out;
+  });
+
+  const chrome = process.env.FIVEDIVE_BROWSER_CHROME;
+  if (!chrome) {
+    die(E_NOTHING_RAN, 'no chrome named for this run — a run must use the same browser the profile was ' +
+      'logged in with, so the executable is passed in rather than guessed here.');
+  }
+
+  const { chromium } = loadPlaywright();
+  let ctx;
+  try {
+    ctx = await chromium.launchPersistentContext(profile, {
+      headless: true,
+      executablePath: chrome,
+      args: launchArgs(),
+      viewport: { width: 1280, height: 800 },
+    });
+  } catch (e) {
+    die(E_NOTHING_RAN, `could not open the ${profile} profile: ${e.message}`);
+  }
+
+  let rc = 0;
+  try {
+    const page = ctx.pages()[0] || await ctx.newPage();
+    page.setDefaultTimeout(STEP_TIMEOUT);
+    for (let i = 0; i < resolved.length; i++) {
+      const s = resolved[i];
+      const where = `step ${i + 1} (${s.op})`;
+      stepsRun++;  // entered, not completed — see stepsRun above
+      switch (s.op) {
+        case 'goto':     await page.goto(s.url, { waitUntil: 'domcontentloaded' }); break;
+        case 'fill':     await page.fill(s.selector, s.value); break;
+        case 'click':    await page.click(s.selector); break;
+        case 'wait_for': await page.waitForSelector(s.selector); break;
+        case 'select':   await page.selectOption(s.selector, s.value); break;
+        case 'upload':   await page.setInputFiles(s.selector, s.path); break;
+        case 'press':    await page.press(s.selector, s.key); break;
+      }
+      process.stderr.write(`  ${where} ok\n`);
+    }
+  } catch (e) {
+    // A STEP FAILURE IS NOT A VERDICT AND MUST NOT BE DRESSED AS ONE. bin/browser
+    // re-reads the artifact by a different path whatever this exits, because
+    // "failed" here and "published" are not mutually exclusive — that is the
+    // case that double-posts on a blind retry.
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    rc = stepFailure();
+    if (rc === E_NOTHING_RAN) {
+      process.stderr.write(`${PROG}: the browser opened but not one step ran, so nothing was ` +
+        `published and there is nothing to re-read.\n`);
+    }
+  } finally {
+    try { await ctx.close(); } catch (e) { /* the verdict is the re-read, not this */ }
+  }
+  process.exit(rc);
+}
+
+main().catch(e => die(stepFailure(), e && e.message ? e.message : String(e)));

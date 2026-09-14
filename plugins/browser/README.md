@@ -287,7 +287,24 @@ and it is not a reason to log a 5dive box into a third party's personal profile.
 
 ## Adapters are data, and the vocabulary is fixed
 
-An adapter is a JSON file at `adapters/<site>.json`. Its steps come from a closed vocabulary —
+An adapter is a JSON file named `<site>.json`, and it is looked for in two places, most-local
+first:
+
+1. **`/var/lib/5dive/browser-profiles/<seat>/.adapters/`** — the seat's own, next to the profiles
+   it describes. **Write yours here.** It is already root-created and 0700-audited, and nothing in
+   a package upgrade touches it.
+2. **the plugin's own `adapters/`** — what 5dive ships, a read-only fallback. A seat file of the
+   same name wins, which is how you correct a shipped adapter and have the correction stick.
+
+`FIVEDIVE_BROWSER_ADAPTER_DIR` overrides both and is then the only directory searched.
+
+**Why two and not one.** It was one — the package's `adapters/` — and that directory is replaced
+wholesale by `5dive plugin upgrade browser@5dive-plugins`. Measured 2026-09-14: a hand-written
+`adapters/reddit.com.json` was there before the upgrade and gone after it, and `status reddit.com`
+went `authenticated` → `UNKNOWN (no adapter)` with nothing else changed. An adapter is your own
+data about your own site; an upgrade that eats it silently un-classifies a live session.
+
+Its steps come from a closed vocabulary —
 `goto fill click wait_for select upload press` — and a step outside it is a **load-time refusal**.
 There is no `eval`, no `script` and no free-text instruction step, because any of those would make
 the adapter a program the executor merely hosts. The LLM decides *what* to distribute, where, and
@@ -306,11 +323,58 @@ the driver's. A DOM assertion on the page you just acted on catches neither fail
 
 ## The executor
 
-The backend is named by `FIVEDIVE_BROWSER_DRIVER` and must drive a **real Chrome profile**
-(the Browser Hand shape: extension + local relay). Playwright is the right tool for *building and
-testing* an adapter and the wrong tool for *running* it, so `run` refuses rather than silently
-falling back to one. One executor, not six: each candidate runtime carries its own site adapters on
-someone else's maintenance schedule, so six dependencies is six adapter surfaces that rot.
+`5dive browser run <site> <action> [--key=value ...]` ships with one, `bin/driver-playwright`, and
+uses it unless `FIVEDIVE_BROWSER_DRIVER` names another (the Browser Hand shape — extension + local
+relay — is still a valid backend). One executor, not six: each candidate runtime carries its own
+site adapters on someone else's maintenance schedule, so six dependencies is six adapter surfaces
+that rot.
+
+**It drives YOUR profile, over a pipe.** The driver opens a persistent context at the seat's own
+0700 profile directory — the one a person logged into by hand — and speaks CDP over
+`--remote-debugging-pipe`, the child process's own file descriptors. **No listening socket exists.**
+A loopback `--remote-debugging-port` would be reachable by every seat on the box, and CDP is full
+control of the browser holding the session: a seat that could never open the profile directory
+would get the session anyway, with no file permission needed, and the directory's 0700 mode would
+be decorative. A `--remote-debugging-*` argument arriving by configuration is a refusal, not a
+launch. This is the same claim `shot` makes, for the same reason.
+
+**It is not a fallback to a throwaway browser.** The earlier refusal here said Playwright was the
+wrong tool for running an adapter; that was about a Playwright that launches its own fresh browser,
+which would throw the hand-logged-in profile away and make the whole design pointless. The driver
+has no launch path that is not this profile directory.
+
+**A served browser is cycled around the run** — stopped, driven, started again — because Chrome
+allows one instance per profile directory and a second one hands its work to the running instance
+and exits with an empty document. The login lives in the directory, not in the process. A **live
+viewer** is the exception: that is a person at a keyboard part-way through the login the viewer
+exists for, so it is a refusal rather than a cycle.
+
+**Exit 70 means nothing ran.** `run`'s verdict is an out-of-band re-read of the artifact, which is
+the right grade for an action that executed and the wrong one for an action that never started —
+for an adapter whose verify URL is an existing page, an executor that is not installed on this box
+would otherwise report SUCCESS for a publish nobody performed. Every refusal the driver raises
+before its first step exits 70 and `run` then refuses instead of re-reading. After the first step a
+failure is exit 1 and the re-read governs, because "published fine but reported failure" is real
+and a blind retry on it double-posts.
+
+**"Before the first step" is not "before the launch."** The browser opening is not a step. A
+browser that opens and then cannot hand over a page has run nothing, so that is exit 70 too — the
+driver counts steps rather than trusting a place in the file, and a step counts from the moment its
+`await` is entered, not from when it returns: a `goto` that throws may already have navigated and a
+`click` may already have posted, and calling *that* "nothing ran" would suppress the re-read on an
+action that half happened.
+
+**Playwright is pinned.** `plugins/browser/package.json` names an exact `playwright-core` version,
+no caret: the driver speaks CDP to a Chrome holding a human's live session, and a silent minor bump
+changes the launch arguments under a credential. Install it with
+`npm install --prefix plugins/browser`; without it, `run` refuses and says so.
+
+**And it is pinned by LOCATION as well as by version.** A bare `require('playwright-core')` searches
+`node_modules` in every ancestor directory of the driver, so unpacking the plugin somewhere that
+happens to sit under one hands this process — the one that opens a directory full of live sessions —
+a library nobody chose. The driver looks in exactly two places, in order: the directories `NODE_PATH`
+names, if any, then `plugins/browser/node_modules`. There is no ancestor walk, so "not installed"
+is a fact about those two places rather than about where the plugin was unpacked.
 
 ## Not shipped yet, and named so nobody assumes it
 

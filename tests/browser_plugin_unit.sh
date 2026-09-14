@@ -27,7 +27,34 @@ set -uo pipefail
 # reds when the plugin breaks lives with it. grading_tree.sh did not come along —
 # it is a 5dive-repo helper — so the tree is named by git directly.
 printf 'grading tree: %s @ %s\n' "$PWD" "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" >&2
-trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+# THIS SUITE LEAKS AN X SERVER PER RUN, AND ON A LONG-LIVED BOX THAT IS A RED ON
+# AN UNCHANGED TREE (inherited from origin/main; fixed here under DIVE-4524
+# because it is what made this row's own arms unverifiable). Several arms let
+# bin/browser restore a serve, and a restore starts a REAL Xvfb whenever the fake
+# is not on PATH. Nothing ever stopped it, and `_display_free` (bin/browser) keys
+# on /tmp/.X11-unix/X<n> EXISTING rather than on a live pid — so every run left
+# one more display AND one more socket behind, the serve arms walked further up
+# the range each time, and after a few dozen runs the suite hung looking for a
+# free display. Invisible in CI, where the runner is fresh.
+#
+# KILL ONLY OURS, and prove it twice: same uid, and not running before we started.
+# Another seat's Xvfb on this box is a live browser someone may be logged into.
+_XVFB_BEFORE=" $(pgrep -u "$(id -u)" -x Xvfb 2>/dev/null | tr '\n' ' ')"
+_reap_xvfb() {
+  local p n
+  for p in $(pgrep -u "$(id -u)" -x Xvfb 2>/dev/null); do
+    [[ "$_XVFB_BEFORE" == *" $p "* ]] && continue
+    n=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | sed -n 's/.*Xvfb :\([0-9][0-9]*\).*/\1/p')
+    kill "$p" 2>/dev/null
+    # BOTH artefacts, and the lock is the one that bites: removing only the
+    # socket leaves a display that `_display_free` reads as FREE and that Xvfb
+    # then REFUSES to start on ("server is already active"), so the next run
+    # fails with "Xvfb did not start" on an unchanged tree. Measured here.
+    [[ -n "$n" && -O "/tmp/.X11-unix/X$n" ]] && rm -f "/tmp/.X11-unix/X$n"
+    [[ -n "$n" && -O "/tmp/.X$n-lock" ]] && rm -f "/tmp/.X$n-lock"
+  done
+}
+trap 'rc=$?; _reap_xvfb; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 BROWSER="$ROOT/plugins/browser/bin/browser"
@@ -312,11 +339,74 @@ t 'T5e the driver receives the profile' "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x"
   "$(jq -r '.profile' "$TMP/driver-plan.json")"
 t 'T5f the driver receives the args'    'slug-42' "$(jq -r '.args.slug' "$TMP/driver-plan.json")"
 
-# ============================================ T6 no executor is a refusal, not a fallback
+# ============================================ T6 an executor that cannot run is a refusal,
+# and — the part that matters — it is NOT verified green.
+#
+# DIVE-4524 made the shipped driver the default, so "no FIVEDIVE_BROWSER_DRIVER"
+# is no longer the interesting case; "the executor refused before it ran a step"
+# is. The fixture is deliberately loaded against us: the verify URL
+# (file://$TMP/slug-42.html) ALREADY HOLDS the expect string, because a permalink
+# that exists is the normal case. So a `run` that reaches its out-of-band re-read
+# after an executor that never opened a browser reports SUCCESS for a publish
+# nobody performed — vacuous green, with a receipt. Exit 70 from the driver is
+# the contract that stops it.
+#
+# AND THE ABSENCE HAS TO BE A FACT, NOT AN ACCIDENT OF WHERE THE CHECKOUT SITS.
+# A bare require() walks node_modules up every ancestor, so on a box with a
+# /tmp/node_modules/playwright-core (this one has) a worktree under /tmp made
+# this arm red — the executor WAS resolvable, just not by anybody's choice.
+# DIVE-4524 pinned the driver's resolution to NODE_PATH + its own package dir,
+# with no ancestor walk, so the fixture is a byte-identical copy of the shipped
+# driver in a directory that has neither. The copy is asserted identical, or this
+# arm would grade a file nobody ships.
+PWABSENT="$TMP/pw-absent"; mkdir -p "$PWABSENT/bin"
+cp "$ROOT/plugins/browser/bin/driver-playwright" "$PWABSENT/bin/driver-playwright"
+t  'T6a (control) the fixture driver is the shipped one, byte for byte' 'same' \
+   "$(cmp -s "$ROOT/plugins/browser/bin/driver-playwright" "$PWABSENT/bin/driver-playwright" && echo same || echo different)"
+env NODE_PATH=/nonexistent-node-modules FIVEDIVE_BROWSER_DRIVER="$PWABSENT/bin/driver-playwright" \
+  "$BROWSER" run x publish --slug=slug-42 --body=hi >"$TMP/t6.out" 2>"$TMP/t6.err"; RC=$?
+OUT="$(cat "$TMP/t6.out")"; ERR="$(cat "$TMP/t6.err")"
+t  'T6a an executor that cannot run at all refuses' 69 "$RC"
+tc 'T6a ...naming the reason it cannot: no playwright installed for this seat' \
+   'playwright-core is not installed' "$ERR"
+tn 'T6a ...and does NOT report the pre-existing artifact as this run'"'"'s success' \
+   'verified:' "$OUT"
+tc 'T6a ...saying nothing was published and there is nothing to re-read' \
+   'nothing was published' "$ERR"
+tc 'T6a ...and that it will not treat what is already there as evidence' \
+   'was not put there by this run' "$ERR"
+# --- T6c an ANCESTOR's node_modules is not this driver's playwright ----------
+# THE MUTANT for the pinning above: put a working playwright-core in a parent
+# directory of the driver, where Node's default resolution would find it. The
+# driver must still refuse — a library that arrives because of where the plugin
+# was unpacked is not one anybody pinned, and this process is the one that opens
+# a profile full of live sessions.
+ANC="$TMP/anc"; mkdir -p "$ANC/node_modules/playwright-core" "$ANC/pkg/bin"
+printf '{ "name": "playwright-core", "version": "0.0.0-ancestor", "main": "index.js" }\n' \
+  > "$ANC/node_modules/playwright-core/package.json"
+printf 'exports.chromium = { launchPersistentContext: async () => { throw new Error("ancestor stub ran"); } };\n' \
+  > "$ANC/node_modules/playwright-core/index.js"
+cp "$ROOT/plugins/browser/bin/driver-playwright" "$ANC/pkg/bin/driver-playwright"
+env -u NODE_PATH FIVEDIVE_BROWSER_DRIVER="$ANC/pkg/bin/driver-playwright" \
+  "$BROWSER" run x publish --slug=slug-42 --body=hi >/dev/null 2>"$TMP/t6c.err"; RC=$?
+t  'T6c a playwright-core in an ANCESTOR directory is not loaded' 69 "$RC"
+tc 'T6c ...it still reports no executor, rather than driving an unpinned one' \
+   'playwright-core is not installed' "$(cat "$TMP/t6c.err")"
+tn 'T6c ...and the ancestor copy never ran' 'ancestor stub ran' "$(cat "$TMP/t6c.err")"
+# CONTROL: that same copy IS loadable — NODE_PATH naming its directory loads it,
+# so T6c is "not from an ancestor", not "this stub is broken".
+env NODE_PATH="$ANC/node_modules" FIVEDIVE_BROWSER_DRIVER="$ANC/pkg/bin/driver-playwright" \
+  "$BROWSER" run x publish --slug=slug-42 --body=hi >/dev/null 2>"$TMP/t6c2.err"; RC=$?
+tc 'T6c (control) the same copy loads when NODE_PATH names it' 'ancestor stub ran' \
+   "$(cat "$TMP/t6c2.err")"
+
+# CONTROL, or T6a grades a fixture that could never have gone green: the SAME
+# adapter and the SAME artifact, with a driver that merely exits non-zero after
+# running, is verified green — that is T5b's design and it must still hold.
+mkdriver 3
+run "$BROWSER" run x publish --slug=slug-42 --body=hi
+t  'T6b (control) a driver that RAN and failed is still graded by the re-read' 0 "$RC"
 unset FIVEDIVE_BROWSER_DRIVER
-run "$BROWSER" run x publish --slug=slug-42
-t  'T6a no driver refuses' 69 "$RC"
-tc 'T6a ...rather than silently falling back to an automated browser' 'Browser Hand' "$ERR"
 
 # ======================= T8 a security challenge is a HARD STOP, never a bypass
 # Decided 2026-09-07: "if a platform presents a security challenge, the executor
@@ -1472,7 +1562,377 @@ run env PATH="$SHOTPATH" "$BROWSER" --help
 tc 'T15i --help lists shot' '5dive browser shot' "$OUT"
 tc 'T15i README documents it' 'browser shot' "$(cat "$ROOT/plugins/browser/README.md")"
 
-# ========== T16 one authenticated DOM -> a self-verifying read evidence triple
+# === T16 DIVE-4524: `run`'s real executor =============================
+#
+# WHAT THESE ARMS ARE MUTANTS OF:
+#   T16a  the shipped driver not being wired at all — `run` dying "no executor
+#         backend" on every box, which is the state this row inherited.
+#   T16b  a --remote-debugging-PORT reaching the launch. CDP is full control of
+#         the browser holding a human's session, and a loopback port is reachable
+#         by every seat on the box — it would hand that session to a seat that
+#         could never open the 0700 profile directory. The pipe has nothing to
+#         reach. This is T15c's claim for the driver instead of the render.
+#   T16c  a throwaway browser. An action that did not run inside the profile a
+#         person logged into by hand is not the thing that was asked for.
+#   T16d  a step outside the fixed vocabulary being "best-efforted" — and the
+#         half that matters, the browser NOT opening before the plan is checked.
+#   T16e  an uninterpolated {placeholder} typed into a real account's composer.
+#   T16f  the served browser left stopped, or a person evicted from a live viewer.
+#
+# The executor is graded through a STUB playwright-core on NODE_PATH that records
+# what it was asked to do. There is no chrome and no real playwright on a CI
+# runner and this suite must not need either; the driver itself is the real one.
+PWROOT="$TMP/pw"; mkdir -p "$PWROOT/node_modules/playwright-core"
+cat > "$PWROOT/node_modules/playwright-core/package.json" <<'PWPKG'
+{ "name": "playwright-core", "version": "0.0.0-stub", "main": "index.js" }
+PWPKG
+cat > "$PWROOT/node_modules/playwright-core/index.js" <<'PWJS'
+// Records every call as JSON lines. It is NOT a mock of Playwright's behaviour —
+// it is a tape of what the driver asked for, which is what the arms grade.
+const fs = require('fs');
+const rec = (o) => fs.appendFileSync(process.env.PWREC, JSON.stringify(o) + '\n');
+const page = {
+  setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t }),
+  goto: async (url, o) => rec({ call: 'goto', url }),
+  fill: async (sel, val) => rec({ call: 'fill', sel, val }),
+  click: async (sel) => {
+    rec({ call: 'click', sel });
+    if (process.env.PWFAIL) throw new Error('stub: the step failed');
+  },
+  waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel }),
+  selectOption: async (sel, val) => rec({ call: 'selectOption', sel, val }),
+  setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p }),
+  press: async (sel, key) => rec({ call: 'press', sel, key }),
+};
+exports.chromium = {
+  launchPersistentContext: async (profile, opts) => {
+    rec({ call: 'launch', profile, args: opts.args, executablePath: opts.executablePath, headless: opts.headless });
+    // PWNOPAGE: THE BROWSER REALLY OPENS AND THEN CANNOT HAND OVER A PAGE.
+    // Every other shape here returns a working page, which is exactly why five
+    // anchored mutants missed the window between the launch and step one
+    // (DIVE-4524 iteration 1) — no arm could enter it. A stub that cannot fail
+    // this way makes the arm below impossible to write, so the shape lives in
+    // the tape, not in the arm.
+    if (process.env.PWNOPAGE) {
+      return {
+        pages: () => [],
+        newPage: async () => { throw new Error('stub: the browser opened but would not give up a page'); },
+        close: async () => rec({ call: 'close' }),
+      };
+    }
+    return { pages: () => [page], newPage: async () => page, close: async () => rec({ call: 'close' }) };
+  },
+};
+PWJS
+PWREC="$TMP/pw-record.jsonl"
+DRV="$ROOT/plugins/browser/bin/driver-playwright"
+pwcalls() { jq -r 'select(.call=="'"$1"'")' "$PWREC" 2>/dev/null; }
+
+# --- T16a the shipped driver is the default, and it is what runs --------------
+unset FIVEDIVE_BROWSER_DRIVER
+: > "$PWREC"
+mkadapter x "file://$TMP/artifact.html" 'PUBLISHED'
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" "$BROWSER" run x publish --body=hello
+t  'T16a `run` with no FIVEDIVE_BROWSER_DRIVER now EXECUTES instead of refusing' 0 "$RC"
+t  'T16a (anchor) the stub really was the playwright that loaded' 'yes' \
+   "$([[ -s "$PWREC" ]] && echo yes || echo no)"
+tc 'T16a ...and the verdict is still the out-of-band re-read' 'verified: publish is live' "$OUT"
+t  'T16a ...the adapter'"'"'s steps reached the page, in order' \
+   'goto fill click' "$(jq -rs '[.[]|select(.call|IN("goto","fill","click"))|.call]|join(" ")' "$PWREC")"
+t  'T16a ...with the caller'"'"'s argument substituted as a VALUE, not a placeholder' \
+   'hello' "$(jq -rs '[.[]|select(.call=="fill")|.val]|first' "$PWREC")"
+
+# --- T16b THE SECURITY CLAIM: over the pipe, never a port ---------------------
+t  'T16b the launch OPENS NO DEBUG PORT for another seat to take the session' '' \
+   "$(jq -rs '[.[]|select(.call=="launch")|.args[]|select(startswith("--remote-debugging"))]|join(" ")' "$PWREC")"
+t  'T16b (control) the launch recorded its argv at all' 'yes' \
+   "$([[ -n "$(jq -rs '[.[]|select(.call=="launch")]|length' "$PWREC")" ]] && echo yes || echo no)"
+t  'T16b ...and it is headless' 'true' \
+   "$(jq -rs '[.[]|select(.call=="launch")|.headless]|first' "$PWREC")"
+# THE MUTANT, driven at the driver directly: a port arriving by config must be a
+# refusal, not a launch. Without this arm "no port in the default args" is all
+# that is graded, and the default args are not where a port would come from.
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"goto","url":"https://x.test/"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true \
+      FIVEDIVE_BROWSER_CHROME_ARGS=--remote-debugging-port=9222 "$DRV" \
+      >"$TMP/t16b.out" 2>"$TMP/t16b.err"; RC=$?
+t  'T16b a debug PORT arriving by config is a REFUSAL' 70 "$RC"
+tc 'T16b ...naming what a port would hand away' 'every seat on' "$(cat "$TMP/t16b.err")"
+t  'T16b ...and NO browser was launched to find out' 'no' \
+   "$([[ -s "$PWREC" ]] && echo yes || echo no)"
+
+# --- T16c the profile driven is the seat's own, not a throwaway ---------------
+: > "$PWREC"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" "$BROWSER" run x publish --body=hello
+t  'T16c the browser is launched AT the seat'"'"'s logged-in profile directory' \
+   "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" \
+   "$(jq -rs '[.[]|select(.call=="launch")|.profile]|first' "$PWREC")"
+t  'T16c ...using the chrome this box resolved, not one the driver picked' 'google-chrome' \
+   "$(jq -rs '[.[]|select(.call=="launch")|.executablePath]|first' "$PWREC")"
+
+# --- T16d the vocabulary is checked BEFORE the browser opens ------------------
+# Half an action is the one outcome with no clean recovery, so a bad plan must
+# not get as far as a launch. bin/browser refuses these at load time; the arm
+# drives the DRIVER, because "validated upstream" is an assumption about a
+# process whose path is an environment variable.
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"goto","url":"https://x.test/"},{"op":"eval","script":"x"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true "$DRV" \
+      >/dev/null 2>"$TMP/t16d.err"; RC=$?
+t  'T16d a step outside the fixed vocabulary is refused by the executor too' 70 "$RC"
+tc 'T16d ...saying why the vocabulary is the point' 'freeform reasoning' "$(cat "$TMP/t16d.err")"
+t  'T16d ...and NOTHING was launched, so no half-action was left behind' 'no' \
+   "$([[ -s "$PWREC" ]] && echo yes || echo no)"
+
+# --- T16e an unsubstituted placeholder is never typed into a real account -----
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"fill","selector":"#e","value":"{body}"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true "$DRV" \
+      >/dev/null 2>"$TMP/t16e.err"; RC=$?
+t  'T16e a {placeholder} with no argument is a refusal' 70 "$RC"
+tc 'T16e ...rather than publishing the literal placeholder' 'publishes literal' "$(cat "$TMP/t16e.err")"
+t  'T16e ...and no fill reached the page' '' \
+   "$(jq -rs '[.[]|select(.call=="fill")|.val]|join(" ")' "$PWREC")"
+# CONTROL: the same step with the argument supplied does fill, so T16e is not
+# "fill never happens".
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"fill","selector":"#e","value":"{body}"}],"args":{"body":"real text"}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true "$DRV" \
+      >/dev/null 2>&1; RC=$?
+t  'T16e (control) the same step with its argument fills' 0 "$RC"
+t  'T16e (control) ...with the value, not the placeholder' 'real text' \
+   "$(jq -rs '[.[]|select(.call=="fill")|.val]|first' "$PWREC")"
+# AND IT MUST BE DECIDED BEFORE THE LAUNCH, not when that step is reached. A
+# placeholder on step TWO discovered mid-action would exit "nothing ran" after
+# step one had run, and bin/browser would then skip the out-of-band re-read on an
+# action that half happened — the one outcome with no clean recovery.
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"goto","url":"https://x.test/"},{"op":"fill","selector":"#e","value":"{body}"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true "$DRV" \
+      >/dev/null 2>&1; RC=$?
+t  'T16e a placeholder on a LATER step refuses too' 70 "$RC"
+t  'T16e ...and NOTHING was launched, so step one did not run either' 'no' \
+   "$([[ -s "$PWREC" ]] && echo yes || echo no)"
+
+# --- T16f a mid-action failure still goes to the out-of-band re-read ----------
+# The dangerous half of the design: "failed" and "published" are not exclusive,
+# and a red driver that suppressed the re-read is what double-posts on a retry.
+# Exit 70 suppresses it; exit 1 must NOT.
+: > "$PWREC"
+mkadapter x "file://$TMP/artifact.html" 'PUBLISHED'
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWFAIL=1 "$BROWSER" run x publish --body=hello
+t  'T16f a step that fails mid-action is still graded by the re-read' 0 "$RC"
+t  'T16f (control) the failing step really did run' 'true' \
+   "$(jq -rs '[.[]|select(.call=="click")]|length>0' "$PWREC")"
+tc 'T16f ...and the artifact is reported live' 'verified: publish is live' "$OUT"
+
+# --- T16i "NOTHING RAN" IS NOT "NEVER LAUNCHED" (quinn's QX, DIVE-4524 it.1) --
+# THE DEFECT THIS ROW EXISTS TO CLOSE, SURVIVING INSIDE THE CLOSE. T16b/d/e all
+# grade refusals raised BEFORE the launch, and iteration 1 guarded exactly those:
+# acquiring the page and arming the timeout sat inside the try whose catch set
+# exit 1 unconditionally. So a browser that OPENS and then cannot hand over a
+# page exited 1 — the "a step failed, re-read the artifact" code — bin/browser
+# re-read a verify URL that already existed, and reported a publish nobody
+# performed. Vacuous green with a receipt, which is the one outcome `run` is for.
+#
+# BOTH CONTROLS ARE THE ARM. Without them a green here is also what a stub that
+# never launched would produce, and the next stub that returns a working page
+# hides the window again.
+: > "$PWREC"
+mkadapter x "file://$TMP/artifact.html" 'PUBLISHED'
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWNOPAGE=1 "$BROWSER" run x publish --body=hello
+t  'T16i (control) the browser really did launch' 'true' \
+   "$(jq -rs '[.[]|select(.call=="launch")]|length>0' "$PWREC")"
+t  'T16i (control) ...and NOT ONE STEP ran' '' \
+   "$(jq -rs '[.[]|select(.call|IN("goto","fill","click","waitForSelector","selectOption","setInputFiles","press"))|.call]|join(" ")' "$PWREC")"
+t  'T16i a launch with no page must NOT be graded by the re-read' 69 "$RC"
+tn 'T16i ...and it does not claim a publish nobody performed' 'verified: publish is live' "$OUT"
+tc 'T16i ...it says nothing ran' 'refused before it ran a single step' "$ERR$OUT"
+# AT THE DRIVER, where the exit code is the contract: 70, not 1.
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"goto","url":"https://x.test/"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWNOPAGE=1 FIVEDIVE_BROWSER_CHROME=/bin/true \
+      "$DRV" >/dev/null 2>"$TMP/t16i.err"; RC=$?
+t  'T16i the driver exits 70, not 1, when the launch succeeded but no step ran' 70 "$RC"
+tc 'T16i ...naming the window it is in' 'not one step ran' "$(cat "$TMP/t16i.err")"
+t  'T16i (control) ...and that launch is on the tape' 'true' \
+   "$(jq -rs '[.[]|select(.call=="launch")]|length>0' "$PWREC")"
+# THE OTHER SIDE OF THE SAME BOUNDARY, and the reason the counter counts a step
+# from when its await is ENTERED and not from when it returns: a goto that throws
+# may already have navigated, a click may already have posted, and calling that
+# "nothing ran" suppresses the re-read on an action that half happened.
+#
+# THE FIXTURE IS ONE STEP, AND THAT IS THE WHOLE ARM. A two-step plan whose
+# SECOND step throws cannot grade this — the first step has completed, so the
+# counter is non-zero wherever in the loop it sits, and a counter moved to the
+# wrong end survives. (Measured here: that shape passed the mutant.) With a
+# single step that throws, "entered" and "returned" give different answers: 1
+# versus 70.
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"click","selector":"#go"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWFAIL=1 FIVEDIVE_BROWSER_CHROME=/bin/true \
+      "$DRV" >/dev/null 2>/dev/null; RC=$?
+t  'T16i the ONLY step entered and threw: exit 1, so the re-read still governs' 1 "$RC"
+t  'T16i (control) ...and that step really did reach the page' 'true' \
+   "$(jq -rs '[.[]|select(.call=="click")]|length>0' "$PWREC")"
+
+# --- T16g the served browser is cycled around the run, and put back ----------
+# A SITE NOTHING ELSE HERE HAS SERVED. `_display_num` is a hash of seat+site, and
+# `_display_free` reads $FIVEDIVE_BROWSER_X11_DIR — which this suite points at a
+# temp dir the REAL Xvfb never writes to. So a second serve of the same site in
+# one run picks the display the first one is still holding, and Xvfb refuses it.
+# Grading the cycle on a fresh site keeps this arm about the cycle.
+: > "$PWREC"
+mkprofile runsrv.test "$LIVE_DOM" >/dev/null
+mkadapter runsrv.test "file://$TMP/artifact.html" 'PUBLISHED'
+RUNSERVE="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/runsrv.test"
+sleep 600 & RUNXPID=$!
+sleep 600 & RUNPID=$!
+( umask 077; printf 'display=471\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+    "$RUNXPID" "$RUNPID" "$(date -u +%s)" > "$RUNSERVE/.5dive-serve" )
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" "$BROWSER" run runsrv.test publish --body=hello
+t  'T16g a served profile is cycled for the run' 0 "$RC"
+t  'T16g ...the old browser was stopped' 'dead' \
+   "$(kill -0 "$RUNPID" 2>/dev/null && echo alive || echo dead)"
+t  'T16g ...and a serve was put back, not left stopped' 'yes' \
+   "$([[ -f "$RUNSERVE/.5dive-serve" ]] && echo yes || echo no)"
+# A PERSON INSIDE THE VIEWER IS NOT EVICTED FOR A MACHINE.
+: > "$PWREC"
+sleep 600 & VXPID=$!
+sleep 600 & VPID=$!
+( umask 077; printf 'display=472\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+    "$VXPID" "$VPID" "$(date -u +%s)" > "$RUNSERVE/.5dive-serve" )
+( umask 077; printf 'vnc_pid=%s\nws_pid=%s\nport=1\nvnc_port=2\n' "$VPID" "$VPID" \
+    > "$RUNSERVE/.5dive-viewer" )
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" "$BROWSER" run runsrv.test publish --body=hello
+t  'T16g a LIVE VIEWER blocks the run instead of taking the human session away' 69 "$RC"
+tc 'T16g ...and says why' 'being viewed by a person' "$ERR"
+t  'T16g ...and the browser was NOT killed' 'alive' \
+   "$(kill -0 "$VPID" 2>/dev/null && echo alive || echo dead)"
+t  'T16g ...and nothing was launched' 'no' "$([[ -s "$PWREC" ]] && echo yes || echo no)"
+kill "$VPID" "$VXPID" "$RUNXPID" 2>/dev/null
+rm -f "$RUNSERVE/.5dive-viewer" "$RUNSERVE/.5dive-serve"
+
+# --- T16h a restore that CANNOT succeed warns; it does not swallow the command -
+# THE MUTANT: `cmd_serve "$s" >/dev/null 2>&1 || printf WARNING`, which is what
+# this was. `cmd_serve` reports failure by calling `die`, and `die` EXITS — so
+# the `||` can never run, the message it would have printed is silenced by the
+# redirect, and a run that fully SUCCEEDED exits 69 with no output at all: no
+# verify line, no reason, nothing. Attaching a catch to a command that exits does
+# not make it catchable. A subshell contains the exit; this arm is the proof.
+: > "$PWREC"
+mkprofile runwarn.test "$LIVE_DOM" >/dev/null
+mkadapter runwarn.test "file://$TMP/artifact.html" 'PUBLISHED'
+WARNSERVE="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/runwarn.test"
+sleep 600 & WXPID=$!
+sleep 600 & WCPID=$!
+( umask 077; printf 'display=473\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+    "$WXPID" "$WCPID" "$(date -u +%s)" > "$WARNSERVE/.5dive-serve" )
+# Make the restart impossible the way bin/browser itself decides: every display
+# in the seat's search range already has a socket, so `cmd_serve` dies with "no
+# free X display". Same formula as _display_num, so the range is the real one.
+X11FULL="$TMP/x11full"; mkdir -p "$X11FULL"
+WBASE=$(( 0x$(printf '%s' "$SEAT/runwarn.test" | sha256sum | cut -c1-4) % 400 + 100 ))
+for i in $(seq 0 60); do : > "$X11FULL/X$(( WBASE + i ))"; done
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_X11_DIR="$X11FULL" \
+    "$BROWSER" run runwarn.test publish --body=hello
+t  'T16h a failed restore does not swallow the run'"'"'s own verdict' 0 "$RC"
+tc 'T16h ...the out-of-band verdict is still reported' 'verified: publish is live' "$OUT"
+tc 'T16h ...and the browser that did not come back is NAMED, not silent' \
+   'could not restart the runwarn.test browser' "$ERR"
+tc 'T16h ...saying the durable half survived' 'profile is intact' "$ERR"
+t  'T16h (control) the run really did execute its steps' 'true' \
+   "$(jq -rs '[.[]|select(.call=="click")]|length>0' "$PWREC")"
+kill "$WXPID" "$WCPID" 2>/dev/null
+rm -f "$WARNSERVE/.5dive-serve"
+
+# === T17 an adapter must survive `plugin upgrade` ============================
+#
+# THE MUTANT, and it is measured rather than imagined (2026-09-14): `5dive plugin
+# upgrade browser@5dive-plugins` replaces the package directory WHOLESALE. A
+# hand-written adapters/reddit.com.json was there before and gone after, and
+# `status reddit.com` went `authenticated` -> `UNKNOWN (no adapter)` with nothing
+# else changed — a live session silently un-classified by an upgrade. So the
+# seat's own adapters live next to its profiles, on a path no package upgrade
+# touches, and the package directory is a read-only fallback.
+ADPOVERRIDE="$FIVEDIVE_BROWSER_ADAPTER_DIR"
+unset FIVEDIVE_BROWSER_ADAPTER_DIR
+PKGADP="$ROOT/plugins/browser/adapters"
+SEATADP="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/.adapters"
+mkdir -p "$SEATADP"
+mkprofile upgr.test "$LIVE_DOM" >/dev/null
+cat > "$SEATADP/upgr.test.json" <<'SADP'
+{ "site": "upgr.test",
+  "probe": { "url": "https://upgr.test/feed", "logged_out_when_dom_matches": "action=\"/login\"" },
+  "actions": {} }
+SADP
+run env PATH="$SHOTPATH" "$BROWSER" status upgr.test
+t  'T17a an adapter written next to the profiles is found' 0 "$RC"
+tc 'T17a ...and classifies the session' 'authenticated' "$OUT"
+t  'T17a ...and it is NOT inside the package directory an upgrade replaces' 'no' \
+   "$([[ -e "$PKGADP/upgr.test.json" ]] && echo yes || echo no)"
+# The dot keeps it out of the glob that enumerates profiles, so the adapter store
+# can never be listed or probed as if it were a site.
+run env PATH="$SHOTPATH" "$BROWSER" ls
+tn 'T17b the adapter store is not enumerated as a profile' '.adapters' "$OUT"
+# The package directory is still a fallback, so what 5dive ships works with no
+# setup at all — and a seat file of the same name WINS, which is what makes a
+# customer's own correction of a shipped adapter stick.
+mkprofile nosuchsite.test "$LIVE_DOM" >/dev/null
+run env PATH="$SHOTPATH" "$BROWSER" status nosuchsite.test
+tc 'T17c a site with no adapter anywhere still says so plainly' 'no adapter' "$OUT$ERR"
+tc 'T17c ...and names the SEAT path to write one at, not the package path' \
+   "$SEATADP/nosuchsite.test.json" "$OUT$ERR"
+
+export FIVEDIVE_BROWSER_ADAPTER_DIR="$ADPOVERRIDE"
+
+# === T18 --out and --dom must not be the same file ===========================
+# The DOM is a second load that runs AFTER the PNG is written and checked, so one
+# path means "rendered ... <file>" is printed over a file holding HTML.
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/t" --out="$SHOTOUT/same.png" --dom="$SHOTOUT/same.png"
+t  'T18a one path for both is a usage refusal' 64 "$RC"
+tc 'T18a ...saying the report would be over a file holding HTML' 'holding HTML' "$ERR"
+t  'T18a ...and nothing was written' 'no' "$([[ -e "$SHOTOUT/same.png" ]] && echo yes || echo no)"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/t" --out="$SHOTOUT/d1.png" --dom="$SHOTOUT/d1.html"
+t  'T18b (control) two paths still render' 0 "$RC"
+
+# === T19 the shipped reddit.com adapter is MEASURED, not guessed =============
+# A logged-out marker that never matches stamps every logged-out page
+# `authenticated` — the mutant T15b exists to catch, manufactured with our own
+# signature on it. So the shipped file is graded against real markup from both
+# sides rather than merely being valid JSON.
+RADP="$PKGADP/reddit.com.json"
+run jq -e . "$RADP"; t 'T19a the shipped reddit adapter is valid JSON' 0 "$RC"
+RMARK="$(jq -r '.probe.logged_out_when_dom_matches' "$RADP")"
+t  'T19b it declares a probe url on the login path' 'https://www.reddit.com/login/' \
+   "$(jq -r '.probe.url' "$RADP")"
+t  'T19c the marker MATCHES reddit'"'"'s logged-out login form' 'match' \
+   "$(grep -qiE "$RMARK" <<<'<form action="/login/"><input name="username" type="text">' && echo match || echo miss)"
+t  'T19c ...and matches the single-quoted attribute spelling too' 'match' \
+   "$(grep -qiE "$RMARK" <<<"<input name='username'>" && echo match || echo miss)"
+t  'T19d it does NOT match a logged-in reddit page' 'miss' \
+   "$(grep -qiE "$RMARK" <<<'<html><body><div id="feed"><shreddit-post>posts</shreddit-post></div></body></html>' && echo match || echo miss)"
+# The trap this file documents: the marker cannot be read off a plain fetch. A
+# fetch of the same URL returns an app shell WITHOUT the username field, so a
+# marker written from one would never match and would stamp every logged-out page
+# authenticated. The file has to say so, because the next person will reach for
+# curl first.
+tc 'T19e the file records that the marker was measured in a browser, not fetched' \
+   'MEASURED, NOT GUESSED' "$(cat "$RADP")"
+# NOTE (DIVE-4524 merge): this section arrived from main as T16 and is renumbered
+# T20 here — DIVE-4524's nine driver arms already occupy T16a..T16i in the section
+# above, and two sections sharing an id makes a red arm unattributable.
+# ========== T20 one authenticated DOM -> a self-verifying read evidence triple
 # This fake serves the profile DOM to the shared login probe and a different,
 # content-rich DOM to the requested article. It also exposes the Chrome version
 # command because page.meta.json must name both sides of the extraction.
@@ -1505,37 +1965,37 @@ READOUT="$TMP/read-evidence"
 rm -f "$READARGV"
 run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
     read shot.example.com "https://shot.example.com/article/1" --out="$READOUT"
-t  'T16a read exits zero for the authenticated page' 0 "$RC"
-t  'T16a ...writes all three evidence files' 'yes' \
+t  'T20a read exits zero for the authenticated page' 0 "$RC"
+t  'T20a ...writes all three evidence files' 'yes' \
    "$([[ -s "$READOUT/page.md" && -s "$READOUT/page.html" && -s "$READOUT/page.meta.json" ]] && echo yes || echo no)"
-t  'T16a ...keeps the exact dump-dom bytes as page.html' 'yes' \
+t  'T20a ...keeps the exact dump-dom bytes as page.html' 'yes' \
    "$(cmp -s "$READHTML" "$READOUT/page.html" && echo yes || echo no)"
-t  'T16a ...makes the output seat-private' '700' "$(stat -c %a "$READOUT")"
-t  'T16a ...and each artifact private' '600 600 600' \
+t  'T20a ...makes the output seat-private' '700' "$(stat -c %a "$READOUT")"
+t  'T20a ...and each artifact private' '600 600 600' \
    "$(stat -c %a "$READOUT/page.html" "$READOUT/page.md" "$READOUT/page.meta.json" | tr '\n' ' ' | sed 's/ $//')"
-tc 'T16a Markdown carries YAML frontmatter' 'canonical_url: "https://shot.example.com/article/1"' "$(cat "$READOUT/page.md")"
-tc 'T16a ...and the extracted article' 'useful authenticated article content' "$(cat "$READOUT/page.md")"
-tn 'T16a ...without restoring navigation Defuddle removed' 'Nav noise' "$(cat "$READOUT/page.md")"
-tn 'T16a ...or footer noise' 'Footer noise' "$(cat "$READOUT/page.md")"
-t  'T16a metadata hashes the exact page.html bytes' \
+tc 'T20a Markdown carries YAML frontmatter' 'canonical_url: "https://shot.example.com/article/1"' "$(cat "$READOUT/page.md")"
+tc 'T20a ...and the extracted article' 'useful authenticated article content' "$(cat "$READOUT/page.md")"
+tn 'T20a ...without restoring navigation Defuddle removed' 'Nav noise' "$(cat "$READOUT/page.md")"
+tn 'T20a ...or footer noise' 'Footer noise' "$(cat "$READOUT/page.md")"
+t  'T20a metadata hashes the exact page.html bytes' \
    "$(sha256sum "$READOUT/page.html" | cut -d' ' -f1)" "$(jq -r .sha256 "$READOUT/page.meta.json")"
-t  'T16a metadata names the exact Defuddle pin' '0.19.3' "$(jq -r .defuddle_version "$READOUT/page.meta.json")"
-t  'T16a metadata names the actual browser build' 'Google Chrome 153.0.8010.36' "$(jq -r .chrome_version "$READOUT/page.meta.json")"
-t  'T16a metadata names the capture honestly' 'dump-dom' "$(jq -r .capture "$READOUT/page.meta.json")"
-t  'T16a article links are absolute and structured' 'https://shot.example.com/next?x=1' \
+t  'T20a metadata names the exact Defuddle pin' '0.19.3' "$(jq -r .defuddle_version "$READOUT/page.meta.json")"
+t  'T20a metadata names the actual browser build' 'Google Chrome 153.0.8010.36' "$(jq -r .chrome_version "$READOUT/page.meta.json")"
+t  'T20a metadata names the capture honestly' 'dump-dom' "$(jq -r .capture "$READOUT/page.meta.json")"
+t  'T20a article links are absolute and structured' 'https://shot.example.com/next?x=1' \
    "$(jq -r '.links[0].href' "$READOUT/page.meta.json")"
-t  'T16a article images are absolute and structured' 'https://shot.example.com/hero.png' \
+t  'T20a article images are absolute and structured' 'https://shot.example.com/hero.png' \
    "$(jq -r '.images[0].src' "$READOUT/page.meta.json")"
-t  'T16a schema.org survives as data' 'Article' "$(jq -r '.schema_org[0]["@type"]' "$READOUT/page.meta.json")"
-tc 'T16a stdout defaults to the Markdown artifact' 'title: "Signal Article"' "$OUT"
-tn 'T16a relative canonical URLs do not leak a Defuddle parse warning' 'Failed to parse URL' "$ERR"
+t  'T20a schema.org survives as data' 'Article' "$(jq -r '.schema_org[0]["@type"]' "$READOUT/page.meta.json")"
+tc 'T20a stdout defaults to the Markdown artifact' 'title: "Signal Article"' "$OUT"
+tn 'T20a relative canonical URLs do not leak a Defuddle parse warning' 'Failed to parse URL' "$ERR"
 
 # `--json` is the programmatic twin: metadata and markdown from the same run.
 READJSON="$TMP/read-json"; rm -f "$READARGV"
 run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
     read shot.example.com "https://shot.example.com/article/1" --out="$READJSON" --json
-t  'T16b --json exits zero' 0 "$RC"
-t  'T16b ...returns metadata and Markdown in one object' 'yes' \
+t  'T20b --json exits zero' 0 "$RC"
+t  'T20b ...returns metadata and Markdown in one object' 'yes' \
    "$(jq -e '.canonical_url == "https://shot.example.com/article/1" and (.markdown | contains("authenticated article content")) and .capture == "dump-dom"' <<<"$OUT" >/dev/null && echo yes || echo no)"
 
 # `links` performs the same capture and leaves the same evidence, but stdout is
@@ -1543,13 +2003,13 @@ t  'T16b ...returns metadata and Markdown in one object' 'yes' \
 READLINKS="$TMP/read-links"; rm -f "$READARGV"
 run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
     links shot.example.com "https://shot.example.com/article/1" --out="$READLINKS"
-t  'T16c links exits zero' 0 "$RC"
-t  'T16c ...prints only the extracted link array' 'yes' \
+t  'T20c links exits zero' 0 "$RC"
+t  'T20c ...prints only the extracted link array' 'yes' \
    "$(jq -e 'type == "array" and length == 1 and .[0].href == "https://shot.example.com/next?x=1"' <<<"$OUT" >/dev/null && echo yes || echo no)"
-t  'T16c ...and keeps the full evidence triple from that run' 'yes' \
+t  'T20c ...and keeps the full evidence triple from that run' 'yes' \
    "$([[ -s "$READLINKS/page.md" && -s "$READLINKS/page.html" && -s "$READLINKS/page.meta.json" ]] && echo yes || echo no)"
-tn 'T16c every read opens NO DEBUG PORT' '--remote-debugging' "$(cat "$READARGV")"
-tc 'T16c ...and captures with dump-dom' '--dump-dom' "$(cat "$READARGV")"
+tn 'T20c every read opens NO DEBUG PORT' '--remote-debugging' "$(cat "$READARGV")"
+tc 'T20c ...and captures with dump-dom' '--dump-dom' "$(cat "$READARGV")"
 
 # The row's dangerous mutant: a sign-in page is valid HTML and Defuddle can
 # produce plausible Markdown from it. Shared preflight must refuse before even
@@ -1558,8 +2018,8 @@ printf '%s' "$DEAD_DOM" > "$SHOTDIR/.fake-dom"
 READDENY="$TMP/read-logged-out"
 run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
     read shot.example.com "https://shot.example.com/article/1" --out="$READDENY"
-t  'T16d logged-out read refuses' 75 "$RC"
-t  'T16d ...and writes nothing, including no empty output directory' 'no' \
+t  'T20d logged-out read refuses' 75 "$RC"
+t  'T20d ...and writes nothing, including no empty output directory' 'no' \
    "$([[ -e "$READDENY" ]] && echo yes || echo no)"
 printf '%s' "$LIVE_DOM" > "$SHOTDIR/.fake-dom"
 
@@ -1568,19 +2028,19 @@ printf '%s' "$LIVE_DOM" > "$SHOTDIR/.fake-dom"
 run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
     read shot.example.com "https://shot.example.com/article/1"
 DEFAULT_READ="$(sed -n 's/^5dive browser: artifacts: //p' <<<"$ERR")"
-t  'T16e default output is a private directory' '700' "$(stat -c %a "$DEFAULT_READ" 2>/dev/null)"
-t  'T16e ...outside the live site profile' 'no' \
+t  'T20e default output is a private directory' '700' "$(stat -c %a "$DEFAULT_READ" 2>/dev/null)"
+t  'T20e ...outside the live site profile' 'no' \
    "$(case "$(realpath -m "$DEFAULT_READ")/" in "$(realpath -m "$SHOTDIR")/"*) echo yes ;; *) echo no ;; esac)"
 run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
     read shot.example.com "https://shot.example.com/article/1" --out="$SHOTDIR/derived"
-t  'T16e an output beneath the browser profile is refused' 77 "$RC"
-t  'T16e ...and no derived directory is left in the profile' 'no' \
+t  'T20e an output beneath the browser profile is refused' 77 "$RC"
+t  'T20e ...and no derived directory is left in the profile' 'no' \
    "$([[ -e "$SHOTDIR/derived" ]] && echo yes || echo no)"
 
 run env PATH="$READPATH" "$BROWSER" --help
-tc 'T16f --help lists read' '5dive browser read' "$OUT"
-tc 'T16f --help lists links' '5dive browser links' "$OUT"
-tc 'T16f README explains dump-dom' 'post-script serialized DOM' "$(cat "$ROOT/plugins/browser/README.md")"
+tc 'T20f --help lists read' '5dive browser read' "$OUT"
+tc 'T20f --help lists links' '5dive browser links' "$OUT"
+tc 'T20f README explains dump-dom' 'post-script serialized DOM' "$(cat "$ROOT/plugins/browser/README.md")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
