@@ -150,7 +150,8 @@ t 'T1f the registry marketplace lists it' 'browser' \
 # plugins any more, and `plugin add` resolves this plugin by CLONING this repo.
 # So the way a file goes missing on a real box is now exactly one thing: it is
 # not COMMITTED here. Grade that, against git, not against a list.
-for f in plugins/browser/.claude-plugin/plugin.json plugins/browser/README.md plugins/browser/bin/browser plugins/browser/adapters/example.json; do
+for f in plugins/browser/.claude-plugin/plugin.json plugins/browser/README.md plugins/browser/bin/browser plugins/browser/adapters/example.json \
+         plugins/browser/lib/extract.bundle.cjs plugins/browser/lib/extract.src.mjs plugins/browser/lib/pins.json; do
   t "T1g $f is committed, so a clone of this repo carries it" "yes" \
     "$(git -C "$ROOT" ls-files --error-unmatch "$f" >/dev/null 2>&1 && echo yes || echo no)"
 done
@@ -1470,6 +1471,116 @@ t 'T15h a traversing profile name is refused' 64 "$RC"
 run env PATH="$SHOTPATH" "$BROWSER" --help
 tc 'T15i --help lists shot' '5dive browser shot' "$OUT"
 tc 'T15i README documents it' 'browser shot' "$(cat "$ROOT/plugins/browser/README.md")"
+
+# ========== T16 one authenticated DOM -> a self-verifying read evidence triple
+# This fake serves the profile DOM to the shared login probe and a different,
+# content-rich DOM to the requested article. It also exposes the Chrome version
+# command because page.meta.json must name both sides of the extraction.
+READBIN="$TMP/readbin"; mkdir -p "$READBIN"
+READARGV="$TMP/read-argv.txt"; READHTML="$TMP/read-page.html"
+cat > "$READHTML" <<'READPAGE'
+<!doctype html><html><head><title>Signal Article</title><link rel="canonical" href="/article/1"><meta name="description" content="A useful description"><meta name="author" content="Ada Example"><meta property="article:published_time" content="2026-09-14T08:00:00Z"><script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"Signal Article"}</script></head><body><nav><a href="/nav">Nav noise</a></nav><article><h1>Signal Article</h1><p>This is useful authenticated article content with enough words to extract cleanly and preserve for the agent reader.</p><p><a href="/next?x=1">Next signal</a><img src="/hero.png" alt="Hero"></p></article><footer>Footer noise</footer></body></html>
+READPAGE
+cat > "$READBIN/google-chrome" <<'RCHROME'
+#!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then printf '%s\n' 'Google Chrome 153.0.8010.36'; exit 0; fi
+printf '%s\n' "$*" >> "$READARGV"
+for a in "$@"; do
+  case "$a" in
+    --user-data-dir=*) d="${a#*=}" ;;
+    --dump-dom) dump=1 ;;
+    -*) ;;
+    *) u="$a" ;;
+  esac
+done
+if [[ -n "${dump:-}" && "${u:-}" == *'/article/1' ]]; then
+  cat "$READ_HTML"
+else
+  cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null
+fi
+RCHROME
+chmod +x "$READBIN/google-chrome"
+READPATH="$READBIN:$PATH"
+READOUT="$TMP/read-evidence"
+rm -f "$READARGV"
+run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
+    read shot.example.com "https://shot.example.com/article/1" --out="$READOUT"
+t  'T16a read exits zero for the authenticated page' 0 "$RC"
+t  'T16a ...writes all three evidence files' 'yes' \
+   "$([[ -s "$READOUT/page.md" && -s "$READOUT/page.html" && -s "$READOUT/page.meta.json" ]] && echo yes || echo no)"
+t  'T16a ...keeps the exact dump-dom bytes as page.html' 'yes' \
+   "$(cmp -s "$READHTML" "$READOUT/page.html" && echo yes || echo no)"
+t  'T16a ...makes the output seat-private' '700' "$(stat -c %a "$READOUT")"
+t  'T16a ...and each artifact private' '600 600 600' \
+   "$(stat -c %a "$READOUT/page.html" "$READOUT/page.md" "$READOUT/page.meta.json" | tr '\n' ' ' | sed 's/ $//')"
+tc 'T16a Markdown carries YAML frontmatter' 'canonical_url: "https://shot.example.com/article/1"' "$(cat "$READOUT/page.md")"
+tc 'T16a ...and the extracted article' 'useful authenticated article content' "$(cat "$READOUT/page.md")"
+tn 'T16a ...without restoring navigation Defuddle removed' 'Nav noise' "$(cat "$READOUT/page.md")"
+tn 'T16a ...or footer noise' 'Footer noise' "$(cat "$READOUT/page.md")"
+t  'T16a metadata hashes the exact page.html bytes' \
+   "$(sha256sum "$READOUT/page.html" | cut -d' ' -f1)" "$(jq -r .sha256 "$READOUT/page.meta.json")"
+t  'T16a metadata names the exact Defuddle pin' '0.19.3' "$(jq -r .defuddle_version "$READOUT/page.meta.json")"
+t  'T16a metadata names the actual browser build' 'Google Chrome 153.0.8010.36' "$(jq -r .chrome_version "$READOUT/page.meta.json")"
+t  'T16a metadata names the capture honestly' 'dump-dom' "$(jq -r .capture "$READOUT/page.meta.json")"
+t  'T16a article links are absolute and structured' 'https://shot.example.com/next?x=1' \
+   "$(jq -r '.links[0].href' "$READOUT/page.meta.json")"
+t  'T16a article images are absolute and structured' 'https://shot.example.com/hero.png' \
+   "$(jq -r '.images[0].src' "$READOUT/page.meta.json")"
+t  'T16a schema.org survives as data' 'Article' "$(jq -r '.schema_org[0]["@type"]' "$READOUT/page.meta.json")"
+tc 'T16a stdout defaults to the Markdown artifact' 'title: "Signal Article"' "$OUT"
+tn 'T16a relative canonical URLs do not leak a Defuddle parse warning' 'Failed to parse URL' "$ERR"
+
+# `--json` is the programmatic twin: metadata and markdown from the same run.
+READJSON="$TMP/read-json"; rm -f "$READARGV"
+run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
+    read shot.example.com "https://shot.example.com/article/1" --out="$READJSON" --json
+t  'T16b --json exits zero' 0 "$RC"
+t  'T16b ...returns metadata and Markdown in one object' 'yes' \
+   "$(jq -e '.canonical_url == "https://shot.example.com/article/1" and (.markdown | contains("authenticated article content")) and .capture == "dump-dom"' <<<"$OUT" >/dev/null && echo yes || echo no)"
+
+# `links` performs the same capture and leaves the same evidence, but stdout is
+# links only — no second fetch and no link scrape from nav/footer noise.
+READLINKS="$TMP/read-links"; rm -f "$READARGV"
+run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
+    links shot.example.com "https://shot.example.com/article/1" --out="$READLINKS"
+t  'T16c links exits zero' 0 "$RC"
+t  'T16c ...prints only the extracted link array' 'yes' \
+   "$(jq -e 'type == "array" and length == 1 and .[0].href == "https://shot.example.com/next?x=1"' <<<"$OUT" >/dev/null && echo yes || echo no)"
+t  'T16c ...and keeps the full evidence triple from that run' 'yes' \
+   "$([[ -s "$READLINKS/page.md" && -s "$READLINKS/page.html" && -s "$READLINKS/page.meta.json" ]] && echo yes || echo no)"
+tn 'T16c every read opens NO DEBUG PORT' '--remote-debugging' "$(cat "$READARGV")"
+tc 'T16c ...and captures with dump-dom' '--dump-dom' "$(cat "$READARGV")"
+
+# The row's dangerous mutant: a sign-in page is valid HTML and Defuddle can
+# produce plausible Markdown from it. Shared preflight must refuse before even
+# creating the destination.
+printf '%s' "$DEAD_DOM" > "$SHOTDIR/.fake-dom"
+READDENY="$TMP/read-logged-out"
+run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
+    read shot.example.com "https://shot.example.com/article/1" --out="$READDENY"
+t  'T16d logged-out read refuses' 75 "$RC"
+t  'T16d ...and writes nothing, including no empty output directory' 'no' \
+   "$([[ -e "$READDENY" ]] && echo yes || echo no)"
+printf '%s' "$LIVE_DOM" > "$SHOTDIR/.fake-dom"
+
+# Default output is discoverable in stderr and private under the seat store,
+# but never inside the Chrome profile itself.
+run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
+    read shot.example.com "https://shot.example.com/article/1"
+DEFAULT_READ="$(sed -n 's/^5dive browser: artifacts: //p' <<<"$ERR")"
+t  'T16e default output is a private directory' '700' "$(stat -c %a "$DEFAULT_READ" 2>/dev/null)"
+t  'T16e ...outside the live site profile' 'no' \
+   "$(case "$(realpath -m "$DEFAULT_READ")/" in "$(realpath -m "$SHOTDIR")/"*) echo yes ;; *) echo no ;; esac)"
+run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" "$BROWSER" \
+    read shot.example.com "https://shot.example.com/article/1" --out="$SHOTDIR/derived"
+t  'T16e an output beneath the browser profile is refused' 77 "$RC"
+t  'T16e ...and no derived directory is left in the profile' 'no' \
+   "$([[ -e "$SHOTDIR/derived" ]] && echo yes || echo no)"
+
+run env PATH="$READPATH" "$BROWSER" --help
+tc 'T16f --help lists read' '5dive browser read' "$OUT"
+tc 'T16f --help lists links' '5dive browser links' "$OUT"
+tc 'T16f README explains dump-dom' 'post-script serialized DOM' "$(cat "$ROOT/plugins/browser/README.md")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

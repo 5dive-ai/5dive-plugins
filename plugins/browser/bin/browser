@@ -26,6 +26,7 @@ STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
 PROFILE_ROOT="${FIVEDIVE_BROWSER_PROFILE_ROOT:-$STATE_DIR/browser-profiles}"
 SETUP_CMD="sudo 5dive browser setup"
 ADAPTER_DIR="${FIVEDIVE_BROWSER_ADAPTER_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/adapters}"
+READ_EXTRACTOR="${FIVEDIVE_BROWSER_EXTRACTOR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/extract.bundle.cjs}"
 
 E_USAGE=64; E_UNAVAILABLE=69; E_PERM=77; E_COLD=75
 
@@ -68,6 +69,11 @@ usage() {
                                       # Refuses unless the session probes authenticated —
                                       # a screenshot of a sign-in page is a lie that
                                       # looks exactly like evidence.
+  5dive browser read <site> <url> [--out=<dir>] [--json]
+                                      # one authenticated render -> page.md,
+                                      # page.html and page.meta.json
+  5dive browser links <site> <url> [--out=<dir>]
+                                      # same evidence triple; print article links only
 
   A profile is a credential. Anything that can READ the directory can replay the
   session, whatever permission model sits above it — so each profile is owned by
@@ -970,29 +976,27 @@ _shot_host_ok() {  # _shot_host_ok <site> <host>
   [[ "$host" == "$base" || "$host" == *".$base" ]]
 }
 
-cmd_shot() {
-  local site="" url="" out="" domout="" size="$SHOT_SIZE_DEFAULT" wait="$SHOT_WAIT_DEFAULT"
-  while (($#)); do
-    case "$1" in
-      --out=*)  out="${1#*=}" ;;
-      --dom=*)  domout="${1#*=}" ;;
-      --size=*) size="${1#*=}" ;;
-      --full)   size="$SHOT_SIZE_FULL" ;;
-      --wait=*) wait="${1#*=}" ;;
-      -h|--help) usage; return 0 ;;
-      -*) die "$E_USAGE" "unknown flag: $1" ;;
-      *) if [[ -z "$site" ]]; then site="$1"; else url="$1"; fi ;;
-    esac; shift
-  done
-  [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser shot <site> <url> [--out=<png>] [--dom=<file>] [--size=WxH|--full] [--wait=<ms>]"
-  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
-  [[ "$size" =~ ^[0-9]{2,5}x[0-9]{2,5}$ ]] || die "$E_USAGE" "--size takes WxH in pixels, e.g. --size=1280x800; got: $size"
-  [[ "$wait" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--wait takes milliseconds; got: $wait"
-
+# ---------------------------------------------------------------------------
+# THE PROLOGUE EVERY RENDER SHARES — DIVE-4515 lifted it out of cmd_shot rather
+# than writing a second copy for `read`. Everything a verb must be sure of
+# BEFORE it points chrome at a page: the url is an http(s) page OF THIS SITE,
+# the profile store is this seat's and 0700, a chrome exists, any served browser
+# has been cycled out of the way (with nobody inside it), and the session probes
+# AUTHENTICATED. That last one is the whole reason this is shared code and not a
+# second copy: `read` has exactly the failure `shot` has — a sign-in page is a
+# perfectly well-formed article, and Defuddle will hand back clean Markdown of
+# it, with a title and a word count, looking like the page that was asked for.
+# A forked copy is a copy that loses the gate on somebody's next edit.
+#
+# Publishes _PG_DIR (the profile dir) and _PG_CHROME (the binary), and may arm
+# the EXIT trap that puts back a serve it stopped.
+_PG_DIR=""; _PG_CHROME=""
+_page_open() {  # _page_open <site> <url>
+  local site="$1" url="$2"
   # SCHEME AND HOST, before the store is even opened. file:// and chrome:// are
   # not pages of a site and have no business being rendered by a verb whose whole
   # contract is "a page of the site you logged into".
-  [[ "$url" =~ ^https?://[^/]+ ]] || die "$E_USAGE" "shot renders http(s) pages; got: $url"
+  [[ "$url" =~ ^https?://[^/]+ ]] || die "$E_USAGE" "browser renders only http(s) pages; got: $url"
   local host="${url#*://}"; host="${host%%/*}"; host="${host%%\?*}"
   host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
   _shot_host_ok "$site" "$host" || die "$E_USAGE" "$url is not a page of '$site' (its host is $host). A profile is a credential scoped to the site it is named for: rendering another site's page inside it produces a LOGGED-OUT screenshot that looks like a bug in this command. Use the profile for that site — or 5dive browser auth $host."
@@ -1025,6 +1029,32 @@ cmd_shot() {
     *)
       die "$E_COLD" "cannot confirm the $site session is live ($state), so a render now could be the sign-in page with no way for the reader to tell. Refusing." ;;
   esac
+
+  _PG_DIR="$dir"; _PG_CHROME="$chrome"
+  return 0
+}
+
+cmd_shot() {
+  local site="" url="" out="" domout="" size="$SHOT_SIZE_DEFAULT" wait="$SHOT_WAIT_DEFAULT"
+  while (($#)); do
+    case "$1" in
+      --out=*)  out="${1#*=}" ;;
+      --dom=*)  domout="${1#*=}" ;;
+      --size=*) size="${1#*=}" ;;
+      --full)   size="$SHOT_SIZE_FULL" ;;
+      --wait=*) wait="${1#*=}" ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; else url="$1"; fi ;;
+    esac; shift
+  done
+  [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser shot <site> <url> [--out=<png>] [--dom=<file>] [--size=WxH|--full] [--wait=<ms>]"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  [[ "$size" =~ ^[0-9]{2,5}x[0-9]{2,5}$ ]] || die "$E_USAGE" "--size takes WxH in pixels, e.g. --size=1280x800; got: $size"
+  [[ "$wait" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--wait takes milliseconds; got: $wait"
+
+  _page_open "$site" "$url"
+  local dir="$_PG_DIR" chrome="$_PG_CHROME"
 
   local stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
   [[ -n "$out" ]] || out="$PWD/${site}-${stamp}.png"
@@ -1081,6 +1111,143 @@ cmd_shot() {
   [[ -n "$domout" && -s "$domout" ]] && printf '  %s  (DOM)\n' "$domout"
   return 0
 }
+
+# ------------------------------------------------------------- read / links
+# `read` deliberately uses Chrome's --dump-dom rather than CDP. It gets the
+# post-script DOM from the same authenticated profile and opens no debugger
+# socket. The raw dump, the derived Markdown and the metadata travel together:
+# callers can verify the hash and re-extract without revisiting the live page.
+READ_WAIT_DEFAULT=8000
+_READ_STAGE=""
+
+_read_cleanup() {
+  local d="$_READ_STAGE"; _READ_STAGE=""
+  case "$d" in /tmp/5dive-browser-read.*) rm -rf -- "$d" ;; esac
+  _shot_restore
+}
+
+_read_output_dir() { # _read_output_dir <site> <explicit-or-empty> <profile-dir>
+  local site="$1" out="$2" profile="$3" base made=0 resolved profile_resolved
+  if [[ -n "$out" ]]; then
+    [[ ! -e "$out" || -d "$out" ]] || die "$E_USAGE" "$out exists and is not a directory"
+    if [[ ! -d "$out" ]]; then
+      (umask 077; mkdir -p -- "$out") || die "$E_UNAVAILABLE" "cannot create artifact directory $out"
+      made=1
+    fi
+  else
+    base="$(_seat_dir)/.read-artifacts"
+    if [[ ! -d "$base" ]]; then
+      (umask 077; mkdir -- "$base") || die "$E_UNAVAILABLE" "cannot create private artifact root $base"
+      chmod 00700 "$base"
+    fi
+    _audit "$base" 700
+    out="$(mktemp -d "$base/${site}.XXXXXXXX")" || die "$E_UNAVAILABLE" "cannot create a private artifact directory under $base"
+    made=1
+  fi
+
+  # `--out` is evidence, never browser state. Resolve symlinks before comparing:
+  # writing even one derived file into the profile makes it credential-adjacent
+  # and makes later cleanup capable of deleting browser-owned data.
+  resolved="$(realpath -m -- "$out")" || die "$E_USAGE" "cannot resolve artifact directory $out"
+  profile_resolved="$(realpath -m -- "$profile")" || die "$E_USAGE" "cannot resolve browser profile $profile"
+  case "$resolved/" in
+    "$profile_resolved/"*)
+      if (( made )); then rmdir -- "$out" 2>/dev/null || true; fi
+      die "$E_PERM" "--out must not be the browser profile or live beneath it; choose an evidence directory outside $profile_resolved" ;;
+  esac
+  _audit "$out" 700 || die "$E_PERM" "$out must be owned by this seat and mode 0700"
+  printf '%s\n' "$resolved"
+}
+
+_cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
+  local kind="$1"; shift
+  local site="" url="" out="" json=0 wait="$READ_WAIT_DEFAULT"
+  while (($#)); do
+    case "$1" in
+      --out=*) out="${1#*=}" ;;
+      --json) [[ "$kind" == read ]] || die "$E_USAGE" "--json belongs to browser read; browser links already prints JSON"; json=1 ;;
+      --wait=*) wait="${1#*=}" ;;
+      -h|--help)
+        printf '%s %s <site> <url> [--out=<dir>]%s [--wait=<ms>]\n' "$PROG" "$kind" "$([[ "$kind" == read ]] && printf ' [--json]')"
+        return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser $kind <site> <url> [--out=<dir>]"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  [[ "$wait" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--wait takes milliseconds; got: $wait"
+  [[ -r "$READ_EXTRACTOR" ]] || die "$E_UNAVAILABLE" "the pinned page extractor is missing from this install ($READ_EXTRACTOR)"
+  command -v node >/dev/null 2>&1 || die "$E_UNAVAILABLE" "node is required to run the pinned page extractor"
+  command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to assemble the evidence metadata"
+
+  # Authenticate BEFORE making the destination. A logged-out call writes
+  # nothing — not even an empty output directory that looks like a failed read.
+  _page_open "$site" "$url"
+  local dir="$_PG_DIR" chrome="$_PG_CHROME"
+  out="$(_read_output_dir "$site" "$out" "$dir")" || exit $?
+
+  _READ_STAGE="$(mktemp -d /tmp/5dive-browser-read.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the page evidence"
+  trap '_read_cleanup' EXIT
+  local stage="$_READ_STAGE"
+
+  # One render, one source of truth. page.html is byte-for-byte stdout from this
+  # invocation and every derived field below comes from that exact file.
+  "$chrome" --headless --no-sandbox --disable-gpu \
+      --user-data-dir="$dir" --virtual-time-budget="$wait" \
+      --dump-dom "$url" >"$stage/page.html" 2>"$stage/chrome.err"
+  local crc=$?
+  if (( crc != 0 )) || [[ ! -s "$stage/page.html" ]]; then
+    die "$E_UNAVAILABLE" "the authenticated DOM capture produced no page (chrome exited $crc); no evidence files were written"
+  fi
+
+  if ! node "$READ_EXTRACTOR" --url="$url" <"$stage/page.html" >"$stage/extracted.json"; then
+    die "$E_UNAVAILABLE" "the pinned Defuddle extractor rejected the captured DOM; no evidence files were written"
+  fi
+  jq -e '.markdown | type == "string"' "$stage/extracted.json" >/dev/null || \
+    die "$E_UNAVAILABLE" "the extractor returned no Markdown; no evidence files were written"
+
+  local retrieved sha chrome_version
+  retrieved="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  sha="$(sha256sum "$stage/page.html" | cut -d' ' -f1)"
+  chrome_version="$($chrome --version 2>/dev/null | head -1)"
+  [[ -n "$chrome_version" ]] || chrome_version="unknown"
+  jq --arg retrieved_at "$retrieved" --arg sha256 "$sha" \
+     --arg chrome_version "$chrome_version" \
+     '. + {retrieved_at:$retrieved_at, sha256:$sha256, chrome_version:$chrome_version, capture:"dump-dom"}' \
+     "$stage/extracted.json" >"$stage/full.json" || die "$E_UNAVAILABLE" "could not assemble page metadata"
+  jq 'del(.markdown, .site)' "$stage/full.json" >"$stage/page.meta.json"
+
+  {
+    printf '%s\n' '---'
+    jq -r '"url: " + (.url | @json), "canonical_url: " + (.canonical_url | @json), "title: " + (.title | @json), "description: " + (.description | @json), "author: " + (.author | @json), "published: " + (.published | @json), "retrieved_at: " + (.retrieved_at | @json), "word_count: " + (.word_count | tostring)' "$stage/full.json"
+    printf '%s\n\n' '---'
+    jq -r '.markdown' "$stage/full.json"
+  } >"$stage/page.md"
+
+  install -m 00600 "$stage/page.html" "$out/page.html" || die "$E_UNAVAILABLE" "cannot install page.html in $out"
+  install -m 00600 "$stage/page.meta.json" "$out/page.meta.json" || die "$E_UNAVAILABLE" "cannot install page.meta.json in $out"
+  install -m 00600 "$stage/page.md" "$out/page.md" || die "$E_UNAVAILABLE" "cannot install page.md in $out"
+
+  if [[ "$kind" == links ]]; then
+    jq '.links' "$stage/full.json"
+  elif (( json )); then
+    cat "$stage/full.json"
+  else
+    cat "$stage/page.md"
+  fi
+  printf '%s: artifacts: %s\n' "$PROG" "$out" >&2
+
+  _READ_STAGE=""
+  rm -rf -- "$stage"
+  _shot_restore
+  trap - EXIT
+  return 0
+}
+
+cmd_read()  { _cmd_read_like read "$@"; }
+cmd_links() { _cmd_read_like links "$@"; }
 
 # ---------------------------------------------------------------------------
 # DIVE-4446: the workflow is the product, and a Claude skill only teaches half
@@ -1197,6 +1364,8 @@ case "${1:-}" in
   doc)   shift; cmd_doc  "$@" ;;
   run)   shift; cmd_run   "$@" ;;
   shot)  shift; cmd_shot  "$@" ;;
+  read)  shift; cmd_read  "$@" ;;
+  links) shift; cmd_links "$@" ;;
   serve) shift; cmd_serve "$@" ;;
   viewer) shift; cmd_viewer "$@" ;;
   viewer-redeem) shift; cmd_viewer_redeem "$@" ;;
