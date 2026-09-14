@@ -1221,6 +1221,10 @@ t  'T14k ...and there is still exactly one fence' 1 \
 #   T15f    one profile's name vouching for another site's page (a logged-out
 #           render that reads as a bug in the feature).
 #   T15g    an empty/absent PNG reported as a screenshot.
+#   T15j    (iteration 2) a STALE PNG from an earlier render reported as this
+#           one. T15g only grades the half where --out starts empty; `-s` is
+#           true for the old file, so a chrome that writes nothing passes the
+#           guard and the caller is handed yesterday's page under today's URL.
 #
 # The fake chrome here records FULL argv and, unlike the probe fakes, honours
 # --screenshot by writing a file — otherwise every arm would red on T15g's check
@@ -1389,6 +1393,70 @@ run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
 t  'T15g a zero-byte render is a failure, not a screenshot' 69 "$RC"
 t  'T15g ...and the empty file is removed, never handed over' 'no' \
    "$([[ -e "$SHOTOUT/j.png" ]] && echo yes || echo no)"
+
+# --- T15j a STALE PNG is never reported as this render ------------------------
+# The other half of T15g's shape, and the one the first guard missed: chrome
+# exits 0 and writes nothing while a file from an EARLIER render is already at
+# --out. `-s "$out"` is true for that file, so the render guard passed and
+# `shot` printed success over an image of a different page — the same lie as the
+# sign-in PNG, and reached by the ordinary use: a grader re-rendering to the
+# same path after a change.
+#
+# This stub accepts --screenshot and leaves it strictly alone.
+cat > "$SHOTBIN/google-chrome" <<'SNOWRITE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SHOTARGV"
+for a in "$@"; do case "$a" in --user-data-dir=*) d="${a#*=}" ;; --screenshot=*) shot="${a#*=}" ;; esac; done
+[[ -z "${shot:-}" ]] && cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null
+exit 0
+SNOWRITE
+chmod +x "$SHOTBIN/google-chrome"
+
+# ANCHOR, and without it this arm grades nothing: prove the stub really is a
+# non-writer by driving it DIRECTLY at a file with known bytes. If the stub
+# wrote (or the fixture were empty), the arms below would pass for the wrong
+# reason — the refusal would be T15g's zero-byte case wearing a new label.
+STALEBYTES='PNG https://shot.example.com/YESTERDAY'
+printf '%s\n' "$STALEBYTES" > "$TMP/stale-anchor.png"
+env SHOTARGV="$TMP/stale-anchor-argv.txt" "$SHOTBIN/google-chrome" \
+    --headless --screenshot="$TMP/stale-anchor.png" "https://shot.example.com/t" >/dev/null 2>&1
+t  'T15j (anchor) the stub does not write --screenshot' "$STALEBYTES" \
+   "$(cat "$TMP/stale-anchor.png")"
+
+printf '%s\n' "$STALEBYTES" > "$SHOTOUT/stale.png"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/today" --out="$SHOTOUT/stale.png"
+t  'T15j a render that wrote nothing over a stale file is a failure' 69 "$RC"
+tn 'T15j ...and success is NOT reported over the old image' 'rendered' "$OUT"
+t  'T15j ...and yesterday'"'"'s image is not left at --out to be picked up' 'no' \
+   "$([[ -e "$SHOTOUT/stale.png" ]] && echo yes || echo no)"
+
+# CONTROL — the fixture is non-degenerate: with a chrome that DOES write, the
+# very same pre-existing file is replaced and the render succeeds. Without this,
+# "refuse whenever --out exists" would pass every arm above.
+cat > "$SHOTBIN/google-chrome" <<'SCHROME2'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SHOTARGV"
+for a in "$@"; do
+  case "$a" in
+    --user-data-dir=*) d="${a#*=}" ;;
+    --screenshot=*) shot="${a#*=}" ;;
+    --dump-dom) dump=1 ;;
+    -*) ;;
+    *) u="$a" ;;
+  esac
+done
+[[ -n "${shot:-}" ]] && printf 'PNG %s\n' "${u:-}" > "$shot"
+[[ -n "${dump:-}" || -z "${shot:-}" ]] && cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null
+exit 0
+SCHROME2
+chmod +x "$SHOTBIN/google-chrome"
+printf '%s\n' "$STALEBYTES" > "$SHOTOUT/stale2.png"
+run env PATH="$SHOTPATH" SHOTARGV="$SHOTARGV" "$BROWSER" shot shot.example.com \
+    "https://shot.example.com/today" --out="$SHOTOUT/stale2.png"
+t  'T15j (control) a real render over a stale file still succeeds' 0 "$RC"
+t  'T15j (control) ...and the bytes at --out are THIS render, not the old one' \
+   'PNG https://shot.example.com/today' "$(cat "$SHOTOUT/stale2.png")"
 
 # --- T15h flags are validated before anything is launched ---------------------
 run env PATH="$SHOTPATH" "$BROWSER" shot shot.example.com

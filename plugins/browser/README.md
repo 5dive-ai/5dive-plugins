@@ -230,6 +230,14 @@ the profile directory, not in the process, so it survives. The one case it will 
 **live viewer** — that is a person at a keyboard, probably part-way through the login the viewer
 exists for, and a screenshot does not get to take that away.
 
+**The `--out` path is cleared before the render, and an empty result is a refusal.** A PNG that is
+not of the page you asked for is the same lie as the sign-in page — a grader cannot tell yesterday's
+dashboard from today's — and the ordinary way to produce one is to re-render to a path that already
+holds an earlier image: if chrome then writes nothing, a check for "is there a file" says yes. So
+the destination is emptied first, and a render that leaves it empty writes nothing and exits
+non-zero. If the old file cannot be removed, `shot` refuses rather than render into it. (`--dom=`
+needs no equivalent — the redirect truncates before chrome starts.)
+
 **The URL must be a page of that site** (the profile's host, or a subdomain of it — `app.<product>`
 behind the login is the point). A profile is a credential scoped by its own name; pointed at an
 unrelated host it renders a logged-out page that reads as a bug in this command.

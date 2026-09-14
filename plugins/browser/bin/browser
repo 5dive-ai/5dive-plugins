@@ -906,9 +906,9 @@ cmd_viewer_revoke() {
 # (a) opens NO listening socket, so the attack surface stays exactly what it
 # already was: the profile directory, already audited on both the seat dir and
 # the site dir before anything is launched. That is the proof the other seat
-# cannot reach the render — there is nothing to reach. `_shot_chrome_argv`
-# records the flags used, and the harness asserts no --remote-debugging-* among
-# them, so (b) cannot be reintroduced without reddening an arm.
+# cannot reach the render — there is nothing to reach. The harness's chrome stub
+# records the argv it was called with and T15c asserts no --remote-debugging-*
+# among it, so (b) cannot be reintroduced without reddening an arm.
 #
 # The one case (a) must NOT take: a LIVE VIEWER. That is a person at a keyboard
 # looking at this browser right now, most likely part-way through the login the
@@ -1032,6 +1032,23 @@ cmd_shot() {
   [[ -d "$odir" ]] || die "$E_USAGE" "no directory $odir to write the PNG into"
 
   local w="${size%x*}" h="${size#*x}"
+
+  # CLEAR THE DESTINATION BEFORE THE LAUNCH, not after the failure. The check
+  # below asks "did THIS render write an image", and it answers with `-s "$out"`
+  # — which a file left there by an EARLIER render satisfies for a chrome that
+  # wrote nothing at all. That is the same lie this verb exists to refuse: a PNG
+  # of yesterday's dashboard is exactly as evidence-shaped as a PNG of the
+  # sign-in page, and the reader cannot tell either one from the real thing. The
+  # reach is this command's own first consumer — a grader re-renders to the same
+  # --out after a change and attaches the old image to the PR the merge rides on.
+  # If the stale file cannot be removed, REFUSE: a destination we cannot clear
+  # leaves chrome's exit status as the only evidence, and trusting that is the
+  # thing the check exists not to do. (--dom= needs no equivalent: `>"$domout"`
+  # truncates before chrome runs.)
+  if ! rm -f "$out" 2>/dev/null || [[ -e "$out" ]]; then
+    die "$E_UNAVAILABLE" "cannot clear $out before the render, so a file already there would be reported as this render's image. Remove it or choose another --out."
+  fi
+
   # The flags are the security claim: --headless with NO --remote-debugging-*, so
   # this render opens no socket any other seat could reach. See the header.
   "$chrome" --headless --no-sandbox --disable-gpu --hide-scrollbars \
@@ -1040,7 +1057,7 @@ cmd_shot() {
   local rc=$?
   if (( rc != 0 )) || [[ ! -s "$out" ]]; then
     rm -f "$out"
-    die "$E_UNAVAILABLE" "the render produced no image (chrome exited $rc). Nothing was written — an empty or missing PNG must not be reported as a screenshot."
+    die "$E_UNAVAILABLE" "the render produced no image (chrome exited $rc). Nothing was written — an empty, missing or stale PNG must not be reported as a screenshot."
   fi
 
   # The DOM is a SECOND load on purpose: --screenshot writes a file and
