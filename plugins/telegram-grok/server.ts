@@ -38,6 +38,7 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
+import { protectTelegramViewerLinks } from './viewer-link.ts'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -591,6 +592,7 @@ bot.api.config.use((prev, method, payload, signal) => {
       p.text = p.text.slice(0, TG_HARD_MESSAGE_LIMIT - 32) + '\n…(message truncated)'
       delete p.parse_mode
     }
+    protectTelegramViewerLinks(payload)
   }
   return prev(method, payload, signal)
 })

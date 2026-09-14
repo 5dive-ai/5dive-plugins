@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — Telegram previewers spent one-time browser viewer links before the human could use them (DIVE-4493), browser 1.3.1 · telegram 0.5.53 · grok/agy 0.5.21 · codex 0.5.14 · opencode 0.5.12 · pi 0.1.12
+
+All six Telegram adapters now recognize the exact browser-viewer route at their Bot API
+`sendMessage`/`editMessageText` boundary. Plain text is sent with a `code` entity, markup output gets
+a code span, overlapping URL entities are removed, and previews are disabled. The transport also
+adds copy-paste/do-not-return guidance; ordinary URLs and nonce lookalikes are unchanged. The shared
+browser workflow carries the same rule for future chat adapters and records that a dashboard may
+offer copy-only UI but must never prefetch the credential.
+
 ### Fixed — a failed gate tap said "exited 126 without reporting a reason" while the reason was in hand (DIVE-4445)
 
 When the 5dive CLI dies without reaching an error path, its own backstop

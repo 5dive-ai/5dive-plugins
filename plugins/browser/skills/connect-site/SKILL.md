@@ -54,10 +54,15 @@ spends nothing. A good nonce is the customer's only redemption.
    escape for a hand-run on the box. Default TTL is short on purpose — mint it *when the
    human is actually there*, not an hour ahead.
 3. **Hand it over on the channel you are already on**, with the two facts that change their
-   behaviour: it is **one-time** and it **expires**. On Telegram that is one short message —
-   the link, "log in here, one-time link, expires in ~10 min", nothing else. Do not put the
-   link in a task body, a PR, a commit, a log line or a wiki page: it is a live credential
-   for as long as it is unspent.
+   behaviour: it is **one-time** and it **expires**. A chat previewer spends the link before
+   the human sees it, so it must never be emitted as a detected bare URL. On Telegram, call
+   `reply` with `format: 'markdownv2'`, put the link inside a MarkdownV2 code span, and say:
+   "Copy-paste this one-time link into your browser. Do not paste it back into chat." The
+   Telegram plugins also enforce that rule at their Bot API boundary. On any other chat
+   surface, use its non-unfurling code formatting and the same copy-paste warning. A browser
+   dashboard may expose copy-only text or a copy button; it must not fetch the URL itself.
+   Do not put the link in a task body, a PR, a commit, a log line or a wiki page: it is a live
+   credential for as long as it is unspent.
 4. **`status <site>`** is the only honest confirmation. Poll it every ~15–30s while they are
    logging in (not tighter — each probe is a real page load). Terminal states:
    - `authenticated` — done. The profile is now reusable by `5dive browser run`.

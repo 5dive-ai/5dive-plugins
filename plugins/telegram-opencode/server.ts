@@ -38,6 +38,7 @@ import { randomBytes } from 'crypto'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import { installLifecycle } from './lifecycle.ts'
+import { protectTelegramViewerLinks } from './viewer-link.ts'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -435,6 +436,7 @@ bot.api.config.use((prev, method, payload, signal) => {
     if (p.text == null || p.text.trim() === '' || p.text.trim() === 'undefined') {
       throw new Error(`telegram ${method}: refusing to send empty/undefined text`)
     }
+    protectTelegramViewerLinks(payload)
   }
   return prev(method, payload, signal)
 })
