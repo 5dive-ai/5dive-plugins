@@ -43,6 +43,7 @@
 // selectOption take strings), never spliced into a command line or a selector.
 
 const fs = require('fs');
+const path = require('path');
 
 const PROG = '5dive browser run';
 // THE EXIT CODE IS A CONTRACT, and 70 is the load-bearing one.
@@ -59,6 +60,28 @@ const PROG = '5dive browser run';
 // treats as "nothing ran, there is nothing to verify". After the first step, a
 // failure is 1 and the re-read governs — that half is the whole design.
 const E_NOTHING_RAN = 70, E_FAILED = 1;
+
+// "BEFORE THE FIRST STEP" IS NOT "BEFORE THE LAUNCH", and reading it as the
+// launch is how this contract was one call short (DIVE-4524 iteration 1).
+// Guarding the launch alone leaves a window — acquiring the page, arming the
+// timeout, anything ever hoisted above the loop — in which the browser is OPEN
+// and NOT ONE STEP has run. A throw in that window used to exit 1, which is the
+// "a step failed, re-read the artifact" code, so bin/browser re-read a verify
+// URL that already existed and reported a publish nobody performed: this file's
+// own named defect, alive inside the change that exists to close it.
+//
+// The boundary is therefore a COUNTER, not a second try block. A counter is the
+// property itself ("did any step run?") rather than a place in the file that has
+// to be kept true as the file changes, so code hoisted above the loop later is
+// covered without anyone remembering this comment. It is module-scope because
+// the outermost .catch() must read the same number.
+//
+// A step COUNTS AS RUN once its await is entered, not once it returns: a goto
+// that throws may already have navigated, a click may already have posted. The
+// expensive direction of a wrong answer here is claiming nothing ran when
+// something did — that is the blind retry that double-posts.
+let stepsRun = 0;
+const stepFailure = () => (stepsRun ? E_FAILED : E_NOTHING_RAN);
 
 // The same list bin/browser enforces. Kept here as a literal on purpose: two
 // copies that must agree is the point — this one is the one that runs.
@@ -111,9 +134,37 @@ function launchArgs() {
   return args;
 }
 
+// WHERE playwright-core COMES FROM IS PART OF THE SECURITY CLAIM, so it is not
+// left to ambient state. A bare require() walks `node_modules` in EVERY ancestor
+// directory of this file, and this process is the one that opens a profile
+// holding somebody's live sessions — so unpacking the plugin somewhere that
+// happens to sit under a `node_modules/playwright-core` hands the driver a
+// library nobody chose or pinned. Measured under DIVE-4524: a checkout under
+// /tmp silently loaded /tmp/node_modules/playwright-core.
+//
+// The order is fixed and short, and there is no ancestor walk:
+//   1. the directories NODE_PATH names, if any — an operator's explicit choice,
+//      and the only lever the harness uses to put a recording stub here;
+//   2. the plugin's OWN node_modules, where package.json pins it exact.
+// Nothing else resolves, so "not installed" is a fact about those two places
+// rather than about wherever the plugin happens to have been unpacked.
+function playwrightDirs() {
+  const named = (process.env.NODE_PATH || '').split(path.delimiter).filter(Boolean);
+  return [...named, path.join(__dirname, '..', 'node_modules')];
+}
+
 function loadPlaywright() {
-  try { return require('playwright-core'); }
-  catch (e) {
+  for (const dir of playwrightDirs()) {
+    const cand = path.join(dir, 'playwright-core');
+    if (!fs.existsSync(cand)) continue;
+    try { return require(cand); }
+    catch (e) {
+      // It is THERE and it will not load. That is not "not installed", and
+      // saying so would send the reader to reinstall something already present.
+      die(E_NOTHING_RAN, `playwright-core at ${cand} could not be loaded: ${e.message}`);
+    }
+  }
+  {
     die(E_NOTHING_RAN, `playwright-core is not installed for this seat, so there is no executor. ` +
       `Install the pinned version next to the plugin:  npm install --prefix ` +
       `${__dirname}/..  (it is pinned in plugins/browser/package.json). ` +
@@ -188,6 +239,7 @@ async function main() {
     for (let i = 0; i < resolved.length; i++) {
       const s = resolved[i];
       const where = `step ${i + 1} (${s.op})`;
+      stepsRun++;  // entered, not completed — see stepsRun above
       switch (s.op) {
         case 'goto':     await page.goto(s.url, { waitUntil: 'domcontentloaded' }); break;
         case 'fill':     await page.fill(s.selector, s.value); break;
@@ -205,11 +257,15 @@ async function main() {
     // "failed" here and "published" are not mutually exclusive — that is the
     // case that double-posts on a blind retry.
     process.stderr.write(`${PROG}: ${e.message}\n`);
-    rc = E_FAILED;
+    rc = stepFailure();
+    if (rc === E_NOTHING_RAN) {
+      process.stderr.write(`${PROG}: the browser opened but not one step ran, so nothing was ` +
+        `published and there is nothing to re-read.\n`);
+    }
   } finally {
     try { await ctx.close(); } catch (e) { /* the verdict is the re-read, not this */ }
   }
   process.exit(rc);
 }
 
-main().catch(e => die(E_FAILED, e && e.message ? e.message : String(e)));
+main().catch(e => die(stepFailure(), e && e.message ? e.message : String(e)));

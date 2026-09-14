@@ -349,8 +349,21 @@ t 'T5f the driver receives the args'    'slug-42' "$(jq -r '.args.slug' "$TMP/dr
 # after an executor that never opened a browser reports SUCCESS for a publish
 # nobody performed — vacuous green, with a receipt. Exit 70 from the driver is
 # the contract that stops it.
-unset FIVEDIVE_BROWSER_DRIVER
-env NODE_PATH=/nonexistent-node-modules "$BROWSER" run x publish --slug=slug-42 --body=hi >"$TMP/t6.out" 2>"$TMP/t6.err"; RC=$?
+#
+# AND THE ABSENCE HAS TO BE A FACT, NOT AN ACCIDENT OF WHERE THE CHECKOUT SITS.
+# A bare require() walks node_modules up every ancestor, so on a box with a
+# /tmp/node_modules/playwright-core (this one has) a worktree under /tmp made
+# this arm red — the executor WAS resolvable, just not by anybody's choice.
+# DIVE-4524 pinned the driver's resolution to NODE_PATH + its own package dir,
+# with no ancestor walk, so the fixture is a byte-identical copy of the shipped
+# driver in a directory that has neither. The copy is asserted identical, or this
+# arm would grade a file nobody ships.
+PWABSENT="$TMP/pw-absent"; mkdir -p "$PWABSENT/bin"
+cp "$ROOT/plugins/browser/bin/driver-playwright" "$PWABSENT/bin/driver-playwright"
+t  'T6a (control) the fixture driver is the shipped one, byte for byte' 'same' \
+   "$(cmp -s "$ROOT/plugins/browser/bin/driver-playwright" "$PWABSENT/bin/driver-playwright" && echo same || echo different)"
+env NODE_PATH=/nonexistent-node-modules FIVEDIVE_BROWSER_DRIVER="$PWABSENT/bin/driver-playwright" \
+  "$BROWSER" run x publish --slug=slug-42 --body=hi >"$TMP/t6.out" 2>"$TMP/t6.err"; RC=$?
 OUT="$(cat "$TMP/t6.out")"; ERR="$(cat "$TMP/t6.err")"
 t  'T6a an executor that cannot run at all refuses' 69 "$RC"
 tc 'T6a ...naming the reason it cannot: no playwright installed for this seat' \
@@ -361,6 +374,31 @@ tc 'T6a ...saying nothing was published and there is nothing to re-read' \
    'nothing was published' "$ERR"
 tc 'T6a ...and that it will not treat what is already there as evidence' \
    'was not put there by this run' "$ERR"
+# --- T6c an ANCESTOR's node_modules is not this driver's playwright ----------
+# THE MUTANT for the pinning above: put a working playwright-core in a parent
+# directory of the driver, where Node's default resolution would find it. The
+# driver must still refuse — a library that arrives because of where the plugin
+# was unpacked is not one anybody pinned, and this process is the one that opens
+# a profile full of live sessions.
+ANC="$TMP/anc"; mkdir -p "$ANC/node_modules/playwright-core" "$ANC/pkg/bin"
+printf '{ "name": "playwright-core", "version": "0.0.0-ancestor", "main": "index.js" }\n' \
+  > "$ANC/node_modules/playwright-core/package.json"
+printf 'exports.chromium = { launchPersistentContext: async () => { throw new Error("ancestor stub ran"); } };\n' \
+  > "$ANC/node_modules/playwright-core/index.js"
+cp "$ROOT/plugins/browser/bin/driver-playwright" "$ANC/pkg/bin/driver-playwright"
+env -u NODE_PATH FIVEDIVE_BROWSER_DRIVER="$ANC/pkg/bin/driver-playwright" \
+  "$BROWSER" run x publish --slug=slug-42 --body=hi >/dev/null 2>"$TMP/t6c.err"; RC=$?
+t  'T6c a playwright-core in an ANCESTOR directory is not loaded' 69 "$RC"
+tc 'T6c ...it still reports no executor, rather than driving an unpinned one' \
+   'playwright-core is not installed' "$(cat "$TMP/t6c.err")"
+tn 'T6c ...and the ancestor copy never ran' 'ancestor stub ran' "$(cat "$TMP/t6c.err")"
+# CONTROL: that same copy IS loadable — NODE_PATH naming its directory loads it,
+# so T6c is "not from an ancestor", not "this stub is broken".
+env NODE_PATH="$ANC/node_modules" FIVEDIVE_BROWSER_DRIVER="$ANC/pkg/bin/driver-playwright" \
+  "$BROWSER" run x publish --slug=slug-42 --body=hi >/dev/null 2>"$TMP/t6c2.err"; RC=$?
+tc 'T6c (control) the same copy loads when NODE_PATH names it' 'ancestor stub ran' \
+   "$(cat "$TMP/t6c2.err")"
+
 # CONTROL, or T6a grades a fixture that could never have gone green: the SAME
 # adapter and the SAME artifact, with a driver that merely exits non-zero after
 # running, is verified green — that is T5b's design and it must still hold.
@@ -1568,6 +1606,19 @@ const page = {
 exports.chromium = {
   launchPersistentContext: async (profile, opts) => {
     rec({ call: 'launch', profile, args: opts.args, executablePath: opts.executablePath, headless: opts.headless });
+    // PWNOPAGE: THE BROWSER REALLY OPENS AND THEN CANNOT HAND OVER A PAGE.
+    // Every other shape here returns a working page, which is exactly why five
+    // anchored mutants missed the window between the launch and step one
+    // (DIVE-4524 iteration 1) — no arm could enter it. A stub that cannot fail
+    // this way makes the arm below impossible to write, so the shape lives in
+    // the tape, not in the arm.
+    if (process.env.PWNOPAGE) {
+      return {
+        pages: () => [],
+        newPage: async () => { throw new Error('stub: the browser opened but would not give up a page'); },
+        close: async () => rec({ call: 'close' }),
+      };
+    }
     return { pages: () => [page], newPage: async () => page, close: async () => rec({ call: 'close' }) };
   },
 };
@@ -1679,6 +1730,58 @@ t  'T16f a step that fails mid-action is still graded by the re-read' 0 "$RC"
 t  'T16f (control) the failing step really did run' 'true' \
    "$(jq -rs '[.[]|select(.call=="click")]|length>0' "$PWREC")"
 tc 'T16f ...and the artifact is reported live' 'verified: publish is live' "$OUT"
+
+# --- T16i "NOTHING RAN" IS NOT "NEVER LAUNCHED" (quinn's QX, DIVE-4524 it.1) --
+# THE DEFECT THIS ROW EXISTS TO CLOSE, SURVIVING INSIDE THE CLOSE. T16b/d/e all
+# grade refusals raised BEFORE the launch, and iteration 1 guarded exactly those:
+# acquiring the page and arming the timeout sat inside the try whose catch set
+# exit 1 unconditionally. So a browser that OPENS and then cannot hand over a
+# page exited 1 — the "a step failed, re-read the artifact" code — bin/browser
+# re-read a verify URL that already existed, and reported a publish nobody
+# performed. Vacuous green with a receipt, which is the one outcome `run` is for.
+#
+# BOTH CONTROLS ARE THE ARM. Without them a green here is also what a stub that
+# never launched would produce, and the next stub that returns a working page
+# hides the window again.
+: > "$PWREC"
+mkadapter x "file://$TMP/artifact.html" 'PUBLISHED'
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWNOPAGE=1 "$BROWSER" run x publish --body=hello
+t  'T16i (control) the browser really did launch' 'true' \
+   "$(jq -rs '[.[]|select(.call=="launch")]|length>0' "$PWREC")"
+t  'T16i (control) ...and NOT ONE STEP ran' '' \
+   "$(jq -rs '[.[]|select(.call|IN("goto","fill","click","waitForSelector","selectOption","setInputFiles","press"))|.call]|join(" ")' "$PWREC")"
+t  'T16i a launch with no page must NOT be graded by the re-read' 69 "$RC"
+tn 'T16i ...and it does not claim a publish nobody performed' 'verified: publish is live' "$OUT"
+tc 'T16i ...it says nothing ran' 'refused before it ran a single step' "$ERR$OUT"
+# AT THE DRIVER, where the exit code is the contract: 70, not 1.
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"goto","url":"https://x.test/"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWNOPAGE=1 FIVEDIVE_BROWSER_CHROME=/bin/true \
+      "$DRV" >/dev/null 2>"$TMP/t16i.err"; RC=$?
+t  'T16i the driver exits 70, not 1, when the launch succeeded but no step ran' 70 "$RC"
+tc 'T16i ...naming the window it is in' 'not one step ran' "$(cat "$TMP/t16i.err")"
+t  'T16i (control) ...and that launch is on the tape' 'true' \
+   "$(jq -rs '[.[]|select(.call=="launch")]|length>0' "$PWREC")"
+# THE OTHER SIDE OF THE SAME BOUNDARY, and the reason the counter counts a step
+# from when its await is ENTERED and not from when it returns: a goto that throws
+# may already have navigated, a click may already have posted, and calling that
+# "nothing ran" suppresses the re-read on an action that half happened.
+#
+# THE FIXTURE IS ONE STEP, AND THAT IS THE WHOLE ARM. A two-step plan whose
+# SECOND step throws cannot grade this — the first step has completed, so the
+# counter is non-zero wherever in the loop it sits, and a counter moved to the
+# wrong end survives. (Measured here: that shape passed the mutant.) With a
+# single step that throws, "entered" and "returned" give different answers: 1
+# versus 70.
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"click","selector":"#go"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWFAIL=1 FIVEDIVE_BROWSER_CHROME=/bin/true \
+      "$DRV" >/dev/null 2>/dev/null; RC=$?
+t  'T16i the ONLY step entered and threw: exit 1, so the re-read still governs' 1 "$RC"
+t  'T16i (control) ...and that step really did reach the page' 'true' \
+   "$(jq -rs '[.[]|select(.call=="click")]|length>0' "$PWREC")"
 
 # --- T16g the served browser is cycled around the run, and put back ----------
 # A SITE NOTHING ELSE HERE HAS SERVED. `_display_num` is a hash of seat+site, and

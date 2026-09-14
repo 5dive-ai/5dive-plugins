@@ -327,10 +327,24 @@ before its first step exits 70 and `run` then refuses instead of re-reading. Aft
 failure is exit 1 and the re-read governs, because "published fine but reported failure" is real
 and a blind retry on it double-posts.
 
+**"Before the first step" is not "before the launch."** The browser opening is not a step. A
+browser that opens and then cannot hand over a page has run nothing, so that is exit 70 too — the
+driver counts steps rather than trusting a place in the file, and a step counts from the moment its
+`await` is entered, not from when it returns: a `goto` that throws may already have navigated and a
+`click` may already have posted, and calling *that* "nothing ran" would suppress the re-read on an
+action that half happened.
+
 **Playwright is pinned.** `plugins/browser/package.json` names an exact `playwright-core` version,
 no caret: the driver speaks CDP to a Chrome holding a human's live session, and a silent minor bump
 changes the launch arguments under a credential. Install it with
 `npm install --prefix plugins/browser`; without it, `run` refuses and says so.
+
+**And it is pinned by LOCATION as well as by version.** A bare `require('playwright-core')` searches
+`node_modules` in every ancestor directory of the driver, so unpacking the plugin somewhere that
+happens to sit under one hands this process — the one that opens a directory full of live sessions —
+a library nobody chose. The driver looks in exactly two places, in order: the directories `NODE_PATH`
+names, if any, then `plugins/browser/node_modules`. There is no ancestor walk, so "not installed"
+is a fact about those two places rather than about where the plugin was unpacked.
 
 ## Not shipped yet, and named so nobody assumes it
 
