@@ -70,7 +70,20 @@ spends nothing. A good nonce is the customer's only redemption.
    the view onto it is the ephemeral half and it is a keyboard attached to their account.
    Leaving it open is the only part of this flow that gets *worse* with time.
 
-Then, and only then: `5dive browser run <site> <action> [--key=value ...]`.
+Then, and only then, the profile is usable:
+
+- `5dive browser run <site> <action> [--key=value ...]` — act, deterministically, via an adapter.
+- `5dive browser shot <site> <url> [--out=<png>] [--dom=<file>]` — **read**: render a page inside
+  the logged-in profile and get a PNG of what the human would see, plus the DOM on request. This
+  is how a grader sees a page that lives behind the login, and how you read a thread on a site
+  that shows a logged-out visitor nothing.
+
+  `shot` renders **only** when `status` says `authenticated`. Every other state — including
+  `UNKNOWN` because the site has no adapter — writes no file. The reason is specific: a
+  screenshot of the **sign-in page** is evidence-shaped, and the person you hand it to cannot
+  tell it from the real page. The URL must belong to that site (a subdomain is fine). A served
+  browser is stopped for the render and started again; a viewer with a **person inside it right
+  now** is a refusal, because a screenshot does not get to end someone's login.
 
 ## What will actually go wrong
 
