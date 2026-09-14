@@ -294,11 +294,19 @@ _probe() {
   local marker; marker=$(_site_logged_out_marker "$site")
   local dom; dom=$(mktemp) || { echo "UNKNOWN (probe did not load)"; return 0; }
   "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
-        --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>/dev/null
+        --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
   local rc=$?
   if (( rc != 0 )) || [[ ! -s "$dom" ]]; then
-    rm -f "$dom"; echo "UNKNOWN (probe did not load)"; return 0
+    # "UNKNOWN (probe did not load)" sat on the canary for hours and nobody could
+    # tell it from "this profile was never probed" — and it was, in fact, a
+    # chrome that could not start at all. Carry chrome's own words, and STAMP it,
+    # so `browser ls` shows a box in this state instead of a blank column.
+    local why; why=$(tr -s '\n' ' ' < "$dom.err" 2>/dev/null | sed 's/^ *//;s/ *$//' | cut -c1-200)
+    rm -f "$dom" "$dom.err"
+    _stamp "$dir" "UNKNOWN — chrome did not load the page${why:+: $why}"
+    echo "UNKNOWN (chrome did not load the page${why:+ — $why})"; return 0
   fi
+  rm -f "$dom.err"
   # Challenge FIRST: a challenge page often still carries the login form's markup,
   # so testing logged-out first would classify an interrogated live session as a
   # dead one and send the user to re-authenticate a session that is fine.
@@ -575,12 +583,24 @@ X11_SOCKET_DIR="${FIVEDIVE_BROWSER_X11_DIR:-/tmp/.X11-unix}"
 _display_socket() { [[ -e "$X11_SOCKET_DIR/X$1" ]]; }
 _display_free()   { ! _display_socket "$1"; }
 
+# `kill -0` IS NOT A LIVENESS TEST FOR OUR OWN CHILD. A background child that has
+# exited but that this shell has not reaped yet is a zombie, and a zombie answers
+# kill -0 with success — so the one moment we most need the truth (the first
+# instants after launch) is the one moment kill -0 cannot give it. /proc says Z.
+_pid_live() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  local st; st=$(sed -n 's/.*) \([A-Za-z]\).*/\1/p' "/proc/$p/stat" 2>/dev/null)
+  [[ "$st" != Z ]]
+}
+
 _serve_running() {  # _serve_running <dir> -> echoes display, 0 if live
   local f; f="$(_serve_pidfile "$1")"
   [[ -f "$f" ]] || return 1
   local xpid cpid disp; xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid); disp=$(_kv "$f" display)
   [[ -n "$xpid" && -n "$cpid" ]] || return 1
-  kill -0 "$xpid" 2>/dev/null && kill -0 "$cpid" 2>/dev/null || return 1
+  _pid_live "$xpid" && _pid_live "$cpid" || return 1
   echo "$disp"; return 0
 }
 
@@ -638,11 +658,42 @@ cmd_serve() {
   while ! _display_socket "$disp" && (( waited < 300 )); do waited=$(( waited + 1 )); sleep 0.05; done
   kill -0 "$xpid" 2>/dev/null || die "$E_UNAVAILABLE" "Xvfb did not start on :$disp"
 
+  # KEEP CHROME'S STDERR. The version this replaces sent it to /dev/null, so the
+  # single sentence explaining why the browser died was destroyed before anyone
+  # could read it, and every later caller had only a pid to go on. 0600, in the
+  # profile, like everything else here.
   local chrome; chrome=$(_chrome)
+  local errlog; errlog="$dir/.5dive-serve.err"
+  ( umask 077; : > "$errlog" ) 2>/dev/null || true
   DISPLAY=":$disp" "$chrome" --user-data-dir="$dir" --no-first-run \
       --no-default-browser-check --window-size=1280,800 \
-      --disable-features=TranslateUI "$(_site_url "$site")" >/dev/null 2>&1 &
+      --disable-features=TranslateUI "$(_site_url "$site")" >/dev/null 2>"$errlog" &
   local cpid=$!
+
+  # WAIT FOR THE BROWSER BEFORE ADVERTISING IT. `serve` used to print success
+  # unconditionally the instant bash returned a pid, so a chrome that trapped in
+  # its first millisecond was indistinguishable from a healthy one to `ls`, to
+  # `status`, to the stack row and to `viewer` — and the ONLY surface that told
+  # the truth was the customer's click, which came back 502 (DIVE-4400).
+  #
+  # The window is a ceiling, not a fixed cost: the loop leaves the moment the
+  # process is gone, so a healthy serve pays it once and then runs for hours.
+  # It cannot prove the page loaded, and is not trying to — it proves that the
+  # process we are about to write into a pidfile still exists.
+  local settle=0
+  while (( settle < 30 )) && _pid_live "$cpid"; do sleep 0.05; settle=$(( settle + 1 )); done
+  if ! _pid_live "$cpid"; then
+    local crc=0; wait "$cpid" 2>/dev/null || crc=$?
+    # REAP THE Xvfb WE STARTED. A failed serve that leaves its display standing
+    # is an orphan that _display_free reads as taken forever, so the next attempt
+    # hops to :376, :377… and the box accumulates displays with nothing behind
+    # them. Two were standing on the canary when this was measured.
+    kill "$xpid" 2>/dev/null; wait "$xpid" 2>/dev/null || true
+    rm -f "$(_serve_pidfile "$dir")"
+    local why; why=$(tr -s '\n' ' ' < "$errlog" 2>/dev/null | sed 's/^ *//;s/ *$//' | cut -c1-500)
+    [[ -n "$why" ]] || why="it printed nothing"
+    die "$E_UNAVAILABLE" "chrome exited immediately (status $crc) — $site is NOT being served, and no display was left behind. Chrome said: $why"
+  fi
 
   ( umask 077; printf 'display=%s\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
       "$disp" "$xpid" "$cpid" "$(date -u +%s)" > "$(_serve_pidfile "$dir")" )
