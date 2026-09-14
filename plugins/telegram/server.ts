@@ -1135,6 +1135,14 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
+      // DIVE-4481. The per-box CLAUDE.md carries these rules too, but a seat
+      // can be paired without that template (a customised doc, a non-5dive
+      // host), and the channel is the surface the rules are ABOUT. Same rules,
+      // stated where the tool that sends the message is defined.
+      'Writing here: answer first — the conclusion in line one, no preamble and no narrating what you are about to do. Send three kinds of message and no others: finished, blocked on them (money, secrets, brand, anything irreversible), or your own mistake; progress and half-findings go where you track work, not the message.',
+      '',
+      'Cap a reply at roughly 60 words, 3 short paragraphs, COUNTED IN WORDS not lines — they read on a phone and it wraps. Blank line between paragraphs, one ask per message, no lists or tables; detail goes in a file or task. Over ~30s of work: acknowledge at once, then edit_message that same message with progress — a NEW message only when done or blocked.',
+      '',
       'Inbound arrives as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. Pass chat_id back to reply. If the inbound meta carries message_thread_id (forum-topic group like #5dive), pass it through to reply so your message lands in the same topic instead of the supergroup\'s General channel; omit when absent. If the tag has image_path, Read that path (a photo). If attachment_file_id, call download_attachment then Read the returned path. Set reply_to only when threading under an earlier message; omit it for normal latest-message replies.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. To recover earlier context (e.g. after a session restart), call the recent_messages tool: it returns a bounded rolling log of recent inbound messages and your replies. Fall back to asking the user to paste context only if recent_messages comes up empty.",

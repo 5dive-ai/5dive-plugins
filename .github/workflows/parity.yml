@@ -67,6 +67,14 @@ jobs:
       # the repo unrun is silence, not a green (same reason as the step above).
       - name: telegram 5dive-reader harness
         run: bash tests/telegram_cliexec_unit.sh
+      # DIVE-4481: the human-messaging rules ship to a customer by two
+      # independent paths — the per-box CLAUDE.md template in 5dive-api and this
+      # plugin's MCP instructions block. The redundancy is the point (a seat can
+      # be paired from a box whose template was customised), and it is exactly
+      # what a later prompt-slimming pass deletes without breaking anything else
+      # in this repo. This arm is what notices.
+      - name: telegram channel instructions carry the human-messaging rules
+        run: bash tests/telegram_instructions_unit.sh
       - name: entry points parse
         run: |
           rc=0
