@@ -10,6 +10,7 @@ import { protectTelegramViewerLinks as protectPi } from '../plugins/telegram-pi/
 
 const NONCE = 'a'.repeat(64)
 const URL = `https://app.5dive.ai/browser/viewer/linkedin/${NONCE}`
+const DOTTED_URL = `https://exact-swallow.5dive.ai/browser/viewer/github.com/${NONCE}`
 const implementations = [
   ['telegram', protectBase],
   ['telegram-codex', protectCodex],
@@ -42,6 +43,25 @@ describe.each(implementations)('%s protects one-time browser viewer links', (_na
     expect(payload.text.match(/Do not paste it back here/g)).toHaveLength(1)
   })
 
+  test('fully escaped MarkdownV2 dotted viewer URL is normalized into a safe code span', () => {
+    const escaped = `https://exact\\-swallow\\.5dive\\.ai/browser/viewer/github\\.com/${NONCE}`
+    const payload = { text: `One\\-time: ${escaped}`, parse_mode: 'MarkdownV2' }
+    expect(protect(payload)).toBe(true)
+    expect(payload.link_preview_options).toEqual({ is_disabled: true })
+    expect(payload.text).toContain(`\`${DOTTED_URL}\``)
+    expect(payload.text).not.toContain('exact\\-swallow')
+    expect(payload.text).not.toContain('github\\.com')
+  })
+
+  test('escaped MarkdownV2 host with a plain slug leaves no stray URL backslash in code', () => {
+    const escaped = `https://exact\\-swallow\\.5dive\\.ai/browser/viewer/linkedin/${NONCE}`
+    const payload = { text: `Open: ${escaped}`, parse_mode: 'MarkdownV2' }
+    expect(protect(payload)).toBe(true)
+    expect(payload.text).toContain(`\`https://exact-swallow.5dive.ai/browser/viewer/linkedin/${NONCE}\``)
+    const code = payload.text.match(/`([^`]+)`/)?.[1]
+    expect(code).not.toContain('\\')
+  })
+
   test('ordinary URLs and lookalikes are unchanged', () => {
     const ordinary = { text: 'Docs: https://example.com/browser/viewer/site/not-a-ticket' }
     expect(protect(ordinary)).toBe(false)
@@ -60,6 +80,14 @@ test('all six Telegram senders enforce protection in the Bot API middleware', ()
     const source = readFileSync(join(import.meta.dir, '..', 'plugins', name, 'server.ts'), 'utf8')
     expect(source, name).toContain("import { protectTelegramViewerLinks } from './viewer-link.ts'")
     expect(source, name).toMatch(/bot\.api\.config\.use\([\s\S]*?protectTelegramViewerLinks\(payload\)/)
+  }
+})
+
+test('all six Telegram viewer-link guards are byte-identical', () => {
+  const canonical = readFileSync(join(import.meta.dir, '..', 'plugins/telegram-grok/viewer-link.ts'), 'utf8')
+  for (const [name] of implementations) {
+    expect(readFileSync(join(import.meta.dir, '..', 'plugins', name, 'viewer-link.ts'), 'utf8'), name)
+      .toBe(canonical)
   }
 })
 

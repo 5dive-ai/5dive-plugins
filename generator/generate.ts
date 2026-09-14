@@ -52,6 +52,7 @@ const COPY_FILES = [
   'access-core.ts', // DIVE-3962: runtime-neutral access-file load taxonomy — no tokens, copied byte-exact
   'banner.ts', // DIVE-1558: pure banner decision module — no tokens, copied byte-exact
   'lifecycle.ts', // DIVE-3752: orphan watchdog + start/exit record — copied byte-exact
+  'viewer-link.ts', // DIVE-4493: one-time viewer-link transport guard — copied byte-exact
   'pair.ts',
   'package.json',
   'AGENTS.md',
@@ -183,7 +184,8 @@ function generate(slug: string, outDir: string): void {
     if (!existsSync(src)) return null
     let text = readFileSync(src, 'utf8')
     // tna.ts (shared tap-resolver), banner.ts (DIVE-1558 shared needs-you
-    // banner decision module) and lifecycle.ts (DIVE-3752 orphan watchdog) are
+    // banner decision module), lifecycle.ts (DIVE-3752 orphan watchdog), and
+    // viewer-link.ts (DIVE-4493 one-time credential transport guard) are
     // kept BYTE-IDENTICAL across the base and every fork (the parity tests assert
     // it; the only per-runtime difference lives in server.ts). Copy them verbatim:
     // the generic name-sweep would otherwise rewrite "grok" inside their own
@@ -194,7 +196,7 @@ function generate(slug: string, outDir: string): void {
     // `plugins/telegram/server.ts` by path as the place the dead ppid clause came
     // from, and a swept copy would claim that history happened in a fork it never
     // happened in. A shared module's provenance must survive being copied.
-    if (file === 'tna.ts' || file === 'banner.ts' || file === 'lifecycle.ts') return text
+    if (file === 'tna.ts' || file === 'banner.ts' || file === 'lifecycle.ts' || file === 'viewer-link.ts') return text
     // Mechanical token subs + bare-cliBin sweep FIRST, so the text now reads as
     // the target runtime everywhere the knobs reach. Structural blocks run AFTER,
     // so their find-strings match the already-tokenized text and their replace

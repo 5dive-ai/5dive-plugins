@@ -13,10 +13,41 @@ export type TelegramTextPayload = {
 }
 
 const VIEWER_LINK_RE = /(?:https?:\/\/[^\s`<>()]+)?\/browser\/viewer\/[A-Za-z0-9._-]+\/[a-fA-F0-9]{64}/g
+const MARKDOWN_V2_RESERVED = new Set('_*[]()~`>#+-=|{}.!\\')
 const WARNING = 'Copy-paste this one-time link into your browser. Do not paste it back here.'
 
-function matchesViewerLinks(text: string): Array<{ index: number; link: string }> {
-  return [...text.matchAll(VIEWER_LINK_RE)].map(match => ({ index: match.index!, link: match[0] }))
+type ViewerLinkMatch = { index: number; raw: string; link: string }
+
+function normalizeMarkdownV2(text: string): { text: string; sourceIndex: number[] } {
+  let normalized = ''
+  const sourceIndex: number[] = []
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\\' && i + 1 < text.length && MARKDOWN_V2_RESERVED.has(text[i + 1])) i++
+    sourceIndex.push(i)
+    normalized += text[i]
+  }
+  return { text: normalized, sourceIndex }
+}
+
+function matchesViewerLinks(text: string, markdownV2: boolean): ViewerLinkMatch[] {
+  if (!markdownV2) {
+    return [...text.matchAll(VIEWER_LINK_RE)].map(match => ({
+      index: match.index!,
+      raw: match[0],
+      link: match[0],
+    }))
+  }
+
+  const normalized = normalizeMarkdownV2(text)
+  return [...normalized.text.matchAll(VIEWER_LINK_RE)].map(match => {
+    const start = normalized.sourceIndex[match.index!]
+    const last = normalized.sourceIndex[match.index! + match[0].length - 1]
+    return {
+      index: start,
+      raw: text.slice(start, last + 1),
+      link: match[0],
+    }
+  })
 }
 
 function alreadyCodeWrapped(text: string, index: number, length: number, html: boolean): boolean {
@@ -29,13 +60,13 @@ function alreadyCodeWrapped(text: string, index: number, length: number, html: b
 
 export function protectTelegramViewerLinks(payload: TelegramTextPayload): boolean {
   if (typeof payload.text !== 'string') return false
-  const matches = matchesViewerLinks(payload.text)
+  const mode = payload.parse_mode?.toLowerCase()
+  const matches = matchesViewerLinks(payload.text, mode === 'markdownv2')
   if (matches.length === 0) return false
   payload.link_preview_options = { ...(payload.link_preview_options ?? {}), is_disabled: true }
-  const mode = payload.parse_mode?.toLowerCase()
   if (!mode) {
     const prior = payload.entities ?? []
-    const viewerRanges = matches.map(({ index, link }) => ({ type: 'code', offset: index, length: link.length }))
+    const viewerRanges = matches.map(({ index, raw }) => ({ type: 'code', offset: index, length: raw.length }))
     payload.entities = [
       ...prior.filter(entity => !viewerRanges.some(range =>
         entity.offset < range.offset + range.length && range.offset < entity.offset + entity.length,
@@ -44,11 +75,14 @@ export function protectTelegramViewerLinks(payload: TelegramTextPayload): boolea
     ]
   } else if (mode === 'markdown' || mode === 'markdownv2' || mode === 'html') {
     const html = mode === 'html'
-    for (const { index, link } of [...matches].reverse()) {
-      if (alreadyCodeWrapped(payload.text, index, link.length, html)) continue
+    for (const { index, raw, link } of [...matches].reverse()) {
+      const wrapped = alreadyCodeWrapped(payload.text, index, raw.length, html)
+      const safeLink = mode === 'markdownv2' ? link.replace(/[\\`]/g, '\\$&') : link
       const open = html ? '<code>' : '`'
       const close = html ? '</code>' : '`'
-      payload.text = payload.text.slice(0, index) + open + link + close + payload.text.slice(index + link.length)
+      payload.text = payload.text.slice(0, index)
+        + (wrapped ? safeLink : open + safeLink + close)
+        + payload.text.slice(index + raw.length)
     }
   }
   if (!payload.text.includes('Do not paste it back here')) {
