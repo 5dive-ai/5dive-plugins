@@ -205,6 +205,16 @@ t  'T2c5 ...and the store root too' 'yes' "$(grep -q 'chmod 00711 "\$PROFILE_ROO
 t  'T2c6 a root caller with SUDO_USER re-executes as the seat before touching a store' 'yes' "$(grep -q 'exec runuser -u "\$_drop" -- "\$0" "\$@"' "$ROOT/plugins/browser/bin/browser" && echo yes || echo no)"
 t  'T2c7 ...but setup stays root'"'"'s' 'yes' "$(grep -A2 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|-h|--help|help|"") ;;' && echo yes || echo no)"
 
+# DIVE-4519: setup owns the schedule instead of leaving "run this on a
+# schedule" as prose. These arms kill a non-persistent timer and a root service
+# that cannot read the seat-owned 0700 profile store.
+t  'T2c8 setup installs a persistent six-hour probe timer' 'yes' \
+  "$(grep -q 'OnUnitActiveSec=6h' "$BROWSER" && grep -q 'Persistent=true' "$BROWSER" && echo yes || echo no)"
+t  'T2c8 ...running as the timer instance seat' 'yes' \
+  "$(grep -q 'User=%i' "$BROWSER" && echo yes || echo no)"
+t  'T2c8 ...and invokes the fleet sweep, not bare status' 'yes' \
+  "$(grep -q 'ExecStart=.*browser probe-all' "$BROWSER" && echo yes || echo no)"
+
 # A site name becomes a directory name.
 for bad in ../etc "a/b" "" "UPPER"; do
   run "$BROWSER" auth "$bad"
@@ -1047,6 +1057,31 @@ t 'T13b ...and leaves the last real verdict standing' 'authenticated-from-before
 rm -f "$SERVEDIR/.5dive-serve" "$URLLOG"
 run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" status served
 t 'T13c ...while an unserved profile is probed as usual' 'https://served.com/' "$(head -1 "$URLLOG")"
+kill "$SXPID" "$SCPID" 2>/dev/null
+
+# T13d — one served and one ordinary profile in the SAME sweep. This prevents
+# both easy false greens: probing a profile whose browser is holding it, and
+# aborting the whole sweep after encountering that profile.
+printf '%s' 'authenticated-from-before' > "$SERVEDIR/.5dive-liveness"
+sleep 300 & SXPID=$!
+sleep 300 & SCPID=$!
+( umask 077; printf 'display=138\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+    "$SXPID" "$SCPID" "$(date -u +%s)" > "$SERVEDIR/.5dive-serve" )
+mkprofile scheduled.example "$LIVE_DOM" >/dev/null
+mkadapter scheduled.example "file://$TMP/artifact.html" 'PUBLISHED'
+rm -f "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/scheduled.example/.5dive-liveness" "$URLLOG"
+run env PATH="$URLBIN:$PATH" URLLOG="$URLLOG" "$BROWSER" probe-all
+t  'T13d probe-all finishes after checking every eligible profile' 0 "$RC"
+tc 'T13d ...names the profile it skipped because it is served' 'served               skipped: served' "$OUT"
+t  'T13d ...does not launch Chrome against the served profile' 'no' \
+   "$([[ -s "$URLLOG" ]] && grep -q 'https://served.com/' "$URLLOG" && echo yes || echo no)"
+t  'T13d ...does probe an unserved profile in the same sweep' 'yes' \
+   "$([[ -s "$URLLOG" ]] && grep -q 'https://scheduled.example.test/feed' "$URLLOG" && echo yes || echo no)"
+t  'T13d ...leaves the served profile stamp untouched' 'authenticated-from-before' \
+   "$(cat "$SERVEDIR/.5dive-liveness")"
+tc 'T13d ...and stamps the eligible profile' 'authenticated' \
+   "$(cat "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/scheduled.example/.5dive-liveness")"
+rm -f "$SERVEDIR/.5dive-serve"
 kill "$SXPID" "$SCPID" 2>/dev/null
 
 # --- T14 DIVE-4446: the workflow doc, and the half of the fleet that is not Claude
