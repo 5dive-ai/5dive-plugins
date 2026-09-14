@@ -1,0 +1,9 @@
+{
+  "_comment": "MEASURED, NOT GUESSED — on BOTH halves. exact-swallow, 2026-09-14 (marker first written by hand under DIVE-4464; both renders re-measured under DIVE-4538 with the plugin's own probe command and with `shot`): logged OUT, /settings/profile lands on 'Sign in to GitHub', whose form posts to /session — 3 matches; logged IN, the same URL renders 'Your profile' — 0 matches.",
+  "site": "github.com",
+  "probe": {
+    "url": "https://github.com/settings/profile",
+    "logged_out_when_dom_matches": "action=[\"']?/session"
+  },
+  "actions": {}
+}
