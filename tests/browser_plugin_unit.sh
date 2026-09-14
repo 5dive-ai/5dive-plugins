@@ -1184,7 +1184,36 @@ for pair in "skill:$SKILL" "doc:$DOCF"; do
      "$([[ $(wc -w <<<"$VERBS") -ge 3 ]] && echo yes || echo no)"
   t  "T14b ...and no unnegated 'spend the link to check it' instruction survives ($W)" \
      'none' "$(_instructs_spend "$F")"
+
+  # DIVE-4523: the cold follower must not have to invent any of the six steps
+  # the live DIVE-4464 run had to add. These are contract strings, not prose
+  # decoration: deleting any one recreates a link that is dead, partial, on the
+  # wrong seat, or forever UNKNOWN.
+  tc "T14b ...starts at the shipped dashboard handoff ($W)" 'Connected sites in the 5dive dashboard' "$TXT"
+  tc "T14b ...names the authenticated bind registration ($W)" '/shell/browser-viewer-bind' "$TXT"
+  tc "T14b ...says viewer itself does not register the bind ($W)" 'does **not** register that bind' "$TXT"
+  tc "T14b ...says stdout is a path, not an absolute URL ($W)" '/browser/viewer/<site>/<nonce>' "$TXT"
+  tc "T14b ...requires the box host prefix ($W)" 'https://<box-host>/browser/viewer/' "$TXT"
+  tc "T14b ...names the relay seat instead of the caller ($W)" 'run as seat `claude`' "$TXT"
+  tc "T14b ...names the upgrade-safe custom-adapter store ($W)" '/browser-profiles/claude/.adapters/<site>.json' "$TXT"
+  tc "T14b ...requires the adapter probe contract ($W)" 'probe.logged_out_when_dom_matches' "$TXT"
+  tn "T14b ...does not tell another seat to serve its own unreachable profile ($W)" 'under YOUR seat' "$TXT"
+  tc "T14b ...forbids polling while Chromium holds the profile ($W)" 'Never poll `status` while `serve` is still running' "$TXT"
+
+  REVOKE_LINE=$(grep -nF '5dive browser viewer-revoke <site>' "$F" | tail -1 | cut -d: -f1)
+  STOP_LINE=$(grep -nF '5dive browser serve <site> --stop' "$F" | tail -1 | cut -d: -f1)
+  STATUS_LINE=$(grep -nF '5dive browser status <site>' "$F" | tail -1 | cut -d: -f1)
+  t "T14b ...orders revoke then stop then status ($W)" 'yes' \
+    "$([[ -n "$REVOKE_LINE" && -n "$STOP_LINE" && -n "$STATUS_LINE" && "$REVOKE_LINE" -lt "$STOP_LINE" && "$STOP_LINE" -lt "$STATUS_LINE" ]] && echo yes || echo no)"
 done
+
+# Both harness surfaces ship one byte-identical fenced workflow. Without this,
+# fixing only the Claude skill leaves every AGENTS.md consumer on the old runbook.
+SKILLFLOW="$TMP/skill-flow.md"; DOCFLOW="$TMP/doc-flow.md"
+awk '/5dive:connect-site-flow:begin/{p=1} p{print} /5dive:connect-site-flow:end/{exit}' "$SKILL" > "$SKILLFLOW"
+awk '/5dive:connect-site-flow:begin/{p=1} p{print} /5dive:connect-site-flow:end/{exit}' "$DOCF" > "$DOCFLOW"
+t 'T14b the Claude skill and harness-neutral doc share one fenced workflow' 'same' \
+  "$(cmp -s "$SKILLFLOW" "$DOCFLOW" && echo same || echo DRIFT)"
 
 # A skills/ dir with no 'skill' capability installs clean and registers NOTHING
 # (cmd_plugin.sh warns and moves on) — the silent half-ship this arm forbids.

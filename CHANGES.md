@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — the browser connect-site runbook now follows the shipped bound viewer flow (DIVE-4523), browser 1.5.2
+
+The Claude skill and harness-neutral AGENTS block now carry one byte-identical fenced workflow. It
+starts from the dashboard action that registers the relay bind and prefixes the box host, names the
+relay's `claude` seat and the upgrade-safe seat-local adapter store, keeps one-time links
+non-unfurling, and verifies a login only after revoke → stop → status. The old raw-CLI path could
+produce a path with no live bind, target the wrong seat, and poll forever while Chromium held the
+profile lock.
+
 ### Fixed — Telegram previewers spent one-time browser viewer links before the human could use them (DIVE-4493), browser 1.3.1 · telegram 0.5.53 · grok/agy 0.5.21 · codex 0.5.14 · opencode 0.5.12 · pi 0.1.12
 
 All six Telegram adapters now recognize the exact browser-viewer route at their Bot API
