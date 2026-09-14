@@ -1,0 +1,9 @@
+{
+  "name": "@5dive/browser-plugin",
+  "private": true,
+  "description": "Dependencies of `5dive browser`'s executor. The plugin itself is bash; this file exists only so the driver's Playwright is PINNED rather than resolved to whatever the box happened to have.",
+  "_comment": "EXACT version, no caret. The driver speaks CDP to a Chrome holding a human's live session: a silent minor bump changes the launch arguments and the connection shape under a credential, and the failure would surface as 'the publish stopped working' on a customer box. Bump it deliberately, with the harness re-run.",
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

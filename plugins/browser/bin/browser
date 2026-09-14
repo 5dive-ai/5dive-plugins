@@ -25,7 +25,29 @@ PROG="5dive browser"
 STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
 PROFILE_ROOT="${FIVEDIVE_BROWSER_PROFILE_ROOT:-$STATE_DIR/browser-profiles}"
 SETUP_CMD="sudo 5dive browser setup"
-ADAPTER_DIR="${FIVEDIVE_BROWSER_ADAPTER_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/adapters}"
+# WHERE AN ADAPTER LIVES, and why it is not one directory (DIVE-4524).
+#
+# It used to be exactly one: the `adapters/` folder inside the plugin package.
+# That directory is REPLACED WHOLESALE by `5dive plugin upgrade` — measured
+# 2026-09-14: a hand-written adapters/reddit.com.json was there before the
+# upgrade and gone after, and `status reddit.com` went `authenticated` ->
+# `UNKNOWN (no adapter)` with nothing else changed. An adapter is a customer's
+# own data about their own site; a product that eats it on upgrade is a product
+# that silently un-classifies a live session.
+#
+# So there are two, searched in order:
+#   1. $PROFILE_ROOT/<seat>/.adapters  — the SEAT's own, next to the profiles it
+#      describes. Already root-created and 0700-audited, on a path no package
+#      upgrade touches. A leading dot keeps it out of the `*/` glob that
+#      enumerates sites, and `_valid_site` forbids a leading dot, so it can never
+#      collide with a real profile name.
+#   2. the package's adapters/       — what 5dive ships, a read-only fallback.
+# FIVEDIVE_BROWSER_ADAPTER_DIR overrides BOTH and is then the only one searched:
+# an explicit override that silently still read two other places would be worse
+# than no override at all.
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ADAPTER_PKG_DIR="$(cd "$_SELF_DIR/.." && pwd)/adapters"
+ADAPTER_SEAT_SUBDIR=".adapters"
 
 E_USAGE=64; E_UNAVAILABLE=69; E_PERM=77; E_COLD=75
 
@@ -61,7 +83,10 @@ usage() {
   for a person. 5dive does not attempt to solve one. What this is: persistent
   human-authenticated sessions — not anti-bot bypassing.
   5dive browser run <site> <action> [--key=value ...]
-                                      # execute an adapter action, deterministically
+                                      # execute an adapter action, deterministically,
+                                      # inside the logged-in profile. The verdict is an
+                                      # out-of-band re-read of the artifact, never the
+                                      # executor's exit status.
   5dive browser shot <site> <url> [--out=<png>] [--dom=<file>] [--size=WxH|--full]
                                       # render a page INSIDE the logged-in profile:
                                       # a PNG (and the DOM) of what you would see.
@@ -94,6 +119,27 @@ USAGE
 # So creation is a root act, once, and every later run AUDITS instead of trusting.
 _seat_dir() { echo "$PROFILE_ROOT/$(_seat)"; }
 _site_dir() { echo "$(_seat_dir)/$1"; }
+
+# The search path, most-local first. Printed one per line so every caller reads
+# the SAME order and there is one place it can drift.
+_adapter_dirs() {
+  if [[ -n "${FIVEDIVE_BROWSER_ADAPTER_DIR:-}" ]]; then
+    printf '%s\n' "$FIVEDIVE_BROWSER_ADAPTER_DIR"; return 0
+  fi
+  printf '%s\n' "$(_seat_dir)/$ADAPTER_SEAT_SUBDIR"
+  printf '%s\n' "$ADAPTER_PKG_DIR"
+}
+# The file for a site: the first that EXISTS, else where one should be WRITTEN.
+# Both answers matter — the second is what every "no adapter" message names, and
+# naming the read-only package directory there is how a customer's hand-written
+# adapter came to be in the place an upgrade deletes.
+_adapter_path() {
+  local d
+  while IFS= read -r d; do
+    [[ -f "$d/$1.json" ]] && { printf '%s\n' "$d/$1.json"; return 0; }
+  done < <(_adapter_dirs)
+  printf '%s\n' "$(_adapter_dirs | head -1)/$1.json"
+}
 
 _valid_site() {
   # A site name becomes a directory name. Keep it to a shape that cannot traverse.
@@ -195,7 +241,7 @@ cmd_auth() {
 # user named, and this is only the URL its own adapter declares (or the bare
 # domain we guessed from the name). We do not choose per-site API-vs-browser paths.
 _site_url() {
-  local a; a="$ADAPTER_DIR/$1.json"
+  local a; a="$(_adapter_path "$1")"
   local u=""
   [[ -f "$a" ]] && u=$(jq -r '.probe.url // empty' "$a")
   [[ -n "$u" ]] && { printf '%s\n' "$u"; return 0; }
@@ -214,14 +260,14 @@ _site_url() {
   esac
 }
 _site_logged_out_marker() {
-  local a; a="$ADAPTER_DIR/$1.json"
+  local a; a="$(_adapter_path "$1")"
   [[ -f "$a" ]] && jq -r '.probe.logged_out_when_dom_matches // empty' "$a"
 }
 # THERE IS DELIBERATELY NO BYPASS BEHIND THIS. It classifies, names a human, and
 # stops. Decided 2026-09-07: "if a platform presents a security challenge, the
 # executor stops and requests human action rather than attempting to bypass it."
 _site_challenge_marker() {
-  local a; a="$ADAPTER_DIR/$1.json"
+  local a; a="$(_adapter_path "$1")"
   local m; m=$([[ -f "$a" ]] && jq -r '.probe.challenge_when_dom_matches // empty' "$a")
   echo "${m:-(g-recaptcha|hcaptcha|cf-challenge|/checkpoint/challenge|two-factor|verify-your-identity)}"
 }
@@ -330,7 +376,7 @@ _probe() {
   # `authenticated*` — which is the fail-closed half.
   if [[ -z "$marker" ]]; then
     _stamp "$dir" unknown
-    echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $ADAPTER_DIR/$site.json with probe.logged_out_when_dom_matches)"
+    echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $(_adapter_path "$site") with probe.logged_out_when_dom_matches)"
     return 0
   fi
   _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
@@ -355,8 +401,6 @@ cmd_ls() {
 # deliberately no `eval`, no `script`, and no free-text instruction step: any of
 # those would make the adapter a program the executor merely hosts.
 ADAPTER_STEPS="goto fill click wait_for select upload press"
-
-_adapter_path() { echo "$ADAPTER_DIR/$1.json"; }
 
 _adapter_validate() {
   local f="$1" action="$2"
@@ -393,6 +437,27 @@ cmd_run() {
   _adapter_validate "$f" "$action"
   _verify_spec "$f" "$action"
 
+  # A RUN NEEDS THE PROFILE THE SAME WAY A RENDER DOES (DIVE-4524). Chrome allows
+  # ONE instance per --user-data-dir: with a served browser holding this profile,
+  # the driver's Chrome hands its work to the running instance and exits with an
+  # empty document — the action would report nothing at all and the out-of-band
+  # verify would correctly call it NOT VERIFIED, every time, for a reason nobody
+  # could see. So `run` takes the same stop-render-restart cycle `shot` already
+  # has (login lives in the directory, not in the process; measured DIVE-4464),
+  # with the same one exception: a LIVE VIEWER is a person at a keyboard inside
+  # this browser right now, most likely part-way through the login the viewer
+  # exists for, and destroying their session to serve a machine is a refusal and
+  # not a cycle. Restore is an EXIT trap because `die` exits — a failed action
+  # must not leave a customer's browser stopped.
+  local sdisp
+  if sdisp=$(_serve_running "$dir"); then
+    ! _viewer_live "$dir" || die "$E_UNAVAILABLE" "the $site browser is being viewed by a person right now (:$sdisp). Running an action means stopping that browser, which would take their session away mid-login. Wait, or end it deliberately: 5dive browser viewer-revoke $site"
+    trap '_shot_restore' EXIT
+    _SHOT_RESTORE_SITE="$site"
+    cmd_serve "$site" --stop >/dev/null
+  fi
+
+
   # Args become named values substituted into step arguments. They are inserted
   # by jq as VALUES, never spliced into a command line.
   local args='{}' kv k v
@@ -425,13 +490,52 @@ cmd_run() {
       die "$E_COLD" "cannot confirm the $site session is live ($state). Refusing to act on a session we did not verify: an unverified session is as likely to be a challenge page as a healthy one, and this is the irreversible half. This state is deliberately QUIET on \`5dive browser status\` — a probe that did not load must not page a person — and fatal here. Re-run the probe, or clear it by hand: 5dive browser auth $site" ;;
   esac
 
-  local driver="${FIVEDIVE_BROWSER_DRIVER:-}"
-  [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend. Set FIVEDIVE_BROWSER_DRIVER to an executable that drives a REAL Chrome profile (the Browser Hand shape: extension + local relay). Playwright is the right tool for BUILDING an adapter and the wrong one for running it, so this refuses rather than falling back to one."
+  # THE SHIPPED EXECUTOR IS THE DEFAULT NOW (DIVE-4524). This was a bare refusal
+  # — FIVEDIVE_BROWSER_DRIVER was set by nothing but the test harness, so `run`
+  # died "no executor backend" on every box and a logged-in profile was a
+  # credential with no consumer. bin/driver-playwright drives THIS profile over
+  # --remote-debugging-pipe (no listening socket, see its header); the env var
+  # still overrides it, for the Browser Hand shape and for anyone driving their
+  # own.
+  #
+  # IT IS STILL NOT A FALLBACK. The refusal the old message was protecting —
+  # "never quietly drive a throwaway browser instead of the one a person logged
+  # into" — is enforced inside the driver, which has no launch path that is not
+  # this profile directory, rather than by having no driver at all.
+  # The driver drives the SAME browser the profile was logged in with, so the
+  # executable is resolved HERE, once, and passed down — a driver that picked its
+  # own chrome could drive a build the session was never created in. This sits
+  # AFTER the liveness probe deliberately: on a box with no browser at all the
+  # answer a person needs is "I could not verify this session", not "no chrome" —
+  # the missing-browser box is the one where an unverified session is most likely
+  # to be a challenge page nobody has looked at.
+  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — an action needs the same browser the profile was logged in with."
+
+  local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
+  [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver. Set FIVEDIVE_BROWSER_DRIVER to an executable that drives a REAL Chrome profile (the Browser Hand shape: extension + local relay), or reinstall the plugin so its own driver is back. This never falls back to a throwaway browser: an action that did not run inside the profile a person logged into by hand is not the thing that was asked for."
 
   local plan; plan=$(jq -c --arg a "$action" --arg profile "$dir" --argjson args "$args" \
       '{profile: $profile, steps: .actions[$a].steps, args: $args}' "$f")
-  FIVEDIVE_BROWSER_PROFILE="$dir" "$driver" <<<"$plan"
+  FIVEDIVE_BROWSER_PROFILE="$dir" FIVEDIVE_BROWSER_CHROME="$chrome" "$driver" <<<"$plan"
   local drc=$?
+
+  # Put the browser back BEFORE the out-of-band verify: the verify is a plain
+  # fetch that needs no profile, and a customer whose browser is down should not
+  # be waiting on a 30s curl to get it back.
+  _shot_restore
+  trap - EXIT
+
+  # EXIT 70 MEANS NOTHING RAN, and it must not reach the verify. The verify is an
+  # out-of-band re-read of the artifact URL, which is exactly the right verdict
+  # for an action that executed and exactly the WRONG one for an action that
+  # never started: whatever is already at that URL would be reported as this
+  # run's success. An executor that is not installed on this box would then read
+  # as a green publish. The driver raises 70 for every refusal it makes before
+  # its first step; a driver that does not use the code loses nothing (it falls
+  # through to the re-read, which is the old behaviour).
+  if (( drc == 70 )); then
+    die "$E_UNAVAILABLE" "the executor refused before it ran a single step, so nothing was published and there is nothing to re-read (it exited 70; its own reason is above). Not treating the artifact URL as evidence: whatever is already there was not put there by this run."
+  fi
 
   # AND HERE IS THE WHOLE POINT. The driver's exit status is evidence, not a
   # verdict: "posted the wrong thing and reported success" and "published fine and
@@ -944,8 +1048,18 @@ _SHOT_RESTORE_SITE=""
 _shot_restore() {
   [[ -n "$_SHOT_RESTORE_SITE" ]] || return 0
   local s="$_SHOT_RESTORE_SITE"; _SHOT_RESTORE_SITE=""
-  cmd_serve "$s" >/dev/null 2>&1 || \
-    printf '%s: WARNING — could not restart the %s browser after the render. The profile is intact; start it again: 5dive browser serve %s\n' "$PROG" "$s" "$s" >&2
+  # THE SUBSHELL IS THE WHOLE POINT, and without it the `||` below can never run
+  # (DIVE-4524). `cmd_serve` reports failure by calling `die`, and `die` EXITS —
+  # attaching a catch to a command that exits does not make it catchable, it just
+  # hides the message (this call silences stderr, so the die text goes nowhere).
+  # The observed shape: a render or an action that fully SUCCEEDED, whose browser
+  # could not be restarted, exited 69 with no output at all — no PNG line, no
+  # verify line, no reason. A subshell contains the exit, so the warning is
+  # printed, the command keeps its own verdict, and the one thing that is true is
+  # the one thing the caller is told: the profile is intact, the browser is not
+  # back up.
+  ( cmd_serve "$s" >/dev/null 2>&1 ) || \
+    printf '%s: WARNING — could not restart the %s browser afterwards. The profile is intact — it is the durable half; start it again: 5dive browser serve %s\n' "$PROG" "$s" "$s" >&2
 }
 
 # A viewer is LIVE when the process that answers it is alive. The pidfile alone
@@ -1030,6 +1144,15 @@ cmd_shot() {
   [[ -n "$out" ]] || out="$PWD/${site}-${stamp}.png"
   local odir; odir=$(dirname "$out")
   [[ -d "$odir" ]] || die "$E_USAGE" "no directory $odir to write the PNG into"
+
+  # --out AND --dom AT THE SAME PATH IS A REFUSAL (DIVE-4488 precision note).
+  # The DOM is a SECOND load, and it runs AFTER the PNG has been written and
+  # checked — so the same path means this prints "rendered ... <path>" over a
+  # file that now holds HTML. The reader is told there is a screenshot there and
+  # there is not, which is this verb's own failure mode wearing a new hat.
+  if [[ -n "$domout" ]] && [[ "$(cd "$(dirname "$domout")" 2>/dev/null && pwd)/$(basename "$domout")" == "$(cd "$odir" && pwd)/$(basename "$out")" ]]; then
+    die "$E_USAGE" "--out and --dom resolve to the same file ($out). The DOM is written after the PNG, so this would report a successful render over a file holding HTML. Give them separate paths."
+  fi
 
   local w="${size%x*}" h="${size#*x}"
 
