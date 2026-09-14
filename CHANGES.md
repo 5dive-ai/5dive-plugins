@@ -9,6 +9,17 @@ adds copy-paste/do-not-return guidance; ordinary URLs and nonce lookalikes are u
 browser workflow carries the same rule for future chat adapters and records that a dashboard may
 offer copy-only UI but must never prefetch the credential.
 
+### Added — authenticated browser pages can be read as Markdown with a hash-bound evidence triple (DIVE-4515), browser 1.4.0
+
+`5dive browser read <site> <url>` now reuses the `shot` authentication and profile boundary, then
+captures one post-script DOM with Chrome `--dump-dom` and extracts the article through a vendored,
+exactly pinned Defuddle 0.19.3 bundle. It writes private `page.md`, `page.html`, and
+`page.meta.json` artifacts; the metadata binds the exact DOM bytes by SHA-256 and records URLs,
+article fields, links, images, schema.org data, extractor version, Chrome version, and capture
+method. `--json` returns metadata plus Markdown, while `browser links` uses the same capture and
+prints only the extracted links. Logged-out, cross-site, live-viewer, and profile-directory output
+attempts fail before producing evidence, and the read opens no CDP socket.
+
 ### Fixed — a failed gate tap said "exited 126 without reporting a reason" while the reason was in hand (DIVE-4445)
 
 When the 5dive CLI dies without reaching an error path, its own backstop
