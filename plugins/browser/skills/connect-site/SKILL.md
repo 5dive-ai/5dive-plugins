@@ -107,6 +107,12 @@ Then, and only then, the profile is usable:
   carries the login markup. Trust the label; do not re-derive it from the HTML.
 - **Sessions die on the site's schedule, not ours.** Run `status` on a schedule, not at
   publish time — otherwise you discover the logout mid-action.
+- **Setup installs that schedule.** `sudo 5dive browser setup` enables a per-seat systemd timer
+  which runs `5dive browser probe-all` about every six hours. The sweep prints `skipped: served`
+  and leaves the existing liveness stamp untouched for a profile whose browser is open; close the
+  view/browser before asking for an immediate check.
+- **Back up hand-written adapters outside the installed plugin.** An upgrade can replace the
+  plugin directory; unpublished adapter files there are not durable configuration.
 
 ## The line this capability does not cross
 
