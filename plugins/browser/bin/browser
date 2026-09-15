@@ -210,8 +210,12 @@ EOF
 Description=Probe 5dive browser profiles every six hours
 
 [Timer]
-OnBootSec=15m
-OnUnitActiveSec=6h
+# OnCalendar, not OnUnitActiveSec: Persistent= "only has an effect on timers
+# configured with OnCalendar=" (systemd.timer(5)). Under a monotonic trigger the
+# directive is INERT, so a box that was off through a window never catches up —
+# and that is the one case the customer sees, because the tile is stale exactly
+# when the box comes back. The randomized delay keeps the fleet off the hour.
+OnCalendar=*-*-* 00/6:00:00
 RandomizedDelaySec=30m
 Persistent=true
 Unit=5dive-browser-probe@%i.service

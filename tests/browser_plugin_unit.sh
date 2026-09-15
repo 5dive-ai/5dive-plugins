@@ -233,15 +233,107 @@ t  'T2c5 ...and the store root too' 'yes' "$(grep -q 'chmod 00711 "\$PROFILE_ROO
 t  'T2c6 a root caller with SUDO_USER re-executes as the seat before touching a store' 'yes' "$(grep -q 'exec runuser -u "\$_drop" -- "\$0" "\$@"' "$ROOT/plugins/browser/bin/browser" && echo yes || echo no)"
 t  'T2c7 ...but setup stays root'"'"'s' 'yes' "$(grep -A2 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|-h|--help|help|"") ;;' && echo yes || echo no)"
 
-# DIVE-4519: setup owns the schedule instead of leaving "run this on a
-# schedule" as prose. These arms kill a non-persistent timer and a root service
-# that cannot read the seat-owned 0700 profile store.
-t  'T2c8 setup installs a persistent six-hour probe timer' 'yes' \
-  "$(grep -q 'OnUnitActiveSec=6h' "$BROWSER" && grep -q 'Persistent=true' "$BROWSER" && echo yes || echo no)"
-t  'T2c8 ...running as the timer instance seat' 'yes' \
-  "$(grep -q 'User=%i' "$BROWSER" && echo yes || echo no)"
-t  'T2c8 ...and invokes the fleet sweep, not bare status' 'yes' \
-  "$(grep -q 'ExecStart=.*browser probe-all' "$BROWSER" && echo yes || echo no)"
+# DIVE-4519 iteration 2 — setup owns the schedule, and these arms DRIVE setup.
+#
+# WHY THE GREPS THEY REPLACE GRADED NOTHING. The first cut of T2c8 matched three
+# strings inside _install_probe_timer's heredocs. Two anchored mutants, run at
+# the graded sha, both left the suite green: deleting the `_install_probe_timer
+# "$seat"` CALL from cmd_setup (the function, and every string it contains, stay
+# in the file) and dropping `enable --now` from the systemctl chain (units get
+# written and never started). Either one ships a fleet where no box ever probes
+# itself — which is the entire "is it automatic?" claim this row answers. A grep
+# over a heredoc cannot see a caller and cannot see an argv.
+#
+# So: run cmd_setup as a subprocess with the seams it already declares —
+# FIVEDIVE_BROWSER_SYSTEMD_DIR at a tmp dir, FIVEDIVE_BROWSER_SYSTEMCTL at a
+# stub that LOGS ITS ARGV, `id` faked to root, and a stub `5dive` on PATH so
+# ExecStart is an exact string rather than whatever this runner happens to have
+# installed — then assert on the files that land and the commands that ran.
+SETUPBIN="$TMP/setupbin"; mkdir -p "$SETUPBIN"
+REALID="$(command -v id)"
+cat > "$SETUPBIN/id" <<ID
+#!/usr/bin/env bash
+# fake root for \`id -u\`, and ONLY for that: \`id -u <user>\` (setup's "is the
+# seat a real uid" check) and \`id -un\` must still answer truthfully, or the arm
+# grades the stub instead of setup.
+[[ "\$*" == "-u" ]] && { echo 0; exit 0; }
+exec "$REALID" "\$@"
+ID
+cat > "$SETUPBIN/systemctl" <<'SCTL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+exit "${SYSTEMCTL_RC:-0}"
+SCTL
+cat > "$SETUPBIN/5dive" <<'FIVE'
+#!/usr/bin/env bash
+exit 0
+FIVE
+chmod +x "$SETUPBIN/id" "$SETUPBIN/systemctl" "$SETUPBIN/5dive"
+
+SDIR="$TMP/systemd"
+SUNIT="$SDIR/5dive-browser-probe@.service"
+STIMER="$SDIR/5dive-browser-probe@.timer"
+export SYSTEMCTL_LOG="$TMP/systemctl.log"
+: > "$SYSTEMCTL_LOG"
+setup_run() {  # setup_run — drive a real cmd_setup into $TMP/setup-store
+  run env PATH="$SETUPBIN:$PATH" \
+      FIVEDIVE_BROWSER_PROFILE_ROOT="$TMP/setup-store" \
+      FIVEDIVE_BROWSER_SYSTEMD_DIR="$SDIR" \
+      FIVEDIVE_BROWSER_SYSTEMCTL=systemctl \
+      SYSTEMCTL_LOG="$SYSTEMCTL_LOG" SYSTEMCTL_RC="${1:-0}" \
+      "$BROWSER" setup
+}
+
+setup_run
+t  'T2c8 setup exits 0'                                  0     "$RC"
+tc 'T2c8 ...and still does its original job: the store'  'profile store ready' "$OUT"
+t  'T2c8 ...seat store is 0700'                          '700' "$(stat -c '%a' "$TMP/setup-store/$SEAT" 2>/dev/null)"
+# THE FIRST MUTANT: delete the _install_probe_timer call from cmd_setup. Nothing
+# lands, and these two go red.
+t  'T2c8 ...installs the probe service unit'             'yes' "$([[ -f "$SUNIT" ]] && echo yes || echo no)"
+t  'T2c8 ...installs the probe timer unit'               'yes' "$([[ -f "$STIMER" ]] && echo yes || echo no)"
+# THE SECOND MUTANT: drop `enable --now` from the systemctl chain. The units are
+# written, the timer never starts, and only the argv can tell.
+tc 'T2c8 ...enables AND starts the timer for THIS seat' "enable --now 5dive-browser-probe@$SEAT.timer" \
+   "$(cat "$SYSTEMCTL_LOG")"
+tc 'T2c8 ...after reloading the unit files it just wrote' 'daemon-reload' "$(cat "$SYSTEMCTL_LOG")"
+# The service must run as the timer's instance seat, not as root: the profile
+# store it sweeps is 0700 and owned by the seat.
+tc 'T2c8 ...the service runs as the instance seat'        'User=%i' "$(cat "$SUNIT")"
+# ExecStart is pinned to an absolute path AND to probe-all: a bare `status` with
+# no site would try to probe a served profile and stamp it UNKNOWN.
+tc 'T2c8 ...and execs probe-all by absolute path'  "ExecStart=$SETUPBIN/5dive browser probe-all" "$(cat "$SUNIT")"
+# DIVE-4519 iteration 2 (b): Persistent= "only has an effect on timers configured
+# with OnCalendar=" (systemd.timer(5)). The first cut paired it with OnBootSec=/
+# OnUnitActiveSec= only, so the README's "a missed run catches up" was a claim
+# about an inert directive. Grade the PAIR, not either half.
+t  'T2c8 ...catch-up is real: Persistent= is paired with OnCalendar='  'yes' \
+   "$(grep -q '^Persistent=true' "$STIMER" && grep -q '^OnCalendar=' "$STIMER" && echo yes || echo no)"
+tn 'T2c8 ...and not with a monotonic trigger that makes it inert' 'OnUnitActiveSec=' "$(cat "$STIMER")"
+tc 'T2c8 ...fleet does not probe in lockstep'  'RandomizedDelaySec=' "$(cat "$STIMER")"
+# Idempotence: setup is documented as re-runnable. Re-running must not stack
+# units, leave staging files behind, or stop re-enabling the timer.
+_sum_before="$(cat "$SUNIT" "$STIMER" | md5sum)"
+: > "$SYSTEMCTL_LOG"
+setup_run
+t  'T2c8 a second setup is idempotent: exits 0'   0 "$RC"
+t  'T2c8 ...leaves the same two unit files'       "$_sum_before" "$(cat "$SUNIT" "$STIMER" | md5sum)"
+t  'T2c8 ...and no half-written staging files'    '2' "$(ls -A "$SDIR" | wc -l)"
+tc 'T2c8 ...and re-enables rather than assuming'  "enable --now 5dive-browser-probe@$SEAT.timer" "$(cat "$SYSTEMCTL_LOG")"
+# DECLARED-GAP ARM (the verifier's "unverified": a box whose systemd will not
+# take the unit). setup must fail LOUDLY — a silent 0 is a box that never probes
+# and says it is automatic — while saying the store itself is ready, and must
+# leave the store usable so a rerun after the box is fixed needs nothing undone.
+rm -rf "$SDIR" "$TMP/setup-store"
+setup_run 1
+t  'T2c8 a systemd that refuses the timer is not a silent success' 69 "$RC"
+tc 'T2c8 ...and the message says the STORE is ready, only the probe is not' \
+   'profile store is ready, but the scheduled browser probe could not be enabled' "$ERR"
+t  'T2c8 ...the seat store survives the failure, so a rerun is a no-op' '700' \
+   "$(stat -c '%a' "$TMP/setup-store/$SEAT" 2>/dev/null)"
+setup_run
+t  'T2c8 ...and the rerun, once systemd takes it, succeeds' 0 "$RC"
+rm -rf "$SDIR" "$TMP/setup-store"
 
 # A site name becomes a directory name.
 for bad in ../etc "a/b" "" "UPPER"; do

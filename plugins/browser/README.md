@@ -169,9 +169,12 @@ interstitial on "unusual activity". A profile that worked Monday is logged out T
 without a scheduled probe the agent finds out **mid-publish**. So:
 
 - `sudo 5dive browser setup` installs and enables a **per-seat systemd timer** which runs
-  `probe-all` about every six hours (`Persistent=true`, with a small randomized delay). Systemd,
-  rather than cron, makes a missed run catch up after reboot, keeps the seat identity explicit,
-  and puts each sweep in the journal. Re-running setup reconciles and re-enables the same units.
+  `probe-all` on a six-hourly calendar (`OnCalendar=*-*-* 00/6:00:00`, plus a randomized delay of
+  up to 30m so a fleet does not probe in lockstep). It is a CALENDAR schedule and not an interval
+  on purpose: `Persistent=true` only has an effect on a calendar timer (systemd.timer(5)), and
+  that is what makes a window missed while the box was down run once when it comes back. Systemd,
+  rather than cron, also keeps the seat identity explicit (`5dive-browser-probe@<seat>.timer`) and
+  puts each sweep in the journal. Re-running setup reconciles and re-enables the same units.
 - `probe-all` attempts every eligible profile, but prints `skipped: served` and leaves the
   liveness stamp untouched when a profile is open in server mode. Holding the profile makes a
   second Chrome probe invalid; the next timer run, or the dashboard's close-view action, checks it
