@@ -1200,6 +1200,19 @@ for pair in "skill:$SKILL" "doc:$DOCF"; do
   tn "T14b ...does not tell another seat to serve its own unreachable profile ($W)" 'under YOUR seat' "$TXT"
   tc "T14b ...forbids polling while Chromium holds the profile ($W)" 'Never poll `status` while `serve` is still running' "$TXT"
 
+  # DIVE-4523 iteration 2: the non-unfurling handoff is DIVE-4493's SHIPPED
+  # guard, not doc decoration — a bare URL in a chat message is redeemed by the
+  # platform's preview bot seconds before the human taps it. test/viewer-link-
+  # unfurl.test.ts asserts these strings in SKILL.md only, so a rewrite that
+  # dropped them from the shared fenced block scored 470/0 here and red there.
+  # These arms bind the mechanism to BOTH surfaces, in the fenced block.
+  tc "T14b ...names the Telegram non-unfurling call ($W)" "format: 'markdownv2'" "$TXT"
+  tc "T14b ...puts the link in a MarkdownV2 code span ($W)" 'MarkdownV2 code span' "$TXT"
+  tc "T14b ...generalises the rule to other chat surfaces ($W)" 'non-unfurling code formatting' "$TXT"
+  tc "T14b ...keeps the copy-paste warning ($W)" 'Copy-paste this one-time link into your browser' "$TXT"
+  tc "T14b ...tells the human not to paste it back ($W)" 'Do not paste it back into chat' "$TXT"
+  tc "T14b ...forbids recording the live link anywhere durable ($W)" 'a log line or a wiki page' "$TXT"
+
   REVOKE_LINE=$(grep -nF '5dive browser viewer-revoke <site>' "$F" | tail -1 | cut -d: -f1)
   STOP_LINE=$(grep -nF '5dive browser serve <site> --stop' "$F" | tail -1 | cut -d: -f1)
   STATUS_LINE=$(grep -nF '5dive browser status <site>' "$F" | tail -1 | cut -d: -f1)

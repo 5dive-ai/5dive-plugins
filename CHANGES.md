@@ -9,6 +9,18 @@ non-unfurling, and verifies a login only after revoke → stop → status. The o
 produce a path with no live bind, target the wrong seat, and poll forever while Chromium held the
 profile lock.
 
+The handoff step states DIVE-4493's guard concretely rather than by reference — on Telegram, `reply`
+with `format: 'markdownv2'` and the link in a MarkdownV2 code span; elsewhere that surface's
+non-unfurling code formatting — and keeps the copy-paste warning and the rule against recording a
+live link in a task body, PR, commit, log line or wiki page. `tests/browser_plugin_unit.sh` now
+guards those strings in BOTH surfaces, so a rewrite cannot drop them while the bash harness stays
+green; previously only `test/viewer-link-unfurl.test.ts` held them, and only for the skill.
+
+`plugins/browser/README.md` no longer says the customer-facing flow ships dark and unlogged-into:
+the dashboard tile went to production 2026-09-12 (DIVE-4355) and a human logged into real sites
+through real one-time viewers on a managed box 2026-09-14 (DIVE-4464). The RELAY-mode caveat below
+it is unchanged and still true.
+
 ### Fixed — Telegram previewers spent one-time browser viewer links before the human could use them (DIVE-4493), browser 1.3.1 · telegram 0.5.53 · grok/agy 0.5.21 · codex 0.5.14 · opencode 0.5.12 · pi 0.1.12
 
 All six Telegram adapters now recognize the exact browser-viewer route at their Bot API

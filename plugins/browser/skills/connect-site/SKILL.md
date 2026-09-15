@@ -57,10 +57,17 @@ not substitute the raw `viewer` command: it mints only one half of the relay cre
    `/browser/viewer/<site>/<nonce>`, not a usable absolute URL. An ordinary agent seat has
    neither the relay seat nor the connectord token, so it must not hand raw CLI output to a
    person: the click will be refused as `no live bind`.
-3. **Hand over the dashboard's absolute URL unopened, as non-unfurling code.** Say: “Copy-paste
-   this one-time link into your browser. Do not paste it back into chat.” It must begin with
-   `https://<box-host>/browser/viewer/…`. Never open, curl, fetch, preview, or log it. The
-   ticket is spent by the first successful GET and expires quickly.
+3. **Hand over the dashboard's absolute URL unopened, as non-unfurling code.** A chat
+   previewer spends the link before the human ever sees it, so it must never be emitted as a
+   detected bare URL. On Telegram, call `reply` with `format: 'markdownv2'` and put the link
+   inside a MarkdownV2 code span; on any other chat surface, use its
+   non-unfurling code formatting. The Telegram plugins enforce it at their Bot API boundary.
+   Say:
+   "Copy-paste this one-time link into your browser. Do not paste it back into chat." The URL
+   must begin with `https://<box-host>/browser/viewer/…`. Never open, curl, fetch, preview,
+   or log it — the ticket is spent by the first successful GET and expires quickly. Do not put
+   it in a task body, a PR, a commit message, a log line or a wiki page: it is a live
+   credential for as long as it is unspent.
 4. **Wait for the person to finish the login in that viewer.** Diagnose progress from the
    shelld journal, never by visiting the link. `viewer_redeemed` plus `viewer_ws_connected`
    means the person is in; `viewer_denied` supplies the reason.
