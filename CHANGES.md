@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Fixed — the browser connect-site runbook now follows the shipped bound viewer flow (DIVE-4523), browser 1.5.2
+### Fixed — the browser connect-site runbook now follows the shipped bound viewer flow (DIVE-4523), browser 1.5.3
 
 The Claude skill and harness-neutral AGENTS block now carry one byte-identical fenced workflow. It
 starts from the dashboard action that registers the relay bind and prefixes the box host, names the
