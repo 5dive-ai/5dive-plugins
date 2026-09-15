@@ -414,14 +414,13 @@ a library nobody chose. The driver looks in exactly two places, in order: the di
 names, if any, then `plugins/browser/node_modules`. There is no ancestor walk, so "not installed"
 is a fact about those two places rather than about where the plugin was unpacked.
 
-## Not shipped yet, and named so nobody assumes it
+## Shipped, and what is still named so nobody assumes it
 
-- **The customer-facing FLOW.** Server mode and the viewer above are built, but they ship **dark**:
-  reachable by hand on a box that has the packages, wired to no button. The dashboard tile and the
-  relay that gates on `viewer-redeem` are DIVE-4239; the provisioning that installs
-  chromium/xvfb/x11vnc/websockify is DIVE-4238; and no human has yet logged into a real site
-  through a real viewer on a managed box. Until that end-to-end arm runs, the flow is not shipped —
-  a tile that promises a login nobody has driven is the failure DIVE-3590 named.
+- **The customer-facing FLOW is live.** The dashboard's Connected sites tile went to production on
+  2026-09-12 (DIVE-4355), and on 2026-09-14 a human logged into real sites through real one-time
+  viewers on a managed box, ending `authenticated` (DIVE-4464). The flow is no longer dark and no
+  longer wired to no button; the runbook for driving it is `skills/connect-site/SKILL.md` and the
+  same fenced workflow in `AGENTS.md`. What the tile promises, someone has now driven end to end.
 - **RELAY mode** — an outbound relay to Chrome on the user's own laptop. It must target a
   **dedicated profile on that desktop, never the user's default**; reaching the default discards
   the entire reason profile-per-site is the design, turning an adapter bug into their bank and

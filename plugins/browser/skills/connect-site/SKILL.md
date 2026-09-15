@@ -3,7 +3,7 @@ name: connect-site
 description: Get a human logged into a site on the box, then use that logged-in session. Use when you need a site the agent has no session for — "log in to X", "connect my X account", "the agent needs a logged-in X", "open a browser on the box", "X says I'm signed out" — or when `5dive browser status` is not `authenticated`. Not for fetching a public page (use a normal fetch) and not for anything a site's API already does.
 ---
 
-# connect-site — serve, hand over the link, poll to authed
+# connect-site — use the bound dashboard handoff, then stop and check
 
 You cannot log a person in. What you CAN do is put a real browser on the box, mint a
 one-time link to it, hand that link to the human over whatever channel you are paired to,
@@ -37,58 +37,60 @@ sudo journalctl -u shelld -n 200 --no-pager \
 The other safe probe is a **deliberately bad nonce**: a refusal is a pure refusal and
 spends nothing. A good nonce is the customer's only redemption.
 
-## The flow
+<!-- 5dive:connect-site-flow:begin -->
+## The shipped flow
 
-```bash
-5dive browser serve <site>                                 # 1. persistent Chrome on its own Xvfb
-5dive browser viewer <site> --bind=<session> [--ttl=600]   # 2. mint ONE-TIME link (prints it once)
-#                                                            3. HAND THE LINK TO THE HUMAN, unopened
-5dive browser status <site>                                # 4. poll until `authenticated`
-5dive browser viewer-revoke <site>                         # 5. close the view; the login survives
-```
+The supported customer handoff starts from **Connected sites in the 5dive dashboard**. Do
+not substitute the raw `viewer` command: it mints only one half of the relay credential.
 
-1. **`serve`** starts the browser and its display. It is idempotent per site.
-2. **`viewer`** prints the link exactly once — it stores only a SHA-256 of the nonce, so a
-   link you lose is gone and you re-mint. `--bind=<session>` is **mandatory** (an unbound
-   ticket would be a bearer credential for a live account); `--bind=local` is the named
-   escape for a hand-run on the box. Default TTL is short on purpose — mint it *when the
-   human is actually there*, not an hour ahead.
-3. **Hand it over on the channel you are already on**, with the two facts that change their
-   behaviour: it is **one-time** and it **expires**. A chat previewer spends the link before
-   the human sees it, so it must never be emitted as a detected bare URL. On Telegram, call
-   `reply` with `format: 'markdownv2'`, put the link inside a MarkdownV2 code span, and say:
-   "Copy-paste this one-time link into your browser. Do not paste it back into chat." The
-   Telegram plugins also enforce that rule at their Bot API boundary. On any other chat
-   surface, use its non-unfurling code formatting and the same copy-paste warning. A browser
-   dashboard may expose copy-only text or a copy button; it must not fetch the URL itself.
-   Do not put the link in a task body, a PR, a commit, a log line or a wiki page: it is a live
+1. **Make the site classifiable before login.** `status` can say `authenticated` only when
+   an adapter supplies `probe.url` and `probe.logged_out_when_dom_matches`. Browser commands
+   redeemed by the shipped relay run as seat `claude`, not as the agent asking for the login.
+   A custom adapter for that relay seat belongs at
+   `/var/lib/5dive/browser-profiles/claude/.adapters/<site>.json`; shipped adapters are the
+   fallback in the dispatched plugin's `adapters/` directory. The seat-local path supersedes
+   the old instruction to edit the package directory, which `plugin upgrade` replaces.
+2. **Use the dashboard's Connect action.** The control plane runs `serve` and `viewer` under
+   the relay's `claude` seat, registers the opaque bind through the authenticated
+   `/shell/browser-viewer-bind` endpoint, and prefixes the box's HTTPS host. `viewer` itself
+   does **not** register that bind; the bind is mandatory. The command prints only a path such as
+   `/browser/viewer/<site>/<nonce>`, not a usable absolute URL. An ordinary agent seat has
+   neither the relay seat nor the connectord token, so it must not hand raw CLI output to a
+   person: the click will be refused as `no live bind`.
+3. **Hand over the dashboard's absolute URL unopened, as non-unfurling code.** A chat
+   previewer spends the link before the human ever sees it, so it must never be emitted as a
+   detected bare URL. On Telegram, call `reply` with `format: 'markdownv2'` and put the link
+   inside a MarkdownV2 code span; on any other chat surface, use its
+   non-unfurling code formatting. The Telegram plugins enforce it at their Bot API boundary.
+   Say:
+   "Copy-paste this one-time link into your browser. Do not paste it back into chat." The URL
+   must begin with `https://<box-host>/browser/viewer/…`. Never open, curl, fetch, preview,
+   or log it — the ticket is spent by the first successful GET and expires quickly. Do not put
+   it in a task body, a PR, a commit message, a log line or a wiki page: it is a live
    credential for as long as it is unspent.
-4. **`status <site>`** is the only honest confirmation. Poll it every ~15–30s while they are
-   logging in (not tighter — each probe is a real page load). Terminal states:
-   - `authenticated` — done. The profile is now reusable by `5dive browser run`.
-   - `session expired` / `CHALLENGE` — a person is still needed; say what the page asks for.
-   - `UNKNOWN` — the probe could not read the page at all. This is **not** a failure to
-     report and **not** permission to act: `status` stays quiet and exits 0, and `run`
-     refuses on it. Re-probe; if it stays UNKNOWN, the browser or the box stack is the
-     problem, not the login.
-5. **`viewer-revoke`** ends the view as soon as they are in. The login is the durable half;
-   the view onto it is the ephemeral half and it is a keyboard attached to their account.
-   Leaving it open is the only part of this flow that gets *worse* with time.
+4. **Wait for the person to finish the login in that viewer.** Diagnose progress from the
+   shelld journal, never by visiting the link. `viewer_redeemed` plus `viewer_ws_connected`
+   means the person is in; `viewer_denied` supplies the reason.
+5. **End the view before checking the login.** The dashboard/control-plane completion action
+   (or an authorised operator acting as the relay seat) must perform this order:
 
-Then, and only then, the profile is usable:
+   ```bash
+   5dive browser viewer-revoke <site>
+   5dive browser serve <site> --stop
+   5dive browser status <site>
+   ```
 
-- `5dive browser run <site> <action> [--key=value ...]` — act, deterministically, via an adapter.
-- `5dive browser shot <site> <url> [--out=<png>] [--dom=<file>]` — **read**: render a page inside
-  the logged-in profile and get a PNG of what the human would see, plus the DOM on request. This
-  is how a grader sees a page that lives behind the login, and how you read a thread on a site
-  that shows a logged-out visitor nothing.
+   Never poll `status` while `serve` is still running. Chromium holds the profile lock, so a
+   second probe returns `UNKNOWN (served on :N …)` and cannot confirm the login. Stopping the
+   browser preserves the profile and the login.
+6. **Read the terminal result.** `authenticated` makes the profile usable. `session expired`
+   or `CHALLENGE` still needs a person. `UNKNOWN (no adapter …)` means step 1 is incomplete;
+   another `UNKNOWN` names a browser/box read failure and is not permission to act. Only after
+   `authenticated` may an agent use `run`, `shot`, `read`, or `links` for that site.
 
-  `shot` renders **only** when `status` says `authenticated`. Every other state — including
-  `UNKNOWN` because the site has no adapter — writes no file. The reason is specific: a
-  screenshot of the **sign-in page** is evidence-shaped, and the person you hand it to cannot
-  tell it from the real page. The URL must belong to that site (a subdomain is fine). A served
-  browser is stopped for the render and started again; a viewer with a **person inside it right
-  now** is a refusal, because a screenshot does not get to end someone's login.
+The view is ephemeral; the login profile is durable. Revoke promptly: a live viewer is a
+keyboard attached to the person's account.
+<!-- 5dive:connect-site-flow:end -->
 
 ## What will actually go wrong
 
@@ -97,22 +99,25 @@ Then, and only then, the profile is usable:
   install them. The refusal names what is missing, and the box's DEGRADED health row names
   the re-install command. Report that to the human; do not improvise an install.
 - **Profiles are per-seat, mode 0700, and never repaired.** Another seat's login is not
-  yours to use, and a profile with wrong ownership is refused rather than fixed. If you
-  need the session, you serve it under YOUR seat and the human logs in again.
+  yours to use, and a profile with wrong ownership is refused rather than fixed. The shipped
+  relay currently redeems the `claude` seat, so a different seat must use the dashboard flow
+  rather than minting a ticket against its own unreachable profile.
 - **Some sites block datacenter IPs at login** ("your request has been blocked",
   "suspicious network"). That is the site's anti-bot policy meeting a VM's IP — it is not
   our bug, there is no flag for it, and the honest answer to the human is that this site
   cannot be logged into from the box. Say so and stop.
 - **A challenge is classified BEFORE a logged-out state**, because a challenge page still
   carries the login markup. Trust the label; do not re-derive it from the HTML.
-- **Sessions die on the site's schedule, not ours.** Run `status` on a schedule, not at
-  publish time — otherwise you discover the logout mid-action.
+- **Sessions die on the site's schedule, not ours.** A scheduled check must skip a profile
+  while it is served, then probe it once the browser is stopped; otherwise the profile lock
+  produces `UNKNOWN` instead of a liveness verdict.
 - **Setup installs that schedule.** `sudo 5dive browser setup` enables a per-seat systemd timer
   which runs `5dive browser probe-all` about every six hours. The sweep prints `skipped: served`
   and leaves the existing liveness stamp untouched for a profile whose browser is open; close the
   view/browser before asking for an immediate check.
-- **Back up hand-written adapters outside the installed plugin.** An upgrade can replace the
-  plugin directory; unpublished adapter files there are not durable configuration.
+- **Hand-written adapters live outside the installed plugin.** An upgrade replaces the plugin
+  directory, so a custom `<site>.json` belongs in the relay seat's store named in step 1, never
+  in the dispatched package's `adapters/`.
 
 ## The line this capability does not cross
 
