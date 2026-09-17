@@ -79,6 +79,10 @@ usage() {
                                       # the relay's gate: consumes the link, prints the loopback target
   5dive browser viewer-revoke <site>  # kill the view; the browser stays logged in
 
+  5dive browser adblock status              # is ad filtering on, and which sites is it off for
+  sudo 5dive browser adblock off <site>     # this site breaks under filtering — stop filtering it
+  sudo 5dive browser adblock on  <site>     # filter it again
+
   5dive browser doc [--append=<file>]
                                       # print the agent-facing workflow doc (any harness),
                                       # or install it into a seat's AGENTS.md / CLAUDE.md
@@ -1486,6 +1490,139 @@ _doc_fence_or_die() {
   return 0
 }
 
+# --- adblock: the per-site OFF switch (DIVE-4516) -----------------------------
+#
+# ONE extension is allowed in an agent Chrome profile — uBlock Origin Lite, pinned
+# — because cookie walls, ad iframes and consent overlays are what an agent clicks
+# by accident and what makes a `shot`/`read` DOM several times larger than the
+# article. Some sites break under filtering, so lodar's direction asks for a way to
+# turn it off for one site without turning it off everywhere.
+#
+# uBOL's OWN per-site switch lives in its popup and is not scriptable from a seat.
+# The one that IS scriptable is Chrome managed policy:
+# `ExtensionSettings.<id>.runtime_blocked_hosts`. That is documented against
+# content-script injection and extension API access, and uBOL Lite filters through
+# declarativeNetRequest — a different mechanism in the network stack — so this was
+# MEASURED before it was built on, on exact-swallow at Chrome 153 (2026-09-14,
+# receipt on DIVE-4516): with the key set for the host, the DNR block disappeared
+# (0 -> 3000 divs, 149 B -> 65002 B) AND the content script stopped injecting;
+# removing the key restored both. It is a real off switch, and it is total.
+#
+# WHY THIS VERB IS ROOT. Chrome policy on Linux is machine-level only — there is
+# no per-user policy path — so the file belongs to root and this is the same shape
+# as `setup`. The off list, not the policy file, is the SOURCE OF TRUTH: the
+# nightly root converge (scripts/inc/browser-stack.sh) re-renders the whole policy
+# file, and a site turned off at 14:00 that lived only in that file would be
+# silently re-filtered at 03:00 with nobody to notice.
+_ADBLOCK_STATE_DIR="$STATE_DIR/browser/ubol"
+_ADBLOCK_OFF_FILE="$_ADBLOCK_STATE_DIR/adblock-off"
+# Same rule as the converger's _bs_policy_dir, and for the same reason: google-chrome
+# and chromium read different paths, and writing the wrong one is a file nobody
+# loads — which is indistinguishable from success unless you look for it.
+_adblock_policy_file() {
+  local dir="${CHROME_POLICY_DIR:-}"
+  if [[ -z "$dir" ]]; then
+    case "$(_chrome 2>/dev/null || true)" in
+      *chromium*) dir=/etc/chromium/policies/managed ;;
+      *)          dir=/etc/opt/chrome/policies/managed ;;
+    esac
+  fi
+  printf '%s/5dive-browser.json\n' "$dir"
+}
+_adblock_id() {
+  local f="$_ADBLOCK_STATE_DIR/extension-id"
+  [[ -f "$f" ]] && { tr -d '[:space:]' < "$f"; return 0; }
+  printf 'bjnapnkpiihibhjaehecmpbpeejnloib\n'
+}
+_adblock_hosts() {
+  [[ -f "$_ADBLOCK_OFF_FILE" ]] || return 0
+  sed -e 's/#.*//' -e 's/[[:space:]]//g' "$_ADBLOCK_OFF_FILE" | grep -v '^$' | sort -u
+}
+# BOTH patterns per host, and this is not belt-and-braces: `*://*.example.com` does
+# NOT match `example.com`, so a wildcard-only off switch reports success and leaves
+# the apex — the host the seat actually typed — still filtered.
+_adblock_patterns() {
+  local h; for h in $(_adblock_hosts); do printf '*://%s\n*://*.%s\n' "$h" "$h"; done
+}
+# Patch the LIVE policy file so the change does not wait for 03:00. Only the one
+# key: everything else in that file is the converger's and must not be re-derived
+# here, or two writers would drift and the file would flip every night.
+_adblock_apply() {
+  local f; f="$(_adblock_policy_file)"
+  [[ -f "$f" ]] || return 2
+  local id; id="$(_adblock_id)"
+  local tmp="$f.5dive.tmp"
+  jq --arg id "$id" --arg hosts "$(_adblock_patterns)" '
+      ($hosts | split("\n") | map(select(length > 0))) as $b
+      | if (.ExtensionSettings[$id] | type) == "object" then . else .ExtensionSettings[$id] = {} end
+      | if ($b | length) == 0
+        then .ExtensionSettings[$id] |= del(.runtime_blocked_hosts)
+        else .ExtensionSettings[$id].runtime_blocked_hosts = $b end' "$f" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  chmod 644 "$f" 2>/dev/null || true
+  return 0
+}
+_adblock_write_list() {
+  mkdir -p "$_ADBLOCK_STATE_DIR" || die "$E_UNAVAILABLE" "cannot create $_ADBLOCK_STATE_DIR"
+  local tmp="$_ADBLOCK_OFF_FILE.tmp"
+  { printf '# 5dive browser adblock — hosts uBlock Origin Lite is turned OFF for.\n'
+    printf '# The SOURCE OF TRUTH: the nightly root converge re-renders the chrome\n'
+    printf '# policy file from this list, so a host removed here comes back filtered.\n'
+    printf '%s\n' "$@"; } > "$tmp" && mv -f "$tmp" "$_ADBLOCK_OFF_FILE" \
+    || { rm -f "$tmp"; die "$E_UNAVAILABLE" "cannot write $_ADBLOCK_OFF_FILE"; }
+  chmod 644 "$_ADBLOCK_OFF_FILE" 2>/dev/null || true
+}
+cmd_adblock() {
+  local sub="${1:-status}"; shift 2>/dev/null || true
+  local site="${1:-}"
+  case "$sub" in
+    status|"")
+      local f; f="$(_adblock_policy_file)"
+      printf 'ad filtering: uBlock Origin Lite %s\n' "$(_adblock_id)"
+      if [[ -f "$f" ]]; then
+        printf 'policy:       %s\n' "$f"
+      else
+        printf 'policy:       %s (ABSENT — this box has no pinned uBlock Origin Lite yet, so nothing is being filtered and nothing is being blocked)\n' "$f"
+      fi
+      # NOT `paste -sd', '`: -d takes a LIST of delimiters and CYCLES them, so
+      # three hosts come out "a,b c,d". One delimiter, then space it out.
+      local off; off="$(_adblock_hosts | paste -sd, - | sed 's/,/, /g')"
+      printf 'filtering is OFF for: %s\n' "${off:-nothing — every site is filtered}"
+      return 0
+      ;;
+    on|off) ;;
+    *) die "$E_USAGE" "unknown adblock subcommand '$sub' — expected on, off or status" ;;
+  esac
+
+  [[ -n "$site" ]] || die "$E_USAGE" "$sub which site? e.g. \`sudo 5dive browser adblock $sub example.com\`"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a host — <site> IS THE HOST (example.com), the same name the profile takes"
+  [[ "$(id -u)" == 0 ]] || die "$E_PERM" "chrome policy on Linux is machine-level and root-owned — there is no per-user policy path. Run: sudo 5dive browser adblock $sub $site"
+
+  local -a hosts=(); local h
+  while read -r h; do [[ -n "$h" && "$h" != "$site" ]] && hosts+=("$h"); done < <(_adblock_hosts)
+  local was_off=no; _adblock_hosts | grep -qx "$site" && was_off=yes
+  [[ "$sub" == off ]] && hosts+=("$site")
+  _adblock_write_list "${hosts[@]+"${hosts[@]}"}"
+
+  local rc=0; _adblock_apply || rc=$?
+  if [[ "$sub" == off ]]; then
+    printf '%s: ad filtering OFF for %s%s\n' "$PROG" "$site" "$([[ $was_off == yes ]] && printf ' (it already was)')"
+  else
+    printf '%s: ad filtering ON for %s%s\n' "$PROG" "$site" "$([[ $was_off == no ]] && printf ' (it already was)')"
+  fi
+  case "$rc" in
+    0) # Measured across FRESH launches only — `shot`/`read` start a new headless
+       # chrome each time and pick it up, an already-running `serve` was never
+       # measured and must not be promised.
+       printf '%s: applied to %s. `shot`/`read` pick this up on their next render; a browser already running under `serve` may need `serve %s --stop` first.\n' \
+         "$PROG" "$(_adblock_policy_file)" "$site" ;;
+    2) printf '%s: recorded. This box has no chrome policy file yet (%s), so nothing is filtered here and there is nothing to turn off — the setting applies the moment the pinned uBlock Origin Lite reaches this box.\n' \
+         "$PROG" "$(_adblock_policy_file)" ;;
+    *) die "$E_UNAVAILABLE" "recorded in $_ADBLOCK_OFF_FILE, but $(_adblock_policy_file) could not be rewritten — the change takes effect at the next nightly converge, not now" ;;
+  esac
+  return 0
+}
+
 cmd_doc() {
   local target=""
   for a in "$@"; do
@@ -1549,7 +1686,9 @@ ok_doc() { printf '%s: %s\n' "$PROG" "$1"; }
 # to the seat's, which is what Chrome and the adapters need.
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   case "${1:-}" in
-    setup|-h|--help|help|"") ;;
+    # `adblock` joins `setup` here: it writes the MACHINE-WIDE chrome policy
+    # file, which is root's. Dropping to the seat would turn it into a refusal.
+    setup|adblock|-h|--help|help|"") ;;
     *)
       _drop="${SUDO_USER}"
       id -u "$_drop" >/dev/null 2>&1 || die "$E_PERM" "SUDO_USER=$_drop is not a user on this box — refusing to operate a profile store as root"
@@ -1567,6 +1706,7 @@ case "${1:-}" in
   probe-all) shift; cmd_probe_all "$@" ;;
   ls)    shift; cmd_ls    "$@" ;;
   doc)   shift; cmd_doc  "$@" ;;
+  adblock) shift; cmd_adblock "$@" ;;
   run)   shift; cmd_run   "$@" ;;
   shot)  shift; cmd_shot  "$@" ;;
   read)  shift; cmd_read  "$@" ;;

@@ -127,3 +127,23 @@ anti-bot bypassing. A CAPTCHA, a 2FA prompt or an "unusual activity" interstitia
 **hard stop that asks for a person**: surface it, do not attempt it, do not look for a way
 around it. Never ask the human for a password, never accept one, never write one down, and
 never export cookies out of a profile.
+
+## When a page looks broken or half-loaded
+
+The agent profile filters ads and cookie walls (uBlock Origin Lite, installed by
+Chrome policy and pinned — it is the only extension allowed, and nothing else can
+be added). A small number of sites break under that filtering: the page renders
+empty, a player never starts, a login form does not submit.
+
+Turn it off for that one site and re-render:
+
+```
+sudo 5dive browser adblock off example.com
+5dive browser shot example.com https://example.com/...
+```
+
+`sudo 5dive browser adblock on example.com` puts it back. `5dive browser adblock
+status` says which sites are currently unfiltered. It is off for the whole host
+(both `example.com` and its subdomains) — there is no partial setting — and a
+browser already running under `serve` may need `serve example.com --stop` before it
+picks the change up.
