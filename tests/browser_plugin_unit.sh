@@ -119,6 +119,16 @@ cat > "$FAKEBIN/google-chrome" <<'CHROME'
 # Serves whatever DOM the arm parked for this profile. Ignores every flag; the
 # point is only that _probe gets a document back and greps it.
 for a in "$@"; do case "$a" in --user-data-dir=*) d="${a#*=}" ;; esac; done
+# A SERVE LAUNCH MUST STAY UP, identified POSITIVELY: headed (no --headless) and
+# sized (--window-size), which is `cmd_serve` and nothing else here — the `shot`
+# render passes --window-size too, but headless. Since DIVE-4400 `serve` refuses
+# to advertise a chrome that has already exited, so a fake that RETURNS here is a
+# browser that DIED, and every restore path graded through this PATH (T16g) would
+# be grading the fake's lifetime instead of the product's restore. Matching
+# negatively ("no --headless") is what NOT to do: `doctor` runs --version and
+# `auth` runs headed in the foreground, and both would then hang forever.
+hl=; ws=; for a in "$@"; do case "$a" in --headless) hl=1 ;; --window-size=*) ws=1 ;; esac; done
+[[ -n "$ws" && -z "$hl" ]] && exec sleep 300
 cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null || echo "<html><body>feed</body></html>"
 CHROME
 chmod +x "$FAKEBIN/google-chrome"
@@ -347,6 +357,15 @@ done
 # ...and the positive control, or "refuses everything" would pass T2d.
 run "$BROWSER" auth x
 tn 'T2e a VALID name is not refused as a name' 'not a usable profile name' "$ERR"
+# ...AND STOP WHAT THAT AUTH STARTED. There is no DISPLAY here, which is the
+# normal case on a managed box, so `auth` takes the server-mode path and STARTS A
+# SERVE for x. Before DIVE-4400 the serve was a lie -- the fake chrome exited at
+# once and `_serve_running` read false -- so the leak was invisible and every
+# later arm on x probed as if nothing were serving. Now the serve is real, and a
+# served profile answers `status` with "UNKNOWN (served on :N)" by design. Left
+# standing it would silently convert T4c and T11d, the two positive controls for
+# `authenticated`, into assertions about a leak.
+run "$BROWSER" serve x --stop >/dev/null 2>&1 || true
 
 # setup is a root act because the alternative is a world-writable parent a
 # hostile seat can squat.
@@ -1581,6 +1600,14 @@ done
 # same binary, and a fake that failed both would red at liveness and never reach
 # the render at all — the arm would then grade nothing it claims to.
 [[ -n "${SHOT_CHROME_FAIL:-}" && -n "${shot:-}" ]] && exit 3
+# A SERVE LAUNCH MUST STAY UP: headed and sized, which is `cmd_serve` and not the
+# headless render above.
+# T15d2/T15e grade that a screenshot PUTS THE CUSTOMER'S BROWSER BACK, and since
+# DIVE-4400 `serve` writes no pidfile for a chrome that has already exited — so a
+# fake that exits here is a chrome that died, and those arms would assert the
+# fake's lifetime instead of the restore.
+hl=; ws=; for a in "$@"; do case "$a" in --headless) hl=1 ;; --window-size=*) ws=1 ;; esac; done
+[[ -n "$ws" && -z "$hl" ]] && exec sleep 300
 exit 0
 SCHROME
 chmod +x "$SHOTBIN/google-chrome"
