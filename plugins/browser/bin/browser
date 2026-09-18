@@ -73,6 +73,11 @@ usage() {
   On a managed box there is no display, so the browser lives on one:
   5dive browser serve <site>          # persistent Chrome on its own Xvfb (server mode)
   5dive browser serve <site> --stop   # stop the browser; the profile survives
+  5dive browser evict [--idle=1800] [--dry-run]
+                                      # stop served browsers nobody has used, on a
+                                      # SCHEDULE. Never one with a person in it or a
+                                      # caller mid-action. The profile is untouched:
+                                      # the next command starts it again, logged in.
   5dive browser viewer <site> --bind=<session> [--ttl=600]
                                       # mint a ONE-TIME, expiring link a person logs in through
   5dive browser viewer-redeem <site> --nonce=- --session=<id>
@@ -101,6 +106,17 @@ usage() {
                                       # Refuses unless the session probes authenticated —
                                       # a screenshot of a sign-in page is a lie that
                                       # looks exactly like evidence.
+  5dive browser tree <site> <url> [--interactive] [--json]
+                                      # what is on this page and how to address it:
+                                      # one ref per node, ref=<role>/<name>[#n].
+                                      # Quote a ref as a selector instead of guessing
+                                      # at obfuscated class names — it is re-derived
+                                      # from the page, so it survives a reload.
+  5dive browser lease <site> [--status|--release]
+                                      # who holds this browser right now. One caller
+                                      # at a time: two in one logged-in profile
+                                      # overwrite each other and read as flakiness.
+                                      # A person at the viewer PREEMPTS an agent.
   5dive browser read <site> <url> [--out=<dir>] [--json]
                                       # one authenticated render -> page.md,
                                       # page.html and page.meta.json
@@ -469,6 +485,21 @@ cmd_probe_all() {
     printf '%s\n' "$output"
   done
   (( found )) || printf 'no profiles yet — 5dive browser auth <site>\n'
+
+  # EVICTION RIDES THE SCHEDULE THAT ALREADY EXISTS (DIVE-4588). A sweep needs a
+  # clock, and this verb is the one thing in the plugin that already has one —
+  # the probe timer installed by `setup`. Giving eviction its own timer would be
+  # a second unit to install, to keep installed, and to forget on an upgrade, for
+  # a job whose cadence is "occasionally".
+  #
+  # Set FIVEDIVE_BROWSER_EVICT_ON_PROBE=0 to leave browsers up. It is a real
+  # knob, not a formality: a box dedicated to one long-running site wants its
+  # Chrome resident, and paying a cold start every time the timer outran the
+  # traffic would be the eviction making things slower than it found them.
+  if [[ "${FIVEDIVE_BROWSER_EVICT_ON_PROBE:-1}" == 1 ]]; then
+    ( cmd_evict ) || printf '%s: the idle sweep did not complete; browsers were left up\n' "$PROG" >&2
+  fi
+
   # Expired/challenge is a liveness result, not a failed timer. Every eligible
   # profile was attempted; the stamp and journal output carry the outcome.
   return 0
@@ -515,6 +546,277 @@ _verify_spec() {
     || die "$E_USAGE" "adapter action '$action' declares no out-of-band verify (needs .verify.url and .verify.expect). An adapter must not grade its own homework: after publishing, the artifact is re-read from a DIFFERENT path, or we do not claim it published."
 }
 
+
+# ======================================================== the per-site lease (DIVE-4588)
+#
+# WHY A LEASE EXISTS AT ALL. A shared browser is a SHARED LOGIN. Two agents in
+# one Gmail tab do not collide in a way that looks like a collision: one clears
+# the other's composer, one reads the other's half-typed draft, one's click lands
+# on a row the other just archived. It presents as "the site is flaky", which is
+# the most expensive possible presentation, because the response to flakiness is
+# retry and the response to a concurrency bug is a lock.
+#
+# This is not hypothetical here. The verbs in this file already STOP a running
+# serve, act, and restart it (`_shot_restore`) — so a second seat's `run` landing
+# mid-action stops the browser out from under the first one. Today the only guard
+# is a check for a live VIEWER, and that check is a single instant at the start.
+#
+# ---- THE FOUR PROPERTIES, AND WHERE EACH ONE IS ENFORCED --------------------
+#
+#   1. EXCLUSIVE. `mkdir` is the acquire. It is the one filesystem operation that
+#      is atomic and fails on an existing name, so two simultaneous acquires have
+#      exactly one winner with no lockfile-of-a-lockfile underneath it.
+#   2. IT CANNOT BE HELD BY A CORPSE. A crashed caller cannot hold a site
+#      forever, so the lease is live only while its HOLDER PID is alive AND the
+#      expiry is in the future. Both, not either: a pid can be reused, and a
+#      process can hang past its TTL. Reaping a dead lease is itself done under a
+#      second lock, or two reapers race and the loser wipes the winner's fresh
+#      lease — two agents in one browser, arrived at by the code that exists to
+#      prevent it.
+#   3. A PERSON PREEMPTS A MACHINE, ALWAYS. The viewer hands a human a keyboard
+#      inside a live session — usually part-way through the login the viewer
+#      exists for. Queueing a person behind an agent's TTL is the wrong answer;
+#      so is letting the agent keep typing. The human acquire OVERWRITES the
+#      lease with a new token.
+#   4. AND THE TOKEN IS RE-CHECKED BEFORE EVERY STEP, not once at the start.
+#      That is the property that makes preemption mean anything: acquiring at
+#      step 0 and never looking again is a lease that protects the first
+#      keystroke and none of the rest. The check lives in the executor
+#      (driver-playwright re-reads FIVEDIVE_BROWSER_LEASE before each step),
+#      because the executor is where the keystrokes are.
+#
+# READS TAKE THE LEASE TOO. `shot`, `read` and `tree` open the same profile:
+# separate tabs of one profile still share cookies, drafts and per-account state,
+# and that sharing is the corruption being avoided. A read-only lease would be a
+# lease that protects the cheap half.
+#
+# EVERY PATH THIS SECTION DELETES IS BUILT WITH ${x:?}. These are `rm -rf` on
+# paths assembled from variables, inside a directory holding a live credential.
+# An empty component would make one of them an rm of the profile root or of `/`,
+# and the shell refusing to expand is a guarantee, where remembering to test is a
+# habit. (Caught in review by main, 2026-09-17, before this shipped.)
+
+LEASE_TTL_DEFAULT=300
+LEASE_TTL_MAX=3600
+LEASE_WAIT_DEFAULT=120
+
+_lease_dir()   { echo "${1:?lease: no profile dir}/.5dive-lease"; }
+_lease_meta()  { echo "${1:?lease: no profile dir}/.5dive-lease/meta"; }
+_lease_reapd() { echo "${1:?lease: no profile dir}/.5dive-lease.reap"; }
+_lease_qdir()  { echo "${1:?lease: no profile dir}/.5dive-lease.q"; }
+
+_lease_token_new() { head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+# Live == the holder is still running AND the clock has not run out.
+_lease_live() {  # _lease_live <profile-dir>
+  local m; m="$(_lease_meta "${1:?}")"
+  [[ -f "$m" ]] || return 1
+  local pid exp now
+  pid=$(_kv "$m" holder_pid); exp=$(_kv "$m" expires_at); now=$(date -u +%s)
+  [[ -n "$pid" && -n "$exp" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  (( now < exp )) || return 1
+  return 0
+}
+
+# Remove a lease nobody holds. Under its own lock: see property 2 above.
+_lease_reap() {  # _lease_reap <profile-dir>
+  local d="${1:?}" reap ld
+  reap="$(_lease_reapd "$d")"; ld="$(_lease_dir "$d")"
+  mkdir "$reap" 2>/dev/null || return 1
+  _lease_live "$d" || rm -rf "${ld:?}"
+  rmdir "$reap" 2>/dev/null
+  return 0
+}
+
+_lease_describe() {  # _lease_describe <profile-dir> -> the line a refused caller reads
+  local m; m="$(_lease_meta "${1:?}")"
+  local who purpose exp kind until
+  who=$(_kv "$m" holder); purpose=$(_kv "$m" purpose); exp=$(_kv "$m" expires_at); kind=$(_kv "$m" kind)
+  until="unknown"
+  [[ -n "$exp" ]] && until=$(date -u -d "@$exp" +%H:%MZ 2>/dev/null || echo "$exp")
+  printf 'busy: held by %s (%s) until %s' "${who:-someone}" "${purpose:-unstated}" "$until"
+  [[ "$kind" == human ]] && printf ' — that is a PERSON in this browser, not an agent'
+  printf '\n'
+}
+
+# THE HOLDER PID IS A PARAMETER, AND THAT IS THE HUMAN CASE (DIVE-4588).
+#
+# For an agent the holder is this process, and the lease dying with it is the
+# whole anti-corpse property. For a PERSON it cannot be: `viewer-redeem` admits
+# the human and then EXITS immediately — it prints a loopback target and its job
+# is done. A human lease anchored to that process would be reapable a
+# millisecond after it was granted, so the first agent along would take the
+# browser back out from under someone mid-login, which is the exact failure
+# preemption exists to prevent, reintroduced by the liveness rule.
+#
+# So a human lease is anchored to the process that IS the person's presence: the
+# x11vnc serving their session. It lives while they are attached and becomes
+# reapable the moment they are not — without anyone having to remember to
+# release it, and including when they simply close the tab.
+_lease_write() {  # _lease_write <profile-dir> <token> <kind> <purpose> <ttl> [<holder-pid>]
+  local d="${1:?}" token="$2" kind="$3" purpose="$4" ttl="$5" pid="${6:-$$}" now
+  now=$(date -u +%s)
+  ( umask 077; printf 'token=%s\nholder=%s\nholder_pid=%s\nkind=%s\npurpose=%s\nacquired_at=%s\nexpires_at=%s\n' \
+      "$token" "$(_seat)" "$pid" "$kind" "$purpose" "$now" "$(( now + ttl ))" > "$(_lease_meta "$d")" )
+}
+
+# Try ONCE. Echoes the token and returns 0, or returns 1 having printed nothing.
+_lease_try() {  # _lease_try <profile-dir> <kind> <purpose> <ttl>
+  local d="${1:?}" kind="$2" purpose="$3" ttl="$4"
+  local ld; ld="$(_lease_dir "$d")"
+  if ! mkdir "$ld" 2>/dev/null; then
+    _lease_live "$d" && return 1
+    _lease_reap "$d" || return 1
+    mkdir "$ld" 2>/dev/null || return 1
+  fi
+  local token; token=$(_lease_token_new)
+  _lease_write "$d" "$token" "$kind" "$purpose" "$ttl"
+  printf '%s\n' "$token"
+}
+
+# A PERSON. Takes the lease whatever is in it, and takes it by REPLACING the
+# token — the agent that was holding it is not asked to stop, it is stopped, and
+# its next step reads a token that is no longer its own and fails closed.
+#
+# The wait for the reap lock is BOUNDED and then breaks it. Everywhere else in
+# this file a contended lock is a refusal, and here it must not be: the caller is
+# a human who has just been handed a viewer URL, and a stuck reap directory left
+# by a killed process would lock a person out of their own browser indefinitely.
+_lease_preempt() {  # _lease_preempt <profile-dir> <purpose> <ttl> <holder-pid>
+  local d="${1:?}" purpose="$2" ttl="$3" pid="$4" reap i=0
+  reap="$(_lease_reapd "$d")"
+  while ! mkdir "$reap" 2>/dev/null; do
+    i=$(( i + 1 ))
+    (( i < 60 )) || { rm -rf "${reap:?}"; continue; }
+    sleep 0.05
+  done
+  mkdir -p "$(_lease_dir "$d")" 2>/dev/null
+  local token; token=$(_lease_token_new)
+  _lease_write "$d" "$token" human "$purpose" "$ttl" "$pid"
+  rmdir "$reap" 2>/dev/null
+  printf '%s\n' "$token"
+}
+
+# FIFO, and it is a queue of LIVE waiters. A waiter that died still holding its
+# ticket must not pin the order forever, so a ticket whose pid is gone is swept
+# by whoever notices. Ordering is by the ticket's timestamp, taken once when the
+# waiter joins — so waiting longer never loses your place to a newcomer.
+_lease_queue_join() {  # _lease_queue_join <profile-dir> -> ticket path
+  local d="${1:?}" q t; q="$(_lease_qdir "$d")"
+  mkdir -p "$q" 2>/dev/null; chmod 700 "$q" 2>/dev/null
+  t="$q/$(date -u +%s%N).$$"
+  ( umask 077; printf '%s\n' "$$" > "$t" )
+  printf '%s\n' "$t"
+}
+_lease_queue_first() {  # echoes the oldest LIVE ticket, sweeping dead ones
+  local d="${1:?}" q f pid
+  q="$(_lease_qdir "$d")"
+  for f in $(ls -1 "$q" 2>/dev/null | sort); do
+    pid=$(cat "${q:?}/${f:?}" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then printf '%s\n' "$q/$f"; return 0; fi
+    rm -f "${q:?}/${f:?}"
+  done
+  return 1
+}
+
+# ---- the one entry point every verb uses ------------------------------------
+_LEASE_DIR=""; _LEASE_TOKEN=""; _LEASE_TICKET=""
+_lease_release() {
+  [[ -n "$_LEASE_TICKET" ]] && rm -f "${_LEASE_TICKET:?}"
+  _LEASE_TICKET=""
+  [[ -n "$_LEASE_DIR" && -n "$_LEASE_TOKEN" ]] || return 0
+  local d="$_LEASE_DIR" tok="$_LEASE_TOKEN" ld
+  _LEASE_DIR=""; _LEASE_TOKEN=""
+  ld="$(_lease_dir "$d")"
+  # ONLY IF IT IS STILL OURS. If a person preempted us, the lease in that
+  # directory is THEIRS, and deleting it on our way out would hand the browser to
+  # the next agent in the queue while they are still typing in it — the exact
+  # outcome preemption exists to prevent, produced by the cleanup path.
+  [[ "$(_kv "$(_lease_meta "$d")" token)" == "$tok" ]] && rm -rf "${ld:?}"
+  return 0
+}
+_lease_and_serve_release() { _lease_release; _shot_restore; }
+
+_lease_take() {  # _lease_take <site> <profile-dir> <purpose> [<wait-seconds>|no]
+  local site="$1" d="${2:?}" purpose="$3" wait="${4:-no}" token
+  local ttl="${FIVEDIVE_BROWSER_LEASE_TTL:-$LEASE_TTL_DEFAULT}"
+  (( ttl > LEASE_TTL_MAX )) && ttl="$LEASE_TTL_MAX"
+  if token=$(_lease_try "$d" agent "$purpose" "$ttl"); then
+    _LEASE_DIR="$d"; _LEASE_TOKEN="$token"; _serve_touch "$d"; return 0
+  fi
+  if [[ "$wait" == no ]]; then
+    die "$E_UNAVAILABLE" "$(_lease_describe "$d")
+Another caller holds the $site browser. Refusing rather than joining them in it: two callers in one
+logged-in profile overwrite each other's drafts and read as site flakiness, not as a collision.
+Wait for it with --wait, or see who has it: 5dive browser lease $site --status"
+  fi
+  _LEASE_TICKET=$(_lease_queue_join "$d")
+  trap '_lease_release' EXIT
+  local waited=0
+  while (( waited < wait )); do
+    if [[ "$(_lease_queue_first "$d")" == "$_LEASE_TICKET" ]] \
+       && token=$(_lease_try "$d" agent "$purpose" "$ttl"); then
+      rm -f "${_LEASE_TICKET:?}"; _LEASE_TICKET=""
+      _LEASE_DIR="$d"; _LEASE_TOKEN="$token"; _serve_touch "$d"
+      return 0
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+  done
+  die "$E_UNAVAILABLE" "waited ${wait}s for the $site browser and it is still $(_lease_describe "$d")"
+}
+
+cmd_lease() {
+  local site="" action=status purpose="held by hand" wait=""
+  while (($#)); do
+    case "$1" in
+      --status)    action=status ;;
+      --release)   action=release ;;
+      --take)      action=take ;;
+      --purpose=*) purpose="${1#*=}" ;;
+      --wait)      wait="$LEASE_WAIT_DEFAULT" ;;
+      --wait=*)    wait="${1#*=}" ;;
+      -h|--help)   usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser lease linkedin.com --status"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  _require_store
+  local dir; dir="$(_site_dir "$site")"
+  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
+  _audit "$dir" 700
+
+  case "$action" in
+    status)
+      if _lease_live "$dir"; then _lease_describe "$dir"; return 0; fi
+      printf 'free: nothing holds the %s browser\n' "$site"; return 0 ;;
+    release)
+      # A HAND RELEASE IS AN OPERATOR ACT AND IT SAYS SO. Taking a lease away
+      # from a LIVE holder is how you get two callers in one browser by hand, so
+      # a live lease is refused here and the escape is to stop that process.
+      if _lease_live "$dir"; then
+        die "$E_PERM" "$(_lease_describe "$dir")
+That holder is still alive. Not releasing it: the lease is the only thing keeping a second caller out
+of that browser, and a forced release puts one there. Stop the holding process, or wait for its TTL."
+      fi
+      _lease_reap "$dir"
+      printf 'released the stale %s lease\n' "$site"; return 0 ;;
+    take)
+      _lease_take "$site" "$dir" "$purpose" "${wait:-no}"
+      printf 'holding the %s browser as %s until %s\n' "$site" "$(_seat)" \
+        "$(date -u -d "@$(_kv "$(_lease_meta "$dir")" expires_at)" +%H:%MZ 2>/dev/null)"
+      printf '%s\n' "$_LEASE_TOKEN"
+      # THE LEASE DIES WITH THIS PROCESS AND THIS PROCESS IS ABOUT TO EXIT, so
+      # `--take` on its own hands back a lease that is already gone. It exists to
+      # be armed by a caller that then does its own work; say so rather than
+      # letting someone believe they are holding something.
+      printf 'this lease is released when this command exits — it is for a caller that holds it open\n' >&2
+      return 0 ;;
+  esac
+}
+
 cmd_run() {
   local site="${1:-}" action="${2:-}"; shift 2 2>/dev/null || true
   [[ -n "$site" && -n "$action" ]] || die "$E_USAGE" "usage: 5dive browser run <site> <action> [--key=value ...]"
@@ -527,6 +829,27 @@ cmd_run() {
   local f; f=$(_adapter_path "$site")
   _adapter_validate "$f" "$action"
   _verify_spec "$f" "$action"
+
+  # THE LEASE, BEFORE ANYTHING TOUCHES THE BROWSER (DIVE-4588). It is taken here
+  # rather than next to the launch because the very next block STOPS a running
+  # serve: without the lease, two `run`s that start a second apart both stop the
+  # other's browser and both act in a profile the other is mid-action in.
+  #
+  # --lease-wait, and NOT --wait, and the collision is the reason: every other
+  # --key=value on this command line is an ADAPTER ARGUMENT, so a bare `--wait`
+  # would be indistinguishable from an adapter with a {wait} placeholder. A flag
+  # that silently eats a caller's argument is worse than a longer flag.
+  local lwait=no rest=() a
+  for a in "$@"; do
+    case "$a" in
+      --lease-wait)   lwait="$LEASE_WAIT_DEFAULT" ;;
+      --lease-wait=*) lwait="${a#*=}" ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  set -- ${rest+"${rest[@]}"}
+  _lease_take "$site" "$dir" "run $action" "$lwait"
+  trap '_lease_and_serve_release' EXIT
 
   # A RUN NEEDS THE PROFILE THE SAME WAY A RENDER DOES (DIVE-4524). Chrome allows
   # ONE instance per --user-data-dir: with a served browser holding this profile,
@@ -543,7 +866,6 @@ cmd_run() {
   local sdisp
   if sdisp=$(_serve_running "$dir"); then
     ! _viewer_live "$dir" || die "$E_UNAVAILABLE" "the $site browser is being viewed by a person right now (:$sdisp). Running an action means stopping that browser, which would take their session away mid-login. Wait, or end it deliberately: 5dive browser viewer-revoke $site"
-    trap '_shot_restore' EXIT
     _SHOT_RESTORE_SITE="$site"
     cmd_serve "$site" --stop >/dev/null
   fi
@@ -615,13 +937,23 @@ cmd_run() {
 
   local plan; plan=$(jq -c --arg a "$action" --arg profile "$dir" --argjson args "$args" \
       '{profile: $profile, steps: .actions[$a].steps, args: $args}' "$f")
-  FIVEDIVE_BROWSER_PROFILE="$dir" FIVEDIVE_BROWSER_CHROME="$chrome" "$driver" <<<"$plan"
+  # THE LEASE TRAVELS WITH THE PLAN, and it is what the executor re-checks before
+  # every single step. Handing it over once and trusting the first check would be
+  # a lease that protects keystroke one: the case it has to cover is a PERSON
+  # redeeming a viewer half-way through a publish, which is when a machine typing
+  # into the same window does the most damage.
+  FIVEDIVE_BROWSER_PROFILE="$dir" FIVEDIVE_BROWSER_CHROME="$chrome" \
+    FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
+    FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
+    "$driver" <<<"$plan"
   local drc=$?
 
   # Put the browser back BEFORE the out-of-band verify: the verify is a plain
   # fetch that needs no profile, and a customer whose browser is down should not
-  # be waiting on a 30s curl to get it back.
+  # be waiting on a 30s curl to get it back. The lease goes with it — the verify
+  # is a curl of a public URL and holds nobody out of the browser.
   _shot_restore
+  _lease_release
   trap - EXIT
 
   # EXIT 70 MEANS NOTHING RAN, and it must not reach the verify. The verify is an
@@ -658,6 +990,178 @@ cmd_run() {
   return 1
 }
 
+
+# ============================================================== tree (DIVE-4588)
+#
+# `tree <site> <url>` — what is on this page, and how to address it.
+#
+# THE ITEM claude-luca's OWN RANKING PUT FIRST. His hour on one connect-inbox-send
+# task was "mostly guessing selectors and fighting the wizard by trial and error,
+# four rounds at a minute each" against `tr.zA`, `.yX .yP`,
+# `input[name=subjectbox]` — obfuscated class names that are documented nowhere
+# and change without notice. A warm browser makes that loop faster. It does not
+# end it. This does.
+#
+# The output is a ref per line. A ref is <role>/<accessible name>[#n], and it is
+# RE-DERIVED from the page on every use rather than being a handle into a live
+# snapshot (lib/aria.cjs carries the reasoning) — so it is quotable in an adapter
+# file, it survives a navigation, a browser restart and a class-name change, and
+# the browser that printed it does not have to still be running when it is used.
+cmd_tree() {
+  local site="" url="" interactive=0 json=0 wait="no"
+  while (($#)); do
+    case "$1" in
+      --interactive) interactive=1 ;;
+      --json)   json=1 ;;
+      --wait)   wait="$LEASE_WAIT_DEFAULT" ;;
+      --wait=*) wait="${1#*=}" ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; else url="$1"; fi ;;
+    esac; shift
+  done
+  [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser tree <site> <url> [--interactive] [--json]"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  _require_store
+  local dir; dir="$(_site_dir "$site")"
+  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
+
+  # THE LEASE IS TAKEN BEFORE THE PROLOGUE, not after. _page_open STOPS a running
+  # serve to get the profile — so the window between "decide to act" and "hold
+  # the browser" is exactly the window in which another caller's browser gets
+  # stopped out from under them.
+  _lease_take "$site" "$dir" "tree" "$wait"
+  trap '_lease_and_serve_release' EXIT
+
+  # THE SAME PROLOGUE EVERY RENDER USES, and for the same reason: a tree of the
+  # sign-in page is a perfectly well-formed tree, with a role and a name for
+  # every field, and an agent would go on to quote its refs into an adapter and
+  # wonder for an hour why they never match.
+  _page_open "$site" "$url"
+
+  local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
+  [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver — tree needs the same executor \`run\` uses, inside the same profile."
+  local chrome; chrome=$(command -v "$_PG_CHROME" 2>/dev/null || printf '%s' "$_PG_CHROME")
+
+  local plan out
+  plan=$(jq -nc --arg p "$_PG_DIR" --arg u "$url" --argjson i "$interactive" \
+      '{profile:$p, mode:"tree", url:$u, interactive:($i==1)}')
+  out=$(FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
+        FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
+        FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
+        "$driver" <<<"$plan") \
+    || die "$E_UNAVAILABLE" "the executor could not enumerate $url (its own reason is above)."
+
+  # Put the browser back and drop the lease BEFORE printing: rendering a tree to
+  # a terminal is not a reason to keep a customer's browser stopped, and it is
+  # not a reason for the next caller to wait.
+  _shot_restore; _lease_release; trap - EXIT
+
+  if (( json )); then printf '%s\n' "$out"; return 0; fi
+  jq -r '.nodes[] | "  \(.role)  \"\(.name)\"\n      ref=\(.ref)"' <<<"$out"
+  printf '\n%s: %s addressable node(s) on %s\n' "$PROG" "$(jq -r '.nodes|length' <<<"$out")" "$url" >&2
+  printf 'Use one as a selector, in an adapter step or on the command line: ref=<role>/<name>\n' >&2
+  printf 'A ref is re-derived from the page each time, so it still works after a reload.\n' >&2
+}
+
+# ================================================= idle eviction (DIVE-4588 (a))
+#
+# WHAT THIS ANSWERS. A served browser is ~300-500 MB of resident Chrome plus an X
+# display, and `serve` has never had an end: once started, it lives until someone
+# stops it by hand or the box reboots. On a 37-seat box where seats serve a few
+# sites each that is not a leak in the usual sense — every one of those Chromes
+# was legitimately asked for — it is an unbounded accumulation of legitimate
+# requests, which is the shape this host already runs a memory tripwire for.
+#
+# THE COST MODEL, stated so it can be checked rather than believed:
+#
+#   a served browser exists per (SEAT, SITE), because a profile is per seat —
+#   two seats logged into the same site are two different accounts and cannot
+#   share a Chrome. Eviction does not change that cardinality. What it changes is
+#   the TIME axis: the standing cost stops being "every site anyone ever served"
+#   and becomes "every site in use in the last IDLE window".
+#
+# Being honest about that is the point: a note claiming N sites x 400 MB and NOT
+# N x seats x 400 MB would be describing a shared-profile design this plugin
+# deliberately does not have (a shared profile is a shared login — see the lease
+# section). The bound eviction actually buys is the one written above.
+#
+# WHAT EVICTS, and what never does:
+#   - a browser whose profile has no LIVE LEASE, no LIVE VIEWER, and whose last
+#     lease was taken more than --idle ago. All three, every time.
+#   - a browser with a person in it is never evicted, whatever the idle clock
+#     says: the viewer exists because somebody is logging in, and logging in
+#     involves long pauses staring at a phone for a code.
+#   - a browser under an active lease is never evicted, because the lease means a
+#     caller is mid-action inside it.
+#
+# THE PROFILE IS NOT TOUCHED. Eviction stops a process; the login lives in the
+# directory (measured, DIVE-4464), so the next command restores the serve and
+# finds the session exactly as it was. That asymmetry is what makes evicting safe
+# enough to do on a timer.
+
+EVICT_IDLE_DEFAULT=1800
+
+# Last time a caller held this browser. Stamped by _lease_take, read by evict.
+# It lives in the serve pidfile rather than in a file of its own: it is a fact
+# about the running browser, and it must disappear when that browser does, or the
+# next serve inherits a stale "in use" claim.
+_serve_touch() {
+  local d="${1:?}" f; f="$(_serve_pidfile "$d")"
+  [[ -f "$f" ]] || return 0
+  local tmp="$f.$$"
+  ( umask 077; grep -v '^last_used=' "$f" > "$tmp"; printf 'last_used=%s\n' "$(date -u +%s)" >> "$tmp" ) \
+    && mv -f "$tmp" "$f"
+  rm -f "${tmp:?}" 2>/dev/null || true
+}
+
+cmd_evict() {
+  local idle="${FIVEDIVE_BROWSER_IDLE_S:-$EVICT_IDLE_DEFAULT}" dry=0
+  while (($#)); do
+    case "$1" in
+      --idle=*) idle="${1#*=}" ;;
+      --dry-run) dry=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) die "$E_USAGE" "evict takes no site — it sweeps this seat's served browsers" ;;
+    esac; shift
+  done
+  [[ "$idle" =~ ^[0-9]+$ ]] || die "$E_USAGE" "--idle is seconds"
+  _require_store
+  local d site now age last f stopped=0
+  now=$(date -u +%s)
+  for d in "$(_seat_dir)"/*/; do
+    [[ -d "$d" ]] || continue
+    site=$(basename "$d")
+    _serve_running "$d" >/dev/null || continue
+    if _viewer_live "$d"; then
+      printf '  %-20s kept: a person is in it\n' "$site"; continue
+    fi
+    if _lease_live "$d"; then
+      printf '  %-20s kept: %s\n' "$site" "$(_lease_describe "$d")"; continue
+    fi
+    f="$(_serve_pidfile "$d")"
+    last=$(_kv "$f" last_used)
+    # NEVER SERVED A CALLER IS NOT "IDLE SINCE THE EPOCH". A browser started but
+    # not yet used has no last_used, and reading a missing value as 0 would evict
+    # it on the first sweep — including the one a person is about to be handed a
+    # viewer onto. Fall back to when the serve STARTED.
+    [[ -n "$last" ]] || last=$(_kv "$f" started_at)
+    [[ -n "$last" ]] || { printf '  %-20s kept: no clock on its serve\n' "$site"; continue; }
+    age=$(( now - last ))
+    if (( age < idle )); then
+      printf '  %-20s kept: used %ss ago\n' "$site" "$age"; continue
+    fi
+    if (( dry )); then
+      printf '  %-20s WOULD evict: idle %ss\n' "$site" "$age"; continue
+    fi
+    cmd_serve "$site" --stop >/dev/null
+    stopped=$(( stopped + 1 ))
+    printf '  %-20s evicted: idle %ss (the profile is untouched; the next command restores it)\n' "$site" "$age"
+  done
+  (( dry )) || printf '%s browser(s) evicted\n' "$stopped"
+  return 0
+}
 
 # =========================================================== server mode (DIVE-4118)
 #
@@ -1091,6 +1595,22 @@ cmd_viewer_redeem() {
   IFS= read -r vncpw < "$pwfile"
   [[ -n "$vncpw" ]] || die "$E_UNAVAILABLE" "the viewer for $site has no usable credential. The ticket was NOT spent — ask the dashboard for a new viewer."
 
+  # A PERSON IS NOW IN THIS BROWSER (DIVE-4588). This line is the moment the
+  # human is admitted, so this is where the lease becomes theirs — taken by
+  # PREEMPTION, not by queueing. An agent holding the site is not asked to
+  # finish: its token is replaced, and its next step reads a lease that is no
+  # longer its own and fails closed. Queueing the person behind the agent's TTL
+  # would be the same product failure with better manners — someone clearing a
+  # captcha must never be typed over, and they arrived here because the session
+  # needs a human precisely now.
+  #
+  # Anchored to the x11vnc pid and expiring with the ticket, so it ends when the
+  # person leaves or their window runs out, with nothing to remember to release.
+  local vncpid lease_ttl
+  vncpid=$(_kv "$(_viewer_pidfile "$dir")" vnc_pid)
+  lease_ttl=$(( expires - $(date -u +%s) )); (( lease_ttl > 0 )) || lease_ttl=1
+  _lease_preempt "$dir" "a person at the viewer" "$lease_ttl" "${vncpid:-$$}" >/dev/null
+
   _viewer_revoke_file "$dir" consumed
   printf 'target=127.0.0.1:%s\npassword=%s\n' "$port" "$vncpw"
 }
@@ -1200,8 +1720,18 @@ _shot_restore() {
   # printed, the command keeps its own verdict, and the one thing that is true is
   # the one thing the caller is told: the profile is intact, the browser is not
   # back up.
-  ( cmd_serve "$s" >/dev/null 2>&1 ) || \
+  if ( cmd_serve "$s" >/dev/null 2>&1 ); then
+    # RE-STAMP THE IDLE CLOCK HERE, not only where the lease was taken. The
+    # acquire-time stamp is written into the serve pidfile — and the action that
+    # took the lease then STOPPED that serve (above), deleting the file the stamp
+    # was in; this restart writes a FRESH pidfile carrying only `started_at`. So
+    # a browser driven every few minutes by `run` would read as never-used-since-
+    # it-started and be evicted mid-workflow by the idle sweep: the clock
+    # destroyed by the one caller whose presence proves the browser is in use.
+    _serve_touch "$(_site_dir "$s")"
+  else
     printf '%s: WARNING — could not restart the %s browser afterwards. The profile is intact — it is the durable half; start it again: 5dive browser serve %s\n' "$PROG" "$s" "$s" >&2
+  fi
 }
 
 # A viewer is LIVE when the process that answers it is alive. The pidfile alone
@@ -1256,13 +1786,28 @@ _page_open() {  # _page_open <site> <url>
   [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
   _audit "$dir" 700
 
+  # A READ TAKES THE LEASE TOO (DIVE-4588), and this is the least obvious half of
+  # the design, so it is written down rather than inferred: separate TABS of one
+  # profile still share cookies, drafts and the site's per-account state. A
+  # render that "only looks" can still move a conversation to read, consume a
+  # one-time code, or trip a rate limit inside somebody else's action. A lease
+  # that protected only the writes would protect the cheap half.
+  #
+  # Conditional, because `tree` takes it earlier: it must hold the browser across
+  # the whole prologue, and a second acquire by the same process would deadlock
+  # against itself.
+  if [[ -z "$_LEASE_TOKEN" ]]; then
+    _lease_take "$site" "$dir" "${_PG_PURPOSE:-render}" no
+    trap '_lease_and_serve_release' EXIT
+  fi
+
   local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — a render needs the same browser the profile was logged in with."
 
   # The served browser holds the profile. Cycle it (never with a person inside).
   local sdisp
   if sdisp=$(_serve_running "$dir"); then
     ! _viewer_live "$dir" || die "$E_UNAVAILABLE" "the $site browser is being viewed by a person right now (:$sdisp). Rendering means stopping that browser, which would take their session away mid-login. Wait, or end it deliberately: 5dive browser viewer-revoke $site"
-    trap '_shot_restore' EXIT
+    trap '_lease_and_serve_release' EXIT
     _SHOT_RESTORE_SITE="$site"
     cmd_serve "$site" --stop >/dev/null
   fi
@@ -1365,6 +1910,7 @@ cmd_shot() {
   fi
 
   _shot_restore
+  _lease_release
   trap - EXIT
   printf 'rendered %s as the logged-in %s profile\n  %s  (%sx%s)\n' "$url" "$site" "$out" "$w" "$h"
   [[ -n "$domout" && -s "$domout" ]] && printf '  %s  (DOM)\n' "$domout"
@@ -1383,6 +1929,7 @@ _read_cleanup() {
   local d="$_READ_STAGE"; _READ_STAGE=""
   case "$d" in /tmp/5dive-browser-read.*) rm -rf -- "$d" ;; esac
   _shot_restore
+  _lease_release
 }
 
 _read_output_dir() { # _read_output_dir <site> <explicit-or-empty> <profile-dir>
@@ -1501,6 +2048,7 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
   _READ_STAGE=""
   rm -rf -- "$stage"
   _shot_restore
+  _lease_release
   trap - EXIT
   return 0
 }
@@ -1759,6 +2307,9 @@ case "${1:-}" in
   doc)   shift; cmd_doc  "$@" ;;
   adblock) shift; cmd_adblock "$@" ;;
   run)   shift; cmd_run   "$@" ;;
+  tree)  shift; cmd_tree  "$@" ;;
+  lease) shift; cmd_lease "$@" ;;
+  evict) shift; cmd_evict "$@" ;;
   shot)  shift; cmd_shot  "$@" ;;
   read)  shift; cmd_read  "$@" ;;
   links) shift; cmd_links "$@" ;;

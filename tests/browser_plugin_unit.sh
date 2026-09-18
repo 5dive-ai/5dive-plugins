@@ -484,8 +484,21 @@ t 'T5f the driver receives the args'    'slug-42' "$(jq -r '.args.slug' "$TMP/dr
 # with no ancestor walk, so the fixture is a byte-identical copy of the shipped
 # driver in a directory that has neither. The copy is asserted identical, or this
 # arm would grade a file nobody ships.
-PWABSENT="$TMP/pw-absent"; mkdir -p "$PWABSENT/bin"
-cp "$ROOT/plugins/browser/bin/driver-playwright" "$PWABSENT/bin/driver-playwright"
+#
+# THE FIXTURE IS A PACKAGE, NOT A FILE (DIVE-4588). It used to copy
+# bin/driver-playwright alone, which worked only while the driver required
+# nothing but node builtins — the moment it gained a sibling (lib/aria.cjs, the
+# ref layer) the copy died MODULE_NOT_FOUND and five arms about PLAYWRIGHT
+# resolution went red for a reason that had nothing to do with playwright. That
+# is a fixture grading its own construction. The driver is still asserted
+# byte-identical below; what is copied alongside it is the rest of its own
+# package, which is what a real install has.
+_mkpkg() {  # _mkpkg <dir> — a plugin tree with no node_modules anywhere in it
+  mkdir -p "$1/bin"
+  cp "$ROOT/plugins/browser/bin/driver-playwright" "$1/bin/driver-playwright"
+  cp -r "$ROOT/plugins/browser/lib" "$1/lib"
+}
+PWABSENT="$TMP/pw-absent"; _mkpkg "$PWABSENT"
 t  'T6a (control) the fixture driver is the shipped one, byte for byte' 'same' \
    "$(cmp -s "$ROOT/plugins/browser/bin/driver-playwright" "$PWABSENT/bin/driver-playwright" && echo same || echo different)"
 env NODE_PATH=/nonexistent-node-modules FIVEDIVE_BROWSER_DRIVER="$PWABSENT/bin/driver-playwright" \
@@ -506,12 +519,11 @@ tc 'T6a ...and that it will not treat what is already there as evidence' \
 # driver must still refuse — a library that arrives because of where the plugin
 # was unpacked is not one anybody pinned, and this process is the one that opens
 # a profile full of live sessions.
-ANC="$TMP/anc"; mkdir -p "$ANC/node_modules/playwright-core" "$ANC/pkg/bin"
+ANC="$TMP/anc"; mkdir -p "$ANC/node_modules/playwright-core"; _mkpkg "$ANC/pkg"
 printf '{ "name": "playwright-core", "version": "0.0.0-ancestor", "main": "index.js" }\n' \
   > "$ANC/node_modules/playwright-core/package.json"
 printf 'exports.chromium = { launchPersistentContext: async () => { throw new Error("ancestor stub ran"); } };\n' \
   > "$ANC/node_modules/playwright-core/index.js"
-cp "$ROOT/plugins/browser/bin/driver-playwright" "$ANC/pkg/bin/driver-playwright"
 env -u NODE_PATH FIVEDIVE_BROWSER_DRIVER="$ANC/pkg/bin/driver-playwright" \
   "$BROWSER" run x publish --slug=slug-42 --body=hi >/dev/null 2>"$TMP/t6c.err"; RC=$?
 t  'T6c a playwright-core in an ANCESTOR directory is not loaded' 69 "$RC"
@@ -1863,12 +1875,34 @@ const rec = (o) => fs.appendFileSync(process.env.PWREC, JSON.stringify(o) + '\n'
 const page = {
   setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t }),
   goto: async (url, o) => rec({ call: 'goto', url }),
-  fill: async (sel, val) => rec({ call: 'fill', sel, val }),
+  fill: async (sel, val) => {
+    rec({ call: 'fill', sel, val });
+    // PWPREEMPT_FILE: a PERSON arrives mid-run. Writing the lease file from
+    // inside a step is the only way to put the preemption exactly where it
+    // hurts — between two steps of a publish that is already under way. A test
+    // that preempted before the run would grade the acquire, not the recheck.
+    if (process.env.PWPREEMPT_FILE) {
+      fs.writeFileSync(process.env.PWPREEMPT_FILE,
+        'token=belongs-to-the-person-at-the-viewer\nholder=someone\nholder_pid=1\nkind=human\n');
+    }
+  },
   click: async (sel) => {
     rec({ call: 'click', sel });
     if (process.env.PWFAIL) throw new Error('stub: the step failed');
   },
   waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel }),
+  waitForTimeout: async (ms) => rec({ call: 'waitForTimeout', ms }),
+  // DIVE-4588. The ref layer runs its walk with page.evaluate, so the tape has
+  // to carry it. PWWALK parks the answer the walk would have produced in a real
+  // page; the arms then grade what the DRIVER does with it, which is the half
+  // that lives in our code. The walk itself is graded directly against a DOM
+  // shim in T23a — a stub cannot grade a function it is standing in for.
+  evaluate: async (fn, arg) => {
+    rec({ call: 'evaluate', fnlen: String(fn).length, mark: (arg && arg.mark) || null,
+          interactiveOnly: !!(arg && arg.interactiveOnly) });
+    if (process.env.PWWALK) return JSON.parse(fs.readFileSync(process.env.PWWALK, 'utf8'));
+    return { nodes: [], marker: null };
+  },
   selectOption: async (sel, val) => rec({ call: 'selectOption', sel, val }),
   setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p }),
   press: async (sel, key) => rec({ call: 'press', sel, key }),
@@ -2437,6 +2471,471 @@ grep -q 'SOURCE OF TRUTH' "$ADB/state/browser/ubol/adblock-off" \
   && { PASS=$((PASS+1)); } || { FAIL=$((FAIL+1)); printf 'FAIL: T97 the off list does not say it is the source of truth\n'; }
 t  'T97b the off list survives as the record the nightly converge re-renders from' 'apex.example.net' \
    "$(grep -v '^#' "$ADB/state/browser/ubol/adblock-off" | tr -d '[:space:]')"
+# =============================================== T22 DIVE-4588: the per-site lease
+#
+# WHAT THESE ARMS ARE MUTANTS OF. A shared browser is a shared LOGIN, and two
+# callers in one profile do not present as a collision — they present as "the
+# site is flaky", which is answered with a retry instead of a lock.
+#
+#   T22a  a second caller being let in, or being queued SILENTLY. Refusal has to
+#         name the holder, the purpose and the expiry, or the operator's only
+#         move is to wait and guess.
+#   T22b  a CORPSE holding a site forever. The row names this one explicitly:
+#         arm it with a caller that dies without releasing.
+#   T22c  the other corpse — a live pid past its TTL.
+#   T22d  a forced release handing a live holder's browser to a second caller.
+#   T22e  THE DANGEROUS ONE, and the reason the token is re-read before every
+#         step: a person redeems a viewer mid-publish and the agent keeps typing
+#         into the session they are logging in with. Acquiring once and never
+#         looking again is a lease that protects keystroke one.
+#   T22f  ...and its control, or T22e would pass on a run that never works.
+#   T22g  the agent's own cleanup deleting the PERSON's lease on the way out —
+#         preemption undone by the tidy-up path, which hands the browser to the
+#         next agent in the queue while somebody is still typing in it.
+#   T22h  a read being exempt. Separate tabs of one profile share cookies and
+#         drafts; a lease that covered only writes would cover the cheap half.
+
+LEASESITE=leasehost.test
+LDIR="$(mkprofile "$LEASESITE" "$LIVE_DOM")"
+mkadapter "$LEASESITE" "file://$TMP/artifact.html" 'PUBLISHED'
+printf 'PUBLISHED\n' > "$TMP/artifact.html"
+
+# A live holder: a real process this harness owns, so kill -0 is a true answer
+# rather than a guess about somebody else's pid.
+sleep 300 & HOLDER=$!
+mklease() {  # mklease <kind> <pid> <expires-in-seconds> [purpose]
+  mkdir -p "$LDIR/.5dive-lease"
+  printf 'token=held-by-someone-else\nholder=otherseat\nholder_pid=%s\nkind=%s\npurpose=%s\nacquired_at=%s\nexpires_at=%s\n' \
+    "$2" "$1" "${4:-compose}" "$(date -u +%s)" "$(( $(date -u +%s) + $3 ))" > "$LDIR/.5dive-lease/meta"
+}
+rmlease() { rm -rf "${LDIR:?}/.5dive-lease" "${LDIR:?}/.5dive-lease.q" "${LDIR:?}/.5dive-lease.reap"; }
+
+# --- T22a a second caller is REFUSED, and told who has it ---------------------
+mkdriver 0
+mklease agent "$HOLDER" 600 compose
+run "$BROWSER" run "$LEASESITE" publish --body=hi
+t  'T22a a second caller for a leased site is refused' 69 "$RC"
+tc 'T22a ...naming the holder'  'held by otherseat' "$ERR"
+tc 'T22a ...naming the purpose' '(compose)'         "$ERR"
+tc 'T22a ...naming when it frees' 'until'           "$ERR"
+tc 'T22a ...and saying why it is not just queued silently' 'read as site flakiness' "$ERR"
+t  'T22a ...and the executor never ran' 'no' "$([[ -f "$TMP/driver-plan.json" ]] && echo yes || echo no)"
+
+run "$BROWSER" lease "$LEASESITE" --status
+tc 'T22a `lease --status` answers who holds it' 'held by otherseat' "$OUT"
+
+# --- T22b THE ROW'S NAMED ARM: a caller that dies without releasing -----------
+# A pid that is gone. The lease file is intact, unexpired and looks perfectly
+# healthy — the ONLY thing wrong with it is that nobody is behind it.
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+mklease agent "$HOLDER" 600 compose
+run "$BROWSER" lease "$LEASESITE" --status
+tc 'T22b a lease whose holder died reads as free' 'free:' "$OUT"
+rm -f "$TMP/driver-plan.json"
+run "$BROWSER" run "$LEASESITE" publish --body=hi
+t  'T22b ...and the next caller gets the browser' 0 "$RC"
+t  'T22b ...having actually executed' 'yes' "$([[ -f "$TMP/driver-plan.json" ]] && echo yes || echo no)"
+t  'T22b ...and it released what it took' 'no' \
+   "$([[ -d "$LDIR/.5dive-lease" ]] && echo yes || echo no)"
+
+# --- T22c the other corpse: alive, but past its TTL ---------------------------
+sleep 300 & HOLDER2=$!
+mklease agent "$HOLDER2" -60 compose
+run "$BROWSER" lease "$LEASESITE" --status
+tc 'T22c a live holder past its expiry reads as free' 'free:' "$OUT"
+rmlease
+
+# --- T22d a forced release is refused while the holder is alive ---------------
+mklease agent "$HOLDER2" 600 compose
+run "$BROWSER" lease "$LEASESITE" --release
+t  'T22d --release refuses a LIVE holder' 77 "$RC"
+tc 'T22d ...saying a forced release is what puts two callers in one browser' \
+   'a forced release puts one there' "$ERR"
+t  'T22d ...and the lease is still there' 'yes' "$([[ -d "$LDIR/.5dive-lease" ]] && echo yes || echo no)"
+kill "$HOLDER2" 2>/dev/null; wait "$HOLDER2" 2>/dev/null
+run "$BROWSER" lease "$LEASESITE" --release
+t  'T22d ...but a stale one releases' 0 "$RC"
+t  'T22d ...and is gone' 'no' "$([[ -d "$LDIR/.5dive-lease" ]] && echo yes || echo no)"
+
+# --- T22e PREEMPTION MID-RUN: the agent's next step fails closed --------------
+# The stub flips the lease file during step 2 (fill) — a person redeeming a
+# viewer while a publish is three steps in. The publish has FOUR steps here
+# (goto, fill, click, wait_for), so there is something after the preemption that
+# must not happen.
+unset FIVEDIVE_BROWSER_DRIVER
+mkadapter "$LEASESITE" "file://$TMP/artifact.html" 'PUBLISHED' wait_for
+: > "$PWREC"
+LEASEMETA_SPY="$TMP/lease-spy"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" \
+    PWPREEMPT_FILE="$LDIR/.5dive-lease/meta" \
+    "$BROWSER" run "$LEASESITE" publish --body=hi
+t  'T22e the click AFTER the preemption never ran' '' "$(pwcalls click)"
+t  'T22e (control) the steps BEFORE it did run' 'yes' \
+   "$([[ -n "$(pwcalls fill)" ]] && echo yes || echo no)"
+tc 'T22e ...and the reason names a person, not a bug' \
+   'TAKEN by someone else' "$ERR"
+tc 'T22e ...refusing to type into a session somebody else is using' \
+   'somebody else is using' "$ERR"
+# AND IT IS NOT "NOTHING RAN". Two steps already executed, so the out-of-band
+# re-read is the verdict — reporting nothing-ran about a half-run action is the
+# shape that double-posts on retry.
+tn 'T22e ...and it does NOT claim nothing was published' 'nothing was published' "$ERR"
+tc 'T22e ...the out-of-band re-read is still what decides' 'verified:' "$OUT"
+# --- T22g the agent's cleanup leaves the PERSON's lease alone -----------------
+t  'T22g the preempting holder still holds it after the agent exits' 'belongs-to-the-person-at-the-viewer' \
+   "$(sed -n 's/^token=//p' "$LDIR/.5dive-lease/meta" 2>/dev/null)"
+rmlease
+
+# --- T22f the control: the SAME run, lease intact, completes ------------------
+: > "$PWREC"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" \
+    "$BROWSER" run "$LEASESITE" publish --body=hi
+t  'T22f (control) with the lease intact every step runs' 'yes' \
+   "$([[ -n "$(pwcalls click)" ]] && echo yes || echo no)"
+t  'T22f ...including the one after the fill' 'yes' \
+   "$([[ -n "$(pwcalls waitForSelector)" ]] && echo yes || echo no)"
+t  'T22f ...and the run is green' 0 "$RC"
+
+# --- T22h a READ takes the lease too ------------------------------------------
+sleep 300 & HOLDER3=$!
+mklease agent "$HOLDER3" 600 'reading the inbox'
+run env READARGV="$TMP/read-argv" READ_HTML="$TMP/read.html" "$BROWSER" \
+    shot "$LEASESITE" "https://$LEASESITE/x" --out="$TMP/leased.png"
+t  'T22h a render under someone else\047s lease is refused' 69 "$RC"
+tc 'T22h ...naming the holder' 'held by otherseat' "$ERR"
+t  'T22h ...and nothing was rendered' 'no' "$([[ -e "$TMP/leased.png" ]] && echo yes || echo no)"
+kill "$HOLDER3" 2>/dev/null; wait "$HOLDER3" 2>/dev/null
+rmlease
+
+# ======================================= T23 DIVE-4588: `tree` and re-derivable refs
+#
+# THE PROBLEM THIS GRADES. claude-luca's hour on one connect-inbox-send task was
+# "mostly guessing selectors and fighting the wizard by trial and error, four
+# rounds at a minute each" against `tr.zA`, `.yX .yP`, `input[name=subjectbox]`.
+# His own ranking put this ABOVE the warm browser: a warm browser makes a
+# guessing loop faster, it does not end it.
+#
+#   T23a  THE WALK ITSELF, against a DOM. Everything below it goes through a stub
+#         that stands in for the browser, and a stub cannot grade the function it
+#         is standing in for — so the ref assignment, the name resolution and the
+#         #n disambiguation are graded here, directly, or they are not graded.
+#   T23b  `tree` printing something that is not addressable. A tree an agent
+#         cannot quote back is a prettier version of the guessing.
+#   T23c  ONE WALK, NOT TWO. `tree` enumerates and `run` resolves; two
+#         implementations would drift, and the failure mode of drift is a ref
+#         that `tree` printed resolving to a DIFFERENT element inside a real
+#         account.
+#   T23d  a ref reaching the page as a literal selector. `ref=button/Send` handed
+#         to page.click as a CSS string matches nothing and reads as a broken site.
+#   T23e  a ref that matches nothing being best-efforted, and — the half that
+#         matters — being reported as a step that RAN.
+#   T23f  a tree of the SIGN-IN page. It is a perfectly well-formed tree, with a
+#         role and a name for every field, and an agent would quote its refs into
+#         an adapter and wonder for an hour why they never match.
+#   T23g  the acceptance the row actually names: an adapter that writes ZERO CSS
+#         selectors by hand runs end to end.
+
+# --- T23a the walk, graded against a DOM -------------------------------------
+# A shim, not jsdom: this suite must not grow a dependency to grade 200 lines of
+# DOM walking. It implements exactly the surface pageWalk touches, and the arms
+# below would notice if it implemented it wrongly, because the expected refs are
+# written out by hand from the markup.
+cat > "$TMP/walk-test.js" <<'WALK'
+const { pageWalk, INTERACTIVE } = require(process.env.ARIA);
+// --- the shim ---------------------------------------------------------------
+class El {
+  constructor(tag, attrs = {}, text = '', kids = []) {
+    this.tagName = tag.toUpperCase(); this._a = attrs; this._t = text; this.kids = kids;
+    kids.forEach(k => { k.parent = this; });
+  }
+  get id() { return this._a.id || ''; }
+  getAttribute(n) { return Object.prototype.hasOwnProperty.call(this._a, n) ? this._a[n] : null; }
+  hasAttribute(n) { return Object.prototype.hasOwnProperty.call(this._a, n); }
+  setAttribute(n, v) { this._a[n] = v; }
+  get textContent() { return this._t + this.kids.map(k => k.textContent).join(''); }
+  closest(sel) { let n = this; const tag = sel.toUpperCase();
+    while (n) { if (n.tagName === tag) return n; n = n.parent; } return null; }
+  get ownerDocument() { return doc; }
+}
+function flatten(el, out = []) { out.push(el); el.kids.forEach(k => flatten(k, out)); return out; }
+const body = new El('body', {}, '', [
+  new El('a', { href: '/inbox' }, 'Inbox'),
+  new El('a', { href: '/inbox2' }, 'Inbox'),
+  new El('label', { for: 'to' }, 'To'),
+  new El('input', { id: 'to', type: 'text' }),
+  new El('input', { type: 'text', placeholder: 'Subject' }),
+  new El('button', { 'aria-label': 'Send' }, 'ignored because aria-label wins'),
+  new El('input', { type: 'hidden', name: 'csrf' }),
+  new El('button', { hidden: '' }, 'Delete forever'),
+  new El('div', { role: 'button', 'aria-hidden': 'true' }, 'Archive'),
+  new El('span', {}, 'just text'),
+]);
+const all = flatten(body).slice(1);
+const doc = {
+  getElementById: (id) => all.find(e => e.id === id) || null,
+  querySelector: (sel) => { const m = /^label\[for="(.*)"\]$/.exec(sel);
+    return m ? all.find(e => e.tagName === 'LABEL' && e.getAttribute('for') === m[1]) || null : null; },
+  defaultView: { getComputedStyle: () => ({ display: 'block', visibility: 'visible' }) },
+};
+global.document = { querySelectorAll: () => all };
+global.CSS = { escape: (s) => s };
+const mode = process.argv[2];
+const r = pageWalk({ interactiveOnly: mode === 'interactive', interactiveRoles: INTERACTIVE,
+                     mark: process.argv[3] || null });
+console.log(JSON.stringify({ refs: r.nodes.map(n => n.ref), marker: r.marker,
+                             marked: all.filter(e => e.getAttribute('data-5dive-ref')).length }));
+WALK
+ARIA="$ROOT/plugins/browser/lib/aria.cjs"
+WALKREFS="$(ARIA="$ARIA" node "$TMP/walk-test.js" all | jq -r '.refs|join(" ")')"
+tc 'T23a a labelled field is addressed by its LABEL, not its name attribute' 'textbox/To' "$WALKREFS"
+tc 'T23a a placeholder is an accessible name when nothing better exists' 'textbox/Subject' "$WALKREFS"
+tc 'T23a aria-label outranks the element text' 'button/Send' "$WALKREFS"
+tn 'T23a ...so the overridden text is NOT the ref' 'ignored because' "$WALKREFS"
+# THE DISAMBIGUATION, both directions. An ordinal that is not needed breaks when
+# an unrelated copy appears; one that IS needed and missing is an ambiguous ref.
+tc 'T23a two identical links get ordinals' 'link/Inbox#1 link/Inbox#2' "$WALKREFS"
+tn 'T23a ...and a unique node does NOT get one' 'button/Send#' "$WALKREFS"
+tn 'T23a a hidden input is not offered as addressable' 'csrf' "$WALKREFS"
+tn 'T23a an element the page declares hidden is not offered' 'Delete forever' "$WALKREFS"
+tn 'T23a an aria-hidden node is not offered' 'Archive' "$WALKREFS"
+tn 'T23a a plain span is not a node' 'just text' "$WALKREFS"
+t  'T23a --interactive drops the non-actionable roles' 'no' \
+   "$(ARIA="$ARIA" node "$TMP/walk-test.js" interactive | jq -r '.refs|join(" ")' | grep -q 'label/' && echo yes || echo no)"
+# MARKING IS THE SAME WALK. One element, and exactly one.
+MARKED="$(ARIA="$ARIA" node "$TMP/walk-test.js" all 'link/Inbox#2')"
+t  'T23a marking a ref stamps exactly one element' '1' "$(jq -r '.marked' <<<"$MARKED")"
+t  'T23a ...and reports the marker the selector is built from' 'yes' \
+   "$(jq -r '.marker' <<<"$MARKED" | grep -q '^r[0-9]' && echo yes || echo no)"
+t  'T23a a ref that matches nothing marks NOTHING' '0' \
+   "$(ARIA="$ARIA" node "$TMP/walk-test.js" all 'button/Nope' | jq -r '.marked')"
+
+# --- the canned walk the stub hands back for the plumbing arms ---------------
+TREESITE=treehost.test
+TDIR="$(mkprofile "$TREESITE" "$LIVE_DOM")"
+mkadapter "$TREESITE" "file://$TMP/artifact.html" 'PUBLISHED'
+WALKJSON="$TMP/walk.json"
+cat > "$WALKJSON" <<'WJ'
+{ "nodes": [ {"ref":"textbox/To","role":"textbox","name":"To","tag":"input"},
+             {"ref":"button/Send","role":"button","name":"Send","tag":"button"} ],
+  "marker": "r7" }
+WJ
+
+# --- T23b `tree` prints refs a caller can quote back --------------------------
+unset FIVEDIVE_BROWSER_DRIVER
+: > "$PWREC"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$WALKJSON" \
+    "$BROWSER" tree "$TREESITE" "https://$TREESITE/inbox"
+t  'T23b tree is green' 0 "$RC"
+tc 'T23b ...and prints a quotable ref'    'ref=button/Send' "$OUT"
+tc 'T23b ...with the role and the name'   'textbox' "$OUT"
+tc 'T23b ...and says a ref survives a reload' 'still works after a reload' "$ERR"
+tc 'T23b it navigated to the url it was asked for' "$TREESITE/inbox" "$(pwcalls goto)"
+# NEVER NETWORK IDLE: a live web app long-polls and never idles — that is what
+# makes `read` hang for 150s on a real Gmail. A bounded settle, or nothing.
+t  'T23b ...and settles on a bounded timer rather than network idle' 'yes' \
+   "$([[ -n "$(pwcalls waitForTimeout)" ]] && echo yes || echo no)"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$WALKJSON" \
+    "$BROWSER" tree "$TREESITE" "https://$TREESITE/inbox" --json
+t  'T23b --json is machine-readable' 'button/Send' "$(jq -r '.nodes[1].ref' <<<"$OUT")"
+
+# --- T23c ONE WALK, TWO MODES -------------------------------------------------
+: > "$PWREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$WALKJSON" \
+    "$BROWSER" tree "$TREESITE" "https://$TREESITE/inbox" >/dev/null 2>&1
+TREEFN="$(jq -r 'select(.call=="evaluate")|.fnlen' "$PWREC" | head -1)"
+cat > "$FIVEDIVE_BROWSER_ADAPTER_DIR/$TREESITE.json" <<JSON
+{ "site": "$TREESITE",
+  "probe": { "url": "https://$TREESITE/feed", "logged_out_when_dom_matches": "action=\"/login\"" },
+  "actions": { "publish": {
+      "steps": [ {"op":"goto","url":"https://$TREESITE/compose"},
+                 {"op":"fill","selector":"ref=textbox/To","value":"{body}"},
+                 {"op":"click","selector":"ref=button/Send"} ],
+      "verify": { "url": "file://$TMP/artifact.html", "expect": "PUBLISHED" } } } }
+JSON
+: > "$PWREC"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$WALKJSON" \
+    "$BROWSER" run "$TREESITE" publish --body=hi
+RUNFN="$(jq -r 'select(.call=="evaluate")|.fnlen' "$PWREC" | head -1)"
+t  'T23c tree and run resolve refs with the SAME walk' "$TREEFN" "$RUNFN"
+t  'T23c (anchor) the walk really ran in both' 'yes' \
+   "$([[ -n "$TREEFN" && "$TREEFN" != null ]] && echo yes || echo no)"
+t  'T23c ...and only the resolve pass asks it to mark' 'button/Send' \
+   "$(jq -r 'select(.call=="evaluate" and .mark!=null)|.mark' "$PWREC" | tail -1)"
+
+# --- T23d a ref is RESOLVED, never handed to the page as a selector ----------
+t  'T23d the ref never reaches the page as a literal selector' '' \
+   "$(jq -r 'select(.call=="click")|.sel' "$PWREC" | grep '^ref=' || true)"
+t  'T23d ...it reaches it as the marker the walk stamped' '[data-5dive-ref="r7"]' \
+   "$(jq -r 'select(.call=="click")|.sel' "$PWREC" | tail -1)"
+t  'T23d ...and a plain CSS selector is passed through untouched' 0 "$RC"
+
+# --- T23e a ref that matches nothing is a REFUSAL, and nothing ran ------------
+cat > "$TMP/walk-miss.json" <<'WJ'
+{ "nodes": [ {"ref":"button/Discard","role":"button","name":"Discard","tag":"button"} ],
+  "marker": null }
+WJ
+cat > "$FIVEDIVE_BROWSER_ADAPTER_DIR/$TREESITE.json" <<JSON
+{ "site": "$TREESITE",
+  "probe": { "url": "https://$TREESITE/feed", "logged_out_when_dom_matches": "action=\"/login\"" },
+  "actions": { "publish": {
+      "steps": [ {"op":"click","selector":"ref=button/Send"} ],
+      "verify": { "url": "file://$TMP/artifact.html", "expect": "PUBLISHED" } } } }
+JSON
+: > "$PWREC"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$TMP/walk-miss.json" \
+    "$BROWSER" run "$TREESITE" publish --body=hi
+t  'T23e a ref that matches nothing does not click anything' '' "$(pwcalls click)"
+tc 'T23e ...and says the PAGE is not the one tree described' 'not the one' "$ERR"
+tc 'T23e ...offering the refs that ARE there' 'ref=button/Discard' "$ERR"
+# THE HALF THAT MATTERS. It was step one, so nothing ran — and a run that never
+# started must not reach the out-of-band re-read, or whatever is already at the
+# verify URL is reported as this run's success.
+t  'T23e ...and a miss on step one is NOTHING RAN, not a failed publish' 69 "$RC"
+tn 'T23e ...so the pre-existing artifact is NOT reported as verified' 'verified:' "$OUT"
+
+# --- T23f a tree of the SIGN-IN page is refused -------------------------------
+printf '%s' "$DEAD_DOM" > "$TDIR/.fake-dom"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$WALKJSON" \
+    "$BROWSER" tree "$TREESITE" "https://$TREESITE/inbox"
+t  'T23f tree refuses a logged-out profile' 75 "$RC"
+tn 'T23f ...and hands back no refs to quote into an adapter' 'ref=' "$OUT"
+printf '%s' "$LIVE_DOM" > "$TDIR/.fake-dom"
+
+# --- T23g THE ROW'S ACCEPTANCE: an action with ZERO hand-written CSS ----------
+cat > "$FIVEDIVE_BROWSER_ADAPTER_DIR/$TREESITE.json" <<JSON
+{ "site": "$TREESITE",
+  "probe": { "url": "https://$TREESITE/feed", "logged_out_when_dom_matches": "action=\"/login\"" },
+  "actions": { "compose": {
+      "steps": [ {"op":"goto","url":"https://$TREESITE/inbox"},
+                 {"op":"wait_for","selector":"ref=button/Send"},
+                 {"op":"fill","selector":"ref=textbox/To","value":"{to}"},
+                 {"op":"click","selector":"ref=button/Send"} ],
+      "verify": { "url": "file://$TMP/artifact.html", "expect": "PUBLISHED" } } } }
+JSON
+: > "$PWREC"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$WALKJSON" \
+    "$BROWSER" run "$TREESITE" compose --to=someone@example.com
+t  'T23g an adapter with no CSS selector at all runs end to end' 0 "$RC"
+t  'T23g (anchor) it really wrote nothing but refs' '0' \
+   "$(jq -r '.actions.compose.steps[]|select(.selector!=null)|.selector' \
+       "$FIVEDIVE_BROWSER_ADAPTER_DIR/$TREESITE.json" | grep -cv '^ref=' || true)"
+t  'T23g ...and every ref reached the page as a resolved marker' '0' \
+   "$(jq -r 'select(.sel!=null)|.sel' "$PWREC" | grep -c '^ref=' || true)"
+tc 'T23g ...with the caller argument still substituted as a VALUE' 'someone@example.com' \
+   "$(pwcalls fill)"
+
+# ====================================== T24 DIVE-4588: idle eviction of served browsers
+#
+# WHAT THIS IS A MUTANT OF. `serve` has never had an end: a browser started once
+# lives until somebody stops it by hand or the box reboots. Each one is ~300-500 MB
+# of resident Chrome plus an X display, and on a 37-seat box that is not a leak in
+# the usual sense — every one of them was legitimately asked for. It is an
+# unbounded accumulation of legitimate requests.
+#
+# The three arms that matter are the ones that must NOT evict, because an
+# eviction sweep that is merely aggressive is worse than none: it takes the
+# browser away from a person mid-login, or out from under a caller mid-publish,
+# and both present as the site being broken.
+
+EVSITE=evicthost.test
+EDIR="$(mkprofile "$EVSITE" "$LIVE_DOM")"
+# A served browser, faked at the pidfile: _serve_running asks only whether the
+# two pids are alive, so two sleeps this harness owns are a truthful fixture and
+# need no Xvfb.
+mkserve() {  # mkserve <dir> <last_used-epoch|-> [extra]
+  local d="$1" last="$2"
+  # THE REDIRECTS ARE LOAD-BEARING. This function is called as `$(mkserve ...)`,
+  # and a command substitution waits for EOF on the pipe, not for the child to
+  # exit — a backgrounded job that inherits stdout holds that pipe open for its
+  # whole life. Without `>/dev/null` the caller blocks for the full `sleep`, and
+  # by the time the arm runs its assertion the two pids it planted are DEAD, so
+  # `_serve_running` skips the profile and `evict` prints "0 browser(s) evicted"
+  # for every arm — the fixture's own shape destroying the fixture, silently and
+  # in the passing direction for anything that asserts an absence.
+  sleep 300 >/dev/null 2>&1 & local xp=$!
+  sleep 300 >/dev/null 2>&1 & local cp=$!
+  printf 'display=999\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' "$xp" "$cp" "$(date -u +%s)" \
+    > "$d/.5dive-serve"
+  [[ "$last" == - ]] || printf 'last_used=%s\n' "$last" >> "$d/.5dive-serve"
+  printf '%s %s\n' "$xp" "$cp"
+}
+SERVEPIDS="$(mkserve "$EDIR" "$(( $(date -u +%s) - 4000 ))")"
+
+# --- T24a an idle browser is evicted, and the LOGIN is not ------------------
+run "$BROWSER" evict --idle=1800
+tc 'T24a an idle served browser is evicted' 'evicted: idle' "$OUT"
+t  'T24a ...and the profile directory is untouched' 'yes' "$([[ -d "$EDIR" ]] && echo yes || echo no)"
+t  'T24a ...as is its cookie jar and everything else in it' 'yes' \
+   "$([[ -f "$EDIR/.fake-dom" ]] && echo yes || echo no)"
+tc 'T24a ...and the message says the next command brings it back' 'the profile is untouched' "$OUT"
+t  'T24a ...the serve really is stopped' 'no' "$([[ -f "$EDIR/.5dive-serve" ]] && echo yes || echo no)"
+
+# --- T24b a browser used recently is KEPT ------------------------------------
+SERVEPIDS="$(mkserve "$EDIR" "$(date -u +%s)")"
+run "$BROWSER" evict --idle=1800
+tc 'T24b a browser used just now is kept' 'kept: used' "$OUT"
+t  'T24b ...and is still serving' 'yes' "$([[ -f "$EDIR/.5dive-serve" ]] && echo yes || echo no)"
+
+# --- T24c A PERSON IN IT IS NEVER EVICTED ------------------------------------
+# Logging in involves long pauses staring at a phone for a code, so "idle" and
+# "nobody is there" are different facts. This is the arm that keeps the sweep
+# from being the thing that breaks the login it exists to make affordable.
+sleep 300 & VNCPID=$!
+printf 'vnc_pid=%s\nws_pid=%s\nport=6080\nvnc_port=5900\n' "$VNCPID" "$VNCPID" > "$EDIR/.5dive-viewer"
+printf 'display=999\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\nlast_used=%s\n' \
+  $SERVEPIDS "$(date -u +%s)" "$(( $(date -u +%s) - 99999 ))" > "$EDIR/.5dive-serve"
+run "$BROWSER" evict --idle=60
+tc 'T24c a browser with a PERSON in it is never evicted, however idle' 'kept: a person is in it' "$OUT"
+t  'T24c ...and is still serving' 'yes' "$([[ -f "$EDIR/.5dive-serve" ]] && echo yes || echo no)"
+rm -f "$EDIR/.5dive-viewer"; kill "$VNCPID" 2>/dev/null; wait "$VNCPID" 2>/dev/null
+
+# --- T24d A CALLER MID-ACTION IS NEVER EVICTED -------------------------------
+sleep 300 & LHOLD=$!
+mkdir -p "$EDIR/.5dive-lease"
+printf 'token=t\nholder=otherseat\nholder_pid=%s\nkind=agent\npurpose=publish\nacquired_at=%s\nexpires_at=%s\n' \
+  "$LHOLD" "$(date -u +%s)" "$(( $(date -u +%s) + 600 ))" > "$EDIR/.5dive-lease/meta"
+run "$BROWSER" evict --idle=60
+tc 'T24d a browser under a live lease is never evicted' 'kept: busy: held by otherseat' "$OUT"
+t  'T24d ...and is still serving' 'yes' "$([[ -f "$EDIR/.5dive-serve" ]] && echo yes || echo no)"
+kill "$LHOLD" 2>/dev/null; wait "$LHOLD" 2>/dev/null
+rm -rf "${EDIR:?}/.5dive-lease"
+
+# --- T24e a serve that has NEVER been used is not "idle since the epoch" ------
+# A missing last_used read as 0 would evict a browser on the first sweep —
+# including the one a person is about to be handed a viewer onto.
+printf 'display=999\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' $SERVEPIDS "$(date -u +%s)" \
+  > "$EDIR/.5dive-serve"
+run "$BROWSER" evict --idle=1800
+tc 'T24e a browser started but never used falls back to when it started' 'kept: used' "$OUT"
+t  'T24e ...and is still serving' 'yes' "$([[ -f "$EDIR/.5dive-serve" ]] && echo yes || echo no)"
+
+# --- T24f --dry-run tells you and changes nothing ----------------------------
+printf 'display=999\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\nlast_used=%s\n' \
+  $SERVEPIDS "$(date -u +%s)" "$(( $(date -u +%s) - 4000 ))" > "$EDIR/.5dive-serve"
+run "$BROWSER" evict --idle=1800 --dry-run
+tc 'T24f --dry-run names what it would evict' 'WOULD evict' "$OUT"
+t  'T24f ...and evicts nothing' 'yes' "$([[ -f "$EDIR/.5dive-serve" ]] && echo yes || echo no)"
+
+# --- T24g holding the lease STAMPS the clock the sweep reads -----------------
+# Without this the sweep grades a number nobody writes, and every browser looks
+# idle from the moment it starts.
+STAMP0="$(sed -n 's/^last_used=//p' "$EDIR/.5dive-serve")"
+mkdriver 0
+mkadapter "$EVSITE" "file://$TMP/artifact.html" 'PUBLISHED'
+run "$BROWSER" run "$EVSITE" publish --body=hi
+STAMP1="$(sed -n 's/^last_used=//p' "$EDIR/.5dive-serve" 2>/dev/null)"
+# `run` cycles the serve, so the pidfile it leaves is a NEW one; what the arm
+# grades is that a caller taking the browser moved the clock forward at all.
+t  'T24g taking the browser stamps the idle clock' 'newer' \
+   "$([[ -n "$STAMP1" && "$STAMP1" -gt "$STAMP0" ]] && echo newer || echo "stale:$STAMP0->$STAMP1")"
+for p in $SERVEPIDS; do kill "$p" 2>/dev/null; done
+rm -f "$EDIR/.5dive-serve"
+
+# --- T24h the sweep rides the schedule that already exists -------------------
+tc 'T24h the scheduled probe runs the idle sweep' 'cmd_evict' \
+   "$(sed -n '/^cmd_probe_all/,/^}/p' "$BROWSER")"
+tc 'T24h ...and it can be turned off on a box that wants its browsers resident' \
+   'FIVEDIVE_BROWSER_EVICT_ON_PROBE' "$(sed -n '/^cmd_probe_all/,/^}/p' "$BROWSER")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
