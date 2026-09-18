@@ -414,6 +414,40 @@ a library nobody chose. The driver looks in exactly two places, in order: the di
 names, if any, then `plugins/browser/node_modules`. There is no ancestor walk, so "not installed"
 is a fact about those two places rather than about where the plugin was unpacked.
 
+## Ad filtering, and the one site where you turn it off
+
+Agent Chrome profiles on a managed box carry exactly ONE extension — uBlock Origin
+Lite, pinned to a version we pack and host ourselves — and the same Chrome managed
+policy that installs it blocks every other extension from being added, including by
+a human sitting at the one-time viewer. Cookie walls, ad iframes and consent
+overlays are what an agent clicks by accident, and what makes a `shot`/`read` DOM
+several times larger than the article it was asked to read.
+
+Some sites break under filtering. That is what this is for:
+
+```
+5dive browser adblock status              # is it on, and which sites is it off for
+sudo 5dive browser adblock off example.com   # this site breaks — stop filtering it
+sudo 5dive browser adblock on  example.com   # filter it again
+```
+
+Three things worth knowing before you use it:
+
+- **It is root, and not by preference.** Chrome policy on Linux is machine-level
+  only — `/etc/opt/chrome/policies/managed` — and there is no per-user policy path,
+  so the file belongs to root the way the profile store's parent does.
+- **It is total for that host.** The mechanism is
+  `ExtensionSettings.<id>.runtime_blocked_hosts`, measured on Chrome 153: it stops
+  the network-level filtering AND the extension's content script on that host.
+  There is no "filter a bit less" setting.
+- **`shot` and `read` pick it up on their next render; a browser already running
+  under `serve` may not.** Only fresh launches were measured. If you need it to
+  take effect inside a live session, `serve <site> --stop` first.
+
+The off list lives at `/var/lib/5dive/browser/ubol/adblock-off` and IS the source of
+truth: the nightly root converge re-renders the policy file from it, so a host you
+remove from that list comes back filtered.
+
 ## Shipped, and what is still named so nobody assumes it
 
 - **The customer-facing FLOW is live.** The dashboard's Connected sites tile went to production on

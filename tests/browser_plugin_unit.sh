@@ -231,7 +231,11 @@ t  'T2c5 ...and the store root too' 'yes' "$(grep -q 'chmod 00711 "\$PROFILE_ROO
 # DIVE-4348: the dashboard's only path is shelld -> `sudo -n 5dive browser …` (root,
 # SUDO_USER=claude); as root every verb but setup refused. Root drops to the seat.
 t  'T2c6 a root caller with SUDO_USER re-executes as the seat before touching a store' 'yes' "$(grep -q 'exec runuser -u "\$_drop" -- "\$0" "\$@"' "$ROOT/plugins/browser/bin/browser" && echo yes || echo no)"
-t  'T2c7 ...but setup stays root'"'"'s' 'yes' "$(grep -A2 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|-h|--help|help|"") ;;' && echo yes || echo no)"
+# DIVE-4516 added `adblock` to this set for the same reason `setup` is in it: it
+# writes the MACHINE-WIDE chrome policy file, which has no per-user path on Linux,
+# so dropping to the seat would turn the verb into a permission refusal.
+t  'T2c7 ...but setup and adblock stay root'"'"'s' 'yes' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|adblock|-h|--help|help|"") ;;' && echo yes || echo no)"
+t  'T2c8 ...and no OTHER verb joined them' '2' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -oP '^\s+\K[a-z|]+(?=\|-h\|--help)' | tr '|' '\n' | grep -c .)"
 
 # DIVE-4519 iteration 2 — setup owns the schedule, and these arms DRIVE setup.
 #
@@ -2249,6 +2253,95 @@ t  'T21c the marker MATCHES the sign-in form (it posts to /session)' 'match' \
 t  'T21d it does NOT match the logged-in settings page' 'miss' \
    "$(grep -qiE "$GMARK" <<<'<title>Your profile</title><meta name="user-login" content="someone"><textarea id="user_profile_bio"></textarea>' && echo match || echo miss)"
 tc 'T21e the file records the measurement' 'MEASURED, NOT GUESSED' "$(cat "$GADP")"
+
+# --- T9x: the per-site adblock off switch (DIVE-4516) -------------------------
+#
+# ONE extension is allowed in an agent profile (uBlock Origin Lite, pinned by
+# managed policy) and some sites break under filtering. These arms grade the verb
+# that turns it off for one site. The policy dir and the state dir are redirected
+# into $TMP; the root check is satisfied by a fake `id` on PATH, because the real
+# property under test is WHAT GETS WRITTEN, and a suite that needed root to grade
+# it would be a suite nobody runs.
+echo "== T9x adblock (DIVE-4516)"
+ADB="$TMP/adb"; mkdir -p "$ADB/state" "$ADB/policies" "$ADB/bin"
+cat > "$ADB/bin/id" <<'SH'
+#!/bin/sh
+[ "$1" = -u ] && [ $# -eq 1 ] && { echo 0; exit 0; }
+exec /usr/bin/id "$@"
+SH
+chmod +x "$ADB/bin/id"
+POLF="$ADB/policies/5dive-browser.json"
+UBOL=bjnapnkpiihibhjaehecmpbpeejnloib
+adb()     { run env STATE_DIR="$ADB/state" CHROME_POLICY_DIR="$ADB/policies" bash "$BROWSER" adblock "$@"; }
+adb_root(){ run env PATH="$ADB/bin:$PATH" STATE_DIR="$ADB/state" CHROME_POLICY_DIR="$ADB/policies" bash "$BROWSER" adblock "$@"; }
+# What the nightly converger renders (scripts/inc/browser-stack.sh). Seeded here so
+# the arms grade the PATCH, not a file this verb invented.
+seed_policy() {
+  jq -n --arg id "$UBOL" '{ "ExtensionInstallBlocklist": ["*"], "ExtensionInstallAllowlist": [$id],
+      "ExtensionInstallForcelist": [($id + ";https://api.5dive.com/ext/ubol/updates.xml")],
+      "ExtensionSettings": { ($id): {"installation_mode":"force_installed","update_url":"https://api.5dive.com/ext/ubol/updates.xml"} } }' > "$POLF"
+}
+
+# A box with no pinned uBOL must SAY there is nothing being filtered. "adblock is
+# off for nothing" on a box with no extension is the reassuring half of a lie.
+adb status
+tc 'T90 status on a box with no policy file says the policy is ABSENT' 'ABSENT' "$OUT"
+tc 'T90b ...and spells out that nothing is being filtered or blocked' 'nothing is being filtered' "$OUT"
+
+# The file is machine-wide and root-owned; a seat that could edit it could turn
+# filtering off for a site and then be shown a page it was never meant to trust.
+adb off example.com
+t  'T91 a non-root caller is refused' '77' "$RC"
+tc 'T91b ...and is told the one command that works' 'sudo 5dive browser adblock off example.com' "$ERR"
+adb_root off 'not a host/../..'
+t  'T92 a site name that is not a host is refused' '64' "$RC"
+adb_root frobnicate example.com
+t  'T92b an unknown subcommand is refused' '64' "$RC"
+adb_root off
+t  'T92c `off` with no site is refused rather than applied to everything' '64' "$RC"
+
+# The off list is recorded even with no policy file to patch — the box may get the
+# extension tonight, and a setting that silently evaporated would come back ON.
+rm -f "$POLF"
+adb_root off news.example.com
+t  'T93 with no policy file on the box the verb still succeeds' '0' "$RC"
+tc 'T93b ...and says the setting applies when the extension arrives' 'applies the moment' "$OUT"
+t  'T93c ...and the off list records it' 'news.example.com' "$(grep -v '^#' "$ADB/state/browser/ubol/adblock-off" | tr -d '[:space:]')"
+
+# The patch: ONE key, and both host patterns. `*://*.example.com` does not match
+# `example.com`, so a wildcard-only off switch reports success and leaves the apex
+# — the host the seat typed — still filtered.
+seed_policy
+adb_root off news.example.com
+t  'T94 the live policy file is patched with BOTH the apex and the wildcard' '*://news.example.com,*://*.news.example.com' \
+   "$(jq -r --arg id "$UBOL" '.ExtensionSettings[$id].runtime_blocked_hosts | join(",")' "$POLF")"
+t  'T94b ...and the blocklist that keeps every other extension out is untouched' '["*"]' "$(jq -c '.ExtensionInstallBlocklist' "$POLF")"
+t  'T94c ...and so is the force-install entry' "$UBOL;https://api.5dive.com/ext/ubol/updates.xml" "$(jq -r '.ExtensionInstallForcelist[0]' "$POLF")"
+tc 'T94d ...and the caller is told a running `serve` may not pick it up (only fresh launches were measured)' 'may need `serve news.example.com --stop`' "$OUT"
+
+adb_root off shop.example.org
+t  'T95 a second site is added, not replaced' '*://news.example.com,*://*.news.example.com,*://shop.example.org,*://*.shop.example.org' \
+   "$(jq -r --arg id "$UBOL" '.ExtensionSettings[$id].runtime_blocked_hosts | join(",")' "$POLF")"
+adb status
+tc 'T95b ...and status lists both' 'news.example.com, shop.example.org' "$OUT"
+
+adb_root on news.example.com
+t  'T96 `on` removes just that site' '*://shop.example.org,*://*.shop.example.org' \
+   "$(jq -r --arg id "$UBOL" '.ExtensionSettings[$id].runtime_blocked_hosts | join(",")' "$POLF")"
+adb_root on shop.example.org
+t  'T96b ...and the last one removed DELETES the key rather than leaving an empty array' 'false' \
+   "$(jq -r --arg id "$UBOL" '.ExtensionSettings[$id] | has("runtime_blocked_hosts")' "$POLF")"
+t  'T96c ...and the extension is still force-installed (turning filtering back on is not uninstalling it)' 'force_installed' \
+   "$(jq -r --arg id "$UBOL" '.ExtensionSettings[$id].installation_mode' "$POLF")"
+
+# The list, not the policy file, is the source of truth: the root converge
+# re-renders that file nightly, and a site turned off at 14:00 that lived only
+# there would be silently re-filtered at 03:00.
+adb_root off apex.example.net
+grep -q 'SOURCE OF TRUTH' "$ADB/state/browser/ubol/adblock-off" \
+  && { PASS=$((PASS+1)); } || { FAIL=$((FAIL+1)); printf 'FAIL: T97 the off list does not say it is the source of truth\n'; }
+t  'T97b the off list survives as the record the nightly converge re-renders from' 'apex.example.net' \
+   "$(grep -v '^#' "$ADB/state/browser/ubol/adblock-off" | tr -d '[:space:]')"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

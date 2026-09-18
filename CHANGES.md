@@ -1,5 +1,30 @@
 ## Unreleased
 
+### Added — `5dive browser adblock`: turn ad filtering off for one site (DIVE-4516), browser 1.6.0
+
+Agent Chrome profiles on a managed box now carry exactly one extension — uBlock
+Origin Lite, pinned and force-installed by Chrome managed policy — and that same
+policy blocks every other extension from being added, including by a human at the
+one-time viewer. Some sites break under filtering, so there is a way to turn it off
+for one host without turning it off everywhere.
+
+- `5dive browser adblock status` / `sudo 5dive browser adblock off|on <site>`.
+- Root, and not by preference: Chrome policy on Linux is machine-level only, with
+  no per-user path, so the file belongs to root the way the profile store does.
+  `adblock` joins `setup` as the second verb a root caller is NOT dropped out of.
+- The mechanism is `ExtensionSettings.<id>.runtime_blocked_hosts`, measured on
+  Chrome 153 before it was built on: uBOL Lite filters through declarativeNetRequest
+  (the network stack), not through the content-script path that key is documented
+  against, and it turned out to stop BOTH. It is total for that host.
+- Both `*://host` and `*://*.host` are written. `*://*.example.com` does not match
+  `example.com`, so a wildcard-only off switch reports success and leaves the apex —
+  the host the seat actually typed — still filtered.
+- `/var/lib/5dive/browser/ubol/adblock-off` is the source of truth, not the policy
+  file: the nightly root converge re-renders that file, and a host living only there
+  would be silently re-filtered at 03:00.
+- Only fresh launches were measured, so `shot`/`read` pick a change up on their next
+  render and the verb SAYS a live `serve` may need a restart rather than promising it.
+
 ### Fixed — the browser connect-site runbook now follows the shipped bound viewer flow (DIVE-4523), browser 1.5.3
 
 The Claude skill and harness-neutral AGENTS block now carry one byte-identical fenced workflow. It
