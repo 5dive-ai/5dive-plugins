@@ -44,6 +44,11 @@
 
 const fs = require('fs');
 const path = require('path');
+// DIVE-4588. The ref layer is a SIBLING FILE addressed by path, not a package
+// name: the whole point of playwrightDirs() below is that this process does not
+// resolve code by walking ancestor node_modules, and a bare require('aria')
+// would reintroduce exactly that.
+const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
 
 const PROG = '5dive browser run';
 // THE EXIT CODE IS A CONTRACT, and 70 is the load-bearing one.
@@ -95,6 +100,53 @@ const STEPS = {
   press:    ['selector', 'key'],
 };
 const STEP_TIMEOUT = Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || 30000);
+
+// ---- THE LEASE, RE-READ BEFORE EVERY STEP (DIVE-4588) -----------------------
+//
+// bin/browser holds a per-site lease for the whole of this run and hands its
+// file and token down. This function is why it hands down a FILE and not just a
+// boolean: the lease can be taken away MID-RUN, and the only case that matters
+// is the one where it is taken by a PERSON. Someone redeems a viewer, gets a
+// keyboard inside this exact browser, and starts clearing a captcha or finishing
+// a login — while this process is three steps into a publish.
+//
+// Checking once at the start would protect keystroke one and nothing after it.
+// So the token is re-read from disk before each step, and a mismatch stops the
+// run where it stands.
+//
+// IT IS A FAILURE, NOT A REFUSAL, AND THAT DISTINCTION IS THE CAREFUL PART. If
+// steps have already run, this exits 1 and bin/browser goes and RE-READS the
+// artifact out of band — because an action interrupted at step 6 of 8 may well
+// have published, and reporting "nothing happened" about a run that half
+// happened is how a retry double-posts. `stepFailure()` already encodes exactly
+// that rule, so this reuses it rather than choosing a code.
+//
+// A run with NO lease in its environment is not policed here. That is
+// deliberate: FIVEDIVE_BROWSER_DRIVER is a documented seam (the Browser Hand
+// shape drives its own browser), and a driver that refused to start without a
+// variable its caller may not set would break that seam to enforce a lock the
+// caller never took. bin/browser always sets it.
+const LEASE_FILE = process.env.FIVEDIVE_BROWSER_LEASE || '';
+const LEASE_TOKEN = process.env.FIVEDIVE_BROWSER_LEASE_TOKEN || '';
+function leaseStillOurs() {
+  if (!LEASE_FILE || !LEASE_TOKEN) return null;   // no lease was handed down
+  let txt;
+  try { txt = fs.readFileSync(LEASE_FILE, 'utf8'); }
+  catch (e) { return 'gone'; }                    // the directory was removed under us
+  const m = txt.match(/^token=(.*)$/m);
+  return m && m[1] === LEASE_TOKEN ? null : 'taken';
+}
+function assertLease(where) {
+  const lost = leaseStillOurs();
+  if (!lost) return;
+  const why = lost === 'gone'
+    ? 'the lease on this browser was released or reaped while this run was in progress'
+    : 'the lease on this browser was TAKEN by someone else — a person redeeming a viewer preempts an agent';
+  throw new Error(
+    `${where}: refusing to continue — ${why}. Stopping here rather than typing into a session ` +
+    `somebody else is using. Whatever steps already ran are still real: bin/browser re-reads the ` +
+    `artifact out of band and that re-read, not this message, is the verdict.`);
+}
 
 function die(code, msg) { process.stderr.write(`${PROG}: ${msg}\n`); process.exit(code); }
 
@@ -173,6 +225,59 @@ function loadPlaywright() {
   }
 }
 
+// The launch every mode shares. Named once so `tree` cannot acquire a second,
+// laxer way into a directory holding somebody's live session.
+async function openProfile(profile, { headless = true } = {}) {
+  if (!profile) die(E_NOTHING_RAN, 'the plan names no profile directory');
+  if (!fs.existsSync(profile)) die(E_NOTHING_RAN, `no profile directory at ${profile}`);
+  const chrome = process.env.FIVEDIVE_BROWSER_CHROME;
+  if (!chrome) {
+    die(E_NOTHING_RAN, 'no chrome named for this run — a run must use the same browser the profile was ' +
+      'logged in with, so the executable is passed in rather than guessed here.');
+  }
+  const { chromium } = loadPlaywright();
+  try {
+    return await chromium.launchPersistentContext(profile, {
+      headless,
+      executablePath: chrome,
+      args: launchArgs(),
+      viewport: { width: 1280, height: 800 },
+    });
+  } catch (e) {
+    die(E_NOTHING_RAN, `could not open the ${profile} profile: ${e.message}`);
+  }
+}
+
+// `tree` — what is on this page, addressable. Prints JSON on stdout; bin/browser
+// renders it. Exit 70 on every refusal, for the same reason the rest of this
+// file does: a caller must be able to tell "the page had no such element" from
+// "this box could not open a browser at all".
+async function treeMode(plan) {
+  const profile = process.env.FIVEDIVE_BROWSER_PROFILE || plan.profile;
+  if (typeof plan.url !== 'string' || !/^https?:\/\//.test(plan.url)) {
+    die(E_NOTHING_RAN, 'tree needs an http(s) url to enumerate');
+  }
+  const ctx = await openProfile(profile);
+  try {
+    const page = ctx.pages()[0] || await ctx.newPage();
+    page.setDefaultTimeout(STEP_TIMEOUT);
+    assertLease('tree');
+    await page.goto(plan.url, { waitUntil: 'domcontentloaded' });
+    // WAIT FOR THE PAGE TO SETTLE, AND NEVER FOR NETWORK IDLE. A live web app
+    // (Gmail, a dashboard) long-polls and never idles — that is measured, it is
+    // what makes `read` hang for 150s on the teal-fox box. A short settle after
+    // domcontentloaded is what a tree needs and is bounded by construction.
+    await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
+    const { nodes } = await aria.walk(page, { interactiveOnly: !!plan.interactive });
+    process.stdout.write(JSON.stringify({ url: plan.url, nodes }) + '\n');
+  } catch (e) {
+    die(E_NOTHING_RAN, `could not enumerate ${plan.url}: ${e.message}`);
+  } finally {
+    try { await ctx.close(); } catch (e) { /* the tree is already printed */ }
+  }
+  process.exit(0);
+}
+
 async function main() {
   const raw = fs.readFileSync(0, 'utf8');
   let plan;
@@ -181,6 +286,15 @@ async function main() {
   const profile = process.env.FIVEDIVE_BROWSER_PROFILE || plan.profile;
   if (!profile) die(E_NOTHING_RAN, 'the plan names no profile directory');
   if (!fs.existsSync(profile)) die(E_NOTHING_RAN, `no profile directory at ${profile}`);
+
+  // TREE IS A READ AND IS NOT A PLAN (DIVE-4588). It navigates and enumerates;
+  // it fills nothing, clicks nothing and publishes nothing, so it does not go
+  // through the step vocabulary and has no out-of-band verify to earn. It shares
+  // this file for one reason only: it must open the SAME profile, the same
+  // chrome and the same no-listening-socket launch as every other page this
+  // plugin touches. A second program that opened a credential directory would be
+  // a second place to get that wrong.
+  if (plan.mode === 'tree') return await treeMode(plan);
 
   const steps = Array.isArray(plan.steps) ? plan.steps : null;
   if (!steps || !steps.length) die(E_NOTHING_RAN, 'the plan carries no steps');
@@ -207,7 +321,10 @@ async function main() {
       }
       // A SELECTOR IS NEVER INTERPOLATED. Selectors come from the adapter, which
       // is ours; values come from the caller, which is not. Substituting into a
-      // selector would let an argument choose which element gets clicked.
+      // selector would let an argument choose which element gets clicked. A
+      // `ref=<role>/<name>` selector (DIVE-4588) is a selector by this rule too
+      // and gets the same refusal: an argument that could choose the ROLE and
+      // NAME of the element to click is the same hole with nicer syntax.
       out[field] = field === 'selector' ? s[field] : interp(s[field], args, `step ${i + 1} (${s.op})`);
     }
     return out;
@@ -219,18 +336,12 @@ async function main() {
       'logged in with, so the executable is passed in rather than guessed here.');
   }
 
-  const { chromium } = loadPlaywright();
-  let ctx;
-  try {
-    ctx = await chromium.launchPersistentContext(profile, {
-      headless: true,
-      executablePath: chrome,
-      args: launchArgs(),
-      viewport: { width: 1280, height: 800 },
-    });
-  } catch (e) {
-    die(E_NOTHING_RAN, `could not open the ${profile} profile: ${e.message}`);
-  }
+  // openProfile() re-states the profile and chrome checks above rather than
+  // taking them on trust. They are cheap and idempotent here, and the reason is
+  // that `tree` reaches the same launch by a different road: one function that
+  // opens a credential directory, with the guards inside it, is the only shape
+  // where a second caller cannot get a laxer one.
+  const ctx = await openProfile(profile);
 
   let rc = 0;
   try {
@@ -239,15 +350,25 @@ async function main() {
     for (let i = 0; i < resolved.length; i++) {
       const s = resolved[i];
       const where = `step ${i + 1} (${s.op})`;
+      // RESOLVE BEFORE THE COUNTER, deliberately. Turning `ref=button/Send` into
+      // a selector is a page.evaluate that reads the document and changes
+      // nothing, so a ref that matches nothing performed no part of the action —
+      // and on step ONE that has to stay 70 ("nothing ran"), or bin/browser
+      // re-reads the verify URL and reports a publish nobody performed. A plain
+      // CSS selector does not touch the page here at all.
+      // BEFORE THE RESOLVE AND BEFORE THE COUNTER. Both of those touch the page,
+      // and the whole point is to touch nothing once the browser is someone else's.
+      assertLease(where);
+      const sel = s.selector === undefined ? undefined : await aria.resolveSelector(page, s.selector);
       stepsRun++;  // entered, not completed — see stepsRun above
       switch (s.op) {
         case 'goto':     await page.goto(s.url, { waitUntil: 'domcontentloaded' }); break;
-        case 'fill':     await page.fill(s.selector, s.value); break;
-        case 'click':    await page.click(s.selector); break;
-        case 'wait_for': await page.waitForSelector(s.selector); break;
-        case 'select':   await page.selectOption(s.selector, s.value); break;
-        case 'upload':   await page.setInputFiles(s.selector, s.path); break;
-        case 'press':    await page.press(s.selector, s.key); break;
+        case 'fill':     await page.fill(sel, s.value); break;
+        case 'click':    await page.click(sel); break;
+        case 'wait_for': await page.waitForSelector(sel); break;
+        case 'select':   await page.selectOption(sel, s.value); break;
+        case 'upload':   await page.setInputFiles(sel, s.path); break;
+        case 'press':    await page.press(sel, s.key); break;
       }
       process.stderr.write(`  ${where} ok\n`);
     }
