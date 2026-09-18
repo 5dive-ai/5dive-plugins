@@ -119,6 +119,16 @@ cat > "$FAKEBIN/google-chrome" <<'CHROME'
 # Serves whatever DOM the arm parked for this profile. Ignores every flag; the
 # point is only that _probe gets a document back and greps it.
 for a in "$@"; do case "$a" in --user-data-dir=*) d="${a#*=}" ;; esac; done
+# A SERVE LAUNCH MUST STAY UP, identified POSITIVELY: headed (no --headless) and
+# sized (--window-size), which is `cmd_serve` and nothing else here — the `shot`
+# render passes --window-size too, but headless. Since DIVE-4400 `serve` refuses
+# to advertise a chrome that has already exited, so a fake that RETURNS here is a
+# browser that DIED, and every restore path graded through this PATH (T16g) would
+# be grading the fake's lifetime instead of the product's restore. Matching
+# negatively ("no --headless") is what NOT to do: `doctor` runs --version and
+# `auth` runs headed in the foreground, and both would then hang forever.
+hl=; ws=; for a in "$@"; do case "$a" in --headless) hl=1 ;; --window-size=*) ws=1 ;; esac; done
+[[ -n "$ws" && -z "$hl" ]] && exec sleep 300
 cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null || echo "<html><body>feed</body></html>"
 CHROME
 chmod +x "$FAKEBIN/google-chrome"
@@ -347,6 +357,15 @@ done
 # ...and the positive control, or "refuses everything" would pass T2d.
 run "$BROWSER" auth x
 tn 'T2e a VALID name is not refused as a name' 'not a usable profile name' "$ERR"
+# ...AND STOP WHAT THAT AUTH STARTED. There is no DISPLAY here, which is the
+# normal case on a managed box, so `auth` takes the server-mode path and STARTS A
+# SERVE for x. Before DIVE-4400 the serve was a lie -- the fake chrome exited at
+# once and `_serve_running` read false -- so the leak was invisible and every
+# later arm on x probed as if nothing were serving. Now the serve is real, and a
+# served profile answers `status` with "UNKNOWN (served on :N)" by design. Left
+# standing it would silently convert T4c and T11d, the two positive controls for
+# `authenticated`, into assertions about a leak.
+run "$BROWSER" serve x --stop >/dev/null 2>&1 || true
 
 # setup is a root act because the alternative is a world-writable parent a
 # hostile seat can squat.
@@ -1113,6 +1132,74 @@ tc 'T10c2 ...naming chromium' 'chromium' "$ERR"
 t  'T10c2 ...and writes NO pidfile for a browser that never started' 'no' \
    "$([[ -f "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/nochrome/.5dive-serve" ]] && echo yes || echo no)"
 
+# --- T10u serve PRINTS SUCCESS FOR A CHROME THAT NEVER STARTED (DIVE-4400) ----
+#
+# Measured on our canary 2026-09-13: `serve` printed "serving linkedin.com on
+# :375", left no chrome at all, and `ls`, the stack row and a `sudo -n browser
+# ls` all read ready — while the dashboard's Connect press, which calls `viewer`
+# directly, came back 502. Chrome died in its first millisecond (a system library
+# upgraded under a 15-week-old kernel) and its stderr went to /dev/null.
+#
+# THE FAKE Xvfb HERE RECORDS ITS OWN PID, because "no display was left behind" is
+# the second half of the defect and it cannot be read off the product's pidfile —
+# a correct failure DELETES that file. `exec` keeps the pid, so the number the
+# script wrote is the number that is sleeping.
+DEADBIN="$TMP/deadbin"; mkdir -p "$DEADBIN"
+cat > "$DEADBIN/Xvfb" <<XVFBD
+#!/usr/bin/env bash
+d="\${1#:}"
+: > "$TMP/x11/X\$d"
+echo \$\$ > "$ARGV/Xvfb-dead.pid"
+exec sleep 300
+XVFBD
+chmod +x "$DEADBIN/Xvfb"
+cp "$SBIN/x11vnc" "$SBIN/websockify" "$DEADBIN/"
+
+# CONTROL FIRST, on the same rig: a chrome that stays up must still serve, and
+# must leave its Xvfb ALIVE. Without this the arm below passes on a rig where
+# nothing ever starts, and "the display was reaped" would be a statement about
+# the fake rather than about the product.
+cat > "$DEADBIN/google-chrome" <<'LIVEC'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in --headless) exec sleep 0 ;; esac; done
+exec sleep 300
+LIVEC
+chmod +x "$DEADBIN/google-chrome"
+mkprofile livechrome "$LIVE_DOM" >/dev/null
+rm -f "$ARGV/Xvfb-dead.pid"
+run env PATH="$DEADBIN:$SRVBIN:$PATH" DISPLAY= "$BROWSER" serve livechrome
+t  'T10u (control) a chrome that stays up still serves' 0 "$RC"
+t  'T10u (control) ...and its Xvfb is left RUNNING' 'live'    "$(p=$(cat "$ARGV/Xvfb-dead.pid" 2>/dev/null); [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && echo live || echo dead)"
+env PATH="$DEADBIN:$SRVBIN:$PATH" "$BROWSER" serve livechrome --stop >/dev/null 2>&1 || true
+
+# Now the defect: present, executable, and gone before the first frame.
+cat > "$DEADBIN/google-chrome" <<'DEADC'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in --headless) exec sleep 0 ;; esac; done
+echo "Trace/breakpoint trap (core dumped)" >&2
+echo "chrome_crashpad_handler: --database is required" >&2
+exit 133
+DEADC
+chmod +x "$DEADBIN/google-chrome"
+mkprofile deadchrome "$LIVE_DOM" >/dev/null
+DDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/deadchrome"
+rm -f "$ARGV/Xvfb-dead.pid"
+run env PATH="$DEADBIN:$SRVBIN:$PATH" DISPLAY= "$BROWSER" serve deadchrome
+t  'T10u A CHROME THAT DIES INSTANTLY IS NOT REPORTED AS SERVING' 69 "$RC"
+tn 'T10u ...serve does not print success' 'serving deadchrome on :' "$OUT"
+tc 'T10u ...it hands back CHROMES OWN STDERR, which used to go to /dev/null' \
+   'Trace/breakpoint trap' "$ERR"
+tc 'T10u ...including the second line, so the cause is not truncated to one word' \
+   'crashpad_handler' "$ERR"
+t  'T10u ...and writes NO pidfile, so ls/viewer/status cannot read it as live' 'no' \
+   "$([[ -f "$DDIR/.5dive-serve" ]] && echo yes || echo no)"
+t  'T10u ...and REAPS THE Xvfb it started, leaving no orphan display' 'dead' \
+   "$(p=$(cat "$ARGV/Xvfb-dead.pid" 2>/dev/null); [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && echo live || echo dead)"
+# The customer-facing consequence, driven end to end: the dashboard press calls
+# `viewer` and nothing else, so this is the exact call that returned 502.
+run env PATH="$DEADBIN:$SRVBIN:$PATH" "$BROWSER" viewer deadchrome --bind=sess-A --ttl=120
+t  'T10u ...and the dashboards own call still refuses rather than minting a dead link' 69 "$RC"
+
 # --- T10l a profile this seat cannot own is refused BEFORE any of this --------
 BADV="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/loosev"; mkdir -p "$BADV"; chmod 755 "$BADV"
 run env PATH="$SPATH" "$BROWSER" serve loosev
@@ -1513,6 +1600,14 @@ done
 # same binary, and a fake that failed both would red at liveness and never reach
 # the render at all — the arm would then grade nothing it claims to.
 [[ -n "${SHOT_CHROME_FAIL:-}" && -n "${shot:-}" ]] && exit 3
+# A SERVE LAUNCH MUST STAY UP: headed and sized, which is `cmd_serve` and not the
+# headless render above.
+# T15d2/T15e grade that a screenshot PUTS THE CUSTOMER'S BROWSER BACK, and since
+# DIVE-4400 `serve` writes no pidfile for a chrome that has already exited — so a
+# fake that exits here is a chrome that died, and those arms would assert the
+# fake's lifetime instead of the restore.
+hl=; ws=; for a in "$@"; do case "$a" in --headless) hl=1 ;; --window-size=*) ws=1 ;; esac; done
+[[ -n "$ws" && -z "$hl" ]] && exec sleep 300
 exit 0
 SCHROME
 chmod +x "$SHOTBIN/google-chrome"
