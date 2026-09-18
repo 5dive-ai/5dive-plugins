@@ -1,5 +1,21 @@
 ## Unreleased
 
+### Fixed — the `attached:` footer no longer clutters the human's message (DIVE-4280), telegram 0.5.54
+
+Auto-attach appended `attached: report.md` to every reply that carried a file it
+found in the text. The file arrives as its own message directly underneath, so on
+a phone that line named something already on screen — one more thing to read past
+in a chat that is mostly read on a phone.
+
+The outgoing text no longer carries it. The two footer lines that survive are the
+ones an attachment cannot say for itself: `+N more files named; ask for one by
+name` when the five-file cap bit, and `too large to send: <name>`.
+
+The names are not lost. `attachedNames()` puts them in the `reply` and
+`edit_message` tool results (`sent (id: 41) · attached: report.md`) and in the
+rolling log record of our own reply, so `recent_messages` still reads back what
+was sent — the two readers that have no attachment to look at.
+
 ### Added — `5dive browser adblock`: turn ad filtering off for one site (DIVE-4516), browser 1.6.0
 
 Agent Chrome profiles on a managed box now carry exactly one extension — uBlock

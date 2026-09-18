@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import {
   planAutoAttach,
   autoAttachFooter,
+  attachedNames,
   candidatePaths,
   isDenied,
   AUTO_ATTACH_MAX,
@@ -78,7 +79,10 @@ describe('positive: a named file is attached without files=', () => {
     const p = plan(`wrote the report to ${P('report.md')}`)
     expect(p.attach).toEqual([P('report.md')])
     expect(p.overflow).toBe(0)
-    expect(autoAttachFooter(p)).toBe('attached: report.md')
+    // The human's message says nothing: the file itself is right below it.
+    expect(autoAttachFooter(p)).toBe('')
+    // The name is not lost, it moved to the readers that cannot see a file.
+    expect(attachedNames(p)).toBe('attached: report.md')
   })
   test('a path in single backticks in prose still counts', () => {
     expect(plan(`see \`${P('report.md')}\` for the numbers`).attach).toEqual([P('report.md')])
@@ -244,7 +248,8 @@ describe("lodar's cap: five tops, then say how many were skipped", () => {
     const p = plan([P('report.md'), P('second.md'), P('third.md')].join(' and '))
     expect(p.attach.length).toBe(3)
     expect(p.overflow).toBe(0)
-    expect(autoAttachFooter(p)).toBe('attached: report.md, second.md, third.md')
+    expect(autoAttachFooter(p)).toBe('')
+    expect(attachedNames(p)).toBe('attached: report.md, second.md, third.md')
   })
   test('seven named paths → five documents and the footer says +2', () => {
     const names = ['report', 'second', 'third', 'four', 'five', 'six', 'seven']
@@ -252,7 +257,9 @@ describe("lodar's cap: five tops, then say how many were skipped", () => {
     expect(p.attach.length).toBe(AUTO_ATTACH_MAX)
     expect(p.attach).toEqual(names.slice(0, 5).map(n => P(`${n}.md`)))
     expect(p.overflow).toBe(2)
-    expect(autoAttachFooter(p)).toContain('+2 more files named; ask for one by name')
+    // Exactly the overflow line now — no 'attached:' above it.
+    expect(autoAttachFooter(p)).toBe('+2 more files named; ask for one by name')
+    expect(attachedNames(p)).toBe('attached: report.md, second.md, third.md, four.md, five.md')
   })
 })
 
@@ -261,6 +268,7 @@ describe('explicit files= wins and is never doubled', () => {
     const p = plan(`the report is at ${P('report.md')}`, [P('report.md')])
     expect(p.attach).toEqual([])
     expect(autoAttachFooter(p)).toBe('')
+    expect(attachedNames(p)).toBe('')
   })
   test('files= does not suppress a DIFFERENT named path', () => {
     const p = plan(`${P('report.md')} plus ${P('second.md')}`, [P('report.md')])
@@ -298,10 +306,111 @@ describe('server wiring', () => {
     // The footer must be appended AFTER yesNoButtons() has read the original
     // text, or it eats the trailing '?' the keyboards key off.
     expect(s.indexOf('yesNoButtons(text)')).toBeLessThan(s.indexOf('const stripped = autoFooter'))
-    // The footer is part of the logical message, so `stripped` (what the
-    // rolling log records) is the footer-bearing text.
-    expect(s).toContain('text: stripped,')
+    // The rolling log records the footer-bearing text PLUS the names the
+    // human's message no longer carries — `recent_messages` reads it back as
+    // text and cannot see an attachment.
+    expect(s).toContain('const loggedText = autoNames ?')
+    expect(s).toContain('text: loggedText,')
+    expect(s).not.toContain('text: stripped,')
     // assertSendable stays as the second net over the channel state dir.
     expect(s).toContain('assertSendable(f)')
+  })
+})
+
+// The DIVE-4280 footer said 'attached: <name>' in the message the human reads.
+// The attachment lands directly underneath it, so that line told them what they
+// could already see. It is gone from the text and kept everywhere the file is
+// NOT visible: the tool result and the rolling log.
+describe('the attached names leave the human text and stay in the record', () => {
+  test('attachedNames: one file, three files, none', () => {
+    expect(attachedNames(plan(`wrote the report to ${P('report.md')}`)))
+      .toBe('attached: report.md')
+    expect(attachedNames(plan([P('report.md'), P('second.md'), P('third.md')].join(' and '))))
+      .toBe('attached: report.md, second.md, third.md')
+    expect(attachedNames(plan('nothing here'))).toBe('')
+  })
+
+  test('the two halves are disjoint: a name is never in both', () => {
+    const p = plan([P('report.md'), P('second.md')].join(' '))
+    expect(autoAttachFooter(p)).not.toContain('report.md')
+    expect(attachedNames(p)).toContain('report.md')
+    // and what the attachment cannot say stays with the human
+    const over = plan(['report', 'second', 'third', 'four', 'five', 'six']
+      .map(n => P(`${n}.md`)).join(' '))
+    expect(autoAttachFooter(over)).toBe('+1 more files named; ask for one by name')
+    expect(autoAttachFooter(over)).not.toContain('attached:')
+  })
+
+  test('a too-large file is still the human\'s business', () => {
+    const p = planAutoAttach(`the capture is ${P('huge.mp4')}`, {
+      home: HOME,
+      probe: (x) => ({ real: x, size: 80 * 1024 * 1024 }),
+    })
+    expect(autoAttachFooter(p)).toBe('too large to send: huge.mp4')
+    expect(attachedNames(p)).toBe('')
+  })
+})
+
+describe('server wiring: where the names went instead', () => {
+  const src = Bun.file(join(import.meta.dir, '..', 'plugins', 'telegram', 'server.ts'))
+
+  test('the reply tool result carries them', async () => {
+    const s = await src.text()
+    expect(s).toContain('const autoNames = attachedNames(autoPlan)')
+    expect(s).toContain('const result = autoNames ? `${sentLine} · ${autoNames}` : sentLine')
+    // and the text the human gets is built from the footer ALONE
+    expect(s).toContain('const stripped = autoFooter')
+    expect(s).not.toContain('${strippedRaw}\n\n${parseMode ? mdv2(autoNames)')
+  })
+
+  test('the edit_message result carries them too', async () => {
+    const s = await src.text()
+    expect(s).toContain('const editNames = attachedNames(editPlan)')
+    expect(s).toContain('editNames ? `${editedLine} · ${editNames}` : editedLine')
+  })
+
+  test('the reply tool description no longer promises a line in the message', async () => {
+    const s = await src.text()
+    expect(s).toContain('names the attached files in the tool result')
+    expect(s).not.toContain("appends an \\'attached: <name>\\' line")
+  })
+})
+
+// MUTANT. Put the line back into the human-facing footer, in the shipped source,
+// and require the '' arm above to go red on it. This is the defect this PR
+// removes, so an arm that stays green on the mutant is grading nothing.
+describe('MUTANT: the attached line pushed back into the human footer', () => {
+  test('reds the arms that pin the new contract, and the mutation really applied', async () => {
+    const srcPath = join(import.meta.dir, '..', 'plugins', 'telegram', 'autoattach.ts')
+    const src = await Bun.file(srcPath).text()
+    const anchor = 'export function autoAttachFooter(plan: AutoAttachPlan): string {\n'
+      + '  const lines: string[] = []\n'
+    // NON-VACUITY: without this, a stale anchor makes the 'mutant' a byte copy
+    // of the shipped function, and every assertion below passes for no reason.
+    expect(src).toContain(anchor)
+    const mutated = src.replace(anchor, anchor
+      + '  if (plan.attach.length) {\n'
+      + '    lines.push(`attached: ${plan.attach.map(p => basename(p)).join(\', \')}`)\n'
+      + '  }\n')
+    expect(mutated).not.toBe(src)
+
+    const dir = mkdtempSync(join(tmpdir(), 'dive4280-mutant-'))
+    try {
+      const file = join(dir, 'autoattach.mutant.ts')
+      writeFileSync(file, mutated)
+      const mut = await import(file)
+      const p = plan(`wrote the report to ${P('report.md')}`)
+      // BEFORE — what main ships today, and what the human complained about.
+      expect(mut.autoAttachFooter(p)).toBe('attached: report.md')
+      // AFTER — the same call on the shipped function. The arm at the top of
+      // this file asserts exactly this, so it IS red against the mutant.
+      expect(autoAttachFooter(p)).toBe('')
+      // and the mutant leaves the names in both places, which is the shape the
+      // change exists to end.
+      expect(mut.autoAttachFooter(p)).toContain('attached:')
+      expect(attachedNames(p)).toBe('attached: report.md')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
