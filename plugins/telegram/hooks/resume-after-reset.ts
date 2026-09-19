@@ -16,6 +16,10 @@
 //     re-parsing any reset time that appears in the pane — until it lifts or
 //     the budget runs out. THIS is the deadlock fix: with no reset time the old
 //     code forked nothing and the agent sat parked until a manual unlock.
+//     DIVE-4628: the transcript is re-resolved on every poll (see
+//     lib/live-transcript) and the loop is capped by ATTEMPTS as well as by
+//     time — a pinned transcript path plus a time-only bound is what let this
+//     type `continue` into a seat that had already answered, seven times.
 //
 //   Phase 4 (ping): tell the paired chats we resumed, or that we gave up.
 //
@@ -30,7 +34,8 @@ import { setTimeout as sleep } from 'timers/promises'
 import { unlinkSync, utimesSync } from 'fs'
 import { capturePaneFor, sendKeys, type TmuxCtx } from './lib/tmux'
 import { sendMessage } from './lib/telegram'
-import { readEntries } from './lib/transcript'
+import { captureBaseline, resolveLiveTranscript, resumedSinceBaseline, rotatedSince, type ResumeBaseline } from './lib/live-transcript'
+import { retryResume, type RetryLimits } from './lib/resume-retry'
 import { parseResetEpoch } from './lib/time'
 import { resumePrompt } from './lib/resume-prompt'
 
@@ -47,7 +52,23 @@ const transcriptPath = process.argv[7] ?? ''
 // gives up before the limit actually lifts.
 const MAX_WAIT_SEC = 30 * 3600 // trust a future reset epoch up to 30h (5h rolling + weekly cap)
 const MAX_RETRY_SEC = 6 * 3600 // after wait/blind, poll-retry for this long before giving up
-const RETRY_INTERVAL_SEC = 300 // back-off between blind resume attempts
+const RETRY_INTERVAL_SEC = 300 // back-off before the 2nd blind resume attempt
+const RETRY_INTERVAL_MAX_SEC = 3600 // …doubling each miss, capped here
+// DIVE-4628: an ATTEMPT cap on top of MAX_RETRY_SEC. Each attempt types
+// `continue` into a live pane, and every one of those starts a fresh assistant
+// turn with the seat's whole context re-sent — so the cost of being wrong
+// scales with attempts, not with elapsed time. A helper that has typed
+// `continue` six times over half an hour and been told "no" each time is not
+// recovering anything; it is either wrong about the seat being limited (the
+// olivia case) or the limit is far longer than a retry loop should sit on.
+const MAX_RETRY_ATTEMPTS = 6
+const RETRY_LIMITS: RetryLimits = {
+  maxRetrySec: MAX_RETRY_SEC,
+  maxAttempts: MAX_RETRY_ATTEMPTS,
+  intervalSec: RETRY_INTERVAL_SEC,
+  intervalMaxSec: RETRY_INTERVAL_MAX_SEC,
+  maxWaitSec: MAX_WAIT_SEC,
+}
 // DIVE-122: when we have NO trustworthy reset epoch, hold the parked menu for
 // this long before the first "continue" attempt. Waking claude immediately into
 // a still-active limit makes it re-limit and, when it exits instead of
@@ -139,27 +160,18 @@ function paneStillLimited(pane: string): boolean {
 
 // A genuine resume = a NEW assistant message after `baseline` that isn't itself
 // a rate-limit error notice. Transcript is the source of truth (immune to the
-// pane scrollback staleness that the alt-screen menu causes).
-function resumedSince(baseline: number): boolean {
-  if (!transcriptPath || baseline < 0) return false
-  const entries = readEntries(transcriptPath)
-  for (let i = baseline; i < entries.length; i++) {
-    const e = entries[i]
-    if (e.type === 'assistant' && e.error !== 'rate_limit') return true
-  }
-  return false
-}
-
-function transcriptLen(): number {
-  if (!transcriptPath) return -1
-  return readEntries(transcriptPath).length
+// pane scrollback staleness that the alt-screen menu causes) — but only if we
+// read the transcript that is live NOW, which is what resumedSinceBaseline does
+// and what the pinned `transcriptPath` of DIVE-4628 did not.
+function resumedSince(baseline: ResumeBaseline): boolean {
+  return resumedSinceBaseline(transcriptPath, baseline, e => e.error !== 'rate_limit')
 }
 
 // One resume attempt: dismiss the menu if showing, type "continue", then watch
 // (~24s) for claude to actually pick up. Returns true on confirmed resume.
 async function attemptResume(): Promise<boolean> {
   if (!ctx) return false
-  const baseline = transcriptLen()
+  const baseline = captureBaseline(transcriptPath)
   if (MENU_RE.test(capturePaneFor(ctx))) {
     sendKeys(ctx, '1', 'Enter')
     await sleep(2000)
@@ -167,7 +179,10 @@ async function attemptResume(): Promise<boolean> {
   sendKeys(ctx, resumePrompt(), 'Enter')
   for (let i = 0; i < VERIFY_POLLS; i++) {
     await sleep(VERIFY_STEP_MS)
-    if (transcriptPath) {
+    if (baseline.len >= 0) {
+      if (rotatedSince(transcriptPath, baseline)) {
+        log(`phase3 session rotated mid-wait: watching ${resolveLiveTranscript(transcriptPath)}`)
+      }
       if (resumedSince(baseline)) return true
     } else if (!paneStillLimited(capturePaneFor(ctx))) {
       return true
@@ -187,6 +202,11 @@ log(
 )
 
 let resumed = false
+let attempts = 0
+// Which bound ended Phase 3 — named in the log AND in the Phase-4 chat ping, so
+// the human reading "couldn't auto-resume" knows whether we ran out of tries or
+// out of time (DIVE-4628 acceptance 2).
+let giveUp: 'attempts' | 'time' | '' = ''
 try {
   // Phase 1 — park the menu while we wait (poll up to 60s for it to render).
   if (ctx) {
@@ -227,28 +247,27 @@ try {
 
   // Phase 3 — resume with verification + bounded retry.
   if (ctx) {
-    const start = Math.floor(Date.now() / 1000)
-    while (Math.floor(Date.now() / 1000) - start < MAX_RETRY_SEC) {
-      if (await attemptResume()) {
-        resumed = true
-        log('phase3 resume confirmed')
-        break
-      }
-      // Still limited. If the live pane reveals a parseable reset time, wait
-      // precisely for it; otherwise back off a fixed interval and try again.
-      const line = capturePaneFor(ctx)
-        .split('\n')
-        .find(l => /resets?\s+\d|try again|in\s+\d+\s*(?:h|m|hour|min)/i.test(l))
-      const epoch = line ? parseResetEpoch(line) : null
-      const now = Math.floor(Date.now() / 1000)
-      if (epoch && epoch > now && epoch - now <= MAX_WAIT_SEC) {
-        log(`phase3 still limited; learned reset, sleeping ${epoch - now + 30}s`)
-        await sleepHeartbeat((epoch - now + 30) * 1000)
-      } else {
-        log(`phase3 still limited; retrying in ${RETRY_INTERVAL_SEC}s`)
-        await sleepHeartbeat(RETRY_INTERVAL_SEC * 1000)
-      }
-    }
+    const outcome = await retryResume(
+      {
+        attempt: attemptResume,
+        // A reset time the LIVE pane reveals while we retry — honoured over the
+        // back-off, which is how a blind retry turns into a precise wait.
+        learnedWaitSec: () => {
+          const line = capturePaneFor(ctx)
+            .split('\n')
+            .find(l => /resets?\s+\d|try again|in\s+\d+\s*(?:h|m|hour|min)/i.test(l))
+          const epoch = line ? parseResetEpoch(line) : null
+          return epoch ? epoch - Math.floor(Date.now() / 1000) : null
+        },
+        sleep: sleepHeartbeat,
+        nowSec: () => Math.floor(Date.now() / 1000),
+        log,
+      },
+      RETRY_LIMITS,
+    )
+    resumed = outcome.resumed
+    attempts = outcome.attempts
+    giveUp = outcome.giveUp
   }
 
   // Phase 4 — Telegram ping (success, or a heads-up that we gave up).
@@ -264,10 +283,13 @@ try {
     })
     const msg = resumed
       ? 'Usage limit reset — agent resumed.'
-      : `Still rate-limited after ${Math.round(MAX_RETRY_SEC / 3600)}h — couldn't auto-resume. ` +
-        `Send "continue" or /resume when you're ready.`
+      : giveUp === 'attempts'
+        ? `Gave up auto-resuming after ${attempts} attempts — the agent never confirmed it picked up. ` +
+          `Send "continue" or /resume when you're ready.`
+        : `Still rate-limited after ${Math.round(MAX_RETRY_SEC / 3600)}h — couldn't auto-resume. ` +
+          `Send "continue" or /resume when you're ready.`
     await Promise.all(targets.map(t => sendMessage(t.chatId, msg, t.threadId)))
-    log(`phase4 telegram ping sent (resumed=${resumed})`)
+    log(`phase4 telegram ping sent (resumed=${resumed} attempts=${attempts} gaveUp=${giveUp || 'no'})`)
   }
 } finally {
   releaseLock()
