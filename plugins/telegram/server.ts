@@ -34,7 +34,7 @@ import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSyn
 import { parseGateReply, resolveGateReply, gateAlertIdent } from './gatereply'
 import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { createFiveRunner, createFailureBreaker, type FiveRunner } from './cliexec.ts'
-import { planAutoAttach, autoAttachFooter, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
+import { planAutoAttach, autoAttachFooter, attachedNames, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
@@ -1200,7 +1200,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading under a specific message, message_thread_id for posting into a forum topic, and files (absolute paths) to attach images or documents. You do not have to remember files= for a file you NAME: the server auto-attaches up to 5 readable document/media paths written in the text (.md .txt .log .json .csv .yaml .html .pdf images audio video) and appends an \'attached: <name>\' line. Credential-shaped paths and anything under ~/.claude are never auto-attached; paths inside fenced code blocks are treated as examples. files= still wins and is never doubled.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading under a specific message, message_thread_id for posting into a forum topic, and files (absolute paths) to attach images or documents. You do not have to remember files= for a file you NAME: the server auto-attaches up to 5 readable document/media paths written in the text (.md .txt .log .json .csv .yaml .html .pdf images audio video) and names the attached files in the tool result. Credential-shaped paths and anything under ~/.claude are never auto-attached; paths inside fenced code blocks are treated as examples. files= still wins and is never doubled.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1398,6 +1398,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // lodar's 5-file cap live in autoattach.ts.
         const autoPlan = planAutoAttach(text, { already: files })
         const autoFooter = autoAttachFooter(autoPlan)
+        const autoNames = attachedNames(autoPlan)
 
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
@@ -1424,10 +1425,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // DIVE-332: detect a trailing yes/no question and strip any opt-out
         // marker. The Yes/No keyboard attaches to the LAST text chunk only.
         const { stripped: strippedRaw, keyboard: ynKeyboard } = yesNoButtons(text)
-        // DIVE-4280: the 'attached:' footer goes on AFTER the button detectors
+        // DIVE-4280: the auto-attach footer goes on AFTER the button detectors
         // have read the original text — otherwise it eats the trailing '?' the
         // Yes/No and option keyboards key off. It IS part of the logical
         // message, so it rides into the chunker and into the rolling log.
+        // What it no longer carries is the 'attached:' line: the file lands
+        // right under the text, so naming it again is noise on a phone. The
+        // overflow and too-large lines stay, because those name files the
+        // human is NOT getting and no attachment can say that.
         const stripped = autoFooter
           ? `${strippedRaw}\n\n${parseMode ? mdv2(autoFooter) : autoFooter}`
           : strippedRaw
@@ -1503,22 +1508,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // logical message (pre-chunk, opt-out markers stripped), not each
         // wire chunk. Best-effort.
         try {
-          if (stripped && stripped.trim()) {
+          // The names left the human's message, not the record: `recent_messages`
+          // reads this log back as text and cannot see an attachment.
+          const loggedText = autoNames ? `${stripped}\n\n${autoNames}` : stripped
+          if (loggedText && loggedText.trim()) {
             const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'
             msglogAppend(MSGLOG_DIR, chat_id, {
               ts: new Date().toISOString(),
               dir: 'out',
               user: me,
-              text: stripped,
+              text: loggedText,
               ...(sentIds[0] != null ? { message_id: String(sentIds[0]) } : {}),
               ...(message_thread_id != null ? { thread_id: String(message_thread_id) } : {}),
             })
           }
         } catch {}
-        const result =
+        const sentLine =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+        // Where the caller now learns which files rode along, since the
+        // human's message no longer says.
+        const result = autoNames ? `${sentLine} · ${autoNames}` : sentLine
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
@@ -1592,6 +1603,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const editPlan = planAutoAttach(body, { already: [...editMemo] })
         for (const f of editPlan.attach) editMemo.add(f)
         const editFooter = autoAttachFooter(editPlan)
+        const editNames = attachedNames(editPlan)
         const bodyWithFooter = editFooter
           ? `${body}\n\n${editParseMode ? mdv2(editFooter) : editFooter}`
           : body
@@ -1609,7 +1621,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // a newer, still-unanswered question as answered.
         markContact()
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
-        return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+        const editedLine = `edited (id: ${id})`
+        return {
+          content: [{ type: 'text', text: editNames ? `${editedLine} · ${editNames}` : editedLine }],
+        }
       }
       default:
         return {

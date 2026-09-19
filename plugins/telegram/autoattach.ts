@@ -225,14 +225,31 @@ export function planAutoAttach(text: string, opts: PlanOpts = {}): AutoAttachPla
 }
 
 /**
- * The footer line(s) appended to the outgoing text, so the human and the
- * transcript agree on what was sent. Empty string when nothing was decided.
+ * The names of the files this plan attaches — `attached: a.md, b.md` — or the
+ * empty string when it attaches none.
+ *
+ * DIVE-4280 put this line in the OUTGOING TEXT so the human and the transcript
+ * would agree on what was sent. The human half of that never earned its place:
+ * the attachment arrives directly under the message, so the phone already shows
+ * it. The transcript half is real and is why the line still exists — the tool
+ * result and the rolling log are readers that cannot see an attachment.
+ */
+export function attachedNames(plan: AutoAttachPlan): string {
+  if (!plan.attach.length) return ''
+  return `attached: ${plan.attach.map(p => basename(p)).join(', ')}`
+}
+
+/**
+ * The footer line(s) appended to the outgoing text: only what the attachment
+ * ITSELF cannot tell the human. Empty string when there is nothing to say.
+ *
+ * Deliberately not the attached names (those are `attachedNames`, and they go
+ * to the readers listed there). A file that was SENT is visible; a file that
+ * was named and NOT sent is not, and that is the whole content of both lines
+ * below.
  */
 export function autoAttachFooter(plan: AutoAttachPlan): string {
   const lines: string[] = []
-  if (plan.attach.length) {
-    lines.push(`attached: ${plan.attach.map(p => basename(p)).join(', ')}`)
-  }
   if (plan.overflow) {
     lines.push(`+${plan.overflow} more files named; ask for one by name`)
   }
