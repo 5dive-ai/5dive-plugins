@@ -15,7 +15,7 @@ import { spawn, spawnSync } from 'child_process'
 import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync, writeFileSync, renameSync } from 'fs'
 import { homedir } from 'os'
 import { join, basename } from 'path'
-import { stateDir } from './lib/paths'
+import { stateDir, signalTurnEnded } from './lib/paths'
 import { readPayload } from './lib/payload'
 import { readEntries, findRateLimitText } from './lib/transcript'
 import { getAllowedChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
@@ -276,6 +276,9 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
     const rotText =
       `Usage limit hit on '${rot.from}' — rotating to '${rot.to}' and resuming this session on the new account.`
     await Promise.all(targets.map(t => sendMessage(t.chatId, rotText, t.threadId)))
+    // The notice is out and nothing more will be typed from this turn — clear the
+    // indicator before the exit below tears the process down.
+    signalTurnEnded()
     // The rotate scheduled a deferred unit restart that relaunches with
     // `claude --resume <id>` on the new creds — no wait-helper needed. The
     // restart tears this process down; the next episode reclaims the
@@ -346,6 +349,12 @@ if (shouldSend) {
   targets.forEach((t, i) => {
     console.error(`[stopfailure-notify] send ${fmtTarget(t)}: ${results[i] ? 'ok' : 'FAILED'}`)
   })
+  // The turn is over: this hook fires when the session STOPPED, and the notice
+  // it just sent says the agent will not type again until the wall lifts. The
+  // server's typing loop cannot see that from here — different process — so say
+  // so, unconditionally rather than on send success: whether Telegram accepted
+  // the notice has no bearing on whether this turn ended.
+  signalTurnEnded()
   // Last-resort fallback: if EVERY routed send failed, the notice is lost and
   // the agent is about to go quiet for hours. Retry on the paired chats we did
   // not already try, so a dead topic (or a group the bot was removed from)
@@ -361,6 +370,11 @@ if (shouldSend) {
       fallback.forEach((id, i) => {
         console.error(`[stopfailure-notify] fallback send ${id}: ${fbResults[i] ? 'ok' : 'FAILED'}`)
       })
+      // Again after the fallback, not only above: these sends happen AFTER that
+      // bump, and the signal is read as an mtime compared against the moment the
+      // loop started. A stamp older than the last send is the one shape that
+      // could still leave the indicator running.
+      signalTurnEnded()
     } else {
       console.error('[stopfailure-notify] all routed send(s) failed and no other paired chat to fall back to')
     }
