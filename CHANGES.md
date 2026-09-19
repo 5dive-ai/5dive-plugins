@@ -41,6 +41,27 @@ for one host without turning it off everywhere.
 - Only fresh launches were measured, so `shot`/`read` pick a change up on their next
   render and the verb SAYS a live `serve` may need a restart rather than promising it.
 
+### Fixed — a shared `XDG_CONFIG_HOME` made Chrome un-launchable for every seat but the first, and nothing said so (DIVE-4587), browser 1.6.1
+
+Reported from a customer box with ~37 seats (teal-fox, 2026-09-16): every Chrome launch by every seat
+but one aborted with `chrome_crashpad_handler: --database is required` and a core dump — rc 133, zero
+bytes — so `serve`, `status`, `run`, `shot` and `read` were all dead. Chrome keeps its crashpad
+database under `$XDG_CONFIG_HOME/google-chrome/Crash Reports` whatever `--user-data-dir` and
+`--crash-dumps-dir` say, and creates it `0700`; 5dive boxes export one shared `XDG_CONFIG_HOME` to
+every seat for `gh`/`gcloud`/`aws`, so the first seat to run Chrome owns that directory permanently.
+`bin/browser` and `bin/driver-playwright` now drop the variable before launching anything, which gives
+each seat its own crash directory under its own home. Dropping the shared export instead was not
+available — about twenty other shared configs reach their state through it — and widening the
+directory's mode breaks again at the next `0700` subdirectory Chrome creates.
+
+The second half is why it survived for months: `status` printed a quiet `UNKNOWN (probe did not load)`
+and exited **0**, the scheduled probe exited 0 without stamping anything, and `doctor` said nothing, so
+the box read healthy while the plugin was entirely dead. A probe failure is now classified before it is
+reported — the browser is asked for `about:blank` in a throwaway profile — and a browser that will not
+start is a loud `BROKEN` state: non-zero from `status`, a refusal at `run` and `shot`, and the one
+condition that fails the probe timer. A page that merely did not load stays quiet, as before: a network
+blip must not page a person, but a box fault that no amount of re-probing will clear must.
+
 ### Fixed — the browser connect-site runbook now follows the shipped bound viewer flow (DIVE-4523), browser 1.5.3
 
 The Claude skill and harness-neutral AGENTS block now carry one byte-identical fenced workflow. It

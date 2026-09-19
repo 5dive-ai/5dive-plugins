@@ -644,10 +644,24 @@ run env PATH="$NOCHROME" "$BROWSER" status nochrome
 t  'T9e status on the same box stays QUIET — a probe that did not load must not page a person' 0 "$RC"
 tc 'T9e ...while still naming what it could not do' 'UNKNOWN' "$OUT"
 
-# T9f — the other UNKNOWN: a browser that IS present and fails. Same asymmetry,
-# and it is a separate branch in the code from "no browser at all".
+# T9f — the other UNKNOWN: a browser that IS present and cannot fetch THE PAGE.
+# Same asymmetry, and it is a separate branch in the code from "no browser at
+# all". The stub launches perfectly well for about:blank and fails only on an
+# http(s) url, which is what a network blip, a slow site or a redirect loop looks
+# like — and is NOT what a broken browser looks like (T9g). Before DIVE-4587 this
+# arm ran against a chrome that exited 1 for EVERYTHING, so it graded the two
+# conditions as one and the quiet exit read as correct for both.
 BROKENBIN="$TMP/brokenbin"; mkdir -p "$BROKENBIN"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$BROKENBIN/google-chrome"; chmod +x "$BROKENBIN/google-chrome"
+cat > "$BROKENBIN/google-chrome" <<'PAGEFAIL'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in http://*|https://*) exit 1 ;; esac; done
+echo "<html><head></head><body></body></html>"
+PAGEFAIL
+chmod +x "$BROKENBIN/google-chrome"
+t 'T9f (anchor) the stub is a page failure, not a launch failure: about:blank works' 0 \
+  "$(PATH="$BROKENBIN:$PATH" google-chrome --headless --dump-dom about:blank >/dev/null 2>&1; echo $?)"
+t 'T9f (anchor) ...and a real page does not' 1 \
+  "$(PATH="$BROKENBIN:$PATH" google-chrome --headless --dump-dom https://x.test/ >/dev/null 2>&1; echo $?)"
 mkprofile brokenprobe "$LIVE_DOM" >/dev/null
 mkadapter brokenprobe "file://$TMP/artifact.html" 'PUBLISHED'
 rm -f "$TMP/driver-plan.json"
@@ -655,7 +669,116 @@ run env PATH="$BROKENBIN:$PATH" "$BROWSER" run brokenprobe publish --body=hi
 t 'T9f a probe that failed to load refuses at the action' 75 "$RC"
 t 'T9f ...without invoking the driver' 'no' "$([[ -f "$TMP/driver-plan.json" ]] && echo yes || echo no)"
 run env PATH="$BROKENBIN:$PATH" "$BROWSER" status brokenprobe
-t 'T9f ...and stays quiet at the scheduler' 0 "$RC"
+t  'T9f ...and stays quiet at the scheduler' 0 "$RC"
+tc 'T9f ...naming the page-only failure without calling the browser dead' \
+   'chrome did not load the page' "$OUT"
+
+# ===================== T9g/T9h/T9i DIVE-4587: the browser that cannot start ====
+#
+# A CUSTOMER BOX RAN FOR MONTHS WITH THE PLUGIN COMPLETELY DEAD AND READ HEALTHY
+# (teal-fox, 2026-09-16). Every seat but the first aborted every Chrome launch —
+# rc 133, zero bytes — because Chrome keeps its crashpad database under
+# $XDG_CONFIG_HOME/google-chrome/Crash Reports whatever --user-data-dir says, 5dive
+# exports ONE shared XDG_CONFIG_HOME to every seat, and Chrome creates that
+# directory 0700, so the first seat to run it owns it forever. `status` printed a
+# quiet UNKNOWN and exited 0; the probe timer exited 0; `doctor` said nothing.
+#
+# Two properties are graded, and neither is graded by the other:
+#   T9g/T9i  the product cannot report healthy while the browser will not start.
+#   T9h      the product no longer hands the shared variable to Chrome at all.
+DEADBIN="$TMP/deadbin"; mkdir -p "$DEADBIN"
+cat > "$DEADBIN/google-chrome" <<'DEADC'
+#!/usr/bin/env bash
+# The real abort, verbatim: the message goes to stderr, stdout is empty, rc 133.
+echo "chrome_crashpad_handler: --database is required" >&2
+exit 133
+DEADC
+chmod +x "$DEADBIN/google-chrome"
+mkprofile deadbrowser "$LIVE_DOM" >/dev/null
+mkadapter deadbrowser "file://$TMP/artifact.html" 'PUBLISHED'
+# Stamp it authenticated first, the way a box gets into this state: the profile
+# WAS live, and then the browser stopped starting. The stale stamp is precisely
+# what must not be repeated back as a current verdict.
+printf '2026-09-01T00:00:00Z authenticated\n' > "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/deadbrowser/.5dive-liveness"
+
+run env PATH="$DEADBIN:$PATH" "$BROWSER" status deadbrowser
+t  'T9g status EXITS NON-ZERO when the browser will not start' 69 "$RC"
+tn 'T9g ...and never prints a healthy line for the session' 'authenticated' "$OUT"
+tc 'T9g ...it names the box, not the session' 'cannot start a browser' "$OUT"
+tc 'T9g ...and reports what the browser actually said' '133' "$OUT"
+tn 'T9g ...without sending a person to log in again for a fault login cannot fix' \
+   '5dive browser auth <site>' "$ERR"
+t  'T9g ...and the stale stamp is NOT overwritten — the last real verdict is still the record' \
+   '2026-09-01T00:00:00Z authenticated' \
+   "$(cat "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/deadbrowser/.5dive-liveness")"
+run env PATH="$DEADBIN:$PATH" "$BROWSER" run deadbrowser publish --body=hi
+t  'T9g ...and an action refuses as a box fault, not as a cold session' 69 "$RC"
+
+# T9i the SCHEDULED probe is the only thing systemd and `doctor` can see. It must
+# fail on a dead browser and must NOT fail on the steady state of a cold profile.
+run env PATH="$DEADBIN:$PATH" "$BROWSER" probe-all
+t 'T9i probe-all FAILS THE TIMER when the browser will not start' 69 "$RC"
+COLDONLY="$TMP/coldonly-profiles"
+mkdir -p "$COLDONLY/$SEAT/coldonly"; chmod 700 "$COLDONLY/$SEAT" "$COLDONLY/$SEAT/coldonly"
+printf '%s' "$DEAD_DOM" > "$COLDONLY/$SEAT/coldonly/.fake-dom"
+mkadapter coldonly "file://$TMP/artifact.html" 'PUBLISHED'
+run env FIVEDIVE_BROWSER_PROFILE_ROOT="$COLDONLY" "$BROWSER" probe-all
+tc 'T9i (control) ...the control profile really is logged out, not unreadable' 'session expired' "$OUT"
+t  'T9i (control) ...and a logged-out profile still exits 0 — that is the steady state, not a failed run' 0 "$RC"
+
+# --- T9h the fix itself: the shared XDG_CONFIG_HOME never reaches Chrome ------
+#
+# THE MUTANT IS A CHROME THAT BEHAVES LIKE THE REAL ONE: it puts its crashpad
+# database under $XDG_CONFIG_HOME regardless of --user-data-dir, and aborts 133
+# when it cannot create it. Pointed at a directory owned by ANOTHER UID, that is
+# the customer's box exactly.
+XDGBIN="$TMP/xdgbin"; mkdir -p "$XDGBIN"
+cat > "$XDGBIN/google-chrome" <<'XDGC'
+#!/usr/bin/env bash
+# Faithful to the defect: --user-data-dir and --crash-dumps-dir are irrelevant,
+# both were tested on the box. The crash dir follows XDG_CONFIG_HOME alone.
+printf '%s\n' "${XDG_CONFIG_HOME-<unset>}" > "$XDGSEEN"
+if [[ -n "${XDG_CONFIG_HOME:-}" ]] && ! mkdir -p "$XDG_CONFIG_HOME/google-chrome/Crash Reports" 2>/dev/null; then
+  echo "chrome_crashpad_handler: --database is required" >&2
+  exit 133
+fi
+for a in "$@"; do case "$a" in --user-data-dir=*) d="${a#*=}" ;; esac; done
+cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null || echo "<html><body>feed</body></html>"
+XDGC
+chmod +x "$XDGBIN/google-chrome"
+
+# A directory owned by another uid that this seat cannot write. Found, not made:
+# creating one needs a second uid we do not have. If the suite is ever run as
+# root there is no such directory and the arm would be vacuous — so the control
+# below is a hard FAIL rather than a skip, because a green that grades nothing is
+# the failure mode this whole file is arranged against.
+FOREIGN=""
+for c in /usr /etc /opt /; do
+  [[ -d "$c" ]] || continue
+  [[ "$(stat -c %u "$c" 2>/dev/null)" == "$(id -u)" ]] && continue
+  mkdir "$c/.5dive-4587-writetest.$$" 2>/dev/null && { rmdir "$c/.5dive-4587-writetest.$$"; continue; }
+  FOREIGN="$c"; break
+done
+t 'T9h (control) found a directory owned by another uid that this seat cannot write into' \
+  'yes' "$([[ -n "$FOREIGN" ]] && echo yes || echo no)"
+if [[ -n "$FOREIGN" ]]; then
+  # THE MUTANT IS REAL: driven directly, with the variable set, this chrome dies
+  # exactly the way the customer's did. Without this anchor a green below is also
+  # what a stub that never aborts would produce.
+  XDGSEEN="$TMP/xdg-anchor.txt" XDG_CONFIG_HOME="$FOREIGN" "$XDGBIN/google-chrome" \
+    --headless --dump-dom about:blank >/dev/null 2>"$TMP/xdg-anchor.err"; XRC=$?
+  t  'T9h (anchor) the stub chrome really aborts 133 under a foreign XDG_CONFIG_HOME' 133 "$XRC"
+  tc 'T9h (anchor) ...with the crashpad message' 'database is required' "$(cat "$TMP/xdg-anchor.err")"
+
+  mkprofile xdgsite "$LIVE_DOM" >/dev/null
+  mkadapter xdgsite "file://$TMP/artifact.html" 'PUBLISHED'
+  run env PATH="$XDGBIN:$PATH" XDG_CONFIG_HOME="$FOREIGN" XDGSEEN="$TMP/xdg-seen.txt" \
+      "$BROWSER" status xdgsite
+  t  'T9h status SUCCEEDS with XDG_CONFIG_HOME pointed at another uid'"'"'s directory' 0 "$RC"
+  tc 'T9h ...and actually classified the session' 'authenticated' "$OUT"
+  t  'T9h ...because the variable was removed from the environment Chrome was launched in' \
+     '<unset>' "$(cat "$TMP/xdg-seen.txt" 2>/dev/null)"
+fi
 
 # ============================================ T7 the shipped example adapter is real
 EX="$ROOT/plugins/browser/adapters/example.json"
@@ -1909,7 +2032,8 @@ const page = {
 };
 exports.chromium = {
   launchPersistentContext: async (profile, opts) => {
-    rec({ call: 'launch', profile, args: opts.args, executablePath: opts.executablePath, headless: opts.headless });
+    // xdg: DIVE-4587 — what the child would inherit. '<unset>' is the fix working.
+    rec({ call: 'launch', profile, args: opts.args, executablePath: opts.executablePath, headless: opts.headless, xdg: process.env.XDG_CONFIG_HOME === undefined ? '<unset>' : process.env.XDG_CONFIG_HOME });
     // PWNOPAGE: THE BROWSER REALLY OPENS AND THEN CANNOT HAND OVER A PAGE.
     // Every other shape here returns a working page, which is exactly why five
     // anchored mutants missed the window between the launch and step one
@@ -1952,6 +2076,19 @@ t  'T16b (control) the launch recorded its argv at all' 'yes' \
    "$([[ -n "$(jq -rs '[.[]|select(.call=="launch")]|length' "$PWREC")" ]] && echo yes || echo no)"
 t  'T16b ...and it is headless' 'true' \
    "$(jq -rs '[.[]|select(.call=="launch")|.headless]|first' "$PWREC")"
+# T16b/DIVE-4587 — the driver is reached by a path in an environment variable, so
+# it does not get to assume its parent unset the shared XDG_CONFIG_HOME. Driven
+# DIRECTLY here, with the variable set, exactly as a caller that is not
+# bin/browser would leave it.
+: > "$PWREC"
+printf '{"profile":"%s","steps":[{"op":"goto","url":"https://x.test/"}],"args":{}}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true \
+      XDG_CONFIG_HOME=/nonexistent-shared-config "$DRV" >/dev/null 2>&1
+t  'T16b the driver drops the shared XDG_CONFIG_HOME before opening a browser' '<unset>' \
+   "$(jq -rs '[.[]|select(.call=="launch")|.xdg]|first' "$PWREC")"
+t  'T16b (control) ...and that launch really was recorded' '1' \
+   "$(jq -rs '[.[]|select(.call=="launch")]|length' "$PWREC")"
 # THE MUTANT, driven at the driver directly: a port arriving by config must be a
 # refusal, not a launch. Without this arm "no port in the default args" is all
 # that is graded, and the default args are not where a port would come from.

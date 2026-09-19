@@ -50,6 +50,23 @@ const path = require('path');
 // would reintroduce exactly that.
 const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
 
+// DO NOT DELETE THIS. It is not dead code — it is the fix for DIVE-4587, and the
+// full mechanism is written out at the top of bin/browser. In one paragraph:
+// Chrome keeps its crashpad database at $XDG_CONFIG_HOME/google-chrome/Crash
+// Reports whatever --user-data-dir and --crash-dumps-dir say, and creates it
+// 0700; 5dive boxes export ONE shared XDG_CONFIG_HOME to every seat, so the
+// first seat to run Chrome owns that directory and every other seat's launch
+// CHECK-fails ("chrome_crashpad_handler: --database is required", rc 133, no
+// output). Unsetting it gives each seat its own crash dir under its own home.
+//
+// bin/browser already unsets it, so in the shipped path this is redundant — and
+// it is here for the same reason this file re-validates a plan bin/browser
+// already validated: the driver is an executable whose path is an environment
+// variable (FIVEDIVE_BROWSER_DRIVER), so "my parent did it" is an assumption
+// about a process we do not control. The cost of the second unset is nothing;
+// the cost of being wrong about the parent is a browser that cannot launch.
+delete process.env.XDG_CONFIG_HOME;
+
 const PROG = '5dive browser run';
 // THE EXIT CODE IS A CONTRACT, and 70 is the load-bearing one.
 //
