@@ -1,5 +1,29 @@
 ## Unreleased
 
+### Fixed — `/model` and `/effort` switch the running session instead of restarting it, telegram 0.5.55
+
+Both commands wrote settings.json and then restarted the seat. Whatever turn was
+running died with it: a tool call was killed mid-flight, its results were never
+written, and all the human saw was `Claude is restarting to apply it — back in
+~20-30s`. Changing the effort level cost you the answer you were waiting for.
+
+The restart was there for a reason that has expired. An older Claude Code
+answered `/model` with an interactive "Switch model?" picker this bridge could
+not reliably drive over Telegram, so settings.json plus a restart became the
+source of truth. `/model <id>` and `/effort <level>` now take the argument
+directly, apply it to the running session and persist the choice themselves.
+
+So the line is typed into the live session and nothing is bounced. The ack says
+which of three things happened, read off the pane rather than assumed: `(live —
+the running session already has it)`, `queued, applies when the current turn
+ends. Nothing was interrupted.` — a line sent mid-turn is held by the TUI, not
+lost — or `saved, but the pane did not confirm it. It applies at the next
+restart.` settings.json is still written either way, which is what makes the
+last one true.
+
+Restart stays where a live command cannot reach: `/restart`, `/resume`,
+`/update`, and `/account` + `/login`, whose new credentials are only read at boot.
+
 ### Fixed — the `attached:` footer no longer clutters the human's message (DIVE-4280), telegram 0.5.54
 
 Auto-attach appended `attached: report.md` to every reply that carried a file it
