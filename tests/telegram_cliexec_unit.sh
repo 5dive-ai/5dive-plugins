@@ -208,6 +208,12 @@ tn 'T10 no unconditional sudo on the task-ls read'         "execFileP(SUDO, ['-n
 tn 'T10 no unconditional sudo on the heartbeat read'       "execFileP(SUDO, ['-n', '5dive', 'heartbeat', 'ls'" "$(cat "$S")"
 tn 'T10 no unconditional sudo on the org-tree read'        "execFileP(SUDO, ['-n', '5dive', 'org', 'tree'"   "$(cat "$S")"
 tc 'T10 the shared reader routes through the runner'       'fiveRunner().run(args' "$(cat "$S")"
+TNA_ADAPTER=$(sed -n '/const tnaM = TNA_RE.exec(data)/,/const info = describeTapError(err)/p' "$S")
+tn 'T10 gate tap does not sudo the broad task surface'      "execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer'" "$TNA_ADAPTER"
+tn 'T10 inbox clear does not sudo the broad task surface'   "['-n', '5dive', 'task', 'clear-recs'" "$(cat "$S")"
+tc 'T10 gate tap carries paired-human channel proof'        'extraArgs.push(`--channel-proof=${senderId}`)' "$(cat "$S")"
+tc 'T10 mutating taps use the narrow write helper'          'await write5diveJson(' "$(cat "$S")"
+tc 'T10 write helper accepts refusal envelopes in place'    'const acceptEnvelope = (stdout: string)' "$(cat "$S")"
 
 # --- T11: the FIVE FORKS carry the same 60s banner timer and the same reader ---
 # telegram-{grok,codex,agy,pi,opencode} each poll `task coordinator` / `task
