@@ -21,6 +21,35 @@
 #      retry.
 set -uo pipefail
 
+# DO NOT DELETE THIS UNSET. It is not dead code, it is the fix for DIVE-4587 —
+# a customer box (teal-fox, 2026-09-16) where every seat but one could not launch
+# Chrome AT ALL, for months, while `status` and `doctor` both read healthy.
+#
+# THE MECHANISM, and it is not guessable from the symptom:
+#   Chrome keeps its crashpad database at $XDG_CONFIG_HOME/google-chrome/Crash
+#   Reports, and it does so REGARDLESS of --user-data-dir and regardless of
+#   --crash-dumps-dir (both tested on the box). It creates that directory 0700.
+#   5dive boxes export a SHARED XDG_CONFIG_HOME=/home/claude/.config to every
+#   seat (/etc/profile.d/5dive-shared-configs.sh, for gh/gcloud/aws), so the
+#   first seat that ever runs Chrome OWNS the crash dir and no other seat —
+#   including `claude`, whose own $HOME/.config it is — can write it. crashpad
+#   then starts with an empty --database, and the launch is not a degraded
+#   launch, it is a CHECK failure:
+#       chrome_crashpad_handler: --database is required
+#       Trace/breakpoint trap (core dumped)     # rc 133, zero bytes of output
+#
+# WHY UNSET AND NOT SOMETHING NARROWER. The variable is load-bearing for ~20
+# other shared configs, so dropping the export is not available; chmod g+w on the
+# shared dir breaks again at the next 0700 subdir Chrome creates. Unsetting HERE
+# is safe because of what this process tree contains: it launches Chrome and
+# nothing else that reads XDG_CONFIG_HOME, and the plugin always passes its own
+# --user-data-dir, so every seat simply gets its own crash dir under its own
+# home. It is exported-unset, i.e. removed from the environment of every child.
+#
+# The general form of the same defect ("a shared config dir where a tool creates
+# a 0700 subdir") is not solved here and is not solvable here.
+unset XDG_CONFIG_HOME
+
 PROG="5dive browser"
 STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
 PROFILE_ROOT="${FIVEDIVE_BROWSER_PROFILE_ROOT:-$STATE_DIR/browser-profiles}"
@@ -358,7 +387,7 @@ _auth_status() {
   local only="${1:-}"
   _require_store
   local seat_dir; seat_dir="$(_seat_dir)"
-  local rc=0 found=0 d site
+  local rc=0 found=0 broken=0 d site
   for d in "$seat_dir"/*/; do
     [[ -d "$d" ]] || continue
     site=$(basename "$d")
@@ -367,9 +396,21 @@ _auth_status() {
     _audit "$d" 700
     local state; state=$(_probe "$site" "$d"); local prc=$?
     printf '  %-20s %s\n' "$site" "$state"
-    (( prc == 0 )) || rc=$E_COLD
+    case "$prc" in
+      0) ;;
+      2) broken=1 ;;
+      *) rc=$E_COLD ;;
+    esac
   done
   (( found )) || { printf 'no profiles yet — 5dive browser auth <site>\n'; return 0; }
+  # A BROKEN BROWSER IS LOUD AND OUTRANKS A COLD PROFILE (DIVE-4587). It is not a
+  # liveness verdict at all — nothing was read — so it must not exit through the
+  # "go and log in again" advice, which sends a person to fix a session that was
+  # never examined and is very probably fine.
+  if (( broken )); then
+    printf '\nThis box cannot start a browser as this seat, so the session states above were\nnot read — they are the last thing we knew, not the state now. That is a box\nfault and logging in again will not clear it. Reproduce it directly to see the\nreason:\n  google-chrome --headless --no-sandbox --disable-gpu --user-data-dir=$(mktemp -d) --dump-dom about:blank\n' >&2
+    return $E_UNAVAILABLE
+  fi
   if (( rc )); then
     printf '\nA cold profile is not an error path, it is the steady state — and only a person\nat a browser can clear it:\n  5dive browser auth <site>\n' >&2
   fi
@@ -395,6 +436,27 @@ _auth_status() {
 #      cannot see a marker past the cap, and a challenge banner is as likely to
 #      be late in a large DOM as early. There is no cap here on purpose; the
 #      bound is the one page we asked for.
+# Can this seat start a browser AT ALL, right now? about:blank in a throwaway
+# profile: no network, no session, no profile of ours to corrupt, and nothing a
+# site can do to change the answer. Prints the reason and returns 0 when the
+# launch FAILS (so `if _chrome_launch_error` reads as "there is an error"), and
+# returns 1 when it works. stderr is captured because that is where the failure
+# is named — `chrome_crashpad_handler: --database is required` is the entire
+# diagnosis of DIVE-4587 and chrome exits 133 with an empty stdout.
+_chrome_launch_error() {
+  local chrome="$1"
+  local d; d=$(mktemp -d) || { printf 'no scratch directory to test a launch in'; return 0; }
+  local err
+  err=$("$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$d" \
+        --virtual-time-budget=2000 --dump-dom about:blank 2>&1 >/dev/null)
+  local rc=$?
+  rm -rf "$d"
+  (( rc == 0 )) && return 1
+  err=$(printf '%s' "$err" | tr '\n\r\t' '   ' | cut -c1-200)
+  printf 'it exited %s%s' "$rc" "${err:+ — $err}"
+  return 0
+}
+
 _probe() {
   local site="$1" dir="$2"
   # SERVED MEANS WE CANNOT LOOK, AND SAYING SO IS THE WHOLE FIX. Chrome allows one
@@ -427,10 +489,27 @@ _probe() {
         --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
   local rc=$?
   if (( rc != 0 )) || [[ ! -s "$dom" ]]; then
-    # "UNKNOWN (probe did not load)" sat on the canary for hours and nobody could
-    # tell it from "this profile was never probed" — and it was, in fact, a
-    # chrome that could not start at all. Carry chrome's own words, and STAMP it,
-    # so `browser ls` shows a box in this state instead of a blank column.
+    # A BROWSER THAT CANNOT START IS NOT AN UNREADABLE SESSION (DIVE-4587). Both
+    # arrive here as a non-zero chrome and an empty document, and collapsing them
+    # into one quiet UNKNOWN is how a customer box ran for months with EVERY seat
+    # but one unable to launch Chrome at all while `status` exited 0 and the box
+    # read healthy. The two need opposite handling:
+    #   - the page did not load (a blip, a slow site, a redirect loop): QUIET,
+    #     because a network blip must not page a person, and the next probe very
+    #     likely answers.
+    #   - the browser did not start: LOUD, because nothing will ever answer until
+    #     somebody fixes the box, and no amount of re-probing is going to.
+    # Telling them apart needs no heuristic on the error text: ask the browser to
+    # do the smallest possible thing, in a throwaway profile, with no network.
+    # One extra launch, only on a path that has already failed.
+    local lerr
+    if lerr=$(_chrome_launch_error "$chrome"); then
+      rm -f "$dom" "$dom.err"
+      echo "BROKEN (this box cannot start a browser as $(_seat): $lerr)"
+      return 2
+    fi
+    # The browser launches, so this is a page-only failure. Keep main's richer
+    # quiet UNKNOWN: stamp and surface Chrome's own bounded reason.
     local why; why=$(tr -s '\n' ' ' < "$dom.err" 2>/dev/null | sed 's/^ *//;s/ *$//' | cut -c1-200)
     rm -f "$dom" "$dom.err"
     _stamp "$dir" "UNKNOWN — chrome did not load the page${why:+: $why}"
@@ -471,7 +550,7 @@ _stamp() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$1/.5dive-l
 
 cmd_probe_all() {
   _require_store
-  local d site output found=0
+  local d site output found=0 broken=0 arc
   for d in "$(_seat_dir)"/*/; do
     [[ -d "$d" ]] || continue
     found=1
@@ -481,11 +560,11 @@ cmd_probe_all() {
       printf '  %-20s skipped: served\n' "$site"
       continue
     fi
-    output=$(_auth_status "$site" 2>&1) || true
+    output=$(_auth_status "$site" 2>&1); arc=$?
     printf '%s\n' "$output"
+    (( arc == E_UNAVAILABLE )) && broken=1
   done
   (( found )) || printf 'no profiles yet — 5dive browser auth <site>\n'
-
   # EVICTION RIDES THE SCHEDULE THAT ALREADY EXISTS (DIVE-4588). A sweep needs a
   # clock, and this verb is the one thing in the plugin that already has one —
   # the probe timer installed by `setup`. Giving eviction its own timer would be
@@ -500,8 +579,16 @@ cmd_probe_all() {
     ( cmd_evict ) || printf '%s: the idle sweep did not complete; browsers were left up\n' "$PROG" >&2
   fi
 
-  # Expired/challenge is a liveness result, not a failed timer. Every eligible
-  # profile was attempted; the stamp and journal output carry the outcome.
+  # A FAILED LAUNCH IS THE ONE THING THAT FAILS THIS TIMER (DIVE-4587). Expired
+  # and challenge are liveness RESULTS, not failed runs: every eligible profile
+  # was attempted and the stamp carries the outcome, so exiting non-zero on them
+  # would turn the steady state into a permanently red unit. A browser that will
+  # not start is the opposite — nothing was attempted, nothing was stamped, and
+  # the unit going green on that is exactly how the box read healthy for months
+  # while the plugin was dead. This is the only signal `systemctl` and `5dive
+  # doctor` can see from here, so it must not be spent on a logged-out session
+  # and must not be withheld from a dead browser.
+  (( broken )) && return $E_UNAVAILABLE
   return 0
 }
 
@@ -899,6 +986,8 @@ cmd_run() {
       die "$E_COLD" "$site is logged out. Failing closed: no retry, no login attempt, no falling through to a generic click. A person clears this — 5dive browser auth $site" ;;
     authenticated*)
       : ;;
+    BROKEN*)
+      die "$E_UNAVAILABLE" "$state. The session was never examined, so this says nothing about $site — a browser that will not start is a box fault, and logging in again cannot clear it." ;;
     *)
       die "$E_COLD" "cannot confirm the $site session is live ($state). Refusing to act on a session we did not verify: an unverified session is as likely to be a challenge page as a healthy one, and this is the irreversible half. This state is deliberately QUIET on \`5dive browser status\` — a probe that did not load must not page a person — and fatal here. Re-run the probe, or clear it by hand: 5dive browser auth $site" ;;
   esac
@@ -1817,6 +1906,8 @@ _page_open() {  # _page_open <site> <url>
   local state; state=$(_probe "$site" "$dir")
   case "$state" in
     authenticated*) : ;;
+    BROKEN*)
+      die "$E_UNAVAILABLE" "$state. Nothing was rendered and nothing was read: a browser that will not start is a box fault, not a verdict about the $site session." ;;
     CHALLENGE*)
       die "$E_COLD" "$site is presenting a security challenge, so anything rendered now is the challenge page and not the page you asked for. A person clears it — 5dive browser auth $site" ;;
     session\ expired*)
