@@ -1,3 +1,4 @@
+import { writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -36,6 +37,29 @@ export function nudgeFile(): string {
 // startTypingLoop and DIVE-146.
 export function typingStopFile(): string {
   return join(stateDir(), 'typing-stop')
+}
+
+// Tell the long-running MCP server's typing loop that this turn has ended.
+//
+// It lives HERE, next to the path it writes, because more than one Stop-class
+// hook needs it and they must not drift: the server stops the "typing…" loop on
+// exactly three signals (the reply tool's outbound, this file's mtime, and a
+// 5-minute ceiling), so a hook that ends a turn out-of-process and does not bump
+// this leaves the indicator spinning until the ceiling. `stop-reply-check` has
+// bumped it since DIVE-146; `stopfailure-notify` sends the usage-limit notice
+// from a different process and did not, which is how a chat could show "typing…"
+// for five minutes after a message saying the agent cannot type until the wall
+// lifts.
+//
+// Best-effort by design, and the try/catch is the point: this is a cosmetic
+// signal, and a read-only or full state dir must never turn a delivered notice
+// into a failed hook.
+export function signalTurnEnded(): void {
+  try {
+    writeFileSync(typingStopFile(), String(Date.now()))
+  } catch {
+    // best-effort cosmetic signal — ignore write failures
+  }
 }
 
 // DIVE-1027: filesystem handshake dir for bridging the native picker tools
