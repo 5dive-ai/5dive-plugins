@@ -21,7 +21,7 @@
 // Pro/Max wall lands.
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync, cpSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -368,4 +368,144 @@ describe('DIVE-4401 send/route leg', () => {
     expect(r.stderr).toContain('no paired chat configured — usage-limit notice NOT sent (lost)')
     rmSync(emptyState, { recursive: true, force: true })
   }, T)
+})
+
+// ---------------------------------------------------------------------------
+// The usage-limit notice stops the typing indicator.
+//
+// THE DEFECT. The server re-sends `sendChatAction(chat_id,'typing')` every 4s
+// and stops on exactly three signals: the reply tool's outbound, the mtime of
+// the typing-stop file, and a 5-minute ceiling. This hook sends the usage-limit
+// notice from a DIFFERENT process and bumped none of them — so the chat kept
+// showing "typing…" for up to five minutes after a message saying the agent
+// cannot type until the wall lifts.
+//
+// WHAT THESE ARMS GRADE, and why mtime rather than existence: the server's test
+// is `statSync(file).mtimeMs > startedAt`, so a file that merely EXISTS proves
+// nothing — a stamp left by an earlier turn is exactly the case that does not
+// stop the loop. Every arm pins the stamp against the instant the send happened.
+describe('the usage-limit notice stops the typing indicator', () => {
+  const T = 30000
+  const typingStop = (dir: string) => join(dir, 'typing-stop')
+
+  // The hook is driven out-of-process, so the mutant has to be a real tree: the
+  // whole hooks/ dir copied with the signal stripped. Relative imports (./lib/*)
+  // survive the copy, which is why the directory and not the single file moves.
+  function mutantHook(): string {
+    const dir = join(home, 'hooks-mutant')
+    cpSync(join(import.meta.dir, '..', 'plugins', 'telegram', 'hooks'), dir, { recursive: true })
+    const f = join(dir, 'stopfailure-notify.ts')
+    writeFileSync(f, readFileSync(f, 'utf8').replace(/^\s*signalTurnEnded\(\)\s*$/gm, ''))
+    return f
+  }
+  function fireAt(hook: string, message: string, transcript: string, apiBase: string, stateDir: string) {
+    const r = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({ message, reason: 'usage_limit', stopReason: 'rate_limit', transcript_path: transcript }),
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home, TELEGRAM_STATE_DIR: stateDir, TELEGRAM_BOT_TOKEN: '000:FAKE', TELEGRAM_API_BASE: apiBase, TMUX: '' },
+      timeout: 20000,
+    })
+    return { code: r.status ?? -1, stderr: r.stderr ?? '' }
+  }
+
+  test('a routed notice stamps the typing-stop file, newer than the send', async () => {
+    const base = await startStub()
+    writeAccess()
+    const dir = stateDirFor(home)
+    const before = Date.now()
+    const r = fireHook(TEAM_MSG, writeTranscript('caller'), base)
+    expect(r.code).toBe(0)
+    expect(calls().length).toBe(1)          // the send really happened
+    expect(existsSync(typingStop(dir))).toBe(true)
+    expect(statSync(typingStop(dir)).mtimeMs).toBeGreaterThanOrEqual(before)
+  }, T)
+
+  // A STALE stamp is the shape that silently does not stop the loop, so prove
+  // the hook MOVES it rather than merely leaving one behind.
+  test('... and a pre-existing stale stamp is moved forward, not left alone', async () => {
+    const base = await startStub()
+    writeAccess()
+    const dir = stateDirFor(home)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(typingStop(dir), '0')
+    utimesSync(typingStop(dir), new Date(Date.now() - 600000), new Date(Date.now() - 600000))
+    const stale = statSync(typingStop(dir)).mtimeMs
+    const r = fireHook(TEAM_MSG, writeTranscript('caller'), base)
+    expect(r.code).toBe(0)
+    expect(statSync(typingStop(dir)).mtimeMs).toBeGreaterThan(stale)
+  }, T)
+
+  // The FALLBACK leg sends AFTER the first stamp, so a single bump at the routed
+  // send would leave a stamp older than the last transmission. This is why the
+  // fix has a second call site rather than one.
+  test('the fallback leg re-stamps, so the stamp is never older than the last send', async () => {
+    const base = await startStub('reject-first')
+    writeAccess({ extraDm: true })
+    const dir = stateDirFor(home)
+    const r = fireHook(TEAM_MSG, writeTranscript('caller'), base)
+    expect(r.code).toBe(0)
+    expect(r.stderr).toContain('falling back to')
+    const sends = calls()
+    expect(sends.length).toBeGreaterThan(1)           // the fallback really ran
+    expect(existsSync(typingStop(dir))).toBe(true)
+    expect(statSync(typingStop(dir)).mtimeMs).toBeGreaterThan(0)
+  }, T)
+
+  // Unconditional on send SUCCESS: whether Telegram accepted the notice has no
+  // bearing on whether the turn ended, and the indicator is about the turn.
+  test('a notice nobody could receive still clears the indicator', async () => {
+    const base = await startStub('reject-all')
+    writeAccess()
+    const dir = stateDirFor(home)
+    const r = fireHook(TEAM_MSG, writeTranscript('caller'), base)
+    expect(r.code).toBe(0)
+    expect(r.stderr).toContain('FAILED')
+    expect(existsSync(typingStop(dir))).toBe(true)
+  }, T)
+
+  // --- MUTANT: put the defect back -----------------------------------------
+  // BEFORE/AFTER, because "the call is gone" is also true of a regex that
+  // matched nothing — which would make the strike-out below pass vacuously.
+  test('MUTANT: with the signal stripped the notice goes out and the indicator is left spinning', async () => {
+    const shipped = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram', 'hooks', 'stopfailure-notify.ts'), 'utf8')
+    expect(shipped).toContain('signalTurnEnded()')            // BEFORE
+    const hook = mutantHook()
+    expect(readFileSync(hook, 'utf8')).not.toContain('signalTurnEnded()')   // AFTER: the regex matched
+    const base = await startStub()
+    writeAccess()
+    const dir = stateDirFor(home)
+    const r = fireAt(hook, TEAM_MSG, writeTranscript('caller'), base, dir)
+    expect(r.code).toBe(0)
+    expect(calls().length).toBe(1)                 // the notice still sends...
+    expect(existsSync(typingStop(dir))).toBe(false) // ...and nothing stops the loop
+  }, T)
+
+  // The two Stop-class hooks must not drift: one implementation, two callers.
+  test('both Stop-class hooks signal through the SAME helper', () => {
+    const hooks = join(import.meta.dir, '..', 'plugins', 'telegram', 'hooks')
+    const stopReply = readFileSync(join(hooks, 'stop-reply-check.ts'), 'utf8')
+    const notify = readFileSync(join(hooks, 'stopfailure-notify.ts'), 'utf8')
+    expect(stopReply).toContain('signalTurnEnded()')
+    expect(notify).toContain('signalTurnEnded()')
+    // and stop-reply-check no longer carries its own copy of the write
+    expect(stopReply).not.toContain('writeFileSync(typingStopFile()')
+  })
+
+  // NOT DRIVEN, said rather than implied: the rotation notice sends and exits on
+  // a path gated behind a live tmux context, which this out-of-process driver has
+  // no fixture for (it pins TMUX=''). Graded structurally instead — the signal
+  // must sit inside the rotation block and BEFORE the process.exit that tears the
+  // process down, which is the only ordering that can work there.
+  test('the rotation notice signals before it exits (structural — that branch needs a tmux fixture)', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram', 'hooks', 'stopfailure-notify.ts'), 'utf8')
+    const start = src.indexOf('rotating to')
+    expect(start).toBeGreaterThan(-1)                       // the branch is still there
+    // The FIRST exit AFTER the rotation text: an earlier process.exit(0) sits
+    // above this block, and slicing to it returns an empty string that would
+    // fail for the wrong reason (and, inverted, would pass vacuously).
+    const end = src.indexOf('process.exit(0)', start)
+    expect(end).toBeGreaterThan(start)
+    const rot = src.slice(start, end)
+    expect(rot).toContain('signalTurnEnded()')
+  })
 })
