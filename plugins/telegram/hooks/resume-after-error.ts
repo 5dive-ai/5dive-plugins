@@ -22,7 +22,7 @@ import { setTimeout as sleep } from 'timers/promises'
 import { unlinkSync, utimesSync } from 'fs'
 import { capturePaneFor, sendKeys, type TmuxCtx } from './lib/tmux'
 import { sendMessage } from './lib/telegram'
-import { readEntries } from './lib/transcript'
+import { captureBaseline, resumedSinceBaseline, rotatedSince, type ResumeBaseline } from './lib/live-transcript'
 import { resumePrompt } from './lib/resume-prompt'
 
 const socket = process.argv[2] ?? ''
@@ -71,20 +71,13 @@ function heartbeat(): void {
 // error. Stricter than the rate-limit helper's check (which only excludes
 // error="rate_limit"): a fresh transient-error retry would land as an
 // assistant entry with a non-rate-limit error, and we must NOT count that as
-// success. Transcript is the source of truth (immune to pane scrollback).
-function resumedSince(baseline: number): boolean {
-  if (!transcriptPath || baseline < 0) return false
-  const entries = readEntries(transcriptPath)
-  for (let i = baseline; i < entries.length; i++) {
-    const e = entries[i]
-    if (e.type === 'assistant' && !e.error) return true
-  }
-  return false
-}
-
-function transcriptLen(): number {
-  if (!transcriptPath) return -1
-  return readEntries(transcriptPath).length
+// success. Transcript is the source of truth (immune to pane scrollback) — and
+// DIVE-4628: the LIVE transcript, re-resolved per poll. This helper is bounded
+// by BACKOFFS_SEC so a rotation here could never wedge it the way it wedged
+// resume-after-reset, but it would still spend every remaining attempt typing
+// `continue` at a seat that had already answered the first one.
+function resumedSince(baseline: ResumeBaseline): boolean {
+  return resumedSinceBaseline(transcriptPath, baseline, e => !e.error)
 }
 
 // Pane fallback when there's no transcript path: an active "API Error" line
@@ -97,11 +90,12 @@ function paneStillErrored(pane: string): boolean {
 // back up. Returns true on confirmed resume.
 async function attemptResume(): Promise<boolean> {
   if (!ctx) return false
-  const baseline = transcriptLen()
+  const baseline = captureBaseline(transcriptPath)
   sendKeys(ctx, resumePrompt(), 'Enter')
   for (let i = 0; i < VERIFY_POLLS; i++) {
     await sleep(VERIFY_STEP_MS)
-    if (transcriptPath) {
+    if (baseline.len >= 0) {
+      if (rotatedSince(transcriptPath, baseline)) log('session rotated mid-wait; watching the live transcript')
       if (resumedSince(baseline)) return true
     } else if (!paneStillErrored(capturePaneFor(ctx))) {
       return true

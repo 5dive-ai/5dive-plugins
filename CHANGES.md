@@ -1,5 +1,28 @@
 ## Unreleased
 
+### Fixed — a resume helper no longer types `continue` at a seat that already answered (DIVE-4628), telegram 0.5.55
+
+At a usage wall the Stop hook spawns `resume-after-reset`, which sleeps until the
+reset, types `continue` into the seat's tmux pane, and then watches the transcript
+to confirm the agent picked up. It was handed the transcript path when it was
+spawned — hours earlier.
+
+A claude session ROTATES to a new `<session-id>.jsonl` (compaction, `/clear`, a
+restart). When it does, the keystroke still reaches the LIVE session and wakes the
+agent, but the verification polls the frozen old file, which by definition never
+changes again. "Did it pick up?" is then permanently no, which reads as "still
+limited", so the helper retried on a 300s timer. Measured on one seat 2026-09-19:
+seven `continue` injections into an agent that answered every one of them and said
+so, each injection a fresh turn with that agent's whole context re-sent.
+
+The transcript is now re-resolved on every poll — the newest session file in the
+project dir IS the live session — and a rotation is named in the helper's log. The
+retry loop is bounded by ATTEMPTS as well as by time (6, doubling 5m→60m, ~2.3h of
+reach against the old 72 injections over 6h), and the Telegram ping now says which
+bound ended it. `resume-after-error` takes the same live-transcript resolution; it
+was already attempt-bounded, but a rotation there still spent every remaining try
+on an agent that had answered.
+
 ### Fixed — the `attached:` footer no longer clutters the human's message (DIVE-4280), telegram 0.5.54
 
 Auto-attach appended `attached: report.md` to every reply that carried a file it
