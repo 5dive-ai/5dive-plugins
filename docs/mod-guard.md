@@ -105,3 +105,23 @@ transcript showing it.
 4. Check the sink afterwards. A `decision: "deny"` line carries `policy` and `check`, so "this
    policy fires 40× a day on good work" is a measurement rather than an argument — see
    `docs/mod-telemetry-contract.md`.
+
+## Known residuals
+
+These are recorded rather than fixed, because each one is ops-fixable in `policy/guard.json`
+without a plugin release, and because a policy that is quietly widened is harder to reason about
+than one whose edges are written down.
+
+- **`pii-fixture/ip` cannot tell an IP address from a four-part version string.** The check is a
+  dotted-quad match, so `expect(v).toBe("10.1.2.3")` and `const V = "2.1.278.0"` in a test file
+  both DENY (measured by the verifier, 2026-09-20). A seat that turns the guard on and writes a
+  version-shaped literal into a test will be refused for it. The narrowing is one entry in the
+  document — add `"^\\d+\\.\\d+\\.\\d+\\.\\d+$"`-shaped exclusions to the check's `allow_any`, or
+  give the check a `path_any` that skips version fixtures — and it is deliberately not taken here:
+  it would ship unverified in the iteration that fixes something else.
+- **`external-reply` only sees an explicit `--repo`/`-R`.** `gh pr comment 4` run from inside a
+  foreign checkout carries no owner on the command line, so nothing is refused.
+- **`pii-fixture` judges the path by NAME** (`test/`, `spec/`, `fixture`, `*.test.*`). A fixture
+  living anywhere else is not covered.
+- **A seat cannot tell "guarded" from "guard broken" except from the sink.** That is the price of
+  failing open, stated above; the debug line and the sink are the only two places it shows.

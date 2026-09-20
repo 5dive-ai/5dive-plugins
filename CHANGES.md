@@ -1,5 +1,58 @@
 ## Unreleased
 
+### Added — a table-driven tool-call policy guard (DIVE-4696), mod 0.4.0
+
+Every rule in the fleet's `CLAUDE.md` files is paid on **every turn** (~1100 loads/day per the
+file's own header), and is enforced *after the fact* — by sudoers scoping, by the pre-push
+guard, or by an audit row somebody reads later. A rule that is a `tool.call` deny instead costs
+nothing per turn, fires **before** the tool runs, and hands the model the reason.
+
+`mod` now compiles `plugins/mod/policy/guard.json` once per session and refuses a call that
+matches. Six policies ship: a real Telegram id / email / routable IP written into a test or
+fixture path, `git commit|push --no-verify`, applying the `smoke-verified` label without a
+receipt for that sha, a direct write into the runtime's store or log paths, a destructive
+command outside the work directory, and a comment or review on a repo we do not own.
+
+**The document is data, not code** — nothing in `guard.ts` or `register.ts` names a policy, a
+path, a tool or a rule, so ops adds or retires one by editing JSON with no plugin release.
+`jq -r '.policies[] | "\(.id)\t\(.rule)"' plugins/mod/policy/guard.json` is the whole reader.
+
+**Off on every seat unless it opts in** (`FIVEDIVE_MOD_GUARD=1`), and off is byte-for-byte the
+observe-only hook DIVE-4692 shipped. It **fails open**: an unparseable document, an
+uncompilable regex or an unexpected event shape lets the call proceed and logs once per
+session. Each policy carries a named seat-setting escape rather than a command-line flag, so
+taking one is recorded. Every refusal is written to the sink with the policy and check that
+refused it, because a deny nobody can count is a rule nobody can grade.
+
+### Added — boundary compaction for the non-fresh seats (DIVE-4695), mod 0.3.0
+
+`main` and `marketing` run with `heartbeat.fresh=false`, so the dispatcher never `/clear`s
+them and every wake lands on the whole accumulated window. Measured 2026-09-20 (`sudo 5dive
+cost`, 24h, quota over API-EQ — quota counts the cache read): **marketing 49.9x, main 43.7x**
+against **dev 33.8x, quinn 31.5x, ops 25.0x** on the fresh seats.
+
+The `mod` plugin can now compact the conversation **at a turn boundary**, so the next
+dispatched goal lands on a summary rather than the transcript. It is off on every seat and
+opted into per seat (`FIVEDIVE_MOD_BOUNDARY_COMPACT`), with the threshold and the continuity
+pin as knobs; a malformed knob turns the feature **off** rather than back to a default.
+
+Continuity is the failure mode, so it is structural and not a prompt: the plugin hooks
+`session.compact` and appends back, verbatim and by the engine's own message handle, any
+message the pin matched that the compaction dropped — an unanswered human gate, a standing
+directive, an open row's branch. It is the only hook in the plugin that returns anything but
+the chain's own value, and it can only ADD.
+
+Two things the live lab run changed: the trigger is `turn.complete`, not `session.measure`
+(which was observed firing BEFORE `turn.complete` on 2.1.278, where the call rejects), and
+`$.session.compact` needs a mounted session — a `claude -p` run refuses it, and the refusal
+is a counted line rather than a crash.
+
+The compaction runs on a promise chain of its **own**, not the telemetry writer's. A
+compaction is a ~50s model call; queued on the writer's chain it delayed no turn but it
+delayed every sink write behind it, including the next `turn.start` — and that sink is
+what the heartbeat, the pacing floor and the pending-restart sweep read idle/busy from, so
+a compacting seat would have read as a silent one for ~50s.
+
 ### Added — `/task` and `/gate` as first-class commands, and what the swap actually saves (DIVE-4693), mod 0.2.0
 
 The `mod` plugin now registers two slash commands with `$.command.register` and serves them by

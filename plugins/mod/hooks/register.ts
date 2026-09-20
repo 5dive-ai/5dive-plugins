@@ -83,7 +83,7 @@ import { compile, envSet, evaluate, type Compiled, type Verdict } from './guard'
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.3.0'
+const VERSION = '0.4.0'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
@@ -157,6 +157,96 @@ const DEFAULT_SUBDIR = '.5dive/mod-telemetry'
  */
 const MAX_LINES = 5000
 
+// ---------------------------------------------------------------------------
+// DIVE-4695 — boundary compaction on the NON-FRESH seats.
+//
+// `main` and `marketing` run with heartbeat.fresh=false: the dispatcher does NOT
+// send `/clear` before a nudge, so every wake lands on the whole accumulated
+// window and every model step inside that turn re-sends it. That is the shape
+// CLAUDE.md calls "the most expensive shape we have", and `task add --fresh`
+// exists only to dodge it one row at a time.
+//
+// This compacts the conversation AT A TURN BOUNDARY, so the next dispatched goal
+// lands on a summary instead of the full transcript, and the seat keeps its
+// continuity in compacted form rather than losing it to a `/clear`.
+//
+// Three properties, and the order is the safety argument:
+//
+//   1. NEVER MID-TURN. `$.session.compact()` "rejects while a turn runs" (the
+//      2.1.278 declaration says so in as many words). The trigger is
+//      `session.measure`, which the engine raises AFTER each main-thread turn —
+//      and the mod additionally tracks `turn.start`/`turn.complete` itself and
+//      refuses to fire while a turn is open, because `session.measure` also
+//      fires when a rate-limit window moves a whole point, which can land
+//      anywhere. The call is never awaited by the hook: it runs on its own
+//      chain, so a compaction can neither delay nor fail a turn.
+//   2. CONTINUITY IS PINNED STRUCTURALLY, NOT ASKED FOR. The row's failure mode
+//      is a compaction that drops a lodar directive or an unanswered human
+//      gate — worse than the tokens it saved. Instructions alone are a request
+//      to a summarizer. So the mod also hooks `session.compact` and, on the way
+//      UP, checks that every message the pin predicate matched is still in the
+//      result by its engine `handle`; any that is not is appended verbatim. The
+//      summary is best-effort; the pin is mechanical.
+//   3. OFF BY DEFAULT, PER SEAT. A third gate on top of the telemetry's two:
+//      FLAG must be on AND COMPACT_FLAG must be "1". A fresh seat wakes clean
+//      already and must never set it.
+// ---------------------------------------------------------------------------
+
+/** Turns boundary compaction on for a seat. Absent or anything but "1" is off. */
+const COMPACT_FLAG = 'FIVEDIVE_MOD_BOUNDARY_COMPACT'
+
+/** The context fill, as a whole percent, at or above which a boundary compacts. */
+const COMPACT_AT_KEY = 'FIVEDIVE_MOD_BOUNDARY_COMPACT_PERCENT'
+
+/** The pin predicate's pattern, overridable per seat. */
+const COMPACT_PIN_KEY = 'FIVEDIVE_MOD_BOUNDARY_COMPACT_PIN'
+
+/**
+ * Default threshold. Claude Code's own auto-compaction runs near the top of the
+ * window; the point of this one is to run EARLIER, because on a non-fresh seat
+ * the cost is not "the window once" but "the window on every model step of every
+ * wake". Measured on this box 2026-09-20 (`sudo 5dive cost`, last 24h), quota
+ * over API-EQ — quota counts the cache READ, so the ratio is how many times a
+ * seat re-read what it had already written:
+ *
+ *     marketing  139.8M / 2.8M  = 49.9x     non-fresh
+ *     main       576.5M / 13.2M = 43.7x     non-fresh
+ *     dev        767.1M / 22.7M = 33.8x     fresh
+ *     quinn      431.0M / 13.7M = 31.5x     fresh
+ *     ops        423.0M / 16.9M = 25.0x     fresh
+ *
+ * 50 is deliberately conservative for a pilot: it halves the re-read without
+ * going near the working set of a single turn. It is a knob, and the 24h A/B on
+ * DIVE-4695 is what moves it.
+ */
+const DEFAULT_COMPACT_AT = 50
+
+/** More than this many pinned messages means the predicate is wrong, not the window. */
+const MAX_PINS = 12
+
+/**
+ * What must survive a boundary compaction, matched against a message's text.
+ *
+ * Deliberately narrow and deliberately overridable: an unanswered human gate and
+ * its ask, the row under work and the branch bound to it, and a standing
+ * directive from the paired human. Everything else is what the summary is for.
+ */
+const DEFAULT_PIN =
+  '(5dive task need|--ask=|GATE|gate cleared|lodar|Branch: |DIVE-[0-9]{3,})'
+
+/**
+ * Handed to the summarizer on OUR compactions. The pin above is what guarantees
+ * the text is still there; this is what stops the summary from contradicting it.
+ */
+const COMPACT_INSTRUCTIONS =
+  'This conversation belongs to an autonomous agent seat that is woken repeatedly ' +
+  'with new goals and must not lose state between them. Keep VERBATIM, and never ' +
+  'paraphrase or drop: any unanswered human gate and the exact question it asks; ' +
+  'any standing instruction from the paired human; the identifier, branch name and ' +
+  'current status of every task still open; and any commitment made to another ' +
+  'agent that has not yet been discharged. Summarize the investigation, not the ' +
+  'obligations.'
+
 type Usage = {
   context?: unknown
   rate_limits?: unknown
@@ -197,6 +287,11 @@ type ContextCost = {
     per_skill: Array<{ name: string; source: string; tokens: number }>
   }
   slash_commands?: { total: number; included: number; tokens: number }
+  /** `compact.*` only: how the boundary decided, and what it cost. */
+  percent?: number
+  tokens_before?: number
+  tokens_after?: number
+  pinned?: number
 }
 
 type Live = {
@@ -205,6 +300,10 @@ type Live = {
   path: string
   producer: string
   sessionId: string
+  /** The boundary-compaction threshold as a whole percent, or null when off. */
+  compactAt: number | null
+  /** The pin predicate, compiled once; null when compaction is off. */
+  pin: RegExp | null
 }
 
 const OFF = { on: false } as const
@@ -218,9 +317,44 @@ const lines: string[] = []
 let flush: Promise<void> = Promise.resolve()
 let stopped = false
 
+/**
+ * The boundary compaction's OWN chain, deliberately not `flush` (DIVE-4695, iteration 2).
+ *
+ * A compaction is a model call and it was measured at ~50s (51.5s / 50.3s in the live
+ * lab run). Queued on `flush` it delayed nothing in the TURN — but it delayed every
+ * telemetry WRITE behind it, including the next `turn.start`, so a compacting seat
+ * went observably silent for the length of the compaction. That sink is what the
+ * heartbeat, the pacing floor and the pending-restart sweep read idle/busy from, so a
+ * 50s hole in it is a 50s window where a busy seat reads as quiet. Its own chain keeps
+ * `record()` prompt; overlap between two compactions is prevented by `compacting`, not
+ * by sharing a queue with the writer.
+ */
+let compactChain: Promise<void> = Promise.resolve()
+
 /** Each of these says its thing once per session, not once per event. */
 let writeFailureLogged = false
 let usageFailureLogged = false
+
+/**
+ * DIVE-4695. Whether a turn is open, tracked from the events rather than inferred:
+ * `session.measure` fires after each main-thread turn AND whenever a rate-limit
+ * window moves a whole point, and the second kind can land anywhere. `$.session.compact`
+ * rejects while a turn runs, so this is the gate that keeps a boundary a boundary.
+ */
+let inTurn = false
+
+/** A compaction already on its way; a second boundary must not start another. */
+let compacting = false
+
+/** Said once per session, like the others. */
+let compactFailureLogged = false
+
+/**
+ * The pin predicate for the session's compactions, published by `resolveState` so
+ * the `session.compact` hook can reach it without re-resolving. Null means the
+ * seat has not opted in, and then that hook is a pass-through.
+ */
+let livePin: RegExp | null = null
 
 /**
  * The seat's name, from the plugin's own directory, which lives under the seat's home:
@@ -289,6 +423,115 @@ export function producerFor(name: string): string {
 }
 
 /**
+ * The boundary-compaction threshold for a seat: a whole percent, or null when the
+ * seat has not opted in or the setting is not a usable percentage.
+ *
+ * A malformed threshold answers null — OFF — rather than falling back to the
+ * default. A typo in a seat's settings must not silently start compacting a live
+ * window at a number nobody chose.
+ *
+ * Exported so test/mod-boundary-compact.test.ts can exercise it without an engine.
+ */
+export function compactThreshold(vars: Record<string, unknown>): number | null {
+  if (String(vars[COMPACT_FLAG] ?? '') !== '1') return null
+  const raw = String(vars[COMPACT_AT_KEY] ?? '')
+  if (raw === '') return DEFAULT_COMPACT_AT
+  if (!/^\d{1,3}$/.test(raw)) return null
+  const n = Number(raw)
+  // 0 would compact on every boundary including an empty window; 100 can never be
+  // reached before the engine's own auto-compaction has already run.
+  return n >= 1 && n <= 99 ? n : null
+}
+
+/**
+ * The pin predicate for a seat. An unparseable override answers null, and a null
+ * pin turns boundary compaction OFF at `resolveState` — the pin is the continuity
+ * guarantee, so a seat that cannot build one must not compact.
+ *
+ * Exported for the test.
+ */
+export function pinFor(vars: Record<string, unknown>): RegExp | null {
+  const raw = String(vars[COMPACT_PIN_KEY] ?? '') || DEFAULT_PIN
+  try {
+    return new RegExp(raw, 'i')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The context fill out of a usage reading, as a whole percent, or undefined when
+ * the engine has not reported one for the live window. `Usage.context` is `unknown`
+ * on the sink's own type by design — the sink records what it was handed — so the
+ * one place that needs a number narrows it here and nowhere else.
+ *
+ * Exported for the test.
+ */
+export function percentOf(u: Usage | undefined): number | undefined {
+  const c = (u as { context?: { percent?: unknown } } | undefined)?.context
+  const pct = c?.percent
+  return typeof pct === 'number' ? pct : undefined
+}
+
+/**
+ * Should this boundary compact? Pure, so the whole decision is gradeable without
+ * an engine, and every refusal names itself: a boundary that declines is a line in
+ * the sink, not silence.
+ *
+ * `percent` absent means the engine has not reported a fill for the live window
+ * yet. That is NOT "0% used" (the blind-meter distinction this plugin exists to
+ * respect), so it declines.
+ *
+ * Exported for the test.
+ */
+export function compactDecision(args: {
+  compactAt: number | null
+  percent: number | undefined
+  inTurn: boolean
+  alreadyRunning: boolean
+}): { go: true } | { go: false; why: string } {
+  if (args.compactAt === null) return { go: false, why: 'off' }
+  if (args.inTurn) return { go: false, why: 'mid-turn' }
+  if (args.alreadyRunning) return { go: false, why: 'in-flight' }
+  if (args.percent === undefined) return { go: false, why: 'no-reading' }
+  if (args.percent < args.compactAt) return { go: false, why: 'below-threshold' }
+  return { go: true }
+}
+
+/**
+ * The continuity pin, and the whole reason this row is not "call compact at a
+ * boundary". Given the transcript the engine handed the `session.compact` hook and
+ * the messages the compaction resolved to, it answers the kept list with every
+ * pinned message that the compaction dropped appended back, verbatim.
+ *
+ * Identity is the engine's `handle`, which it stamps on the messages it hands a
+ * compact hook and on the ones core kept. A message the summary happens to quote
+ * does not count as kept: the pinned text must be present as a MESSAGE, because a
+ * paraphrase of an unanswered gate is exactly the failure the row names.
+ *
+ * `MAX_PINS` is a predicate check, not a budget. A pin that matches half the
+ * window means the pattern is wrong; pinning half the window would defeat the
+ * compaction while looking like it worked, so it pins the NEWEST `MAX_PINS` and
+ * the count goes on the sink line where the pilot can see it.
+ *
+ * Exported for the test.
+ */
+export function pinKept<T extends { text: string; handle?: string }>(
+  pin: RegExp | null,
+  before: readonly T[],
+  kept: readonly T[],
+): { messages: readonly T[]; pinned: number } {
+  if (pin === null) return { messages: kept, pinned: 0 }
+  const present = new Set(kept.map((m) => m.handle).filter((h) => h !== undefined))
+  const dropped = before.filter(
+    (m) => pin.test(m.text) && (m.handle === undefined || !present.has(m.handle)),
+  )
+  if (dropped.length === 0) return { messages: kept, pinned: 0 }
+  const keep = dropped.slice(-MAX_PINS)
+  return { messages: [...kept, ...keep], pinned: keep.length }
+}
+
+/**
  * Decides once whether this session records, and where. Every failure answers OFF:
  * a mod that cannot tell what it is measuring must not guess, and a mod that throws
  * must not reach the chain. Declared at the top of the file because it takes
@@ -325,12 +568,32 @@ async function resolveState($: EngineInterface): Promise<State> {
     }
 
     const sessionId = await $.session.id()
+
+    // DIVE-4695. The pin is the continuity guarantee, so a seat that opted into
+    // boundary compaction but whose pin pattern will not compile gets NO
+    // compaction — not an unpinned one. Said out loud, because "the flag is on and
+    // nothing compacts" is otherwise indistinguishable from the flag being off.
+    const pin = pinFor(vars)
+    let compactAt = compactThreshold(vars)
+    if (compactAt !== null && pin === null) {
+      compactAt = null
+      $.ui.log(
+        `5dive mod: boundary compaction is OFF on this seat — ${COMPACT_PIN_KEY} is ` +
+          `not a valid regular expression, and an unpinned compaction can drop an ` +
+          `unanswered gate. Fix it or remove it to use the default.`,
+        { to: 'debug' },
+      )
+    }
+    livePin = compactAt === null ? null : pin
+
     return {
       on: true,
       seat,
       producer: producerFor($.plugin.name),
       sessionId,
       path: sinkPath(dir, seat, sessionId),
+      compactAt,
+      pin: livePin,
     }
   } catch (err) {
     // Not a crash and not a silent no-op: one line naming what this Claude Code
@@ -782,6 +1045,99 @@ async function contextCost($: EngineInterface): Promise<ContextCost | undefined>
     return undefined
   }
 }
+/**
+ * Runs one boundary compaction and records what it cost. Never awaited by the hook
+ * that starts it, and never on the writer's chain: a compaction is a model call, and
+ * the pilot must not be able to delay a turn, fail one, or stall the sink. Every outcome — including every refusal — is a line in
+ * the sink, because the 24h A/B this row owes is read off those lines.
+ *
+ * Declared at the top level because it takes `$` (see the HOST RULE at the top).
+ */
+function considerBoundary($: EngineInterface, s: Live, percent: number | undefined): void {
+  const d = compactDecision({
+    compactAt: s.compactAt,
+    percent,
+    inTurn,
+    alreadyRunning: compacting,
+  })
+  if (d.go) {
+    // Not awaited, and on its OWN chain (`compactChain`, not `flush`): a compaction
+    // can neither delay a turn nor fail one, and it no longer parks the telemetry
+    // writer behind a ~50s model call — see the `compactChain` comment.
+    startCompaction($, s, percent ?? 0)
+    return
+  }
+  // A boundary that declined, for a reason the pilot has to be able to COUNT — a
+  // quiet sink must not be the same observable as a working one. `below-threshold`
+  // is the common case and is left out, or it would drown the file.
+  if (s.compactAt !== null && d.why !== 'below-threshold') {
+    record($, s, {
+      ts: Date.now(),
+      event: 'compact.skip',
+      reason: d.why,
+      ...(percent === undefined ? {} : { percent }),
+    })
+  }
+}
+
+export function startCompaction($: EngineInterface, s: Live, percent: number): void {
+  compacting = true
+  const at = Date.now()
+  compactChain = compactChain
+    .then(() => $.session.compact({ instructions: COMPACT_INSTRUCTIONS }))
+    .then(
+      (r) => {
+        compacting = false
+        if (r.skip !== undefined) {
+          record($, s, {
+            ts: Date.now(),
+            event: 'compact.skip',
+            reason: `vetoed: ${r.skip}`,
+            percent,
+          })
+          return
+        }
+        record($, s, {
+          ts: Date.now(),
+          event: 'compact.done',
+          percent,
+          // Absent when core did not record them — absent, never zero.
+          ...(r.tokensBefore === undefined ? {} : { tokens_before: r.tokensBefore }),
+          ...(r.tokensAfter === undefined ? {} : { tokens_after: r.tokensAfter }),
+          pinned: lastPinned,
+          reason: `${Date.now() - at}ms`,
+        })
+      },
+      (err) => {
+        compacting = false
+        // The expected rejection is "a turn started while this was queued". It is
+        // not a defect and it is not silent: the next boundary tries again.
+        record($, s, {
+          ts: Date.now(),
+          event: 'compact.skip',
+          reason: `rejected: ${String(err)}`,
+          percent,
+        })
+        if (!compactFailureLogged) {
+          compactFailureLogged = true
+          try {
+            $.ui.log(
+              `5dive mod: a boundary compaction was refused by this Claude Code ` +
+                `build (verified against ${VERIFIED_AGAINST}): ${String(err)}. The ` +
+                `seat keeps its full window; the next boundary tries again.`,
+              { to: 'debug' },
+            )
+          } catch {}
+        }
+      },
+    )
+}
+
+/**
+ * How many messages the last compaction had to pin back. Set by the `session.compact`
+ * hook, read by the line `startCompaction` writes — the two halves of one event.
+ */
+let lastPinned = 0
 
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1278,7 @@ export const register: Register = (on) => {
 
   on('turn.start', async ($, e, next) => {
     const r = await next(e)
+    inTurn = true
     state ??= resolveState($)
     const s = await state
     // The turn's OPENING boundary — the signal the reclaim and the pending-restart
@@ -935,6 +1292,10 @@ export const register: Register = (on) => {
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    // The boundary opens HERE and `session.measure` is what steps through it: this
+    // hook only records the fact, so nothing in a turn's own path can be delayed by
+    // a compaction (DIVE-4695).
+    inTurn = false
     state ??= resolveState($)
     const s = await state
     // `reason` distinguishes an answered turn from an interrupted, refused or errored
@@ -942,12 +1303,13 @@ export const register: Register = (on) => {
     // EVENT — `turn.abort` is a call on `$` and "turn-abort" is an abort reason — so
     // turn.complete is where the pilot reads one.
     if (s.on) {
+      const u = await usage($)
       record($, s, {
         ts: Date.now(),
         event: 'turn.complete',
         turn_id: e.turnId,
         reason: e.reason,
-        usage: await usage($),
+        usage: u,
         // DIVE-4693's before/after is read off this field: ONE line, on the FIRST
         // completed turn, and only when the seat asked for it.
         //
@@ -967,6 +1329,15 @@ export const register: Register = (on) => {
           ? {}
           : ((auditDone = true), { context_cost: await contextCost($) })),
       })
+      // DIVE-4695's PRIMARY boundary, and it is here rather than in `session.measure`
+      // because of a MEASUREMENT, not a preference. The declaration says measure
+      // "fires after each main-thread turn"; on 2.1.278 it was observed firing BEFORE
+      // turn.complete (lab session 2026-09-20: `compact.skip reason=mid-turn` at 3%,
+      // then turn.complete). Trusting the event's timing would have put the call
+      // mid-turn, where it rejects. Measure is kept as a SECOND trigger for the
+      // boundaries it does raise cleanly — a rate-limit window moving while the seat
+      // sits idle between wakes — and `compactDecision` is the same one either way.
+      considerBoundary($, s, percentOf(u))
     }
     return r
   })
@@ -1031,6 +1402,39 @@ export const register: Register = (on) => {
     const s = await state
     if (s.on) record($, s, { ts: Date.now(), event: 'tool.call', tool: e.tool })
     return r
+  })
+
+  on('session.measure', async ($, e, next) => {
+    // DIVE-4695's trigger. The engine raises this after each main-thread turn (and
+    // when a rate-limit window moves a whole point), with the figures pushed rather
+    // than polled — so reading the fill here costs the seat nothing.
+    const r = await next(e)
+    state ??= resolveState($)
+    const s = await state
+    if (s.on) considerBoundary($, s, e.context.percent)
+    return r
+  })
+
+  on('session.compact', async ($, e, next) => {
+    // The ONE hook in this module that changes what the engine does, and it changes
+    // it in exactly one direction: it can only ADD BACK a message the compaction
+    // dropped. It never removes, never rewrites, never vetoes, and on a seat that
+    // has not opted into boundary compaction it is a pass-through.
+    //
+    // Why it exists: the row's failure mode is a compaction that loses an unanswered
+    // human gate or a standing directive, which is worse than the tokens it saved.
+    // `COMPACT_INSTRUCTIONS` asks the summarizer; this makes it structural.
+    const r = await next(e)
+    if (livePin === null || r.skip !== undefined) return r
+    const { messages, pinned } = pinKept(livePin, e.messages, r.messages)
+    lastPinned = pinned
+    if (pinned === 0) return r
+    state ??= resolveState($)
+    const s = await state
+    if (s.on) {
+      record($, s, { ts: Date.now(), event: 'compact.pinned', reason: e.trigger, pinned })
+    }
+    return { ...r, messages }
   })
 
   on('session.end', async ($, e, next) => {

@@ -43,8 +43,27 @@ const EVENTS = [
   'turn.complete',
   'command.run',
   'tool.call',
+  'session.measure',
+  'session.compact',
   'session.end',
 ] as const
+
+/**
+ * The hooks that observe and nothing else. DIVE-4695 added the first two hooks that
+ * are NOT in this set, and the exemption is spelled out one place only — here — so
+ * that a third one cannot appear without editing this line:
+ *
+ *   - `session.measure` still returns the chain's value untouched, but it may START
+ *     a compaction. It does so on the sink's own promise chain and never awaits it,
+ *     so it can neither delay a turn nor fail one; what it can do is change the
+ *     conversation the NEXT turn runs over, which is the point of that row.
+ *   - `session.compact` is the only hook in the module that returns something other
+ *     than `r`, and the arms in mod-boundary-compact.test.ts pin the direction: it
+ *     may only APPEND messages the compaction dropped, never remove or rewrite one.
+ */
+const OBSERVE_ONLY = EVENTS.filter(
+  (e) => e !== 'session.measure' && e !== 'session.compact',
+)
 
 describe('mod: manifest and module stay wired together', () => {
   test('hooks/hooks.json names the module', () => {
@@ -124,26 +143,61 @@ describe('mod: it cannot affect the session it measures', () => {
     expect(SRC).not.toMatch(/next\(\s*\{\s*\.\.\.e/)
   })
 
-  test('every TELEMETRY hook awaits next(e) before it does anything else', () => {
-    const bodies = [...SRC.matchAll(/^  on\('([^']+)', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms)]
+  test('every hook awaits next(e) before it does anything else', () => {
+    const bodies = [
+      ...SRC.matchAll(/^  on\('([^']+)', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms),
+    ]
     expect(bodies.length).toBe(EVENTS.length)
-    for (const [, event, body] of bodies) {
-      const first = body.split('\n').map((l) => l.trim()).find((l) => l !== '' && !l.startsWith('//'))
-      if (event === 'tool.call') {
-        // The guard's hook, and the only one that may act before `next`. What it may
-        // do first is pinned to the one call: anything else here would be a side
-        // effect on the path of every tool call on the seat.
+    for (const [, name, body] of bodies) {
+      const first = body!.split('\n').map((l) => l.trim()).find((l) => l !== '' && !l.startsWith('//'))
+      if (name === 'tool.call') {
+        // DIVE-4696 — the guard's hook, and the ONE exemption from the rule below.
+        // What it may do before `next` is pinned to the single call: anything else
+        // here would be a side effect on the path of every tool call on the seat.
         expect(first).toBe('const v = await verdictFor($, e.tool, e)')
-        // ...and when it does NOT deny, it is the old observe-only hook: next(e) first
-        // and the chain's own result handed back.
-        expect(body).toContain('const r = await next(e)')
-        expect(body.trimEnd().endsWith('return r')).toBe(true)
+        // ...and when it does NOT deny, it is the observe-only hook DIVE-4692
+        // shipped: next(e) first, and the chain's own result handed back.
+        expect(body!).toContain('const r = await next(e)')
+        expect(body!.trimEnd().endsWith('return r')).toBe(true)
         continue
       }
+      // No other hook does ANYTHING — not a settings read, not a threshold check —
+      // before the chain below it has resolved.
       expect(first).toBe('const r = await next(e)')
-      // and the hook hands back exactly what the chain resolved to
-      expect(body.trimEnd().endsWith('return r')).toBe(true)
+      if ((OBSERVE_ONLY as readonly string[]).includes(name!)) {
+        // and the observe-only hooks hand back exactly what the chain resolved to
+        expect(body!.trimEnd().endsWith('return r')).toBe(true)
+      }
     }
+  })
+
+  test('exactly TWO hooks return anything other than the chain\'s own value', () => {
+    // The exemption list is the assertion. `session.compact` may ADD a message back;
+    // `tool.call` may REFUSE the call outright (DIVE-4696). A third name appearing
+    // here is a hook that started changing what the engine does, and it must be
+    // argued for rather than discovered.
+    const bodies = [
+      ...SRC.matchAll(/^  on\('([^']+)', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms),
+    ]
+    const rewriting = bodies
+      .filter(([, , body]) => /^\s*return (?!r\b)/m.test(body!))
+      .map(([, name]) => name)
+    expect(rewriting.sort()).toEqual(['session.compact', 'tool.call'])
+  })
+
+  test('the compact hook can only ADD messages, never drop or rewrite one', () => {
+    // `pinKept` is the only thing that builds the list it returns, and its own arms
+    // are in mod-boundary-compact.test.ts. What is asserted from the source is that
+    // the hook has no OTHER way to produce a message list: no filter, no slice, no
+    // map over `r.messages`, and the returned object is `r` with only `messages`
+    // replaced.
+    const body = /^  on\('session\.compact'.*?^  \}\)/gms.exec(SRC)?.[0] ?? ''
+    expect(body).not.toBe('')
+    expect(body).toContain('const { messages, pinned } = pinKept(livePin, e.messages, r.messages)')
+    expect(body).toContain('return { ...r, messages }')
+    expect(body).not.toMatch(/r\.messages\.(filter|slice|map|splice)/)
+    // and a seat that has not opted in never reaches any of it
+    expect(body).toContain('if (livePin === null || r.skip !== undefined) return r')
   })
 
   test('the guard is off unless the seat turns it on, and off is the old hook', () => {
@@ -254,7 +308,9 @@ describe('mod: the sink write fails loudly, once, and then the mod is off', asyn
   // The arms in this block share the module's session state (`stopped`, the "said it
   // once" latches, the flush chain) BY DESIGN — latching is the property under test, so
   // they run in order and each one depends on the one before it.
-  const { record, producerFor } = await import(join(ROOT, 'hooks', 'register.ts'))
+  const { record, producerFor, startCompaction } = await import(
+    join(ROOT, 'hooks', 'register.ts')
+  )
 
   const live = (path: string) => ({
     on: true as const,
@@ -294,6 +350,38 @@ describe('mod: the sink write fails loudly, once, and then the mod is off', asyn
     expect(writes[0]!.path).toBe('/tmp/dev-sess1.jsonl')
     expect(JSON.parse(writes[0]!.text.trim()).event).toBe('turn.start')
     expect(logs).toEqual([])
+  })
+
+  test('an in-flight compaction does NOT park the sink (DIVE-4695 iteration 2)', async () => {
+    // The regression this forbids, and it shipped in iteration 1: the ~50s
+    // $.session.compact() call was queued on `flush`, the SAME chain every telemetry
+    // write is queued on. Nothing was lost and no turn was delayed, but for the length
+    // of a compaction (51.5s and 50.3s in the live lab run) no line reached the file —
+    // including the NEXT turn.start. The heartbeat, the pacing floor and the
+    // pending-restart sweep read idle/busy off that sink, so a compacting seat read as
+    // a silent one. The fix is a second chain; this arm is the proof, not the comment.
+    //
+    // It runs BEFORE the failing-write arm below on purpose: that arm latches the
+    // recorder off for the rest of the block.
+    const before = writes.length
+    let released: (v: unknown) => void = () => {}
+    const compacting = {
+      ...(engine as object),
+      session: {
+        // A compaction that never finishes — the worst case of the ~50s call.
+        compact: () => new Promise((r) => (released = r)),
+      },
+    } as unknown as Parameters<typeof record>[0]
+
+    startCompaction(compacting, live('/tmp/dev-sess1.jsonl') as never, 60)
+    record(engine, live('/tmp/dev-sess1.jsonl'), { ts: 9, event: 'turn.start', turn_id: 't2' })
+    await settle()
+
+    // On the shared chain this was 0: the write sat behind the model call.
+    expect(writes.length).toBe(before + 1)
+    expect(JSON.parse(writes[writes.length - 1]!.text.trim().split('\n').pop()!).turn_id).toBe('t2')
+    released({ skip: 'test' })
+    await settle()
   })
 
   test('a rejected write logs ONE line naming the path and the error', async () => {
