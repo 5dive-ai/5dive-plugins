@@ -22,6 +22,14 @@ DIVE-3343 removed an enforcement for. The burn figure is read from the heartbeat
 snapshot, so the panel shows the number the park will act on rather than a second one derived
 differently.
 
+**A gate that is over reads `none`.** `task show --json` carries a `gate` field, and it is the
+board's VERBOSE HEADER — `ANSWERED approve (lead:ops, 2026-09-20 19:17:24)` on a row whose gate is
+closed, `PENDING — awaiting a HUMAN (approval, tier 1, asked …) — the ask is in the 'human gate:'
+block below` while one is open. The panel reads only `routed_reviewer` off that payload, to upgrade
+`agent:approval` to `ops:approval`, and composes the cell itself. Found by the first live capture
+on a real seat, not by the unit suite: the header pasted into the cell drew the whole answered-gate
+sentence across a 120-column band and pushed every other field off it.
+
 **It does not repeat the status line.** DIVE-4665 landed first and put effort, context fill,
 session cost and the account's 5h/7d percentages one row below. The panel carries only what belongs
 to the ROW. The account cell appears in two cases the status line cannot express: a window at or

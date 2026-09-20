@@ -31,6 +31,7 @@ import {
   clip,
   envOf,
   gateOf,
+  gateWithRouting,
   graderOf,
   pickRow,
   scaleTokens,
@@ -174,6 +175,69 @@ describe('mod panel: the gate cell', () => {
     // `ls --json` does not carry the routed seat. Naming one would be the more useful
     // line and the wrong one; `show` supplies the exact header when a gate is live.
     expect(gateOf({ gate_live: 1, needs_human: 0, need_type: 'decision' })).toBe('agent:decision')
+  })
+})
+
+/**
+ * These six arms exist because the first LIVE capture of this panel — a real seat, a real
+ * board, a 120-column tmux pane — drew one cell and no others:
+ *
+ *   DIVE-4694 · in_progress · gate ANSWERED approve (lead:ops, 2026-09-20 19:17:24)
+ *
+ * on a row whose `gate_live` was 0. `gateOf` was right and was then overwritten: the
+ * refresh pasted `show --json`'s `gate` field into the cell, and that field is the board's
+ * verbose HEADER, composed for an answered gate as readily as a live one. Forty green arms
+ * did not see it because the merge lived inside `refresh`, which takes `$` and had no seam.
+ * The merge is now `gateWithRouting` and these grade it.
+ */
+describe('mod panel: what the second subprocess may and may not change', () => {
+  const SHOWN = {
+    gate: 'ANSWERED approve (lead:ops, 2026-09-20 19:17:24)',
+    routed_reviewer: 'ops',
+    need_type: 'approval',
+    task_budget: '150000000',
+  }
+
+  test('an ANSWERED gate stays none — show cannot resurrect a gate that is over', () => {
+    expect(gateWithRouting({ gate_live: 0, needs_human: 0, need_type: 'approval' }, SHOWN))
+      .toBe('none')
+  })
+
+  test('a live routed gate is upgraded to the seat show names, and stays a cell', () => {
+    expect(gateWithRouting({ gate_live: 1, needs_human: 0, need_type: 'approval' }, SHOWN))
+      .toBe('ops:approval')
+  })
+
+  test('a live HUMAN gate is not re-routed to the reviewer show happens to carry', () => {
+    // `routed_reviewer` survives on the row after the gate escalates to a person; reading
+    // it here would draw `ops:approval` on a gate only lodar can answer.
+    expect(gateWithRouting({ gate_live: 1, needs_human: 1, need_type: 'approval' }, SHOWN))
+      .toBe('HUMAN:approval')
+  })
+
+  test('no routed seat on the payload leaves the ls-only answer standing', () => {
+    expect(gateWithRouting({ gate_live: 1, needs_human: 0, need_type: 'decision' }, { gate: 'x' }))
+      .toBe('agent:decision')
+    expect(gateWithRouting({ gate_live: 1, needs_human: 0, need_type: 'decision' }, undefined))
+      .toBe('agent:decision')
+  })
+
+  test('whatever show says, the cell is one of the four documented shapes', () => {
+    const shapes = /^(none|HUMAN:[a-z_]+|[a-z0-9:_-]+:[a-z_]+)$/
+    for (const live of [0, 1]) {
+      for (const human of [0, 1]) {
+        const cell = gateWithRouting({ gate_live: live, needs_human: human, need_type: 'approval' }, SHOWN)
+        expect(cell).toMatch(shapes)
+        expect(cell.length).toBeLessThanOrEqual(24)
+      }
+    }
+  })
+
+  test('the module never assigns show\'s `gate` field into the cell', () => {
+    // The regression itself, read off the source: the one line that drew the sentence was
+    // `const gate = str(t['gate']); if (gate !== undefined) next.gate = gate`.
+    expect(CODE).not.toMatch(/next\.gate\s*=\s*gate\b/)
+    expect(CODE).toContain('next.gate = gateWithRouting(row, t)')
   })
 })
 

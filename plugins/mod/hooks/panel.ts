@@ -236,6 +236,38 @@ export function gateOf(row: TaskRow): string {
 }
 
 /**
+ * The same cell after the second subprocess, which is the only thing that can name the
+ * seat a routed gate sits with: `show --json` carries `routed_reviewer`, so `ops:approval`
+ * replaces the `agent:approval` that `ls` alone could say. That upgrade is ALL that is
+ * taken from it.
+ *
+ * What is deliberately NOT taken is `show`'s own `gate` field. That field is the board's
+ * VERBOSE HEADER (`_task_gate_header_sql`), a sentence written for a human reading a
+ * `task show`, and it is composed for a DEAD gate as readily as a live one:
+ *
+ *   gate_live 0 -> `ANSWERED approve (lead:ops, 2026-09-20 19:17:24)`
+ *   gate_live 1 -> `PENDING — awaiting a HUMAN (approval, tier 1, asked 2026-09-20
+ *                   18:57:59) — the ask is in the 'human gate:' block below`
+ *
+ * The first is a gate that is OVER, and an earlier cut of this panel pasted it into the
+ * cell: the first live capture on this box drew `DIVE-4694 · in_progress · gate ANSWERED
+ * approve (lead:ops, 2026-09-20 19:17:24)` and nothing else — the seat name, the grader,
+ * the burn and the title all pushed off a 120-column band by a gate that was not open.
+ * The second is 110 characters and would do the same while one is. The board's COMPACT
+ * cell is not on `--json`; the two columns that compose it are, so the panel composes it
+ * and stays inside its own documented vocabulary.
+ */
+export function gateWithRouting(row: TaskRow, shown: unknown): string {
+  const base = gateOf(row)
+  if (base === 'none' || truthy(row.needs_human)) return base
+  if (shown === null || typeof shown !== 'object') return base
+  const seat = str((shown as Record<string, unknown>)['routed_reviewer'])
+  if (seat === undefined) return base
+  const type = str((shown as Record<string, unknown>)['need_type']) ?? str(row.need_type) ?? 'gate'
+  return `${seat}:${type}`
+}
+
+/**
  * The verifier cell. The board keeps this in four columns and none of them alone says
  * it, so the panel composes:
  *
@@ -457,10 +489,10 @@ async function refresh($: EngineInterface): Promise<void> {
         if (t !== null && typeof t === 'object') {
           budget = str((t as Record<string, unknown>)['task_budget'])
           budgetCache = { ident: next.ident, budget }
-          // `show` composes the gate header the board prints, which names the ROUTED
-          // seat where `ls` can only say "an agent". Prefer it when it is there.
-          const gate = str((t as Record<string, unknown>)['gate'])
-          if (gate !== undefined) next.gate = gate
+          // `show` names the ROUTED seat where `ls` can only say "an agent". That, and
+          // nothing else from it, reaches the cell — see gateWithRouting for what the
+          // `gate` field on that payload actually is and what pasting it drew.
+          next.gate = gateWithRouting(row, t)
         }
       }
 

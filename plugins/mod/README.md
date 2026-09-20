@@ -41,7 +41,7 @@ the whole reason it lives here and not in a `/goal` preamble or a skill.
 | `5dive <seat>` | which seat's board is being read |
 | `DIVE-…` | the row the seat is on: an `in_progress` row, else one **delivered and not closed**, else one holding a live gate, else the first open row (`ls` has already ordered by priority then age) |
 | `in_progress` | the row's status |
-| `gate …` | `none`, or the board's own header — `HUMAN:<type>` (red) when a person owes the answer, `<seat>:<type>` (yellow) when an agent does |
+| `gate …` | `none` when no gate is LIVE (an answered one is over and reads `none`), else the board's own compact vocabulary — `HUMAN:<type>` (red) when a person owes the answer, `<seat>:<type>` (yellow) when an agent does. Composed here from `gate_live` / `needs_human` / `need_type` / `routed_reviewer`; `show --json`'s `gate` field is the verbose header the board prints for a human and is never drawn |
 | `grader …` | the verifier state: `<seat> waiting` (a delivery is with it), `<seat> bound`, `delivered→temp` (the pool attaches one at delivery), `check` / `rubric`, or `none` |
 | `burn …` | the row's metered tokens against its budget. `*` on the denominator means the row carries no budget of its own and the box default is shown. `~… unverified` means the figure is attributed but the dispatch cross-check could not tie it to this row (see below). `—` means no reading — **absent, never zero**. `exempt` is a row budgeted `none` |
 | `acct …` | **only** when it says something the status line does not: `5h 92%!` for a window at or past 80%, `—` for a blind meter |
