@@ -46,6 +46,7 @@
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
+const cp = require('child_process');
 const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
 
 // DIVE-4587: Chrome keeps its crashpad DB under $XDG_CONFIG_HOME whatever
@@ -57,7 +58,54 @@ const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
 delete process.env.XDG_CONFIG_HOME;
 
 const PROG = '5dive browser daemon';
-const E_NOTHING_RAN = 70, E_FAILED = 1, E_UNAVAILABLE = 69;
+const E_NOTHING_RAN = 70, E_FAILED = 1, E_UNAVAILABLE = 69, E_PERM = 77;
+
+// ---- WHO IS ASKING (DIVE-4664 scope (c)) -----------------------------------
+//
+// The socket used to sit inside the 0700 profile, so "who is asking" had exactly
+// one answer and nobody had to ask. In the rendezvous it is reachable by every
+// agent seat on the box, and the profile's OWNER is then the holder of every
+// lease and the subject of every log line whoever called — which is what
+// DIVE-4662's hand test read back: under a sudo broker the holder said `claude`
+// for a request `agent-tesy` had made. A log whose subject is a constant is not
+// a log.
+//
+// SO_PEERCRED IS THE KERNEL'S ANSWER, not the caller's. It is read off the
+// accepted connection, so a request cannot claim to be a seat it is not —
+// there is no field for it to lie in. Node has no binding for getsockopt, so
+// the read is a three-line python3 on the connection's own fd; python3 is
+// stdlib-only here and present on every box this ships to. Where it is NOT
+// available, bin/browser never opens a rendezvous socket in the first place
+// (_peercred_ok), so the daemon keeps the old one-seat 0700 socket and this
+// path is never reached — the broker is what is lost, never the attribution.
+const PEERCRED_PY = 'import socket,struct,sys\n' +
+  's=socket.socket(fileno=0)\n' +
+  'sys.stdout.write("%d %d %d" % struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))))\n';
+
+function peerOf(conn) {
+  const fd = conn && conn._handle && typeof conn._handle.fd === 'number' ? conn._handle.fd : -1;
+  if (fd < 0) return null;
+  let r;
+  try { r = cp.spawnSync('python3', ['-c', PEERCRED_PY], { stdio: [fd, 'pipe', 'ignore'] }); }
+  catch (e) { return null; }
+  if (!r || r.status !== 0 || !r.stdout) return null;
+  const m = String(r.stdout).trim().match(/^(\d+) (\d+) (\d+)$/);
+  if (!m) return null;
+  return { pid: Number(m[1]), uid: Number(m[2]), gid: Number(m[3]) };
+}
+
+// uid -> the seat's name. /etc/passwd rather than `getent`: one file read beats
+// a process spawn on a path that runs per request, and a 5dive seat is a local
+// user by construction (bin/browser refuses a profile whose owner is not one).
+function seatOfUid(uid) {
+  let txt;
+  try { txt = fs.readFileSync('/etc/passwd', 'utf8'); } catch (e) { return null; }
+  for (const line of txt.split('\n')) {
+    const f = line.split(':');
+    if (f.length > 2 && Number(f[2]) === uid) return f[0];
+  }
+  return null;
+}
 
 const STEPS = {
   goto:     ['url'],
@@ -141,8 +189,31 @@ function assertLease(req, where) {
 }
 
 // ---------------------------------------------------------------- serve mode
-async function serveMode(profile, sock) {
+async function serveMode(profile, sock, broker) {
   if (!profile || !fs.existsSync(profile)) die(E_UNAVAILABLE, `no profile directory at ${profile}`);
+  const site = path.basename(profile);
+  const selfBrowser = path.join(__dirname, 'browser');
+  const ownUid = process.getuid();
+
+  // THE BROKER REFUSES A CALLER IT CANNOT NAME. This socket is group-reachable,
+  // so the file mode has stopped being the whole access control and the
+  // attribution IS the rest of it. Failing open here would give an anonymous
+  // seat a live logged-in session and an audit trail that says `claude` did it.
+  const callerOf = (conn) => {
+    if (!broker) return { seat: null, uid: ownUid };
+    const p = peerOf(conn);
+    if (!p) return null;
+    return { seat: seatOfUid(p.uid), uid: p.uid, pid: p.pid };
+  };
+
+  // Every request the broker serves leaves a row naming the CALLER, written by
+  // re-entering bin/browser as the owner — one lease implementation and one
+  // audit format, rather than a second copy here that nothing exercises.
+  const brokerCall = (args, behalf) => {
+    const env = Object.assign({}, process.env);
+    if (behalf) env.FIVEDIVE_BROWSER_ON_BEHALF_OF = behalf;
+    return cp.spawnSync(selfBrowser, args, { env, encoding: 'utf8' });
+  };
   const chrome = process.env.FIVEDIVE_BROWSER_CHROME;
   if (!chrome) die(E_UNAVAILABLE, 'no chrome named for this daemon — a session must be held in the same ' +
     'browser the profile was logged in with, so the executable is passed in rather than guessed here.');
@@ -186,7 +257,58 @@ async function serveMode(profile, sock) {
       try { req = JSON.parse(line); } catch (e) { send({ t: 'err', msg: `request is not JSON: ${e.message}` }); return end(E_NOTHING_RAN); }
 
       if (req.op === 'ping') { send({ t: 'out', data: 'pong\n' }); return end(0); }
-      if (req.op === 'shutdown') { end(0); cleanup(); try { await ctx.close(); } catch (e) { /* going anyway */ } process.exit(0); }
+
+      // WHO IS ASKING, BEFORE ANYTHING IS DONE FOR THEM.
+      const who = callerOf(conn);
+      if (!who) {
+        send({ t: 'err', msg: 'this session is brokered and the kernel would not name the process on the other end of this socket, so nothing can be attributed to a seat. Refusing: an anonymous caller driving a logged-in session is the one thing the rendezvous must not allow. Nothing ran.' });
+        return end(E_PERM);
+      }
+      // ALWAYS NAMED, even when the caller IS the owner. A field that appears
+      // only for brokered callers is a field whose absence has to be
+      // interpreted, and "the owner did it" is exactly the reading that was
+      // wrong before. The name is the kernel's; `req` has no say in it, and a
+      // request that puts an on_behalf_of of its own in the JSON is ignored
+      // here on purpose — there is nowhere for a caller to sign someone else's
+      // name.
+      // On a brokered socket the name is ALWAYS written, even when the caller
+      // IS the owner: a field that appears only for other seats is a field
+      // whose absence has to be interpreted, and "the owner did it" is exactly
+      // the reading that was wrong before. On the old in-profile socket there
+      // is only one possible caller, so there is nothing to disambiguate and
+      // bin/browser's own default (the owner) stands.
+      // The name is the KERNEL'S. `req` has no say in it — a request carrying
+      // an on_behalf_of of its own is ignored here on purpose, because there
+      // must be nowhere for a caller to sign somebody else's name.
+      const behalf = broker ? (who.seat || `uid:${who.uid}`) : null;
+
+      // SHUTDOWN IS THE OWNER'S. A brokered seat stopping the box's browser
+      // would take the session out from under every other seat AND from under
+      // whoever is at the viewer — `serve --stop` is the owner's verb and this
+      // is the socket-shaped door into it.
+      if (req.op === 'shutdown') {
+        if (broker && who.uid !== ownUid) {
+          send({ t: 'err', msg: `stopping this session is the owning seat's act: it is the box's login and other seats are using it. Nothing was stopped.` });
+          return end(E_PERM);
+        }
+        end(0); cleanup(); try { await ctx.close(); } catch (e) { /* going anyway */ } process.exit(0);
+      }
+
+      // THE LEASE, FOR A CALLER THAT CANNOT WRITE IN THE PROFILE (scope (a)).
+      // It is not re-implemented here: bin/browser owns the lease and the daemon
+      // re-enters it as the profile's owner, carrying the caller's name.
+      if (req.op === 'lease') {
+        const act = req.act;
+        if (!['acquire', 'release', 'status'].includes(act)) {
+          send({ t: 'err', msg: `lease act must be acquire, release or status; got '${act}'` });
+          return end(E_NOTHING_RAN);
+        }
+        const r = brokerCall(['_broker-lease', site, act,
+          String(req.purpose || 'brokered'), String(req.ttl || ''), String(req.token || '')], behalf);
+        if (r.stderr) send({ t: 'err', msg: String(r.stderr).trim() });
+        if (r.stdout) send({ t: 'out', data: String(r.stdout) });
+        return end(r.status === null ? E_UNAVAILABLE : r.status);
+      }
 
       // ONE REQUEST AT A TIME, AND A REFUSAL RATHER THAN A QUEUE. The per-site
       // lease already serialises callers, so a second request arriving mid-run is
@@ -196,9 +318,11 @@ async function serveMode(profile, sock) {
       if (busy) { send({ t: 'err', msg: 'this session is already executing a request — the per-site lease is what serialises callers, and whoever sent this did not hold it. Nothing ran.' }); return end(E_NOTHING_RAN); }
       busy = true;
       try {
+        if (behalf) brokerCall(['_broker-audit', site, req.op, String(req.url || '')], behalf);
         if (req.op === 'probe') await probeRequest(ctx, req, send, end);
-      else if (req.op === 'tree') await treeRequest(ctx, req, send, end);
+        else if (req.op === 'tree') await treeRequest(ctx, req, send, end);
         else if (req.op === 'snapshot') await snapshotRequest(ctx, req, send, end);
+        else if (req.op === 'render') await renderRequest(ctx, req, send, end);
         else if (req.op === 'plan') await planRequest(ctx, req, send, end);
         else { send({ t: 'err', msg: `unknown op '${req.op}'` }); end(E_NOTHING_RAN); }
       } catch (e) {
@@ -211,14 +335,19 @@ async function serveMode(profile, sock) {
   // THE SOCKET IS CREATED UNDER umask 077, INSIDE THE 0700 PROFILE. Both, not
   // either: the directory keeps other seats out, the mode keeps the socket itself
   // from being the one thing in there that is not 0700.
-  const prevUmask = process.umask(0o077);
+  // 077 IN THE PROFILE, 007 IN THE RENDEZVOUS. In the profile the directory
+  // already keeps every other seat out and the socket must not be the one thing
+  // in there that is looser. In the rendezvous the GROUP is the access control —
+  // a 0700 socket there would be reachable by nobody and the broker would be a
+  // directory with an unusable file in it.
+  const prevUmask = process.umask(broker ? 0o007 : 0o077);
   try { fs.unlinkSync(sock); } catch (e) { /* no stale socket */ }
   server.listen(sock, () => {
     process.umask(prevUmask);
     // DIVE-4400's contract, re-implemented rather than inherited: say READY only
     // when the context is open AND the socket is accepting. `serve` prints
     // success on this line and on nothing else.
-    process.stdout.write(`ready sock=${sock} pid=${process.pid}\n`);
+    process.stdout.write(`ready sock=${sock} pid=${process.pid} broker=${broker ? 'yes' : 'no'}\n`);
   });
   server.on('error', (e) => die(E_UNAVAILABLE, `could not listen on ${sock}: ${e.message}`));
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
@@ -272,6 +401,50 @@ async function probeRequest(ctx, req, send, end) {
     end(0);
   } catch (e) {
     send({ t: 'err', msg: `could not load ${req.url}: ${e.message}` });
+    end(E_FAILED);
+  } finally {
+    try { if (page) await page.close(); } catch (e) { /* the tab is going anyway */ }
+  }
+}
+
+// ---- render: what `shot` and `read` needed and DIVE-4621 did not build ------
+//
+// Those two were the last verbs still driving a chrome of their own, which a
+// brokered seat cannot do at all: --user-data-dir on somebody else's 0700
+// profile is an EACCES, and the profile is the whole point. So the render
+// happens in the browser that already holds the session and the BYTES come
+// back — never a path to write. A request carrying an --out= would be this
+// process writing a caller-chosen path as the profile's owner, which is the
+// rig DIVE-4662's hand test used and the row explicitly said not to ship.
+//
+// IN ITS OWN TAB, like the probe, so a person at the viewer is not navigated
+// away — and both halves come from ONE page instant, which the cold path
+// (two chromes, --screenshot then --dump-dom) cannot promise.
+async function renderRequest(ctx, req, send, end) {
+  if (typeof req.url !== 'string' || !/^https?:\/\//.test(req.url)) {
+    send({ t: 'err', msg: 'render needs an http(s) url' }); return end(E_NOTHING_RAN);
+  }
+  let page;
+  try {
+    assertLease(req, 'render');
+    page = await ctx.newPage();
+    page.setDefaultTimeout(Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || STEP_TIMEOUT));
+    const w = Number(req.width) || 1280, h = Number(req.height) || 800;
+    if (typeof page.setViewportSize === 'function') {
+      try { await page.setViewportSize({ width: w, height: h }); } catch (e) { /* headed ctx may refuse */ }
+    }
+    await page.goto(req.url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(Number(req.wait) || Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
+    const buf = await page.screenshot({ fullPage: !!req.full });
+    const html = await page.content();
+    send({ t: 'out', data: JSON.stringify({
+      url: req.url,
+      png: Buffer.isBuffer(buf) ? buf.toString('base64') : Buffer.from(String(buf)).toString('base64'),
+      html,
+    }) + '\n' });
+    end(0);
+  } catch (e) {
+    send({ t: 'err', msg: `could not render ${req.url}: ${e.message}` });
     end(E_FAILED);
   } finally {
     try { if (page) await page.close(); } catch (e) { /* the tab is going anyway */ }
@@ -460,8 +633,13 @@ function main() {
   const [, , mode, arg] = process.argv;
   if (mode === 'serve') {
     const profile = arg;
-    const sock = process.argv[4] || path.join(profile || '', '.5dive-session.sock');
-    return serveMode(profile, sock).catch(e => die(E_UNAVAILABLE, e && e.message ? e.message : String(e)));
+    const rest = process.argv.slice(4);
+    // --broker IS PASSED, NOT INFERRED from the socket's path. The rule it turns
+    // on is a security rule, and a security rule that keys on a string
+    // comparison is one rename away from being silently off.
+    const broker = rest.includes('--broker');
+    const sock = rest.filter(a => a !== '--broker')[0] || path.join(profile || '', '.5dive-session.sock');
+    return serveMode(profile, sock, broker).catch(e => die(E_UNAVAILABLE, e && e.message ? e.message : String(e)));
   }
   if (mode === 'call') {
     if (!arg) die(E_USAGE_MISSING, 'call needs a socket path');
