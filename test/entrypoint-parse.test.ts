@@ -88,10 +88,37 @@ const TS_PLUGINS: TsPlugin[] = PLUGIN_DIRS
   .map(dir => ({ dir, entries: declaredTsEntries(dir) }))
   .filter(p => p.entries.length > 0)
 
-// The complement: a plugin that declares no TS launcher must be a real bash
-// plugin, i.e. ship an executable bin/<name>. Without this a TS plugin could
-// lose its package.json and fall silently out of TS_PLUGINS instead of failing.
-const BASH_PLUGINS = PLUGIN_DIRS.filter(d => !TS_PLUGINS.some(p => p.dir === d))
+// DIVE-4692 — A THIRD KIND, derived the same way: declared, not listed.
+//
+// `mod` is a Claude Code FUNCTION-HOOK plugin. It launches no server and ships
+// no bin/<name>: the harness loads its module in-process, and the module it
+// loads is the one hooks/hooks.json names in "modules". That declaration is
+// what makes it this kind, exactly as package.json's start script is what
+// makes a plugin a TS plugin above — so losing the hooks.json drops the plugin
+// out of this set and into the bash complement, where it fails for want of a
+// bin/. Which is the point: a hooks plugin whose hooks.json goes missing loads
+// with no hooks at all and looks perfectly healthy on the seat.
+function declaredHooksModules(dir: string): string[] {
+  const p = join(PLUGINS, dir, 'hooks', 'hooks.json')
+  if (!existsSync(p)) return []
+  const mods = JSON.parse(readFileSync(p, 'utf8'))?.modules
+  return Array.isArray(mods) ? mods.map(String) : []
+}
+
+type ModPlugin = { dir: string; modules: string[] }
+
+const MOD_PLUGINS: ModPlugin[] = PLUGIN_DIRS
+  .filter(d => !TS_PLUGINS.some(p => p.dir === d))
+  .map(dir => ({ dir, modules: declaredHooksModules(dir) }))
+  .filter(p => p.modules.length > 0)
+
+// The complement: a plugin that declares neither a TS launcher nor a hooks
+// module must be a real bash plugin, i.e. ship an executable bin/<name>.
+// Without this a TS plugin could lose its package.json and fall silently out
+// of TS_PLUGINS instead of failing.
+const BASH_PLUGINS = PLUGIN_DIRS.filter(
+  d => !TS_PLUGINS.some(p => p.dir === d) && !MOD_PLUGINS.some(p => p.dir === d),
+)
 
 // ── the gate itself ─────────────────────────────────────────────────────────
 
@@ -103,10 +130,22 @@ describe('every plugin TypeScript file parses', () => {
     // FLOOR: an empty or collapsed derived set fails here rather than passing
     // by grading nothing. Every plugin dir is accounted for as TS or bash.
     expect(TS_PLUGINS.length).toBeGreaterThanOrEqual(5)
-    expect(TS_PLUGINS.length + BASH_PLUGINS.length).toBe(PLUGIN_DIRS.length)
+    expect(TS_PLUGINS.length + MOD_PLUGINS.length + BASH_PLUGINS.length).toBe(PLUGIN_DIRS.length)
     for (const p of TS_PLUGINS) {
       expect(files).toContain(join(PLUGINS, p.dir, 'server.ts'))
       for (const rel of p.entries) expect(files).toContain(join(PLUGINS, p.dir, rel))
+    }
+  })
+
+  test('a hooks-module plugin ships the module its hooks.json names', () => {
+    for (const p of MOD_PLUGINS) {
+      for (const rel of p.modules) {
+        // "./register.ts" is relative to the hooks/ folder the manifest sits in.
+        const abs = join(PLUGINS, p.dir, 'hooks', rel)
+        expect(existsSync(abs)).toBe(true)
+        // and it is graded by the parse loop below like every other plugin .ts
+        if (abs.endsWith('.ts')) expect(files).toContain(abs)
+      }
     }
   })
 
