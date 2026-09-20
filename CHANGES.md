@@ -1,5 +1,54 @@
 ## Unreleased
 
+### Added — `mod`: the seat's own turn boundaries and usage meter (DIVE-4692), mod 0.1.0
+
+5dive asks two questions about a seat from the outside. Is it mid-turn? The heartbeat's
+reclaim and the self-update's pending-restart sweep answer it from `claude agents --json`
+polling, byte-stable pane samples, a composer glyph and whether the seat holds a claimed
+row. What does its usage meter read? The pacing floor holds rows on an account that has
+no reading at all. Both are inferences over a surface that was never built to answer
+them, and when they are wrong a seat gets restarted mid-turn and the turn is lost.
+
+Claude Code 2.1.x loads a plugin's `hooks/register.ts` inside the harness process, where
+both questions are already answered. `mod` registers six events and writes a line per
+event to a per-seat JSONL sink: `session.start`, `turn.start`, `turn.complete`,
+`command.run`, `tool.call`, `session.end`. `turn.start`/`turn.complete` are the pair that
+carries the load — a seat is busy between them, whatever its pane looks like — and every
+line but `tool.call` carries `$.session.usage()`: the context fill, the session cost, and
+the account's five-hour and seven-day windows with their reset times.
+
+Nothing reads these lines yet, on purpose. This ships the producer and the measurement;
+whether the heartbeat and the pacing floor gain a second source is what the comparison
+against today's pane-and-board readings decides.
+
+The contract is in `docs/mod-telemetry-contract.md` and is deliberately not a Claude Code
+contract: `harness` and `producer` are fields, a codex or grok seat could drop files of the
+same shape into the same directory, and a consumer that finds no file must fall back to
+what it does today rather than read absence as idleness. The same rule runs through the
+schema — a reading the producer does not have is ABSENT, never zero, because a consumer
+that cannot tell "no reading" from "0% used" has the blind-meter bug back.
+
+Two gates, both off by default: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in the seat's env
+(without it Claude Code loads no installed plugin's hooks module at all), and
+`FIVEDIVE_MOD_TELEMETRY=1` in the seat's settings. The plugin is observe-only — every hook
+awaits `next(e)` first and returns what the chain resolved to, and CI asserts that against
+the source, because this runs inside every turn on every seat that enables it.
+
+Early access, verified against Claude Code 2.1.278. `plugin.json` has no field for pinning
+a version range, so the pin is in the data: every line names the build it came from. A
+release that drops a call the mod makes is caught twice — the engine's own static scan
+refuses the module at load, and every `$` call is inside a try/catch so nothing reaches the
+chain. Either way the seat runs exactly as it did before.
+
+Every one of those catches EMITS, which is the other half of fail-open and the half a
+try/catch never evidences on its own: an observe-only producer that swallows a failure is
+indistinguishable from one that is switched off. A failed sink write names the path and the
+error and latches the session off; a failed usage reading says so once and the turn
+boundaries keep recording (absent is the contract's answer for a reading nobody has, never
+zero). The sink defaults to the seat's own `~/.5dive/mod-telemetry`, a directory it owns:
+`/var/lib/5dive` is `drwxr-s--- root:claude` and no seat can create a subdirectory there,
+so a shared sink is opt-in and needs root to create it group-writable first.
+
 ### Added — one snapshot per decision: `browser snapshot` (DIVE-4653), browser 1.8.0
 
 Before an agent acts on a page it reads the same three things: what it can click
