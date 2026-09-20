@@ -154,6 +154,17 @@ _seat() {
   fi
 }
 
+# DEPRECATED IN THIS REGISTRY (DIVE-4691). browser ships from its own repository
+# now — 5dive-ai/5dive-browser — and this copy is frozen: it still resolves and
+# still installs, because boxes provisioned before the move name it today, but no
+# fix lands here again. The notice goes to STDERR and only on the two verbs a
+# person reads, `--help` and `status`. Never on `tree`, `read`, `snapshot`, `run`,
+# `shot`, `capture` or `ls`: their output is parsed, and a line of prose in a
+# caller's stdout is a bug, not a courtesy.
+_deprecated() {
+  printf '%s: browser@5dive-plugins is deprecated; it ships from 5dive-ai/5dive-browser now — see CHANGES.md\n' "$PROG" >&2
+}
+
 usage() {
   cat <<'USAGE'
 5dive browser — operate a site as yourself, in a profile you logged into by hand
@@ -3352,10 +3363,10 @@ fi
 # <<< DIVE-4348
 
 case "${1:-}" in
-  -h|--help|help|"") usage ;;
+  -h|--help|help|"") _deprecated; usage ;;
   setup) shift; cmd_setup "$@" ;;
   auth)  shift; cmd_auth  "$@" ;;
-  status) shift; _auth_status "${1:-}" ;;
+  status) shift; _deprecated; _auth_status "${1:-}" ;;
   probe-all) shift; cmd_probe_all "$@" ;;
   ls)    shift; cmd_ls    "$@" ;;
   doc)   shift; cmd_doc  "$@" ;;

@@ -52,6 +52,33 @@ compaction is a ~50s model call; queued on the writer's chain it delayed no turn
 delayed every sink write behind it, including the next `turn.start` — and that sink is
 what the heartbeat, the pacing floor and the pending-restart sweep read idle/busy from, so
 a compacting seat would have read as a silent one for ~50s.
+### Deprecated — `browser@5dive-plugins` is frozen; the plugin ships from 5dive-ai/5dive-browser (DIVE-4691), browser 1.9.1
+
+The browser plugin now has its own repository, **[5dive-ai/5dive-browser](https://github.com/5dive-ai/5dive-browser)**,
+and that is the only place it is fixed from now on. The copy in this registry is frozen at the
+1.9.0 code and **still resolves** — `plugin add browser@5dive-plugins` and
+`plugin upgrade browser@5dive-plugins` keep working on every box, because a plugin cache is not
+enumerable across customer boxes and there is no moment at which it is safe to assume nobody names
+this entry. Nothing is removed here: not the tree, not the tests, not the parity step. Removing it
+is a later change, after the notice has been on the registry for a release cycle.
+
+Migrate in two commands, in this order:
+
+```text
+sudo 5dive plugin remove browser@5dive-plugins
+sudo 5dive plugin add 5dive-ai/5dive-browser
+```
+
+The remove comes first because the CLI refuses two plugins claiming the same `browser` verb, so
+adding before removing fails rather than replacing.
+
+**The migration costs you nothing that matters.** The profile store is a directory on the box, not
+part of the plugin, and so is each seat's `.adapters/`: the sessions you logged into by hand and the
+adapters you wrote survive the remove and the add, and the new copy picks them up where they are. A
+re-login is not part of this.
+
+This release is the notice itself — `--help` and `status` now say where the plugin lives, on stderr
+only, never on the verbs whose stdout a caller parses.
 
 ### Added — `/task` and `/gate` as first-class commands, and what the swap actually saves (DIVE-4693), mod 0.2.0
 

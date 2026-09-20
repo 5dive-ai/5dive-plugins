@@ -1,13 +1,13 @@
 {
   "name": "browser",
-  "version": "1.9.0",
-  "description": "Persistent human-authenticated browser sessions \u2014 log into a site once by hand, then let deterministic adapters operate it. Never solves a security challenge; it stops and asks you.",
+  "version": "1.9.1",
+  "description": "DEPRECATED — the browser plugin now ships from its own repository, https://github.com/5dive-ai/5dive-browser (`sudo 5dive plugin add 5dive-ai/5dive-browser`). This copy still resolves and still installs, because boxes provisioned before the move name it today — but it is frozen and receives no fixes. A box already carrying it migrates in two commands: `sudo 5dive plugin remove browser@5dive-plugins`, then the add above (the CLI refuses two plugins claiming the `browser` verb). Persistent human-authenticated browser sessions — log into a site once by hand, then let deterministic adapters operate it. Never solves a security challenge; it stops and asks you.",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com",
     "url": "https://5dive.ai"
   },
-  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/browser",
+  "homepage": "https://github.com/5dive-ai/5dive-browser",
   "license": "MIT",
   "skills": "./skills/",
   "keywords": [
