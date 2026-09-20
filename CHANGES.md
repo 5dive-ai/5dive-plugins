@@ -30,6 +30,22 @@ outlives every caller and serves callers holding different tokens, so the token
 travels in the request and the file is what is trusted. A box without the pinned
 `playwright-core` still serves — `serve` falls back to launching Chrome directly
 and says so in one line. Losing the speed must not lose the browser.
+### Fixed — the usage-limit notice now stops the "typing…" indicator, telegram 0.5.56
+
+Message a seat whose account is usage-walled and the bot answers at once —
+`Usage limit hit — resumes in 7h 7m…` — and then the chat kept showing "typing…"
+for up to five more minutes, promising a reply from an agent that had just said
+it cannot type until the wall lifts.
+
+The server's typing loop stops on three signals: the reply tool's outbound, the
+mtime of a shared typing-stop file, and a five-minute ceiling. The usage-limit
+notice is sent by a Stop hook in a different process and bumped none of them, so
+the loop ran to its ceiling every time.
+
+That hook now signals turn-end on each of its send legs — routed, fallback and
+the rotation notice — through one helper the other Stop hook already uses, so the
+two cannot drift. The indicator clears within one 4-second interval of the
+notice.
 
 ### Fixed — a resume helper no longer types `continue` at a seat that already answered (DIVE-4628), telegram 0.5.55
 
