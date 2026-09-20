@@ -105,6 +105,20 @@ PY
 
 TMP="$(mktemp -d)"
 OUT=""; ERR=""; RC=0
+
+# THE SESSION DAEMON IS OFF BY DEFAULT IN THIS SUITE, AND THE REASON IS NOT
+# CONVENIENCE (DIVE-4621). `serve` prefers a warm session whenever the pinned
+# playwright-core is resolvable, and whether it is resolvable HERE depends on
+# whether somebody has run `npm install` next to the plugin — so without this
+# line every serve arm below grades a different product on a developer box than
+# in CI, and grades it by handing real playwright a fake `google-chrome` that
+# will never speak CDP (a 30s launch timeout per arm, then the fallback). Ambient
+# node_modules deciding what runs is the same class DIVE-4524 pinned the driver
+# resolution to close.
+#
+# The T25 arms point this at the real binary explicitly. Every arm before them is
+# grading the cold path on purpose.
+export FIVEDIVE_BROWSER_SESSION_DAEMON="$TMP/no-session-daemon"
 run() { local o="$TMP/.o" e="$TMP/.e"; "$@" >"$o" 2>"$e"; RC=$?; OUT=$(cat "$o"); ERR=$(cat "$e"); return 0; }
 
 SEAT="$(id -un)"
@@ -3073,6 +3087,321 @@ tc 'T24h the scheduled probe runs the idle sweep' 'cmd_evict' \
    "$(sed -n '/^cmd_probe_all/,/^}/p' "$BROWSER")"
 tc 'T24h ...and it can be turned off on a box that wants its browsers resident' \
    'FIVEDIVE_BROWSER_EVICT_ON_PROBE' "$(sed -n '/^cmd_probe_all/,/^}/p' "$BROWSER")"
+
+# ============================== T25 DIVE-4621: the session daemon (scope (a)) ==
+#
+# WHAT THESE GRADE. `serve` used to be an Xvfb and an abandoned Chrome, and every
+# command that needed the profile stopped it, launched its own, and started it
+# again — four launches for an action that is three clicks. A daemon holds ONE
+# persistent context and answers over a unix socket in the 0700 profile. Each arm
+# below is a mutant of the specific way that goes wrong:
+#
+#   the socket becomes a port       -> T25f: a debug port is REFUSED.
+#   a warm serve gets cycled anyway -> T25c: the daemon pid must SURVIVE a `run`.
+#   the lease is read once          -> T25d: preempt between two steps of a publish.
+#   "ready" means "bash got a pid"  -> T25b: a daemon that never comes up must not
+#                                      be advertised, must not take the browser
+#                                      down with it, and must say why.
+#   the daemon dies mid-request     -> T25h: a closed socket is NOT a clean run.
+#
+# The daemon loads playwright the way the driver does, so it is graded through a
+# recording stub on NODE_PATH — with the two methods a long-lived context needs
+# that a one-shot driver never asked for: a page that can be closed, and a
+# document it can hand back.
+DAEMONBIN="$ROOT/plugins/browser/bin/session-daemon"
+export FIVEDIVE_BROWSER_SESSION_DAEMON="$DAEMONBIN"
+DSTUB="$TMP/dpw"; mkdir -p "$DSTUB/node_modules/playwright-core"
+printf '{ "name": "playwright-core", "version": "0.0.0-daemon-stub", "main": "index.js" }\n' \
+  > "$DSTUB/node_modules/playwright-core/package.json"
+cat > "$DSTUB/node_modules/playwright-core/index.js" <<'DPWJS'
+const fs = require('fs');
+const rec = (o) => fs.appendFileSync(process.env.PWREC, JSON.stringify(o) + '\n');
+const mkpage = (kind) => ({
+  setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t, kind }),
+  goto: async (url) => rec({ call: 'goto', url, kind }),
+  content: async () => { rec({ call: 'content', kind }); return fs.readFileSync(process.env.DPWDOM, 'utf8'); },
+  fill: async (sel, val) => {
+    rec({ call: 'fill', sel, val, kind });
+    if (process.env.PWPREEMPT_FILE) {
+      fs.writeFileSync(process.env.PWPREEMPT_FILE,
+        'token=belongs-to-the-person-at-the-viewer\nholder=someone\nholder_pid=1\nkind=human\n');
+    }
+  },
+  click: async (sel) => { rec({ call: 'click', sel, kind }); if (process.env.PWFAIL) throw new Error('stub: the step failed'); },
+  waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel, kind }),
+  waitForTimeout: async (ms) => rec({ call: 'waitForTimeout', ms, kind }),
+  evaluate: async (fn, arg) => { rec({ call: 'evaluate', kind, mark: (arg && arg.mark) || null }); return { nodes: [], marker: null }; },
+  selectOption: async (sel, val) => rec({ call: 'selectOption', sel, val, kind }),
+  setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p, kind }),
+  press: async (sel, key) => rec({ call: 'press', sel, key, kind }),
+  close: async () => rec({ call: 'pageclose', kind }),
+});
+const first = mkpage('first');
+exports.chromium = {
+  launchPersistentContext: async (profile, opts) => {
+    rec({ call: 'launch', profile, args: opts.args, headless: opts.headless,
+          xdg: process.env.XDG_CONFIG_HOME === undefined ? '<unset>' : process.env.XDG_CONFIG_HOME });
+    if (process.env.DPWNOLAUNCH) throw new Error('stub: this box cannot open the profile');
+    return { pages: () => [first], newPage: async () => mkpage('extra'), close: async () => rec({ call: 'close' }) };
+  },
+};
+DPWJS
+DPWDOM="$TMP/dpw.dom"; printf '%s' "$LIVE_DOM" > "$DPWDOM"
+DREC="$TMP/dpw-record.jsonl"; : > "$DREC"
+# The daemon runs in ITS OWN process with its own environment, so the stub has to
+# reach it through `serve`'s environment and not through the arm's.
+dserve() {  # dserve <site> [extra env assignments...]
+  local site="$1"; shift
+  run env PATH="$SPATH" DISPLAY= NODE_PATH="$DSTUB/node_modules" PWREC="$DREC" DPWDOM="$DPWDOM" \
+      "$@" "$BROWSER" serve "$site"
+}
+dwarm() {  # dwarm <verb...> — a command that should find the warm session
+  run env PATH="$SPATH" NODE_PATH="$DSTUB/node_modules" PWREC="$DREC" DPWDOM="$DPWDOM" "$@"
+}
+dkv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+launches() { jq -rs '[.[]|select(.call=="launch")]|length' "$DREC"; }
+
+mkprofile warm.test "$LIVE_DOM" >/dev/null
+WDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/warm.test"
+mkadapter warm.test "file://$TMP/artifact.html" 'PUBLISHED'
+
+# --- T25a `serve` holds the session in a daemon -------------------------------
+dserve warm.test
+t  'T25a serve starts and reports a warm session' 0 "$RC"
+tc 'T25a ...and says the browser now outlives the command' 'warm session' "$OUT"
+WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+t  'T25a ...the pidfile names the daemon' 'yes' "$([[ -n "$WPID" ]] && echo yes || echo no)"
+t  'T25a ...the daemon is alive' 'yes' "$(kill -0 "${WPID:-0}" 2>/dev/null && echo yes || echo no)"
+t  'T25a ...and the profile holds a SOCKET, not a port' 'socket' \
+   "$(stat -c '%F' "$WDIR/.5dive-session.sock" 2>/dev/null)"
+t  'T25a ...created 0700' '700' "$(stat -c '%a' "$WDIR/.5dive-session.sock" 2>/dev/null)"
+t  'T25a ...the context was opened headed, in THIS profile' "false $WDIR" \
+   "$(jq -rs '[.[]|select(.call=="launch")]|last|"\(.headless) \(.profile)"' "$DREC")"
+t  'T25a ...with the shared XDG_CONFIG_HOME unset under it (DIVE-4587)' '<unset>' \
+   "$(jq -rs '[.[]|select(.call=="launch")]|last|.xdg' "$DREC")"
+
+# --- T25b a daemon that will not come up must not be advertised ---------------
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+dserve warm.test DPWNOLAUNCH=1
+t  'T25b serve still SERVES when the daemon cannot start' 0 "$RC"
+tn 'T25b ...and does not claim a warm session' 'warm session' "$OUT"
+tc 'T25b ...it says every command will pay a cold launch' 'no warm session' "$ERR"
+tc 'T25b ...and carries the daemon own reason' 'cannot open the profile' "$ERR"
+t  'T25b ...no daemon is left recorded' '' "$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+t  'T25b ...and no stale socket is left behind' 'no' \
+   "$([[ -S "$WDIR/.5dive-session.sock" ]] && echo yes || echo no)"
+t  'T25b ...the browser IS up anyway — losing the speed must not lose the session' 'yes' \
+   "$([[ -n "$(dkv "$WDIR/.5dive-serve" chrome_pid)" ]] && echo yes || echo no)"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+
+# --- T25c a `run` on a warm session does not cycle the browser ----------------
+dserve warm.test
+WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+LB="$(launches)"
+CB="$(jq -rs '[.[]|select(.call=="close")]|length' "$DREC")"
+dwarm "$BROWSER" run warm.test publish --body=hello
+t  'T25c a run through the warm session succeeds' 0 "$RC"
+tc 'T25c ...and the verdict is still the out-of-band re-read' 'verified: publish is live' "$OUT"
+t  'T25c ...the SAME daemon is still holding the browser afterwards' "$WPID" \
+   "$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+t  'T25c ...it was never stopped and restarted' 'yes' \
+   "$(kill -0 "${WPID:-0}" 2>/dev/null && echo yes || echo no)"
+# THE POINT OF THE WHOLE ROW, as a number: not one new browser was launched.
+t  'T25c ...and NOT ONE Chrome was launched to do it' "$LB" "$(launches)"
+t  'T25c ...the steps reached the page, in order' 'goto fill click' \
+   "$(jq -rs '[.[]|select(.kind=="first")|select(.call|IN("goto","fill","click"))|.call]|join(" ")' "$DREC")"
+t  'T25c ...with the caller argument substituted as a VALUE' 'hello' \
+   "$(jq -rs '[.[]|select(.call=="fill")|.val]|last' "$DREC")"
+t  'T25c ...and the session was NOT closed when the command finished' "$CB" \
+   "$(jq -rs '[.[]|select(.call=="close")]|length' "$DREC")"
+
+# --- T25d the DAEMON re-reads the lease before every step ---------------------
+# The token now travels in the REQUEST, because the daemon outlives every caller
+# and serves callers holding different tokens. The mutant is a daemon that trusts
+# the token it was handed at connect: a person redeems a viewer at step 2 of a
+# publish and the machine types through them.
+# THE ENV OF THE COMMAND IS NOT THE ENV OF THE DAEMON, and that is the whole
+# shape of this row: the stub runs INSIDE a process started by an earlier
+# `serve`, so PWPREEMPT_FILE on the `run` command line reaches nothing at all and
+# the arm would pass green having injected no preemption. Arm it at the serve.
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+dserve warm.test PWPREEMPT_FILE="$WDIR/.5dive-lease/meta"
+t  'T25d (anchor) the preempting session really is the one holding the browser' 'yes' \
+   "$([[ -n "$(dkv "$WDIR/.5dive-serve" daemon_pid)" ]] && echo yes || echo no)"
+CLICKS_BEFORE="$(jq -rs '[.[]|select(.call=="click")]|length' "$DREC")"
+dwarm "$BROWSER" run warm.test publish --body=hello
+tc 'T25d a person taking the lease mid-run stops the run' 'TAKEN by someone else' "$ERR"
+t  'T25d ...the step AFTER the preemption never ran' "$CLICKS_BEFORE" \
+   "$(jq -rs '[.[]|select(.call=="click")]|length' "$DREC")"
+tn 'T25d ...and it is NOT reported as nothing-ran' 'nothing was published' "$ERR"
+# AND THE EXIT STATUS IS STILL THE RE-READ'S, NOT THE EXECUTOR'S. This arm was
+# written expecting a red and the product was right: an action interrupted at
+# step 3 of 3 may well have published, the artifact IS live at its permalink, and
+# reporting failure there is precisely the lie that double-posts on a retry. The
+# executor's refusal is evidence; the out-of-band re-read is the verdict.
+t  'T25d ...and the verdict is the ARTIFACT, not the interrupted executor' 0 "$RC"
+tc 'T25d ...which is what it says' 'verified: publish is live' "$OUT"
+# THE OTHER DIRECTION, or the arm above grades nothing: with no artifact at the
+# permalink, the same interrupted run must read NOT VERIFIED.
+mkadapter warm.test "file://$TMP/never-published.html" 'PUBLISHED'
+CLICKS_BEFORE="$(jq -rs '[.[]|select(.call=="click")]|length' "$DREC")"
+dwarm "$BROWSER" run warm.test publish --body=hello
+t  'T25d (control) preempted, and nothing at the permalink, reads NOT VERIFIED' 1 "$RC"
+tc 'T25d (control) ...and warns against a blind retry' 'Do NOT retry blind' "$ERR"
+t  'T25d (control) ...having still stopped before the click' "$CLICKS_BEFORE" \
+   "$(jq -rs '[.[]|select(.call=="click")]|length' "$DREC")"
+mkadapter warm.test "file://$TMP/artifact.html" 'PUBLISHED'
+rm -rf "$WDIR/.5dive-lease"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+dserve warm.test
+
+# --- T25e `tree` enumerates out of the warm session ---------------------------
+LB="$(launches)"
+dwarm "$BROWSER" tree warm.test https://warm.test/compose --json
+t  'T25e tree runs against the warm session' 0 "$RC"
+t  'T25e ...launching nothing' "$LB" "$(launches)"
+tc 'T25e ...and still prints the ref tree' '"url":"https://warm.test/compose"' "$OUT"
+
+# --- T25f the face is a socket and a debug PORT is refused --------------------
+run env NODE_PATH="$DSTUB/node_modules" PWREC="$DREC" DPWDOM="$DPWDOM" \
+    FIVEDIVE_BROWSER_CHROME=/bin/true FIVEDIVE_BROWSER_CHROME_ARGS=--remote-debugging-port=9222 \
+    "$DAEMONBIN" serve "$WDIR" "$TMP/t25f.sock"
+t  'T25f a debug PORT is refused before anything opens' 70 "$RC"
+tc 'T25f ...naming what it would give away' 'full control of the browser' "$ERR"
+t  'T25f ...and no socket was created' 'no' "$([[ -S "$TMP/t25f.sock" ]] && echo yes || echo no)"
+t  'T25f (control) the shipped launch names no debug flag at all' '0' \
+   "$(jq -rs '[.[]|select(.call=="launch")|.args[]?|select(startswith("--remote-debugging"))]|length' "$DREC")"
+
+# --- T25g `status` can finally read a SERVED profile --------------------------
+# Before this row a served profile answered "UNKNOWN (served on :N)" — Chrome
+# allows one instance per --user-data-dir, and both fixes on the table needed a
+# port. The daemon is the third shape: a process that outlives the command,
+# reached over a 0700 socket.
+dwarm "$BROWSER" status warm.test
+tc 'T25g a served profile now reads through the daemon' 'authenticated' "$OUT"
+tn 'T25g ...instead of the served non-answer' 'served on' "$OUT"
+t  'T25g ...in its OWN tab, so nobody at the viewer is navigated away' 'extra' \
+   "$(jq -rs '[.[]|select(.call=="content")]|last|.kind' "$DREC")"
+t  'T25g ...and that tab is closed again' 'extra' \
+   "$(jq -rs '[.[]|select(.call=="pageclose")]|last|.kind' "$DREC")"
+# CONTROL: the refusal is still there where there is no daemon to ask.
+mkprofile cold.test "$LIVE_DOM" >/dev/null
+CDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/cold.test"
+( umask 077; printf 'display=999\nxvfb_pid=%s\nchrome_pid=%s\n' "$$" "$$" > "$CDIR/.5dive-serve" )
+run env PATH="$SPATH" "$BROWSER" status cold.test
+tc 'T25g (control) with no daemon, a served profile still refuses to guess' 'served on :999' "$OUT"
+rm -f "$CDIR/.5dive-serve"
+
+# --- T25h a daemon that dies MID-REQUEST is not a clean run -------------------
+# The mutant is node default behaviour: the connection closes, the client exits
+# 0, and bin/browser goes on to re-read a verify URL that already existed — a
+# publish nobody performed, reported green, with a receipt. This is graded
+# against a socket that ACCEPTS and then dies, which is the only way to enter the
+# window: a daemon that is already gone is a connect error, a different path.
+cat > "$TMP/t25h-server.js" <<'T25H'
+const net = require('net');
+net.createServer((c) => { c.on('data', () => { c.destroy(); process.exit(1); }); })
+   .listen(process.argv[2]);
+T25H
+node "$TMP/t25h-server.js" "$TMP/t25h.sock" &
+T25HPID=$!
+for _ in $(seq 1 50); do [[ -S "$TMP/t25h.sock" ]] && break; sleep 0.1; done
+run env FIVEDIVE_BROWSER_CHROME=/bin/true "$DAEMONBIN" call "$TMP/t25h.sock" <<< '{"op":"plan","steps":[{"op":"goto","url":"https://warm.test/x"}],"args":{}}'
+t  'T25h a session that dies mid-request does not exit 0' 'nonzero' \
+   "$([[ "$RC" == 0 ]] && echo zero || echo nonzero)"
+tc 'T25h ...it says the browser holding the profile is gone' 'is gone' "$ERR"
+tc 'T25h ...and does not claim nothing happened' 'already ran are still real' "$ERR"
+kill "$T25HPID" 2>/dev/null
+# AND THE OTHER HALF: a daemon that is simply GONE is not a failure at all — the
+# cold path is still there, and a command must take it rather than refuse.
+WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+kill -9 "$WPID" 2>/dev/null
+rm -f "$WDIR/.5dive-session.sock"
+# NOT $SPATH HERE. That PATH's fake chrome answers a --headless probe with an
+# empty document (it exists to be a SERVE, not a probe), so the cold fallback
+# would refuse on liveness and the arm would grade the fake instead of the
+# fallback. The suite's own probe-answering chrome is on the default PATH.
+run env NODE_PATH="$DSTUB/node_modules" PWREC="$DREC" DPWDOM="$DPWDOM" \
+    "$BROWSER" run warm.test publish --body=hello
+t  'T25h a dead daemon falls back to the cold path rather than refusing' 0 "$RC"
+tc 'T25h ...and the run still happened' 'verified: publish is live' "$OUT"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+
+# --- T25i `serve --stop` takes the daemon and the socket with it --------------
+dserve warm.test
+WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+run env PATH="$SPATH" "$BROWSER" serve warm.test --stop
+t  'T25i stop returns cleanly' 0 "$RC"
+t  'T25i ...the daemon is gone' 'gone' \
+   "$(kill -0 "${WPID:-0}" 2>/dev/null && echo alive || echo gone)"
+t  'T25i ...the socket is gone with it' 'no' "$([[ -S "$WDIR/.5dive-session.sock" ]] && echo yes || echo no)"
+# THE GRACEFUL PATH IS THE ROUTE, NOT THE BACKSTOP: closing the context is how
+# Chrome writes the profile out, and the profile holding the login is the durable
+# half. A SIGKILL mid-write corrupts exactly that.
+tc 'T25i ...and it was ASKED to go before it was killed' 'shutdown' \
+   "$(sed -n '/^cmd_serve/,/^}/p' "$BROWSER")"
+tc 'T25i ...the profile is still reported as the durable half' 'profile is untouched' "$OUT"
+
+# --- T25j a second caller mid-request is refused, not queued ------------------
+tc 'T25j a busy session refuses rather than queueing' 'did not hold it' \
+   "$(cat "$DAEMONBIN")"
+tc 'T25j ...and says nothing ran, so no artifact is re-read as evidence' 'Nothing ran' \
+   "$(cat "$DAEMONBIN")"
+
+# --- T25k `shot` on a WARM profile: down, render, and a LIVE daemon back ------
+# ITERATION 2, AND IT IS A COMPOSITION ARM ON PURPOSE. Every other T25 arm
+# reaches the daemon because the arm puts the stub on NODE_PATH; every `shot` and
+# `read` arm in this suite therefore runs with the daemon effectively pinned off,
+# so the one path a served customer actually takes on a render — take the daemon
+# DOWN, drive a second chrome at the profile it was holding, bring a daemon BACK
+# — was reasoned about and never executed. The pieces each have an arm (T25i:
+# `--stop` closes and unlinks; T25a: a restart comes back warm) and that is
+# exactly the shape that hides a composition defect: Chrome allows one instance
+# per --user-data-dir, so a render that starts while the daemon's Chrome still
+# owns the profile is a do-nothing launch, and `cmd_serve --stop`'s SIGTERM
+# backstop is the only thing between the two.
+#
+# THE THREE THINGS IT ASSERTS, and none of them is "the code says so":
+#   asked to go   -> the stub records a context close. A SIGKILL records nothing,
+#                    and the profile is written out by the close.
+#   it rendered   -> rc 0 and a non-empty PNG of the url asked for.
+#   warm again    -> a NEW pid, alive, and a socket that ANSWERS a ping. A pidfile
+#                    with a dead pid in it is what "restored" looks like when the
+#                    restore only half worked.
+# This PATH has to do three jobs in one arm: a headed chrome that stays up (the
+# serve), a headless one that honours --screenshot (the render) — both are
+# SHOTBIN — and a fake Xvfb, which is SBIN.
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+KPATH="$SHOTBIN:$SBIN:$PATH"
+KREC="$TMP/dpw-shot.jsonl"; : > "$KREC"
+kenv() { env PATH="$KPATH" DISPLAY= SHOTARGV="$TMP/k-argv.txt" \
+             NODE_PATH="$DSTUB/node_modules" PWREC="$KREC" DPWDOM="$DPWDOM" "$@"; }
+kping() { kenv "$DAEMONBIN" call "$WDIR/.5dive-session.sock" <<< '{"op":"ping"}'; }
+
+run kenv "$BROWSER" serve warm.test
+KPID1="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+t  'T25k (anchor) the profile really is held by a live daemon first' 'warm' \
+   "$([[ -n "$KPID1" ]] && kill -0 "$KPID1" 2>/dev/null && kping >/dev/null 2>&1 && echo warm || echo cold)"
+KCLOSES="$(jq -rs '[.[]|select(.call=="close")]|length' "$KREC")"
+
+rm -f "$SHOTOUT/k.png"
+run kenv "$BROWSER" shot warm.test "https://warm.test/p" --out="$SHOTOUT/k.png"
+t  'T25k a shot on a served-and-WARM profile renders' 0 "$RC"
+t  'T25k ...and the PNG exists and is non-empty' 'yes' \
+   "$([[ -s "$SHOTOUT/k.png" ]] && echo yes || echo no)"
+tc 'T25k ...of the URL asked for' 'https://warm.test/p' "$(cat "$SHOTOUT/k.png" 2>/dev/null)"
+t  'T25k ...the daemon was ASKED to close its context, not just killed' 'closed' \
+   "$([[ "$(jq -rs '[.[]|select(.call=="close")]|length' "$KREC")" -gt "$KCLOSES" ]] && echo closed || echo killed-only)"
+t  'T25k ...the daemon that was holding the profile is gone' 'gone' \
+   "$(kill -0 "${KPID1:-0}" 2>/dev/null && echo alive || echo gone)"
+KPID2="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+t  'T25k ...a NEW daemon is recorded afterwards' 'new' \
+   "$([[ -n "$KPID2" && "$KPID2" != "$KPID1" ]] && echo new || echo "none:$KPID2")"
+t  'T25k ...it is ALIVE, not just a pid in a file' 'alive' \
+   "$(kill -0 "${KPID2:-0}" 2>/dev/null && echo alive || echo dead)"
+t  'T25k ...and its socket ANSWERS — the profile is warm again, not just served' 'pong' \
+   "$(kping 2>/dev/null | tr -d '\n')"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
