@@ -1,5 +1,29 @@
 ## Unreleased
 
+### Added — a table-driven tool-call policy guard (DIVE-4696), mod 0.4.0
+
+Every rule in the fleet's `CLAUDE.md` files is paid on **every turn** (~1100 loads/day per the
+file's own header), and is enforced *after the fact* — by sudoers scoping, by the pre-push
+guard, or by an audit row somebody reads later. A rule that is a `tool.call` deny instead costs
+nothing per turn, fires **before** the tool runs, and hands the model the reason.
+
+`mod` now compiles `plugins/mod/policy/guard.json` once per session and refuses a call that
+matches. Six policies ship: a real Telegram id / email / routable IP written into a test or
+fixture path, `git commit|push --no-verify`, applying the `smoke-verified` label without a
+receipt for that sha, a direct write into the runtime's store or log paths, a destructive
+command outside the work directory, and a comment or review on a repo we do not own.
+
+**The document is data, not code** — nothing in `guard.ts` or `register.ts` names a policy, a
+path, a tool or a rule, so ops adds or retires one by editing JSON with no plugin release.
+`jq -r '.policies[] | "\(.id)\t\(.rule)"' plugins/mod/policy/guard.json` is the whole reader.
+
+**Off on every seat unless it opts in** (`FIVEDIVE_MOD_GUARD=1`), and off is byte-for-byte the
+observe-only hook DIVE-4692 shipped. It **fails open**: an unparseable document, an
+uncompilable regex or an unexpected event shape lets the call proceed and logs once per
+session. Each policy carries a named seat-setting escape rather than a command-line flag, so
+taking one is recorded. Every refusal is written to the sink with the policy and check that
+refused it, because a deny nobody can count is a rule nobody can grade.
+
 ### Added — boundary compaction for the non-fresh seats (DIVE-4695), mod 0.3.0
 
 `main` and `marketing` run with `heartbeat.fresh=false`, so the dispatcher never `/clear`s

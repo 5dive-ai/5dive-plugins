@@ -128,10 +128,17 @@ describe('mod: it cannot affect the session it measures', () => {
   // The safety property, asserted against the source because there is no cheaper way
   // to assert it: this plugin runs on every seat that enables it, inside every turn.
 
-  test('no hook can deny, rewrite or answer a call', () => {
-    // Unchanged by DIVE-4693: the command hooks answer their OWN commands, which is
-    // not a `deny` and cannot refuse anything the session would otherwise have done.
-    expect(SRC).not.toMatch(/\bdeny\b\s*:/)
+  test('exactly ONE site in the module can deny, and its reason is the policy\'s', () => {
+    // DIVE-4696 made this a counted exception rather than an absolute. The count is
+    // the assertion: a second deny site added anywhere in this file — in a command
+    // hook, in a telemetry hook, on a tool the policy file does not mention — is a
+    // rule this plugin enforces that `policy/guard.json` does not state, which is the
+    // one thing the data-driven shape exists to prevent.
+    const denies = [...SRC.matchAll(/return \{ deny: ([^}]+) \}/g)].map((m) => m[1]!.trim())
+    expect(denies).toEqual(['v.reason'])
+    // `v` is the verdict the policy document produced. A literal string here would be
+    // a rule living in code.
+    expect(SRC).toContain('const v = await verdictFor($, e.tool, e)')
     // `next(e)` is always the untouched event; a rewrite would spread into it.
     expect(SRC).not.toMatch(/next\(\s*\{\s*\.\.\.e/)
   })
@@ -143,8 +150,19 @@ describe('mod: it cannot affect the session it measures', () => {
     expect(bodies.length).toBe(EVENTS.length)
     for (const [, name, body] of bodies) {
       const first = body!.split('\n').map((l) => l.trim()).find((l) => l !== '' && !l.startsWith('//'))
-      // No hook does ANYTHING — not a settings read, not a threshold check — before
-      // the chain below it has resolved. This half holds for all eight.
+      if (name === 'tool.call') {
+        // DIVE-4696 — the guard's hook, and the ONE exemption from the rule below.
+        // What it may do before `next` is pinned to the single call: anything else
+        // here would be a side effect on the path of every tool call on the seat.
+        expect(first).toBe('const v = await verdictFor($, e.tool, e)')
+        // ...and when it does NOT deny, it is the observe-only hook DIVE-4692
+        // shipped: next(e) first, and the chain's own result handed back.
+        expect(body!).toContain('const r = await next(e)')
+        expect(body!.trimEnd().endsWith('return r')).toBe(true)
+        continue
+      }
+      // No other hook does ANYTHING — not a settings read, not a threshold check —
+      // before the chain below it has resolved.
       expect(first).toBe('const r = await next(e)')
       if ((OBSERVE_ONLY as readonly string[]).includes(name!)) {
         // and the observe-only hooks hand back exactly what the chain resolved to
@@ -153,15 +171,18 @@ describe('mod: it cannot affect the session it measures', () => {
     }
   })
 
-  test('only session.compact returns anything other than the chain\'s own value', () => {
-    // The exemption is one hook wide and this is the assertion that keeps it there.
+  test('exactly TWO hooks return anything other than the chain\'s own value', () => {
+    // The exemption list is the assertion. `session.compact` may ADD a message back;
+    // `tool.call` may REFUSE the call outright (DIVE-4696). A third name appearing
+    // here is a hook that started changing what the engine does, and it must be
+    // argued for rather than discovered.
     const bodies = [
       ...SRC.matchAll(/^  on\('([^']+)', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms),
     ]
     const rewriting = bodies
       .filter(([, , body]) => /^\s*return (?!r\b)/m.test(body!))
       .map(([, name]) => name)
-    expect(rewriting).toEqual(['session.compact'])
+    expect(rewriting.sort()).toEqual(['session.compact', 'tool.call'])
   })
 
   test('the compact hook can only ADD messages, never drop or rewrite one', () => {
@@ -177,6 +198,13 @@ describe('mod: it cannot affect the session it measures', () => {
     expect(body).not.toMatch(/r\.messages\.(filter|slice|map|splice)/)
     // and a seat that has not opted in never reaches any of it
     expect(body).toContain('if (livePin === null || r.skip !== undefined) return r')
+  })
+
+  test('the guard is off unless the seat turns it on, and off is the old hook', () => {
+    // The default has to be legible from the source: a guard that is on by default
+    // would refuse calls on 18 seats the moment the plugin updates.
+    expect(SRC).toContain("const GUARD_FLAG = 'FIVEDIVE_MOD_GUARD'")
+    expect(SRC).toMatch(/String\(vars\[GUARD_FLAG\] \?\? ''\) !== '1'\) return \{ on: false \}/)
   })
 
   test('the module never binds $ to a name', () => {
