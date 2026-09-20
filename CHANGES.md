@@ -1,5 +1,36 @@
 ## Unreleased
 
+### Added — a warm browser session: `serve` holds one Chrome and commands attach to it (DIVE-4621), browser 1.7.0
+
+`serve` was an Xvfb and an abandoned Chrome. Because Chrome allows one instance per
+`--user-data-dir`, every command that needed the profile had to STOP it, launch a
+probe, launch the driver's browser, and start it again — four launches for an
+action that is three clicks.
+
+It is now a daemon holding `launchPersistentContext(<the 0700 profile>)` on the
+site's display, answering on a unix socket inside that same 0700 directory.
+`run` and `tree` attach to it. Never a `--remote-debugging-port`, and the launch
+refuses one: a loopback debug port is reachable by every seat on the box and CDP
+is full control of the browser holding the session.
+
+Measured on one box, same task, `run` = goto + fill + click + the out-of-band
+verify, three consecutive runs: **4589 / 4934 / 4001 ms** with a browser served
+and no daemon (the shape a customer is in) against **1387 / 1309 / 1276 ms**
+warm — **3.5x**. About 1.0 s of what is left is the liveness probe, not a launch.
+
+`status` can also read a SERVED profile for the first time: it used to answer
+`UNKNOWN (served on :N)`, because probing a held profile needed CDP and CDP
+needed a port. The daemon is a third shape — a process that outlives the command
+— so the probe goes through it, in its own tab, which is then closed so nobody at
+the viewer is navigated away. That command is now ~1.0 s instead of 78 ms of a
+non-answer.
+
+The lease is still re-read from disk before every step, by the daemon: it
+outlives every caller and serves callers holding different tokens, so the token
+travels in the request and the file is what is trusted. A box without the pinned
+`playwright-core` still serves — `serve` falls back to launching Chrome directly
+and says so in one line. Losing the speed must not lose the browser.
+
 ### Fixed — a resume helper no longer types `continue` at a seat that already answered (DIVE-4628), telegram 0.5.55
 
 At a usage wall the Stop hook spawns `resume-after-reset`, which sleeps until the
