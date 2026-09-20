@@ -109,23 +109,48 @@ describe('mod: it cannot affect the session it measures', () => {
   // The safety property, asserted against the source because there is no cheaper way
   // to assert it: this plugin runs on every seat that enables it, inside every turn.
 
-  test('no hook can deny, rewrite or answer a call', () => {
-    // Unchanged by DIVE-4693: the command hooks answer their OWN commands, which is
-    // not a `deny` and cannot refuse anything the session would otherwise have done.
-    expect(SRC).not.toMatch(/\bdeny\b\s*:/)
+  test('exactly ONE site in the module can deny, and its reason is the policy\'s', () => {
+    // DIVE-4696 made this a counted exception rather than an absolute. The count is
+    // the assertion: a second deny site added anywhere in this file — in a command
+    // hook, in a telemetry hook, on a tool the policy file does not mention — is a
+    // rule this plugin enforces that `policy/guard.json` does not state, which is the
+    // one thing the data-driven shape exists to prevent.
+    const denies = [...SRC.matchAll(/return \{ deny: ([^}]+) \}/g)].map((m) => m[1]!.trim())
+    expect(denies).toEqual(['v.reason'])
+    // `v` is the verdict the policy document produced. A literal string here would be
+    // a rule living in code.
+    expect(SRC).toContain('const v = await verdictFor($, e.tool, e)')
     // `next(e)` is always the untouched event; a rewrite would spread into it.
     expect(SRC).not.toMatch(/next\(\s*\{\s*\.\.\.e/)
   })
 
-  test('every hook awaits next(e) before it does anything else', () => {
-    const bodies = [...SRC.matchAll(/^  on\('[^']+', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms)]
+  test('every TELEMETRY hook awaits next(e) before it does anything else', () => {
+    const bodies = [...SRC.matchAll(/^  on\('([^']+)', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms)]
     expect(bodies.length).toBe(EVENTS.length)
-    for (const [, body] of bodies) {
+    for (const [, event, body] of bodies) {
       const first = body.split('\n').map((l) => l.trim()).find((l) => l !== '' && !l.startsWith('//'))
+      if (event === 'tool.call') {
+        // The guard's hook, and the only one that may act before `next`. What it may
+        // do first is pinned to the one call: anything else here would be a side
+        // effect on the path of every tool call on the seat.
+        expect(first).toBe('const v = await verdictFor($, e.tool, e)')
+        // ...and when it does NOT deny, it is the old observe-only hook: next(e) first
+        // and the chain's own result handed back.
+        expect(body).toContain('const r = await next(e)')
+        expect(body.trimEnd().endsWith('return r')).toBe(true)
+        continue
+      }
       expect(first).toBe('const r = await next(e)')
       // and the hook hands back exactly what the chain resolved to
       expect(body.trimEnd().endsWith('return r')).toBe(true)
     }
+  })
+
+  test('the guard is off unless the seat turns it on, and off is the old hook', () => {
+    // The default has to be legible from the source: a guard that is on by default
+    // would refuse calls on 18 seats the moment the plugin updates.
+    expect(SRC).toContain("const GUARD_FLAG = 'FIVEDIVE_MOD_GUARD'")
+    expect(SRC).toMatch(/String\(vars\[GUARD_FLAG\] \?\? ''\) !== '1'\) return \{ on: false \}/)
   })
 
   test('the module never binds $ to a name', () => {

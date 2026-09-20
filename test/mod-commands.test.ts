@@ -211,8 +211,12 @@ describe('mod commands: the surface stays a dispatch', () => {
     // iteration 1). The flag joins `state` and `commands` behind a session latch.
     expect(SRC).toContain('let audit: Promise<boolean> | null = null')
     expect(SRC).toMatch(/async function resolveAudit\(\$: EngineInterface\): Promise<boolean>/)
-    // Every settings read in the module sits in a once-per-session resolver.
-    expect([...SRC.matchAll(/\$\.settings\.read\(\)/g)].length).toBe(3)
+    // Every settings read in the module sits in a once-per-session resolver, and the
+    // count is pinned because a read added OUTSIDE one is invisible in review and
+    // costs every turn of every seat. DIVE-4696 added the fourth (`resolveGuard`).
+    expect([...SRC.matchAll(/\$\.settings\.read\(\)/g)].length).toBe(4)
+    expect(SRC).toMatch(/async function resolveGuard\(\$: EngineInterface\): Promise<Guard>/)
+    expect(SRC).toContain('let guard: Promise<Guard> | null = null')
     const turnComplete = SRC.slice(SRC.indexOf("on('turn.complete'"))
     const body = turnComplete.slice(0, turnComplete.indexOf("on('command.run'"))
     expect(body).not.toContain('$.settings.read()')

@@ -1,7 +1,7 @@
 {
   "name": "mod",
-  "description": "5dive telemetry producer and command surface for Claude Code function hooks (early access). Publishes turn and session boundaries and the account's usage reading from inside the harness process to a per-seat JSONL sink, so the heartbeat, the pacing floor and the self-update's pending-restart sweep can read a first-class signal instead of inferring idle/busy from pane samples and the task board. Also registers /task and /gate, which dispatch to the 5dive CLI in-process. Both capabilities are off unless the seat opts in, and neither denies, rewrites or delays a call the session would otherwise have made.",
-  "version": "0.2.0",
+  "description": "5dive telemetry producer, command surface and tool-call policy guard for Claude Code function hooks (early access). Publishes turn and session boundaries and the account's usage reading from inside the harness process to a per-seat JSONL sink, so the heartbeat, the pacing floor and the self-update's pending-restart sweep can read a first-class signal instead of inferring idle/busy from pane samples and the task board. Registers /task and /gate, which dispatch to the 5dive CLI in-process. Enforces a table-driven deny list over tool calls (policy/guard.json), so a rule that today costs every seat tokens on every turn and is caught after the fact is refused before the tool runs, with the reason handed to the model. All three capabilities are off unless the seat opts in; nothing rewrites a call, and only the guard can refuse one.",
+  "version": "0.3.0",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com"

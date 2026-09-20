@@ -23,10 +23,15 @@
 // it cannot refuse, rewrite or delay anything the session would otherwise have done.
 // The telemetry hooks below are untouched and remain observe-only.
 //
-//   1. OBSERVE ONLY (every hook registered with NO matcher). Every one calls `next(e)`
-//      FIRST and returns exactly what the chain resolved to. No hook returns `{ deny }`, rewrites `e`, or awaits
-//      anything before `next`. The guard capability (a `tool.call` deny list) and
-//      the wall-handling capability are deliberately NOT here; they are separate rows.
+//   1. OBSERVE ONLY, WITH ONE NAMED EXCEPTION. Every telemetry hook calls `next(e)`
+//      FIRST and returns exactly what the chain resolved to: none of them returns
+//      `{ deny }`, rewrites `e`, or awaits anything before `next`. DIVE-4696 added the
+//      exception and it is exactly one hook: `tool.call` now consults a policy
+//      document (`hooks/guard.ts` + `policy/guard.json`) and may answer
+//      `{ deny: <the policy's reason> }` INSTEAD of calling `next`. It is off unless
+//      the seat sets FIVEDIVE_MOD_GUARD=1, it never rewrites a call, and the reason
+//      comes from the data file rather than from this module. The wall-handling
+//      capability is still deliberately NOT here; it is a separate row.
 //   2. FAIL OPEN, AND FAIL LEGIBLY. The surface below is EARLY ACCESS and may change
 //      between Claude Code releases. Every `$` call the mod makes sits inside a
 //      try/catch, so no failure ever propagates into the chain — and every catch
@@ -72,12 +77,13 @@
 // later without any consumer changing.
 
 import type { EngineInterface, Register } from 'claude-code'
+import { compile, envSet, evaluate, type Compiled, type Verdict } from './guard'
 
 /** The schema version of a sink line. Bump only on a breaking change. */
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
@@ -107,6 +113,18 @@ const COMMANDS_FLAG = 'FIVEDIVE_MOD_COMMANDS'
  * breakdown counts with the token-count API, so it is not free.
  */
 const AUDIT_FLAG = 'FIVEDIVE_MOD_CONTEXT_AUDIT'
+
+/**
+ * The settings key that turns the tool-call GUARD on for a seat (DIVE-4696). Absent or
+ * anything but "1" is off, and off means the `tool.call` hook is exactly the
+ * observe-only hook DIVE-4692 shipped. Independent of FLAG and COMMANDS_FLAG: a seat
+ * may want the deny list with no sink, or the sink with no deny list.
+ */
+const GUARD_FLAG = 'FIVEDIVE_MOD_GUARD'
+
+/** Where the policy document lives unless the seat names another one. */
+const GUARD_POLICY_KEY = 'FIVEDIVE_MOD_GUARD_POLICY'
+const DEFAULT_POLICY = 'policy/guard.json'
 
 /** The 5dive CLI the commands dispatch to; override for a test or a non-standard path. */
 const CLI_KEY = 'FIVEDIVE_MOD_CLI'
@@ -155,6 +173,11 @@ type Fields = {
   usage?: Usage
   /** DIVE-4693's measurement: what the per-turn listings cost this session. */
   context_cost?: ContextCost
+  /** DIVE-4696: set on a `tool.call` line the guard REFUSED. Absent means allowed. */
+  decision?: 'deny'
+  /** The policy and the check inside it that refused, so a deny is attributable. */
+  policy?: string
+  check?: string
 }
 
 /**
@@ -760,6 +783,118 @@ async function contextCost($: EngineInterface): Promise<ContextCost | undefined>
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// DIVE-4696: the tool-call GUARD.
+//
+// This is the one capability in this plugin that can refuse a call, and it is the
+// reason the "observe only" promise in the header is now scoped to the telemetry
+// hooks rather than to the file. Read `hooks/guard.ts` for what a policy is; this
+// section is only the wiring: the gate, the one `$.fs.read` that loads the document,
+// and the single call site inside the existing `tool.call` hook.
+//
+// WHY IT LIVES INSIDE THAT HOOK AND NOT IN A SECOND ONE. The engine refuses a second
+// UNMATCHED registration of an event a plugin already hooks, naming both sites
+// (measured on 2.1.278, DIVE-4694). `tool.call` is already hooked without a matcher
+// for the telemetry, so the guard either shares that hook or fans out into one matched
+// hook per tool name — and a per-tool matcher set would have to be kept in step with
+// the policy file by hand, which is the drift the data-driven shape exists to avoid.
+// It shares the hook. The consequence is stated plainly in the hook's own comment: on
+// a seat with GUARD_FLAG off, the hook is byte-for-byte the old observe-only one,
+// because `resolveGuard` answers OFF before any policy is consulted.
+//
+// SEATING. `sec-default` seats itself outermost on managed machines and `prependPlugins`
+// orders the chain; this mod is seated the same way (the seat's settings list it first),
+// so its deny is reached before a later plugin can rewrite the call out from under it.
+//
+// FAIL OPEN. Every failure here answers "no policy" and the call proceeds: an early-
+// access surface that fails closed takes a seat out on a Claude Code upgrade. Each
+// failure says so once — see the header's note on why a silent fail-open is worse than
+// no guard at all.
+
+/** Whether this session enforces policies, and which ones. */
+type Guard = { on: true; compiled: Compiled; env: Record<string, unknown> } | { on: false }
+
+/** Resolved once per session. */
+let guard: Promise<Guard> | null = null
+
+/** Each says its thing once per session, not once per call. */
+let guardFailureLogged = false
+let dropsLogged = false
+
+/**
+ * Loads and compiles the policy document once. Declared at the top level because it
+ * takes `$` (see the HOST RULE note at the top of the file).
+ */
+async function resolveGuard($: EngineInterface): Promise<Guard> {
+  try {
+    const vars = envOf(await $.settings.read())
+    if (String(vars[GUARD_FLAG] ?? '') !== '1') return { on: false }
+    const named = String(vars[GUARD_POLICY_KEY] ?? '')
+    const path = named !== '' ? named : `${$.plugin.root}/${DEFAULT_POLICY}`
+    const compiled = compile(JSON.parse(await $.fs.read(path)))
+    if (compiled.policies.length === 0) {
+      // Nothing compiled: that is the guard being OFF, and it must not read as on.
+      $.ui.log(
+        `5dive mod guard off: ${path} compiled 0 policies` +
+          (compiled.drops.length === 0
+            ? ' (the file lists none).'
+            : `: ${compiled.drops.map((d) => `${d.policy} (${d.why})`).join('; ')}`),
+        { to: 'debug' },
+      )
+      return { on: false }
+    }
+    if (compiled.drops.length > 0 && !dropsLogged) {
+      dropsLogged = true
+      // A partial load is the dangerous state: the seat thinks it is guarded and one
+      // rule is not there. Say which, once, naming the policy by its id.
+      $.ui.log(
+        `5dive mod guard: ${compiled.policies.length} policies from ${path}; ` +
+          `DROPPED ${compiled.drops.map((d) => `${d.policy} (${d.why})`).join('; ')}. ` +
+          'Those rules are NOT enforced on this seat.',
+        { to: 'debug' },
+      )
+    }
+    return { on: true, compiled, env: vars }
+  } catch (err) {
+    if (!guardFailureLogged) {
+      guardFailureLogged = true
+      try {
+        $.ui.log(
+          `5dive mod guard off: could not load the policy document (verified against ` +
+            `${VERIFIED_AGAINST}): ${String(err)}. Tool calls run unguarded on this ` +
+            `seat — the written rules in CLAUDE.md are the only thing holding them.`,
+          { to: 'debug' },
+        )
+      } catch {}
+    }
+    return { on: false }
+  }
+}
+
+/**
+ * The guard's verdict on one call, or null. Never throws: a guard that can throw into
+ * the chain can lose a turn, which is a strictly worse outcome than a rule going
+ * unenforced for one call. Declared at the top level because it takes `$`.
+ */
+async function verdictFor($: EngineInterface, tool: string, input: unknown): Promise<Verdict> {
+  try {
+    const g = await (guard ??= resolveGuard($))
+    if (!g.on) return null
+    return evaluate(g.compiled, { tool, input }, g.env)
+  } catch (err) {
+    if (!guardFailureLogged) {
+      guardFailureLogged = true
+      try {
+        $.ui.log(`5dive mod guard: evaluation failed, call allowed: ${String(err)}`, {
+          to: 'debug',
+        })
+      } catch {}
+    }
+    return null
+  }
+}
+
 export const register: Register = (on) => {
   // Registration is unconditional: the engine statically scans the event names a
   // module registers and refuses an unknown one at load, so the gates cannot be
@@ -847,10 +982,50 @@ export const register: Register = (on) => {
   })
 
   on('tool.call', async ($, e, next) => {
-    // OBSERVE. `next(e)` first and its result returned untouched: this hook can
-    // neither deny a call nor change one. It carries no usage reading — a tool call is
-    // frequent and `$.session.usage()` per call would be the one place this mod could
-    // cost a turn real time.
+    // THE ONE HOOK IN THIS FILE THAT CAN REFUSE (DIVE-4696), and the only one that
+    // does anything before `next(e)`. Both properties are scoped as tightly as the
+    // shape allows:
+    //
+    //   - with GUARD_FLAG off — the default on every seat — `verdictFor` answers null
+    //     without reading a policy, and what runs below is the observe-only hook
+    //     DIVE-4692 shipped, unchanged;
+    //   - the reason handed back is the policy document's, never this file's. Nothing
+    //     here names a rule, a path or a tool: adding one is an edit to
+    //     policy/guard.json, which is why ops can extend the list without a release;
+    //   - `e` is never rewritten. A call is refused whole or it runs untouched — v1
+    //     has no third answer (a row constraint).
+    //
+    // The refused call is RECORDED before it is refused, with the policy and check
+    // that refused it. A deny nobody can count is a rule nobody can grade: the sink
+    // line is what makes "this policy fires 40× a day on good work" a measurement
+    // instead of an argument.
+    // `e` IS the tool's argument bag. MEASURED, not inferred (2026-09-20, 2.1.278): a
+    // `tool.call` event arrives as the tool's own arguments spread at the top level,
+    // plus `tool` and `tool_use_id` — `{command, description, tool, tool_use_id}` for
+    // Bash. There is no `e.input`. The neighbouring `$.tool.check` call DOES take
+    // `{ tool, input }`, and reading the event's shape off that neighbour is what made
+    // the first draft of this hook pass every unit arm and deny nothing on a live
+    // seat: `e.input` was `undefined`, every policy read an empty subject, and a guard
+    // that allows everything is indistinguishable from one that is switched off.
+    const v = await verdictFor($, e.tool, e)
+    if (v !== null) {
+      state ??= resolveState($)
+      const sd = await state
+      if (sd.on) {
+        record($, sd, {
+          ts: Date.now(),
+          event: 'tool.call',
+          tool: e.tool,
+          decision: 'deny',
+          policy: v.policy,
+          check: v.check,
+        })
+      }
+      return { deny: v.reason }
+    }
+    // OBSERVE. `next(e)` first and its result returned untouched. It carries no usage
+    // reading — a tool call is frequent and `$.session.usage()` per call would be the
+    // one place this mod could cost a turn real time.
     const r = await next(e)
     state ??= resolveState($)
     const s = await state
@@ -868,13 +1043,14 @@ export const register: Register = (on) => {
     return r
   })
 
-  // The two hooks that SERVE this plugin's own commands. Unlike every hook above they
-  // answer with `{ text }` instead of calling `next(e)` — a command registered by
+  // The two hooks that SERVE this plugin's own commands. Unlike the telemetry hooks
+  // they answer with `{ text }` instead of calling `next(e)` — a command registered by
   // `$.command.register` has no core implementation to pass to, and `next` would
   // resolve to "no hook answered this". The matcher is the engine's, not an `if`: these
   // bodies are unreachable for any command but the two names registered above, and
-  // neither can return `{ deny }`, so no other command and no tool call can be refused,
-  // rewritten or delayed by this file.
+  // neither can return `{ deny }`, so no OTHER command can be refused, rewritten or
+  // delayed here. The one thing in this file that can refuse is the `tool.call` guard
+  // above, on the policies in policy/guard.json and only when the seat enabled it.
   on('command.run', { command: 'task' }, async ($, e) => {
     const c = await (commands ??= resolveCommands($))
     if (!c.on) {

@@ -1,0 +1,152 @@
+{
+  "v": 1,
+  "id": "5dive-guard",
+  "doc": "docs/mod-guard.md",
+  "note": "DATA, NOT CODE. Every field here is read by plugins/mod/hooks/guard.ts and by `jq` — ops extends this list without a plugin release. Each entry names the CLAUDE.md rule it replaces; a policy with no `rule` is not a policy, it is a preference.",
+  "policies": [
+    {
+      "id": "pii-fixture",
+      "rule": "Test fixtures: never a real identifier (5dive/CLAUDE.md)",
+      "tools": ["Write", "Edit", "NotebookEdit"],
+      "path_keys": ["file_path", "notebook_path"],
+      "text_keys": ["content", "new_string", "new_source"],
+      "path_any": [
+        "(^|/)tests?/",
+        "(^|/)__?fixtures?__?/",
+        "(^|/)spec/",
+        "\\.test\\.[A-Za-z]+$",
+        "\\.spec\\.[A-Za-z]+$",
+        "fixture"
+      ],
+      "checks": [
+        {
+          "id": "telegram-id",
+          "find": "\\b(?:chat_?id|user_?id|telegram_?id|from_?id)\\b\\s*[:=]\\s*\"?(\\d{7,15})",
+          "flags": "gi",
+          "group": 1,
+          "allow_any": ["^1234567890$"],
+          "say": "a Telegram id that is not the reserved fake 1234567890"
+        },
+        {
+          "id": "email",
+          "find": "[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})",
+          "flags": "g",
+          "group": 1,
+          "allow_any": ["^example\\.(com|org|net)$", "^localhost$"],
+          "say": "an email address outside @example.com"
+        },
+        {
+          "id": "ip",
+          "find": "\\b(\\d{1,3}(?:\\.\\d{1,3}){3})\\b",
+          "flags": "g",
+          "group": 1,
+          "allow_any": [
+            "^192\\.0\\.2\\.",
+            "^198\\.51\\.100\\.",
+            "^203\\.0\\.113\\.",
+            "^127\\.",
+            "^0\\.0\\.0\\.0$",
+            "^255\\.255\\.255\\.255$"
+          ],
+          "say": "an IP address outside the RFC 5737 documentation range 192.0.2.x"
+        }
+      ],
+      "deny": "This writes {found} into a test fixture ({path}). The rule is a NAMED DEFAULT, not more care: Telegram ids are 1234567890, emails are @example.com, IP addresses are 192.0.2.x (RFC 5737). Change the value, do not change the path. [{rule}]"
+    },
+    {
+      "id": "no-verify",
+      "rule": "The pre-push PII guard catches these; do not --no-verify past it (5dive/CLAUDE.md)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_NO_VERIFY",
+      "checks": [
+        {
+          "id": "git-no-verify",
+          "find": "(?:^|[;&|(]\\s*)(?:\\S*/)?git\\s+(?:-\\S+\\s+)*(?:commit|push)\\b[^;&|\\n]*?\\s--no-verify\\b",
+          "flags": "",
+          "say": "a git commit or push with --no-verify"
+        }
+      ],
+      "deny": "{found} skips the pre-push PII guard and the co-author hook — the two rails that grade what this repo will CONTAIN. If a hook is wrong, fix the hook or say on the row why it is wrong; bypassing it leaves no record that it was bypassed. [{rule}]"
+    },
+    {
+      "id": "smoke-attestation",
+      "rule": "Never apply smoke-verified when the smoke did not run — that is forging an attestation (5dive/CLAUDE.md)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_SMOKE_RECEIPT",
+      "checks": [
+        {
+          "id": "add-smoke-verified",
+          "find": "smoke-verified",
+          "flags": "",
+          "require_all": ["\\b(?:gh|5dive)\\b", "(?:--add-label|\\blabels\\b|-f\\s*labels)"],
+          "say": "applying the smoke-verified label"
+        }
+      ],
+      "deny": "{found}. That label asserts the paid Hetzner smoke ran green at this sha, and only the smoke can produce it — the other exit is `smoke-override` with the five-part written reason. If the smoke DID run, record its sha in the seat's FIVEDIVE_MOD_GUARD_SMOKE_RECEIPT setting first, so the attestation has an author. [{rule}]"
+    },
+    {
+      "id": "runtime-store",
+      "rule": "The audit log and the runtime store are append-only to the runtime, not to a seat (mod guard, capability 2)",
+      "tools": ["Write", "Edit", "NotebookEdit"],
+      "path_keys": ["file_path", "notebook_path"],
+      "text_keys": [],
+      "checks": [
+        {
+          "id": "protected-path",
+          "on": "path",
+          "find": "^(?:/var/lib/5dive/|/var/log/5dive/|/etc/5dive/)|(?:^|/)tasks\\.db$",
+          "flags": "",
+          "say": "a write into the runtime's own store or audit log"
+        }
+      ],
+      "deny": "{found} ({path}). The runtime owns these paths: a row, a gate and an audit line are written through `5dive`, which records who wrote them. A direct write leaves a state the CLI did not make and cannot explain. [{rule}]"
+    },
+    {
+      "id": "destructive-outside-workdir",
+      "rule": "Destructive commands stay inside the workdir (mod guard, capability 2)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_DESTRUCTIVE",
+      "checks": [
+        {
+          "id": "rm-rf-absolute",
+          "find": "\\brm\\s+(?:-\\S+\\s+)*-[a-zA-Z]*[rR][a-zA-Z]*\\s+(?:-\\S+\\s+)*(/(?:var|etc|usr|boot|opt|srv|root)\\b\\S*|/home/[^/\\s]+/\\.[^\\s]*|/\\s*$|~\\S*)",
+          "flags": "",
+          "group": 1,
+          "say": "a recursive delete of {match}"
+        },
+        {
+          "id": "git-clean-outside",
+          "find": "\\bgit\\s+(?:-C\\s+(/\\S+)\\s+)?clean\\b[^;&|\\n]*-[a-zA-Z]*f",
+          "flags": "",
+          "say": "a `git clean -f`, which deletes another seat's uncommitted work when the checkout is shared"
+        }
+      ],
+      "deny": "{found}. Outside your own worktree these paths belong to the host or to another seat, and the delete is not revertible by a redeploy. Name the directory you mean, or do it from your worktree. [{rule}]"
+    },
+    {
+      "id": "external-reply",
+      "rule": "A reply on a repo we do not own goes out as lodar; it needs a per-thread approval (main's identity-cap rule)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED",
+      "checks": [
+        {
+          "id": "gh-comment-foreign-repo",
+          "find": "(?:--repo|-R)[=\\s]+(?:https://github\\.com/)?([A-Za-z0-9_.-]+)/[A-Za-z0-9_.-]+",
+          "flags": "g",
+          "group": 1,
+          "allow_any": ["^5dive-ai$", "^lodar$", "^5dive$"],
+          "require_all": [
+            "\\bgh\\b",
+            "\\b(?:pr\\s+comment|issue\\s+comment|pr\\s+review|pr\\s+create|issue\\s+create)\\b"
+          ],
+          "say": "a public reply on a repository owned by {match}"
+        }
+      ],
+      "deny": "{found}. This seat's GitHub token writes under an identity that is not yours, so the comment is published in someone else's name on a project we do not own — it cannot be unsent. Put the text on the row and get the one-line approval first. [{rule}]"
+    }
+  ]
+}
