@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Added — the mod's above-prompt seat panel (DIVE-4694), mod 0.2.0
+### Added — the mod's above-prompt seat panel (DIVE-4694), mod 0.3.0
 
 A seat could not see its own row. lodar reads seats through tmux panes and `5dive watch`; the
 seat's own screen said nothing about which row it held, whether a gate was open on it, how much of
@@ -43,6 +43,39 @@ draw, is never awaited by the hook that triggers it, and is rate-limited; steady
 
 Off by default, behind `FIVEDIVE_MOD_PANEL=1` in the seat's settings `env` — a separate flag from
 the telemetry half's, so "it is off" is never ambiguous about which half.
+
+### Added — `/task` and `/gate` as first-class commands, and what the swap actually saves (DIVE-4693), mod 0.3.0
+
+The `mod` plugin now registers two slash commands with `$.command.register` and serves them by
+dispatching to the `5dive` CLI in the harness process: `/task <verb> …` and `/gate <ident> …`. The
+CLI stays the single source of truth — no flag parsing, no defaults, no re-implemented guard, and
+no shell (`$.process.run` takes an argv, so nothing in an ask or a row body can be interpreted as
+one). Off unless the seat sets `FIVEDIVE_MOD_COMMANDS=1`, independently of the telemetry flag.
+
+The verb list is an allowlist and `task add` is **refused by name**: on this fleet the filing cap
+is a `PreToolUse` hook on the *Bash tool*, and a verb dispatched in-process never crosses it, so
+offering `add` here would be a way around a rail rather than a shortcut to it.
+
+**The row's question was whether this saves per-turn tokens, and the answer is a number with a
+caveat.** Measured 2026-09-20 on the `dev` seat, one Claude Code 2.1.278 session per arm, the
+engine's own `/context` figures read on the first completed turn through the new
+`FIVEDIVE_MOD_CONTEXT_AUDIT=1` instrument:
+
+| | skill listing | of which `5dive-cli` + `notify-user` | slash-command listing |
+| --- | --- | --- | --- |
+| commands **off** | 1988 tok / 24 skills | **132 tok** (60 + 72) | 971 tok / 24 commands |
+| commands **on** | 1988 tok / 24 skills | 132 tok | **971 tok / 24 commands** |
+
+Dropping the two skills would save **132 tokens per turn** (6.6% of the skill listing, 0.5% of a
+28k-token turn), and registering the two commands costs **nothing** — the listing is byte-identical
+across the arms.
+
+It costs nothing because the model never sees them. `totalCommands` is 24 in both arms, and a third
+arm asked a session with the commands registered to invoke `/task` or else answer `NOCMD`: it
+answered **NOCMD**. A `$.command.register` command is a surface for a *person at the composer*, not
+a capability the model can reach. So the second half of the row — dropping the two skill
+descriptions behind the flag — is **deliberately not shipped**: it would trade a model-facing
+capability for 132 tokens a turn. Detail and the raw sink lines are on DIVE-4693.
 
 ### Added — a site login is per BOX and brokered: seats use the box's login (DIVE-4664), browser 1.9.0
 

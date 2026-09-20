@@ -1,7 +1,7 @@
 # mod
 
-Two 5dive capabilities built on Claude Code's function hooks (early access), each behind
-its own flag and each off by default.
+Three 5dive capabilities built on Claude Code's function hooks (early access), each
+behind its own flag and each off by default.
 
 1. **A telemetry producer.** It publishes the two signals 5dive currently infers from
    the outside — whether a seat is mid-turn, and what its usage meter reads — from
@@ -10,6 +10,8 @@ its own flag and each off by default.
 2. **A seat panel.** One line above the prompt naming the row the seat holds, its gate,
    its grader and its token burn against its budget, at zero context cost. See
    [The seat panel](#the-seat-panel-dive-4694).
+3. **A command surface.** `/task` and `/gate`, dispatched to the `5dive` CLI in the
+   harness process. See [`/task` and `/gate`](#task-and-gate).
 
 ## What it does, and what it deliberately does not
 
@@ -92,6 +94,19 @@ noise. `show` is only paid when the drawn row CHANGES or holds a live gate, so s
 state is **one ~0.6 s subprocess per turn boundary, ~1.2 s of CPU per turn**, off the
 critical path.
 
+## `/task` and `/gate`
+
+The mod also registers two slash commands that dispatch to the `5dive` CLI in the
+harness process — `/task show DIVE-1`, `/gate DIVE-1 --type=decision --ask="…"`. They
+are a thin surface over the CLI, not a second implementation, and the verbs they serve
+are an allowlist rather than a pass-through (`task add` stays on Bash, because the
+filing cap is a PreToolUse hook on the *Bash tool* and a dispatched command never
+crosses it).
+
+Gate: `FIVEDIVE_MOD_COMMANDS=1`, independent of the telemetry flag. The contract, the
+allowlist and the `FIVEDIVE_MOD_CONTEXT_AUDIT` measurement instrument are in
+[`docs/mod-commands.md`](../../docs/mod-commands.md).
+
 ## Turning it on
 
 Two independent gates. Both must be on, and the second is off on every seat by default.
@@ -102,12 +117,12 @@ Two independent gates. Both must be on, and the second is off on every seat by d
 2. **5dive's.** In the seat's `~/.claude/settings.json`:
 
    ```json
-   { "env": { "FIVEDIVE_MOD_TELEMETRY": "1", "FIVEDIVE_MOD_PANEL": "1" } }
+   { "env": { "FIVEDIVE_MOD_TELEMETRY": "1", "FIVEDIVE_MOD_PANEL": "1", "FIVEDIVE_MOD_COMMANDS": "1" } }
    ```
 
-   The two capabilities have **separate** flags on purpose: a seat may want the screen
-   without the sink or the sink without the screen, and one flag for both would make
-   "it is off" ambiguous. Each defaults to off.
+   The three capabilities have **separate** flags on purpose: a seat may want the screen
+   without the sink, the sink without the screen, or the commands without either, and
+   one flag for several would make "it is off" ambiguous. Each defaults to off.
 
 Optional, same block:
 

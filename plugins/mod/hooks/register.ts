@@ -12,8 +12,19 @@
 //
 // Three hard properties, in the order they matter:
 //
-//   1. OBSERVE ONLY. Every hook calls `next(e)` FIRST and returns exactly what the
-//      chain resolved to. No hook returns `{ deny }`, rewrites `e`, or awaits
+// DIVE-4693 added a SECOND capability to this module, and it is the one place the
+// "observe only" property above is deliberately not universal, so read this before the
+// list: the mod now also SERVES two slash commands of its own, `/task` and `/gate`,
+// registered with `$.command.register` behind their own gate. A command this plugin
+// registered has no core implementation — nothing downstream of the hook can run it —
+// so its `command.run` hook ANSWERS with `{ text }` instead of calling `next`. That is
+// the only hook in the file that does, it is reached only for names this plugin
+// registered (an engine matcher, not an `if`), and it still never returns `{ deny }`:
+// it cannot refuse, rewrite or delay anything the session would otherwise have done.
+// The telemetry hooks below are untouched and remain observe-only.
+//
+//   1. OBSERVE ONLY (every hook registered with NO matcher). Every one calls `next(e)`
+//      FIRST and returns exactly what the chain resolved to. No hook returns `{ deny }`, rewrites `e`, or awaits
 //      anything before `next`. The guard capability (a `tool.call` deny list) and
 //      the wall-handling capability are deliberately NOT here; they are separate rows.
 //   2. FAIL OPEN, AND FAIL LEGIBLY. The surface below is EARLY ACCESS and may change
@@ -69,7 +80,7 @@ import { registerPanel } from './panel'
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
@@ -83,6 +94,33 @@ const FLAG = 'FIVEDIVE_MOD_TELEMETRY'
 /** Optional overrides, same place as FLAG. */
 const DIR_KEY = 'FIVEDIVE_MOD_TELEMETRY_DIR'
 const SEAT_KEY = 'FIVEDIVE_MOD_TELEMETRY_SEAT'
+
+/**
+ * The settings key that turns the `/task` and `/gate` commands on for a seat
+ * (DIVE-4693). Independent of FLAG on purpose: the telemetry pilot and the command
+ * surface are separate decisions, and a seat may want either without the other.
+ * Absent or anything but "1" is off, and off means the commands are never registered.
+ */
+const COMMANDS_FLAG = 'FIVEDIVE_MOD_COMMANDS'
+
+/**
+ * The settings key that makes the mod record ONE context-cost line per session
+ * (DIVE-4693's measurement instrument). Off by default and meant to be switched on for
+ * a measurement run, never left on: unlike `$.session.usage()` with no argument, a
+ * breakdown counts with the token-count API, so it is not free.
+ */
+const AUDIT_FLAG = 'FIVEDIVE_MOD_CONTEXT_AUDIT'
+
+/** The 5dive CLI the commands dispatch to; override for a test or a non-standard path. */
+const CLI_KEY = 'FIVEDIVE_MOD_CLI'
+const DEFAULT_CLI = '5dive'
+
+/**
+ * How long a dispatched CLI call may take before the command gives up. `5dive task
+ * show` is a local sqlite read; the ceiling is here so a hung CLI cannot hold the
+ * composer, not because any verb is expected to approach it.
+ */
+const CLI_TIMEOUT_MS = 60_000
 
 /**
  * Where the sink lands unless DIR_KEY says otherwise: the runtime's per-seat state
@@ -118,6 +156,27 @@ type Fields = {
   command?: string
   tool?: string
   usage?: Usage
+  /** DIVE-4693's measurement: what the per-turn listings cost this session. */
+  context_cost?: ContextCost
+}
+
+/**
+ * The per-turn listing cost, as the engine itself counts it (`/context`'s own numbers,
+ * not an estimate of ours): the skill listing in total and per skill, and the
+ * slash-command listing in total. This is the instrument DIVE-4693's before/after is
+ * read off — a saving claimed from the difference between two of these lines, one with
+ * the skills in the seat's skill set and one with the commands registered instead.
+ */
+type ContextCost = {
+  model: string
+  total_tokens: number
+  skills?: {
+    total: number
+    included: number
+    tokens: number
+    per_skill: Array<{ name: string; source: string; tokens: number }>
+  }
+  slash_commands?: { total: number; included: number; tokens: number }
 }
 
 type Live = {
@@ -357,6 +416,353 @@ export function record($: EngineInterface, s: Live, f: Fields): void {
   )
 }
 
+
+// ---------------------------------------------------------------------------
+// DIVE-4693: `/task` and `/gate` as first-class commands.
+//
+// WHY A COMMAND AND NOT A SKILL. The `5dive-cli` and `notify-user` skills are the
+// seat's instructions for driving the same CLI. A skill's frontmatter is listed to the
+// model on EVERY turn whether or not it is ever used, and its BODY is loaded again on
+// every invocation. A slash command this plugin registers is listed once in the
+// command listing and its body is code, not prompt. Whether that is actually cheaper
+// per turn is a measurement, not an assumption — the instrument is `contextCost`
+// below and the numbers are on DIVE-4693. The commands are worth having either way
+// (they are one dispatch instead of "recall the flag, write the bash line"), but the
+// row's claim was the token one, so the token one is measured.
+//
+// THE CLI IS THE SINGLE SOURCE OF TRUTH. These commands build an argv and run the same
+// `5dive` binary a seat runs from Bash. They parse no flags, default no values, and
+// reimplement no guard: the filing cap, done-refuses-blank and the ask-readability
+// check refuse a command exactly as they refuse a Bash line, because it is the same
+// process doing the refusing.
+//
+// WITH ONE EXCEPTION, AND IT IS THE POINT OF THE ALLOWLIST. Not every 5dive guard
+// lives in the CLI. On this fleet the filing cap is a Claude Code PreToolUse hook on
+// the *Bash tool* (`~/.claude/hooks/pretool-filing-cap.sh`), so a verb dispatched
+// through `$.process.run` does not pass it — the tool it guards is never used. A
+// command surface that offered `task add` would therefore be a hole in a rail, not a
+// shortcut through it. So the surface is an ALLOWLIST of the verbs DIVE-4693 scoped,
+// `add` is not on it and is refused by name with the reason, and a verb nobody has
+// thought about is refused rather than passed through.
+
+/** The `task` verbs `/task` will dispatch. Anything else is refused, not passed on. */
+export const TASK_VERBS = [
+  'show',
+  'ls',
+  'done',
+  'deliver',
+  'reject',
+  'assign',
+  'set-body',
+] as const
+
+/**
+ * Verbs refused with a reason of their own rather than the generic one, because the
+ * reason is a rail and not a scoping accident. `add` is guarded by a PreToolUse hook on
+ * the Bash tool, which a dispatched command does not cross (see the note above).
+ */
+export const TASK_VERBS_REFUSED: Record<string, string> = {
+  add: 'filing goes through Bash: the filing cap is a PreToolUse hook on the Bash tool, and a command dispatched in-process would not cross it',
+  need: 'use /gate, which is this same dispatch with the gate CLI\'s own checks',
+}
+
+/**
+ * Splits a command's argument string into an argv the way a POSIX shell would, so
+ * `--ask="one crisp question"` arrives as ONE argument. Single quotes are literal,
+ * double quotes allow a backslash escape, and a backslash outside quotes escapes the
+ * next character.
+ *
+ * This exists because `$.process.run` takes an argv and runs no shell — which is the
+ * property worth having (nothing in an ask, a result or a body can reach a shell), and
+ * the cost of it is that the splitting is ours. An unterminated quote answers null and
+ * the command says so rather than guessing where the argument ended.
+ */
+export function splitArgs(input: string): string[] | null {
+  const out: string[] = []
+  let cur = ''
+  let has = false
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < input.length; i += 1) {
+    const c = input[i]!
+    if (quote === "'") {
+      if (c === "'") quote = null
+      else cur += c
+      continue
+    }
+    if (quote === '"') {
+      if (c === '"') quote = null
+      else if (c === '\\' && i + 1 < input.length && '"\\$`'.includes(input[i + 1]!)) {
+        i += 1
+        cur += input[i]!
+      } else cur += c
+      continue
+    }
+    if (c === "'" || c === '"') {
+      quote = c
+      has = true
+      continue
+    }
+    if (c === '\\' && i + 1 < input.length) {
+      i += 1
+      cur += input[i]!
+      has = true
+      continue
+    }
+    if (c === ' ' || c === '\t' || c === '\n') {
+      if (has) out.push(cur)
+      cur = ''
+      has = false
+      continue
+    }
+    cur += c
+    has = true
+  }
+  if (quote !== null) return null
+  if (has) out.push(cur)
+  return out
+}
+
+/** What a command resolved to: an argv to run, or a refusal to show as the output. */
+export type Dispatch = { argv: string[] } | { refuse: string }
+
+/**
+ * Turns `/task <verb> ...` into the argv for the CLI, or into a refusal.
+ *
+ * `cli` is the executable; everything after it is passed to `5dive task` untouched.
+ */
+export function taskDispatch(cli: string, args: string): Dispatch {
+  const argv = splitArgs(args)
+  if (argv === null) {
+    return { refuse: 'Unterminated quote in the arguments — nothing was run.' }
+  }
+  const verb = argv[0]
+  if (verb === undefined) {
+    return {
+      refuse:
+        `/task needs a verb. This surface serves: ${TASK_VERBS.join(', ')}.\n` +
+        'Everything else stays on the CLI: run `5dive task --help` from Bash.',
+    }
+  }
+  const named = TASK_VERBS_REFUSED[verb]
+  if (named !== undefined) {
+    return { refuse: `/task ${verb} is not served here — ${named}. Run it from Bash.` }
+  }
+  if (!(TASK_VERBS as readonly string[]).includes(verb)) {
+    return {
+      refuse:
+        `/task ${verb} is not one of the verbs this surface serves ` +
+        `(${TASK_VERBS.join(', ')}).\nRun it from Bash: \`5dive task ${verb} …\`. ` +
+        'A verb is added here deliberately, never by falling through.',
+    }
+  }
+  return { argv: [cli, 'task', ...argv] }
+}
+
+/**
+ * Turns `/gate <ident> --type=… --ask=… --recommend=…` into `5dive task need …`.
+ *
+ * The gate's own rules — that the ask is readable by someone who has never seen our
+ * code, that a decision carries `--options`, what tier a type defaults to — are the
+ * CLI's and stay the CLI's. This does not pre-check them: a check here that drifted
+ * from `need.sh` would refuse a gate the CLI would have taken, which is worse than no
+ * check at all.
+ */
+export function gateDispatch(cli: string, args: string): Dispatch {
+  const argv = splitArgs(args)
+  if (argv === null) {
+    return { refuse: 'Unterminated quote in the arguments — nothing was run.' }
+  }
+  if (argv.length === 0) {
+    return {
+      refuse:
+        '/gate needs the row and the gate: `/gate DIVE-1234 --type=decision ' +
+        '--ask="…" --recommend="…" --options="…|…"`.',
+    }
+  }
+  return { argv: [cli, 'task', 'need', ...argv] }
+}
+
+/** How a finished dispatch presents: the person's line, and the model's note. */
+export function dispatchResult(
+  argv: readonly string[],
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+): { text: string; context: readonly string[] } {
+  const shown = `${stdout}${stdout !== '' && stderr !== '' ? '\n' : ''}${stderr}`.trimEnd()
+  const line = argv.join(' ')
+  const head = exitCode === 0 ? `$ ${line}` : `$ ${line}\n(exit ${exitCode})`
+  return {
+    text: shown === '' ? `${head}\n(no output)` : `${head}\n${shown}`,
+    // The model reads the exit code explicitly: a 5dive verb that refuses prints its
+    // reason on stdout and exits non-zero, and "it printed something" is not the same
+    // fact as "it worked". The output itself rides the transcript row above.
+    context: [
+      `\`${line}\` exited ${exitCode}. The 5dive CLI is the authority on what it did; ` +
+        'this command only ran it.',
+    ],
+  }
+}
+
+/** Whether this session serves `/task` and `/gate`, and with which CLI. */
+type Commands = { on: true; cli: string } | { on: false }
+
+/** Resolved once per session. */
+let commands: Promise<Commands> | null = null
+
+/** Each says its thing once per session, not once per command. */
+let registerFailureLogged = false
+let auditFailureLogged = false
+
+/** The context-cost audit is one line per session, on the first completed turn. */
+let auditDone = false
+
+/**
+ * Whether this session wants the context-cost line at all. Resolved ONCE, like
+ * `state` and `commands`: audit-off is the default case, and read per turn it would
+ * be a settings read on every turn of every telemetry seat that is not auditing.
+ */
+let audit: Promise<boolean> | null = null
+
+/**
+ * Reads AUDIT_FLAG once per session. A settings read that throws means off — the same
+ * contract as everywhere else in this file. Declared at the top level because it
+ * takes `$`.
+ */
+async function resolveAudit($: EngineInterface): Promise<boolean> {
+  try {
+    return String(envOf(await $.settings.read())[AUDIT_FLAG] ?? '') === '1'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Decides once whether this session serves the commands, and registers them.
+ *
+ * Gated independently of the telemetry FLAG: a seat may want the command surface with
+ * no sink, or the sink with no commands. Failure is the same contract as everywhere
+ * else in this file — one debug line, off for the session, the seat runs as before.
+ * Declared at the top level because it takes `$`.
+ */
+async function resolveCommands($: EngineInterface): Promise<Commands> {
+  try {
+    const vars = envOf(await $.settings.read())
+    if (String(vars[COMMANDS_FLAG] ?? '') !== '1') return { on: false }
+    const cli = String(vars[CLI_KEY] ?? '') || DEFAULT_CLI
+
+    await $.command.register({
+      name: 'task',
+      description: 'Run a 5dive task verb (show, ls, done, deliver, reject, assign, set-body).',
+      argumentHint: 'verb [ident] [flags]',
+    })
+    await $.command.register({
+      name: 'gate',
+      description: 'File a 5dive human gate on a row (5dive task need).',
+      argumentHint: 'ident --type=… --ask="…" --recommend="…"',
+    })
+    return { on: true, cli }
+  } catch (err) {
+    if (!registerFailureLogged) {
+      registerFailureLogged = true
+      try {
+        $.ui.log(
+          `5dive mod: could not register the /task and /gate commands on this build ` +
+            `(verified against ${VERIFIED_AGAINST}): ${String(err)}. The seat keeps the ` +
+            `5dive-cli skill and the Bash path; nothing else changes.`,
+          { to: 'debug' },
+        )
+      } catch {}
+    }
+    return { on: false }
+  }
+}
+
+/**
+ * Runs one dispatched CLI call. Every failure — the binary missing, a timeout, a
+ * non-zero exit — comes back as TEXT for the person, never as a thrown hook: a command
+ * surface that can crash the composer is worse than one that can be wrong.
+ *
+ * Declared at the top level because it takes `$`.
+ */
+async function runCli(
+  $: EngineInterface,
+  d: Dispatch,
+): Promise<{ text: string; context?: readonly string[] }> {
+  if ('refuse' in d) return { text: d.refuse }
+  try {
+    const r = await $.process.run(d.argv, { timeoutMs: CLI_TIMEOUT_MS })
+    return dispatchResult(d.argv, r.exitCode, r.stdout, r.stderr)
+  } catch (err) {
+    // `$.process.run` rejects when the command cannot start or is still running at the
+    // timeout. Both are the person's to see, with the argv, because the argv is the
+    // thing they would retype into Bash.
+    return {
+      text:
+        `$ ${d.argv.join(' ')}\n(the command did not complete: ${String(err)})\n` +
+        'Run it from Bash — this surface is a dispatch, not a second implementation.',
+    }
+  }
+}
+
+/**
+ * DIVE-4693's measurement instrument: ONE line per session naming what the skill and
+ * slash-command listings cost in the context window, as the engine counts them.
+ *
+ * Gated behind AUDIT_FLAG and off by default, and deliberately NOT per turn: a
+ * breakdown counts with the token-count API (the no-argument `$.session.usage()` the
+ * telemetry hooks use does not), so leaving this on would make the mod cost the thing
+ * it is here to measure.
+ *
+ * Declared at the top level because it takes `$`.
+ */
+async function contextCost($: EngineInterface): Promise<ContextCost | undefined> {
+  try {
+    const u = await $.session.usage({ breakdown: 'full' })
+    const b = u.context?.breakdown
+    if (b === undefined) return undefined
+    return {
+      model: b.model,
+      total_tokens: b.totalTokens,
+      ...(b.skills === undefined
+        ? {}
+        : {
+            skills: {
+              total: b.skills.totalSkills,
+              included: b.skills.includedSkills,
+              tokens: b.skills.tokens,
+              per_skill: b.skills.skillFrontmatter.map((f) => ({
+                name: f.name,
+                source: f.source,
+                tokens: f.tokens,
+              })),
+            },
+          }),
+      ...(b.slashCommands === undefined
+        ? {}
+        : {
+            slash_commands: {
+              total: b.slashCommands.totalCommands,
+              included: b.slashCommands.includedCommands,
+              tokens: b.slashCommands.tokens,
+            },
+          }),
+    }
+  } catch (err) {
+    if (!auditFailureLogged) {
+      auditFailureLogged = true
+      try {
+        $.ui.log(
+          `5dive mod: the context-cost audit failed on this build (verified against ` +
+            `${VERIFIED_AGAINST}): ${String(err)}. No context_cost line this session.`,
+          { to: 'debug' },
+        )
+      } catch {}
+    }
+    return undefined
+  }
+}
+
 export const register: Register = (on) => {
   // Registration is unconditional: the engine statically scans the event names a
   // module registers and refuses an unknown one at load, so the gates cannot be
@@ -366,6 +772,11 @@ export const register: Register = (on) => {
     const r = await next(e)
     state ??= resolveState($)
     const s = await state
+    // The command surface is gated independently of the sink, so it is resolved here
+    // whatever the telemetry state says. `$.command.register` is what makes `/task`
+    // and `/gate` appear in the typeahead; the hooks below are what serve them.
+    commands ??= resolveCommands($)
+    await commands
     if (s.on) {
       record($, s, {
         ts: Date.now(),
@@ -405,6 +816,24 @@ export const register: Register = (on) => {
         turn_id: e.turnId,
         reason: e.reason,
         usage: await usage($),
+        // DIVE-4693's before/after is read off this field: ONE line, on the FIRST
+        // completed turn, and only when the seat asked for it.
+        //
+        // The first COMPLETED turn and not `session.start`, and the difference is the
+        // measurement: at session.start the breakdown is taken before a request has
+        // been assembled, and it reports counts for listings whose token figures are
+        // not yet the ones a turn pays (measured 2026-09-20 — two arms differing by
+        // four listed commands both reported an identical slash-command token figure
+        // there, while their skill counts disagreed for no reason the arms explain).
+        // After a turn completes, the breakdown is over what was actually sent, which
+        // is the only number this row is allowed to claim a per-turn saving from.
+        //
+        // The flag itself is resolved once per session (`audit`), not read here: with
+        // the audit off — the default — `auditDone` never flips, so a settings read in
+        // this expression would run on every turn of every telemetry seat forever.
+        ...(auditDone || !(await (audit ??= resolveAudit($)))
+          ? {}
+          : ((auditDone = true), { context_cost: await contextCost($) })),
       })
     }
     return r
@@ -440,6 +869,29 @@ export const register: Register = (on) => {
       record($, s, { ts: Date.now(), event: 'session.end', reason: e.reason, usage: await usage($) })
     }
     return r
+  })
+
+  // The two hooks that SERVE this plugin's own commands. Unlike every hook above they
+  // answer with `{ text }` instead of calling `next(e)` — a command registered by
+  // `$.command.register` has no core implementation to pass to, and `next` would
+  // resolve to "no hook answered this". The matcher is the engine's, not an `if`: these
+  // bodies are unreachable for any command but the two names registered above, and
+  // neither can return `{ deny }`, so no other command and no tool call can be refused,
+  // rewritten or delayed by this file.
+  on('command.run', { command: 'task' }, async ($, e) => {
+    const c = await (commands ??= resolveCommands($))
+    if (!c.on) {
+      return { text: 'The 5dive command surface is off on this seat. Run `5dive task …` from Bash.' }
+    }
+    return runCli($, taskDispatch(c.cli, e.args))
+  })
+
+  on('command.run', { command: 'gate' }, async ($, e) => {
+    const c = await (commands ??= resolveCommands($))
+    if (!c.on) {
+      return { text: 'The 5dive command surface is off on this seat. Run `5dive task need …` from Bash.' }
+    }
+    return runCli($, gateDispatch(c.cli, e.args))
   })
 
   registerPanel(on)
