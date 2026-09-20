@@ -25,7 +25,12 @@ harness that cannot should keep working unchanged. That is what this file specif
 A directory of append-only JSONL files. One file per **session**, named
 `<seat>-<session_id>.jsonl`, both components reduced to `[A-Za-z0-9._-]`.
 
-Default directory: `/var/lib/5dive/mod-telemetry`.
+Default directory: the producing seat's own `~/.5dive/mod-telemetry` — the runtime's
+per-seat state directory. A consumer globs `/home/*/.5dive/mod-telemetry/*.jsonl`, plus
+any shared directory a seat has been pointed at. A shared sink is the better end state
+and it has a precondition: `/var/lib/5dive` is `drwxr-s--- root:claude`, so a directory
+there must be created group-writable by root before any seat can write into it. A
+producer's default must be a path it owns.
 
 One session owns its file exclusively, which is the whole concurrency story: there is
 no second writer, no lock, and a consumer that reads a partially written file sees a
@@ -99,6 +104,15 @@ reading per tool call is the one place a producer could cost a turn real time.
 
 ## Adding a producer for another harness
 
-Write files of this shape into the same directory. Nothing else. A producer that cannot
-name its seat must write nothing rather than guess: an unattributable line is worse than
-a missing one, because a consumer cannot tell the two apart once it is on disk.
+Write files of this shape into a sink of this shape. Nothing else. Two obligations come
+with it, and they are the same obligation twice:
+
+- **A producer that cannot name its seat writes nothing rather than guess.** An
+  unattributable line is worse than a missing one, because a consumer cannot tell the
+  two apart once it is on disk.
+- **A producer that cannot write says so where an operator will see it**, and stops.
+  Consumer rule 1 — absence of a file is not idleness — is what makes a broken producer
+  undetectable from the sink alone: the consumer correctly falls back and reports nothing
+  wrong. So *off*, *on and broken* and *on and quiet* must be three distinguishable
+  observables, and the third one cannot come from the sink. It comes from the producer's
+  log. An empty catch around the write deletes it.

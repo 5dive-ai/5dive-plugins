@@ -37,8 +37,17 @@ the source, because this runs inside every turn on every seat that enables it.
 Early access, verified against Claude Code 2.1.278. `plugin.json` has no field for pinning
 a version range, so the pin is in the data: every line names the build it came from. A
 release that drops a call the mod makes is caught twice — the engine's own static scan
-refuses the module at load, and every `$` call is inside a try/catch that disables the mod
-for the session after one debug line. Either way the seat runs exactly as it did before.
+refuses the module at load, and every `$` call is inside a try/catch so nothing reaches the
+chain. Either way the seat runs exactly as it did before.
+
+Every one of those catches EMITS, which is the other half of fail-open and the half a
+try/catch never evidences on its own: an observe-only producer that swallows a failure is
+indistinguishable from one that is switched off. A failed sink write names the path and the
+error and latches the session off; a failed usage reading says so once and the turn
+boundaries keep recording (absent is the contract's answer for a reading nobody has, never
+zero). The sink defaults to the seat's own `~/.5dive/mod-telemetry`, a directory it owns:
+`/var/lib/5dive` is `drwxr-s--- root:claude` and no seat can create a subdirectory there,
+so a shared sink is opt-in and needs root to create it group-writable first.
 
 ### Added — one snapshot per decision: `browser snapshot` (DIVE-4653), browser 1.8.0
 

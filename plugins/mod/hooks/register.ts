@@ -16,11 +16,23 @@
 //      chain resolved to. No hook returns `{ deny }`, rewrites `e`, or awaits
 //      anything before `next`. The guard capability (a `tool.call` deny list) and
 //      the wall-handling capability are deliberately NOT here; they are separate rows.
-//   2. FAIL OPEN. The surface below is EARLY ACCESS and may change between Claude Code
-//      releases. Every `$` call the mod makes sits inside a try/catch, and the FIRST
-//      failure disables the mod for the rest of the session after logging one line —
-//      it does not retry per event and it never propagates. A seat whose Claude Code
-//      no longer has one of these calls runs exactly as a seat with no mod.
+//   2. FAIL OPEN, AND FAIL LEGIBLY. The surface below is EARLY ACCESS and may change
+//      between Claude Code releases. Every `$` call the mod makes sits inside a
+//      try/catch, so no failure ever propagates into the chain — and every catch
+//      EMITS, because a producer that swallows its failure is indistinguishable from
+//      one that is switched off (DIVE-4692 iteration 1 shipped exactly that: an empty
+//      rejection handler on the sink write, at a default path no seat could write, so
+//      the mod loaded and wrote nothing and said nothing). Which failure does what:
+//        - resolving the gates, the seat or the session id fails -> one debug line,
+//          the mod is OFF for the session;
+//        - the sink WRITE fails -> one debug line naming the path and the error, and
+//          the mod is OFF for the session (a sink it cannot write is not a sink);
+//        - `$.session.usage()` fails -> one debug line, and the turn boundaries keep
+//          recording with NO `usage` key. Absent is the contract's own answer for a
+//          reading nobody has (never zero), so losing the boundaries as well would
+//          cost the pilot more than the meter does.
+//      A seat whose Claude Code no longer has one of these calls runs exactly as a
+//      seat with no mod, and the debug log says which call went.
 //   3. OFF BY DEFAULT. Two independent gates, both of which must be on:
 //        - the harness's: CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 in the seat's env, or
 //          this module is never loaded at all;
@@ -45,7 +57,7 @@
 // The sink and its schema are documented in docs/mod-telemetry-contract.md. The
 // contract is HARNESS-AGNOSTIC on purpose: this mod is one producer of it, not the
 // contract itself. A codex/grok/pi/opencode/agy seat keeps the pane-and-board
-// fallback today and could drop lines of the same shape into the same directory
+// fallback today and could drop lines of the same shape into a sink of the same shape
 // later without any consumer changing.
 
 import type { EngineInterface, Register } from 'claude-code'
@@ -69,8 +81,17 @@ const FLAG = 'FIVEDIVE_MOD_TELEMETRY'
 const DIR_KEY = 'FIVEDIVE_MOD_TELEMETRY_DIR'
 const SEAT_KEY = 'FIVEDIVE_MOD_TELEMETRY_SEAT'
 
-/** Where the sink lands unless DIR_KEY says otherwise. One file per session. */
-const DEFAULT_DIR = '/var/lib/5dive/mod-telemetry'
+/**
+ * Where the sink lands unless DIR_KEY says otherwise: the runtime's per-seat state
+ * directory, under the seat's own home. One file per session.
+ *
+ * NOT a shared directory under /var/lib/5dive. That tree is `drwxr-s--- root:claude`,
+ * so a seat cannot create a subdirectory in it (measured 2026-09-20 — it is what made
+ * iteration 1 of this plugin write nothing at its own documented default). A shared
+ * sink is still reachable, and is opt-in: ops creates it group-writable and the seat
+ * points DIR_KEY at it. The default has to be a path the seat owns.
+ */
+const DEFAULT_SUBDIR = '.5dive/mod-telemetry'
 
 /**
  * How many lines one session's file may hold. A session that reaches it stops
@@ -115,6 +136,10 @@ const lines: string[] = []
 let flush: Promise<void> = Promise.resolve()
 let stopped = false
 
+/** Each of these says its thing once per session, not once per event. */
+let writeFailureLogged = false
+let usageFailureLogged = false
+
 /**
  * The seat's name, from the plugin's own directory, which lives under the seat's home:
  * /home/agent-<seat>/... is `<seat>` and /home/claude/... is `claude`. Anything else
@@ -131,6 +156,19 @@ export function seatFromRoot(root: string): string | null {
     return user.slice('agent-'.length)
   }
   return null
+}
+
+/**
+ * The seat's home directory, read off the same path the seat name comes from. The
+ * default sink lives under it because it is the one directory a seat is guaranteed to
+ * be able to write. Answers null on a path the rule does not cover, and then the mod
+ * records nothing unless DIR_KEY names a directory explicitly.
+ *
+ * Exported so test/mod-telemetry.test.ts can exercise it without an engine.
+ */
+export function homeFromRoot(root: string): string | null {
+  const m = /^(\/home\/[^/]+)(?:\/|$)/.exec(root)
+  return m?.[1] ?? null
 }
 
 /** A filename component that cannot escape the sink directory. */
@@ -190,7 +228,20 @@ async function resolveState($: EngineInterface): Promise<State> {
       return OFF
     }
 
-    const dir = String(vars[DIR_KEY] ?? '') || DEFAULT_DIR
+    // Binding the HOME is fine; binding `$` is what the host scan refuses.
+    const home = homeFromRoot($.plugin.root)
+    const dir =
+      String(vars[DIR_KEY] ?? '') || (home === null ? '' : `${home}/${DEFAULT_SUBDIR}`)
+    if (dir === '') {
+      $.ui.log(
+        `5dive mod off: no sink directory — ${$.plugin.root} is not under a seat's ` +
+          `home, so the default cannot be derived; set ${DIR_KEY} in the seat's ` +
+          `settings to a directory this seat can write.`,
+        { to: 'debug' },
+      )
+      return OFF
+    }
+
     const sessionId = await $.session.id()
     return {
       on: true,
@@ -234,19 +285,58 @@ async function usage($: EngineInterface): Promise<Usage | undefined> {
       rate_limits: u.rateLimits,
       ...(u.cost === undefined ? {} : { cost_usd: u.cost.usd }),
     }
-  } catch {
+  } catch (err) {
+    // Absent, not zero — but absent SILENTLY, forever, is the blind meter this row
+    // exists to remove, so the first failure says so once. The boundaries keep
+    // recording: they are the half of the pilot that does not depend on this call.
+    if (!usageFailureLogged) {
+      usageFailureLogged = true
+      try {
+        $.ui.log(
+          `5dive mod: $.session.usage() failed on this build (verified against ` +
+            `${VERIFIED_AGAINST}): ${String(err)}. Lines this session carry NO usage ` +
+            `reading — absent, never zero. Turn boundaries keep recording.`,
+          { to: 'debug' },
+        )
+      } catch {}
+    }
     return undefined
   }
+}
+
+/**
+ * The sink write failed. Says so ONCE, naming the path and the error, and stops the
+ * session's recording: a producer that cannot write its sink is off, and it has to be
+ * possible to tell that from the outside — "off", "on and broken" and "on and quiet"
+ * are one observable otherwise, which is how iteration 1 passed its own negative
+ * controls while producing nothing.
+ *
+ * It does not throw and it does not retry. Declared at the top level because it takes
+ * `$` (see the HOST RULE note at the top of the file).
+ */
+function writeFailed($: EngineInterface, path: string, err: unknown): void {
+  stopped = true
+  if (writeFailureLogged) return
+  writeFailureLogged = true
+  try {
+    $.ui.log(
+      `5dive mod disabled: could not write the telemetry sink at ${path}: ` +
+        `${String(err)}. No further lines this session; the seat runs exactly as it ` +
+        `does with no mod. Point ${DIR_KEY} at a directory this seat can write.`,
+      { to: 'debug' },
+    )
+  } catch {}
 }
 
 /**
  * Appends one line to the session's file. `$.fs.write` replaces a file rather than
  * appending, so the session's lines are held here and the whole file is rewritten;
  * one session owns one file, so there is no second writer to race with. Writes are
- * chained so two events in the same tick cannot interleave, and every failure is
- * swallowed: telemetry must never be able to fail a turn.
+ * chained so two events in the same tick cannot interleave, and no failure is ever
+ * allowed to reach the chain — telemetry must not be able to fail a turn — but the
+ * first one is logged and latches recording off (`writeFailed`).
  */
-function record($: EngineInterface, s: Live, f: Fields): void {
+export function record($: EngineInterface, s: Live, f: Fields): void {
   if (stopped) return
   if (lines.length >= MAX_LINES) {
     stopped = true
@@ -260,7 +350,7 @@ function record($: EngineInterface, s: Live, f: Fields): void {
   const path = s.path
   flush = flush.then(() => $.fs.write(path, text)).then(
     () => {},
-    () => {},
+    (err) => writeFailed($, path, err),
   )
 }
 

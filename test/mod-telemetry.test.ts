@@ -13,6 +13,16 @@
 //      rewritten `e` — which is the one change that turns this from a measurement into
 //      a thing that can lose a turn.
 //
+// A third class was added in iteration 2, and it is the one that bounced the delivery:
+//
+//   3. the WRITE PATH swallowing its own failure. The pure helpers were covered and the
+//      write was not, so an empty rejection handler at a default path no seat could
+//      write shipped as green: the mod loaded, wrote nothing, and said nothing, which
+//      is the same observable as being switched off. `record` takes `$` as its first
+//      argument (a host rule — see the module), so a stub engine is all it takes to
+//      grade both halves of fail-open: the failure does not propagate, AND it is
+//      legible.
+//
 // The end-to-end evidence (a session loading the module, the sink lines, the two
 // negative controls) is on DIVE-4692 and is reproduced by the command in the plugin's
 // README.
@@ -102,9 +112,8 @@ describe('mod: it cannot affect the session it measures', () => {
 })
 
 describe('mod: the pure helpers the sink path and line schema rest on', async () => {
-  const { seatFromRoot, safe, envOf, sinkPath, lineFor, producerFor } = await import(
-    join(ROOT, 'hooks', 'register.ts')
-  )
+  const { seatFromRoot, homeFromRoot, safe, envOf, sinkPath, lineFor, producerFor } =
+    await import(join(ROOT, 'hooks', 'register.ts'))
 
   test('a seat is named from the plugin directory, or not at all', () => {
     expect(seatFromRoot('/home/agent-dev/.claude/plugins/cache/5dive-plugins/mod/0.1.0')).toBe('dev')
@@ -125,6 +134,29 @@ describe('mod: the pure helpers the sink path and line schema rest on', async ()
     expect(sinkPath('/var/lib/5dive/mod-telemetry', 'dev', '../x')).toBe(
       '/var/lib/5dive/mod-telemetry/dev-.._x.jsonl',
     )
+  })
+
+  test('the default sink is under the seat home the plugin is installed in', () => {
+    // Iteration 1's default was a fixed /var/lib/5dive/mod-telemetry. That tree is
+    // `drwxr-s--- root:claude`: no seat can create a subdirectory in it, so the mod
+    // wrote nothing at its own documented default. The default is now derived from the
+    // same path the seat name is, which is a directory the seat owns by construction.
+    expect(homeFromRoot('/home/agent-dev/.claude/plugins/cache/5dive-plugins/mod/0.1.0')).toBe(
+      '/home/agent-dev',
+    )
+    expect(homeFromRoot('/home/claude/projects/5dive/5dive-plugins/plugins/mod')).toBe(
+      '/home/claude',
+    )
+    expect(homeFromRoot('/home/agent-dev')).toBe('/home/agent-dev')
+    expect(homeFromRoot('/opt/somewhere/mod')).toBeNull()
+    expect(homeFromRoot('/home')).toBeNull()
+    // The pair the sink path is actually built from.
+    const root = '/home/agent-dev/.claude/plugins/cache/5dive-plugins/mod/0.1.0'
+    expect(sinkPath(`${homeFromRoot(root)}/.5dive/mod-telemetry`, seatFromRoot(root), 's1')).toBe(
+      '/home/agent-dev/.5dive/mod-telemetry/dev-s1.jsonl',
+    )
+    // And nothing anywhere in the module still defaults to the unwritable tree.
+    expect(SRC).not.toContain("'/var/lib/5dive/mod-telemetry'")
   })
 
   test('the gate block is read defensively', () => {
@@ -164,5 +196,94 @@ describe('mod: the pure helpers the sink path and line schema rest on', async ()
     }
     const line = JSON.parse(lineFor(s, { ts: 1, event: 'tool.call', tool: 'Bash' }))
     expect('usage' in line).toBe(false)
+  })
+})
+
+describe('mod: the sink write fails loudly, once, and then the mod is off', async () => {
+  // The arms in this block share the module's session state (`stopped`, the "said it
+  // once" latches, the flush chain) BY DESIGN — latching is the property under test, so
+  // they run in order and each one depends on the one before it.
+  const { record, producerFor } = await import(join(ROOT, 'hooks', 'register.ts'))
+
+  const live = (path: string) => ({
+    on: true as const,
+    seat: 'dev',
+    path,
+    producer: producerFor('mod'),
+    sessionId: 'sess1',
+  })
+
+  const writes: Array<{ path: string; text: string }> = []
+  const logs: string[] = []
+  let failWrites = false
+
+  // A stub engine. `record` takes `$` as an argument (the host scan admits that for a
+  // top-level function), which is what makes the write path gradeable at all.
+  const engine = {
+    fs: {
+      write: async (path: string, text: string) => {
+        if (failWrites) throw new Error('EACCES: permission denied')
+        writes.push({ path, text })
+      },
+    },
+    ui: {
+      log: (text: string) => {
+        logs.push(text)
+      },
+    },
+  } as unknown as Parameters<typeof record>[0]
+
+  /** Let the chained write promise settle. */
+  const settle = () => new Promise((r) => setTimeout(r, 0))
+
+  test('a healthy write reaches the sink and says nothing', async () => {
+    record(engine, live('/tmp/dev-sess1.jsonl'), { ts: 1, event: 'turn.start', turn_id: 't1' })
+    await settle()
+    expect(writes.length).toBe(1)
+    expect(writes[0]!.path).toBe('/tmp/dev-sess1.jsonl')
+    expect(JSON.parse(writes[0]!.text.trim()).event).toBe('turn.start')
+    expect(logs).toEqual([])
+  })
+
+  test('a rejected write logs ONE line naming the path and the error', async () => {
+    // This is the arm iteration 1 did not have. The handler there was `() => {}`: every
+    // event failed identically and silently forever, and the only observable — no sink
+    // file — is the same one the two negative controls produce when the mod is OFF.
+    failWrites = true
+    // TWO events in the same tick, which is what a real turn does: both are already in
+    // the flush chain before the first rejection lands, so both reject. The line is
+    // said ONCE per session — a per-event line would bury the debug log of every seat
+    // that ever misconfigures the directory.
+    record(engine, live('/var/lib/5dive/mod-telemetry/dev-sess1.jsonl'), {
+      ts: 2,
+      event: 'turn.complete',
+      turn_id: 't1',
+      reason: 'answer',
+    })
+    record(engine, live('/var/lib/5dive/mod-telemetry/dev-sess1.jsonl'), {
+      ts: 3,
+      event: 'command.run',
+      command: 'status',
+    })
+    await settle()
+    expect(logs.length).toBe(1)
+    expect(logs[0]).toContain('5dive mod')
+    expect(logs[0]).toContain('/var/lib/5dive/mod-telemetry/dev-sess1.jsonl')
+    expect(logs[0]).toContain('EACCES')
+  })
+
+  test('the mod is latched off: no further write, and it does not say it twice', async () => {
+    failWrites = false
+    const before = writes.length
+    record(engine, live('/tmp/dev-sess1.jsonl'), { ts: 3, event: 'tool.call', tool: 'Bash' })
+    await settle()
+    expect(writes.length).toBe(before)
+    expect(logs.length).toBe(1)
+  })
+
+  test('nothing propagated: the recorder never throws and never returns a promise', () => {
+    // record() is called from inside a hook that has already resolved `next(e)`. If it
+    // could throw or be awaited, telemetry could fail or delay a turn.
+    expect(record(engine, live('/tmp/x.jsonl'), { ts: 4, event: 'session.end' })).toBeUndefined()
   })
 })
