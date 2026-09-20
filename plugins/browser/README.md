@@ -265,6 +265,48 @@ unrelated host it renders a logged-out page that reads as a bug in this command.
 `--full` is a **tall viewport**, which is the most headless Chrome's screenshot can honestly
 promise — it does not scroll-stitch a page.
 
+### `browser snapshot` — one cycle, one page instant, everything a decision needs
+
+```
+5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full]
+```
+
+Before an agent acts on a page it reads the same three things: **what it can click** (`tree`),
+**what the page says** (`read`), and **what it looks like** (`shot`). Each of those is a separate
+command, and each command here is a browser cycle — probe the session, open a browser at the
+profile, load the URL, do one thing, close. Three cycles and three loads of the same page, for one
+decision. `snapshot` is those three reads as **one** cycle: one navigation, one page-side walk that
+returns the refs *and* the document, and one screenshot of that same tab.
+
+The count is the point, and it is the shape jev-ultrafast measured upstream (1092 protocol calls on
+a task whose work is 101): the cost is not the work, it is asking for it in pieces.
+
+**The second half is correctness, and it is the half a fast box does not fix.** Three cycles are
+three different page instants. A ref `tree` printed can be gone from the DOM `read` captured four
+seconds later; the PNG can show a consent overlay neither of them saw. Those files land in one
+directory looking like one observation of one page, and nothing in them says otherwise. Here they
+come from one tab at one instant, so the artifact directory is honest by construction.
+
+The artifacts, 0600 in a 0700 directory chosen exactly as `read` chooses one:
+
+| file | what it is |
+| --- | --- |
+| `tree.json` | the addressable nodes: `ref=<role>/<name>[#n]`, quotable straight into `run` |
+| `page.md` | the extracted article, from the **same pinned Defuddle bundle** `read` uses |
+| `page.html` | the document both of the above came from, hashed in `page.meta.json` |
+| `page.meta.json` | URLs, metadata, links, images, word count, versions, SHA-256 — `capture` reads `snapshot` |
+| `page.png` | the same tab at the same instant (`--no-shot` skips it; `--full` is a tall viewport) |
+
+**On a served profile it runs inside the warm browser** (DIVE-4621's daemon) — no launch, no stop,
+no restart, and a person at a viewer is not disturbed. This is the render op that daemon did not
+have, which is why `shot` and `read` still cycle a cold chrome of their own; `snapshot` does not
+retrofit them, and they remain the right verbs when one field is all you want.
+
+Every guard the other render verbs carry applies unchanged: the site boundary, the 0700 profile
+audit, the live-viewer refusal, the positive authenticated-session probe, the per-site lease, and
+the rule that an output directory is never the profile or beneath it. A capture that came back
+empty writes **no** evidence at all.
+
 ### `browser read` — Markdown and provenance from the authenticated page
 
 ```
@@ -288,7 +330,9 @@ a second crawler path.
 The phrase **DOM capture** has a precise limit here: Chrome's `--dump-dom` is a post-script serialized DOM.
 It is not the server's original response bytes, not a network archive, and not a
 SingleFile snapshot with its subresources embedded. That stronger preservation belongs to a later
-snapshot verb; describing this artifact as one would overstate what can be reconstructed.
+*archive* verb; describing this artifact as one would overstate what can be reconstructed. (The
+`snapshot` verb below is a different thing again and makes no archival claim: it is one atomic READ
+of a live page, and its `page.html` is the same kind of post-script DOM this paragraph is about.)
 
 Extraction is a reviewed, vendored bundle pinned to Defuddle 0.19.3 and linkedom 0.18.13. Nothing
 is resolved from npm at install or run time. Linkedom supplies Defuddle's documented Node DOM shape

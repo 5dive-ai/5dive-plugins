@@ -80,11 +80,31 @@ not substitute the raw `viewer` command: it mints only one half of the relay cre
 6. **Read the terminal result.** `authenticated` makes the profile usable. `session expired`
    or `CHALLENGE` still needs a person. `UNKNOWN (no adapter …)` means step 1 is incomplete;
    another `UNKNOWN` names a browser/box read failure and is not permission to act. Only after
-   `authenticated` may an agent use `run`, `shot`, `read`, or `links` for that site.
+   `authenticated` may an agent use `run`, `snapshot`, `shot`, `read`, or `links` for that site.
 
 The view is ephemeral; the login profile is durable. Revoke promptly: a live viewer is a
 keyboard attached to the person's account.
 <!-- 5dive:connect-site-flow:end -->
+
+## Working the page: ONE snapshot per decision
+
+```bash
+5dive browser snapshot <site> <url>        # refs + text + PNG, one browser cycle
+5dive browser run <site> <action> --key=value   # then act, quoting a ref as the selector
+```
+
+**Reach for `snapshot` first, not for three commands.** `tree`, `read` and `shot` each open
+their own browser and load the page again, so taking all three — which is what deciding
+actually needs — costs three cycles and three loads. `snapshot` is one cycle: `tree.json`
+(the refs you quote into `run`), `page.md` (what the page says), `page.html` and a
+`page.png` of the same tab, all in one artifact directory.
+
+They are also **one page instant**, which the three separate commands are not: a ref printed
+by `tree` can be gone from the DOM `read` captured seconds later, and nothing in the two
+files says so. Use `tree`, `read` or `shot` when one field really is all you want.
+
+**Never guess a selector.** A ref is `ref=<role>/<accessible name>[#n]` and is re-derived from
+the page every time, so it survives a reload — an obfuscated class name does not.
 
 ## What will actually go wrong
 

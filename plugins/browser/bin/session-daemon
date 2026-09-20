@@ -198,6 +198,7 @@ async function serveMode(profile, sock) {
       try {
         if (req.op === 'probe') await probeRequest(ctx, req, send, end);
       else if (req.op === 'tree') await treeRequest(ctx, req, send, end);
+        else if (req.op === 'snapshot') await snapshotRequest(ctx, req, send, end);
         else if (req.op === 'plan') await planRequest(ctx, req, send, end);
         else { send({ t: 'err', msg: `unknown op '${req.op}'` }); end(E_NOTHING_RAN); }
       } catch (e) {
@@ -293,6 +294,54 @@ async function treeRequest(ctx, req, send, end) {
     end(0);
   } catch (e) {
     send({ t: 'err', msg: `could not enumerate ${req.url}: ${e.message}` });
+    end(E_NOTHING_RAN);
+  }
+}
+
+// ---- snapshot: the decision payload, warm and in one round trip (DIVE-4653)
+//
+// This is the op the DIVE-4621 header said the daemon did not have. `shot` and
+// `read` kept a cold chrome of their own because the daemon could only navigate
+// and enumerate — it had no way to hand back a document or a picture, so giving
+// those verbs the warm session would have meant rendering nothing.
+//
+// `snapshot` closes that without retrofitting either verb: one request, one
+// navigation inside the browser that is ALREADY holding this profile, one
+// page-side walk that returns the refs AND the document, and one screenshot of
+// that same tab. Three cold cycles (a launch, a session probe and a load each)
+// become one socket call.
+//
+// THE DOCUMENT AND THE PNG ARE WRITTEN TO FILES THE CALLER NAMED, and the socket
+// carries only the small payload. The daemon is this seat's own process writing
+// inside this seat's own 0700 artifact directory, which bin/browser made — so
+// this adds no reach, and it keeps a multi-megabyte document out of a protocol
+// framed as JSON lines.
+async function snapshotRequest(ctx, req, send, end) {
+  if (typeof req.url !== 'string' || !/^https?:\/\//.test(req.url)) {
+    send({ t: 'err', msg: 'snapshot needs an http(s) url to capture' }); return end(E_NOTHING_RAN);
+  }
+  if (typeof req.html !== 'string' || !req.html.startsWith('/')) {
+    send({ t: 'err', msg: 'snapshot needs an absolute path to write the captured document to' });
+    return end(E_NOTHING_RAN);
+  }
+  try {
+    const page = await pageOf(ctx);
+    assertLease(req, 'snapshot');
+    await page.goto(req.url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
+    const snap = await aria.snapshot(page, { interactiveOnly: !!req.interactive });
+    fs.writeFileSync(req.html, snap.html || '', { mode: 0o600 });
+    if (req.shot) await page.screenshot({ path: req.shot, fullPage: !!req.full });
+    send({ t: 'out', data: JSON.stringify({
+      url: snap.url || req.url,
+      title: snap.title || '',
+      nodes: snap.nodes || [],
+      html_bytes: Buffer.byteLength(snap.html || ''),
+      png: req.shot || null,
+    }) + '\n' });
+    end(0);
+  } catch (e) {
+    send({ t: 'err', msg: `could not capture ${req.url}: ${e.message}` });
     end(E_NOTHING_RAN);
   }
 }

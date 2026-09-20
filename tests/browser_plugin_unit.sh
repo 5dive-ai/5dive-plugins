@@ -2036,9 +2036,16 @@ const page = {
   // shim in T23a — a stub cannot grade a function it is standing in for.
   evaluate: async (fn, arg) => {
     rec({ call: 'evaluate', fnlen: String(fn).length, mark: (arg && arg.mark) || null,
-          interactiveOnly: !!(arg && arg.interactiveOnly) });
+          interactiveOnly: !!(arg && arg.interactiveOnly), snapshot: !!(arg && arg.snapshot) });
     if (process.env.PWWALK) return JSON.parse(fs.readFileSync(process.env.PWWALK, 'utf8'));
     return { nodes: [], marker: null };
+  },
+  // DIVE-4653. The snapshot takes its picture through the page that is already
+  // open, so the tape has to carry the call — an arm that could not see it could
+  // not tell "same tab" from "a second browser nobody noticed".
+  screenshot: async (o) => {
+    rec({ call: 'screenshot', path: (o && o.path) || null, fullPage: !!(o && o.fullPage) });
+    if (o && o.path) fs.writeFileSync(o.path, process.env.PWSHOT || 'stub-png');
   },
   selectOption: async (sel, val) => rec({ call: 'selectOption', sel, val }),
   setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p }),
@@ -3130,7 +3137,15 @@ const mkpage = (kind) => ({
   click: async (sel) => { rec({ call: 'click', sel, kind }); if (process.env.PWFAIL) throw new Error('stub: the step failed'); },
   waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel, kind }),
   waitForTimeout: async (ms) => rec({ call: 'waitForTimeout', ms, kind }),
-  evaluate: async (fn, arg) => { rec({ call: 'evaluate', kind, mark: (arg && arg.mark) || null }); return { nodes: [], marker: null }; },
+  evaluate: async (fn, arg) => {
+    rec({ call: 'evaluate', kind, mark: (arg && arg.mark) || null, snapshot: !!(arg && arg.snapshot) });
+    if (arg && arg.snapshot && process.env.DPWSNAP) return JSON.parse(fs.readFileSync(process.env.DPWSNAP, 'utf8'));
+    return { nodes: [], marker: null };
+  },
+  screenshot: async (o) => {
+    rec({ call: 'screenshot', path: (o && o.path) || null, fullPage: !!(o && o.fullPage), kind });
+    if (o && o.path) fs.writeFileSync(o.path, process.env.PWSHOT || 'stub-png');
+  },
   selectOption: async (sel, val) => rec({ call: 'selectOption', sel, val, kind }),
   setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p, kind }),
   press: async (sel, key) => rec({ call: 'press', sel, key, kind }),
@@ -3401,6 +3416,210 @@ t  'T25k ...it is ALIVE, not just a pid in a file' 'alive' \
    "$(kill -0 "${KPID2:-0}" 2>/dev/null && echo alive || echo dead)"
 t  'T25k ...and its socket ANSWERS — the profile is warm again, not just served' 'pong' \
    "$(kping 2>/dev/null | tr -d '\n')"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+
+# ============= T26 DIVE-4653: one snapshot per decision, not one verb per field
+#
+# WHAT IS GRADED HERE, and it is two claims, not one.
+#
+# (1) THE COUNT. The three reads an agent makes before it acts — refs, document,
+#     picture — cost three browser cycles and three loads of the same URL today,
+#     one per verb. `snapshot` costs one of each. The arms count the tape rather
+#     than the clock: a wall-clock number is a fact about this runner, a call
+#     count is a fact about the design, and the upstream measurement this row
+#     lifts (1092 protocol calls where 101 do the work) is a count too.
+#
+# (2) THE INSTANT, which is the half that survives a fast box. Three cycles are
+#     three different page instants, so the refs, the Markdown and the PNG in one
+#     artifact directory can disagree with each other and nothing in them says
+#     so. These arms prove the three outputs come from ONE evaluate of ONE tab:
+#     the document hashed in page.meta.json is the document the refs were walked
+#     out of, and the PNG was taken through the same page object with no second
+#     navigation.
+#
+# The mutants that would pass a weaker suite: a `snapshot` that simply CALLS tree
+# then read then shot internally (T26b, T26c), one that re-navigates for the PNG
+# (T26d), one that writes evidence from a capture that failed (T26g), and one
+# that reaches the page by a second, laxer walk of its own (T26c).
+#
+# THE COLD ARMS RUN ON A COLD PROFILE, and saying so is not housekeeping: an
+# earlier section leaves shot.example.com SERVED, and a served profile is exactly
+# the case where `snapshot` goes through the daemon instead of the driver — so
+# without this stop the arms below would grade the warm path while claiming to
+# grade the cold one, and their tape would be empty. The warm path has its own
+# arms (T26i) with its own tape.
+env PATH="$READPATH" "$BROWSER" serve shot.example.com --stop >/dev/null 2>&1
+# AND THE SHIPPED DRIVER IS WHAT RUNS. An earlier section left `mkdriver`'s stub
+# exported, and that stub exits 0 having written nothing — which is precisely the
+# shape `snapshot` refuses ("the capture produced no document"), so every arm
+# below would red on a correct product and blame the wrong file. T16a does the
+# same unset for the same reason.
+unset FIVEDIVE_BROWSER_DRIVER
+SNAPWALK="$TMP/snap-walk.json"
+SNAPOUT="$TMP/snap-evidence"
+jq -n --arg html "$(cat "$READHTML")" '{
+  nodes: [ {ref:"link/Next signal", role:"link", name:"Next signal", tag:"a"},
+           {ref:"heading/Signal Article", role:"heading", name:"Signal Article", tag:"h1"} ],
+  marker: null,
+  title: "Signal Article",
+  url: "https://shot.example.com/article/1",
+  html: $html
+}' > "$SNAPWALK"
+
+SNAPARGV="$TMP/snap-argv.txt"
+snapenv() { env PATH="$READPATH" READARGV="$SNAPARGV" READ_HTML="$READHTML" \
+                NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$SNAPWALK" "$@"; }
+pwn() { jq -rs "[.[]|select(.call==\"$1\")]|length" "$PWREC"; }
+
+: > "$PWREC"; : > "$SNAPARGV"; rm -rf "$SNAPOUT"
+run snapenv "$BROWSER" snapshot shot.example.com "https://shot.example.com/article/1" --out="$SNAPOUT"
+t  'T26a snapshot exits zero for the authenticated page' 0 "$RC"
+t  'T26a ...and leaves ONE artifact directory holding all four outputs' 'yes' \
+   "$([[ -s "$SNAPOUT/page.md" && -s "$SNAPOUT/page.html" && -s "$SNAPOUT/page.meta.json" && -s "$SNAPOUT/tree.json" && -s "$SNAPOUT/page.png" ]] && echo yes || echo no)"
+t  'T26a ...each one seat-private' '600 600 600 600 600' \
+   "$(stat -c %a "$SNAPOUT/page.html" "$SNAPOUT/page.md" "$SNAPOUT/page.meta.json" "$SNAPOUT/tree.json" "$SNAPOUT/page.png" | tr '\n' ' ' | sed 's/ $//')"
+tc 'T26a the document went through the pinned extractor' 'useful authenticated article content' "$(cat "$SNAPOUT/page.md")"
+t  'T26a the refs are addressable' 'link/Next signal' "$(jq -r '.nodes[0].ref' "$SNAPOUT/tree.json")"
+t  'T26a ...and the payload names the URL the page SETTLED on' 'https://shot.example.com/article/1' \
+   "$(jq -r '.url' "$SNAPOUT/tree.json")"
+
+# --- T26b THE COUNT: one cycle, one load -------------------------------------
+t  'T26b one browser was launched for the whole decision' '1' "$(pwn launch)"
+t  'T26b ...the page was loaded exactly ONCE' '1' "$(pwn goto)"
+t  'T26b ...and the page was read exactly ONCE' '1' "$(pwn evaluate)"
+t  'T26b ...that read was the atomic one, not the plain walk' 'true' \
+   "$(jq -rs '[.[]|select(.call=="evaluate")|.snapshot]|first' "$PWREC")"
+t  'T26b the browser was closed again — no session left held' '1' "$(pwn close)"
+# THE CONTROL, and without it the four numbers above are unattributable: the same
+# decision, taken the way it is taken today. `tree` is the same playwright tape;
+# `read` and `shot` drive chrome directly, so their loads are counted off the
+# chrome argv log. Three cycles, three loads of the same URL, three page instants.
+CTLARGV="$TMP/snap-ctl-argv.txt"
+ctlenv() { env PATH="$READPATH" READARGV="$CTLARGV" READ_HTML="$READHTML" \
+               NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$SNAPWALK" "$@"; }
+: > "$PWREC"; : > "$CTLARGV"; rm -rf "$TMP/snap-ctl-read" "$TMP/snap-ctl.png"
+ctlenv "$BROWSER" tree shot.example.com "https://shot.example.com/article/1" >/dev/null 2>&1
+ctlenv "$BROWSER" read shot.example.com "https://shot.example.com/article/1" --out="$TMP/snap-ctl-read" >/dev/null 2>&1
+ctlenv "$BROWSER" shot shot.example.com "https://shot.example.com/article/1" --out="$TMP/snap-ctl.png" >/dev/null 2>&1
+CTL_CYCLES=$(( $(pwn launch) + $(grep -c -- '--user-data-dir' "$CTLARGV" 2>/dev/null || echo 0) ))
+CTL_TARGET=$(( $(pwn goto) + $(grep -c -- 'article/1' "$CTLARGV" 2>/dev/null || echo 0) ))
+t  'T26b (control) the three verbs it replaces open THREE browser cycles, before probes' 'yes' \
+   "$([[ "$CTL_CYCLES" -ge 3 ]] && echo yes || echo "no:$CTL_CYCLES")"
+t  'T26b (control) ...and load the SAME url three times, at three different instants' 'yes' \
+   "$([[ "$CTL_TARGET" -ge 3 ]] && echo yes || echo "no:$CTL_TARGET")"
+
+# --- T26c ONE WALK: the refs and the document are the same observation --------
+# The mutant this stops is the cheap implementation of this whole verb — a
+# `snapshot` that shells out to tree, then to read, and staples the outputs
+# together. It would pass T26a completely.
+t  'T26c the bytes hashed in the metadata ARE the page.html that shipped' \
+   "$(sha256sum "$SNAPOUT/page.html" | cut -d' ' -f1)" "$(jq -r .sha256 "$SNAPOUT/page.meta.json")"
+t  'T26c the metadata names the capture honestly, and not as a dump-dom' 'snapshot' \
+   "$(jq -r .capture "$SNAPOUT/page.meta.json")"
+t  'T26c no --dump-dom chrome ran for this capture at all' 'none' \
+   "$(grep -c -- '--dump-dom.*article/1' "$SNAPARGV" 2>/dev/null | sed 's/^0$/none/')"
+t  'T26c ...and no --screenshot chrome ran for it either' 'none' \
+   "$(grep -c -- '--screenshot' "$SNAPARGV" 2>/dev/null | sed 's/^0$/none/')"
+t  'T26c the derivation is the one `read` uses — same extractor pin' '0.19.3' \
+   "$(jq -r .defuddle_version "$SNAPOUT/page.meta.json")"
+
+# --- T26d the PNG is the SAME TAB, not a second visit ------------------------
+: > "$PWREC"; rm -rf "$TMP/snap-shot2"
+run snapenv "$BROWSER" snapshot shot.example.com "https://shot.example.com/article/1" --out="$TMP/snap-shot2"
+t  'T26d the screenshot was taken through the page already open' '1' "$(pwn screenshot)"
+t  'T26d ...with NO second navigation to take it' '1' "$(pwn goto)"
+t  'T26d ...and it landed where the artifact directory says' 'yes' \
+   "$([[ -s "$TMP/snap-shot2/page.png" ]] && echo yes || echo no)"
+: > "$PWREC"; rm -rf "$TMP/snap-noshot"
+run snapenv "$BROWSER" snapshot shot.example.com "https://shot.example.com/article/1" --out="$TMP/snap-noshot" --no-shot
+t  'T26d --no-shot takes no picture at all' '0' "$(pwn screenshot)"
+t  'T26d ...and ships no PNG next to the rest' 'no' \
+   "$([[ -e "$TMP/snap-noshot/page.png" ]] && echo yes || echo no)"
+t  'T26d ...while the document and the refs are still there' 'yes' \
+   "$([[ -s "$TMP/snap-noshot/page.md" && -s "$TMP/snap-noshot/tree.json" ]] && echo yes || echo no)"
+
+# --- T26e a snapshot is still a READ of a logged-in profile -------------------
+# Every guard the other render verbs earned applies here, and they are re-graded
+# rather than assumed: this verb reaches the profile by its own road.
+printf '%s' "$DEAD_DOM" > "$SHOTDIR/.fake-dom"
+run snapenv "$BROWSER" snapshot shot.example.com "https://shot.example.com/article/1" --out="$TMP/snap-loggedout"
+t  'T26e a logged-out snapshot refuses' 75 "$RC"
+t  'T26e ...and writes nothing, not even an empty directory' 'no' \
+   "$([[ -e "$TMP/snap-loggedout" ]] && echo yes || echo no)"
+printf '%s' "$LIVE_DOM" > "$SHOTDIR/.fake-dom"
+run snapenv "$BROWSER" snapshot shot.example.com "https://shot.example.com/article/1" --out="$SHOTDIR/snapderived"
+t  'T26e an output beneath the browser profile is refused' 77 "$RC"
+t  'T26e ...and nothing is left in the profile' 'no' \
+   "$([[ -e "$SHOTDIR/snapderived" ]] && echo yes || echo no)"
+run snapenv "$BROWSER" snapshot shot.example.com "https://other.example.com/article/1" --out="$TMP/snap-crosssite"
+t  'T26e a url outside the profile'"'"'s site is refused' 64 "$RC"
+: > "$PWREC"
+run snapenv "$BROWSER" snapshot shot.example.com "https://shot.example.com/article/1" --out="$TMP/snap-json" --json
+t  'T26f --json prints one object a caller can act on' 'yes' \
+   "$(jq -e '.title == "Signal Article" and (.nodes|length) == 2 and (.artifacts|type=="string")' <<<"$OUT" >/dev/null && echo yes || echo no)"
+
+# --- T26g A CAPTURE THAT FAILED WRITES NO EVIDENCE ---------------------------
+# The shape this file has refused since T15: an artifact directory is read as an
+# observation of the page, so a partial one is worse than none. Driven with a
+# walk fixture that returns an EMPTY document, which is what a capture that never
+# reached the page looks like from here.
+printf '{"nodes":[],"marker":null,"title":"","url":"https://shot.example.com/article/1","html":""}' > "$TMP/snap-empty.json"
+rm -rf "$TMP/snap-fail"
+run env PATH="$READPATH" READARGV="$READARGV" READ_HTML="$READHTML" \
+        NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$TMP/snap-empty.json" \
+        "$BROWSER" snapshot shot.example.com "https://shot.example.com/article/1" --out="$TMP/snap-fail"
+t  'T26g an empty capture is a refusal, not an empty evidence set' 69 "$RC"
+t  'T26g ...and no page.md was written for a page nobody read' 'no' \
+   "$([[ -e "$TMP/snap-fail/page.md" ]] && echo yes || echo no)"
+# THE DRIVER'S OWN GUARD, driven directly: a relative path for the document is a
+# refusal BEFORE the browser opens, so a caller that got it wrong does not learn
+# about it by finding a file in whatever directory the daemon happened to be in.
+: > "$PWREC"
+printf '{"profile":"%s","mode":"snapshot","url":"https://x.test/","html":"page.html"}' \
+  "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/x" | \
+  env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true \
+      "$DRV" >/dev/null 2>"$TMP/t26g.err"; RC=$?
+t  'T26g the driver refuses a relative document path' 70 "$RC"
+t  'T26g ...before opening a browser to find out' '0' "$(pwn launch)"
+
+run env PATH="$READPATH" "$BROWSER" --help
+tc 'T26h --help lists snapshot' '5dive browser snapshot' "$OUT"
+tc 'T26h README documents the one-cycle read' 'browser snapshot' "$(cat "$ROOT/plugins/browser/README.md")"
+tc 'T26h the agent-facing doc tells an agent to reach for it first' 'browser snapshot' \
+   "$(cat "$ROOT/plugins/browser/AGENTS.md")"
+
+# --- T26i THE WARM PATH: the daemon got the render op it did not have ---------
+# DIVE-4621 shipped the session daemon with probe/tree/plan and said so in its
+# own header: `shot` and `read` keep cycling a cold chrome because the daemon has
+# no way to hand back a document or a picture. `snapshot` is that op. Graded
+# through the daemon stub, on the served warm.test profile, counting the tape the
+# same way: one navigation and one read INSIDE the browser already holding the
+# profile, and no launch at all.
+DSNAP="$TMP/dpw-snap.json"
+jq -n --arg html "$LIVE_DOM" '{nodes:[{ref:"button/Compose", role:"button", name:"Compose", tag:"button"}],
+  marker:null, title:"Warm Page", url:"https://warm.test/p", html:$html}' > "$DSNAP"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+DREC2="$TMP/dpw-snap.jsonl"; : > "$DREC2"
+run env PATH="$SPATH" DISPLAY= NODE_PATH="$DSTUB/node_modules" PWREC="$DREC2" DPWDOM="$DPWDOM" \
+    DPWSNAP="$DSNAP" "$BROWSER" serve warm.test
+t  'T26i (anchor) the profile is held by a warm daemon first' 0 "$RC"
+DLAUNCH_BEFORE="$(jq -rs '[.[]|select(.call=="launch")]|length' "$DREC2")"
+rm -rf "$TMP/snap-warm"
+run env PATH="$SPATH" NODE_PATH="$DSTUB/node_modules" PWREC="$DREC2" DPWDOM="$DPWDOM" DPWSNAP="$DSNAP" \
+    "$BROWSER" snapshot warm.test "https://warm.test/p" --out="$TMP/snap-warm"
+t  'T26i a snapshot on a warm profile succeeds' 0 "$RC"
+t  'T26i ...and opened NO new browser to do it' "$DLAUNCH_BEFORE" \
+   "$(jq -rs '[.[]|select(.call=="launch")]|length' "$DREC2")"
+t  'T26i ...it read the page atomically, in the browser that was already open' 'true' \
+   "$(jq -rs '[.[]|select(.call=="evaluate" and .snapshot==true)|.snapshot]|last' "$DREC2")"
+t  'T26i ...and took the picture through that same tab' 'yes' \
+   "$(jq -rs '[.[]|select(.call=="screenshot")]|length>0' "$DREC2" | sed 's/true/yes/;s/false/no/')"
+t  'T26i the warm capture leaves the same evidence set as the cold one' 'yes' \
+   "$([[ -s "$TMP/snap-warm/page.md" && -s "$TMP/snap-warm/tree.json" && -s "$TMP/snap-warm/page.html" && -s "$TMP/snap-warm/page.png" ]] && echo yes || echo no)"
+t  'T26i ...with the refs the warm walk found' 'button/Compose' \
+   "$(jq -r '.nodes[0].ref' "$TMP/snap-warm/tree.json")"
+t  'T26i ...and the daemon is STILL holding the profile afterwards' 'alive' \
+   "$(kill -0 "$(dkv "$WDIR/.5dive-serve" daemon_pid)" 2>/dev/null && echo alive || echo gone)"
 env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

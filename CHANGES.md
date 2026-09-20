@@ -1,5 +1,38 @@
 ## Unreleased
 
+### Added — one snapshot per decision: `browser snapshot` (DIVE-4653), browser 1.8.0
+
+Before an agent acts on a page it reads the same three things: what it can click
+(`tree`), what the page says (`read`) and what it looks like (`shot`). Each of those
+is its own command, and each command is its own browser cycle — probe the session,
+open a browser at the profile, load the URL, do one thing, close. Three cycles and
+three loads of the same page, for one decision. `snapshot` is those three reads as
+ONE cycle: one navigation, one page-side walk that returns the refs *and* the
+document, and one screenshot of that same tab. On a served profile it runs inside
+the warm browser — the render op the DIVE-4621 daemon did not have.
+
+The second half is correctness, and a faster box does not fix it. Three cycles are
+three different page instants: a ref `tree` printed can be gone from the DOM `read`
+captured seconds later, and the PNG can show an overlay neither saw. Those files land
+in one artifact directory looking like one observation and nothing in them says
+otherwise. Here they come from one `page.evaluate` of one tab, so `page.meta.json`
+hashes the very bytes the refs were walked out of.
+
+The count is graded deterministically in the unit suite (one launch, one navigation,
+one read, against a control that shows the three verbs taking three of each). The wall
+clock comes from a rig that ships with the change — `tests/browser_snapshot_bench.sh`,
+which anyone can re-run — on a local static page, one box, two iterations, 2026-09-20:
+nothing served **6380 -> 3507 ms (1.8x)**, warm daemon **7687 -> 3006 ms (2.6x)**. The
+warm three-verb arm is the *slowest* of the four because two of those three verbs stop
+and restart the daemon to get the profile; `snapshot` never does. A local page makes
+this an upper bound on the ratio for this task shape, not a constant — a real
+application spends more time in the page and less in the launch, and the claim that
+survives there is the cycle count.
+
+`tree`, `read` and `shot` are unchanged and are still the right verb when one field is
+all you want; `read`'s independent `--dump-dom` capture keeps its own provenance.
+
+
 ### Added — a warm browser session: `serve` holds one Chrome and commands attach to it (DIVE-4621), browser 1.7.0
 
 `serve` was an Xvfb and an abandoned Chrome. Because Chrome allows one instance per

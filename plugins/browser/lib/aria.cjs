@@ -170,6 +170,38 @@ function pageWalk(opts) {
     }
     return { ref: ref, role: o.role, name: o.name, tag: o.el.tagName.toLowerCase() };
   });
+
+  // ---- ONE SNAPSHOT PER DECISION (DIVE-4653) --------------------------------
+  //
+  // An agent deciding what to do on a page needs three things: what it can act
+  // on (the refs above), what the page SAYS (the DOM, which the pinned extractor
+  // turns into Markdown), and where it actually ended up (the post-redirect URL
+  // and title). Until this flag those were three separate commands, each opening
+  // its own browser and loading the same URL again — `tree` here, `read` through
+  // a second chrome with --dump-dom, `shot` through a third with --screenshot.
+  //
+  // Three loads is not only slow, it is three DIFFERENT page instants: a ref
+  // `tree` printed can be missing from the DOM `read` captured a few seconds
+  // later, and neither output says so. Reading the extra fields HERE, inside the
+  // walk that is already standing in the page, makes the whole payload one
+  // instant by construction — there is no window for the page to move in.
+  //
+  // It is a FLAG ON THE SAME WALK rather than a second page-side function on
+  // purpose. The file's own invariant is "one walk, not two": if the snapshot
+  // enumerated elements by its own copy of this code, a ref printed by `snapshot`
+  // and a ref resolved by `run` could drift apart, which is the expensive
+  // failure (clicking the wrong thing inside a real account). Callers that do not
+  // pass the flag get the byte-identical old return value.
+  if (opts.snapshot) {
+    var doc = document.documentElement;
+    return {
+      nodes: nodes,
+      marker: marker,
+      title: document.title || '',
+      url: location.href,
+      html: doc ? doc.outerHTML : '',
+    };
+  }
   return { nodes: nodes, marker: marker };
 }
 
@@ -182,6 +214,24 @@ async function walk(page, { interactiveOnly = false, mark = null } = {}) {
     interactiveOnly,
     interactiveRoles: INTERACTIVE,
     mark,
+  });
+}
+
+// THE ATOMIC READ (DIVE-4653). One page.evaluate, one DOM instant, everything a
+// decision needs: the addressable nodes, the document the extractor will read,
+// the title and the URL the page actually settled on after its redirects.
+//
+// The caller gets `html` as a string and is expected to put it on disk and hand
+// it to the SAME pinned extractor `read` uses. That split is deliberate: the
+// Markdown, the links and the word count stay the pinned extractor's answer
+// about bytes we can hash and re-extract, rather than a second summariser living
+// in the page where nobody can check it.
+async function snapshot(page, { interactiveOnly = false } = {}) {
+  return page.evaluate(pageWalk, {
+    interactiveOnly,
+    interactiveRoles: INTERACTIVE,
+    mark: null,
+    snapshot: true,
   });
 }
 
@@ -226,4 +276,4 @@ function render(nodes, { json = false } = {}) {
   }).join('\n');
 }
 
-module.exports = { INTERACTIVE, pageWalk, walk, resolveRef, resolveSelector, isRef, render, REF_PREFIX };
+module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector, isRef, render, REF_PREFIX };
