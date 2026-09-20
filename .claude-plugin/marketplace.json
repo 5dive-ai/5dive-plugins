@@ -41,6 +41,13 @@
       "category": "channel",
       "source": "./plugins/browser",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/browser"
+    },
+    {
+      "name": "mod",
+      "description": "Seat telemetry from inside the harness: turn and session boundaries and the account's usage meter, published to a per-seat JSONL sink for the heartbeat, the pacing floor and the self-update sweep to read instead of inferring from pane samples and the task board. Observe-only and off unless the seat opts in.",
+      "category": "productivity",
+      "source": "./plugins/mod",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/mod"
     }
   ]
 }
