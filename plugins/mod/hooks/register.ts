@@ -611,6 +611,9 @@ let commands: Promise<Commands> | null = null
 let registerFailureLogged = false
 let auditFailureLogged = false
 
+/** The context-cost audit is one line per session, on the first completed turn. */
+let auditDone = false
+
 /**
  * Decides once whether this session serves the commands, and registers them.
  *
@@ -757,12 +760,6 @@ export const register: Register = (on) => {
         event: 'session.start',
         reason: e.isInteractive ? 'interactive' : 'headless',
         usage: await usage($),
-        // DIVE-4693's before/after is read off this field, once per session and only
-        // when the seat asked for it. Requires the sink (FLAG), because a measurement
-        // with nowhere to land is not one.
-        ...(String(envOf(await $.settings.read())[AUDIT_FLAG] ?? '') === '1'
-          ? { context_cost: await contextCost($) }
-          : {}),
       })
     }
     return r
@@ -796,6 +793,22 @@ export const register: Register = (on) => {
         turn_id: e.turnId,
         reason: e.reason,
         usage: await usage($),
+        // DIVE-4693's before/after is read off this field: ONE line, on the FIRST
+        // completed turn, and only when the seat asked for it.
+        //
+        // The first COMPLETED turn and not `session.start`, and the difference is the
+        // measurement: at session.start the breakdown is taken before a request has
+        // been assembled, and it reports counts for listings whose token figures are
+        // not yet the ones a turn pays (measured 2026-09-20 — two arms differing by
+        // four listed commands both reported an identical slash-command token figure
+        // there, while their skill counts disagreed for no reason the arms explain).
+        // After a turn completes, the breakdown is over what was actually sent, which
+        // is the only number this row is allowed to claim a per-turn saving from.
+        ...(auditDone
+          ? {}
+          : String(envOf(await $.settings.read())[AUDIT_FLAG] ?? '') === '1'
+            ? ((auditDone = true), { context_cost: await contextCost($) })
+            : {}),
       })
     }
     return r

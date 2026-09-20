@@ -196,8 +196,11 @@ describe('mod commands: the surface stays a dispatch', () => {
     expect(SRC).toContain("const AUDIT_FLAG = 'FIVEDIVE_MOD_CONTEXT_AUDIT'")
     const breakdownCalls = [...SRC.matchAll(/breakdown: 'full'/g)]
     expect(breakdownCalls.length).toBe(1)
-    // and the one call site is reached from session.start only
-    const turnHooks = SRC.slice(SRC.indexOf("on('turn.start'"))
-    expect(turnHooks).not.toContain('contextCost(')
+    // ONE call site, and a latch in front of it, so the second turn of a session with
+    // the audit left on costs nothing. The latch is the assertion: without it the
+    // instrument would be a per-turn token-count request on every audited seat.
+    expect(SRC).toContain('let auditDone = false')
+    expect([...SRC.matchAll(/contextCost\(\$\)/g)].length).toBe(1)
+    expect(SRC).toMatch(/auditDone\s*\n?\s*\? \{\}/)
   })
 })
