@@ -237,6 +237,17 @@ describe('the compaction can neither delay a turn nor fail one', () => {
     expect(SRC).toContain('function startCompaction($: EngineInterface, s: Live, percent: number): void {')
   })
 
+  test('the compaction has its OWN chain, and it is not the writer\'s', () => {
+    // Iteration 1 queued $.session.compact() on `flush`, the chain record() writes on.
+    // Structural half of the fix (the behavioural half is in mod-telemetry.test.ts):
+    // the writer still owns `flush`, the compaction owns `compactChain`, and no
+    // $.session.compact call is ever assigned back into `flush`.
+    expect(SRC).toContain('let compactChain: Promise<void> = Promise.resolve()')
+    expect(SRC).toContain('compactChain = compactChain\n    .then(() => $.session.compact(')
+    expect(SRC).toContain('flush = flush.then(() => $.fs.write(path, text))')
+    expect(SRC).not.toMatch(/flush\s*=\s*flush[\s\S]{0,80}\$\.session\.compact/)
+  })
+
   test('turn.complete is the PRIMARY boundary, and it decides AFTER clearing inTurn', () => {
     // Measured on Claude Code 2.1.278, 2026-09-20: `session.measure` fired BEFORE
     // `turn.complete` in a headless run, so the mod's own turn-gate refused it

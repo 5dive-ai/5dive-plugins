@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Added — boundary compaction for the non-fresh seats (DIVE-4695), mod 0.2.0
+### Added — boundary compaction for the non-fresh seats (DIVE-4695), mod 0.3.0
 
 `main` and `marketing` run with `heartbeat.fresh=false`, so the dispatcher never `/clear`s
 them and every wake lands on the whole accumulated window. Measured 2026-09-20 (`sudo 5dive
@@ -22,6 +22,45 @@ Two things the live lab run changed: the trigger is `turn.complete`, not `sessio
 (which was observed firing BEFORE `turn.complete` on 2.1.278, where the call rejects), and
 `$.session.compact` needs a mounted session — a `claude -p` run refuses it, and the refusal
 is a counted line rather than a crash.
+
+The compaction runs on a promise chain of its **own**, not the telemetry writer's. A
+compaction is a ~50s model call; queued on the writer's chain it delayed no turn but it
+delayed every sink write behind it, including the next `turn.start` — and that sink is
+what the heartbeat, the pacing floor and the pending-restart sweep read idle/busy from, so
+a compacting seat would have read as a silent one for ~50s.
+
+### Added — `/task` and `/gate` as first-class commands, and what the swap actually saves (DIVE-4693), mod 0.2.0
+
+The `mod` plugin now registers two slash commands with `$.command.register` and serves them by
+dispatching to the `5dive` CLI in the harness process: `/task <verb> …` and `/gate <ident> …`. The
+CLI stays the single source of truth — no flag parsing, no defaults, no re-implemented guard, and
+no shell (`$.process.run` takes an argv, so nothing in an ask or a row body can be interpreted as
+one). Off unless the seat sets `FIVEDIVE_MOD_COMMANDS=1`, independently of the telemetry flag.
+
+The verb list is an allowlist and `task add` is **refused by name**: on this fleet the filing cap
+is a `PreToolUse` hook on the *Bash tool*, and a verb dispatched in-process never crosses it, so
+offering `add` here would be a way around a rail rather than a shortcut to it.
+
+**The row's question was whether this saves per-turn tokens, and the answer is a number with a
+caveat.** Measured 2026-09-20 on the `dev` seat, one Claude Code 2.1.278 session per arm, the
+engine's own `/context` figures read on the first completed turn through the new
+`FIVEDIVE_MOD_CONTEXT_AUDIT=1` instrument:
+
+| | skill listing | of which `5dive-cli` + `notify-user` | slash-command listing |
+| --- | --- | --- | --- |
+| commands **off** | 1988 tok / 24 skills | **132 tok** (60 + 72) | 971 tok / 24 commands |
+| commands **on** | 1988 tok / 24 skills | 132 tok | **971 tok / 24 commands** |
+
+Dropping the two skills would save **132 tokens per turn** (6.6% of the skill listing, 0.5% of a
+28k-token turn), and registering the two commands costs **nothing** — the listing is byte-identical
+across the arms.
+
+It costs nothing because the model never sees them. `totalCommands` is 24 in both arms, and a third
+arm asked a session with the commands registered to invoke `/task` or else answer `NOCMD`: it
+answered **NOCMD**. A `$.command.register` command is a surface for a *person at the composer*, not
+a capability the model can reach. So the second half of the row — dropping the two skill
+descriptions behind the flag — is **deliberately not shipped**: it would trade a model-facing
+capability for 132 tokens a turn. Detail and the raw sink lines are on DIVE-4693.
 
 ### Added — a site login is per BOX and brokered: seats use the box's login (DIVE-4664), browser 1.9.0
 

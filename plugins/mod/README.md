@@ -1,6 +1,8 @@
 # mod
 
-A 5dive telemetry **producer** built on Claude Code's function hooks (early access).
+A 5dive telemetry **producer** and a 5dive **command surface**, built on Claude Code's
+function hooks (early access). Two capabilities, two independent gates, both off by
+default.
 
 It publishes the two signals 5dive currently infers from the outside — whether a seat is
 mid-turn, and what its usage meter reads — from inside the harness process that owns
@@ -18,6 +20,19 @@ resolved to. It never denies a tool call, rewrites an input, or delays a turn. T
 `tool.call` deny-list guard and the usage-wall handling that the original proposal
 sketched are *not* here; they are separate rows, and shipping them alongside a
 measurement would make the measurement unreadable.
+
+## `/task` and `/gate`
+
+The mod also registers two slash commands that dispatch to the `5dive` CLI in the
+harness process — `/task show DIVE-1`, `/gate DIVE-1 --type=decision --ask="…"`. They
+are a thin surface over the CLI, not a second implementation, and the verbs they serve
+are an allowlist rather than a pass-through (`task add` stays on Bash, because the
+filing cap is a PreToolUse hook on the *Bash tool* and a dispatched command never
+crosses it).
+
+Gate: `FIVEDIVE_MOD_COMMANDS=1`, independent of the telemetry flag. The contract, the
+allowlist and the `FIVEDIVE_MOD_CONTEXT_AUDIT` measurement instrument are in
+[`docs/mod-commands.md`](../../docs/mod-commands.md).
 
 ## Turning it on
 
@@ -191,8 +206,15 @@ it mid-turn on every boundary. The primary trigger is `turn.complete`, after the
 clears its own `inTurn`; `session.measure` stays wired as a second trigger for the
 boundaries it does raise cleanly (a rate-limit window moving while the seat sits idle).
 
-The call itself is never awaited by either hook — it runs on the sink's own promise chain,
-so a compaction can neither delay a turn nor fail one.
+The call itself is never awaited by either hook, and it runs on a promise chain of its
+**own** (`compactChain`) rather than the one the telemetry writer uses. Both halves matter.
+Not awaiting keeps a compaction from delaying a turn or failing one. The separate chain
+keeps it from stalling the **sink**: a compaction was measured at ~50s (51.5s and 50.3s in
+the live run), and queued behind it on the writer's chain no telemetry line reached the
+file for that whole time — including the next `turn.start`. The heartbeat, the pacing
+floor and the pending-restart sweep read idle/busy off that sink, so a compacting seat
+would have read as a silent one. Overlap between two compactions is prevented by the
+in-flight latch, not by sharing a queue with the writer.
 
 ### `$.session.compact` needs a mounted session
 
