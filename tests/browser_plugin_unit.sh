@@ -149,10 +149,16 @@ chmod +x "$FAKEBIN/google-chrome"
 export PATH="$FAKEBIN:$PATH"
 
 # --- fixtures ----------------------------------------------------------------
-mkprofile() {  # mkprofile <site> <dom>
-  local d="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/$1"
+mkprofile() {  # mkprofile <site> <dom> [seat]
+  # THE SEAT IS AN ARGUMENT because a store owned by a seat whose NAME this uid
+  # does not have is the only way to tell "recorded the owner" apart from
+  # "recorded the caller" without a second uid (T27, DIVE-4664). The directory
+  # is still created by, and owned by, this uid at 0700 — which is what `_audit`
+  # grades — so the name is the only thing that moves.
+  local s="${3:-$SEAT}"
+  local d="$FIVEDIVE_BROWSER_PROFILE_ROOT/$s/$1"
   mkdir -p "$d"; chmod 700 "$d"; printf '%s' "$2" > "$d/.fake-dom"
-  chmod 700 "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT"
+  chmod 700 "$FIVEDIVE_BROWSER_PROFILE_ROOT/$s"
   echo "$d"
 }
 LIVE_DOM='<html><body><div id="feed">posts</div></body></html>'
@@ -3686,8 +3692,18 @@ env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
 #                                        answer, and a request cannot sign it.
 #   _seat believes SUDO_USER           -> T27g: euid is the seat.
 #   shot/read stay chrome-only         -> T27i: they render through the daemon.
-BOXSEAT="$SEAT"
-OTHER="agent-brokered.test"                 # a seat name this uid is NOT
+# THE BOX SEAT CARRIES A NAME THIS UID DOES NOT, and that is load-bearing rather
+# than tidiness. With BOXSEAT="$SEAT" the two halves of acceptance 3 — `holder`
+# (the seat that OWNS the profile) and `on_behalf_of` (the seat that ASKED, read
+# by the kernel) — are the same shell expansion twice, so the pair cannot tell
+# "records the caller" from "records only the owner": the one-line mutant that
+# drops FIVEDIVE_BROWSER_ON_BEHALF_OF out of `_audit_row` survives the whole
+# suite. Naming the owner separately makes the two arms measure two things.
+# It costs no root and no second uid: the store is still created by THIS uid and
+# stays 0700, so `_audit` passes on it — the same mechanism T27j's control arm
+# grades. What a NAME cannot do is skip that audit, which is T27j's subject.
+BOXSEAT="agent-box.test"                    # the OWNING seat; not this uid's name
+OTHER="agent-brokered.test"                 # a brokered seat, also not this uid
 RVROOT="$TMP/browser-sessions"              # the sibling of $TMP/profiles
 export FIVEDIVE_BROWSER_BOX_SEAT="$BOXSEAT"
 
@@ -3697,10 +3713,14 @@ mkdir -p "$RVROOT/$BOXSEAT"; chmod 711 "$RVROOT"; chmod 750 "$RVROOT/$BOXSEAT"
 
 DREC3="$TMP/dpw-record-4664.jsonl"; : > "$DREC3"
 BOXDOM="$TMP/box.dom"; printf '%s' "$LIVE_DOM" > "$BOXDOM"
-bserve() {  # the OWNER serves
+bserve() {  # the OWNER serves, out of the OWNER's store
+  # The daemon is a child of this serve and inherits its environment, so the
+  # re-entered `bin/browser` the broker uses for leases and audit rows resolves
+  # `_seat` to the OWNER — which is exactly what `holder` has to be.
   run env PATH="$SPATH" DISPLAY= NODE_PATH="$DSTUB/node_modules" PWREC="$DREC3" DPWDOM="$BOXDOM" \
-      "$@" "$BROWSER" serve box.test
+      FIVEDIVE_BROWSER_SEAT="$BOXSEAT" "$@" "$BROWSER" serve box.test
 }
+bstop() { env PATH="$SPATH" FIVEDIVE_BROWSER_SEAT="$BOXSEAT" "$BROWSER" serve box.test --stop; }
 # A SECOND SEAT, with no store of its own. NOT $SPATH: that PATH's chrome is the
 # one built to be a SERVE and it answers a --headless probe with an empty
 # document, so a seat falling back to a COLD read there would grade the fake
@@ -3712,7 +3732,7 @@ bother() {
 }
 blaunches() { jq -rs '[.[]|select(.call=="launch")]|length' "$DREC3"; }
 
-mkprofile box.test "$LIVE_DOM" >/dev/null
+mkprofile box.test "$LIVE_DOM" "$BOXSEAT" >/dev/null
 BDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$BOXSEAT/box.test"
 mkadapter box.test "file://$TMP/artifact.html" 'PUBLISHED'
 BSOCK="$RVROOT/$BOXSEAT/box.test.sock"
@@ -3773,7 +3793,10 @@ t  'T27c ...which means it launched a chrome of its own, not the daemon' "$BL2" 
 rm -rf "$FIVEDIVE_BROWSER_PROFILE_ROOT/$OTHER"
 
 # --- T27d ACCEPTANCE 2 (control): what the other seat still CANNOT do ---------
-t  'T27d the profile stays owned by the box seat alone' "$(id -u)" "$(stat -c '%u' "$BDIR")"
+# The box SEAT is a distinct name here, but there is only one uid in this suite,
+# so these two arms grade the mode and the ownership of the store — not that a
+# different human's uid is locked out. That is the arm below, and it needs root.
+t  'T27d the profile stays owned by one uid alone' "$(id -u)" "$(stat -c '%u' "$BDIR")"
 t  'T27d ...at 0700, so a cookie file in it is unreadable to any other uid' '700' "$(stat -c '%a' "$BDIR")"
 t  'T27d ...the per-owner rendezvous grants the group read+traverse and others none' '750' \
    "$(stat -c '%a' "$RVROOT/$BOXSEAT" 2>/dev/null)"
@@ -3793,7 +3816,7 @@ else
 fi
 
 # --- T27e SCOPE (b): "no daemon" and "no login" are different sentences -------
-env PATH="$SPATH" "$BROWSER" serve box.test --stop >/dev/null 2>&1
+bstop >/dev/null 2>&1
 bother "$BROWSER" status box.test
 t  'T27e a brokered site with nothing serving it refuses' 69 "$RC"
 tc 'T27e ...naming the seat whose login it is' "'$BOXSEAT' seat" "$ERR"
@@ -3818,9 +3841,16 @@ t  'T27f ...alongside the seat that owns the profile' "$BOXSEAT" \
    "$(jq -rs 'map(select(.event=="plan"))|last|.holder' "$BDIR/.5dive-audit.jsonl" 2>/dev/null)"
 t  'T27f ...and the lease it took carried the same pair' "$BOXSEAT $MYSEAT" \
    "$(jq -rs 'map(select(.event=="lease-acquire"))|last|"\(.holder) \(.on_behalf_of)"' "$BDIR/.5dive-audit.jsonl" 2>/dev/null)"
-# THE FORGERY ARM. This is the property, not the value: with one uid the name is
-# the same either way, so what has to be graded is that a REQUEST cannot choose
-# it. A daemon that trusted the field would write `somebody-else` here.
+# THE TWO NAMES ARE DIFFERENT STRINGS, and the arms above are worth nothing if
+# they stop being — a fixture that lets the owner and the caller share one name
+# passes identically whether the product records the caller or only the owner.
+# So grade the fixture here, next to the arms that depend on it.
+tn 'T27f (fixture) the owner and the caller are not the same name, or the pair above measures nothing' \
+   "$MYSEAT" "$BOXSEAT"
+# THE FORGERY ARM. The value is now measured; this is the other half of the
+# property — that a REQUEST cannot CHOOSE the name. `on_behalf_of` is the
+# kernel's answer about the connected peer, so a daemon that trusted the field
+# instead would write `somebody-else` here.
 env PATH="$SPATH" "$DAEMONBIN" call "$BSOCK" \
   <<<'{"op":"lease","act":"acquire","purpose":"forged","on_behalf_of":"somebody-else","holder":"somebody-else"}' \
   >"$TMP/forge.tok" 2>/dev/null
@@ -3830,6 +3860,8 @@ tn 'T27f ...the name it asked for appears nowhere in the record' 'somebody-else'
    "$(cat "$BDIR/.5dive-audit.jsonl" "$BDIR/.5dive-lease/meta" 2>/dev/null)"
 t  'T27f ...and the lease meta carries the calling seat too' "$MYSEAT" \
    "$(sed -n 's/^on_behalf_of=//p' "$BDIR/.5dive-lease/meta" 2>/dev/null | head -1)"
+t  'T27f ...beside the owner, which is the name "who has the browser?" used to answer with alone' "$BOXSEAT" \
+   "$(sed -n 's/^holder=//p' "$BDIR/.5dive-lease/meta" 2>/dev/null | head -1)"
 rm -rf "$BDIR/.5dive-lease"
 
 # --- T27g SCOPE (e): the seat is the EFFECTIVE uid, not SUDO_USER ------------
@@ -3838,9 +3870,14 @@ rm -rf "$BDIR/.5dive-lease"
 # CALLER. The old `${SUDO_USER:-…}` answered with the caller and then looked for
 # the caller's store while running as somebody else — the trap that forced an
 # `env SUDO_USER=` spoof into DIVE-4662's hand test.
+# A site ONLY this uid's own store holds. Not box.test: that belongs to the box
+# seat now, and `ls` advertises the box's offers to every seat — so finding it
+# would prove the offers section works, not that `_seat` ignored SUDO_USER.
+mkprofile t27g-own.test "$LIVE_DOM" >/dev/null
 run env PATH="$SPATH" SUDO_USER=a-caller-who-is-not-this-uid "$BROWSER" ls
 t  'T27g a non-root caller with SUDO_USER set is still ITSELF' 0 "$RC"
-tc 'T27g ...and reads its own store, not the store of the name in SUDO_USER' 'box.test' "$OUT"
+tc 'T27g ...and reads its own store, not the store of the name in SUDO_USER' 't27g-own.test' "$OUT"
+rm -rf "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/t27g-own.test"
 
 # --- T27h ACCEPTANCE 4: the memory number ships with its rig -----------------
 t  'T27h the per-site memory rig is in the tree' 'yes' \
@@ -3869,7 +3906,7 @@ t  'T27i ...with the whole evidence triple' 'yes' \
 t  'T27i ...and the metadata says what actually rendered it' 'session-daemon' \
    "$(jq -r '.capture' "$TMP/brokeread/page.meta.json" 2>/dev/null)"
 t  'T27i ...still not one chrome of its own' "$BL3" "$(blaunches)"
-env PATH="$SPATH" "$BROWSER" serve box.test --stop >/dev/null 2>&1
+bstop >/dev/null 2>&1
 
 # --- T27j the seat override grants NOTHING, which is why it can exist ---------
 #
