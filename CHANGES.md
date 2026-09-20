@@ -1,6 +1,35 @@
 ## Unreleased
 
-### Added — the mod's above-prompt seat panel (DIVE-4694), mod 0.3.0
+### Added — boundary compaction for the non-fresh seats (DIVE-4695), mod 0.3.0
+
+`main` and `marketing` run with `heartbeat.fresh=false`, so the dispatcher never `/clear`s
+them and every wake lands on the whole accumulated window. Measured 2026-09-20 (`sudo 5dive
+cost`, 24h, quota over API-EQ — quota counts the cache read): **marketing 49.9x, main 43.7x**
+against **dev 33.8x, quinn 31.5x, ops 25.0x** on the fresh seats.
+
+The `mod` plugin can now compact the conversation **at a turn boundary**, so the next
+dispatched goal lands on a summary rather than the transcript. It is off on every seat and
+opted into per seat (`FIVEDIVE_MOD_BOUNDARY_COMPACT`), with the threshold and the continuity
+pin as knobs; a malformed knob turns the feature **off** rather than back to a default.
+
+Continuity is the failure mode, so it is structural and not a prompt: the plugin hooks
+`session.compact` and appends back, verbatim and by the engine's own message handle, any
+message the pin matched that the compaction dropped — an unanswered human gate, a standing
+directive, an open row's branch. It is the only hook in the plugin that returns anything but
+the chain's own value, and it can only ADD.
+
+Two things the live lab run changed: the trigger is `turn.complete`, not `session.measure`
+(which was observed firing BEFORE `turn.complete` on 2.1.278, where the call rejects), and
+`$.session.compact` needs a mounted session — a `claude -p` run refuses it, and the refusal
+is a counted line rather than a crash.
+
+The compaction runs on a promise chain of its **own**, not the telemetry writer's. A
+compaction is a ~50s model call; queued on the writer's chain it delayed no turn but it
+delayed every sink write behind it, including the next `turn.start` — and that sink is
+what the heartbeat, the pacing floor and the pending-restart sweep read idle/busy from, so
+a compacting seat would have read as a silent one for ~50s.
+
+### Added — the mod's above-prompt seat panel (DIVE-4694), mod 0.4.0
 
 A seat could not see its own row. lodar reads seats through tmux panes and `5dive watch`; the
 seat's own screen said nothing about which row it held, whether a gate was open on it, how much of
@@ -44,7 +73,7 @@ draw, is never awaited by the hook that triggers it, and is rate-limited; steady
 Off by default, behind `FIVEDIVE_MOD_PANEL=1` in the seat's settings `env` — a separate flag from
 the telemetry half's, so "it is off" is never ambiguous about which half.
 
-### Added — `/task` and `/gate` as first-class commands, and what the swap actually saves (DIVE-4693), mod 0.3.0
+### Added — `/task` and `/gate` as first-class commands, and what the swap actually saves (DIVE-4693), mod 0.2.0
 
 The `mod` plugin now registers two slash commands with `$.command.register` and serves them by
 dispatching to the `5dive` CLI in the harness process: `/task <verb> …` and `/gate <ident> …`. The

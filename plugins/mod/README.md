@@ -221,3 +221,95 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude \
   --plugin-dir plugins/mod --debug-file /tmp/dbg.log -p "say OK"
 grep 'hooks module mod' /tmp/dbg.log
 ```
+
+## Boundary compaction on the non-fresh seats (DIVE-4695)
+
+`main` and `marketing` run with `heartbeat.fresh=false`: the dispatcher does **not** send
+`/clear` before a nudge, so every wake lands on the whole accumulated window and every
+model step inside that turn re-sends it. Measured on this box 2026-09-20 (`sudo 5dive
+cost`, last 24h), quota over API-EQ — quota counts the cache **read**, so the ratio is how
+many times a seat re-read what it had already written:
+
+| seat | quota / API-EQ | fresh |
+| --- | --- | --- |
+| marketing | 49.9x | no |
+| main | 43.7x | no |
+| dev | 33.8x | yes |
+| quinn | 31.5x | yes |
+| ops | 25.0x | yes |
+
+This compacts **at a turn boundary**, so the next dispatched goal lands on a summary
+instead of the full transcript — continuity in compacted form, rather than the `/clear`
+that throws it away.
+
+Off on every seat. To turn it on, in the seat's `~/.claude/settings.json` `env` block:
+
+| key | default | meaning |
+| --- | --- | --- |
+| `FIVEDIVE_MOD_BOUNDARY_COMPACT` | absent (off) | `"1"` turns it on. Anything else is off. |
+| `FIVEDIVE_MOD_BOUNDARY_COMPACT_PERCENT` | `50` | context fill, as a whole percent 1–99, at or above which a boundary compacts. **A malformed value turns the feature OFF**, never back to the default. |
+| `FIVEDIVE_MOD_BOUNDARY_COMPACT_PIN` | see below | the pattern for what must survive a compaction. An uncompilable pattern turns the feature off. |
+
+**Never set it on a fresh seat.** A fresh seat is `/clear`ed before each nudge and has
+nothing to compact.
+
+### Continuity is pinned, not asked for
+
+The failure mode is a compaction that drops an unanswered human gate or a standing
+directive — worse than the tokens it saved. So there are two layers, and only the second
+is a guarantee:
+
+1. Our compactions carry `instructions` telling the summarizer to keep the obligations
+   verbatim and summarize the investigation instead. That is a request.
+2. The mod hooks `session.compact` and, on the way **up**, checks by the engine's own
+   message `handle` that every message the pin matched is still in the result. Any that is
+   not is **appended back verbatim**. A paraphrase in the summary does not count as
+   keeping it — the seat cannot answer a gate whose question is gone.
+
+The default pin is
+`(5dive task need|--ask=|GATE|gate cleared|lodar|Branch: |DIVE-[0-9]{3,})`, matched
+case-insensitively against a message's text. At most 12 messages are pinned back (the
+newest); a pin that matches more than that means the pattern is wrong, and the count is on
+the `compact.pinned` line.
+
+This is the **only** hook in the plugin that returns anything but what the chain resolved
+to, and it can only ADD — `test/mod-telemetry.test.ts` asserts both, from the source.
+
+### The boundary is `turn.complete`, and that was a measurement
+
+The 2.1.278 declaration says `session.measure` "fires after each main-thread turn". In a
+headless lab run on 2026-09-20 it fired **before** `turn.complete`, and the mod's own
+turn-tracking refused it (`compact.skip reason=mid-turn percent=3`). `$.session.compact()`
+rejects while a turn runs, so a trigger that trusted the event's timing would have called
+it mid-turn on every boundary. The primary trigger is `turn.complete`, after the mod
+clears its own `inTurn`; `session.measure` stays wired as a second trigger for the
+boundaries it does raise cleanly (a rate-limit window moving while the seat sits idle).
+
+The call itself is never awaited by either hook, and it runs on a promise chain of its
+**own** (`compactChain`) rather than the one the telemetry writer uses. Both halves matter.
+Not awaiting keeps a compaction from delaying a turn or failing one. The separate chain
+keeps it from stalling the **sink**: a compaction was measured at ~50s (51.5s and 50.3s in
+the live run), and queued behind it on the writer's chain no telemetry line reached the
+file for that whole time — including the next `turn.start`. The heartbeat, the pacing
+floor and the pending-restart sweep read idle/busy off that sink, so a compacting seat
+would have read as a silent one. Overlap between two compactions is prevented by the
+in-flight latch, not by sharing a queue with the writer.
+
+### `$.session.compact` needs a mounted session
+
+On 2.1.278 a `claude -p` run answers
+`$.session.compact is not available in this mode: no session is bound in this process`.
+The 5dive seats run an interactive session in tmux, which is mounted; a headless one is
+not. The rejection is a counted `compact.skip` line and one debug line, and the seat
+carries on with its full window.
+
+### Reading the pilot
+
+Every boundary is a line, including every refusal — a quiet sink must not be the same
+observable as a working one:
+
+| event | what it means |
+| --- | --- |
+| `compact.done` | it compacted; `tokens_before` / `tokens_after` are core's own counts (absent when core did not record them, never zero), `pinned` is how many messages had to be put back |
+| `compact.pinned` | the compaction dropped `pinned` pinned messages and they were appended back |
+| `compact.skip` | the boundary declined; `reason` is `off`, `mid-turn`, `in-flight`, `no-reading`, `vetoed: …` or `rejected: …`. `below-threshold` is deliberately NOT recorded — it is the common case and would drown the file |
