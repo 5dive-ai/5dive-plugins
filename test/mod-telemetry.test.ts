@@ -70,14 +70,38 @@ describe('mod: manifest and module stay wired together', () => {
 })
 
 describe('mod: it registers exactly the events it claims', () => {
-  const registered = [...SRC.matchAll(/^  on\('([^']+)'/gm)].map((m) => m[1])
+  // Two shapes of registration live in this module and they are graded apart, because
+  // they carry different promises (DIVE-4693):
+  //   - MATCHER-LESS: the telemetry hooks. Observe-only, asserted below.
+  //   - MATCHED: the hooks that serve this plugin's OWN slash commands. They answer
+  //     with `{ text }` and never call `next`, which is correct for a command with no
+  //     core implementation — and would be a bug on any other event, so the matcher
+  //     set is pinned here rather than left to grow.
+  const observing = [...SRC.matchAll(/^  on\('([^']+)', async/gm)].map((m) => m[1])
+  const matched = [...SRC.matchAll(/^  on\('([^']+)', \{ command: '([^']+)' \}/gm)].map(
+    (m) => [m[1], m[2]] as const,
+  )
 
-  test('the set matches, with no extras', () => {
-    expect(registered.sort()).toEqual([...EVENTS].sort())
+  test('the observe-only set matches, with no extras', () => {
+    expect(observing.sort()).toEqual([...EVENTS].sort())
   })
 
-  test('no event is registered twice', () => {
-    expect(new Set(registered).size).toBe(registered.length)
+  test('no event is registered twice as an observer', () => {
+    expect(new Set(observing).size).toBe(observing.length)
+  })
+
+  test('the served commands are exactly the ones the module registers', () => {
+    // The names it serves...
+    expect(matched.map(([event]) => event)).toEqual(['command.run', 'command.run'])
+    const served = matched.map(([, name]) => name).sort()
+    // ...and the names it declares to the engine. A hook serving a name never
+    // registered is dead code; a name registered with no hook prints "no hook answered"
+    // at the person, which reads exactly like a broken install.
+    const declared = [...SRC.matchAll(/\$\.command\.register\(\{\s*name: '([^']+)'/g)]
+      .map((m) => m[1])
+      .sort()
+    expect(served).toEqual(declared)
+    expect(served).toEqual(['gate', 'task'])
   })
 })
 
@@ -86,6 +110,8 @@ describe('mod: it cannot affect the session it measures', () => {
   // to assert it: this plugin runs on every seat that enables it, inside every turn.
 
   test('no hook can deny, rewrite or answer a call', () => {
+    // Unchanged by DIVE-4693: the command hooks answer their OWN commands, which is
+    // not a `deny` and cannot refuse anything the session would otherwise have done.
     expect(SRC).not.toMatch(/\bdeny\b\s*:/)
     // `next(e)` is always the untouched event; a rewrite would spread into it.
     expect(SRC).not.toMatch(/next\(\s*\{\s*\.\.\.e/)
