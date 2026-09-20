@@ -1,5 +1,41 @@
 ## Unreleased
 
+### Added — the mod's above-prompt seat panel (DIVE-4694), mod 0.2.0
+
+A seat could not see its own row. lodar reads seats through tmux panes and `5dive watch`; the
+seat's own screen said nothing about which row it held, whether a gate was open on it, how much of
+its budget the row had burned, or whether its delivery was sitting with a grader.
+
+The `mod` plugin now draws one line directly above the prompt:
+
+```
+5dive dev · DIVE-4694 · in_progress · gate none · grader temp · burn 15.1M/150.0M* · Function-hook mod: above-prompt…
+```
+
+It costs the model nothing. A `ui.render` tree is drawn by the terminal and is never part of the
+prompt, so none of it reaches the context window.
+
+**Absent is never zero.** A row with no attributed usage window draws `—`, not `0` — `0/150.0M`
+reads as "this row is free". A figure the DIVE-4430 dispatch cross-check could not tie to the row
+draws `~… unverified` rather than as the row's own, because that is exactly the distinction
+DIVE-3343 removed an enforcement for. The burn figure is read from the heartbeat's published
+snapshot, so the panel shows the number the park will act on rather than a second one derived
+differently.
+
+**It does not repeat the status line.** DIVE-4665 landed first and put effort, context fill,
+session cost and the account's 5h/7d percentages one row below. The panel carries only what belongs
+to the ROW. The account cell appears in two cases the status line cannot express: a window at or
+past 80%, and no reading at all — a blind meter renders as plain absence there, which is the same
+pixels as the field being off.
+
+**No timer.** `$.clock` is never touched. The band's own `isWorking` prop is true exactly while a
+turn runs, so its edges are the turn boundary, delivered by the surface. A refresh runs outside the
+draw, is never awaited by the hook that triggers it, and is rate-limited; steady state is one
+~0.6 s subprocess per turn boundary, off the critical path.
+
+Off by default, behind `FIVEDIVE_MOD_PANEL=1` in the seat's settings `env` — a separate flag from
+the telemetry half's, so "it is off" is never ambiguous about which half.
+
 ### Added — a site login is per BOX and brokered: seats use the box's login (DIVE-4664), browser 1.9.0
 
 Measured on one box 2026-09-20: the profile store held **fifteen seats and fourteen empty

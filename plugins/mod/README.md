@@ -1,10 +1,15 @@
 # mod
 
-A 5dive telemetry **producer** built on Claude Code's function hooks (early access).
+Two 5dive capabilities built on Claude Code's function hooks (early access), each behind
+its own flag and each off by default.
 
-It publishes the two signals 5dive currently infers from the outside — whether a seat is
-mid-turn, and what its usage meter reads — from inside the harness process that owns
-them, into the sink described in [`docs/mod-telemetry-contract.md`](../../docs/mod-telemetry-contract.md).
+1. **A telemetry producer.** It publishes the two signals 5dive currently infers from
+   the outside — whether a seat is mid-turn, and what its usage meter reads — from
+   inside the harness process that owns them, into the sink described in
+   [`docs/mod-telemetry-contract.md`](../../docs/mod-telemetry-contract.md).
+2. **A seat panel.** One line above the prompt naming the row the seat holds, its gate,
+   its grader and its token burn against its budget, at zero context cost. See
+   [The seat panel](#the-seat-panel-dive-4694).
 
 ## What it does, and what it deliberately does not
 
@@ -19,6 +24,74 @@ resolved to. It never denies a tool call, rewrites an input, or delays a turn. T
 sketched are *not* here; they are separate rows, and shipping them alongside a
 measurement would make the measurement unreadable.
 
+## The seat panel (DIVE-4694)
+
+One line directly above the prompt, on the terminal, naming the row this seat holds:
+
+```
+5dive dev · DIVE-4694 · in_progress · gate none · grader temp · burn 15.1M/150.0M* · Function-hook mod: above-prompt seat…
+```
+
+It costs the model **nothing**. A `ui.render` hook's tree is drawn by the terminal and
+is never part of the prompt, so no token of this reaches the context window — which is
+the whole reason it lives here and not in a `/goal` preamble or a skill.
+
+| cell | what it says |
+| --- | --- |
+| `5dive <seat>` | which seat's board is being read |
+| `DIVE-…` | the row the seat is on: an `in_progress` row, else one **delivered and not closed**, else one holding a live gate, else the first open row (`ls` has already ordered by priority then age) |
+| `in_progress` | the row's status |
+| `gate …` | `none`, or the board's own header — `HUMAN:<type>` (red) when a person owes the answer, `<seat>:<type>` (yellow) when an agent does |
+| `grader …` | the verifier state: `<seat> waiting` (a delivery is with it), `<seat> bound`, `delivered→temp` (the pool attaches one at delivery), `check` / `rubric`, or `none` |
+| `burn …` | the row's metered tokens against its budget. `*` on the denominator means the row carries no budget of its own and the box default is shown. `~… unverified` means the figure is attributed but the dispatch cross-check could not tie it to this row (see below). `—` means no reading — **absent, never zero**. `exempt` is a row budgeted `none` |
+| `acct …` | **only** when it says something the status line does not: `5h 92%!` for a window at or past 80%, `—` for a blind meter |
+
+Fields drop from the right as the band narrows, whole rather than truncated; the row's
+ident is the last thing to go. The title is the first.
+
+### What this carries, and what the status line carries
+
+DIVE-4665 put the model, effort, context fill, session cost **and the account's 5h/7d
+percentages** on the seat's status line (`5dive-api scripts/inc/statusline.sh`), one row
+below this band. So the split is by owner of the fact:
+
+- **status line** — everything belonging to the SESSION and the ACCOUNT;
+- **this panel** — everything belonging to the ROW, which the statusline payload does
+  not know and cannot: ident, status, gate, grader, burn against the row's budget.
+
+The account windows are therefore not repeated here as figures. The one exception is the
+`acct` cell above, and it exists because a *missing* reading renders on a status line as
+plain absence — the same pixels as the field being switched off — and a blind meter is
+exactly what holds rows on the pacing floor.
+
+### Where the burn figure comes from, and why it is sometimes marked
+
+`5dive usage --json` is root-only and a seat is not root. The heartbeat runs it once a
+tick and publishes the result at `/var/lib/5dive/pace-usage.json` (mode 0664, group
+`claude`, which every seat is in); the panel reads that file. It is the **same** figure
+`_hb_task_budget_sweep` parks a row on, so the panel shows the operator the number the
+guard will act on rather than a second one derived differently.
+
+That sweep charges a row only when the dispatch cross-check verified the window
+(`dispatched: true`) — an attributed window with no `/goal` dispatch of that ident
+inside it is likely another row's tokens (DIVE-3343 → DIVE-4430). The panel shows such a
+figure, because an operator wants to see it, marked `~… unverified`.
+
+### Refresh, and what it costs
+
+No timer, and `$.clock` is never touched. The band's own `isWorking` prop is true
+exactly while a model turn runs and the engine re-renders on its edges, so watching that
+edge **is** the turn boundary, with no second hook. (A second registration of
+`session.start` / `turn.complete` / `command.run` is not available anyway: the telemetry
+half owns them and `claude plugin validate` refuses the duplicate.)
+
+A refresh runs outside the draw and is never awaited by the hook that triggers it — the
+panel cannot delay a turn — and is rate-limited to one per 1.5 s. Measured on this box:
+`5dive task ls` ≈ 0.6 s CPU, `5dive task show` ≈ 0.5 s, and the 36 kB snapshot read is
+noise. `show` is only paid when the drawn row CHANGES or holds a live gate, so steady
+state is **one ~0.6 s subprocess per turn boundary, ~1.2 s of CPU per turn**, off the
+critical path.
+
 ## Turning it on
 
 Two independent gates. Both must be on, and the second is off on every seat by default.
@@ -29,8 +102,12 @@ Two independent gates. Both must be on, and the second is off on every seat by d
 2. **5dive's.** In the seat's `~/.claude/settings.json`:
 
    ```json
-   { "env": { "FIVEDIVE_MOD_TELEMETRY": "1" } }
+   { "env": { "FIVEDIVE_MOD_TELEMETRY": "1", "FIVEDIVE_MOD_PANEL": "1" } }
    ```
+
+   The two capabilities have **separate** flags on purpose: a seat may want the screen
+   without the sink or the sink without the screen, and one flag for both would make
+   "it is off" ambiguous. Each defaults to off.
 
 Optional, same block:
 
@@ -38,6 +115,8 @@ Optional, same block:
 | --- | --- | --- |
 | `FIVEDIVE_MOD_TELEMETRY_DIR` | `~/.5dive/mod-telemetry` on the seat the plugin is installed under | where the sink files land |
 | `FIVEDIVE_MOD_TELEMETRY_SEAT` | derived from the plugin's own path | the seat name on each line |
+| `FIVEDIVE_MOD_PANEL_SEAT` | derived from the plugin's own path | whose board the panel reads |
+| `FIVEDIVE_MOD_PANEL_USAGE_FILE` | `/var/lib/5dive/pace-usage.json` | the heartbeat's published usage snapshot |
 
 The seat name is otherwise read off the plugin's install directory, which sits under the
 seat's home: `/home/agent-<seat>/…` is `<seat>` and `/home/claude/…` is `claude`. If it
