@@ -68,7 +68,7 @@
 import type { EngineInterface, On, RenderElement, RenderInputOf } from 'claude-code'
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-panel.test.ts. */
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 
 /** The Claude Code build this file was written and verified against. */
 const VERIFIED_AGAINST = '2.1.278'

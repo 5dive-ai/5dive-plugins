@@ -53,6 +53,9 @@ One JSON object per line. Fields:
 | `reason` | sometimes | `turn.complete`: `answer` / `aborted` / `refusal` / `error`. `session.start`: `interactive` / `headless`. `session.end`: the harness's end reason. |
 | `command` | on `command.run` | the slash command's name. |
 | `tool` | on `tool.call` | the tool's name. |
+| `decision` | on a REFUSED `tool.call` | `deny`, and only that. Absent means the call ran. A consumer counting refusals counts this field, never the absence of a later event. |
+| `policy` | with `decision` | the id of the policy in `policy/guard.json` that refused, e.g. `pii-fixture`. |
+| `check` | with `decision` | the id of the check inside that policy, e.g. `telegram-id`. Together with `policy` it makes a deny attributable to one line of one data file — which is what lets a policy that fires on good work be found and retired. |
 | `usage` | when there is a reading | see below. |
 
 ### Events

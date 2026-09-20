@@ -20,11 +20,27 @@ Publishes, per session, one JSONL file of `session.start` / `turn.start` /
 rate-limit windows and the session's context fill and cost attached to all but
 `tool.call`.
 
-It is **observe-only**. Every hook calls `next(e)` first and returns what the chain
-resolved to. It never denies a tool call, rewrites an input, or delays a turn. The
-`tool.call` deny-list guard and the usage-wall handling that the original proposal
-sketched are *not* here; they are separate rows, and shipping them alongside a
-measurement would make the measurement unreadable.
+The telemetry is **observe-only**. Every one of those hooks calls `next(e)` first and
+returns what the chain resolved to: none of them denies a tool call, rewrites an input,
+or delays a turn. The usage-wall handling the original proposal sketched is still *not*
+here; it is a separate row.
+
+## The tool-call guard
+
+DIVE-4696 added the proposal's capability 2, and it is the one thing in this plugin that
+can refuse a call. A table of policies in [`policy/guard.json`](policy/guard.json) —
+data, not code — is matched against each `tool.call`, and a match answers
+`{ deny: <the policy's reason> }` instead of running the tool. It ships with six
+policies, each one a rule that until now was prose in `CLAUDE.md`, paid for on every
+turn of every seat and caught only after the fact: a real identifier in a test fixture,
+`--no-verify`, applying `smoke-verified`, writing the runtime's own store, `rm -r`
+outside the workdir, and replying on a repository we do not own.
+
+Gate: `FIVEDIVE_MOD_GUARD=1`, independent of the other two flags. With it off — the
+default on every seat — the `tool.call` hook is byte-for-byte the observe-only hook
+above. It never rewrites a call, it fails open and says so, and adding a policy means
+editing the JSON, not the plugin. Full contract, the fields, and what a new policy owes:
+[`docs/mod-guard.md`](../../docs/mod-guard.md).
 
 ## The seat panel (DIVE-4694)
 
@@ -132,6 +148,8 @@ Optional, same block:
 | `FIVEDIVE_MOD_TELEMETRY_SEAT` | derived from the plugin's own path | the seat name on each line |
 | `FIVEDIVE_MOD_PANEL_SEAT` | derived from the plugin's own path | whose board the panel reads |
 | `FIVEDIVE_MOD_PANEL_USAGE_FILE` | `/var/lib/5dive/pace-usage.json` | the heartbeat's published usage snapshot |
+| `FIVEDIVE_MOD_GUARD` | off | enforce the tool-call policies in `policy/guard.json` |
+| `FIVEDIVE_MOD_GUARD_POLICY` | the plugin's own `policy/guard.json` | a different policy document |
 
 The seat name is otherwise read off the plugin's install directory, which sits under the
 seat's home: `/home/agent-<seat>/…` is `<seat>` and `/home/claude/…` is `claude`. If it
