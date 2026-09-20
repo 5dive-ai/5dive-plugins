@@ -295,6 +295,66 @@ async function treeMode(plan) {
   process.exit(0);
 }
 
+// `snapshot` — ONE browser, ONE navigation, ONE page-side read (DIVE-4653).
+//
+// WHAT IT REPLACES. An agent orienting on a page ran three commands: `tree` for
+// the refs (this driver), `read` for the text (a second chrome, --dump-dom) and
+// `shot` for the picture (a third chrome, --screenshot). Each one opens a
+// browser, probes the session and loads the same URL again. jev-ultrafast
+// measured the same shape upstream and put the number at 1092 protocol calls for
+// a task that needs 101: the cost is not the work, it is asking for it in
+// pieces.
+//
+// The pieces here are not independent, either. Three loads are three different
+// page instants, so a ref printed by `tree` can be gone from the DOM `read`
+// captured — and the two files land next to each other in an artifact directory
+// looking like one observation. Taking all of it inside one page.evaluate makes
+// that impossible rather than unlikely.
+//
+// THE HTML AND THE PNG GO TO FILES, not to stdout. stdout carries the decision
+// payload (url, title, nodes) and a caller reads it with jq; a document is
+// megabytes and a PNG is not text. Both paths are named by the caller, which
+// already made them inside the seat's own 0700 artifact directory.
+async function snapshotMode(plan) {
+  const profile = process.env.FIVEDIVE_BROWSER_PROFILE || plan.profile;
+  if (typeof plan.url !== 'string' || !/^https?:\/\//.test(plan.url)) {
+    die(E_NOTHING_RAN, 'snapshot needs an http(s) url to capture');
+  }
+  if (typeof plan.html !== 'string' || !plan.html.startsWith('/')) {
+    die(E_NOTHING_RAN, 'snapshot needs an absolute path to write the captured document to');
+  }
+  const ctx = await openProfile(profile);
+  let payload;
+  try {
+    const page = ctx.pages()[0] || await ctx.newPage();
+    page.setDefaultTimeout(STEP_TIMEOUT);
+    assertLease('snapshot');
+    await page.goto(plan.url, { waitUntil: 'domcontentloaded' });
+    // NEVER network idle, for the reason written above treeMode: a live web app
+    // long-polls and never idles, and waiting for it is what makes a read hang.
+    await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
+    const snap = await aria.snapshot(page, { interactiveOnly: !!plan.interactive });
+    fs.writeFileSync(plan.html, snap.html || '', { mode: 0o600 });
+    // The PNG is a SECOND protocol call and NOT a second load: same browser,
+    // same tab, same document as the walk above. That is the whole difference
+    // from `shot`, which opens its own chrome and navigates again.
+    if (plan.shot) await page.screenshot({ path: plan.shot, fullPage: !!plan.full });
+    payload = {
+      url: snap.url || plan.url,
+      title: snap.title || '',
+      nodes: snap.nodes || [],
+      html_bytes: Buffer.byteLength(snap.html || ''),
+      png: plan.shot || null,
+    };
+  } catch (e) {
+    die(E_NOTHING_RAN, `could not capture ${plan.url}: ${e.message}`);
+  } finally {
+    try { await ctx.close(); } catch (e) { /* the capture is already on disk */ }
+  }
+  process.stdout.write(JSON.stringify(payload) + '\n');
+  process.exit(0);
+}
+
 async function main() {
   const raw = fs.readFileSync(0, 'utf8');
   let plan;
@@ -312,6 +372,10 @@ async function main() {
   // plugin touches. A second program that opened a credential directory would be
   // a second place to get that wrong.
   if (plan.mode === 'tree') return await treeMode(plan);
+  // Same rule as tree: a snapshot reads and publishes nothing, so it does not go
+  // through the step vocabulary — and it must open the profile by the one
+  // guarded road every other page in this plugin is opened by.
+  if (plan.mode === 'snapshot') return await snapshotMode(plan);
 
   const steps = Array.isArray(plan.steps) ? plan.steps : null;
   if (!steps || !steps.length) die(E_NOTHING_RAN, 'the plan carries no steps');

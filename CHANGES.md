@@ -8,7 +8,78 @@ forbidden to run. Reads stay unprivileged; writes carry the paired Telegram
 user id as channel proof and let the CLI cross its narrow `_task_channel` rail.
 Only `task answer` and `task clear-recs` use that rail. Start, done, cancel,
 escalate, agent-send, and council actions remain admin-only.
+### Added — one snapshot per decision: `browser snapshot` (DIVE-4653), browser 1.8.0
 
+Before an agent acts on a page it reads the same three things: what it can click
+(`tree`), what the page says (`read`) and what it looks like (`shot`). Each of those
+is its own command, and each command is its own browser cycle — probe the session,
+open a browser at the profile, load the URL, do one thing, close. Three cycles and
+three loads of the same page, for one decision. `snapshot` is those three reads as
+ONE cycle: one navigation, one page-side walk that returns the refs *and* the
+document, and one screenshot of that same tab. On a served profile it runs inside
+the warm browser — the render op the DIVE-4621 daemon did not have.
+
+The second half is correctness, and a faster box does not fix it. Three cycles are
+three different page instants: a ref `tree` printed can be gone from the DOM `read`
+captured seconds later, and the PNG can show an overlay neither saw. Those files land
+in one artifact directory looking like one observation and nothing in them says
+otherwise. Here they come from one `page.evaluate` of one tab, so `page.meta.json`
+hashes the very bytes the refs were walked out of.
+
+The count is graded deterministically in the unit suite (one launch, one navigation,
+one read, against a control that shows the three verbs taking three of each). The wall
+clock comes from a rig that ships with the change — `tests/browser_snapshot_bench.sh`,
+which anyone can re-run — on a local static page, one box, two iterations, 2026-09-20:
+nothing served **6380 -> 3507 ms (1.8x)**, warm daemon **7687 -> 3006 ms (2.6x)**. The
+warm three-verb arm is the *slowest* of the four because two of those three verbs stop
+and restart the daemon to get the profile; `snapshot` never does. A local page makes
+this an upper bound on the ratio for this task shape, not a constant — a real
+application spends more time in the page and less in the launch, and the claim that
+survives there is the cycle count.
+
+`tree`, `read` and `shot` are unchanged and are still the right verb when one field is
+all you want; `read`'s independent `--dump-dom` capture keeps its own provenance.
+
+
+### Added — a warm browser session: `serve` holds one Chrome and commands attach to it (DIVE-4621), browser 1.7.0
+
+`serve` was an Xvfb and an abandoned Chrome. Because Chrome allows one instance per
+`--user-data-dir`, every command that needed the profile had to STOP it, launch a
+probe, launch the driver's browser, and start it again — four launches for an
+action that is three clicks.
+
+It is now a daemon holding `launchPersistentContext(<the 0700 profile>)` on the
+site's display, answering on a unix socket inside that same 0700 directory.
+`run` and `tree` attach to it. Never a `--remote-debugging-port`, and the launch
+refuses one: a loopback debug port is reachable by every seat on the box and CDP
+is full control of the browser holding the session.
+
+Measured by a rig that ships with the change — `tests/browser_session_bench.sh`,
+which anyone can re-run — on one box, same task, `run` = goto + fill + click +
+the out-of-band verify. A browser served with no daemon (the shape a customer is
+in) against the same command warm: **3.1x-6.4x** across three runs. The spread
+is box load, and it falls on one side only — the warm median was 1290-1381 ms in
+every run, while the served-no-daemon median moved 4047 -> 8656 ms as the box got
+busy. That is the point rather than a caveat: what the daemon removes is the
+launch, and the launch is the part that costs more the more the box is doing.
+Where nothing was being served at all it is 1.4x-2.7x. About 1.0 s of what is
+left warm is the liveness probe, not a launch,
+and the page is a local static file — a real web application spends more of its
+time in the page, so this is an upper bound for this task shape rather than a
+constant.
+
+`status` can also read a SERVED profile for the first time: it used to answer
+`UNKNOWN (served on :N)`, because probing a held profile needed CDP and CDP
+needed a port. The daemon is a third shape — a process that outlives the command
+— so the probe goes through it, in its own tab, which is then closed so nobody at
+the viewer is navigated away. That command is now ~1.0 s instead of 78 ms of a
+non-answer.
+
+The lease is still re-read from disk before every step, by the daemon: it
+outlives every caller and serves callers holding different tokens, so the token
+travels in the request and the file is what is trusted. A box without the pinned
+`playwright-core` still serves — `serve` falls back to launching Chrome directly
+and says so in one line. Losing the speed must not lose the browser.
 ### Fixed — the usage-limit notice now stops the "typing…" indicator, telegram 0.5.56
 
 Message a seat whose account is usage-walled and the bot answers at once —

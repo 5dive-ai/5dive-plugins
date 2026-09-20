@@ -86,7 +86,7 @@ not substitute the raw `viewer` command: it mints only one half of the relay cre
 6. **Read the terminal result.** `authenticated` makes the profile usable. `session expired`
    or `CHALLENGE` still needs a person. `UNKNOWN (no adapter …)` means step 1 is incomplete;
    another `UNKNOWN` names a browser/box read failure and is not permission to act. Only after
-   `authenticated` may an agent use `run`, `shot`, `read`, or `links` for that site.
+   `authenticated` may an agent use `run`, `snapshot`, `shot`, `read`, or `links` for that site.
 
 The view is ephemeral; the login profile is durable. Revoke promptly: a live viewer is a
 keyboard attached to the person's account.

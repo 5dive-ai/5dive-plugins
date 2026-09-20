@@ -100,7 +100,9 @@ usage() {
   5dive browser ls                    # profiles, and when each was last seen alive
 
   On a managed box there is no display, so the browser lives on one:
-  5dive browser serve <site>          # persistent Chrome on its own Xvfb (server mode)
+  5dive browser serve <site>          # hold the session: one browser on its own Xvfb,
+                                      #   held by a daemon, so commands attach to it
+                                      #   instead of stopping and restarting it
   5dive browser serve <site> --stop   # stop the browser; the profile survives
   5dive browser evict [--idle=1800] [--dry-run]
                                       # stop served browsers nobody has used, on a
@@ -146,6 +148,12 @@ usage() {
                                       # at a time: two in one logged-in profile
                                       # overwrite each other and read as flakiness.
                                       # A person at the viewer PREEMPTS an agent.
+  5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json]
+                                      # ONE cycle, one page instant: the refs, the
+                                      # document and a PNG of the same tab. What `tree`,
+                                      # `read` and `shot` give you in three browser
+                                      # cycles of three different instants — use this
+                                      # when you are about to DECIDE what to do next.
   5dive browser read <site> <url> [--out=<dir>] [--json]
                                       # one authenticated render -> page.md,
                                       # page.html and page.meta.json
@@ -476,18 +484,39 @@ _probe() {
   # on this box and hands them full control of a logged-in profile — the exact
   # credential the 0700 audit above exists to protect, given away with no file
   # permission needed at all. That trade is not the status command's to make.
-  local sdisp
+  #
+  # ...AND THE DAEMON IS WHAT MAKES "ASK THAT BROWSER" POSSIBLE (DIVE-4621). The
+  # paragraph above is still exactly right about a pipe and about a port. What it
+  # could not assume is a process that outlives the command AND exposes a 0700
+  # unix socket: that is a third shape, and with one running the served profile
+  # is readable by the only process that can already drive it — in its own tab,
+  # so nobody at the viewer is navigated away. Where there is no daemon, the
+  # refusal below is unchanged.
+  local sdisp warm=0
   if sdisp=$(_serve_running "$dir"); then
-    echo "UNKNOWN (served on :$sdisp — the probe cannot open a profile the served browser holds; ask that browser, or stop it: 5dive browser serve $site --stop)"
-    return 0
+    if _daemon_live "$dir"; then
+      warm=1
+    else
+      echo "UNKNOWN (served on :$sdisp — the probe cannot open a profile the served browser holds; ask that browser, or stop it: 5dive browser serve $site --stop)"
+      return 0
+    fi
   fi
-  local chrome; chrome=$(_chrome) || { echo "UNKNOWN (no chrome on this box)"; return 0; }
+  local chrome=""
+  if (( ! warm )); then
+    chrome=$(_chrome) || { echo "UNKNOWN (no chrome on this box)"; return 0; }
+  fi
   local url; url=$(_site_url "$site")
   local marker; marker=$(_site_logged_out_marker "$site")
   local dom; dom=$(mktemp) || { echo "UNKNOWN (probe did not load)"; return 0; }
-  "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
-        --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
-  local rc=$?
+  local rc
+  if (( warm )); then
+    _daemon_call "$dir" "$(jq -nc --arg u "$url" '{op:"probe", url:$u}')" >"$dom" 2>"$dom.err"
+    rc=$?
+  else
+    "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
+          --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
+    rc=$?
+  fi
   if (( rc != 0 )) || [[ ! -s "$dom" ]]; then
     # A BROWSER THAT CANNOT START IS NOT AN UNREADABLE SESSION (DIVE-4587). Both
     # arrive here as a non-zero chrome and an empty document, and collapsing them
@@ -502,8 +531,13 @@ _probe() {
     # Telling them apart needs no heuristic on the error text: ask the browser to
     # do the smallest possible thing, in a throwaway profile, with no network.
     # One extra launch, only on a path that has already failed.
+    # A WARM PROBE CANNOT BE A LAUNCH FAILURE, so it must not be diagnosed as
+    # one: the daemon IS a running browser on this box, launched by this seat.
+    # Sending a customer to "this box cannot start a browser" because a page
+    # timed out inside a browser that is up would be a worse lie than the quiet
+    # UNKNOWN it replaced.
     local lerr
-    if lerr=$(_chrome_launch_error "$chrome"); then
+    if (( ! warm )) && lerr=$(_chrome_launch_error "$chrome"); then
       rm -f "$dom" "$dom.err"
       echo "BROKEN (this box cannot start a browser as $(_seat): $lerr)"
       return 2
@@ -950,8 +984,16 @@ cmd_run() {
   # exists for, and destroying their session to serve a machine is a refusal and
   # not a cycle. Restore is an EXIT trap because `die` exits — a failed action
   # must not leave a customer's browser stopped.
-  local sdisp
-  if sdisp=$(_serve_running "$dir"); then
+  # A WARM SESSION IS NOT CYCLED (DIVE-4621). The cycle below is here because
+  # Chrome allows one instance per --user-data-dir; a daemon holding the profile
+  # means the action goes INTO that browser, so there is nothing to stop and
+  # nothing to restart — and a person at the viewer is not thrown out to run it.
+  # The lease, not the cycle, is what keeps the machine and the person apart, and
+  # the daemon re-reads it before every step.
+  local warm=0 sdisp
+  if _daemon_live "$dir"; then
+    warm=1
+  elif sdisp=$(_serve_running "$dir"); then
     ! _viewer_live "$dir" || die "$E_UNAVAILABLE" "the $site browser is being viewed by a person right now (:$sdisp). Running an action means stopping that browser, which would take their session away mid-login. Wait, or end it deliberately: 5dive browser viewer-revoke $site"
     _SHOT_RESTORE_SITE="$site"
     cmd_serve "$site" --stop >/dev/null
@@ -1011,6 +1053,26 @@ cmd_run() {
   # answer a person needs is "I could not verify this session", not "no chrome" —
   # the missing-browser box is the one where an unverified session is most likely
   # to be a challenge page nobody has looked at.
+  if (( warm )); then
+    # THE WARM SESSION EXECUTES IT. Same fixed vocabulary, same refusals, same
+    # lease re-read before every step — the daemon re-validates the plan rather
+    # than trusting the process that sent it, exactly as the one-shot driver
+    # re-validates what bin/browser already checked. What is gone is the four
+    # launches: stop the served browser, start a probe, start the driver's,
+    # start the served one again.
+    local wplan wrc=0
+    wplan=$(jq -nc --argjson steps "$(jq -c --arg a "$action" '.actions[$a].steps' "$f")" \
+        --argjson args "$args" --argjson l "$(_daemon_lease_json)" \
+        '{op:"plan", steps:$steps, args:$args} + $l')
+    _daemon_call "$dir" "$wplan" || wrc=$?
+    _lease_release; trap - EXIT
+    if (( wrc == 70 )); then
+      die "$E_UNAVAILABLE" "the warm session refused before it ran a single step, so nothing was published and there is nothing to re-read (it exited 70; its own reason is above). Not treating the artifact URL as evidence: whatever is already there was not put there by this run."
+    fi
+    _run_verify "$f" "$action" "$args" "$wrc"
+    return $?
+  fi
+
   local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — an action needs the same browser the profile was logged in with."
   # PLAYWRIGHT TAKES A PATH, NOT A NAME. _chrome answers with whatever `command -v`
   # found first — the bare word `google-chrome` — which bash resolves through PATH
@@ -1057,10 +1119,22 @@ cmd_run() {
     die "$E_UNAVAILABLE" "the executor refused before it ran a single step, so nothing was published and there is nothing to re-read (it exited 70; its own reason is above). Not treating the artifact URL as evidence: whatever is already there was not put there by this run."
   fi
 
-  # AND HERE IS THE WHOLE POINT. The driver's exit status is evidence, not a
-  # verdict: "posted the wrong thing and reported success" and "published fine and
-  # reported failure" are both driver-green/driver-red lies, and the second one
-  # double-posts on retry. So we go and LOOK, by a different path.
+  _run_verify "$f" "$action" "$args" "$drc"
+  return $?
+}
+
+# AND HERE IS THE WHOLE POINT. The executor's exit status is evidence, not a
+# verdict: "posted the wrong thing and reported success" and "published fine and
+# reported failure" are both executor-green/executor-red lies, and the second one
+# double-posts on retry. So we go and LOOK, by a different path.
+#
+# It is a FUNCTION as of DIVE-4621, because there are now two executors — the
+# one-shot driver and the warm session — and the verdict must not be able to
+# differ between them. A copy per executor is a copy that loses the re-read on
+# somebody's next edit, and losing it means the driver's own exit status silently
+# becomes the verdict.
+_run_verify() {  # _run_verify <adapter-file> <action> <args-json> <executor-rc>
+  local f="$1" action="$2" args="$3" drc="$4"
   local vurl vexpect
   # BOTH fields interpolate. The expect string is usually the thing that
   # IDENTIFIES the artifact — a slug, an id — so an uninterpolated expect can
@@ -1122,24 +1196,41 @@ cmd_tree() {
   _lease_take "$site" "$dir" "tree" "$wait"
   trap '_lease_and_serve_release' EXIT
 
+  # A TREE IS A NAVIGATION AND NOTHING ELSE, so it is the cheapest verb to serve
+  # out of a warm session and the one an agent runs most: the ref tree exists to
+  # end the guess-a-selector loop, and a loop is measured per round.
+  _PG_WARM=1
+
   # THE SAME PROLOGUE EVERY RENDER USES, and for the same reason: a tree of the
   # sign-in page is a perfectly well-formed tree, with a role and a name for
   # every field, and an agent would go on to quote its refs into an adapter and
   # wonder for an hour why they never match.
   _page_open "$site" "$url"
 
-  local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
-  [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver — tree needs the same executor \`run\` uses, inside the same profile."
-  local chrome; chrome=$(command -v "$_PG_CHROME" 2>/dev/null || printf '%s' "$_PG_CHROME")
-
   local plan out
-  plan=$(jq -nc --arg p "$_PG_DIR" --arg u "$url" --argjson i "$interactive" \
-      '{profile:$p, mode:"tree", url:$u, interactive:($i==1)}')
-  out=$(FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
-        FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
-        FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
-        "$driver" <<<"$plan") \
-    || die "$E_UNAVAILABLE" "the executor could not enumerate $url (its own reason is above)."
+  if _daemon_live "$_PG_DIR"; then
+    # THE WARM SESSION ENUMERATES IT (DIVE-4621) — no launch, no stop, no
+    # restart. The refs are identical by construction: the walk is lib/aria.cjs
+    # either way, and a ref is re-derived from the page on every use rather than
+    # being a handle into the browser that printed it, so which process did the
+    # walk is not a property the answer carries.
+    plan=$(jq -nc --arg u "$url" --argjson i "$interactive" --argjson l "$(_daemon_lease_json)" \
+        '{op:"tree", url:$u, interactive:($i==1)} + $l')
+    out=$(_daemon_call "$_PG_DIR" "$plan") \
+      || die "$E_UNAVAILABLE" "the warm session could not enumerate $url (its own reason is above)."
+  else
+    local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
+    [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver — tree needs the same executor \`run\` uses, inside the same profile."
+    local chrome; chrome=$(command -v "$_PG_CHROME" 2>/dev/null || printf '%s' "$_PG_CHROME")
+
+    plan=$(jq -nc --arg p "$_PG_DIR" --arg u "$url" --argjson i "$interactive" \
+        '{profile:$p, mode:"tree", url:$u, interactive:($i==1)}')
+    out=$(FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
+          FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
+          FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
+          "$driver" <<<"$plan") \
+      || die "$E_UNAVAILABLE" "the executor could not enumerate $url (its own reason is above)."
+  fi
 
   # Put the browser back and drop the lease BEFORE printing: rendering a tree to
   # a terminal is not a reason to keep a customer's browser stopped, and it is
@@ -1300,6 +1391,61 @@ VIEWER_TTL_MIN=60
 VIEWER_BRIDGE_WAIT_S=10
 
 _serve_pidfile()  { echo "$1/.5dive-serve"; }
+# ---- the session daemon (DIVE-4621) ----------------------------------------
+#
+# WHAT CHANGES. `serve` used to be "an Xvfb and a Chrome", and every command that
+# needed the profile had to STOP it, launch its own Chrome, and start it again —
+# four launches for an action that is three clicks. The daemon is the same
+# browser, held by a process that outlives the command: it keeps the CDP pipe
+# (fds 3/4 of its own child, reachable by nobody) and puts a UNIX SOCKET in the
+# 0700 profile directory as the agent face. Humans still arrive over VNC, at the
+# same X display, in the same Chrome.
+#
+# IT IS NEVER A TCP DEBUG PORT, and that is the reason the socket exists at all:
+# a loopback --remote-debugging-port is reachable by every seat on this box and
+# CDP is full control of the browser holding the session, so the 0700 mode on the
+# profile would be decorative
+# (community/wiki/a-loopback-debug-port-makes-a-0700-profile-decorative.md).
+#
+# A BOX WITHOUT playwright-core STILL SERVES. The daemon needs the pinned
+# playwright next to the plugin; where it is absent `serve` falls back to
+# launching Chrome directly, exactly as before, and says so. A warm session is a
+# speed property, not a correctness one — losing it must not lose the browser.
+_daemon_sock()   { echo "$1/.5dive-session.sock"; }
+_daemon_errlog() { echo "$1/.5dive-session.err"; }
+_daemon_bin()    { echo "${FIVEDIVE_BROWSER_SESSION_DAEMON:-$_SELF_DIR/session-daemon}"; }
+
+# LIVE MEANS A LIVE PID AND A SOCKET, not a pidfile. The pidfile is what a
+# previous boot left behind; the socket is what a caller can actually reach. Both
+# checks are cheap and the pair is the whole liveness claim — the same shape
+# DIVE-4400 made `serve` adopt for Chrome.
+_daemon_live() {  # _daemon_live <profile-dir>
+  local f; f="$(_serve_pidfile "$1")"
+  [[ -f "$f" ]] || return 1
+  local p; p=$(_kv "$f" daemon_pid)
+  [[ -n "$p" ]] || return 1
+  _pid_live "$p" || return 1
+  [[ -S "$(_daemon_sock "$1")" ]]
+}
+
+# Send one request, get the daemon's own exit status back. stdout is the
+# daemon's output; its progress and refusals go to stderr, where the one-shot
+# driver's already went, so callers read the same stream either way.
+_daemon_call() {  # _daemon_call <profile-dir> <request-json>
+  local dir="$1" req="$2" bin; bin="$(_daemon_bin)"
+  [[ -x "$bin" ]] || return "$E_UNAVAILABLE"
+  "$bin" call "$(_daemon_sock "$dir")" <<<"$req"
+}
+
+# The lease fields every request carries. The daemon re-reads the FILE before
+# each step rather than trusting the token it was handed: it outlives every
+# caller and serves callers holding different tokens, so "the token I was given
+# at connect" is exactly the check that protects keystroke one and nothing after
+# it (DIVE-4588).
+_daemon_lease_json() {
+  jq -nc --arg lease "$(_lease_meta "$_LEASE_DIR")" --arg token "$_LEASE_TOKEN" \
+     '{lease:$lease, token:$token}'
+}
 _viewer_ticket()  { echo "$1/.5dive-viewer.ticket"; }
 _viewer_pidfile() { echo "$1/.5dive-viewer"; }
 
@@ -1392,9 +1538,19 @@ _pid_live() {
 _serve_running() {  # _serve_running <dir> -> echoes display, 0 if live
   local f; f="$(_serve_pidfile "$1")"
   [[ -f "$f" ]] || return 1
-  local xpid cpid disp; xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid); disp=$(_kv "$f" display)
-  [[ -n "$xpid" && -n "$cpid" ]] || return 1
-  _pid_live "$xpid" && _pid_live "$cpid" || return 1
+  local xpid cpid dpid disp
+  xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid); dpid=$(_kv "$f" daemon_pid)
+  disp=$(_kv "$f" display)
+  # EITHER HOLDER COUNTS, AND NEITHER IS OPTIONAL (DIVE-4621). A serve is now one
+  # of two shapes — a daemon holding a persistent context, or (no playwright on
+  # the box) a Chrome launched directly — and the display is only half of it. A
+  # pidfile naming a daemon that has exited is a serve that is NOT running, which
+  # is the same false-healthy DIVE-4400 closed for the direct shape.
+  [[ -n "$xpid" ]] || return 1
+  [[ -n "$cpid" || -n "$dpid" ]] || return 1
+  _pid_live "$xpid" || return 1
+  if [[ -n "$dpid" ]]; then _pid_live "$dpid" || return 1
+  else _pid_live "$cpid" || return 1; fi
   echo "$disp"; return 0
 }
 
@@ -1423,10 +1579,21 @@ cmd_serve() {
     _viewer_revoke_file "$dir" revoked
     _viewer_stop "$dir"
     local f; f="$(_serve_pidfile "$dir")"
-    local xpid cpid; xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid)
+    local xpid cpid dpid; xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid); dpid=$(_kv "$f" daemon_pid)
+    # ASK THE DAEMON TO GO, THEN INSIST (DIVE-4621). The graceful path closes the
+    # context, which is how Chrome writes the profile out; SIGKILL on a browser
+    # mid-write is how a profile that holds a login gets corrupted, and the login
+    # is the durable half this whole design protects. The kill below is the
+    # backstop for a daemon that is wedged, not the route.
+    if [[ -n "$dpid" ]] && _pid_live "$dpid"; then
+      _daemon_call "$dir" '{"op":"shutdown"}' >/dev/null 2>&1 || true
+      local w=0
+      while (( w < 100 )) && _pid_live "$dpid"; do sleep 0.05; w=$(( w + 1 )); done
+      _pid_live "$dpid" && kill "$dpid" 2>/dev/null
+    fi
     [[ -n "$cpid" ]] && kill "$cpid" 2>/dev/null
     [[ -n "$xpid" ]] && kill "$xpid" 2>/dev/null
-    rm -f "$f"
+    rm -f "$f" "$(_daemon_sock "$dir")"
     printf 'stopped the %s browser. The profile is untouched — it is the durable half.\n' "$site"
     return 0
   fi
@@ -1452,11 +1619,61 @@ cmd_serve() {
   while ! _display_socket "$disp" && (( waited < 300 )); do waited=$(( waited + 1 )); sleep 0.05; done
   kill -0 "$xpid" 2>/dev/null || die "$E_UNAVAILABLE" "Xvfb did not start on :$disp"
 
+  # ---- THE DAEMON IS THE SERVE (DIVE-4621) ---------------------------------
+  #
+  # Xvfb is up. The browser on it is now held by a daemon rather than launched
+  # and abandoned, so that `run`, `tree` and `status` can attach to THIS browser
+  # instead of stopping it and starting their own. DIVE-4400's contract is
+  # RE-IMPLEMENTED here, not inherited: this path has its own launch, so it owes
+  # its own "do not print success until the browser is alive", its own kept
+  # stderr, and its own Xvfb reaping.
+  local chrome; chrome=$(_chrome)
+  # PLAYWRIGHT TAKES A PATH, NOT A NAME (DIVE-4538). `_chrome` answers with the
+  # bare word `google-chrome`, which bash resolves through PATH at every exec and
+  # Playwright's executablePath does not.
+  local chrome_path; chrome_path=$(command -v "$chrome" 2>/dev/null || printf '%s' "$chrome")
+  local daemon; daemon="$(_daemon_bin)"
+  local dpid="" derr; derr="$(_daemon_errlog "$dir")"
+  if [[ -x "$daemon" && -z "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then
+    local rdy="$dir/.5dive-session.ready"
+    ( umask 077; : > "$rdy"; : > "$derr" ) 2>/dev/null || true
+    rm -f "$(_daemon_sock "$dir")"
+    DISPLAY=":$disp" FIVEDIVE_BROWSER_CHROME="$chrome_path" \
+      "$daemon" serve "$dir" "$(_daemon_sock "$dir")" >"$rdy" 2>"$derr" &
+    dpid=$!
+    # READY IS A LINE THE DAEMON PRINTS WHEN THE CONTEXT IS OPEN AND THE SOCKET
+    # IS ACCEPTING — not when bash got a pid back. 30s is a ceiling and not a
+    # cost: the loop leaves on the first of "ready" or "the process is gone".
+    local w=0
+    while (( w < 600 )); do
+      grep -q '^ready ' "$rdy" 2>/dev/null && break
+      _pid_live "$dpid" || break
+      sleep 0.05; w=$(( w + 1 ))
+    done
+    if ! grep -q '^ready ' "$rdy" 2>/dev/null; then
+      # NOT A FAILURE OF `serve`, AND NOT SILENT EITHER. The daemon is the fast
+      # path; a box without the pinned playwright-core simply does not have one.
+      # Reap it, say why in one bounded line, and serve the old way — a customer
+      # who cannot start a browser at all is a much worse outcome than a customer
+      # whose commands each pay a cold launch.
+      kill "$dpid" 2>/dev/null; wait "$dpid" 2>/dev/null || true; dpid=""
+      rm -f "$(_daemon_sock "$dir")"
+      local dwhy; dwhy=$(tr -s '\n' ' ' < "$derr" 2>/dev/null | sed 's/^ *//;s/ *$//' | cut -c1-300)
+      printf '%s: NOTE — no warm session for %s, so every command will stop and restart this browser. %s\n' \
+        "$PROG" "$site" "${dwhy:-the session daemon printed nothing}" >&2
+    fi
+  fi
+  if [[ -n "$dpid" ]]; then
+    ( umask 077; printf 'display=%s\nxvfb_pid=%s\ndaemon_pid=%s\nsock=%s\nstarted_at=%s\n' \
+        "$disp" "$xpid" "$dpid" "$(_daemon_sock "$dir")" "$(date -u +%s)" > "$(_serve_pidfile "$dir")" )
+    printf 'serving %s on :%s (warm session — the profile outlives every viewer, and the browser outlives every command)\n' "$site" "$disp"
+    return 0
+  fi
+
   # KEEP CHROME'S STDERR. The version this replaces sent it to /dev/null, so the
   # single sentence explaining why the browser died was destroyed before anyone
   # could read it, and every later caller had only a pid to go on. 0600, in the
   # profile, like everything else here.
-  local chrome; chrome=$(_chrome)
   local errlog; errlog="$dir/.5dive-serve.err"
   ( umask 077; : > "$errlog" ) 2>/dev/null || true
   DISPLAY=":$disp" "$chrome" --user-data-dir="$dir" --no-first-run \
@@ -1859,7 +2076,7 @@ _shot_host_ok() {  # _shot_host_ok <site> <host>
 #
 # Publishes _PG_DIR (the profile dir) and _PG_CHROME (the binary), and may arm
 # the EXIT trap that puts back a serve it stopped.
-_PG_DIR=""; _PG_CHROME=""
+_PG_DIR=""; _PG_CHROME=""; _PG_WARM=0
 _page_open() {  # _page_open <site> <url>
   local site="$1" url="$2"
   # SCHEME AND HOST, before the store is even opened. file:// and chrome:// are
@@ -1892,6 +2109,27 @@ _page_open() {  # _page_open <site> <url>
 
   local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — a render needs the same browser the profile was logged in with."
 
+  # THE WARM SESSION IS NOT CYCLED (DIVE-4621). The stop-render-restart below
+  # exists for one reason — Chrome allows one instance per --user-data-dir, so a
+  # second browser at a held profile is a browser that does nothing. A daemon
+  # removes the need rather than the constraint: the work goes INTO the browser
+  # that is already holding the profile, so there is nothing to stop and nothing
+  # to put back. A person at a viewer is therefore not disturbed at all on this
+  # path, where the cold path had to refuse them outright.
+  # OPT-IN PER VERB, and the opt-in is the honest half. `tree` and `run` do their
+  # work THROUGH the browser (a navigation, a click), so a warm session serves
+  # them as-is. `shot` and `read` still drive a chrome of their own with
+  # --screenshot / --dump-dom, and that second chrome at a held profile is the
+  # exact do-nothing launch this section is about — so they keep the cycle, which
+  # now stops and restarts the daemon rather than a bare Chrome. Giving them the
+  # warm session means giving the daemon a render op; that is not done here, and
+  # saying so is better than a flag that silently renders nothing.
+  if (( ${_PG_WARM:-0} )) && _daemon_live "$dir"; then
+    _PG_DIR="$dir"; _PG_CHROME="$chrome"
+    _page_open_probe "$site" "$dir"
+    return 0
+  fi
+
   # The served browser holds the profile. Cycle it (never with a person inside).
   local sdisp
   if sdisp=$(_serve_running "$dir"); then
@@ -1901,8 +2139,18 @@ _page_open() {  # _page_open <site> <url>
     cmd_serve "$site" --stop >/dev/null
   fi
 
-  # LIVENESS, positive list only. See the header: the failure this stops is a PNG
-  # of the sign-in page handed over as the artifact.
+  _page_open_probe "$site" "$dir"
+
+  _PG_DIR="$dir"; _PG_CHROME="$chrome"
+  return 0
+}
+
+# LIVENESS, positive list only. See the header: the failure this stops is a PNG
+# of the sign-in page handed over as the artifact. Lifted out of _page_open under
+# DIVE-4621 because the warm path reaches it by a different road, and a second
+# copy of a positive list is a second place for a state to fall through.
+_page_open_probe() {
+  local site="$1" dir="$2"
   local state; state=$(_probe "$site" "$dir")
   case "$state" in
     authenticated*) : ;;
@@ -1915,9 +2163,6 @@ _page_open() {  # _page_open <site> <url>
     *)
       die "$E_COLD" "cannot confirm the $site session is live ($state), so a render now could be the sign-in page with no way for the reader to tell. Refusing." ;;
   esac
-
-  _PG_DIR="$dir"; _PG_CHROME="$chrome"
-  return 0
 }
 
 cmd_shot() {
@@ -2056,6 +2301,47 @@ _read_output_dir() { # _read_output_dir <site> <explicit-or-empty> <profile-dir>
   printf '%s\n' "$resolved"
 }
 
+# THE DERIVATION, ONCE (DIVE-4653). page.html -> page.md + page.meta.json, with
+# the hash and the provenance of the bytes it came from.
+#
+# It is a function rather than a copy in each verb because `read` and `snapshot`
+# capture the SAME document by two different roads (a --dump-dom chrome, and one
+# page.evaluate inside the browser that is already open) and must produce the
+# same evidence triple from it. Two copies of this would drift in the direction
+# that matters: a reader comparing a snapshot's page.md against a read's would be
+# comparing two extractors and calling the difference a change in the page.
+#
+# `capture` is recorded and NOT normalised: how the bytes were taken is a fact
+# about the evidence, and "dump-dom" and "snapshot" are genuinely different reads
+# of a live page — the snapshot is the DOM the agent acted against, the dump-dom
+# is a second load of the same URL.
+_derive_capture() { # _derive_capture <stage> <url> <chrome> <capture-kind>
+  local stage="$1" url="$2" chrome="$3" capture="$4"
+  if ! node "$READ_EXTRACTOR" --url="$url" <"$stage/page.html" >"$stage/extracted.json"; then
+    die "$E_UNAVAILABLE" "the pinned Defuddle extractor rejected the captured DOM; no evidence files were written"
+  fi
+  jq -e '.markdown | type == "string"' "$stage/extracted.json" >/dev/null || \
+    die "$E_UNAVAILABLE" "the extractor returned no Markdown; no evidence files were written"
+
+  local retrieved sha chrome_version
+  retrieved="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  sha="$(sha256sum "$stage/page.html" | cut -d' ' -f1)"
+  chrome_version="$($chrome --version 2>/dev/null | head -1)"
+  [[ -n "$chrome_version" ]] || chrome_version="unknown"
+  jq --arg retrieved_at "$retrieved" --arg sha256 "$sha" \
+     --arg chrome_version "$chrome_version" --arg capture "$capture" \
+     '. + {retrieved_at:$retrieved_at, sha256:$sha256, chrome_version:$chrome_version, capture:$capture}' \
+     "$stage/extracted.json" >"$stage/full.json" || die "$E_UNAVAILABLE" "could not assemble page metadata"
+  jq 'del(.markdown, .site)' "$stage/full.json" >"$stage/page.meta.json"
+
+  {
+    printf '%s\n' '---'
+    jq -r '"url: " + (.url | @json), "canonical_url: " + (.canonical_url | @json), "title: " + (.title | @json), "description: " + (.description | @json), "author: " + (.author | @json), "published: " + (.published | @json), "retrieved_at: " + (.retrieved_at | @json), "word_count: " + (.word_count | tostring)' "$stage/full.json"
+    printf '%s\n\n' '---'
+    jq -r '.markdown' "$stage/full.json"
+  } >"$stage/page.md"
+}
+
 _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
   local kind="$1"; shift
   local site="" url="" out="" json=0 wait="$READ_WAIT_DEFAULT"
@@ -2099,29 +2385,7 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
     die "$E_UNAVAILABLE" "the authenticated DOM capture produced no page (chrome exited $crc); no evidence files were written"
   fi
 
-  if ! node "$READ_EXTRACTOR" --url="$url" <"$stage/page.html" >"$stage/extracted.json"; then
-    die "$E_UNAVAILABLE" "the pinned Defuddle extractor rejected the captured DOM; no evidence files were written"
-  fi
-  jq -e '.markdown | type == "string"' "$stage/extracted.json" >/dev/null || \
-    die "$E_UNAVAILABLE" "the extractor returned no Markdown; no evidence files were written"
-
-  local retrieved sha chrome_version
-  retrieved="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  sha="$(sha256sum "$stage/page.html" | cut -d' ' -f1)"
-  chrome_version="$($chrome --version 2>/dev/null | head -1)"
-  [[ -n "$chrome_version" ]] || chrome_version="unknown"
-  jq --arg retrieved_at "$retrieved" --arg sha256 "$sha" \
-     --arg chrome_version "$chrome_version" \
-     '. + {retrieved_at:$retrieved_at, sha256:$sha256, chrome_version:$chrome_version, capture:"dump-dom"}' \
-     "$stage/extracted.json" >"$stage/full.json" || die "$E_UNAVAILABLE" "could not assemble page metadata"
-  jq 'del(.markdown, .site)' "$stage/full.json" >"$stage/page.meta.json"
-
-  {
-    printf '%s\n' '---'
-    jq -r '"url: " + (.url | @json), "canonical_url: " + (.canonical_url | @json), "title: " + (.title | @json), "description: " + (.description | @json), "author: " + (.author | @json), "published: " + (.published | @json), "retrieved_at: " + (.retrieved_at | @json), "word_count: " + (.word_count | tostring)' "$stage/full.json"
-    printf '%s\n\n' '---'
-    jq -r '.markdown' "$stage/full.json"
-  } >"$stage/page.md"
+  _derive_capture "$stage" "$url" "$chrome" dump-dom
 
   install -m 00600 "$stage/page.html" "$out/page.html" || die "$E_UNAVAILABLE" "cannot install page.html in $out"
   install -m 00600 "$stage/page.meta.json" "$out/page.meta.json" || die "$E_UNAVAILABLE" "cannot install page.meta.json in $out"
@@ -2146,6 +2410,164 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
 
 cmd_read()  { _cmd_read_like read "$@"; }
 cmd_links() { _cmd_read_like links "$@"; }
+
+# ================================================ snapshot (DIVE-4653)
+#
+# ONE SNAPSHOT PER DECISION, instead of one command per FIELD of that decision.
+#
+# What an agent actually does before it acts on a page is always the same three
+# reads: what can I click (`tree`), what does the page say (`read`), what does it
+# look like (`shot`). Each of those is a separate command, and each command in
+# this plugin is a browser cycle: probe the session, open a browser at the
+# profile, load the URL, do one thing, close. Three cycles, three probes, three
+# loads of the same page, for one decision.
+#
+# jev-ultrafast measured this shape upstream and put a number on it — 1092
+# protocol calls for a task whose work is 101 — and the fix it demonstrates is
+# not a faster call, it is asking ONCE: one navigation, one atomic read of the
+# page, everything the next decision needs in the answer.
+#
+# THE SECOND HALF IS CORRECTNESS, not speed, and it is the half that survives a
+# fast box. Three cycles are three different page instants. A ref `tree` printed
+# can be gone from the DOM `read` captured four seconds later; the PNG can show a
+# consent overlay neither of them saw. Those three files land in one artifact
+# directory looking like one observation of one page, and nothing in them says
+# otherwise. Here the refs, the document and the picture come from one tab at one
+# instant, so the artifact directory is honest by construction.
+#
+# WHAT IT DOES NOT DO. It does not replace `shot`, `read` or `tree`, and it does
+# not quietly re-point them: each is still the right verb when one field is all
+# you want, and `read`'s --dump-dom capture stays exactly as it is (a second,
+# independently re-runnable load, hash and all). This verb is for the case that
+# was paying three times for one answer.
+SNAP_SETTLE_DEFAULT=1200
+
+cmd_snapshot() {
+  local site="" url="" out="" interactive=0 json=0 shot=1 full=0 wait="no" settle=""
+  while (($#)); do
+    case "$1" in
+      --out=*)  out="${1#*=}" ;;
+      --interactive) interactive=1 ;;
+      --json)   json=1 ;;
+      --no-shot) shot=0 ;;
+      --full)   full=1 ;;
+      --settle=*) settle="${1#*=}" ;;
+      --wait)   wait="$LEASE_WAIT_DEFAULT" ;;
+      --wait=*) wait="${1#*=}" ;;
+      -h|--help)
+        printf '%s snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full]\n' "$PROG"
+        return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac; shift
+  done
+  [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot]"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  [[ -z "$settle" || "$settle" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--settle takes milliseconds; got: $settle"
+  [[ -r "$READ_EXTRACTOR" ]] || die "$E_UNAVAILABLE" "the pinned page extractor is missing from this install ($READ_EXTRACTOR)"
+  command -v node >/dev/null 2>&1 || die "$E_UNAVAILABLE" "node is required to run the pinned page extractor"
+  command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to assemble the evidence metadata"
+  _require_store
+  local dir; dir="$(_site_dir "$site")"
+  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
+
+  # The lease is taken before the prologue, for the reason cmd_tree states: the
+  # prologue can stop somebody's served browser, so the window before the lease
+  # is the window in which that happens to a caller who is mid-action.
+  _lease_take "$site" "$dir" "snapshot" "$wait"
+  trap '_lease_and_serve_release' EXIT
+
+  # A snapshot is a navigation and a read — exactly the shape the warm session
+  # serves, and the verb an agent runs most in a loop.
+  _PG_WARM=1
+  _page_open "$site" "$url"
+
+  out="$(_read_output_dir "$site" "$out" "$_PG_DIR")" || exit $?
+  _READ_STAGE="$(mktemp -d /tmp/5dive-browser-read.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the page evidence"
+  trap '_read_cleanup' EXIT
+  local stage="$_READ_STAGE"
+  local png=""; (( shot )) && png="$stage/page.png"
+
+  local plan payload
+  if _daemon_live "$_PG_DIR"; then
+    # THE WARM SESSION CAPTURES IT — no launch, no stop, no restart, and the
+    # person at a viewer is not disturbed. This is the render op DIVE-4621 said
+    # the daemon did not have, which is why `shot` and `read` still cycle a cold
+    # chrome of their own; `snapshot` is that op, scoped to the one verb built
+    # for it rather than retrofitted onto the other two.
+    plan=$(jq -nc --arg u "$url" --arg h "$stage/page.html" --arg s "$png" \
+        --argjson i "$interactive" --argjson f "$full" --argjson l "$(_daemon_lease_json)" \
+        '{op:"snapshot", url:$u, html:$h, shot:(if $s=="" then null else $s end),
+          interactive:($i==1), full:($f==1)} + $l')
+    payload=$(_daemon_call "$_PG_DIR" "$plan") \
+      || die "$E_UNAVAILABLE" "the warm session could not capture $url (its own reason is above)."
+  else
+    local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
+    [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver — snapshot reads the page through the same executor \`run\` acts through, inside the same profile."
+    local chrome; chrome=$(command -v "$_PG_CHROME" 2>/dev/null || printf '%s' "$_PG_CHROME")
+    plan=$(jq -nc --arg p "$_PG_DIR" --arg u "$url" --arg h "$stage/page.html" --arg s "$png" \
+        --argjson i "$interactive" --argjson f "$full" \
+        '{profile:$p, mode:"snapshot", url:$u, html:$h, shot:(if $s=="" then null else $s end),
+          interactive:($i==1), full:($f==1)}')
+    payload=$(FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
+          FIVEDIVE_BROWSER_TREE_SETTLE_MS="${settle:-${FIVEDIVE_BROWSER_TREE_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}" \
+          FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
+          FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
+          "$driver" <<<"$plan") \
+      || die "$E_UNAVAILABLE" "the executor could not capture $url (its own reason is above)."
+  fi
+
+  [[ -s "$stage/page.html" ]] || die "$E_UNAVAILABLE" "the capture produced no document; no evidence files were written"
+
+  # The SAME derivation `read` uses, over the bytes the walk above came from.
+  _derive_capture "$stage" "$url" "$_PG_CHROME" snapshot
+
+  # tree.json is the refs, written from the same payload the walk returned — so
+  # "what I can click" and "what the page said" are one observation on disk.
+  jq '{url, title, nodes}' <<<"$payload" >"$stage/tree.json" \
+    || die "$E_UNAVAILABLE" "the capture returned no addressable nodes; no evidence files were written"
+
+  local f
+  for f in page.html page.md page.meta.json tree.json; do
+    install -m 00600 "$stage/$f" "$out/$f" || die "$E_UNAVAILABLE" "cannot install $f in $out"
+  done
+  if (( shot )); then
+    if [[ -s "$stage/page.png" ]]; then
+      install -m 00600 "$stage/page.png" "$out/page.png" || die "$E_UNAVAILABLE" "cannot install page.png in $out"
+    else
+      # SAY SO RATHER THAN SHIP THE REST QUIETLY. A missing PNG next to a present
+      # page.md reads as "this page has no picture", and the reader has no way to
+      # tell that from "the screenshot failed".
+      printf '%s: WARNING — the document and the refs were captured but the screenshot was not written. %s/page.png is absent.\n' "$PROG" "$out" >&2
+    fi
+  fi
+
+  local nodes title final
+  nodes=$(jq -r '.nodes | length' <<<"$payload")
+  title=$(jq -r '.title // ""' <<<"$payload")
+  final=$(jq -r '.url // ""' <<<"$payload")
+
+  _READ_STAGE=""
+  rm -rf -- "$stage"
+  _shot_restore
+  _lease_release
+  trap - EXIT
+
+  if (( json )); then
+    jq -nc --argjson p "$payload" --arg o "$out" '$p + {artifacts:$o}'
+    return 0
+  fi
+  printf '%s\n' "$title"
+  printf '  %s\n' "$final"
+  printf '  %s addressable node(s); one page instant, one capture\n' "$nodes"
+  printf '  %s\n' "$out"
+  printf '    page.md         what the page says (the pinned extractor, over page.html)\n'
+  printf '    tree.json       what you can act on: ref=<role>/<name>[#n]\n'
+  printf '    page.html       the document the two above came from\n'
+  (( shot )) && [[ -s "$out/page.png" ]] && printf '    page.png        the same tab, the same instant\n'
+  printf '%s: one browser cycle for all of it — quote a ref straight into `run`.\n' "$PROG" >&2
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # DIVE-4446: the workflow is the product, and a Claude skill only teaches half
@@ -2403,6 +2825,7 @@ case "${1:-}" in
   evict) shift; cmd_evict "$@" ;;
   shot)  shift; cmd_shot  "$@" ;;
   read)  shift; cmd_read  "$@" ;;
+  snapshot) shift; cmd_snapshot "$@" ;;
   links) shift; cmd_links "$@" ;;
   serve) shift; cmd_serve "$@" ;;
   viewer) shift; cmd_viewer "$@" ;;
