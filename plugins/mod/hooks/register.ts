@@ -615,6 +615,26 @@ let auditFailureLogged = false
 let auditDone = false
 
 /**
+ * Whether this session wants the context-cost line at all. Resolved ONCE, like
+ * `state` and `commands`: audit-off is the default case, and read per turn it would
+ * be a settings read on every turn of every telemetry seat that is not auditing.
+ */
+let audit: Promise<boolean> | null = null
+
+/**
+ * Reads AUDIT_FLAG once per session. A settings read that throws means off — the same
+ * contract as everywhere else in this file. Declared at the top level because it
+ * takes `$`.
+ */
+async function resolveAudit($: EngineInterface): Promise<boolean> {
+  try {
+    return String(envOf(await $.settings.read())[AUDIT_FLAG] ?? '') === '1'
+  } catch {
+    return false
+  }
+}
+
+/**
  * Decides once whether this session serves the commands, and registers them.
  *
  * Gated independently of the telemetry FLAG: a seat may want the command surface with
@@ -804,11 +824,13 @@ export const register: Register = (on) => {
         // there, while their skill counts disagreed for no reason the arms explain).
         // After a turn completes, the breakdown is over what was actually sent, which
         // is the only number this row is allowed to claim a per-turn saving from.
-        ...(auditDone
+        //
+        // The flag itself is resolved once per session (`audit`), not read here: with
+        // the audit off — the default — `auditDone` never flips, so a settings read in
+        // this expression would run on every turn of every telemetry seat forever.
+        ...(auditDone || !(await (audit ??= resolveAudit($)))
           ? {}
-          : String(envOf(await $.settings.read())[AUDIT_FLAG] ?? '') === '1'
-            ? ((auditDone = true), { context_cost: await contextCost($) })
-            : {}),
+          : ((auditDone = true), { context_cost: await contextCost($) })),
       })
     }
     return r

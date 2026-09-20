@@ -201,6 +201,20 @@ describe('mod commands: the surface stays a dispatch', () => {
     // instrument would be a per-turn token-count request on every audited seat.
     expect(SRC).toContain('let auditDone = false')
     expect([...SRC.matchAll(/contextCost\(\$\)/g)].length).toBe(1)
-    expect(SRC).toMatch(/auditDone\s*\n?\s*\? \{\}/)
+    expect(SRC).toMatch(/auditDone \|\| !\(await \(audit \?\?= resolveAudit\(\$\)\)\)/)
+  })
+
+  test('the audit FLAG is resolved once a session, not read per turn', () => {
+    // Audit-off is the default case and `auditDone` never flips there, so a settings
+    // read inside the turn hook would run on every turn of every telemetry seat that
+    // is not auditing — the per-turn cost this row exists to remove (quinn, DIVE-4693
+    // iteration 1). The flag joins `state` and `commands` behind a session latch.
+    expect(SRC).toContain('let audit: Promise<boolean> | null = null')
+    expect(SRC).toMatch(/async function resolveAudit\(\$: EngineInterface\): Promise<boolean>/)
+    // Every settings read in the module sits in a once-per-session resolver.
+    expect([...SRC.matchAll(/\$\.settings\.read\(\)/g)].length).toBe(3)
+    const turnComplete = SRC.slice(SRC.indexOf("on('turn.complete'"))
+    const body = turnComplete.slice(0, turnComplete.indexOf("on('command.run'"))
+    expect(body).not.toContain('$.settings.read()')
   })
 })
