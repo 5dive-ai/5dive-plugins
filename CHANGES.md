@@ -13,10 +13,19 @@ site's display, answering on a unix socket inside that same 0700 directory.
 refuses one: a loopback debug port is reachable by every seat on the box and CDP
 is full control of the browser holding the session.
 
-Measured on one box, same task, `run` = goto + fill + click + the out-of-band
-verify, three consecutive runs: **4589 / 4934 / 4001 ms** with a browser served
-and no daemon (the shape a customer is in) against **1387 / 1309 / 1276 ms**
-warm — **3.5x**. About 1.0 s of what is left is the liveness probe, not a launch.
+Measured by a rig that ships with the change — `tests/browser_session_bench.sh`,
+which anyone can re-run — on one box, same task, `run` = goto + fill + click +
+the out-of-band verify. A browser served with no daemon (the shape a customer is
+in) against the same command warm: **3.1x-6.4x** across three runs. The spread
+is box load, and it falls on one side only — the warm median was 1290-1381 ms in
+every run, while the served-no-daemon median moved 4047 -> 8656 ms as the box got
+busy. That is the point rather than a caveat: what the daemon removes is the
+launch, and the launch is the part that costs more the more the box is doing.
+Where nothing was being served at all it is 1.4x-2.7x. About 1.0 s of what is
+left warm is the liveness probe, not a launch,
+and the page is a local static file — a real web application spends more of its
+time in the page, so this is an upper bound for this task shape rather than a
+constant.
 
 `status` can also read a SERVED profile for the first time: it used to answer
 `UNKNOWN (served on :N)`, because probing a held profile needed CDP and CDP

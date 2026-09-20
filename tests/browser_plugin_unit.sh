@@ -3348,5 +3348,60 @@ tc 'T25j a busy session refuses rather than queueing' 'did not hold it' \
 tc 'T25j ...and says nothing ran, so no artifact is re-read as evidence' 'Nothing ran' \
    "$(cat "$DAEMONBIN")"
 
+# --- T25k `shot` on a WARM profile: down, render, and a LIVE daemon back ------
+# ITERATION 2, AND IT IS A COMPOSITION ARM ON PURPOSE. Every other T25 arm
+# reaches the daemon because the arm puts the stub on NODE_PATH; every `shot` and
+# `read` arm in this suite therefore runs with the daemon effectively pinned off,
+# so the one path a served customer actually takes on a render — take the daemon
+# DOWN, drive a second chrome at the profile it was holding, bring a daemon BACK
+# — was reasoned about and never executed. The pieces each have an arm (T25i:
+# `--stop` closes and unlinks; T25a: a restart comes back warm) and that is
+# exactly the shape that hides a composition defect: Chrome allows one instance
+# per --user-data-dir, so a render that starts while the daemon's Chrome still
+# owns the profile is a do-nothing launch, and `cmd_serve --stop`'s SIGTERM
+# backstop is the only thing between the two.
+#
+# THE THREE THINGS IT ASSERTS, and none of them is "the code says so":
+#   asked to go   -> the stub records a context close. A SIGKILL records nothing,
+#                    and the profile is written out by the close.
+#   it rendered   -> rc 0 and a non-empty PNG of the url asked for.
+#   warm again    -> a NEW pid, alive, and a socket that ANSWERS a ping. A pidfile
+#                    with a dead pid in it is what "restored" looks like when the
+#                    restore only half worked.
+# This PATH has to do three jobs in one arm: a headed chrome that stays up (the
+# serve), a headless one that honours --screenshot (the render) — both are
+# SHOTBIN — and a fake Xvfb, which is SBIN.
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+KPATH="$SHOTBIN:$SBIN:$PATH"
+KREC="$TMP/dpw-shot.jsonl"; : > "$KREC"
+kenv() { env PATH="$KPATH" DISPLAY= SHOTARGV="$TMP/k-argv.txt" \
+             NODE_PATH="$DSTUB/node_modules" PWREC="$KREC" DPWDOM="$DPWDOM" "$@"; }
+kping() { kenv "$DAEMONBIN" call "$WDIR/.5dive-session.sock" <<< '{"op":"ping"}'; }
+
+run kenv "$BROWSER" serve warm.test
+KPID1="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+t  'T25k (anchor) the profile really is held by a live daemon first' 'warm' \
+   "$([[ -n "$KPID1" ]] && kill -0 "$KPID1" 2>/dev/null && kping >/dev/null 2>&1 && echo warm || echo cold)"
+KCLOSES="$(jq -rs '[.[]|select(.call=="close")]|length' "$KREC")"
+
+rm -f "$SHOTOUT/k.png"
+run kenv "$BROWSER" shot warm.test "https://warm.test/p" --out="$SHOTOUT/k.png"
+t  'T25k a shot on a served-and-WARM profile renders' 0 "$RC"
+t  'T25k ...and the PNG exists and is non-empty' 'yes' \
+   "$([[ -s "$SHOTOUT/k.png" ]] && echo yes || echo no)"
+tc 'T25k ...of the URL asked for' 'https://warm.test/p' "$(cat "$SHOTOUT/k.png" 2>/dev/null)"
+t  'T25k ...the daemon was ASKED to close its context, not just killed' 'closed' \
+   "$([[ "$(jq -rs '[.[]|select(.call=="close")]|length' "$KREC")" -gt "$KCLOSES" ]] && echo closed || echo killed-only)"
+t  'T25k ...the daemon that was holding the profile is gone' 'gone' \
+   "$(kill -0 "${KPID1:-0}" 2>/dev/null && echo alive || echo gone)"
+KPID2="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
+t  'T25k ...a NEW daemon is recorded afterwards' 'new' \
+   "$([[ -n "$KPID2" && "$KPID2" != "$KPID1" ]] && echo new || echo "none:$KPID2")"
+t  'T25k ...it is ALIVE, not just a pid in a file' 'alive' \
+   "$(kill -0 "${KPID2:-0}" 2>/dev/null && echo alive || echo dead)"
+t  'T25k ...and its socket ANSWERS — the profile is warm again, not just served' 'pong' \
+   "$(kping 2>/dev/null | tr -d '\n')"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
