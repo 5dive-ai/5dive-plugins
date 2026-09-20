@@ -3144,8 +3144,14 @@ const mkpage = (kind) => ({
   },
   screenshot: async (o) => {
     rec({ call: 'screenshot', path: (o && o.path) || null, fullPage: !!(o && o.fullPage), kind });
-    if (o && o.path) fs.writeFileSync(o.path, process.env.PWSHOT || 'stub-png');
+    // A PATHLESS screenshot returns the BYTES, which is the shape the render op
+    // uses: a brokered caller is handed the image over the socket and writes it
+    // itself, because a daemon writing a caller-chosen path writes it as the
+    // profile's owner (DIVE-4664).
+    if (o && o.path) { fs.writeFileSync(o.path, process.env.PWSHOT || 'stub-png'); return; }
+    return Buffer.from(process.env.PWSHOT || 'stub-png');
   },
+  setViewportSize: async (v) => rec({ call: 'setViewportSize', w: v && v.width, h: v && v.height, kind }),
   selectOption: async (sel, val) => rec({ call: 'selectOption', sel, val, kind }),
   setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p, kind }),
   press: async (sel, key) => rec({ call: 'press', sel, key, kind }),
@@ -3161,6 +3167,12 @@ exports.chromium = {
   },
 };
 DPWJS
+# WHEREVER THIS BOX'S `serve` PUTS THE SOCKET. Since DIVE-4664 that is the broker
+# rendezvous when setup has made one (this suite has run setup) and the 0700
+# profile otherwise, so the arms below name it once here rather than each pinning
+# a path — a pinned path grades the path instead of the property.
+WSOCK_ANY() { local p; p="$(dkv "$WDIR/.5dive-serve" sock)"; printf '%s\n' "${p:-$WDIR/.5dive-session.sock}"; }
+WSOCK_RV="$TMP/browser-sessions/$SEAT/warm.test.sock"
 DPWDOM="$TMP/dpw.dom"; printf '%s' "$LIVE_DOM" > "$DPWDOM"
 DREC="$TMP/dpw-record.jsonl"; : > "$DREC"
 # The daemon runs in ITS OWN process with its own environment, so the stub has to
@@ -3187,9 +3199,36 @@ tc 'T25a ...and says the browser now outlives the command' 'warm session' "$OUT"
 WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
 t  'T25a ...the pidfile names the daemon' 'yes' "$([[ -n "$WPID" ]] && echo yes || echo no)"
 t  'T25a ...the daemon is alive' 'yes' "$(kill -0 "${WPID:-0}" 2>/dev/null && echo yes || echo no)"
-t  'T25a ...and the profile holds a SOCKET, not a port' 'socket' \
+# WHERE THE SOCKET LIVES IS DIVE-4664'S BUSINESS NOW, and it has two answers, so
+# this arm follows the product (the pidfile names it) instead of pinning one of
+# them: the 0700 profile on a box with no broker rendezvous, the rendezvous where
+# `setup` has made one. It is a SOCKET and never a port in both. This suite has
+# run `setup`, so it has a rendezvous; T25a2 is the other shape.
+WSOCK="$(dkv "$WDIR/.5dive-serve" sock)"
+t  'T25a ...and the session is reached by a SOCKET, not a port' 'socket' \
+   "$(stat -c '%F' "$WSOCK" 2>/dev/null)"
+t  'T25a ...at a filesystem path, where the MODE is the access control' 'yes' \
+   "$([[ "$WSOCK" == /* ]] && echo yes || echo no)"
+t  'T25a ...group-reachable in the rendezvous, because that IS the broker (DIVE-4664)' '770' \
+   "$(stat -c '%a' "$WSOCK" 2>/dev/null)"
+t  'T25a ...and it LEFT the 0700 profile rather than being duplicated into it' 'no' \
+   "$([[ -e "$WDIR/.5dive-session.sock" ]] && echo yes || echo no)"
+
+# --- T25a2 a box with NO rendezvous keeps the old one-seat socket -------------
+# The broker is additive (DIVE-4664). A box that has not re-run `setup`, or one
+# whose rendezvous could not be made, must still get a warm session — just one
+# that only its owner can reach, which is exactly what it had before.
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+dserve warm.test FIVEDIVE_BROWSER_SESSION_ROOT="$TMP/no-rendezvous-here"
+t  'T25a2 serve still holds a warm session with no rendezvous on the box' 0 "$RC"
+tn 'T25a2 ...and does not claim to broker one' 'brokered at' "$OUT"
+t  'T25a2 ...the socket goes back inside the 0700 profile' 'socket' \
    "$(stat -c '%F' "$WDIR/.5dive-session.sock" 2>/dev/null)"
-t  'T25a ...created 0700' '700' "$(stat -c '%a' "$WDIR/.5dive-session.sock" 2>/dev/null)"
+t  'T25a2 ...created 0700 — one seat, exactly as before' '700' \
+   "$(stat -c '%a' "$WDIR/.5dive-session.sock" 2>/dev/null)"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+dserve warm.test
+WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
 t  'T25a ...the context was opened headed, in THIS profile' "false $WDIR" \
    "$(jq -rs '[.[]|select(.call=="launch")]|last|"\(.headless) \(.profile)"' "$DREC")"
 t  'T25a ...with the shared XDG_CONFIG_HOME unset under it (DIVE-4587)' '<unset>' \
@@ -3203,8 +3242,8 @@ tn 'T25b ...and does not claim a warm session' 'warm session' "$OUT"
 tc 'T25b ...it says every command will pay a cold launch' 'no warm session' "$ERR"
 tc 'T25b ...and carries the daemon own reason' 'cannot open the profile' "$ERR"
 t  'T25b ...no daemon is left recorded' '' "$(dkv "$WDIR/.5dive-serve" daemon_pid)"
-t  'T25b ...and no stale socket is left behind' 'no' \
-   "$([[ -S "$WDIR/.5dive-session.sock" ]] && echo yes || echo no)"
+t  'T25b ...and no stale socket is left behind, in either place it could be' 'no no' \
+   "$([[ -S "$WDIR/.5dive-session.sock" ]] && echo yes || echo no) $([[ -S "$WSOCK_RV" ]] && echo yes || echo no)"
 t  'T25b ...the browser IS up anyway — losing the speed must not lose the session' 'yes' \
    "$([[ -n "$(dkv "$WDIR/.5dive-serve" chrome_pid)" ]] && echo yes || echo no)"
 env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
@@ -3331,7 +3370,7 @@ kill "$T25HPID" 2>/dev/null
 # cold path is still there, and a command must take it rather than refuse.
 WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
 kill -9 "$WPID" 2>/dev/null
-rm -f "$WDIR/.5dive-session.sock"
+rm -f "$WDIR/.5dive-session.sock" "$WSOCK_RV"
 # NOT $SPATH HERE. That PATH's fake chrome answers a --headless probe with an
 # empty document (it exists to be a SERVE, not a probe), so the cold fallback
 # would refuse on liveness and the arm would grade the fake instead of the
@@ -3349,7 +3388,8 @@ run env PATH="$SPATH" "$BROWSER" serve warm.test --stop
 t  'T25i stop returns cleanly' 0 "$RC"
 t  'T25i ...the daemon is gone' 'gone' \
    "$(kill -0 "${WPID:-0}" 2>/dev/null && echo alive || echo gone)"
-t  'T25i ...the socket is gone with it' 'no' "$([[ -S "$WDIR/.5dive-session.sock" ]] && echo yes || echo no)"
+t  'T25i ...the socket is gone with it, wherever serve had put it' 'no' \
+   "$([[ -S "$(WSOCK_ANY)" || -S "$WDIR/.5dive-session.sock" || -S "$WSOCK_RV" ]] && echo yes || echo no)"
 # THE GRACEFUL PATH IS THE ROUTE, NOT THE BACKSTOP: closing the context is how
 # Chrome writes the profile out, and the profile holding the login is the durable
 # half. A SIGKILL mid-write corrupts exactly that.
@@ -3391,7 +3431,10 @@ KPATH="$SHOTBIN:$SBIN:$PATH"
 KREC="$TMP/dpw-shot.jsonl"; : > "$KREC"
 kenv() { env PATH="$KPATH" DISPLAY= SHOTARGV="$TMP/k-argv.txt" \
              NODE_PATH="$DSTUB/node_modules" PWREC="$KREC" DPWDOM="$DPWDOM" "$@"; }
-kping() { kenv "$DAEMONBIN" call "$WDIR/.5dive-session.sock" <<< '{"op":"ping"}'; }
+# THE SOCKET PATH IS READ FROM THE PIDFILE AT CALL TIME, not pinned: since
+# DIVE-4664 `serve` puts it in the broker rendezvous where the box has one, and
+# an arm that pins the old path grades the path instead of the liveness.
+kping() { kenv "$DAEMONBIN" call "$(dkv "$WDIR/.5dive-serve" sock)" <<< '{"op":"ping"}'; }
 
 run kenv "$BROWSER" serve warm.test
 KPID1="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
@@ -3621,6 +3664,240 @@ t  'T26i ...with the refs the warm walk found' 'button/Compose' \
 t  'T26i ...and the daemon is STILL holding the profile afterwards' 'alive' \
    "$(kill -0 "$(dkv "$WDIR/.5dive-serve" daemon_pid)" 2>/dev/null && echo alive || echo gone)"
 env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+
+# ========== T27 DIVE-4664: a site login is per BOX, and it is BROKERED ========
+#
+# WHAT THESE GRADE, and the measurement that forced the row: on exact-swallow the
+# store held 15 seats and 14 of them were EMPTY, so every agent seat was logged
+# out of every site a human had connected and each one that needed a site was
+# another human login. The fix is NOT a shared directory — anything that can READ
+# a profile can replay the session — it is a BROKER: the store stays 0700 to the
+# shelld seat, the session daemon's socket moves to a rendezvous the box's agent
+# seats can reach, and a seat with no login of its own acts through it.
+#
+# Each arm is a mutant of the specific way that goes wrong:
+#   the store becomes group-readable   -> T27a: the profile dir is still 0700.
+#   the socket stays in the 0700 dir   -> T27a: it is in the rendezvous, 0770.
+#   the broker never engages           -> T27b: a second seat reads AUTHENTICATED
+#                                        and acts, launching no chrome of its own.
+#   per-seat stops being the opt-in    -> T27c: a seat's OWN login wins.
+#   "no daemon" reads as "no login"    -> T27e: two conditions, two sentences.
+#   the log records only the owner     -> T27f: on_behalf_of is the KERNEL'S
+#                                        answer, and a request cannot sign it.
+#   _seat believes SUDO_USER           -> T27g: euid is the seat.
+#   shot/read stay chrome-only         -> T27i: they render through the daemon.
+BOXSEAT="$SEAT"
+OTHER="agent-brokered.test"                 # a seat name this uid is NOT
+RVROOT="$TMP/browser-sessions"              # the sibling of $TMP/profiles
+export FIVEDIVE_BROWSER_BOX_SEAT="$BOXSEAT"
+
+# The rendezvous as `setup` builds it (that path is root's; this is the shape it
+# produces, and T27a asserts the product still agrees with it).
+mkdir -p "$RVROOT/$BOXSEAT"; chmod 711 "$RVROOT"; chmod 750 "$RVROOT/$BOXSEAT"
+
+DREC3="$TMP/dpw-record-4664.jsonl"; : > "$DREC3"
+BOXDOM="$TMP/box.dom"; printf '%s' "$LIVE_DOM" > "$BOXDOM"
+bserve() {  # the OWNER serves
+  run env PATH="$SPATH" DISPLAY= NODE_PATH="$DSTUB/node_modules" PWREC="$DREC3" DPWDOM="$BOXDOM" \
+      "$@" "$BROWSER" serve box.test
+}
+# A SECOND SEAT, with no store of its own. NOT $SPATH: that PATH's chrome is the
+# one built to be a SERVE and it answers a --headless probe with an empty
+# document, so a seat falling back to a COLD read there would grade the fake
+# rather than the product. The ambient PATH's fake answers probes, which is what
+# T27c (a seat's own login wins) actually needs.
+bother() {
+  run env NODE_PATH="$DSTUB/node_modules" PWREC="$DREC3" DPWDOM="$BOXDOM" \
+      FIVEDIVE_BROWSER_SEAT="$OTHER" "$@"
+}
+blaunches() { jq -rs '[.[]|select(.call=="launch")]|length' "$DREC3"; }
+
+mkprofile box.test "$LIVE_DOM" >/dev/null
+BDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$BOXSEAT/box.test"
+mkadapter box.test "file://$TMP/artifact.html" 'PUBLISHED'
+BSOCK="$RVROOT/$BOXSEAT/box.test.sock"
+
+# --- T27a the socket leaves the 0700 store, and the store does NOT open up -----
+bserve
+t  'T27a the owner serves' 0 "$RC"
+tc 'T27a ...and says the session is brokered for the rest of the box' 'brokered at' "$OUT"
+t  'T27a ...the socket is in the rendezvous, not in the profile' 'socket' "$(stat -c '%F' "$BSOCK" 2>/dev/null)"
+t  'T27a ...and NOT in the 0700 profile directory' 'no' \
+   "$([[ -e "$BDIR/.5dive-session.sock" ]] && echo yes || echo no)"
+t  'T27a ...group-reachable (0770), because the group IS the access control there' '770' \
+   "$(stat -c '%a' "$BSOCK" 2>/dev/null)"
+t  'T27a ...the credential itself is UNCHANGED: the profile is still 0700' '700' \
+   "$(stat -c '%a' "$BDIR" 2>/dev/null)"
+t  'T27a ...the rendezvous root is traverse-not-list, so no uid outside can find an owner' '711' \
+   "$(stat -c '%a' "$RVROOT" 2>/dev/null)"
+t  'T27a ...and the box advertises the site in a marker, not by letting anyone stat the store' '640' \
+   "$(stat -c '%a' "$RVROOT/$BOXSEAT/box.test.offered" 2>/dev/null)"
+t  'T27a ...the daemon reports itself as a broker' 'broker=yes' \
+   "$(grep -o 'broker=[a-z]*' "$BDIR/.5dive-session.ready" 2>/dev/null | head -1)"
+
+# --- T27b ACCEPTANCE 1: a second seat, one login, zero second login -----------
+BL_BEFORE="$(blaunches)"
+bother "$BROWSER" status box.test
+t  'T27b a second seat reads the box session' 0 "$RC"
+tc 'T27b ...as AUTHENTICATED — not "no profile", not UNKNOWN' 'authenticated' "$OUT"
+tc 'T27b ...and says whose login it is using' 'the box login' "$OUT"
+t  'T27b ...without launching a browser of its own' "$BL_BEFORE" "$(blaunches)"
+t  'T27b ...and it never made a store of its own' 'no' \
+   "$([[ -d "$FIVEDIVE_BROWSER_PROFILE_ROOT/$OTHER" ]] && echo yes || echo no)"
+
+bother "$BROWSER" tree box.test https://box.test/compose --json
+t  'T27b ...`tree` works through the broker' 0 "$RC"
+t  'T27b ...and returns the page it enumerated' 'https://box.test/compose' "$(jq -r '.url' <<<"$OUT" 2>/dev/null)"
+
+bother "$BROWSER" run box.test publish --body=brokered
+t  'T27b ...`run` acts in the box browser' 0 "$RC"
+tc 'T27b ...and the verdict is still the out-of-band re-read' 'verified: publish is live' "$OUT"
+t  'T27b ...STILL not one chrome of its own, for any of the three' "$BL_BEFORE" "$(blaunches)"
+t  'T27b ...the browser was never stopped and restarted to serve it' 'alive' \
+   "$(kill -0 "$(dkv "$BDIR/.5dive-serve" daemon_pid)" 2>/dev/null && echo alive || echo gone)"
+
+# --- T27c ACCEPTANCE 5: the seat's OWN login wins ----------------------------
+#
+# Per-seat survives as the private opt-in. The mutant is a resolution that
+# reaches for the box store first, which would silently act in somebody else's
+# session for a seat that deliberately made its own.
+OWNDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$OTHER/box.test"
+mkdir -p "$OWNDIR"; chmod 700 "$FIVEDIVE_BROWSER_PROFILE_ROOT/$OTHER" "$OWNDIR"
+printf '%s' "$LIVE_DOM" > "$OWNDIR/.fake-dom"
+BL2="$(blaunches)"
+bother "$BROWSER" status box.test
+t  'T27c a seat with its own login for the site reads it' 0 "$RC"
+tn 'T27c ...and is NOT using the box login' 'the box login' "$OUT"
+tc 'T27c ...it reads authenticated out of its own profile' 'authenticated' "$OUT"
+t  'T27c ...which means it launched a chrome of its own, not the daemon' "$BL2" "$(blaunches)"
+rm -rf "$FIVEDIVE_BROWSER_PROFILE_ROOT/$OTHER"
+
+# --- T27d ACCEPTANCE 2 (control): what the other seat still CANNOT do ---------
+t  'T27d the profile stays owned by the box seat alone' "$(id -u)" "$(stat -c '%u' "$BDIR")"
+t  'T27d ...at 0700, so a cookie file in it is unreadable to any other uid' '700' "$(stat -c '%a' "$BDIR")"
+t  'T27d ...the per-owner rendezvous grants the group read+traverse and others none' '750' \
+   "$(stat -c '%a' "$RVROOT/$BOXSEAT" 2>/dev/null)"
+t  'T27d ...and the socket grants others nothing either' '0' \
+   "$(( $(stat -c '%a' "$BSOCK" 2>/dev/null || echo 770) % 10 ))"
+# THE REAL CONTROL NEEDS A REAL SECOND UID, and that needs root. Where this suite
+# has it, run it; where it does not, SAY SO on its own line rather than leaving a
+# silent gap — a control that is quietly absent reads exactly like a control that
+# passed.
+if [[ "$(id -u)" == 0 ]] && id -u nobody >/dev/null 2>&1; then
+  t 'T27d (real uid) a uid outside the owner cannot read the profile' 'denied' \
+    "$(runuser -u nobody -- cat "$BDIR/.fake-dom" >/dev/null 2>&1 && echo read || echo denied)"
+  t 'T27d (real uid) ...and cannot connect to the brokered socket either' 'denied' \
+    "$(runuser -u nobody -- "$DAEMONBIN" call "$BSOCK" <<<'{"op":"ping"}' >/dev/null 2>&1 && echo connected || echo denied)"
+else
+  printf 'NOTE: T27d real-uid control not run (needs root + a second unprivileged user); the mode/owner arms above are what ran.\n'
+fi
+
+# --- T27e SCOPE (b): "no daemon" and "no login" are different sentences -------
+env PATH="$SPATH" "$BROWSER" serve box.test --stop >/dev/null 2>&1
+bother "$BROWSER" status box.test
+t  'T27e a brokered site with nothing serving it refuses' 69 "$RC"
+tc 'T27e ...naming the seat whose login it is' "'$BOXSEAT' seat" "$ERR"
+tc 'T27e ...saying WHY this seat cannot just open it' 'mode 0700' "$ERR"
+tc 'T27e ...and what to do about it' "serve box.test" "$ERR"
+tn 'T27e ...and it does NOT send anybody to log in again' 'browser auth box.test' "$ERR"
+# THE OTHER SILENCE, through a verb that ACTS. `status` on a site nobody has is
+# an empty enumeration, not a refusal; `tree` is the shape that has to choose
+# between the two sentences.
+bother "$BROWSER" tree never-connected.test https://never-connected.test/x
+tc 'T27e a site the box has NO login for gets the other sentence' 'no profile for never-connected.test' "$ERR"
+tc 'T27e ...which is the one that DOES send you to log in' 'browser auth never-connected.test' "$ERR"
+
+# --- T27f ACCEPTANCE 3: the row names who asked, and the caller cannot sign it -
+bserve >/dev/null 2>&1
+bother "$BROWSER" run box.test publish --body=attributed
+t  'T27f a brokered run succeeds' 0 "$RC"
+MYSEAT="$(id -un)"
+t  'T27f ...and the audit row names the CALLING uid, resolved by the kernel' "$MYSEAT" \
+   "$(jq -rs 'map(select(.event=="plan"))|last|.on_behalf_of' "$BDIR/.5dive-audit.jsonl" 2>/dev/null)"
+t  'T27f ...alongside the seat that owns the profile' "$BOXSEAT" \
+   "$(jq -rs 'map(select(.event=="plan"))|last|.holder' "$BDIR/.5dive-audit.jsonl" 2>/dev/null)"
+t  'T27f ...and the lease it took carried the same pair' "$BOXSEAT $MYSEAT" \
+   "$(jq -rs 'map(select(.event=="lease-acquire"))|last|"\(.holder) \(.on_behalf_of)"' "$BDIR/.5dive-audit.jsonl" 2>/dev/null)"
+# THE FORGERY ARM. This is the property, not the value: with one uid the name is
+# the same either way, so what has to be graded is that a REQUEST cannot choose
+# it. A daemon that trusted the field would write `somebody-else` here.
+env PATH="$SPATH" "$DAEMONBIN" call "$BSOCK" \
+  <<<'{"op":"lease","act":"acquire","purpose":"forged","on_behalf_of":"somebody-else","holder":"somebody-else"}' \
+  >"$TMP/forge.tok" 2>/dev/null
+t  'T27f a request that signs somebody else name does not get to' "$MYSEAT" \
+   "$(jq -rs 'map(select(.event=="lease-acquire"))|last|.on_behalf_of' "$BDIR/.5dive-audit.jsonl" 2>/dev/null)"
+tn 'T27f ...the name it asked for appears nowhere in the record' 'somebody-else' \
+   "$(cat "$BDIR/.5dive-audit.jsonl" "$BDIR/.5dive-lease/meta" 2>/dev/null)"
+t  'T27f ...and the lease meta carries the calling seat too' "$MYSEAT" \
+   "$(sed -n 's/^on_behalf_of=//p' "$BDIR/.5dive-lease/meta" 2>/dev/null | head -1)"
+rm -rf "$BDIR/.5dive-lease"
+
+# --- T27g SCOPE (e): the seat is the EFFECTIVE uid, not SUDO_USER ------------
+#
+# `sudo -u <seat> 5dive browser …` sets euid to <seat> and SUDO_USER to the
+# CALLER. The old `${SUDO_USER:-…}` answered with the caller and then looked for
+# the caller's store while running as somebody else — the trap that forced an
+# `env SUDO_USER=` spoof into DIVE-4662's hand test.
+run env PATH="$SPATH" SUDO_USER=a-caller-who-is-not-this-uid "$BROWSER" ls
+t  'T27g a non-root caller with SUDO_USER set is still ITSELF' 0 "$RC"
+tc 'T27g ...and reads its own store, not the store of the name in SUDO_USER' 'box.test' "$OUT"
+
+# --- T27h ACCEPTANCE 4: the memory number ships with its rig -----------------
+t  'T27h the per-site memory rig is in the tree' 'yes' \
+   "$([[ -x "$ROOT/tests/browser_box_login_bench.sh" ]] && echo yes || echo no)"
+tc 'T27h ...and it measures a per-SITE delta, not a per-seat one' 'per-site' \
+   "$(head -45 "$ROOT/tests/browser_box_login_bench.sh" 2>/dev/null)"
+run bash "$ROOT/tests/browser_box_login_bench.sh" --self-test
+t  'T27h ...its plumbing is exercised without a real browser' 0 "$RC"
+tc 'T27h ...and it refuses rather than inventing a number' 'refuses' "$OUT"
+
+# --- T27i SCOPE (d): shot and read render THROUGH the daemon ----------------
+BL3="$(blaunches)"
+bother "$BROWSER" shot box.test https://box.test/feed --out="$TMP/brokered.png" --dom="$TMP/brokered.html"
+t  'T27i a brokered shot renders' 0 "$RC"
+t  'T27i ...and the PNG came back as BYTES this seat wrote itself' 'stub-png' \
+   "$(cat "$TMP/brokered.png" 2>/dev/null)"
+t  'T27i ...the daemon was never asked to write a caller-chosen path' 'null' \
+   "$(jq -rs '[.[]|select(.call=="screenshot")]|last|.path' "$DREC3" 2>/dev/null)"
+t  'T27i ...the DOM is the SAME page instant, not a second load' 'yes' \
+   "$([[ -s "$TMP/brokered.html" ]] && echo yes || echo no)"
+t  'T27i ...and no chrome was launched for it' "$BL3" "$(blaunches)"
+bother "$BROWSER" read box.test https://box.test/feed --out="$TMP/brokeread"
+t  'T27i a brokered read captures the page' 0 "$RC"
+t  'T27i ...with the whole evidence triple' 'yes' \
+   "$([[ -s "$TMP/brokeread/page.html" && -s "$TMP/brokeread/page.md" && -s "$TMP/brokeread/page.meta.json" ]] && echo yes || echo no)"
+t  'T27i ...and the metadata says what actually rendered it' 'session-daemon' \
+   "$(jq -r '.capture' "$TMP/brokeread/page.meta.json" 2>/dev/null)"
+t  'T27i ...still not one chrome of its own' "$BL3" "$(blaunches)"
+env PATH="$SPATH" "$BROWSER" serve box.test --stop >/dev/null 2>&1
+
+# --- T27j the seat override grants NOTHING, which is why it can exist ---------
+#
+# WHY THIS ARM IS HERE AND NOT A COMMENT. DIVE-4662's hand-test rig spoofed the
+# seat with `env SUDO_USER=` under a sudo grant, and the row said in as many
+# words: do not ship that. FIVEDIVE_BROWSER_SEAT is a different thing wearing a
+# similar shape, and "different" has to be demonstrated rather than asserted:
+#   - it chooses which STORE this process looks in, and nothing else;
+#   - every directory is still opened by this uid, so `_audit` refuses anything
+#     this uid does not own or that is not 0700 — the override does not skip it;
+#   - the only shape it can reach is the BROKERED one, which is access a member
+#     of the rendezvous group already has;
+#   - and it cannot touch attribution: `on_behalf_of` is SO_PEERCRED, read by
+#     the daemon from the connection, which no environment of the caller's
+#     reaches.
+# The rig it replaced chose who you ACTED AS while holding somebody else's
+# privilege. This one cannot, and that is the whole difference.
+SQUAT="$FIVEDIVE_BROWSER_PROFILE_ROOT/agent-squatter.test"
+mkdir -p "$SQUAT/box.test"; chmod 700 "$SQUAT"; chmod 755 "$SQUAT/box.test"
+run env FIVEDIVE_BROWSER_SEAT=agent-squatter.test "$BROWSER" status box.test
+t  'T27j claiming a seat does not skip the store audit' 77 "$RC"
+tc 'T27j ...it is refused on the mode, exactly as an unclaimed store would be' 'refusing' "$ERR"
+tn 'T27j ...and nothing was read out of that profile' 'authenticated' "$OUT"
+t  'T27j (control) the same store at 0700 is usable, so the arm above graded the AUDIT' 'authenticated' \
+   "$(chmod 700 "$SQUAT/box.test"; printf '%s' "$LIVE_DOM" > "$SQUAT/box.test/.fake-dom"; \
+      env FIVEDIVE_BROWSER_SEAT=agent-squatter.test "$BROWSER" status box.test 2>/dev/null \
+      | grep -o authenticated | head -1)"
+rm -rf "$SQUAT"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

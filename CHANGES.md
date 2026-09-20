@@ -1,5 +1,47 @@
 ## Unreleased
 
+### Added — a site login is per BOX and brokered: seats use the box's login (DIVE-4664), browser 1.9.0
+
+Measured on one box 2026-09-20: the profile store held **fifteen seats and fourteen empty
+stores**. Every agent seat was logged out of every site a human had connected through the
+dashboard, so each seat that needed a site was another human login — and with one shared site
+across ~18 seats, up to eighteen Chromes at ~300–500 MB each, which makes RAM (not the work) the
+thing that bounds how many seats can hold a live session.
+
+The store does **not** move and does **not** open up. Group-reading a profile directory is handing
+out the credential — anything that can read it can replay the session — so the store stays 0700 to
+the shelld seat where every existing login already lives, and there is no migration. What moves is
+the session daemon's unix socket: out of the 0700 directory and into a rendezvous
+(`/var/lib/5dive/browser-sessions/<seat>/`, `0750` to the box's agent group) where other seats can
+**connect to it**. They never open the profile; they ask the process that already holds it. Still
+never a TCP port — a loopback debug port is reachable by every seat on the box and CDP is full
+control of the browser holding the session.
+
+`status`, `tree`, `run`, `shot` and `read` all work from a brokered seat, with no second login.
+`shot` and `read` needed a **render op** the DIVE-4621 daemon did not have: the PNG and the DOM come
+back over the socket as bytes from ONE page instant, never as a path for the daemon to write — a
+request carrying `--out=` would be the owning seat writing a caller-chosen path, which is the test
+rig DIVE-4662 built and explicitly did not ship.
+
+Resolution is **own store first, then the box store**, so a seat that made its own private login for
+a site keeps using it; per-seat survives as the opt-in it always was, with no per-site policy table.
+Attribution comes from `SO_PEERCRED` on the connection, so the lease and every audit row carry
+`holder=claude on_behalf_of=<the calling seat>` — the kernel's answer, with nowhere for a request to
+sign somebody else's name. Where the caller cannot be named, the rendezvous socket is not opened at
+all and the session stays one-seat: losing the broker is a lost convenience, an unattributable
+caller driving a live login is not.
+
+Two refusals that used to be one silence: a site the box has no login for still says "no profile —
+log in", while a site it HAS a login for with nothing serving it names the owning seat and the
+command to start it. Sandboxed seats are outside all of this by construction — `agent create` keeps
+them out of the shared group on purpose, and that is their isolation working.
+
+Also fixed while here: `_seat` now resolves from the **effective uid** rather than `SUDO_USER`, so
+`sudo -u <seat> 5dive browser …` acts as `<seat>` instead of looking for the CALLER's store while
+running as somebody else. The per-site memory claim ships with its rig,
+`tests/browser_box_login_bench.sh`, which prints the per-site available-RAM delta and the chrome
+process count before and after N brokered seats act on the same site.
+
 ### Added — one snapshot per decision: `browser snapshot` (DIVE-4653), browser 1.8.0
 
 Before an agent acts on a page it reads the same three things: what it can click

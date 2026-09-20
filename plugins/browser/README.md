@@ -154,6 +154,11 @@ store is:
 /var/lib/5dive/browser-profiles/          root, 0711   traverse, do not list
                               /<seat>/    that seat,  0700
                                      /<site>/         0700
+
+/var/lib/5dive/browser-sessions/          root, 0711   traverse, do not list
+                              /<seat>/    seat:group, 0750   the broker rendezvous
+                                     /<site>.sock     0770   the session daemon's face
+                                     /<site>.offered  0640   "this seat has a login here"
 ```
 
 `0711` on the parent means a seat reaches its own subtree and can enumerate nobody else's. It also
@@ -161,6 +166,38 @@ means a seat cannot create its own directory there, which is why `setup` is a ro
 alternative is a world-writable parent, and on one of those a hostile seat pre-creates another
 seat's directory name, owns it, and every profile that seat later authenticates lands somewhere it
 can read. Every command re-audits owner and mode and **fails closed**; it never repairs them.
+
+## A site login is per BOX, and it is brokered
+
+A store like the one above is per SEAT, and that had a cost nobody had priced. Measured on one box
+2026-09-20: fifteen seats, **fourteen of them with empty stores** — every agent seat logged out of
+every site a human had connected, and each seat that needed a site was another human login. With
+~18 seats and one shared site that is also up to eighteen Chromes at ~300–500 MB, so the number of
+seats that can hold a live session at once was bounded by RAM rather than by anything about the work.
+
+The fix is **not** a shared directory. Anything that can read a profile can replay the session, so
+group-reading the store is handing out the credential, not tuning a permission. Instead:
+
+1. **The store does not move.** Its owner is the shelld seat (`claude`), where every existing login
+   already lives — no migration, and the directory stays 0700 to one uid.
+2. **Other seats reach it through a BROKER.** The session daemon's unix socket moves out of the
+   0700 directory into the rendezvous above, where every agent seat in the box's group can connect
+   to it. They never open the profile; they ask the process that already has it. Still never a TCP
+   port, for the reason the daemon has always refused one.
+3. **Own store first, then the box store.** A seat that made its own private login for a site keeps
+   using it. Per-seat survives as the opt-in it always was.
+4. **Every request is attributed.** The daemon reads `SO_PEERCRED` off the connection, so the lease
+   and every audit row carry `holder=claude on_behalf_of=<the calling seat>` — the kernel's answer
+   about who is asking, not a name the request supplied. Where the caller cannot be named, the
+   rendezvous socket is not opened at all and the session stays one-seat, as before.
+
+A seat with no login of its own and nothing serving the box's gets a refusal that says so and names
+the seat to start it — never "no profile", which is the sentence that sends somebody to do a second
+human login they did not need.
+
+**Sandboxed seats are outside this by construction.** `5dive agent create` puts admin and standard
+seats in the `claude` group and deliberately leaves sandboxed ones out, so a sandboxed agent cannot
+reach the rendezvous. That is its isolation working, not a gap.
 
 ## Sessions die, and that is the steady state
 

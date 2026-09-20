@@ -111,9 +111,16 @@ the page every time, so it survives a reload — an obfuscated class name does n
 - **No server-mode stack on the box.** chromium / Xvfb / x11vnc / websockify are installed
   box-level as root; a seat cannot install them. The refusal names what is missing and the
   DEGRADED health row names the re-install command. Report it; do not improvise an install.
-- **Profiles are per-seat and mode 0700, and are never repaired.** Another seat's login is
-  not yours to use; a profile with the wrong owner is refused, not fixed. The shipped relay
-  currently redeems the `claude` seat, so other seats use the dashboard flow.
+- **A site login is per BOX, and you reach it through a broker.** The profile itself is still
+  one seat's, mode 0700, and never repaired — you cannot open it and must not try. What you
+  get instead is a conversation with the browser that is already holding it: if the box has a
+  login for the site and something is serving it, `status`, `tree`, `run`, `shot` and `read`
+  all just work from your seat, with **no second human login**. Your own login for a site, if
+  you made one, wins over the box's. If nothing is serving it the refusal says exactly that
+  and names the seat to start it — that is not "log in again".
+- **Every brokered request is attributed to YOU.** The daemon reads the calling seat from the
+  kernel, so the lease and the audit row say `holder=claude on_behalf_of=<your seat>`. You
+  cannot set that field and should not try to.
 - **Some sites block datacenter IPs at login.** "Request blocked by network security" is the
   site's anti-bot policy meeting a VM's IP — not our bug, no flag for it. Tell the human the
   site cannot be logged into from the box, and stop.
