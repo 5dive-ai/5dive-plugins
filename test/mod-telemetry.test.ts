@@ -43,8 +43,27 @@ const EVENTS = [
   'turn.complete',
   'command.run',
   'tool.call',
+  'session.measure',
+  'session.compact',
   'session.end',
 ] as const
+
+/**
+ * The hooks that observe and nothing else. DIVE-4695 added the first two hooks that
+ * are NOT in this set, and the exemption is spelled out one place only — here — so
+ * that a third one cannot appear without editing this line:
+ *
+ *   - `session.measure` still returns the chain's value untouched, but it may START
+ *     a compaction. It does so on the sink's own promise chain and never awaits it,
+ *     so it can neither delay a turn nor fail one; what it can do is change the
+ *     conversation the NEXT turn runs over, which is the point of that row.
+ *   - `session.compact` is the only hook in the module that returns something other
+ *     than `r`, and the arms in mod-boundary-compact.test.ts pin the direction: it
+ *     may only APPEND messages the compaction dropped, never remove or rewrite one.
+ */
+const OBSERVE_ONLY = EVENTS.filter(
+  (e) => e !== 'session.measure' && e !== 'session.compact',
+)
 
 describe('mod: manifest and module stay wired together', () => {
   test('hooks/hooks.json names the module', () => {
@@ -92,14 +111,46 @@ describe('mod: it cannot affect the session it measures', () => {
   })
 
   test('every hook awaits next(e) before it does anything else', () => {
-    const bodies = [...SRC.matchAll(/^  on\('[^']+', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms)]
+    const bodies = [
+      ...SRC.matchAll(/^  on\('([^']+)', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms),
+    ]
     expect(bodies.length).toBe(EVENTS.length)
-    for (const [, body] of bodies) {
-      const first = body.split('\n').map((l) => l.trim()).find((l) => l !== '' && !l.startsWith('//'))
+    for (const [, name, body] of bodies) {
+      const first = body!.split('\n').map((l) => l.trim()).find((l) => l !== '' && !l.startsWith('//'))
+      // No hook does ANYTHING — not a settings read, not a threshold check — before
+      // the chain below it has resolved. This half holds for all eight.
       expect(first).toBe('const r = await next(e)')
-      // and the hook hands back exactly what the chain resolved to
-      expect(body.trimEnd().endsWith('return r')).toBe(true)
+      if ((OBSERVE_ONLY as readonly string[]).includes(name!)) {
+        // and the observe-only hooks hand back exactly what the chain resolved to
+        expect(body!.trimEnd().endsWith('return r')).toBe(true)
+      }
     }
+  })
+
+  test('only session.compact returns anything other than the chain\'s own value', () => {
+    // The exemption is one hook wide and this is the assertion that keeps it there.
+    const bodies = [
+      ...SRC.matchAll(/^  on\('([^']+)', async \(\$, e, next\) => \{\n(.*?)^  \}\)/gms),
+    ]
+    const rewriting = bodies
+      .filter(([, , body]) => /^\s*return (?!r\b)/m.test(body!))
+      .map(([, name]) => name)
+    expect(rewriting).toEqual(['session.compact'])
+  })
+
+  test('the compact hook can only ADD messages, never drop or rewrite one', () => {
+    // `pinKept` is the only thing that builds the list it returns, and its own arms
+    // are in mod-boundary-compact.test.ts. What is asserted from the source is that
+    // the hook has no OTHER way to produce a message list: no filter, no slice, no
+    // map over `r.messages`, and the returned object is `r` with only `messages`
+    // replaced.
+    const body = /^  on\('session\.compact'.*?^  \}\)/gms.exec(SRC)?.[0] ?? ''
+    expect(body).not.toBe('')
+    expect(body).toContain('const { messages, pinned } = pinKept(livePin, e.messages, r.messages)')
+    expect(body).toContain('return { ...r, messages }')
+    expect(body).not.toMatch(/r\.messages\.(filter|slice|map|splice)/)
+    // and a seat that has not opted in never reaches any of it
+    expect(body).toContain('if (livePin === null || r.skip !== undefined) return r')
   })
 
   test('the module never binds $ to a name', () => {

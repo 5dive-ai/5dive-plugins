@@ -1,5 +1,28 @@
 ## Unreleased
 
+### Added — boundary compaction for the non-fresh seats (DIVE-4695), mod 0.2.0
+
+`main` and `marketing` run with `heartbeat.fresh=false`, so the dispatcher never `/clear`s
+them and every wake lands on the whole accumulated window. Measured 2026-09-20 (`sudo 5dive
+cost`, 24h, quota over API-EQ — quota counts the cache read): **marketing 49.9x, main 43.7x**
+against **dev 33.8x, quinn 31.5x, ops 25.0x** on the fresh seats.
+
+The `mod` plugin can now compact the conversation **at a turn boundary**, so the next
+dispatched goal lands on a summary rather than the transcript. It is off on every seat and
+opted into per seat (`FIVEDIVE_MOD_BOUNDARY_COMPACT`), with the threshold and the continuity
+pin as knobs; a malformed knob turns the feature **off** rather than back to a default.
+
+Continuity is the failure mode, so it is structural and not a prompt: the plugin hooks
+`session.compact` and appends back, verbatim and by the engine's own message handle, any
+message the pin matched that the compaction dropped — an unanswered human gate, a standing
+directive, an open row's branch. It is the only hook in the plugin that returns anything but
+the chain's own value, and it can only ADD.
+
+Two things the live lab run changed: the trigger is `turn.complete`, not `session.measure`
+(which was observed firing BEFORE `turn.complete` on 2.1.278, where the call rejects), and
+`$.session.compact` needs a mounted session — a `claude -p` run refuses it, and the refusal
+is a counted line rather than a crash.
+
 ### Added — a site login is per BOX and brokered: seats use the box's login (DIVE-4664), browser 1.9.0
 
 Measured on one box 2026-09-20: the profile store held **fifteen seats and fourteen empty
