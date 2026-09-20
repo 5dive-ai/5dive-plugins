@@ -26,6 +26,11 @@ import { readAccessFile as readAccessFileCore } from './access-core.ts'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, applyModelAliases, EFFORT_LEVELS } from './commands'
+import {
+  switchLine, switchAck, switchPending, classifySwitch,
+  SWITCH_POLL_MS, SWITCH_POLL_STEP_MS, SWITCH_MENU_RE,
+  type SwitchKind,
+} from './liveswitch'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
 import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice, describeTapError, tapLanding, tapFailureCopy, type TapLanding } from './tna'
 // DIVE-2846: aliased so the durable tap-failure record needs no surgery on
@@ -2559,27 +2564,23 @@ function applyModel(alias: string, chatId: number): ApplyResult {
     return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}` }
   }
   return {
-    text: `✅ Model → ${alias}\n\n⚠️  Claude is restarting to apply it — back in ~20-30s once the new session loads.`,
-    // Mirror applyAccount: deferred systemd-run restart fires ~1s later as a
-    // transient unit that survives this process's teardown, so the ack above
-    // is on the wire first. The previous design tried to flip the model live
-    // via `tmux send-keys /model <id>` plus a Switch-model? auto-confirm, but
-    // that proved unreliable — the running TUI sometimes ignored the menu or
-    // the menu never rendered, leaving settings.json correct but the live
-    // process running the old model. Restarting picks up settings.json cleanly.
-    after: () => {
-      void execFileP(
-        SUDO,
-        ['-n', '5dive', 'agent', '_self_restart'],
-        { timeout: 5000 },
-      ).catch((err: any) => {
-        const stderr = err?.stderr ? String(err.stderr).trim() : ''
-        void bot.api.sendMessage(
-          chatId,
-          `❌ Failed to restart for model change: ${stderr || (err instanceof Error ? err.message : String(err))}`,
-        ).catch(() => {})
-      })
-    },
+    text: switchPending('model', alias),
+    // NO RESTART. This used to fire `sudo -n 5dive agent _self_restart`, which
+    // bounced the unit ~1s later and killed whatever turn was running — a tool
+    // call mid-flight died with its results unwritten and the human saw only
+    // "Claude is restarting".
+    //
+    // The restart was here because an older Claude Code answered a bare
+    // `/model` with an interactive "Switch model?" picker this bridge could not
+    // reliably drive: the menu was sometimes ignored, sometimes never rendered,
+    // and settings.json plus a restart became the source of truth. That is no
+    // longer the shape. `/model <id>` takes the argument directly, applies it
+    // to the running session and persists the choice itself, so the restart
+    // buys nothing and costs the turn.
+    //
+    // patchSettings above STAYS — belt and braces for the next start, and the
+    // thing that makes the `unconfirmed` branch honest rather than a failure.
+    after: () => { void liveSwitch('model', MODEL_ALIASES[alias]!, alias, chatId) },
   }
 }
 // Apply path for /account: shell out to `sudo -n 5dive agent set-account
@@ -2593,9 +2594,10 @@ function applyModel(alias: string, chatId: number): ApplyResult {
 // because the CLI's restart timer starts the instant set-account returns
 // (~1s, via systemd-run). Running it before our Telegram I/O meant SIGTERM
 // raced — and usually beat — the confirmation reply, so the user saw the
-// keyboard vanish with no "switched / restarting" ack. Deferring it (like
-// /model defers its TUI proxy) means the restart clock only starts once the
-// handler has finished sending the ack.
+// keyboard vanish with no "switched / restarting" ack. Deferring it means the
+// restart clock only starts once the handler has finished sending the ack.
+// (/model and /effort defer too, but no longer to a restart — they defer the
+// live TUI switch and its pane poll.)
 async function applyAccount(name: string, chatId: number): Promise<ApplyResult> {
   const me = thisAgentName()
   if (!me) return { text: `Can't determine this agent's name (not running as agent-* user).` }
@@ -2638,22 +2640,12 @@ function applyEffort(level: string, chatId: number): ApplyResult {
     return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}` }
   }
   return {
-    text: `✅ Effort → ${level}\n\n⚠️  Claude is restarting to apply it — back in ~20-30s once the new session loads.`,
-    // Same shape as applyModel — see comment there. Live-flipping effort via
-    // tmux send-keys was unreliable; deferred restart is the source of truth.
-    after: () => {
-      void execFileP(
-        SUDO,
-        ['-n', '5dive', 'agent', '_self_restart'],
-        { timeout: 5000 },
-      ).catch((err: any) => {
-        const stderr = err?.stderr ? String(err.stderr).trim() : ''
-        void bot.api.sendMessage(
-          chatId,
-          `❌ Failed to restart for effort change: ${stderr || (err instanceof Error ? err.message : String(err))}`,
-        ).catch(() => {})
-      })
-    },
+    text: switchPending('effort', level),
+    // Same shape as applyModel, and the same removed restart — see the note
+    // there. `/effort <level>` is a live slash command: the pane answers "Set
+    // effort level to <level> (saved as your default for new sessions)" and the
+    // session carries on.
+    after: () => { void liveSwitch('effort', level, level, chatId) },
   }
 }
 // Send a slash command into the running claude TUI by typing it into the
@@ -2664,10 +2656,12 @@ function applyEffort(level: string, chatId: number): ApplyResult {
 //
 // autoConfirm: if set, after sending `line` we poll the pane for a few
 // seconds and press "1\n" when the regex matches. This is for TUI commands
-// that pop a confirmation menu the user can't dismiss over Telegram (e.g.
-// claude's "Switch model?" prompt that appears when the conversation is
-// cached and switching invalidates it). No-op when the menu never renders
-// (e.g. switching to the already-active model is a silent "Kept model as").
+// that pop a confirmation menu the user can't dismiss over Telegram — claude's
+// "Switch model?" / "Change effort level?" prompt, which appears when the
+// conversation is cached and switching invalidates it. No-op when the menu
+// never renders, and measured on 2.1.278 it often doesn't: not mid-turn, and
+// not when the requested value is already the active one (that prints the
+// ordinary "Set model to <name>" line, NOT a distinct "Kept model as").
 // Returns true if it could address a pane (agent-* user), false otherwise —
 // callers that surface a confirmation to the user (e.g. the carry-over button)
 // branch their copy on this so they don't claim success when nothing was sent.
@@ -2699,6 +2693,77 @@ async function confirmMenuIfPresent(paneTarget: string, re: RegExp): Promise<voi
     }
     await new Promise((r) => setTimeout(r, 250))
   }
+}
+
+// Type a live `/model <id>` or `/effort <level>` into the running TUI, watch the
+// pane for the answer, and tell the human which of the three things happened.
+//
+// TWO VALUES, DELIBERATELY. `value` is what gets TYPED — the resolved model ID,
+// the effort level. `shown` is what the HUMAN said — the alias, the level — and
+// it is both what the ack repeats back and what the pane is searched for. They
+// are the same string for /effort and different for /model, because the pane
+// answers `/model claude-opus-5` with "Set model to Opus 5": the display name.
+// Searching for the ID there never matched, so every model switch was reported
+// as queued or unconfirmed however long the poll ran.
+//
+// THE ACK IS BUILT FROM THE PANE, NOT FROM THE SEND. `send-keys` succeeding only
+// means the keystrokes reached tmux; it says nothing about whether the session
+// took the change. The old code had the same gap in a worse form — it announced
+// a restart and then performed one, so the claim was at least self-fulfilling.
+// A live switch has three distinguishable outcomes and the human needs
+// different words for each, so we sample the pane and let classifySwitch()
+// decide (see plugins/telegram/liveswitch.ts).
+//
+// AND THE MENU IS ANSWERED, NOT WAITED OUT. SWITCH_MENU_RE hands
+// proxyToClaudeTUI the cache-invalidation prompt to press "1" on; left standing
+// it would block the switch AND hold the pane, so the next line the bridge
+// typed into the seat would land in the menu instead of the composer.
+//
+// ONLY THE ONE THIS LINE RAISED, THOUGH. The pane is read once before the send:
+// if a matching modal is ALREADY up it belongs to whoever is at the seat, and
+// the regex is withheld so we cannot answer their question. The two are
+// indistinguishable once both are on screen, which is why the check has to
+// happen first and cannot be folded into the poll.
+//
+// BOUNDED AND BEST-EFFORT. The poll is SWITCH_POLL_MS and every failure path
+// resolves to `unconfirmed`, which is true whatever went wrong: patchSettings()
+// already ran, so the change lands at the next start. No tmux, no pane and no
+// agent-* user all land there too.
+async function liveSwitch(
+  kind: SwitchKind,
+  value: string,
+  shown: string,
+  chatId: number,
+): Promise<void> {
+  const user = process.env.USER ?? process.env.LOGNAME ?? ''
+  const paneTarget = user.startsWith('agent-') ? `${user}:0` : ''
+  let outcome: ReturnType<typeof classifySwitch> = 'unconfirmed'
+  if (paneTarget) {
+    let menuAlreadyUp = false
+    try {
+      menuAlreadyUp = SWITCH_MENU_RE.test(
+        (await execFileP(TMUX, ['capture-pane', '-t', paneTarget, '-p'])).stdout,
+      )
+    } catch {
+      /* no pane to read — the send below fails the same way and lands on
+         `unconfirmed`, which settings.json makes true */
+    }
+    if (proxyToClaudeTUI(switchLine(kind, value), menuAlreadyUp ? undefined : SWITCH_MENU_RE)) {
+      const captures: string[] = []
+      const deadline = Date.now() + SWITCH_POLL_MS
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, SWITCH_POLL_STEP_MS))
+        try {
+          captures.push((await execFileP(TMUX, ['capture-pane', '-t', paneTarget, '-p'])).stdout)
+        } catch {
+          break /* tmux gone — settings.json still carries the change */
+        }
+        if (classifySwitch(kind, shown, captures) === 'live') break
+      }
+      outcome = classifySwitch(kind, shown, captures)
+    }
+  }
+  await bot.api.sendMessage(chatId, switchAck(kind, shown, outcome)).catch(() => {})
 }
 
 // Newest mtime (ms) among carryover_*.md files across this agent's memory dirs,
@@ -5190,9 +5255,10 @@ bot.on('callback_query:data', async ctx => {
     return
   }
   // /account picker: account:noop is the active-row no-op; account:<name>
-  // re-binds via `5dive agent set-account`. Same await-then-restart shape
-  // as /model so the user sees the confirmation message before SIGTERM
-  // races the outbound HTTP request.
+  // re-binds via `5dive agent set-account`. Await the confirmation before the
+  // deferred action fires, so the user sees it before SIGTERM races the
+  // outbound HTTP request. /account still restarts — new credentials are only
+  // read at boot — which is why it keeps the shape /model has dropped.
   if (data === 'account:noop') {
     await ctx.answerCallbackQuery({ text: 'Already active.' }).catch(() => {})
     return
@@ -5918,8 +5984,10 @@ async function handleInbound(
       await reportLoginTerminal(armed.sessionId, chat_id, fin, { restarting: authedOk })
       // Apply the new creds: claude reads auth only at boot, and a fresh login can
       // revoke the live session's prior token — so restart to come back live on the
-      // new creds (DIVE-380). Mirror /model's deferred systemd-run restart: the ack
-      // above is on the wire first, then the transient unit restarts us ~1s later.
+      // new creds (DIVE-380). Credentials are one of the few things a live switch
+      // cannot do, so this keeps the deferred systemd-run restart /model dropped:
+      // the ack above is on the wire first, then the transient unit restarts us
+      // ~1s later.
       if (authedOk) {
         const me = thisAgentName()
         if (me) {

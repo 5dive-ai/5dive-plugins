@@ -72,6 +72,53 @@ outlives every caller and serves callers holding different tokens, so the token
 travels in the request and the file is what is trusted. A box without the pinned
 `playwright-core` still serves — `serve` falls back to launching Chrome directly
 and says so in one line. Losing the speed must not lose the browser.
+### Fixed — `/model` and `/effort` switch the running session instead of restarting it, telegram 0.5.57
+
+Both commands wrote settings.json and then restarted the seat. Whatever turn was
+running died with it: a tool call was killed mid-flight, its results were never
+written, and all the human saw was `Claude is restarting to apply it — back in
+~20-30s`. Changing the effort level cost you the answer you were waiting for.
+
+The restart was there for a reason that has expired. An older Claude Code
+answered `/model` with an interactive "Switch model?" picker this bridge could
+not reliably drive over Telegram, so settings.json plus a restart became the
+source of truth. `/model <id>` and `/effort <level>` now take the argument
+directly, apply it to the running session and persist the choice themselves.
+
+A SECOND CHANGE comes with it, because the first is not true without it. The
+picker did not entirely go: what is left is a one-key question — "Switch
+model?" / "Change effort level?" — raised when the pane is IDLE and the
+conversation is already cached, because switching then means the full history
+gets re-read. Mid-turn it does not render at all, which is why a switch typed
+into a busy pane applies straight away with no menu. Left standing it does two
+things and the second is the worse one: the switch never happens, and the modal
+holds the pane, so the next line the bridge types into the seat lands in the
+menu instead of the composer. It is now answered rather than waited out — and
+only when no such menu was on screen before the line went in, so a modal the
+human raised themselves is never answered for them.
+
+So the line is typed into the live session and nothing is bounced. The ack says
+which of three things happened, read off the pane rather than assumed: `(live —
+the running session already has it)`, `queued, applies when the current turn
+ends. Nothing was interrupted.` — a line sent mid-turn is held by the TUI, not
+lost — or `saved, but the pane did not confirm it. It applies at the next
+restart.` settings.json is still written either way, which is what makes the
+last one true.
+
+Read off the pane means read off what it prints. Asked for `/model
+claude-opus-5`, Claude Code answers `Set model to Opus 5 …` — the display name —
+so the acknowledgement is matched on the word the human typed, `opus`,
+case-insensitively, and on the same line as the phrase, which is what keeps the
+previous switch's line from answering for this one. The other wording this
+bridge matched on, `Kept model as …` for re-selecting the model already active,
+is gone rather than corrected: every form of the command — argument, alias, and
+the bare picker — prints the same `Set model to …` line, and matching a phrase
+nobody has seen print is how the first narrowing got here. The test fixtures are
+verbatim pane captures for the same reason.
+
+Restart stays where a live command cannot reach: `/restart`, `/resume`,
+`/update`, and `/account` + `/login`, whose new credentials are only read at boot.
+
 ### Fixed — the usage-limit notice now stops the "typing…" indicator, telegram 0.5.56
 
 Message a seat whose account is usage-walled and the bot answers at once —
