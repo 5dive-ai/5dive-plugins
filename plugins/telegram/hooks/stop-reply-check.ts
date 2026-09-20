@@ -38,7 +38,7 @@ import { readPayload } from './lib/payload'
 import { readEntries, analyzeTurn, hadTelegramToolCallAfter } from './lib/transcript'
 import { sendMessage, getToken } from './lib/telegram'
 import { emitBlock } from './lib/output'
-import { TG_TOOL_PREFIX, typingStopFile } from './lib/paths'
+import { TG_TOOL_PREFIX, signalTurnEnded } from './lib/paths'
 import { getAllowedChatIds, getCallerChat, getGroupTopics, type CallerChat } from './lib/access'
 import { parseResetEpoch } from './lib/time'
 import type { HookPayload, TranscriptEntry, TranscriptContentBlock } from './lib/types'
@@ -230,11 +230,7 @@ const threadId = a.lastThreadId ?? undefined
 // every 4s and only learns the turn is over via the reply tool, which the
 // auto-relay/diagnostic branches below bypass (separate process). Bumping
 // this file's mtime lets the server's typing loop notice and stop. DIVE-146.
-try {
-  writeFileSync(typingStopFile(), String(Date.now()))
-} catch {
-  // best-effort cosmetic signal — ignore write failures
-}
+signalTurnEnded()
 
 // Turn-level rule: if the agent delivered text through the proper channel
 // — reply or edit_message — anywhere in this turn, every loose assistant
