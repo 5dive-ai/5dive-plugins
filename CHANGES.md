@@ -8,6 +8,7 @@ forbidden to run. Reads stay unprivileged; writes carry the paired Telegram
 user id as channel proof and let the CLI cross its narrow `_task_channel` rail.
 Only `task answer` and `task clear-recs` use that rail. Start, done, cancel,
 escalate, agent-send, and council actions remain admin-only.
+
 ### Added — one snapshot per decision: `browser snapshot` (DIVE-4653), browser 1.8.0
 
 Before an agent acts on a page it reads the same three things: what it can click
