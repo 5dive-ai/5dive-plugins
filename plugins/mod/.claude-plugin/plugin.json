@@ -1,7 +1,7 @@
 {
   "name": "mod",
-  "description": "5dive telemetry producer, command surface and tool-call policy guard for Claude Code function hooks (early access). Publishes turn and session boundaries and the account's usage reading from inside the harness process to a per-seat JSONL sink, so the heartbeat, the pacing floor and the self-update's pending-restart sweep can read a first-class signal instead of inferring idle/busy from pane samples and the task board. Registers /task and /gate, which dispatch to the 5dive CLI in-process. On the NON-FRESH seats it can additionally compact the conversation at a turn boundary, so the next dispatched goal lands on a summary instead of the whole accumulated window; that half pins any unanswered human gate or standing directive back into the compacted transcript. And it enforces a table-driven deny list over tool calls (policy/guard.json), so a rule that today costs every seat tokens on every turn and is caught after the fact is refused before the tool runs, with the reason handed to the model. Every capability is off unless the seat opts in; the compact hook is the only one that rewrites a call and the guard is the only one that can refuse one.",
-  "version": "0.4.0",
+  "description": "5dive telemetry producer, seat panel, command surface and tool-call policy guard for Claude Code function hooks (early access). Publishes turn and session boundaries and the account's usage reading from inside the harness process to a per-seat JSONL sink, so the heartbeat, the pacing floor and the self-update's pending-restart sweep can read a first-class signal instead of inferring idle/busy from pane samples and the task board. Registers /task and /gate, which dispatch to the 5dive CLI in-process. It also draws one line above the prompt naming the row the seat holds, its gate, its grader and its token burn against its budget, at zero context cost. On the NON-FRESH seats it can additionally compact the conversation at a turn boundary, so the next dispatched goal lands on a summary instead of the whole accumulated window; that half pins any unanswered human gate or standing directive back into the compacted transcript. And it enforces a table-driven deny list over tool calls (policy/guard.json), so a rule that today costs every seat tokens on every turn and is caught after the fact is refused before the tool runs, with the reason handed to the model. Every capability is off unless the seat opts in; the compact hook is the only one that rewrites a call and the guard is the only one that can refuse one.",
+  "version": "0.5.0",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com"
@@ -11,6 +11,7 @@
     "telemetry",
     "function-hooks",
     "observability",
+    "above-prompt",
     "claude-code-2.1.278"
   ]
 }

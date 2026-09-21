@@ -77,13 +77,16 @@
 // later without any consumer changing.
 
 import type { EngineInterface, Register } from 'claude-code'
+// The above-prompt seat panel (DIVE-4694). Its own file, its own flag, its own state;
+// registered from here because `hooks.json` admits exactly one module per plugin.
+import { registerPanel } from './panel'
 import { compile, envSet, evaluate, type Compiled, type Verdict } from './guard'
 
 /** The schema version of a sink line. Bump only on a breaking change. */
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
@@ -1470,4 +1473,6 @@ export const register: Register = (on) => {
     }
     return runCli($, gateDispatch(c.cli, e.args))
   })
+
+  registerPanel(on)
 }
