@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Changed — the tool-call guard is ON unless a seat opts out (DIVE-4720), mod 0.5.0
+### Changed — the tool-call guard is ON unless a seat opts out (DIVE-4720), mod 0.6.0
 
 DIVE-4696 shipped six policies and left them off on every seat, so the thing the row was filed
 for — **deleting the prose those policies replace from the fleet's `CLAUDE.md`** — could not be
@@ -81,6 +81,50 @@ compaction is a ~50s model call; queued on the writer's chain it delayed no turn
 delayed every sink write behind it, including the next `turn.start` — and that sink is
 what the heartbeat, the pacing floor and the pending-restart sweep read idle/busy from, so
 a compacting seat would have read as a silent one for ~50s.
+
+### Added — the mod's above-prompt seat panel (DIVE-4694), mod 0.5.0
+
+A seat could not see its own row. lodar reads seats through tmux panes and `5dive watch`; the
+seat's own screen said nothing about which row it held, whether a gate was open on it, how much of
+its budget the row had burned, or whether its delivery was sitting with a grader.
+
+The `mod` plugin now draws one line directly above the prompt:
+
+```
+5dive dev · DIVE-4694 · in_progress · gate none · grader temp · burn 15.1M/150.0M* · Function-hook mod: above-prompt…
+```
+
+It costs the model nothing. A `ui.render` tree is drawn by the terminal and is never part of the
+prompt, so none of it reaches the context window.
+
+**Absent is never zero.** A row with no attributed usage window draws `—`, not `0` — `0/150.0M`
+reads as "this row is free". A figure the DIVE-4430 dispatch cross-check could not tie to the row
+draws `~… unverified` rather than as the row's own, because that is exactly the distinction
+DIVE-3343 removed an enforcement for. The burn figure is read from the heartbeat's published
+snapshot, so the panel shows the number the park will act on rather than a second one derived
+differently.
+
+**A gate that is over reads `none`.** `task show --json` carries a `gate` field, and it is the
+board's VERBOSE HEADER — `ANSWERED approve (lead:ops, 2026-09-20 19:17:24)` on a row whose gate is
+closed, `PENDING — awaiting a HUMAN (approval, tier 1, asked …) — the ask is in the 'human gate:'
+block below` while one is open. The panel reads only `routed_reviewer` off that payload, to upgrade
+`agent:approval` to `ops:approval`, and composes the cell itself. Found by the first live capture
+on a real seat, not by the unit suite: the header pasted into the cell drew the whole answered-gate
+sentence across a 120-column band and pushed every other field off it.
+
+**It does not repeat the status line.** DIVE-4665 landed first and put effort, context fill,
+session cost and the account's 5h/7d percentages one row below. The panel carries only what belongs
+to the ROW. The account cell appears in two cases the status line cannot express: a window at or
+past 80%, and no reading at all — a blind meter renders as plain absence there, which is the same
+pixels as the field being off.
+
+**No timer.** `$.clock` is never touched. The band's own `isWorking` prop is true exactly while a
+turn runs, so its edges are the turn boundary, delivered by the surface. A refresh runs outside the
+draw, is never awaited by the hook that triggers it, and is rate-limited; steady state is one
+~0.6 s subprocess per turn boundary, off the critical path.
+
+Off by default, behind `FIVEDIVE_MOD_PANEL=1` in the seat's settings `env` — a separate flag from
+the telemetry half's, so "it is off" is never ambiguous about which half.
 
 ### Added — `/task` and `/gate` as first-class commands, and what the swap actually saves (DIVE-4693), mod 0.2.0
 

@@ -29,12 +29,68 @@
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 
 const ROOT = join(import.meta.dir, '..', 'plugins', 'mod')
 const SRC = readFileSync(join(ROOT, 'hooks', 'register.ts'), 'utf8')
 const MANIFEST = JSON.parse(readFileSync(join(ROOT, '.claude-plugin', 'plugin.json'), 'utf8'))
 const HOOKS_JSON = JSON.parse(readFileSync(join(ROOT, 'hooks', 'hooks.json'), 'utf8'))
+
+/**
+ * The manifest version PUBLISHED on main, and the comparison against it (DIVE-4720
+ * iteration 2).
+ *
+ * Why this cannot be done with the source-vs-manifest arm below. That arm compares two
+ * files inside the working tree, so a branch that bumps both to a number main already
+ * shipped is green on both. That is exactly what happened here: #96 took 0.5.0 at
+ * 00:47Z, this branch opened ten minutes later and bumped 0.4.0 -> 0.5.0 on a base that
+ * predated it, and every version arm in the suite passed. A plugin only moves a box on
+ * a STRICTLY HIGHER number, so two builds sharing one number means the second can never
+ * be installed — the collision is not a tidiness defect, it strands the release.
+ */
+const MANIFEST_REL = 'plugins/mod/.claude-plugin/plugin.json'
+const REPO = join(import.meta.dir, '..')
+
+function git(args: string[]): string | null {
+  try {
+    return execFileSync('git', args, {
+      cwd: REPO,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return null
+  }
+}
+
+/** main's manifest version, or null when this tree genuinely cannot reach main. */
+function versionOnMain(): string | null {
+  for (const ref of ['origin/main', 'main']) {
+    const raw = git(['show', `${ref}:${MANIFEST_REL}`])
+    if (raw) return JSON.parse(raw).version
+  }
+  // A CI checkout is shallow and single-ref (actions/checkout@v4 gives depth 1 on the
+  // PR merge ref), so neither name above resolves there. Fetching main is the whole
+  // difference between grading the collision and skipping it in the one place that
+  // would have caught this one.
+  if (git(['fetch', '--depth=1', 'origin', 'main']) !== null) {
+    const raw = git(['show', `FETCH_HEAD:${MANIFEST_REL}`])
+    if (raw) return JSON.parse(raw).version
+  }
+  return null
+}
+
+/** -1 / 0 / 1 on the numeric semver triple. Equal is a FAILING comparison here. */
+function cmpVersion(a: string, b: string): number {
+  const pa = a.split('.').map(Number)
+  const pb = b.split('.').map(Number)
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (d !== 0) return d > 0 ? 1 : -1
+  }
+  return 0
+}
 
 /** The events the mod is allowed to register. A new one is a deliberate decision. */
 const EVENTS = [
@@ -76,6 +132,28 @@ describe('mod: manifest and module stay wired together', () => {
   test('the version in the source matches the manifest', () => {
     const inSource = /const VERSION = '([^']+)'/.exec(SRC)?.[1]
     expect(inSource).toBe(MANIFEST.version)
+  })
+
+  test('the manifest version is strictly above the one published on main', () => {
+    const onMain = versionOnMain()
+    // Null means no ref AND no fetch — a tree that cannot see main at all. Passing
+    // here would make the arm vacuous in precisely the environment where nobody is
+    // watching, so it reds and says why.
+    expect(onMain === null ? 'could not read main' : 'read main').toBe('read main')
+    const ours = MANIFEST.version
+    const verdict = cmpVersion(ours, onMain as string) > 0 ? 'above' : 'NOT above'
+    expect(`${ours} is ${verdict} main's ${onMain}`).toBe(`${ours} is above main's ${onMain}`)
+  })
+
+  test('the comparison reds on a version merely EQUAL to main, not just a lower one', () => {
+    // The collision that bounced iteration 1 was an EQUAL number, not a lower one, so
+    // a >= comparison would have shipped it. Pinned here rather than left implicit.
+    const onMain = versionOnMain()
+    expect(cmpVersion(onMain as string, onMain as string)).toBe(0)
+    expect(cmpVersion('0.5.0', '0.5.0')).toBe(0)
+    expect(cmpVersion('0.4.0', '0.5.0')).toBe(-1)
+    expect(cmpVersion('0.6.0', '0.5.0')).toBe(1)
+    expect(cmpVersion('0.10.0', '0.9.0')).toBe(1)
   })
 
   test('the manifest records the Claude Code build the mod was verified against', () => {
