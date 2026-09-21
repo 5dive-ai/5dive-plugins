@@ -9,6 +9,21 @@
 first — measured on two boxes before this landed, logged-in profiles survive the swap.
 The four browser harnesses under `tests/` left with it; they already run in the new
 repo's CI.
+### Fixed — the mod version guard no longer reds on main forever (DIVE-4747)
+
+`mod: the manifest version is strictly above the one published on main` asserted a GAP
+between two trees. On `main` that gap is zero, so the arm went false the moment the branch
+it guarded merged and stayed false — on `main` and on every open PR that had since taken
+`main` in, about a plugin those PRs never touched. The repository's only CI signal was red
+on every head from mod 0.6.0 onward, which is worse than blocking: the next real regression
+would have arrived indistinguishable from the standing one.
+
+The guard is now scoped to the diff. If `git merge-base main HEAD` shows no change under
+`plugins/mod/`, it has nothing to say and skips; if the branch DID change the mod, the
+version must still be strictly above main's, equal included. The parity checkout takes
+`fetch-depth: 0` because the merge base is what separates the two readings — without it the
+guard degrades to a tip diff and the DIVE-4720 collision goes silent. No plugin changed, so
+no version moved.
 
 ### Fixed — standard Telegram seats can land authenticated gate taps (DIVE-4609), telegram 0.5.58
 

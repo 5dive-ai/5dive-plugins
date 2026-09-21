@@ -32,7 +32,18 @@ jobs:
   parity:
     runs-on: ubuntu-latest
     steps:
+      # DIVE-4747: full history, not the default depth 1. The mod version guard is
+      # scoped to `git merge-base main HEAD`, and that is what lets it tell "this
+      # branch changed the mod and did not bump it" (a real defect) apart from "main
+      # published a mod release this branch never touched" (the steady state that made
+      # the board permanently red). With a depth-1 checkout there is no common history
+      # to compute, the guard degrades to comparing against main's TIP, and a branch
+      # that bumped to a number main has since published reads as unchanged — which is
+      # exactly the DIVE-4720 collision going silent. test/mod-telemetry.test.ts pins
+      # this line so the degradation cannot be reintroduced by deleting it.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
       # DIVE-2374: the whole suite, not a named file. CI ran ONLY parity.test.ts,
       # so test/tna-harness.test.ts -- the harness that owns the tap line -- had
