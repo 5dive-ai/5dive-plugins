@@ -3936,5 +3936,56 @@ t  'T27j (control) the same store at 0700 is usable, so the arm above graded the
       | grep -o authenticated | head -1)"
 rm -rf "$SQUAT"
 
+# --- T28 THE DEPRECATION NOTICE: stderr on the two human verbs, nowhere else --
+#
+# WHY THIS ARM EXISTS. DIVE-4691 turned this registry entry into a deprecation
+# stub, and the notice IS the deliverable — but `grep -ri deprecat tests/` came
+# back empty when it shipped. Nothing asserted the line prints, nothing asserted
+# it stays OFF stdout, and the next edit to the case statement would have dropped
+# it in silence. The split is the whole design: `--help` and `status` are read by
+# a person, so the line goes to their stderr; `tree`, `read`, `ls`, `snapshot`,
+# `run` and `shot` have stdout a caller PARSES, and a line of prose in that
+# stream is a bug, not a courtesy. Both directions are graded, and each negative
+# arm is paired with a control that proves the verb actually ran — an absence
+# measured on a command that never dispatched grades nothing.
+DEPRLINE='browser@5dive-plugins is deprecated; it ships from 5dive-ai/5dive-browser now'
+mkprofile deprnotice.test "$LIVE_DOM" >/dev/null
+
+# --- T28a the two human verbs DO carry it, on stderr, exactly once ------------
+run bash "$BROWSER" --help
+t  'T28a --help still exits 0' 0 "$RC"
+tc 'T28a --help puts the deprecation notice on stderr' "$DEPRLINE" "$ERR"
+t  'T28a ...exactly once, not once per helper that wants to be helpful' 1 \
+   "$(printf '%s\n' "$ERR" | grep -c 'is deprecated; it ships from')"
+tn 'T28a ...and never on stdout, which is the usage a person pipes' 'deprecated' "$OUT"
+tc 'T28a (control) ...while the usage itself DID come out on stdout' '5dive browser' "$OUT"
+
+run bash "$BROWSER" status deprnotice.test
+tc 'T28a status puts the notice on stderr too' "$DEPRLINE" "$ERR"
+tn 'T28a ...and status keeps its own stdout clean of it' 'deprecated' "$OUT"
+tc 'T28a (control) ...and status really ran, all the way through the probe' \
+   'deprnotice.test' "$OUT"
+
+# --- T28b the PARSED verbs carry it on NEITHER stream -------------------------
+for _v in tree read snapshot run shot; do
+  run bash "$BROWSER" "$_v"
+  tn "T28b $_v: no deprecation prose on the stdout a caller parses" 'deprecated' "$OUT"
+  tn "T28b $_v: none on its stderr either, which scripts read too" \
+     'is deprecated; it ships from' "$ERR"
+  tc "T28b (control) $_v: ...and it really dispatched and spoke for itself" \
+     "usage: 5dive browser $_v" "$ERR"
+done
+unset _v
+
+# `ls` is the one parsed verb that SUCCEEDS with no arguments, so it grades the
+# stdout case with a stream that actually has content in it rather than an empty
+# one — an absence proved on no output is not an absence.
+run bash "$BROWSER" ls
+t  'T28b ls: exits 0' 0 "$RC"
+tc 'T28b (control) ls: ...and it listed the store, so this stdout is real' \
+   'deprnotice.test' "$OUT"
+tn 'T28b ls: no deprecation prose in that listing' 'deprecated' "$OUT"
+tn 'T28b ls: none on its stderr either' 'is deprecated; it ships from' "$ERR"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

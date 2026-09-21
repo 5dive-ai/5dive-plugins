@@ -62,7 +62,16 @@ enumerable across customer boxes and there is no moment at which it is safe to a
 this entry. Nothing is removed here: not the tree, not the tests, not the parity step. Removing it
 is a later change, after the notice has been on the registry for a release cycle.
 
-Migrate in two commands, in this order:
+**Do not migrate yet if you are on 1.9.x.** 5dive-ai/5dive-browser is at **1.8.0** today and does
+not yet carry the per-box brokered login this copy has (DIVE-1033, DIVE-4662, DIVE-4664): on 1.8.0 a
+seat that does not own the 0700 profile directory still dies with `no profile directory for seat`.
+Nothing in the mechanism will stop you — `plugin add <owner>/<repo>` is a fresh add and compares no
+versions, and the `browser` verb claim forces the remove to come FIRST — so running the two commands
+below on a 1.9.x box takes it DOWN to 1.8.0 and costs it that work. The port is tracked as
+DIVE-4719; once the new repository is at or above this version, this notice becomes an instruction
+to migrate and this paragraph goes away.
+
+Then, and not before, migrate in two commands, in this order:
 
 ```text
 sudo 5dive plugin remove browser@5dive-plugins
@@ -70,12 +79,9 @@ sudo 5dive plugin add 5dive-ai/5dive-browser
 ```
 
 The remove comes first because the CLI refuses two plugins claiming the same `browser` verb, so
-adding before removing fails rather than replacing.
-
-**The migration costs you nothing that matters.** The profile store is a directory on the box, not
-part of the plugin, and so is each seat's `.adapters/`: the sessions you logged into by hand and the
-adapters you wrote survive the remove and the add, and the new copy picks them up where they are. A
-re-login is not part of this.
+adding before removing fails rather than replacing. The profile store is a directory on the box, not
+part of the plugin, and so is each seat's `.adapters/`, so both survive the remove and the add
+whenever you do make the move.
 
 This release is the notice itself — `--help` and `status` now say where the plugin lives, on stderr
 only, never on the verbs whose stdout a caller parses.
