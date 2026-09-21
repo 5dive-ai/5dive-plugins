@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Removed — the registry copy of `browser` (DIVE-4734)
+
+`plugins/browser` and its marketplace entry are gone. The plugin lives in
+`5dive-ai/5dive-browser` (1.9.2 at removal); install it with
+`sudo 5dive plugin add 5dive-ai/5dive-browser`. A box still carrying
+`browser@5dive-plugins` migrates with `sudo 5dive plugin remove browser@5dive-plugins`
+first — measured on two boxes before this landed, logged-in profiles survive the swap.
+The four browser harnesses under `tests/` left with it; they already run in the new
+repo's CI.
+
 ### Fixed — standard Telegram seats can land authenticated gate taps (DIVE-4609), telegram 0.5.58
 
 Gate buttons and inbox recommendation clears no longer shell a broad
