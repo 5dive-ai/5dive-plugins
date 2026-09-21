@@ -27,9 +27,10 @@
 // negative controls) is on DIVE-4692 and is reproduced by the command in the plugin's
 // README.
 
-import { describe, test, expect } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { afterAll, describe, test, expect } from 'bun:test'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const ROOT = join(import.meta.dir, '..', 'plugins', 'mod')
@@ -50,12 +51,13 @@ const HOOKS_JSON = JSON.parse(readFileSync(join(ROOT, 'hooks', 'hooks.json'), 'u
  * be installed — the collision is not a tidiness defect, it strands the release.
  */
 const MANIFEST_REL = 'plugins/mod/.claude-plugin/plugin.json'
+const MOD_PATHSPEC = 'plugins/mod/'
 const REPO = join(import.meta.dir, '..')
 
-function git(args: string[]): string | null {
+function git(args: string[], cwd: string = REPO): string | null {
   try {
     return execFileSync('git', args, {
-      cwd: REPO,
+      cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -64,21 +66,93 @@ function git(args: string[]): string | null {
   }
 }
 
-/** main's manifest version, or null when this tree genuinely cannot reach main. */
-function versionOnMain(): string | null {
+/**
+ * A name THIS tree can use for main's tip, or null when it cannot reach main at all.
+ *
+ * Split out of the old `versionOnMain()` (DIVE-4747) because the scoping half below
+ * needs the REF, not the version string it happens to point at.
+ *
+ * A CI checkout is shallow and single-ref (actions/checkout@v4 gives depth 1 on the
+ * PR merge ref), so neither local name resolves there. Fetching main is the whole
+ * difference between grading the collision and skipping it in the one place that would
+ * have caught DIVE-4720's.
+ */
+function mainRef(cwd: string = REPO): string | null {
   for (const ref of ['origin/main', 'main']) {
-    const raw = git(['show', `${ref}:${MANIFEST_REL}`])
-    if (raw) return JSON.parse(raw).version
+    if (git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], cwd)) return ref
   }
-  // A CI checkout is shallow and single-ref (actions/checkout@v4 gives depth 1 on the
-  // PR merge ref), so neither name above resolves there. Fetching main is the whole
-  // difference between grading the collision and skipping it in the one place that
-  // would have caught this one.
-  if (git(['fetch', '--depth=1', 'origin', 'main']) !== null) {
-    const raw = git(['show', `FETCH_HEAD:${MANIFEST_REL}`])
-    if (raw) return JSON.parse(raw).version
+  // Full fetch FIRST (DIVE-4747). `--depth=1` hands back a tip with no ancestry, and
+  // `modChangedSinceMain` then has no merge base to scope against — it degrades to a
+  // tip diff, under which a branch that bumped to a number main has since published
+  // reads as "unchanged" and the collision goes silent. The workflow checks out full
+  // history (pinned by an arm below), so this fetch is incremental there; the shallow
+  // form stays as a last resort because a vacuous skip is worse than a degraded scope.
+  for (const args of [
+    ['fetch', '--no-tags', 'origin', 'main'],
+    ['fetch', '--no-tags', '--depth=1', 'origin', 'main'],
+  ]) {
+    if (
+      git(args, cwd) !== null &&
+      git(['rev-parse', '--verify', '--quiet', 'FETCH_HEAD^{commit}'], cwd)
+    ) {
+      return 'FETCH_HEAD'
+    }
   }
   return null
+}
+
+/** The manifest version at a ref, or null when that ref has no manifest to read. */
+function versionAt(ref: string, cwd: string = REPO): string | null {
+  const raw = git(['show', `${ref}:${MANIFEST_REL}`], cwd)
+  return raw ? JSON.parse(raw).version : null
+}
+
+/** main's manifest version, or null when this tree genuinely cannot reach main. */
+function versionOnMain(cwd: string = REPO): string | null {
+  const ref = mainRef(cwd)
+  return ref === null ? null : versionAt(ref, cwd)
+}
+
+/**
+ * Did THIS tree change anything under `plugins/mod/` since it diverged from main?
+ *
+ * The scoping DIVE-4747 is about. "Our version is strictly above main's" is a statement
+ * about the DISTANCE between two trees, and on `main` that distance is zero — so the
+ * unscoped arm was false by construction the moment the branch it guarded merged, and
+ * stayed false on `main` and on every PR that had since taken `main` in. It made the
+ * repository's only CI signal permanently red, which is worse than blocking: the next
+ * real regression arrives indistinguishable from the standing one.
+ *
+ * The merge BASE, not main's tip, is what makes the answer about this branch's own work:
+ * a branch sitting on a base that predates someone else's `mod` release has not touched
+ * `mod`, and must not be asked to out-rank it. The tip is the fallback for a shallow CI
+ * checkout with no common history to compute — correct there because `pull_request` hands
+ * us the PR MERGED INTO main, so the tip-diff IS the PR's own effect, and `push` on main
+ * hands us main, where it is empty.
+ *
+ * Diffed against the WORKING TREE (one-commit form), so an uncommitted bump counts.
+ * Returns null when neither base resolves: an unknown, never a silent "no".
+ */
+function modChangedSinceMain(ref: string, cwd: string = REPO): boolean | null {
+  const base =
+    git(['merge-base', ref, 'HEAD'], cwd)?.trim() ||
+    git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], cwd)?.trim()
+  if (!base) return null
+  const out = git(['diff', '--name-only', base, '--', MOD_PATHSPEC], cwd)
+  return out === null ? null : out.trim().length > 0
+}
+
+/**
+ * The three readings the scoped guard can produce, as one pure function so the control
+ * arms can drive it over histories this checkout cannot be made to have.
+ *
+ * `skipped` is a real verdict and not an escape: the arm has nothing to say about a
+ * plugin this branch never touched, and asserting anyway is asserting about someone
+ * else's work.
+ */
+function versionVerdict(changed: boolean, ours: string, onMain: string): string {
+  if (!changed) return 'skipped'
+  return cmpVersion(ours, onMain) > 0 ? 'above' : 'NOT above'
 }
 
 /** -1 / 0 / 1 on the numeric semver triple. Equal is a FAILING comparison here. */
@@ -134,15 +208,26 @@ describe('mod: manifest and module stay wired together', () => {
     expect(inSource).toBe(MANIFEST.version)
   })
 
-  test('the manifest version is strictly above the one published on main', () => {
-    const onMain = versionOnMain()
+  test('a tree that CHANGED plugins/mod carries a version strictly above the one published on main', () => {
+    const ref = mainRef()
     // Null means no ref AND no fetch — a tree that cannot see main at all. Passing
     // here would make the arm vacuous in precisely the environment where nobody is
     // watching, so it reds and says why.
+    expect(ref === null ? 'could not read main' : 'read main').toBe('read main')
+    const onMain = versionAt(ref as string)
     expect(onMain === null ? 'could not read main' : 'read main').toBe('read main')
+    // Same reasoning one level down: an unscopable diff is an unknown, and an unknown
+    // that reads as "unchanged" would switch the guard off silently.
+    const changed = modChangedSinceMain(ref as string)
+    expect(changed === null ? 'could not scope to the diff' : 'scoped to the diff').toBe(
+      'scoped to the diff',
+    )
     const ours = MANIFEST.version
-    const verdict = cmpVersion(ours, onMain as string) > 0 ? 'above' : 'NOT above'
-    expect(`${ours} is ${verdict} main's ${onMain}`).toBe(`${ours} is above main's ${onMain}`)
+    const scope = changed ? 'changed' : 'unchanged'
+    const verdict = versionVerdict(changed as boolean, ours, onMain as string)
+    expect(`plugins/mod ${scope}: ${ours} vs main's ${onMain} -> ${verdict}`).toBe(
+      `plugins/mod ${scope}: ${ours} vs main's ${onMain} -> ${changed ? 'above' : 'skipped'}`,
+    )
   })
 
   test('the comparison reds on a version merely EQUAL to main, not just a lower one', () => {
@@ -524,5 +609,178 @@ describe('mod: the sink write fails loudly, once, and then the mod is off', asyn
     // record() is called from inside a hook that has already resolved `next(e)`. If it
     // could throw or be awaited, telemetry could fail or delay a turn.
     expect(record(engine, live('/tmp/x.jsonl'), { ts: 4, event: 'session.end' })).toBeUndefined()
+  })
+})
+
+describe('mod: the version guard is scoped to the diff, so it survives its own merge (DIVE-4747)', () => {
+  // Controls, and they are the point of the row rather than a courtesy. The arm above
+  // grades whatever history this checkout happens to have, so on `main` it is green by
+  // skipping and on a bump it is green by comparing — one reading each, never both, and
+  // an arm that cannot be shown to fail is zero evidence. These build the histories the
+  // live arm cannot be made to have, and ask it the same two functions.
+  //
+  // Each fixture is a throwaway repo: two or three commits and a manifest with nothing
+  // in it but a name and a version, because the predicate reads only the version.
+
+  const made: string[] = []
+
+  function g(dir: string, ...args: string[]): string {
+    const out = git(args, dir)
+    if (out === null) throw new Error(`fixture: git ${args.join(' ')} failed in ${dir}`)
+    return out
+  }
+
+  function writeManifest(dir: string, version: string): void {
+    mkdirSync(join(dir, 'plugins', 'mod', '.claude-plugin'), { recursive: true })
+    writeFileSync(
+      join(dir, 'plugins', 'mod', '.claude-plugin', 'plugin.json'),
+      `${JSON.stringify({ name: 'mod', version }, null, 2)}\n`,
+    )
+  }
+
+  function writeOther(dir: string, body: string): void {
+    mkdirSync(join(dir, 'plugins', 'telegram'), { recursive: true })
+    writeFileSync(join(dir, 'plugins', 'telegram', 'server.ts'), body)
+  }
+
+  /** A repo whose `main` publishes `version`, checked out on `main`. */
+  function repoOnMain(version: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'mod-version-guard-'))
+    made.push(dir)
+    g(dir, 'init', '--quiet', '--initial-branch=main')
+    g(dir, 'config', 'user.email', 'fixture@example.com')
+    g(dir, 'config', 'user.name', 'fixture')
+    writeManifest(dir, version)
+    writeOther(dir, 'export const seed = 1\n')
+    g(dir, 'add', '-A')
+    g(dir, 'commit', '--quiet', '-m', `main: mod ${version}`)
+    return dir
+  }
+
+  function commitAll(dir: string, message: string): void {
+    g(dir, 'add', '-A')
+    g(dir, 'commit', '--quiet', '-m', message)
+  }
+
+  /** What the arm reads: the scope, and the verdict that scope produces. */
+  function grade(dir: string): { scope: string; verdict: string; ours: string; onMain: string } {
+    const ref = mainRef(dir)
+    if (ref === null) throw new Error('fixture: cannot reach main')
+    const onMain = versionAt(ref, dir) as string
+    const ours = JSON.parse(
+      readFileSync(join(dir, 'plugins', 'mod', '.claude-plugin', 'plugin.json'), 'utf8'),
+    ).version as string
+    const changed = modChangedSinceMain(ref, dir)
+    if (changed === null) throw new Error('fixture: cannot scope the diff')
+    return {
+      scope: changed ? 'changed' : 'unchanged',
+      verdict: versionVerdict(changed, ours, onMain),
+      ours,
+      onMain,
+    }
+  }
+
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('GREEN on main itself — the regression this row exists for', () => {
+    // The unscoped predicate was false by construction here: ours EQUALS main's, because
+    // ours IS main's. That single arm made the repo red on every head from 04:08Z onward.
+    const dir = repoOnMain('0.6.0')
+    expect(grade(dir)).toMatchObject({ scope: 'unchanged', verdict: 'skipped' })
+    // ...and the pre-fix predicate is pinned as red on the same tree, so this arm cannot
+    // be passing for some reason other than the scoping.
+    expect(cmpVersion('0.6.0', '0.6.0') > 0).toBe(false)
+  })
+
+  test('RED on a branch that edits plugins/mod without bumping the version', () => {
+    const dir = repoOnMain('0.6.0')
+    g(dir, 'checkout', '--quiet', '-b', 'edits-mod')
+    mkdirSync(join(dir, 'plugins', 'mod', 'hooks'), { recursive: true })
+    writeFileSync(join(dir, 'plugins', 'mod', 'hooks', 'register.ts'), 'export const x = 2\n')
+    commitAll(dir, 'edit mod, forget the bump')
+    expect(grade(dir)).toMatchObject({ scope: 'changed', verdict: 'NOT above' })
+  })
+
+  test('RED on a version merely EQUAL to main’s — the DIVE-4720 collision', () => {
+    // Branch bumps 0.6.0 -> 0.7.0 on a base that predates main publishing 0.7.0 itself.
+    // Both trees now say 0.7.0, so the second build can never install: a strictly higher
+    // number is what moves a box. This is the defect the arm was written for and it must
+    // survive the scoping.
+    const dir = repoOnMain('0.6.0')
+    g(dir, 'checkout', '--quiet', '-b', 'bumps-into-a-collision')
+    writeManifest(dir, '0.7.0')
+    commitAll(dir, 'bump mod to 0.7.0')
+    g(dir, 'checkout', '--quiet', 'main')
+    writeManifest(dir, '0.7.0')
+    commitAll(dir, 'main publishes mod 0.7.0')
+    g(dir, 'checkout', '--quiet', 'bumps-into-a-collision')
+    expect(grade(dir)).toMatchObject({ scope: 'changed', verdict: 'NOT above', ours: '0.7.0', onMain: '0.7.0' })
+  })
+
+  test('GREEN on a branch that edits plugins/mod AND bumps above main', () => {
+    const dir = repoOnMain('0.6.0')
+    g(dir, 'checkout', '--quiet', '-b', 'bumps-properly')
+    writeManifest(dir, '0.7.0')
+    commitAll(dir, 'bump mod to 0.7.0')
+    expect(grade(dir)).toMatchObject({ scope: 'changed', verdict: 'above' })
+  })
+
+  test('GREEN on a branch that never touched plugins/mod while main bumped it — stale base', () => {
+    const dir = repoOnMain('0.6.0')
+    g(dir, 'checkout', '--quiet', '-b', 'touches-another-plugin')
+    writeOther(dir, 'export const seed = 2\n')
+    commitAll(dir, 'change a plugin that is not mod')
+    g(dir, 'checkout', '--quiet', 'main')
+    writeManifest(dir, '0.7.0')
+    commitAll(dir, 'main publishes mod 0.7.0')
+    g(dir, 'checkout', '--quiet', 'touches-another-plugin')
+    const graded = grade(dir)
+    expect(graded).toMatchObject({ scope: 'unchanged', verdict: 'skipped', ours: '0.6.0', onMain: '0.7.0' })
+    // The pre-fix predicate on the very same tree: 0.6.0 is NOT above 0.7.0, so it red on
+    // a branch whose diff contains no file under plugins/mod at all.
+    expect(cmpVersion(graded.ours, graded.onMain) > 0).toBe(false)
+  })
+
+  test('GREEN on a branch that TOOK MAIN IN and still never touched plugins/mod', () => {
+    // The exact shape that presented: a one-hunk conflict resolution pulled main in, the
+    // versions became equal, and a PR touching zero files under plugins/mod went red.
+    const dir = repoOnMain('0.6.0')
+    g(dir, 'checkout', '--quiet', '-b', 'took-main-in')
+    writeOther(dir, 'export const seed = 3\n')
+    commitAll(dir, 'change a plugin that is not mod')
+    g(dir, 'checkout', '--quiet', 'main')
+    writeManifest(dir, '0.7.0')
+    commitAll(dir, 'main publishes mod 0.7.0')
+    g(dir, 'checkout', '--quiet', 'took-main-in')
+    g(dir, 'merge', '--quiet', '--no-edit', 'main')
+    const graded = grade(dir)
+    expect(graded).toMatchObject({ scope: 'unchanged', verdict: 'skipped', ours: '0.7.0', onMain: '0.7.0' })
+    expect(cmpVersion(graded.ours, graded.onMain) > 0).toBe(false)
+  })
+
+  test('the parity workflow checks out full history, because the scoping needs a merge base', () => {
+    // Not a style pin. `fetch-depth: 0` is the precondition for the arm above having
+    // any discrimination at all in CI: delete it and the guard silently degrades to a
+    // tip diff, which cannot see the DIVE-4720 collision. The degradation is invisible
+    // — every arm stays green — so it is pinned here rather than trusted.
+    const wf = readFileSync(join(import.meta.dir, '..', '.github', 'workflows', 'parity.yml'), 'utf8')
+    expect(/uses: actions\/checkout@v4\s*\n\s*with:\s*\n\s*fetch-depth: 0/.test(wf)).toBe(true)
+  })
+
+  test('mod-telemetry is still the ONLY test that compares this tree against main', () => {
+    // The class, not the instance. A second cross-tree guard written the unscoped way
+    // would red on main the same day it merged, and nothing else in the suite would
+    // notice. If this arm reds, scope the new comparison before shipping it — the
+    // question to ask is: what does this arm say when it runs ON main?
+    const dir = join(import.meta.dir)
+    const comparers = readdirSync(dir)
+      .filter((f) => f.endsWith('.test.ts'))
+      // The tell of a cross-TREE read, not the word "main": a ref name, a fetched head,
+      // or a merge base. `council.test.ts` says "main" about a model and is not one.
+      .filter((f) => /origin\/main|FETCH_HEAD|merge-base/.test(readFileSync(join(dir, f), 'utf8')))
+      .sort()
+    expect(comparers).toEqual(['mod-telemetry.test.ts'])
   })
 })
