@@ -8,6 +8,7 @@
       "id": "pii-fixture",
       "rule": "Test fixtures: never a real identifier (5dive/CLAUDE.md)",
       "tools": ["Write", "Edit", "NotebookEdit"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_FIXTURE_ID",
       "path_keys": ["file_path", "notebook_path"],
       "text_keys": ["content", "new_string", "new_source"],
       "path_any": [
@@ -37,7 +38,7 @@
         },
         {
           "id": "ip",
-          "find": "\\b(\\d{1,3}(?:\\.\\d{1,3}){3})\\b",
+          "find": "(?<![\\w.])((?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(?:\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3})(?!\\.\\d)(?![\\w-])",
           "flags": "g",
           "group": 1,
           "allow_any": [
@@ -89,6 +90,7 @@
     {
       "id": "runtime-store",
       "rule": "The audit log and the runtime store are append-only to the runtime, not to a seat (mod guard, capability 2)",
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_RUNTIME_WRITE",
       "tools": ["Write", "Edit", "NotebookEdit"],
       "path_keys": ["file_path", "notebook_path"],
       "text_keys": [],

@@ -1,5 +1,33 @@
 ## Unreleased
 
+### Changed — the tool-call guard is ON unless a seat opts out (DIVE-4720), mod 0.5.0
+
+DIVE-4696 shipped six policies and left them off on every seat, so the thing the row was filed
+for — **deleting the prose those policies replace from the fleet's `CLAUDE.md`** — could not be
+taken: deleting a rule sentence while nothing enforces it does not move the rule into the guard,
+it removes the rule. Net prose movement was −92 bytes of ~16.6KB, and the ~1100-loads/day saving
+was still owed. `FIVEDIVE_MOD_GUARD` now means: absent → **on**; `0`, `off`, `false` or `no` →
+off. Nothing else about the hook changed.
+
+Two narrowings land with the flip, both in `policy/guard.json` and both ops-editable without a
+plugin release, because on-by-default turns a false positive from a verifier's note into a
+fleet-wide refusal of legitimate writes:
+
+- **`pii-fixture/ip` no longer reads a version string as an IP address.** The check was a bare
+  dotted-quad, so `const V = "2.1.278.0"` in a test file denied — and this repo's own tests pin
+  Claude Code releases by number. The match now requires **valid octets** (`278`, `300`, `999`
+  are not octets) and will not start or end inside a longer dotted-numeric run, so `v2.1.27.0`,
+  `1.2.3.4.5` and `2.1.27.0-rc1` are all ignored while `95.216.4.19` and `8.8.8.8` still deny.
+- **`pii-fixture` and `runtime-store` gained the named seat-setting escape** every other policy
+  already carried (`FIVEDIVE_MOD_GUARD_ALLOW_FIXTURE_ID`, `FIVEDIVE_MOD_GUARD_ALLOW_RUNTIME_WRITE`).
+  On by default, a policy with no escape is an outage with no exit but an edit to the shared file.
+
+**What this does NOT do, and it is the larger half of DIVE-4720.** The guard still enforces
+nothing on any seat, because `mod@5dive-plugins` is enabled in **no seat's `enabledPlugins`** and
+no code path puts it there — `src/lib/agent_setup.sh` in `5dive-cli` builds that map from the
+seat's *channels* (`telegram`, `dashboard`, `buzz`) only. On-by-default is the precondition for
+the rollout, not the rollout. The prose deletion stays owed until the rollout lands.
+
 ### Added — a table-driven tool-call policy guard (DIVE-4696), mod 0.4.0
 
 Every rule in the fleet's `CLAUDE.md` files is paid on **every turn** (~1100 loads/day per the
@@ -17,7 +45,8 @@ command outside the work directory, and a comment or review on a repo we do not 
 path, a tool or a rule, so ops adds or retires one by editing JSON with no plugin release.
 `jq -r '.policies[] | "\(.id)\t\(.rule)"' plugins/mod/policy/guard.json` is the whole reader.
 
-**Off on every seat unless it opts in** (`FIVEDIVE_MOD_GUARD=1`), and off is byte-for-byte the
+**Off on every seat unless it opts in** (`FIVEDIVE_MOD_GUARD=1`) — *reversed below by
+DIVE-4720, which makes absent mean ON* — and off is byte-for-byte the
 observe-only hook DIVE-4692 shipped. It **fails open**: an unparseable document, an
 uncompilable regex or an unexpected event shape lets the call proceed and logs once per
 session. Each policy carries a named seat-setting escape rather than a command-line flag, so

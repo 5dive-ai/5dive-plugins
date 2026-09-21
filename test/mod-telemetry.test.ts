@@ -200,11 +200,33 @@ describe('mod: it cannot affect the session it measures', () => {
     expect(body).toContain('if (livePin === null || r.skip !== undefined) return r')
   })
 
-  test('the guard is off unless the seat turns it on, and off is the old hook', () => {
-    // The default has to be legible from the source: a guard that is on by default
-    // would refuse calls on 18 seats the moment the plugin updates.
+  test('the guard is ON unless the seat opts out, and opting out is the old hook', () => {
+    // REVERSED BY DIVE-4720, deliberately. The arm this replaces pinned the opposite
+    // default and gave the reason: "a guard that is on by default would refuse calls
+    // on 18 seats the moment the plugin updates." That reason was measured and found
+    // to be the wrong way round — off-by-default refused calls on ZERO seats, which is
+    // why the six CLAUDE.md rules the policies replace could not be deleted and the
+    // fleet went on paying for them on every turn. A rule nothing enforces is not a
+    // rule. The default still has to be legible from the source; it is the value that
+    // changed, not the requirement to state it.
     expect(SRC).toContain("const GUARD_FLAG = 'FIVEDIVE_MOD_GUARD'")
-    expect(SRC).toMatch(/String\(vars\[GUARD_FLAG\] \?\? ''\) !== '1'\) return \{ on: false \}/)
+    // Absent is ON: only a named opt-out answers `{ on: false }`.
+    expect(SRC).toMatch(/flag === '0' \|\| flag === 'off' \|\| flag === 'false' \|\| flag === 'no'\) return \{ on: false \}/)
+    // And the old predicate is GONE, not merely shadowed by a second one.
+    expect(SRC).not.toMatch(/GUARD_FLAG\] \?\? ''\) !== '1'/)
+  })
+
+  test('on by default, every policy carries a named escape', () => {
+    // The blast radius of the flip rests on this: a seat that hits a false positive
+    // has a one-setting exit that is not "edit the file all 18 seats read". Off by
+    // default, a policy with no escape cost nobody anything; on by default it is an
+    // outage with a reason attached. Read from the DOCUMENT, so a policy added later
+    // without an escape reds here rather than on a seat.
+    const doc = JSON.parse(readFileSync(join(ROOT, 'policy', 'guard.json'), 'utf8'))
+    const naked = doc.policies
+      .filter((p: { unless_env?: string }) => typeof p.unless_env !== 'string' || p.unless_env === '')
+      .map((p: { id: string }) => p.id)
+    expect(naked).toEqual([])
   })
 
   test('the module never binds $ to a name', () => {

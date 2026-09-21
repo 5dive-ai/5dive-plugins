@@ -61,23 +61,31 @@ reason, not a report.
 
 | id | refuses | escape |
 | --- | --- | --- |
-| `pii-fixture` | a real Telegram id, email or routable IP written into a test or fixture path | change the value |
+| `pii-fixture` | a real Telegram id, email or routable IP written into a test or fixture path | change the value, or `FIVEDIVE_MOD_GUARD_ALLOW_FIXTURE_ID` |
 | `no-verify` | `git commit`/`git push --no-verify` | `FIVEDIVE_MOD_GUARD_ALLOW_NO_VERIFY` |
 | `smoke-attestation` | applying the `smoke-verified` label | `FIVEDIVE_MOD_GUARD_SMOKE_RECEIPT=<sha>` |
-| `runtime-store` | a direct write into `/var/lib/5dive`, `/var/log/5dive`, `/etc/5dive` or `tasks.db` | — |
+| `runtime-store` | a direct write into `/var/lib/5dive`, `/var/log/5dive`, `/etc/5dive` or `tasks.db` | `FIVEDIVE_MOD_GUARD_ALLOW_RUNTIME_WRITE` |
 | `destructive-outside-workdir` | `rm -r` of a host path or a seat's dotfiles; `git clean -f` | `FIVEDIVE_MOD_GUARD_ALLOW_DESTRUCTIVE` |
 | `external-reply` | `gh pr/issue comment|review|create --repo <owner we do not own>` | `FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED` |
 
 ## Turning it on
 
-Two gates, both required:
+Since DIVE-4720 the guard's own flag is ON by default; what remains are the two gates that decide
+whether the MODULE runs at all, and both are still required:
 
-- `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in the seat's environment, or the module never loads;
-- `"env": { "FIVEDIVE_MOD_GUARD": "1" }` in the seat's `settings.json`.
+- `mod@5dive-plugins` in the seat's `enabledPlugins`. **This is the one that is not satisfied
+  anywhere.** As of 2026-09-21 no seat on this host lists it and no code path adds it:
+  `5dive-cli`'s `src/lib/agent_setup.sh` builds `enabledPlugins` from the seat's *channels*
+  (`telegram`, `dashboard`, `buzz`) only. Until that changes, everything below is theory.
+- `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in the seat's environment, or the module never loads.
+  Measured 2026-09-21: without it a `tool.call` policy cannot fire and the mod writes no sink,
+  so an acceptance run that forgets it reports a clean "not denied" that looks like a passing
+  guard. The absent sink is the tell.
 
-Off is the default on every seat, and off means the `tool.call` hook is byte-for-byte the
-observe-only telemetry hook DIVE-4692 shipped. `FIVEDIVE_MOD_GUARD_POLICY` points at a different
-document; absent, it is the plugin's own `policy/guard.json`.
+`FIVEDIVE_MOD_GUARD` itself: absent means ON; `0`, `off`, `false` or `no` opts the seat out, and
+opted out means the `tool.call` hook is byte-for-byte the observe-only telemetry hook DIVE-4692
+shipped. `FIVEDIVE_MOD_GUARD_POLICY` points at a different document; absent, it is the plugin's
+own `policy/guard.json`.
 
 Seat it the way `sec-default` is seated — first in the seat's plugin list, which `prependPlugins`
 orders — so the deny is reached before a later plugin can rewrite the call out from under it.
@@ -112,13 +120,15 @@ These are recorded rather than fixed, because each one is ops-fixable in `policy
 without a plugin release, and because a policy that is quietly widened is harder to reason about
 than one whose edges are written down.
 
-- **`pii-fixture/ip` cannot tell an IP address from a four-part version string.** The check is a
-  dotted-quad match, so `expect(v).toBe("10.1.2.3")` and `const V = "2.1.278.0"` in a test file
-  both DENY (measured by the verifier, 2026-09-20). A seat that turns the guard on and writes a
-  version-shaped literal into a test will be refused for it. The narrowing is one entry in the
-  document — add `"^\\d+\\.\\d+\\.\\d+\\.\\d+$"`-shaped exclusions to the check's `allow_any`, or
-  give the check a `path_any` that skips version fixtures — and it is deliberately not taken here:
-  it would ship unverified in the iteration that fixes something else.
+- **`pii-fixture/ip` reads MOST version strings correctly now, and one shape is still undecidable.**
+  TAKEN in DIVE-4720, when the guard went on by default and the false positive stopped being a
+  note and became a refusal of legitimate writes. The match now requires **valid octets** and
+  will not begin or end inside a longer dotted-numeric run, so `2.1.278.0`, `v2.1.27.0`,
+  `1.2.3.4.5` and `2.1.27.0-rc1` are ignored while `95.216.4.19` and `8.8.8.8` still deny.
+  **What is left is genuinely undecidable by regex**: a four-part version whose every part is a
+  valid octet and which carries no `v` and no fifth part — `10.1.2.3` is both a private address
+  and a plausible version, and no amount of pattern is going to separate them. That case is what
+  `FIVEDIVE_MOD_GUARD_ALLOW_FIXTURE_ID` is for: one seat setting, recorded, for the one write.
 - **`external-reply` only sees an explicit `--repo`/`-R`.** `gh pr comment 4` run from inside a
   foreign checkout carries no owner on the command line, so nothing is refused.
 - **`pii-fixture` judges the path by NAME** (`test/`, `spec/`, `fixture`, `*.test.*`). A fixture
