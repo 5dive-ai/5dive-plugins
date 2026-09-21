@@ -52,6 +52,36 @@ compaction is a ~50s model call; queued on the writer's chain it delayed no turn
 delayed every sink write behind it, including the next `turn.start` — and that sink is
 what the heartbeat, the pacing floor and the pending-restart sweep read idle/busy from, so
 a compacting seat would have read as a silent one for ~50s.
+### Deprecated — `browser@5dive-plugins` is frozen; the plugin ships from 5dive-ai/5dive-browser (DIVE-4691), browser 1.9.1
+
+The browser plugin now has its own repository, **[5dive-ai/5dive-browser](https://github.com/5dive-ai/5dive-browser)**,
+and that is the only place it is fixed from now on. The copy in this registry is frozen at the
+1.9.0 code and **still resolves** — `plugin add browser@5dive-plugins` and
+`plugin upgrade browser@5dive-plugins` keep working on every box, because a plugin cache is not
+enumerable across customer boxes and there is no moment at which it is safe to assume nobody names
+this entry. Nothing is removed here: not the tree, not the tests, not the parity step. Removing it
+is a later change, after the notice has been on the registry for a release cycle.
+
+**Migrating is safe as of this release, and it was not before.** 5dive-ai/5dive-browser was cut at
+1.8.0 and this registry copy kept receiving merges, so for a day the repository the notice points at
+was a strict SUBSET of the copy it deprecates and the move would have been a downgrade. That is
+closed: DIVE-4719 ported the per-box brokered login (DIVE-1033, DIVE-4662, DIVE-4664) into the new
+repository, whose `bin/browser` is now byte-identical to this one at the same version, **1.9.1**. The
+two copies carry the same code; the only difference is that the new one is still maintained.
+
+Migrate in two commands, in this order:
+
+```text
+sudo 5dive plugin remove browser@5dive-plugins
+sudo 5dive plugin add 5dive-ai/5dive-browser
+```
+
+The remove comes first because the CLI refuses two plugins claiming the same `browser` verb, so
+adding before removing fails rather than replacing. The profile store is a directory on the box, not
+part of the plugin, and so is each seat's `.adapters/`, so both survive the remove and the add.
+
+This release is the notice itself — `--help` and `status` now say where the plugin lives, on stderr
+only, never on the verbs whose stdout a caller parses.
 
 ### Added — the mod's above-prompt seat panel (DIVE-4694), mod 0.5.0
 
