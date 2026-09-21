@@ -1,5 +1,28 @@
 ## Unreleased
 
+### Changed — the frozen browser copy is aligned to 1.10.2 so one converger floor covers both copies (DIVE-4797), browser 1.10.2
+
+No code change. `served` and `forget` landed here at **1.10.0** (DIVE-4791, #106) and reached zero
+boxes: `_bs_plugin_add` tries `5dive-ai/5dive-browser` first, and the converger's `_BS_PLUGIN_MIN`
+is a single number checked against whichever copy a box resolved — so the shippable floor is a
+`min()` over both copies
+(`community/wiki/a-forked-plugin-makes-the-converger-floor-a-min-over-both-copies.md`).
+
+DIVE-4797 ported the two verbs to the maintained repo, where `main` was already at 1.10.1
+(DIVE-4794), so the port had to publish **1.10.2**. That makes 1.10.2 the only number that means
+"this box has Stop and Disconnect" on *both* copies: 1.10.1 is reachable on the maintained repo and
+does NOT carry the verbs, so a floor of 1.10.0 or 1.10.1 would pass boxes that cannot serve the
+controls. Leaving this copy at 1.10.0 while the floor goes to 1.10.2 would instead push every box
+still keyed `browser@5dive-plugins` permanently below floor — `plugin upgrade` cannot cross the
+move (the verb claim refuses the maintained repo while this copy is installed), so they could never
+climb out. Hence the alignment.
+
+**The bytes are not identical and the manifest now says so.** This copy does not carry DIVE-4794's
+probe wait, which shipped only in the maintained repo. The version is a capability floor here, not
+a content hash; the two installs are keyed to different marketplaces and `plugin upgrade` never
+compares them against each other. The real fix is migrating the remaining boxes off this copy, which
+is not this row.
+
 ### Fixed — the mod version guard no longer reds on main forever (DIVE-4747)
 
 `mod: the manifest version is strictly above the one published on main` asserted a GAP
