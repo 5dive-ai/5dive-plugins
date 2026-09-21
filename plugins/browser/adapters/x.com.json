@@ -1,0 +1,10 @@
+{
+  "_comment": "MEASURED, NOT GUESSED. Read off x.com's real logged-out login flow on a box (exact-swallow, main, 2026-09-14, DIVE-4538) with the plugin's OWN probe command — google-chrome --headless --dump-dom --virtual-time-budget=8000 on a throwaway profile — and identical at a 25s budget and under Playwright 1.63 after 15s of real time. A plain fetch of this URL returns an app shell with no form at all, so a marker written from curl would never match and would stamp every logged-out page authenticated — the one mutant this file must not carry.",
+  "site": "x.com",
+  "probe": {
+    "url": "https://x.com/i/flow/login",
+    "logged_out_when_dom_matches": "name=[\"']?username_or_email",
+    "_comment": "The login flow's first field (<input name=\"username_or_email\" autocomplete=\"username webauthn\">). UNMEASURED HALF: no x.com profile exists on any box (throwaways only, and there is none), so the logged-in render of this URL was not observed. That gap fails SAFE: were a logged-in visitor still shown this field, status would read 'session expired' and name a person — never 'authenticated' on a logged-out page."
+  },
+  "actions": {}
+}
