@@ -52,14 +52,8 @@ jobs:
       # without resolving a single specifier, so this needs no node_modules.
       # test/entrypoint-parse.test.ts asserts the same thing from `bun test`;
       # this step exists so the failure has a name in the checks list.
-      # DIVE-4202: `browser` and `voice` moved here from the CLI repo, and
-      # browser's harness came with them. It is plain bash (no bun deps) and it
-      # grades the shipped script + the manifest + this repo's marketplace entry
-      # — the arms that used to red in 5dive-ai/5dive when the plugin broke.
-      # Without this step the harness would sit in the repo unrun, which is
-      # silence, not a green.
-      - name: browser plugin harness
-        run: bash tests/browser_plugin_unit.sh
+      # DIVE-4734: the browser harness left with the plugin — `browser` now lives in
+      # 5dive-ai/5dive-browser and its tests/browser_plugin_unit.sh runs in that repo's CI.
       # DIVE-4397: the unprivileged-first 5dive reader, and the arms that assert
       # all five telegram forks still route through it. `bun test` does not reach
       # it — the module is driven with an injected exec function from bash, and
