@@ -9,6 +9,286 @@ user id as channel proof and let the CLI cross its narrow `_task_channel` rail.
 Only `task answer` and `task clear-recs` use that rail. Start, done, cancel,
 escalate, agent-send, and council actions remain admin-only.
 
+### Changed — the tool-call guard is ON unless a seat opts out (DIVE-4720), mod 0.6.0
+
+DIVE-4696 shipped six policies and left them off on every seat, so the thing the row was filed
+for — **deleting the prose those policies replace from the fleet's `CLAUDE.md`** — could not be
+taken: deleting a rule sentence while nothing enforces it does not move the rule into the guard,
+it removes the rule. Net prose movement was −92 bytes of ~16.6KB, and the ~1100-loads/day saving
+was still owed. `FIVEDIVE_MOD_GUARD` now means: absent → **on**; `0`, `off`, `false` or `no` →
+off. Nothing else about the hook changed.
+
+Two narrowings land with the flip, both in `policy/guard.json` and both ops-editable without a
+plugin release, because on-by-default turns a false positive from a verifier's note into a
+fleet-wide refusal of legitimate writes:
+
+- **`pii-fixture/ip` no longer reads a version string as an IP address.** The check was a bare
+  dotted-quad, so `const V = "2.1.278.0"` in a test file denied — and this repo's own tests pin
+  Claude Code releases by number. The match now requires **valid octets** (`278`, `300`, `999`
+  are not octets) and will not start or end inside a longer dotted-numeric run, so `v2.1.27.0`,
+  `1.2.3.4.5` and `2.1.27.0-rc1` are all ignored while `95.216.4.19` and `8.8.8.8` still deny.
+- **`pii-fixture` and `runtime-store` gained the named seat-setting escape** every other policy
+  already carried (`FIVEDIVE_MOD_GUARD_ALLOW_FIXTURE_ID`, `FIVEDIVE_MOD_GUARD_ALLOW_RUNTIME_WRITE`).
+  On by default, a policy with no escape is an outage with no exit but an edit to the shared file.
+
+**What this does NOT do, and it is the larger half of DIVE-4720.** The guard still enforces
+nothing on any seat, because `mod@5dive-plugins` is enabled in **no seat's `enabledPlugins`** and
+no code path puts it there — `src/lib/agent_setup.sh` in `5dive-cli` builds that map from the
+seat's *channels* (`telegram`, `dashboard`, `buzz`) only. On-by-default is the precondition for
+the rollout, not the rollout. The prose deletion stays owed until the rollout lands.
+
+### Added — a table-driven tool-call policy guard (DIVE-4696), mod 0.4.0
+
+Every rule in the fleet's `CLAUDE.md` files is paid on **every turn** (~1100 loads/day per the
+file's own header), and is enforced *after the fact* — by sudoers scoping, by the pre-push
+guard, or by an audit row somebody reads later. A rule that is a `tool.call` deny instead costs
+nothing per turn, fires **before** the tool runs, and hands the model the reason.
+
+`mod` now compiles `plugins/mod/policy/guard.json` once per session and refuses a call that
+matches. Six policies ship: a real Telegram id / email / routable IP written into a test or
+fixture path, `git commit|push --no-verify`, applying the `smoke-verified` label without a
+receipt for that sha, a direct write into the runtime's store or log paths, a destructive
+command outside the work directory, and a comment or review on a repo we do not own.
+
+**The document is data, not code** — nothing in `guard.ts` or `register.ts` names a policy, a
+path, a tool or a rule, so ops adds or retires one by editing JSON with no plugin release.
+`jq -r '.policies[] | "\(.id)\t\(.rule)"' plugins/mod/policy/guard.json` is the whole reader.
+
+**Off on every seat unless it opts in** (`FIVEDIVE_MOD_GUARD=1`) — *reversed below by
+DIVE-4720, which makes absent mean ON* — and off is byte-for-byte the
+observe-only hook DIVE-4692 shipped. It **fails open**: an unparseable document, an
+uncompilable regex or an unexpected event shape lets the call proceed and logs once per
+session. Each policy carries a named seat-setting escape rather than a command-line flag, so
+taking one is recorded. Every refusal is written to the sink with the policy and check that
+refused it, because a deny nobody can count is a rule nobody can grade.
+
+### Added — boundary compaction for the non-fresh seats (DIVE-4695), mod 0.3.0
+
+`main` and `marketing` run with `heartbeat.fresh=false`, so the dispatcher never `/clear`s
+them and every wake lands on the whole accumulated window. Measured 2026-09-20 (`sudo 5dive
+cost`, 24h, quota over API-EQ — quota counts the cache read): **marketing 49.9x, main 43.7x**
+against **dev 33.8x, quinn 31.5x, ops 25.0x** on the fresh seats.
+
+The `mod` plugin can now compact the conversation **at a turn boundary**, so the next
+dispatched goal lands on a summary rather than the transcript. It is off on every seat and
+opted into per seat (`FIVEDIVE_MOD_BOUNDARY_COMPACT`), with the threshold and the continuity
+pin as knobs; a malformed knob turns the feature **off** rather than back to a default.
+
+Continuity is the failure mode, so it is structural and not a prompt: the plugin hooks
+`session.compact` and appends back, verbatim and by the engine's own message handle, any
+message the pin matched that the compaction dropped — an unanswered human gate, a standing
+directive, an open row's branch. It is the only hook in the plugin that returns anything but
+the chain's own value, and it can only ADD.
+
+Two things the live lab run changed: the trigger is `turn.complete`, not `session.measure`
+(which was observed firing BEFORE `turn.complete` on 2.1.278, where the call rejects), and
+`$.session.compact` needs a mounted session — a `claude -p` run refuses it, and the refusal
+is a counted line rather than a crash.
+
+The compaction runs on a promise chain of its **own**, not the telemetry writer's. A
+compaction is a ~50s model call; queued on the writer's chain it delayed no turn but it
+delayed every sink write behind it, including the next `turn.start` — and that sink is
+what the heartbeat, the pacing floor and the pending-restart sweep read idle/busy from, so
+a compacting seat would have read as a silent one for ~50s.
+### Deprecated — `browser@5dive-plugins` is frozen; the plugin ships from 5dive-ai/5dive-browser (DIVE-4691), browser 1.9.1
+
+The browser plugin now has its own repository, **[5dive-ai/5dive-browser](https://github.com/5dive-ai/5dive-browser)**,
+and that is the only place it is fixed from now on. The copy in this registry is frozen at the
+1.9.0 code and **still resolves** — `plugin add browser@5dive-plugins` and
+`plugin upgrade browser@5dive-plugins` keep working on every box, because a plugin cache is not
+enumerable across customer boxes and there is no moment at which it is safe to assume nobody names
+this entry. Nothing is removed here: not the tree, not the tests, not the parity step. Removing it
+is a later change, after the notice has been on the registry for a release cycle.
+
+**Migrating is safe as of this release, and it was not before.** 5dive-ai/5dive-browser was cut at
+1.8.0 and this registry copy kept receiving merges, so for a day the repository the notice points at
+was a strict SUBSET of the copy it deprecates and the move would have been a downgrade. That is
+closed: DIVE-4719 ported the per-box brokered login (DIVE-1033, DIVE-4662, DIVE-4664) into the new
+repository, whose `bin/browser` is now byte-identical to this one at the same version, **1.9.1**. The
+two copies carry the same code; the only difference is that the new one is still maintained.
+
+Migrate in two commands, in this order:
+
+```text
+sudo 5dive plugin remove browser@5dive-plugins
+sudo 5dive plugin add 5dive-ai/5dive-browser
+```
+
+The remove comes first because the CLI refuses two plugins claiming the same `browser` verb, so
+adding before removing fails rather than replacing. The profile store is a directory on the box, not
+part of the plugin, and so is each seat's `.adapters/`, so both survive the remove and the add.
+
+This release is the notice itself — `--help` and `status` now say where the plugin lives, on stderr
+only, never on the verbs whose stdout a caller parses.
+
+### Added — the mod's above-prompt seat panel (DIVE-4694), mod 0.5.0
+
+A seat could not see its own row. lodar reads seats through tmux panes and `5dive watch`; the
+seat's own screen said nothing about which row it held, whether a gate was open on it, how much of
+its budget the row had burned, or whether its delivery was sitting with a grader.
+
+The `mod` plugin now draws one line directly above the prompt:
+
+```
+5dive dev · DIVE-4694 · in_progress · gate none · grader temp · burn 15.1M/150.0M* · Function-hook mod: above-prompt…
+```
+
+It costs the model nothing. A `ui.render` tree is drawn by the terminal and is never part of the
+prompt, so none of it reaches the context window.
+
+**Absent is never zero.** A row with no attributed usage window draws `—`, not `0` — `0/150.0M`
+reads as "this row is free". A figure the DIVE-4430 dispatch cross-check could not tie to the row
+draws `~… unverified` rather than as the row's own, because that is exactly the distinction
+DIVE-3343 removed an enforcement for. The burn figure is read from the heartbeat's published
+snapshot, so the panel shows the number the park will act on rather than a second one derived
+differently.
+
+**A gate that is over reads `none`.** `task show --json` carries a `gate` field, and it is the
+board's VERBOSE HEADER — `ANSWERED approve (lead:ops, 2026-09-20 19:17:24)` on a row whose gate is
+closed, `PENDING — awaiting a HUMAN (approval, tier 1, asked …) — the ask is in the 'human gate:'
+block below` while one is open. The panel reads only `routed_reviewer` off that payload, to upgrade
+`agent:approval` to `ops:approval`, and composes the cell itself. Found by the first live capture
+on a real seat, not by the unit suite: the header pasted into the cell drew the whole answered-gate
+sentence across a 120-column band and pushed every other field off it.
+
+**It does not repeat the status line.** DIVE-4665 landed first and put effort, context fill,
+session cost and the account's 5h/7d percentages one row below. The panel carries only what belongs
+to the ROW. The account cell appears in two cases the status line cannot express: a window at or
+past 80%, and no reading at all — a blind meter renders as plain absence there, which is the same
+pixels as the field being off.
+
+**No timer.** `$.clock` is never touched. The band's own `isWorking` prop is true exactly while a
+turn runs, so its edges are the turn boundary, delivered by the surface. A refresh runs outside the
+draw, is never awaited by the hook that triggers it, and is rate-limited; steady state is one
+~0.6 s subprocess per turn boundary, off the critical path.
+
+Off by default, behind `FIVEDIVE_MOD_PANEL=1` in the seat's settings `env` — a separate flag from
+the telemetry half's, so "it is off" is never ambiguous about which half.
+
+### Added — `/task` and `/gate` as first-class commands, and what the swap actually saves (DIVE-4693), mod 0.2.0
+
+The `mod` plugin now registers two slash commands with `$.command.register` and serves them by
+dispatching to the `5dive` CLI in the harness process: `/task <verb> …` and `/gate <ident> …`. The
+CLI stays the single source of truth — no flag parsing, no defaults, no re-implemented guard, and
+no shell (`$.process.run` takes an argv, so nothing in an ask or a row body can be interpreted as
+one). Off unless the seat sets `FIVEDIVE_MOD_COMMANDS=1`, independently of the telemetry flag.
+
+The verb list is an allowlist and `task add` is **refused by name**: on this fleet the filing cap
+is a `PreToolUse` hook on the *Bash tool*, and a verb dispatched in-process never crosses it, so
+offering `add` here would be a way around a rail rather than a shortcut to it.
+
+**The row's question was whether this saves per-turn tokens, and the answer is a number with a
+caveat.** Measured 2026-09-20 on the `dev` seat, one Claude Code 2.1.278 session per arm, the
+engine's own `/context` figures read on the first completed turn through the new
+`FIVEDIVE_MOD_CONTEXT_AUDIT=1` instrument:
+
+| | skill listing | of which `5dive-cli` + `notify-user` | slash-command listing |
+| --- | --- | --- | --- |
+| commands **off** | 1988 tok / 24 skills | **132 tok** (60 + 72) | 971 tok / 24 commands |
+| commands **on** | 1988 tok / 24 skills | 132 tok | **971 tok / 24 commands** |
+
+Dropping the two skills would save **132 tokens per turn** (6.6% of the skill listing, 0.5% of a
+28k-token turn), and registering the two commands costs **nothing** — the listing is byte-identical
+across the arms.
+
+It costs nothing because the model never sees them. `totalCommands` is 24 in both arms, and a third
+arm asked a session with the commands registered to invoke `/task` or else answer `NOCMD`: it
+answered **NOCMD**. A `$.command.register` command is a surface for a *person at the composer*, not
+a capability the model can reach. So the second half of the row — dropping the two skill
+descriptions behind the flag — is **deliberately not shipped**: it would trade a model-facing
+capability for 132 tokens a turn. Detail and the raw sink lines are on DIVE-4693.
+
+### Added — a site login is per BOX and brokered: seats use the box's login (DIVE-4664), browser 1.9.0
+
+Measured on one box 2026-09-20: the profile store held **fifteen seats and fourteen empty
+stores**. Every agent seat was logged out of every site a human had connected through the
+dashboard, so each seat that needed a site was another human login — and with one shared site
+across ~18 seats, up to eighteen Chromes at ~300–500 MB each, which makes RAM (not the work) the
+thing that bounds how many seats can hold a live session.
+
+The store does **not** move and does **not** open up. Group-reading a profile directory is handing
+out the credential — anything that can read it can replay the session — so the store stays 0700 to
+the shelld seat where every existing login already lives, and there is no migration. What moves is
+the session daemon's unix socket: out of the 0700 directory and into a rendezvous
+(`/var/lib/5dive/browser-sessions/<seat>/`, `0750` to the box's agent group) where other seats can
+**connect to it**. They never open the profile; they ask the process that already holds it. Still
+never a TCP port — a loopback debug port is reachable by every seat on the box and CDP is full
+control of the browser holding the session.
+
+`status`, `tree`, `run`, `shot` and `read` all work from a brokered seat, with no second login.
+`shot` and `read` needed a **render op** the DIVE-4621 daemon did not have: the PNG and the DOM come
+back over the socket as bytes from ONE page instant, never as a path for the daemon to write — a
+request carrying `--out=` would be the owning seat writing a caller-chosen path, which is the test
+rig DIVE-4662 built and explicitly did not ship.
+
+Resolution is **own store first, then the box store**, so a seat that made its own private login for
+a site keeps using it; per-seat survives as the opt-in it always was, with no per-site policy table.
+Attribution comes from `SO_PEERCRED` on the connection, so the lease and every audit row carry
+`holder=claude on_behalf_of=<the calling seat>` — the kernel's answer, with nowhere for a request to
+sign somebody else's name. Where the caller cannot be named, the rendezvous socket is not opened at
+all and the session stays one-seat: losing the broker is a lost convenience, an unattributable
+caller driving a live login is not.
+
+Two refusals that used to be one silence: a site the box has no login for still says "no profile —
+log in", while a site it HAS a login for with nothing serving it names the owning seat and the
+command to start it. Sandboxed seats are outside all of this by construction — `agent create` keeps
+them out of the shared group on purpose, and that is their isolation working.
+
+Also fixed while here: `_seat` now resolves from the **effective uid** rather than `SUDO_USER`, so
+`sudo -u <seat> 5dive browser …` acts as `<seat>` instead of looking for the CALLER's store while
+running as somebody else. The per-site memory claim ships with its rig,
+`tests/browser_box_login_bench.sh`, which prints the per-site available-RAM delta and the chrome
+process count before and after N brokered seats act on the same site.
+
+### Added — `mod`: the seat's own turn boundaries and usage meter (DIVE-4692), mod 0.1.0
+
+5dive asks two questions about a seat from the outside. Is it mid-turn? The heartbeat's
+reclaim and the self-update's pending-restart sweep answer it from `claude agents --json`
+polling, byte-stable pane samples, a composer glyph and whether the seat holds a claimed
+row. What does its usage meter read? The pacing floor holds rows on an account that has
+no reading at all. Both are inferences over a surface that was never built to answer
+them, and when they are wrong a seat gets restarted mid-turn and the turn is lost.
+
+Claude Code 2.1.x loads a plugin's `hooks/register.ts` inside the harness process, where
+both questions are already answered. `mod` registers six events and writes a line per
+event to a per-seat JSONL sink: `session.start`, `turn.start`, `turn.complete`,
+`command.run`, `tool.call`, `session.end`. `turn.start`/`turn.complete` are the pair that
+carries the load — a seat is busy between them, whatever its pane looks like — and every
+line but `tool.call` carries `$.session.usage()`: the context fill, the session cost, and
+the account's five-hour and seven-day windows with their reset times.
+
+Nothing reads these lines yet, on purpose. This ships the producer and the measurement;
+whether the heartbeat and the pacing floor gain a second source is what the comparison
+against today's pane-and-board readings decides.
+
+The contract is in `docs/mod-telemetry-contract.md` and is deliberately not a Claude Code
+contract: `harness` and `producer` are fields, a codex or grok seat could drop files of the
+same shape into the same directory, and a consumer that finds no file must fall back to
+what it does today rather than read absence as idleness. The same rule runs through the
+schema — a reading the producer does not have is ABSENT, never zero, because a consumer
+that cannot tell "no reading" from "0% used" has the blind-meter bug back.
+
+Two gates, both off by default: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in the seat's env
+(without it Claude Code loads no installed plugin's hooks module at all), and
+`FIVEDIVE_MOD_TELEMETRY=1` in the seat's settings. The plugin is observe-only — every hook
+awaits `next(e)` first and returns what the chain resolved to, and CI asserts that against
+the source, because this runs inside every turn on every seat that enables it.
+
+Early access, verified against Claude Code 2.1.278. `plugin.json` has no field for pinning
+a version range, so the pin is in the data: every line names the build it came from. A
+release that drops a call the mod makes is caught twice — the engine's own static scan
+refuses the module at load, and every `$` call is inside a try/catch so nothing reaches the
+chain. Either way the seat runs exactly as it did before.
+
+Every one of those catches EMITS, which is the other half of fail-open and the half a
+try/catch never evidences on its own: an observe-only producer that swallows a failure is
+indistinguishable from one that is switched off. A failed sink write names the path and the
+error and latches the session off; a failed usage reading says so once and the turn
+boundaries keep recording (absent is the contract's answer for a reading nobody has, never
+zero). The sink defaults to the seat's own `~/.5dive/mod-telemetry`, a directory it owns:
+`/var/lib/5dive` is `drwxr-s--- root:claude` and no seat can create a subdirectory there,
+so a shared sink is opt-in and needs root to create it group-writable first.
+
 ### Added — one snapshot per decision: `browser snapshot` (DIVE-4653), browser 1.8.0
 
 Before an agent acts on a page it reads the same three things: what it can click

@@ -54,6 +54,36 @@ PROG="5dive browser"
 STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
 PROFILE_ROOT="${FIVEDIVE_BROWSER_PROFILE_ROOT:-$STATE_DIR/browser-profiles}"
 SETUP_CMD="sudo 5dive browser setup"
+
+# ---------------------------------------------------------- the BOX store (DIVE-4664)
+#
+# A SITE LOGIN IS PER BOX, NOT PER SEAT, AND IT IS BROKERED. Decided on DIVE-4662
+# (community/wiki/a-site-login-is-per-box-and-brokered-not-per-seat-and-not-a-shared-directory.md)
+# after the measurement that forced it: on exact-swallow the store held 15 seats
+# and 14 of them were EMPTY, so every agent seat was logged out of every site a
+# human had connected, and each one that needed the site was another human login.
+#
+# WHAT IS *NOT* CHANGING, and this is the whole reason the decision is cheap:
+# the store does not move. Its owner is still the shelld seat, where every
+# existing login already lives, still 0700, still one seat's directory. No
+# migration, no shared directory, and in particular NOT a group-readable profile
+# — anything that can READ a profile directory can replay the session, so a
+# second seat gaining read is the credential, not a permission tweak.
+#
+# WHAT IS CHANGING: the daemon's socket moves OUT of the 0700 directory into a
+# rendezvous the box's agent seats can reach, and a seat that has no login of its
+# own for a site acts THROUGH that socket. It never opens the profile. The owner
+# stays the only uid that can read the credential; everyone else gets a
+# conversation with the process that already holds it.
+# A SIBLING OF THE STORE, NOT A PATH OF ITS OWN. The two trees are one
+# deployment: a box that relocates its profiles (a test rig, a second store on
+# another disk) and keeps its rendezvous in /var/lib would broker for profiles
+# that are not there. Deriving it from $PROFILE_ROOT makes them move together
+# and leaves the default byte-identical to $STATE_DIR/browser-sessions.
+SESSION_ROOT="${FIVEDIVE_BROWSER_SESSION_ROOT:-${PROFILE_ROOT%/*}/browser-sessions}"
+# The seat that owns the box's logins. It is the shelld seat: the one the
+# dashboard's Connect-site tile already authenticates through.
+BOX_SEAT="${FIVEDIVE_BROWSER_BOX_SEAT:-claude}"
 # WHERE AN ADAPTER LIVES, and why it is not one directory (DIVE-4524).
 #
 # It used to be exactly one: the `adapters/` folder inside the plugin package.
@@ -85,9 +115,55 @@ E_USAGE=64; E_UNAVAILABLE=69; E_PERM=77; E_COLD=75
 
 die() { printf '%s: %s\n' "$PROG" "$2" >&2; exit "$1"; }
 
-# The calling seat. SUDO_USER first: under `sudo 5dive browser setup` the profile
-# must belong to the human/seat that asked, never to root.
-_seat() { echo "${SUDO_USER:-${USER:-$(id -un)}}"; }
+# THE CALLING SEAT, AND IT IS THE EFFECTIVE UID (DIVE-4664 scope (e)).
+#
+# This was `${SUDO_USER:-${USER:-$(id -un)}}` — SUDO_USER unconditionally first —
+# and that is wrong for exactly one shape, which is the shape a broker makes
+# common: `sudo -u <seat> 5dive browser …`. There euid IS <seat> and SUDO_USER is
+# the CALLER, so the old form answered with the caller and then went looking for
+# the caller's profile store while running as somebody else. It is what forced a
+# `SUDO_USER=` spoof into DIVE-4662's hand test, and a rig whose seat is an
+# environment variable is a rig that can be pointed at any store on the box.
+#
+# euid is the uid the kernel will actually check every open against, so it is the
+# only answer `_audit` can agree with. The ONE case where euid is not the seat is
+# root: `sudo 5dive browser setup` runs as root precisely to chown the store to
+# somebody else, and there SUDO_USER names who that is. (Every other verb never
+# reaches here as root — the DIVE-4348 block at the foot of this file re-executes
+# as the seat first.)
+#
+# FIVEDIVE_BROWSER_SEAT overrides WHICH STORE this process looks in, and nothing
+# else. It cannot widen anything and that is worth stating rather than trusting:
+# every directory is still opened by this uid, and `_audit` refuses any store
+# this uid does not own — so naming a seat you are not gets you exit 77, not
+# that seat's session. The only shape it can reach is the brokered one (a seat
+# with NO store of its own), which is access a member of the rendezvous group
+# already has. It exists because that shape cannot be exercised in-process any
+# other way, and a rig that switches uid only exists as root.
+# ATTRIBUTION NEVER READS IT: `on_behalf_of` is SO_PEERCRED, read by the daemon
+# from the connection, which this variable cannot reach. That separation is what
+# makes it safe, and it is the difference from DIVE-4662's `SUDO_USER=` rig —
+# that one chose who you ACTED AS while holding somebody else's privilege.
+_seat() {
+  if [[ -n "${FIVEDIVE_BROWSER_SEAT:-}" ]]; then
+    printf '%s\n' "$FIVEDIVE_BROWSER_SEAT"
+  elif [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
+    printf '%s\n' "$SUDO_USER"
+  else
+    id -un
+  fi
+}
+
+# DEPRECATED IN THIS REGISTRY (DIVE-4691). browser ships from its own repository
+# now — 5dive-ai/5dive-browser — and this copy is frozen: it still resolves and
+# still installs, because boxes provisioned before the move name it today, but no
+# fix lands here again. The notice goes to STDERR and only on the two verbs a
+# person reads, `--help` and `status`. Never on `tree`, `read`, `snapshot`, `run`,
+# `shot`, `capture` or `ls`: their output is parsed, and a line of prose in a
+# caller's stdout is a bug, not a courtesy.
+_deprecated() {
+  printf '%s: browser@5dive-plugins is deprecated; it ships from 5dive-ai/5dive-browser now — see CHANGES.md\n' "$PROG" >&2
+}
 
 usage() {
   cat <<'USAGE'
@@ -184,7 +260,102 @@ USAGE
 # seat can read. That is not a theoretical squat; it is the whole credential.
 # So creation is a root act, once, and every later run AUDITS instead of trusting.
 _seat_dir() { echo "$PROFILE_ROOT/$(_seat)"; }
-_site_dir() { echo "$(_seat_dir)/$1"; }
+# THE PROFILE PATH FOR *THIS* SEAT. A write always lands here: `auth` makes a
+# login for whoever ran it, never for the box. Reads go through _site_dir.
+_own_site_dir() { echo "$PROFILE_ROOT/$(_seat)/$1"; }
+
+# ---------------------------------------------------------- the rendezvous
+#
+# $SESSION_ROOT (root, 0711) / <owner-seat> (owner, 0710 root-set group) holds
+# two public things about a 0700 store and nothing else:
+#
+#   <site>.sock     the session daemon's socket. 0770, group = the agent group,
+#                   so any seat on this box can CONNECT and no uid outside it
+#                   can even traverse the directory to find it. Never a TCP
+#                   port: a loopback debug port is reachable by every seat AND
+#                   by anything else on the box, and CDP is full control of a
+#                   browser holding a human's session
+#                   (community/wiki/a-loopback-debug-port-makes-a-0700-profile-decorative.md).
+#   <site>.offered  a 0640 marker saying "the owner has a login for this site".
+#                   It exists because a brokered seat CANNOT stat inside the
+#                   0700 store, so without it "the box has no login for x" and
+#                   "the box has a login nobody is serving" are the same silence
+#                   — and those need opposite messages (scope (b)).
+#
+# 0710 is traverse-but-not-list, the same trade $PROFILE_ROOT makes one level
+# up: a seat reaches a socket it can name and cannot enumerate what else is
+# being served on this box.
+_rv_dir()   { echo "$SESSION_ROOT/$1"; }
+_rv_sock()  { echo "$SESSION_ROOT/$1/$2.sock"; }
+_rv_offer() { echo "$SESSION_ROOT/$1/$2.offered"; }
+
+# Publish the one public fact. Best-effort on purpose: a box whose rendezvous
+# root was never created (an older install that has not re-run setup) must keep
+# working exactly as it did, just without brokering.
+_rv_offer_write() {  # _rv_offer_write <seat> <site>
+  local d; d="$(_rv_dir "$1")"
+  [[ -d "$d" && -w "$d" ]] || return 0
+  ( umask 037; printf 'site=%s\nowner=%s\n' "$2" "$1" > "$(_rv_offer "$1" "$2")" ) 2>/dev/null || true
+}
+
+# CAN THIS BOX NAME THE CALLER? The rendezvous socket is reachable by every agent
+# seat, so "who is asking" stops being answerable from the file mode and has to
+# come from the kernel (SO_PEERCRED). Where it cannot be read, the broker is not
+# opened at all and `serve` keeps the old in-profile socket: one seat, as before.
+# That is the fail-closed direction — an unattributable caller driving a live
+# logged-in session is the thing this check exists to prevent, and losing the
+# broker only loses a convenience.
+_peercred_ok() {
+  [[ -z "${FIVEDIVE_BROWSER_NO_BROKER:-}" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c 'import socket; socket.SO_PEERCRED' >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------- resolution order
+#
+# OWN STORE FIRST, THEN THE BOX STORE (scope (b)). A seat that made its own
+# private login for a site keeps using it — per-seat survives as the opt-in it
+# always was, with no new surface and no per-site policy table until a customer
+# asks for one. Only when the seat has nothing of its own does it reach for the
+# box login, and then it acts through the broker and never opens the directory.
+#
+# These two globals are the answer's second half and every caller reads them:
+# _SITE_BROKERED says the directory below is NOT ours to open, and _SITE_OWNER
+# names whose it is.
+_SITE_BROKERED=0
+_SITE_OWNER=""
+_SITE_DIR=""
+_resolve_site() {  # _resolve_site <site> -> the dir; sets _SITE_DIR/_SITE_BROKERED/_SITE_OWNER
+  local site="$1" me; me="$(_seat)"
+  _SITE_OWNER="$me"; _SITE_BROKERED=0; _SITE_DIR="$PROFILE_ROOT/$me/$site"
+  if [[ ! -d "$_SITE_DIR" && "$me" != "$BOX_SEAT" && -f "$(_rv_offer "$BOX_SEAT" "$site")" ]]; then
+    _SITE_OWNER="$BOX_SEAT"; _SITE_BROKERED=1; _SITE_DIR="$PROFILE_ROOT/$BOX_SEAT/$site"
+  fi
+  printf '%s\n' "$_SITE_DIR"
+}
+_site_dir() { _resolve_site "$1"; }
+
+# THE ONE WAY AN ACTING VERB OPENS A SITE, and it exists because the globals
+# above cannot survive a `$( … )`: every caller used to write
+# `dir="$(_site_dir "$site")"`, and a resolution that also has to say WHOSE
+# directory it is cannot be delivered down a pipe. Callers read $_SITE_DIR.
+_open_site() {  # _open_site <site> [--no-broker <verb> <why> | --may-create]
+  local site="$1" mode="${2:-}" verb="${3:-}" why="${4:-}"
+  _require_store "$site"
+  _resolve_site "$site" >/dev/null
+  if (( _SITE_BROKERED )); then
+    [[ "$mode" != --no-broker ]] || die "$E_PERM" "$site is the box's login, owned by the '$_SITE_OWNER' seat, and $why Run it as the owner:  sudo -u $_SITE_OWNER 5dive browser $verb $site"
+    _broker_ready "$site" "$_SITE_DIR"
+  else
+    # --may-create is `serve`'s and `auth`'s: they are the two verbs allowed to
+    # be the FIRST thing that touches a site, so "there is no directory yet" is
+    # their normal case and not a refusal. Everything else is acting on a login
+    # that must already exist.
+    [[ "$mode" == --may-create || -d "$_SITE_DIR" ]] \
+      || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
+    [[ -d "$_SITE_DIR" ]] && _audit "$_SITE_DIR" 700
+  fi
+}
 
 # The search path, most-local first. Printed one per line so every caller reads
 # the SAME order and there is one place it can drift.
@@ -226,9 +397,51 @@ _audit() {
   return 0
 }
 
-_require_store() {
+_require_store() {  # _require_store [<site>]
   [[ -d "$PROFILE_ROOT" ]] || die "$E_UNAVAILABLE" "no profile store at $PROFILE_ROOT. 5dive does not create it behind your back: $SETUP_CMD"
+  # RESOLVE FIRST WHEN A SITE IS NAMED (DIVE-4664). A brokered seat is not
+  # required to own a store at all — it owns no profile, which is the entire
+  # point — so auditing its (absent) directory before finding out where the
+  # session actually lives would refuse the normal case.
+  if [[ -n "${1:-}" ]]; then
+    _resolve_site "$1" >/dev/null
+    (( _SITE_BROKERED )) && return 0
+  fi
+  if [[ ! -d "$(_seat_dir)" && -d "$(_rv_dir "$BOX_SEAT")" ]]; then
+    # No store of its own and a rendezvous on the box: a seat that only ever
+    # uses the box's logins. `ls` and `status` still have something to say.
+    return 0
+  fi
   _audit "$(_seat_dir)" 700 || die "$E_UNAVAILABLE" "no profile directory for seat '$(_seat)' at $(_seat_dir). Create it once: $SETUP_CMD"
+}
+
+# ---------------------------------------------------------- the broker rail
+#
+# THE ONE REFUSAL A BROKERED CALLER CAN GET, AND IT NAMES THE REASON (scope (b)).
+# Without this the seat falls through to "no profile for <site>" — which is a lie
+# in the most expensive direction: the box HAS the login, and the message sends
+# somebody to do a second human login that was never needed. The two conditions
+# need opposite words and the marker file is what tells them apart.
+_broker_ready() {  # _broker_ready <site> <profile-dir>
+  (( _SITE_BROKERED )) || return 0
+  _daemon_live "$2" && return 0
+  die "$E_UNAVAILABLE" "$1 is logged in on this box under the '$_SITE_OWNER' seat, but nothing is serving that session right now — and '$(_seat)' cannot open the profile directly: it is mode 0700 to $_SITE_OWNER, which is what stops any seat here from replaying somebody else's login. A brokered seat acts THROUGH the running browser or not at all.
+Start one on the owning seat:  sudo -u $_SITE_OWNER 5dive browser serve $1
+If that starts but says 'no warm session', this box has no playwright-core, so there is no daemon to broker through and only $_SITE_OWNER can use the profile:  npm install --prefix $(cd "$_SELF_DIR/.." && pwd)"
+}
+
+# Every request the broker serves leaves a row naming WHO ASKED, not only who
+# owns the profile. The owner is `claude` on every brokered row by construction,
+# so a log that recorded only the holder would record nothing at all.
+_audit_row() {  # _audit_row <profile-dir> <event> <detail>
+  local d="${1:?}" ev="$2" detail="$3"
+  [[ -d "$d" && -w "$d" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  ( umask 077
+    jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg e "$ev" --arg h "$(_seat)" \
+       --arg o "${FIVEDIVE_BROWSER_ON_BEHALF_OF:-$(_seat)}" --arg x "$detail" \
+       '{ts:$ts, event:$e, holder:$h, on_behalf_of:$o, detail:$x}' >> "$d/.5dive-audit.jsonl"
+  ) 2>/dev/null || true
 }
 
 _ensure_profile_dir() {
@@ -299,9 +512,55 @@ cmd_setup() {
   mkdir -p "$PROFILE_ROOT/$seat"
   chown "$seat" "$PROFILE_ROOT/$seat"
   chmod 00700 "$PROFILE_ROOT/$seat"  # one seat, and nobody else, reads its sessions (5-digit, see above)
+
+  # THE RENDEZVOUS (DIVE-4664). A second tree, next to the store and not inside
+  # it, because the store's whole claim is "one uid can open this" and the
+  # broker's is "every agent seat can reach a conversation with the process that
+  # already has". Those are different claims and they get different directories.
+  #
+  # THE GROUP IS THE SEAT'S OWN PRIMARY GROUP, and on a 5dive box that is
+  # `claude` — verified in the installer rather than assumed from this host:
+  # 5dive-cli/src/cmd_agent_create.sh:12-14 puts admin and standard seats in
+  # `claude` at create time, and deliberately does NOT put SANDBOXED seats there
+  # (DIVE-1033 keeps them out of the shared workspace on purpose). So a
+  # sandboxed agent cannot reach the box login, which is the correct answer and
+  # not a gap: its isolation is the feature it was created for. The override
+  # exists for a box whose seats were grouped some other way; it is printed, so
+  # nobody has to read this file to find out which group is load-bearing.
+  #
+  # BEST-EFFORT, AND THAT IS THE RIGHT DIRECTION. The profile store is the
+  # product; the rendezvous is the convenience on top of it. A box that cannot
+  # make this directory (no such group, a read-only path, a store relocated
+  # somewhere root does not own) must still end up with a working store and a
+  # sentence saying what it did not get — not a refusal that leaves the customer
+  # unable to log into anything.
+  local agroup rv_ok=1
+  agroup="${FIVEDIVE_BROWSER_AGENT_GROUP:-$(id -gn "$seat" 2>/dev/null)}"
+  if [[ -z "$agroup" ]] || ! mkdir -p "$SESSION_ROOT/$seat" 2>/dev/null; then
+    rv_ok=0
+  else
+    chown root:root "$SESSION_ROOT" 2>/dev/null || true
+    chmod 00711 "$SESSION_ROOT" 2>/dev/null || true   # traverse, do not list — same trade as the store
+    chown "$seat:$agroup" "$SESSION_ROOT/$seat" 2>/dev/null || rv_ok=0
+  # 0750, NOT 0710. Group-READ looks like a leak and is not one: a seat in this
+  # group can already CONNECT to every socket in here and drive the session
+  # behind it, so withholding the NAMES buys nothing and costs `ls` and `status`
+  # the ability to say what this box is logged into. $SESSION_ROOT above stays
+  # 0711, so a uid outside the group cannot traverse to this directory at all.
+    chmod 00750 "$SESSION_ROOT/$seat" 2>/dev/null || rv_ok=0
+  fi
+
   _install_probe_timer "$seat"
-  printf 'profile store ready\n  %s  (root, 0711 — traverse, not list)\n  %s  (%s, 0700)\n  liveness probe: every ~6h (served profiles are skipped)\n\nNow, as %s:  5dive browser auth <site>\n' \
-    "$PROFILE_ROOT" "$PROFILE_ROOT/$seat" "$seat" "$seat"
+  printf 'profile store ready\n  %s  (root, 0711 — traverse, not list)\n  %s  (%s, 0700)\n  liveness probe: every ~6h (served profiles are skipped)\n' \
+    "$PROFILE_ROOT" "$PROFILE_ROOT/$seat" "$seat"
+  if (( rv_ok )); then
+    printf '  %s  (%s:%s, 0750 — the broker rendezvous; every agent seat in group %s uses THIS box login, with no second login of its own)\n' \
+      "$SESSION_ROOT/$seat" "$seat" "$agroup" "$agroup"
+  else
+    printf '  no broker rendezvous at %s — other seats on this box cannot use %s'"'"'s logins and each one would need a login of its own. Nothing else is affected.\n' \
+      "$SESSION_ROOT/$seat" "$seat" >&2
+  fi
+  printf '\nNow, as %s:  5dive browser auth <site>\n' "$seat"
 }
 
 # ------------------------------------------------------------------------ auth
@@ -328,8 +587,14 @@ cmd_auth() {
   [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser auth linkedin.com"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name (lowercase letters, digits, . _ -)"
   _require_store
-  local dir; dir="$(_site_dir "$site")"
+  # A LOGIN IS ALWAYS THE CALLER'S OWN. `auth` is the one verb that creates a
+  # credential, and resolution's "fall back to the box" answer would make it
+  # write into somebody else's directory. A seat that runs this deliberately is
+  # taking the private per-seat opt-in, which resolution then prefers over the
+  # box login for that site (scope (b), acceptance 5).
+  local dir; dir="$(_own_site_dir "$site")"
   _ensure_profile_dir "$dir"
+  _rv_offer_write "$(_seat)" "$site"
 
   local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no Chrome or Chromium on this box — auth hands a real browser to a human and there is nothing to hand over."
 
@@ -393,6 +658,20 @@ _site_challenge_marker() {
 # more than any adapter, because the alternative is finding out MID-PUBLISH.
 _auth_status() {
   local only="${1:-}"
+  # A NAMED SITE RESOLVES BEFORE THE ENUMERATION (DIVE-4664). The loop below
+  # walks THIS seat's directories, and a brokered site is by definition not one
+  # of them — so without this branch `status github.com` on a seat that uses the
+  # box login answers "no profiles yet", which is the exact wrong sentence.
+  if [[ -n "$only" ]]; then
+    _valid_site "$only" || die "$E_USAGE" "'$only' is not a usable profile name"
+    _require_store "$only"
+    if (( _SITE_BROKERED )); then
+      _broker_ready "$only" "$_SITE_DIR"
+      local bstate; bstate=$(_probe "$only" "$_SITE_DIR"); local bprc=$?
+      printf '  %-20s %s\n' "$only" "$bstate  (the box login, held by $_SITE_OWNER)"
+      case "$bprc" in 0) return 0 ;; 2) return 2 ;; *) return "$E_COLD" ;; esac
+    fi
+  fi
   _require_store
   local seat_dir; seat_dir="$(_seat_dir)"
   local rc=0 found=0 broken=0 d site
@@ -410,7 +689,11 @@ _auth_status() {
       *) rc=$E_COLD ;;
     esac
   done
-  (( found )) || { printf 'no profiles yet — 5dive browser auth <site>\n'; return 0; }
+  if (( ! found )); then
+    _ls_box_offers
+    printf 'no profiles of your own yet — 5dive browser auth <site>\n'
+    return 0
+  fi
   # A BROKEN BROWSER IS LOUD AND OUTRANKS A COLD PROFILE (DIVE-4587). It is not a
   # liveness verdict at all — nothing was read — so it must not exit through the
   # "go and log in again" advice, which sends a person to fix a session that was
@@ -493,13 +776,21 @@ _probe() {
   # so nobody at the viewer is navigated away. Where there is no daemon, the
   # refusal below is unchanged.
   local sdisp warm=0
-  if sdisp=$(_serve_running "$dir"); then
+  if (( _SITE_BROKERED )); then
+    # _broker_ready has already proved the daemon answers, and the pidfile that
+    # would say "served" lives in a directory this seat cannot read. The socket
+    # IS the liveness claim here.
+    warm=1
+  elif sdisp=$(_serve_running "$dir"); then
     if _daemon_live "$dir"; then
       warm=1
     else
       echo "UNKNOWN (served on :$sdisp — the probe cannot open a profile the served browser holds; ask that browser, or stop it: 5dive browser serve $site --stop)"
       return 0
     fi
+  fi
+  if (( _SITE_BROKERED )) && ! command -v jq >/dev/null 2>&1; then
+    echo "UNKNOWN (jq is needed to talk to the box session and is not installed for this seat)"; return 0
   fi
   local chrome=""
   if (( ! warm )); then
@@ -580,7 +871,13 @@ _probe() {
   fi
   _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
 }
-_stamp() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$1/.5dive-liveness" 2>/dev/null || true; }
+# The liveness file is the TILE'S memory and it lives in the owner's 0700
+# directory. A brokered caller has nothing to write it with and must not pretend
+# otherwise — the owner's own scheduled probe keeps it current.
+_stamp() {
+  (( _SITE_BROKERED )) && return 0
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$1/.5dive-liveness" 2>/dev/null || true
+}
 
 cmd_probe_all() {
   _require_store
@@ -634,6 +931,35 @@ cmd_ls() {
     site=$(basename "$d")
     printf '  %-20s %s\n' "$site" "$(cat "$d/.5dive-liveness" 2>/dev/null || echo 'never probed')"
   done
+  _ls_box_offers
+}
+
+# WHAT THIS BOX IS LOGGED INTO THAT THIS SEAT DOES NOT OWN (DIVE-4664). Without
+# it a seat with an empty store prints nothing at all and reads as "log in
+# again" — which is the fourteen-empty-stores outcome the decision was made to
+# end. A site the seat DOES own is skipped, because its own login wins.
+_ls_box_offers() {
+  local me; me="$(_seat)"
+  [[ "$me" != "$BOX_SEAT" ]] || return 0
+  local f site shown=0
+  for f in "$(_rv_dir "$BOX_SEAT")"/*.offered; do
+    [[ -f "$f" ]] || continue
+    site="$(basename "$f" .offered)"
+    [[ -d "$PROFILE_ROOT/$me/$site" ]] && continue
+    (( shown )) || printf '\n  the box login (owned by %s — you use it, you do not log in again):\n' "$BOX_SEAT"
+    shown=1
+    _resolve_site "$site" >/dev/null
+    if _daemon_live "$_SITE_DIR"; then
+      printf '  %-20s %s\n' "$site" "served — ready to use"
+    else
+      printf '  %-20s %s\n' "$site" "not being served (sudo -u $BOX_SEAT 5dive browser serve $site)"
+    fi
+  done
+  # PUT THE RESOLUTION GLOBALS BACK. This is an ENUMERATION and it resolved other
+  # people's sites to do it; leaving _SITE_BROKERED set would make whatever runs
+  # next in this process believe it is acting on the box's login.
+  _SITE_BROKERED=0; _SITE_OWNER="$me"; _SITE_DIR=""
+  return 0
 }
 
 # -------------------------------------------------------------------- adapters
@@ -754,8 +1080,12 @@ _lease_describe() {  # _lease_describe <profile-dir> -> the line a refused calle
   local m; m="$(_lease_meta "${1:?}")"
   local who purpose exp kind until
   who=$(_kv "$m" holder); purpose=$(_kv "$m" purpose); exp=$(_kv "$m" expires_at); kind=$(_kv "$m" kind)
+  local behalf; behalf=$(_kv "$m" on_behalf_of)
   until="unknown"
   [[ -n "$exp" ]] && until=$(date -u -d "@$exp" +%H:%MZ 2>/dev/null || echo "$exp")
+  # Naming only the holder here is how "who has the browser?" became "claude"
+  # for every caller on the box. Say both, and only when they differ.
+  [[ -n "$behalf" && "$behalf" != "$who" ]] && who="$who on behalf of $behalf"
   printf 'busy: held by %s (%s) until %s' "${who:-someone}" "${purpose:-unstated}" "$until"
   [[ "$kind" == human ]] && printf ' — that is a PERSON in this browser, not an agent'
   printf '\n'
@@ -778,8 +1108,16 @@ _lease_describe() {  # _lease_describe <profile-dir> -> the line a refused calle
 _lease_write() {  # _lease_write <profile-dir> <token> <kind> <purpose> <ttl> [<holder-pid>]
   local d="${1:?}" token="$2" kind="$3" purpose="$4" ttl="$5" pid="${6:-$$}" now
   now=$(date -u +%s)
-  ( umask 077; printf 'token=%s\nholder=%s\nholder_pid=%s\nkind=%s\npurpose=%s\nacquired_at=%s\nexpires_at=%s\n' \
-      "$token" "$(_seat)" "$pid" "$kind" "$purpose" "$now" "$(( now + ttl ))" > "$(_lease_meta "$d")" )
+  # ON_BEHALF_OF IS THE WHOLE ATTRIBUTION FIX (DIVE-4664 scope (c)). Under a
+  # broker the holder is ALWAYS the owning seat — it is the only uid that can
+  # open the profile — so a lease that recorded only `holder` would answer "who
+  # is in this browser?" with `claude` for every seat on the box, every time.
+  # DIVE-4662's hand test read exactly that and it is why this field exists. The
+  # daemon sets it from SO_PEERCRED, so it is the kernel's answer and not the
+  # caller's claim about itself.
+  local behalf="${FIVEDIVE_BROWSER_ON_BEHALF_OF:-}"
+  ( umask 077; printf 'token=%s\nholder=%s\non_behalf_of=%s\nholder_pid=%s\nkind=%s\npurpose=%s\nacquired_at=%s\nexpires_at=%s\n' \
+      "$token" "$(_seat)" "${behalf:-$(_seat)}" "$pid" "$kind" "$purpose" "$now" "$(( now + ttl ))" > "$(_lease_meta "$d")" )
 }
 
 # Try ONCE. Echoes the token and returns 0, or returns 1 having printed nothing.
@@ -847,6 +1185,15 @@ _lease_release() {
   [[ -n "$_LEASE_TICKET" ]] && rm -f "${_LEASE_TICKET:?}"
   _LEASE_TICKET=""
   [[ -n "$_LEASE_DIR" && -n "$_LEASE_TOKEN" ]] || return 0
+  # BROKERED: the lease file is in a directory this seat cannot open, so the
+  # release is a request, not an unlink. The daemon applies the SAME
+  # "only if it is still ours" rule on the other side — it runs the same code.
+  if (( _SITE_BROKERED )); then
+    local bd="$_LEASE_DIR" btok="$_LEASE_TOKEN"
+    _LEASE_DIR=""; _LEASE_TOKEN=""
+    _daemon_call "$bd" "$(jq -nc --arg t "$btok" '{op:"lease", act:"release", token:$t}')" >/dev/null 2>&1 || true
+    return 0
+  fi
   local d="$_LEASE_DIR" tok="$_LEASE_TOKEN" ld
   _LEASE_DIR=""; _LEASE_TOKEN=""
   ld="$(_lease_dir "$d")"
@@ -859,12 +1206,41 @@ _lease_release() {
 }
 _lease_and_serve_release() { _lease_release; _shot_restore; }
 
+# BROKERED ACQUIRE (DIVE-4664). A seat that cannot create a file in the profile
+# directory cannot take the lease by making a directory in it, so it asks the
+# process that can. The queue-and-wait ladder is deliberately NOT rebuilt on this
+# side: the daemon serialises one request at a time anyway, and a fair queue
+# needs a ticket file in the same unreachable directory. A brokered caller that
+# loses the race retries on the same one-second cadence and says who has it.
+_lease_take_brokered() {  # <site> <dir> <purpose> <wait> <ttl>
+  local site="$1" d="$2" purpose="$3" wait="$4" ttl="$5" token="" waited=0 req
+  req=$(jq -nc --arg p "$purpose" --argjson t "$ttl" '{op:"lease", act:"acquire", purpose:$p, ttl:$t}')
+  while :; do
+    token=$(_daemon_call "$d" "$req" 2>/dev/null) || token=""
+    [[ -n "$token" ]] && break
+    [[ "$wait" == no ]] && break
+    (( waited >= wait )) && break
+    sleep 1; waited=$(( waited + 1 ))
+  done
+  if [[ -z "$token" ]]; then
+    local who; who=$(_daemon_call "$d" '{"op":"lease","act":"status"}' 2>/dev/null)
+    die "$E_UNAVAILABLE" "${who:-busy: somebody else holds it}
+Another caller holds the $site browser on this box. Refusing rather than joining them in it: two callers in
+one logged-in profile overwrite each other's drafts and read as site flakiness, not as a collision.
+Wait for it with --wait, or see who has it: 5dive browser lease $site --status"
+  fi
+  _LEASE_DIR="$d"; _LEASE_TOKEN="$token"
+  trap '_lease_release' EXIT
+  return 0
+}
+
 _lease_take() {  # _lease_take <site> <profile-dir> <purpose> [<wait-seconds>|no]
   local site="$1" d="${2:?}" purpose="$3" wait="${4:-no}" token
   local ttl="${FIVEDIVE_BROWSER_LEASE_TTL:-$LEASE_TTL_DEFAULT}"
   (( ttl > LEASE_TTL_MAX )) && ttl="$LEASE_TTL_MAX"
+  if (( _SITE_BROKERED )); then _lease_take_brokered "$site" "$d" "$purpose" "$wait" "$ttl"; return $?; fi
   if token=$(_lease_try "$d" agent "$purpose" "$ttl"); then
-    _LEASE_DIR="$d"; _LEASE_TOKEN="$token"; _serve_touch "$d"; return 0
+    _LEASE_DIR="$d"; _LEASE_TOKEN="$token"; _serve_touch "$d"; _audit_row "$d" lease-acquire "$purpose"; return 0
   fi
   if [[ "$wait" == no ]]; then
     die "$E_UNAVAILABLE" "$(_lease_describe "$d")
@@ -904,10 +1280,25 @@ cmd_lease() {
   done
   [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser lease linkedin.com --status"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
-  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
-  _audit "$dir" 700
+  _open_site "$site"
+  local dir="$_SITE_DIR"
+
+  # BROKERED: the lease file is in a directory this seat cannot open, so "who
+  # holds it" is a question for the process that can — and a hand RELEASE is not
+  # available at all. Reaping somebody else's stale lease on a browser several
+  # seats share is an owner's act, and the token that would authorise it belongs
+  # to the caller that took it.
+  if (( _SITE_BROKERED )); then
+    case "$action" in
+      status)
+        local bl; bl=$(_daemon_call "$dir" '{"op":"lease","act":"status"}' 2>/dev/null)
+        [[ -n "$bl" ]] && { printf '%s' "$bl"; return 0; }
+        printf 'free: nothing holds the %s browser (the box login, held by %s)\n' "$site" "$_SITE_OWNER"
+        return 0 ;;
+      release)
+        die "$E_PERM" "the $site browser is the box's login, owned by the '$_SITE_OWNER' seat. A hand release reaps a lease belonging to whoever took it, on a browser several seats share, so it is that seat's act:  sudo -u $_SITE_OWNER 5dive browser lease $site --release" ;;
+    esac
+  fi
 
   case "$action" in
     status)
@@ -942,10 +1333,8 @@ cmd_run() {
   local site="${1:-}" action="${2:-}"; shift 2 2>/dev/null || true
   [[ -n "$site" && -n "$action" ]] || die "$E_USAGE" "usage: 5dive browser run <site> <action> [--key=value ...]"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
-  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
-  _audit "$dir" 700
+  _open_site "$site"
+  local dir="$_SITE_DIR"
 
   local f; f=$(_adapter_path "$site")
   _adapter_validate "$f" "$action"
@@ -1185,9 +1574,8 @@ cmd_tree() {
   done
   [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser tree <site> <url> [--interactive] [--json]"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
-  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
+  _open_site "$site"
+  local dir="$_SITE_DIR"
 
   # THE LEASE IS TAKEN BEFORE THE PROLOGUE, not after. _page_open STOPS a running
   # serve to get the profile — so the window between "decide to act" and "hold
@@ -1411,7 +1799,33 @@ _serve_pidfile()  { echo "$1/.5dive-serve"; }
 # playwright next to the plugin; where it is absent `serve` falls back to
 # launching Chrome directly, exactly as before, and says so. A warm session is a
 # speed property, not a correctness one — losing it must not lose the browser.
-_daemon_sock()   { echo "$1/.5dive-session.sock"; }
+# WHERE THE SOCKET IS, FOR A CALLER (DIVE-4664). Three answers, in the order
+# that makes each caller read the truth rather than a convention:
+#   brokered  -> the owner's rendezvous, the only path this seat can reach;
+#   served    -> whatever the pidfile says, because `serve` decided it and a
+#                box mid-upgrade may still be serving on the old in-profile path;
+#   otherwise -> the in-profile path, which is what a box with no rendezvous has.
+_daemon_sock() {  # _daemon_sock <profile-dir>
+  if (( _SITE_BROKERED )); then
+    printf '%s\n' "$(_rv_sock "$_SITE_OWNER" "$(basename "$1")")"; return 0
+  fi
+  local s; s="$(_kv "$(_serve_pidfile "$1")" sock)"
+  [[ -n "$s" ]] && { printf '%s\n' "$s"; return 0; }
+  printf '%s\n' "$1/.5dive-session.sock"
+}
+
+# WHERE `serve` PUTS IT. The rendezvous when this box has one AND the caller can
+# be named; the 0700 profile otherwise. Both halves are required: a socket every
+# agent seat can reach, served by a daemon that cannot say WHICH seat is asking,
+# would write `holder=claude` on every row and make the audit trail a constant.
+# Losing the broker only loses a convenience, so that is the direction to fail.
+_serve_sock_path() {  # _serve_sock_path <site> <profile-dir>
+  local me d; me="$(_seat)"; d="$(_rv_dir "$me")"
+  if [[ -d "$d" && -w "$d" ]] && _peercred_ok; then
+    printf '%s\n' "$(_rv_sock "$me" "$1")"; return 0
+  fi
+  printf '%s\n' "$2/.5dive-session.sock"
+}
 _daemon_errlog() { echo "$1/.5dive-session.err"; }
 _daemon_bin()    { echo "${FIVEDIVE_BROWSER_SESSION_DAEMON:-$_SELF_DIR/session-daemon}"; }
 
@@ -1420,6 +1834,17 @@ _daemon_bin()    { echo "${FIVEDIVE_BROWSER_SESSION_DAEMON:-$_SELF_DIR/session-d
 # checks are cheap and the pair is the whole liveness claim — the same shape
 # DIVE-4400 made `serve` adopt for Chrome.
 _daemon_live() {  # _daemon_live <profile-dir>
+  # A BROKERED CALLER CANNOT READ THE PIDFILE — it is in the 0700 directory. The
+  # pair it CAN establish is the stronger one anyway: a socket that exists and a
+  # daemon that answers on it. (`ping` is the daemon's one op that touches
+  # neither the lease nor the browser.)
+  if (( _SITE_BROKERED )); then
+    local rs; rs="$(_rv_sock "$_SITE_OWNER" "$(basename "$1")")"
+    [[ -S "$rs" ]] || return 1
+    local rb; rb="$(_daemon_bin)"; [[ -x "$rb" ]] || return 1
+    "$rb" call "$rs" <<<'{"op":"ping"}' >/dev/null 2>&1
+    return $?
+  fi
   local f; f="$(_serve_pidfile "$1")"
   [[ -f "$f" ]] || return 1
   local p; p=$(_kv "$f" daemon_pid)
@@ -1442,6 +1867,24 @@ _daemon_call() {  # _daemon_call <profile-dir> <request-json>
 # caller and serves callers holding different tokens, so "the token I was given
 # at connect" is exactly the check that protects keystroke one and nothing after
 # it (DIVE-4588).
+# ONE RENDER, OVER THE SOCKET, AND THE BYTES COME BACK (DIVE-4664 scope (d)).
+#
+# THE PNG IS RETURNED, NOT WRITTEN. The daemon runs as the profile's owner, so a
+# request carrying `--out=/some/path` would be that seat writing a
+# caller-chosen path as the owner — exactly the hole DIVE-4662's hand-test rig
+# had and the row said not to ship. base64 over a unix socket costs a third more
+# bytes and owes nobody a permission decision.
+#
+# IT IS ALSO ONE INSTANT. The cold `shot --dom=` takes two loads on purpose (a
+# chrome asked for --screenshot and --dump-dom gives whichever that build likes);
+# here the same page object answers both, so the DOM really is the DOM of the
+# image, which the cold path cannot promise.
+_daemon_render() {  # _daemon_render <dir> <url> <w> <h> <full> <wait-ms>
+  _daemon_call "$1" "$(jq -nc --arg u "$2" --argjson w "$3" --argjson h "$4" \
+      --argjson f "$5" --argjson t "$6" --argjson l "$(_daemon_lease_json)" \
+      '{op:"render", url:$u, width:$w, height:$h, full:$f, wait:$t} + $l')"
+}
+
 _daemon_lease_json() {
   jq -nc --arg lease "$(_lease_meta "$_LEASE_DIR")" --arg token "$_LEASE_TOKEN" \
      '{lease:$lease, token:$token}'
@@ -1568,8 +2011,15 @@ cmd_serve() {
   done
   [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser serve linkedin.com"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
+  # SERVING IS THE OWNER'S ACT. A brokered seat asking to serve is asking to
+  # open a profile directory it cannot read; saying so beats an EACCES from
+  # somewhere deep inside Chrome.
+  _open_site "$site" --no-broker serve "serve HOLDS that browser open, which only the seat that can read the profile can do."
+  local dir="$_SITE_DIR"
+  # `serve` may be the first thing that ever touches this site (that is how a
+  # box with no display gets a login at all: `auth` hands over to it), so the
+  # directory is created here rather than demanded above.
+  (( _SITE_BROKERED )) || [[ -d "$dir" ]] || _ensure_profile_dir "$dir"
   _ensure_profile_dir "$dir"
 
   if (( stop )); then
@@ -1593,7 +2043,8 @@ cmd_serve() {
     fi
     [[ -n "$cpid" ]] && kill "$cpid" 2>/dev/null
     [[ -n "$xpid" ]] && kill "$xpid" 2>/dev/null
-    rm -f "$f" "$(_daemon_sock "$dir")"
+    local ssock; ssock="$(_kv "$f" sock)"
+    rm -f "$f" "${ssock:-$dir/.5dive-session.sock}"
     printf 'stopped the %s browser. The profile is untouched — it is the durable half.\n' "$site"
     return 0
   fi
@@ -1637,9 +2088,17 @@ cmd_serve() {
   if [[ -x "$daemon" && -z "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then
     local rdy="$dir/.5dive-session.ready"
     ( umask 077; : > "$rdy"; : > "$derr" ) 2>/dev/null || true
-    rm -f "$(_daemon_sock "$dir")"
+    # THE SOCKET IS THE BROKER (DIVE-4664). When it lands in the rendezvous the
+    # daemon is told so explicitly rather than inferring it from the path: on
+    # that path it must refuse any caller the kernel will not name, and a
+    # security rule that switches on a string comparison is one rename away from
+    # being off.
+    local dsock dbroker=""
+    dsock="$(_serve_sock_path "$site" "$dir")"
+    [[ "$dsock" == "$dir/"* ]] || dbroker=--broker
+    rm -f "$dsock"
     DISPLAY=":$disp" FIVEDIVE_BROWSER_CHROME="$chrome_path" \
-      "$daemon" serve "$dir" "$(_daemon_sock "$dir")" >"$rdy" 2>"$derr" &
+      "$daemon" serve "$dir" "$dsock" $dbroker >"$rdy" 2>"$derr" &
     dpid=$!
     # READY IS A LINE THE DAEMON PRINTS WHEN THE CONTEXT IS OPEN AND THE SOCKET
     # IS ACCEPTING — not when bash got a pid back. 30s is a ceiling and not a
@@ -1657,7 +2116,7 @@ cmd_serve() {
       # who cannot start a browser at all is a much worse outcome than a customer
       # whose commands each pay a cold launch.
       kill "$dpid" 2>/dev/null; wait "$dpid" 2>/dev/null || true; dpid=""
-      rm -f "$(_daemon_sock "$dir")"
+      rm -f "$dsock"
       local dwhy; dwhy=$(tr -s '\n' ' ' < "$derr" 2>/dev/null | sed 's/^ *//;s/ *$//' | cut -c1-300)
       printf '%s: NOTE — no warm session for %s, so every command will stop and restart this browser. %s\n' \
         "$PROG" "$site" "${dwhy:-the session daemon printed nothing}" >&2
@@ -1665,8 +2124,10 @@ cmd_serve() {
   fi
   if [[ -n "$dpid" ]]; then
     ( umask 077; printf 'display=%s\nxvfb_pid=%s\ndaemon_pid=%s\nsock=%s\nstarted_at=%s\n' \
-        "$disp" "$xpid" "$dpid" "$(_daemon_sock "$dir")" "$(date -u +%s)" > "$(_serve_pidfile "$dir")" )
+        "$disp" "$xpid" "$dpid" "$dsock" "$(date -u +%s)" > "$(_serve_pidfile "$dir")" )
+    _rv_offer_write "$(_seat)" "$site"
     printf 'serving %s on :%s (warm session — the profile outlives every viewer, and the browser outlives every command)\n' "$site" "$disp"
+    [[ -n "$dbroker" ]] && printf '  brokered at %s — other seats on this box use THIS login, with no second login of their own\n' "$dsock"
     return 0
   fi
 
@@ -1748,10 +2209,8 @@ cmd_viewer() {
   (( ttl >= VIEWER_TTL_MIN )) || die "$E_USAGE" "--ttl below ${VIEWER_TTL_MIN}s is not long enough for a person to log in"
   (( ttl <= VIEWER_TTL_MAX )) || die "$E_USAGE" "--ttl above ${VIEWER_TTL_MAX}s: this is a re-auth window, not a session. The browser persists; the VIEW does not."
 
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
-  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser serve $site"
-  _audit "$dir" 700
+  _open_site "$site" --no-broker viewer "a viewer hands that browser to a PERSON, and the link is minted by the seat that owns it."
+  local dir="$_SITE_DIR"
 
   local disp
   disp=$(_serve_running "$dir") || die "$E_UNAVAILABLE" "no browser is serving $site — start it first: 5dive browser serve $site"
@@ -1851,9 +2310,8 @@ cmd_viewer_redeem() {
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
   [[ -n "$session" ]] || die "$E_USAGE" "--session=<id> is required: a ticket is bound to the session that asked for it"
 
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
-  _audit "$dir" 700
+  _open_site "$site" --no-broker viewer "the viewer is minted and revoked by the seat that owns it."
+  local dir="$_SITE_DIR"
   local tf; tf="$(_viewer_ticket "$dir")"
   [[ -f "$tf" ]] || die "$E_PERM" "no viewer ticket for $site"
 
@@ -1933,9 +2391,8 @@ cmd_viewer_revoke() {
   local site="${1:-}"
   [[ -n "$site" ]] || die "$E_USAGE" "usage: 5dive browser viewer-revoke <site>"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
-  _audit "$dir" 700
+  _open_site "$site" --no-broker viewer "the viewer is minted and revoked by the seat that owns it."
+  local dir="$_SITE_DIR"
   _viewer_revoke_file "$dir" revoked
   _viewer_stop "$dir"
   rm -f "$dir/.5dive-viewer.pw"
@@ -2087,10 +2544,8 @@ _page_open() {  # _page_open <site> <url>
   host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
   _shot_host_ok "$site" "$host" || die "$E_USAGE" "$url is not a page of '$site' (its host is $host). A profile is a credential scoped to the site it is named for: rendering another site's page inside it produces a LOGGED-OUT screenshot that looks like a bug in this command. Use the profile for that site — or 5dive browser auth $host."
 
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
-  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
-  _audit "$dir" 700
+  _open_site "$site"
+  local dir="$_SITE_DIR"
 
   # A READ TAKES THE LEASE TOO (DIVE-4588), and this is the least obvious half of
   # the design, so it is written down rather than inferred: separate TABS of one
@@ -2105,6 +2560,18 @@ _page_open() {  # _page_open <site> <url>
   if [[ -z "$_LEASE_TOKEN" ]]; then
     _lease_take "$site" "$dir" "${_PG_PURPOSE:-render}" no
     trap '_lease_and_serve_release' EXIT
+  fi
+
+  # BROKERED IS ALWAYS THE WARM PATH (DIVE-4664 scope (d)), and it is not an
+  # optimisation here — it is the only path that exists. A brokered seat cannot
+  # hand --user-data-dir to a chrome of its own, so the render happens in the
+  # browser that already holds the profile and comes back over the socket. It
+  # also does not need a chrome installed for itself, and requiring one would
+  # refuse a seat that was never going to launch it.
+  if (( _SITE_BROKERED )); then
+    _PG_DIR="$dir"; _PG_CHROME=""
+    _page_open_probe "$site" "$dir"
+    return 0
   fi
 
   local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — a render needs the same browser the profile was logged in with."
@@ -2219,6 +2686,26 @@ cmd_shot() {
     die "$E_UNAVAILABLE" "cannot clear $out before the render, so a file already there would be reported as this render's image. Remove it or choose another --out."
   fi
 
+  if (( _SITE_BROKERED )); then
+    local rj rrc=0
+    rj=$(_daemon_render "$dir" "$url" "$w" "$h" false "$wait") || rrc=$?
+    if (( rrc != 0 )) || [[ -z "$rj" ]]; then
+      die "$E_UNAVAILABLE" "the box session did not render $url (it exited $rrc; its own reason is above). Nothing was written — an empty or missing PNG must not be reported as a screenshot."
+    fi
+    jq -r '.png' <<<"$rj" | base64 -d > "$out" 2>/dev/null || true
+    if [[ ! -s "$out" ]]; then
+      rm -f "$out"
+      die "$E_UNAVAILABLE" "the box session answered without an image for $url. Nothing was written."
+    fi
+    # ONE INSTANT, so the DOM is written from the SAME answer rather than from a
+    # second load. See _daemon_render.
+    [[ -n "$domout" ]] && jq -r '.html' <<<"$rj" > "$domout"
+    _lease_release; trap - EXIT
+    printf 'rendered %s as the logged-in %s profile (the box login, held by %s)\n  %s  (%sx%s)\n' "$url" "$site" "$_SITE_OWNER" "$out" "$w" "$h"
+    [[ -n "$domout" && -s "$domout" ]] && printf '  %s  (DOM, same page instant)\n' "$domout"
+    return 0
+  fi
+
   # The flags are the security claim: --headless with NO --remote-debugging-*, so
   # this render opens no socket any other seat could reach. See the header.
   "$chrome" --headless --no-sandbox --disable-gpu --hide-scrollbars \
@@ -2323,10 +2810,15 @@ _derive_capture() { # _derive_capture <stage> <url> <chrome> <capture-kind>
   jq -e '.markdown | type == "string"' "$stage/extracted.json" >/dev/null || \
     die "$E_UNAVAILABLE" "the extractor returned no Markdown; no evidence files were written"
 
-  local retrieved sha chrome_version
+  # EMPTY, NOT UNSET. The assignment below is conditional (a brokered capture has
+  # no local chrome), and this file runs under `set -u`, so an unset name here is
+  # a hard exit on the very next line rather than the "unknown" it means.
+  local retrieved sha chrome_version=""
   retrieved="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sha="$(sha256sum "$stage/page.html" | cut -d' ' -f1)"
-  chrome_version="$($chrome --version 2>/dev/null | head -1)"
+  # A BROKERED CAPTURE HAS NO LOCAL CHROME, and `$chrome --version` with an
+  # empty $chrome runs `--version` as a command. Say what actually rendered it.
+  if [[ -n "$chrome" ]]; then chrome_version="$($chrome --version 2>/dev/null | head -1)"; fi
   [[ -n "$chrome_version" ]] || chrome_version="unknown"
   jq --arg retrieved_at "$retrieved" --arg sha256 "$sha" \
      --arg chrome_version "$chrome_version" --arg capture "$capture" \
@@ -2377,15 +2869,26 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
 
   # One render, one source of truth. page.html is byte-for-byte stdout from this
   # invocation and every derived field below comes from that exact file.
-  "$chrome" --headless --no-sandbox --disable-gpu \
-      --user-data-dir="$dir" --virtual-time-budget="$wait" \
-      --dump-dom "$url" >"$stage/page.html" 2>"$stage/chrome.err"
-  local crc=$?
-  if (( crc != 0 )) || [[ ! -s "$stage/page.html" ]]; then
-    die "$E_UNAVAILABLE" "the authenticated DOM capture produced no page (chrome exited $crc); no evidence files were written"
+  local crc=0 capture=dump-dom
+  if (( _SITE_BROKERED )); then
+    capture=session-daemon
+    local rj=""
+    rj=$(_daemon_render "$dir" "$url" 1280 800 false "$wait") || crc=$?
+    if (( crc == 0 )) && [[ -n "$rj" ]]; then jq -r '.html' <<<"$rj" > "$stage/page.html"; fi
+    if (( crc != 0 )) || [[ ! -s "$stage/page.html" ]]; then
+      die "$E_UNAVAILABLE" "the box session did not capture $url (it exited $crc; its own reason is above); no evidence files were written"
+    fi
+  else
+    "$chrome" --headless --no-sandbox --disable-gpu \
+        --user-data-dir="$dir" --virtual-time-budget="$wait" \
+        --dump-dom "$url" >"$stage/page.html" 2>"$stage/chrome.err"
+    crc=$?
+    if (( crc != 0 )) || [[ ! -s "$stage/page.html" ]]; then
+      die "$E_UNAVAILABLE" "the authenticated DOM capture produced no page (chrome exited $crc); no evidence files were written"
+    fi
   fi
 
-  _derive_capture "$stage" "$url" "$chrome" dump-dom
+  _derive_capture "$stage" "$url" "$chrome" "$capture"
 
   install -m 00600 "$stage/page.html" "$out/page.html" || die "$E_UNAVAILABLE" "cannot install page.html in $out"
   install -m 00600 "$stage/page.meta.json" "$out/page.meta.json" || die "$E_UNAVAILABLE" "cannot install page.meta.json in $out"
@@ -2467,9 +2970,8 @@ cmd_snapshot() {
   [[ -r "$READ_EXTRACTOR" ]] || die "$E_UNAVAILABLE" "the pinned page extractor is missing from this install ($READ_EXTRACTOR)"
   command -v node >/dev/null 2>&1 || die "$E_UNAVAILABLE" "node is required to run the pinned page extractor"
   command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to assemble the evidence metadata"
-  _require_store
-  local dir; dir="$(_site_dir "$site")"
-  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site — 5dive browser auth $site"
+  _open_site "$site"
+  local dir="$_SITE_DIR"
 
   # The lease is taken before the prologue, for the reason cmd_tree states: the
   # prologue can stop somebody's served browser, so the window before the lease
@@ -2785,6 +3287,56 @@ cmd_doc() {
 }
 ok_doc() { printf '%s: %s\n' "$PROG" "$1"; }
 
+# ------------------------------------------------ the broker's own two verbs
+#
+# THESE ARE CALLED BY THE SESSION DAEMON, NOT BY A PERSON, and they are not in
+# `usage` for that reason. The daemon runs as the profile's owner, so when a
+# brokered caller needs something done INSIDE the 0700 directory — take the
+# lease, write an audit row — the daemon re-enters this script rather than
+# reimplementing it in JavaScript. One lease implementation, one audit format;
+# the alternative is two that drift, and the one that drifts is the one nobody
+# runs (there is no second caller to notice).
+#
+# WHO IS ASKING comes in $FIVEDIVE_BROWSER_ON_BEHALF_OF, and the daemon sets it
+# from SO_PEERCRED — the kernel's answer about the socket's peer, not a name the
+# request asked to be called. A caller cannot set it for itself: it never runs
+# this program, the daemon does.
+cmd_broker_lease() {  # _broker-lease <site> acquire|release [<purpose>] [<ttl>] [<token>]
+  local site="${1:-}" act="${2:-}" purpose="${3:-brokered}" ttl="${4:-}" token="${5:-}"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  local d; d="$(_own_site_dir "$site")"
+  [[ -d "$d" ]] || die "$E_UNAVAILABLE" "no profile for $site under $(_seat)"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl="$LEASE_TTL_DEFAULT"
+  (( ttl > LEASE_TTL_MAX )) && ttl="$LEASE_TTL_MAX"
+  case "$act" in
+    acquire)
+      local t
+      t=$(_lease_try "$d" agent "$purpose" "$ttl") \
+        || die "$E_UNAVAILABLE" "$(_lease_describe "$d")"
+      _serve_touch "$d"; _audit_row "$d" lease-acquire "$purpose"
+      printf '%s\n' "$t" ;;
+    release)
+      # THE SAME "ONLY IF IT IS STILL OURS" RULE as _lease_release, for the same
+      # reason: a person at the viewer may have preempted this caller, and
+      # deleting their lease on the way out hands the browser to the next agent
+      # while they are still typing in it.
+      if [[ -n "$token" && "$(_kv "$(_lease_meta "$d")" token)" == "$token" ]]; then
+        rm -rf "$(_lease_dir "$d")"
+        _audit_row "$d" lease-release ""
+      fi ;;
+    status)  _lease_live "$d" && _lease_describe "$d" ;;
+    *) die "$E_USAGE" "lease act is acquire|release|status" ;;
+  esac
+}
+
+cmd_broker_audit() {  # _broker-audit <site> <event> [<detail>]
+  local site="${1:-}" ev="${2:-request}" detail="${3:-}"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  local d; d="$(_own_site_dir "$site")"
+  [[ -d "$d" ]] || return 0
+  _audit_row "$d" "$ev" "$detail"
+}
+
 
 # >>> DIVE-4348 a root caller operates the SEAT's store — as the seat
 # The dashboard reaches every verb through shelld's whitelist, which is
@@ -2811,10 +3363,10 @@ fi
 # <<< DIVE-4348
 
 case "${1:-}" in
-  -h|--help|help|"") usage ;;
+  -h|--help|help|"") _deprecated; usage ;;
   setup) shift; cmd_setup "$@" ;;
   auth)  shift; cmd_auth  "$@" ;;
-  status) shift; _auth_status "${1:-}" ;;
+  status) shift; _deprecated; _auth_status "${1:-}" ;;
   probe-all) shift; cmd_probe_all "$@" ;;
   ls)    shift; cmd_ls    "$@" ;;
   doc)   shift; cmd_doc  "$@" ;;
@@ -2826,6 +3378,9 @@ case "${1:-}" in
   shot)  shift; cmd_shot  "$@" ;;
   read)  shift; cmd_read  "$@" ;;
   snapshot) shift; cmd_snapshot "$@" ;;
+  # Not in usage: the session daemon re-enters here as the profile's owner.
+  _broker-lease) shift; cmd_broker_lease "$@" ;;
+  _broker-audit) shift; cmd_broker_audit "$@" ;;
   links) shift; cmd_links "$@" ;;
   serve) shift; cmd_serve "$@" ;;
   viewer) shift; cmd_viewer "$@" ;;

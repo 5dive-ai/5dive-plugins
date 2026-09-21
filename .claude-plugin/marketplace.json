@@ -37,10 +37,17 @@
     },
     {
       "name": "browser",
-      "description": "Persistent human-authenticated browser sessions: you log into a site once by hand, the agent is granted the session and never the credentials, and deterministic adapters decide where to click. A security challenge is a hard stop that asks for a person.",
+      "description": "DEPRECATED — browser now lives in its own repository. Install it with `5dive plugin add 5dive-ai/5dive-browser`. This entry still resolves and still installs, because every box provisioned before the move runs `plugin add browser@5dive-plugins` today; it is kept only until no reader names it. A box that already carries browser@5dive-plugins cannot simply add the repo copy — the CLI refuses two plugins claiming the `browser` verb — so migrate in two commands: `sudo 5dive plugin remove browser@5dive-plugins` then `sudo 5dive plugin add 5dive-ai/5dive-browser`. Persistent human-authenticated browser sessions: you log into a site once by hand, the agent is granted the session and never the credentials, and deterministic adapters decide where to click. A security challenge is a hard stop that asks for a person.",
       "category": "channel",
       "source": "./plugins/browser",
-      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/browser"
+      "homepage": "https://github.com/5dive-ai/5dive-browser"
+    },
+    {
+      "name": "mod",
+      "description": "Seat telemetry from inside the harness: turn and session boundaries and the account's usage meter, published to a per-seat JSONL sink for the heartbeat, the pacing floor and the self-update sweep to read instead of inferring from pane samples and the task board. Observe-only and off unless the seat opts in.",
+      "category": "productivity",
+      "source": "./plugins/mod",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/mod"
     }
   ]
 }

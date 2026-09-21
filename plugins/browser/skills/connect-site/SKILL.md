@@ -98,10 +98,11 @@ keyboard attached to the person's account.
   x11vnc and websockify, installed box-level as root (`browser-stack.sh`) — a seat cannot
   install them. The refusal names what is missing, and the box's DEGRADED health row names
   the re-install command. Report that to the human; do not improvise an install.
-- **Profiles are per-seat, mode 0700, and never repaired.** Another seat's login is not
-  yours to use, and a profile with wrong ownership is refused rather than fixed. The shipped
-  relay currently redeems the `claude` seat, so a different seat must use the dashboard flow
-  rather than minting a ticket against its own unreachable profile.
+- **A site login is per BOX and brokered.** The profile stays one seat's, mode 0700, and is
+  never repaired — you cannot open another seat's and must not try. But you do not need to:
+  where the box has a login and something is serving it, your seat acts through the running
+  browser and needs **no second human login**. A login you made yourself wins over the box's.
+  The viewer and `serve` stay the owning seat's acts; the relay still redeems `claude`.
 - **Some sites block datacenter IPs at login** ("your request has been blocked",
   "suspicious network"). That is the site's anti-bot policy meeting a VM's IP — it is not
   our bug, there is no flag for it, and the honest answer to the human is that this site

@@ -34,7 +34,7 @@ than on the next CLI release.
 | [`dashboard`](./plugins/dashboard) | Talk to your agent from the authenticated web dashboard (and mobile app). |
 | [`buzz`](./plugins/buzz) | Buzz (Nostr) channel — inbound mentions arrive as channel notifications. |
 | [`voice`](./plugins/voice) | Local speech-to-text and text-to-speech. The reference implementation of the 5dive plugin contract. |
-| [`browser`](./plugins/browser) | Persistent human-authenticated browser sessions — the agent is granted the session and never the credentials. |
+| [`browser`](./plugins/browser) | **Moved to [`5dive-ai/5dive-browser`](https://github.com/5dive-ai/5dive-browser)** — install it with `5dive plugin add 5dive-ai/5dive-browser`. Persistent human-authenticated browser sessions; the agent is granted the session and never the credentials. The copy here still resolves so boxes provisioned before the move keep working, and goes away once no reader names it. A box already carrying `browser@5dive-plugins` migrates in two commands — `sudo 5dive plugin remove browser@5dive-plugins`, then the add above — because the CLI refuses two plugins claiming the `browser` verb. |
 
 ## Install
 
