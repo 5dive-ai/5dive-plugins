@@ -91,7 +91,9 @@ test('all six Telegram viewer-link guards are byte-identical', () => {
   }
 })
 
-// The browser workflow's non-unfurling handoff copy used to be asserted here against
-// plugins/browser/skills/connect-site/SKILL.md. That plugin now lives in
-// 5dive-ai/5dive-browser (DIVE-4734), and its tests/browser_plugin_unit.sh arm T14b
-// asserts the same three strings on the moved SKILL.md.
+test('the shared browser workflow requires non-unfurling handoff copy', () => {
+  const skill = readFileSync(join(import.meta.dir, '..', 'plugins/browser/skills/connect-site/SKILL.md'), 'utf8')
+  expect(skill).toContain("format: 'markdownv2'")
+  expect(skill).toContain('Do not paste it back into chat')
+  expect(skill).toContain('non-unfurling code formatting')
+})
