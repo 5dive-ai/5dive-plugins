@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — standard Telegram seats can land authenticated gate taps (DIVE-4609), telegram 0.5.58
+
+Gate buttons and inbox recommendation clears no longer shell a broad
+`sudo 5dive task ...` command that standard-isolation seats are intentionally
+forbidden to run. Reads stay unprivileged; writes carry the paired Telegram
+user id as channel proof and let the CLI cross its narrow `_task_channel` rail.
+Only `task answer` and `task clear-recs` use that rail. Start, done, cancel,
+escalate, agent-send, and council actions remain admin-only.
+
 ### Changed — the tool-call guard is ON unless a seat opts out (DIVE-4720), mod 0.6.0
 
 DIVE-4696 shipped six policies and left them off on every seat, so the thing the row was filed

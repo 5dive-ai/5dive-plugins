@@ -2148,6 +2148,22 @@ async function read5diveJson(args: string[], timeout: number = CLI_READ_MS): Pro
   }
 }
 
+// Mutating task calls run unprivileged first. The CLI may internally cross its
+// exact-path _task_channel sudo rail after it re-verifies --channel-proof; the
+// plugin itself must never ask for the broad `sudo 5dive task ...` surface.
+async function write5diveJson(args: string[], timeout: number = CLI_READ_MS): Promise<any> {
+  const acceptEnvelope = (stdout: string): boolean => {
+    try { JSON.parse(stdout); return true } catch { return false }
+  }
+  const r = await fiveRunner().run(args, { timeout, maxBuffer: JSON_MAXBUFFER }, acceptEnvelope)
+  let j: any
+  try { j = JSON.parse(r.stdout) } catch {
+    throw r.error instanceof Error ? r.error : new Error('unparseable 5dive write response')
+  }
+  if (!r.ok || j?.ok !== true) throw new Error(String(j?.error?.message ?? r.error ?? '5dive write refused'))
+  return j
+}
+
 // Read-only surfaces that parse stdout themselves. Same unprivileged-first
 // strategy; throws on failure so each caller keeps its own user-facing message.
 async function read5diveStdout(args: string[], opts?: { timeout?: number; maxBuffer?: number }): Promise<string> {
@@ -4611,8 +4627,8 @@ bot.on('callback_query:data', async ctx => {
     const humanProof = tnaM[3]
     let tnaIdent: string | null = null
     try {
-      const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
-      const task = JSON.parse(show.stdout).data?.task
+      const show = await read5diveJson(['--json', 'task', 'show', taskId])
+      const task = show?.data?.task
       // All branch logic (no-gate / already-answered / invalid-token / resolve the
       // answer incl. the secret no-value path) lives in resolveTnaAnswer (DIVE-369),
       // exercised headless by test/tna-harness.test.ts. This handler is the thin
@@ -4656,7 +4672,8 @@ bot.on('callback_query:data', async ctx => {
         messageId: ctx.callbackQuery.message?.message_id,
         osUser: process.env.USER,
       })
-      await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], { timeout: 8000 })
+      extraArgs.push(`--channel-proof=${senderId}`)
+      await write5diveJson(['--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], 8000)
       await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
       await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
     } catch (err) {
@@ -4672,8 +4689,8 @@ bot.on('callback_query:data', async ctx => {
       let answer: string | null = null
       let recheckDetail: string | null = null
       try {
-        const re = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
-        const t = JSON.parse(re.stdout).data?.task
+        const re = await read5diveJson(['--json', 'task', 'show', taskId])
+        const t = re?.data?.task
         landing = tapLanding(true, t)
         if (typeof t?.ident === 'string') tnaIdent = t.ident
         answer = t?.need_answer ?? null
@@ -4879,12 +4896,10 @@ bot.on('callback_query:data', async ctx => {
   if (gcM) {
     const taskId = gcM[1]!
     try {
-      const r = await execFileP(
-        SUDO,
-        ['-n', '5dive', 'task', 'clear-recs', `--channel-proof=${senderId}`, `--only=${taskId}`, '--json'],
-        { timeout: 8000 },
+      const cj = await write5diveJson(
+        ['task', 'clear-recs', `--channel-proof=${senderId}`, `--only=${taskId}`, '--json'],
+        8000,
       )
-      const cj = JSON.parse(r.stdout)
       if (cj?.ok && Number(cj.data?.cleared ?? 0) > 0) {
         await ctx.answerCallbackQuery({ text: '✅ Applied your recommendation' }).catch(() => {})
         // DIVE-3279: mark THIS message resolved and drop ITS keyboard — do not
@@ -4919,12 +4934,10 @@ bot.on('callback_query:data', async ctx => {
   // keep their per-gate taps. Fully fail-soft.
   if (data === 'gclearall') {
     try {
-      const { stdout } = await execFileP(
-        SUDO,
-        ['-n', '5dive', 'task', 'clear-recs', `--channel-proof=${senderId}`, '--from=telegram', '--json'],
-        { timeout: 15000 },
+      const j = await write5diveJson(
+        ['task', 'clear-recs', `--channel-proof=${senderId}`, '--from=telegram', '--json'],
+        15000,
       )
-      const j = JSON.parse(stdout)
       const cleared = Number(j?.data?.cleared ?? 0)
       if (j?.ok && cleared > 0) {
         await ctx.answerCallbackQuery({ text: `✅ Cleared ${cleared} recommended gate${cleared === 1 ? '' : 's'}` }).catch(() => {})
@@ -5467,7 +5480,7 @@ async function handleGateClearReply(text: string, senderId: string): Promise<str
   if (!(await read5diveVersion())) return null // 5dive-only surface; no-op on OSS hosts
   const args = ['task', 'clear-recs', `--channel-proof=${senderId}`, '--json']
   if (one) args.push(`--only=${one[1]}`)
-  const j = await read5diveJson(args)
+  const j = await write5diveJson(args).catch(() => null)
   if (!j?.ok) {
     return one
       ? `Couldn't clear ${one[1]} — it may be a hard gate (money/destructive/secret/brand) that still needs a button tap, or already answered. Open it: /task_${String(one[1]).replace(/^DIVE-/, '')}`
