@@ -28,8 +28,8 @@
 //      `{ deny }`, rewrites `e`, or awaits anything before `next`. DIVE-4696 added the
 //      exception and it is exactly one hook: `tool.call` now consults a policy
 //      document (`hooks/guard.ts` + `policy/guard.json`) and may answer
-//      `{ deny: <the policy's reason> }` INSTEAD of calling `next`. It is off unless
-//      the seat sets FIVEDIVE_MOD_GUARD=1, it never rewrites a call, and the reason
+//      `{ deny: <the policy's reason> }` INSTEAD of calling `next`. Since DIVE-4720 it
+//      is ON unless the seat sets FIVEDIVE_MOD_GUARD=0, it never rewrites a call, and the reason
 //      comes from the data file rather than from this module. The wall-handling
 //      capability is still deliberately NOT here; it is a separate row.
 //   2. FAIL OPEN, AND FAIL LEGIBLY. The surface below is EARLY ACCESS and may change
@@ -86,7 +86,7 @@ import { compile, envSet, evaluate, type Compiled, type Verdict } from './guard'
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.5.0'
+const VERSION = '0.6.0'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
@@ -118,10 +118,18 @@ const COMMANDS_FLAG = 'FIVEDIVE_MOD_COMMANDS'
 const AUDIT_FLAG = 'FIVEDIVE_MOD_CONTEXT_AUDIT'
 
 /**
- * The settings key that turns the tool-call GUARD on for a seat (DIVE-4696). Absent or
- * anything but "1" is off, and off means the `tool.call` hook is exactly the
- * observe-only hook DIVE-4692 shipped. Independent of FLAG and COMMANDS_FLAG: a seat
- * may want the deny list with no sink, or the sink with no deny list.
+ * The settings key that governs the tool-call GUARD for a seat (DIVE-4696, default
+ * flipped by DIVE-4720). The guard is ON when the key is ABSENT: a rule that nothing
+ * enforces is not a rule, and DIVE-4696 shipped six policies that every seat left off,
+ * so the prose those policies replace could not be deleted and the fleet kept paying
+ * for it on every turn. Opting OUT is explicit and named — "0", "off" or "false".
+ * Independent of FLAG and COMMANDS_FLAG: a seat may want the deny list with no sink,
+ * or the sink with no deny list.
+ *
+ * The blast radius of the flip is bounded by two things already in the document: every
+ * policy carries the CLAUDE.md rule it enforces, so a deny is never a surprise rule,
+ * and every policy now carries an `unless_env` escape a seat can set for one false
+ * positive without editing the shared file.
  */
 const GUARD_FLAG = 'FIVEDIVE_MOD_GUARD'
 
@@ -1188,7 +1196,11 @@ let dropsLogged = false
 async function resolveGuard($: EngineInterface): Promise<Guard> {
   try {
     const vars = envOf(await $.settings.read())
-    if (String(vars[GUARD_FLAG] ?? '') !== '1') return { on: false }
+    // ABSENT IS ON (DIVE-4720). Only a named opt-out switches it off, so a seat that
+    // installs the mod for its telemetry also gets the rules — the coupling is
+    // deliberate, because the uncoupled default is what left the guard off everywhere.
+    const flag = String(vars[GUARD_FLAG] ?? '').trim().toLowerCase()
+    if (flag === '0' || flag === 'off' || flag === 'false' || flag === 'no') return { on: false }
     const named = String(vars[GUARD_POLICY_KEY] ?? '')
     const path = named !== '' ? named : `${$.plugin.root}/${DEFAULT_POLICY}`
     const compiled = compile(JSON.parse(await $.fs.read(path)))
@@ -1360,7 +1372,7 @@ export const register: Register = (on) => {
     // does anything before `next(e)`. Both properties are scoped as tightly as the
     // shape allows:
     //
-    //   - with GUARD_FLAG off — the default on every seat — `verdictFor` answers null
+    //   - with GUARD_FLAG explicitly opted out of, `verdictFor` answers null
     //     without reading a policy, and what runs below is the observe-only hook
     //     DIVE-4692 shipped, unchanged;
     //   - the reason handed back is the policy document's, never this file's. Nothing

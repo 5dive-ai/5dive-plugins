@@ -29,12 +29,68 @@
 
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 
 const ROOT = join(import.meta.dir, '..', 'plugins', 'mod')
 const SRC = readFileSync(join(ROOT, 'hooks', 'register.ts'), 'utf8')
 const MANIFEST = JSON.parse(readFileSync(join(ROOT, '.claude-plugin', 'plugin.json'), 'utf8'))
 const HOOKS_JSON = JSON.parse(readFileSync(join(ROOT, 'hooks', 'hooks.json'), 'utf8'))
+
+/**
+ * The manifest version PUBLISHED on main, and the comparison against it (DIVE-4720
+ * iteration 2).
+ *
+ * Why this cannot be done with the source-vs-manifest arm below. That arm compares two
+ * files inside the working tree, so a branch that bumps both to a number main already
+ * shipped is green on both. That is exactly what happened here: #96 took 0.5.0 at
+ * 00:47Z, this branch opened ten minutes later and bumped 0.4.0 -> 0.5.0 on a base that
+ * predated it, and every version arm in the suite passed. A plugin only moves a box on
+ * a STRICTLY HIGHER number, so two builds sharing one number means the second can never
+ * be installed — the collision is not a tidiness defect, it strands the release.
+ */
+const MANIFEST_REL = 'plugins/mod/.claude-plugin/plugin.json'
+const REPO = join(import.meta.dir, '..')
+
+function git(args: string[]): string | null {
+  try {
+    return execFileSync('git', args, {
+      cwd: REPO,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return null
+  }
+}
+
+/** main's manifest version, or null when this tree genuinely cannot reach main. */
+function versionOnMain(): string | null {
+  for (const ref of ['origin/main', 'main']) {
+    const raw = git(['show', `${ref}:${MANIFEST_REL}`])
+    if (raw) return JSON.parse(raw).version
+  }
+  // A CI checkout is shallow and single-ref (actions/checkout@v4 gives depth 1 on the
+  // PR merge ref), so neither name above resolves there. Fetching main is the whole
+  // difference between grading the collision and skipping it in the one place that
+  // would have caught this one.
+  if (git(['fetch', '--depth=1', 'origin', 'main']) !== null) {
+    const raw = git(['show', `FETCH_HEAD:${MANIFEST_REL}`])
+    if (raw) return JSON.parse(raw).version
+  }
+  return null
+}
+
+/** -1 / 0 / 1 on the numeric semver triple. Equal is a FAILING comparison here. */
+function cmpVersion(a: string, b: string): number {
+  const pa = a.split('.').map(Number)
+  const pb = b.split('.').map(Number)
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (d !== 0) return d > 0 ? 1 : -1
+  }
+  return 0
+}
 
 /** The events the mod is allowed to register. A new one is a deliberate decision. */
 const EVENTS = [
@@ -76,6 +132,28 @@ describe('mod: manifest and module stay wired together', () => {
   test('the version in the source matches the manifest', () => {
     const inSource = /const VERSION = '([^']+)'/.exec(SRC)?.[1]
     expect(inSource).toBe(MANIFEST.version)
+  })
+
+  test('the manifest version is strictly above the one published on main', () => {
+    const onMain = versionOnMain()
+    // Null means no ref AND no fetch — a tree that cannot see main at all. Passing
+    // here would make the arm vacuous in precisely the environment where nobody is
+    // watching, so it reds and says why.
+    expect(onMain === null ? 'could not read main' : 'read main').toBe('read main')
+    const ours = MANIFEST.version
+    const verdict = cmpVersion(ours, onMain as string) > 0 ? 'above' : 'NOT above'
+    expect(`${ours} is ${verdict} main's ${onMain}`).toBe(`${ours} is above main's ${onMain}`)
+  })
+
+  test('the comparison reds on a version merely EQUAL to main, not just a lower one', () => {
+    // The collision that bounced iteration 1 was an EQUAL number, not a lower one, so
+    // a >= comparison would have shipped it. Pinned here rather than left implicit.
+    const onMain = versionOnMain()
+    expect(cmpVersion(onMain as string, onMain as string)).toBe(0)
+    expect(cmpVersion('0.5.0', '0.5.0')).toBe(0)
+    expect(cmpVersion('0.4.0', '0.5.0')).toBe(-1)
+    expect(cmpVersion('0.6.0', '0.5.0')).toBe(1)
+    expect(cmpVersion('0.10.0', '0.9.0')).toBe(1)
   })
 
   test('the manifest records the Claude Code build the mod was verified against', () => {
@@ -200,11 +278,33 @@ describe('mod: it cannot affect the session it measures', () => {
     expect(body).toContain('if (livePin === null || r.skip !== undefined) return r')
   })
 
-  test('the guard is off unless the seat turns it on, and off is the old hook', () => {
-    // The default has to be legible from the source: a guard that is on by default
-    // would refuse calls on 18 seats the moment the plugin updates.
+  test('the guard is ON unless the seat opts out, and opting out is the old hook', () => {
+    // REVERSED BY DIVE-4720, deliberately. The arm this replaces pinned the opposite
+    // default and gave the reason: "a guard that is on by default would refuse calls
+    // on 18 seats the moment the plugin updates." That reason was measured and found
+    // to be the wrong way round — off-by-default refused calls on ZERO seats, which is
+    // why the six CLAUDE.md rules the policies replace could not be deleted and the
+    // fleet went on paying for them on every turn. A rule nothing enforces is not a
+    // rule. The default still has to be legible from the source; it is the value that
+    // changed, not the requirement to state it.
     expect(SRC).toContain("const GUARD_FLAG = 'FIVEDIVE_MOD_GUARD'")
-    expect(SRC).toMatch(/String\(vars\[GUARD_FLAG\] \?\? ''\) !== '1'\) return \{ on: false \}/)
+    // Absent is ON: only a named opt-out answers `{ on: false }`.
+    expect(SRC).toMatch(/flag === '0' \|\| flag === 'off' \|\| flag === 'false' \|\| flag === 'no'\) return \{ on: false \}/)
+    // And the old predicate is GONE, not merely shadowed by a second one.
+    expect(SRC).not.toMatch(/GUARD_FLAG\] \?\? ''\) !== '1'/)
+  })
+
+  test('on by default, every policy carries a named escape', () => {
+    // The blast radius of the flip rests on this: a seat that hits a false positive
+    // has a one-setting exit that is not "edit the file all 18 seats read". Off by
+    // default, a policy with no escape cost nobody anything; on by default it is an
+    // outage with a reason attached. Read from the DOCUMENT, so a policy added later
+    // without an escape reds here rather than on a seat.
+    const doc = JSON.parse(readFileSync(join(ROOT, 'policy', 'guard.json'), 'utf8'))
+    const naked = doc.policies
+      .filter((p: { unless_env?: string }) => typeof p.unless_env !== 'string' || p.unless_env === '')
+      .map((p: { id: string }) => p.id)
+    expect(naked).toEqual([])
   })
 
   test('the module never binds $ to a name', () => {

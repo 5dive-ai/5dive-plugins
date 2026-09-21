@@ -116,6 +116,43 @@ describe('policy: pii-fixture — a real identifier in a test fixture', () => {
     expect(verdict(write(FIXTURE, 'host = "127.0.0.1"'))).toBeNull()
   })
 
+  // DIVE-4720. The residual DIVE-4696 recorded and did not fix: with the guard off on
+  // every seat a version-shaped literal only cost the verifier a note, but ON BY
+  // DEFAULT it is a fleet-wide refusal of legitimate writes — this repo's own tests
+  // pin Claude Code releases by number. The narrowing is octet VALIDITY plus the two
+  // boundaries, all three in `find`, so it stays an ops edit with no plugin release.
+  test('MUTANT: a four-part version literal is not an IP address', () => {
+    // The exact string named in docs/mod-guard.md's residual list.
+    expect(verdict(write(FIXTURE, 'const V = "2.1.278.0"'))).toBeNull()
+    // 278 is not an octet, and neither is 300 or 999.
+    expect(verdict(write(FIXTURE, 'expect(v).toBe("2.1.300.4")'))).toBeNull()
+    expect(verdict(write(FIXTURE, 'VERIFIED_AGAINST = "999.1.2.3"'))).toBeNull()
+  })
+
+  test('MUTANT: a v-prefixed or five-part version is not an IP address', () => {
+    expect(verdict(write(FIXTURE, 'tag = "v2.1.27.0"'))).toBeNull()
+    expect(verdict(write(FIXTURE, 'build = "1.2.3.4.5"'))).toBeNull()
+    expect(verdict(write(FIXTURE, 'rel = "2.1.27.0-rc1"'))).toBeNull()
+  })
+
+  test('the narrowing did not cost the policy a real address', () => {
+    // The whole point of an exclusion is that it excludes ONLY what it names. These
+    // are the shapes the check exists for, re-asserted at the new regex.
+    expect(verdict(write(FIXTURE, 'host = "95.216.4.19"'))).toBe('pii-fixture')
+    expect(verdict(write(FIXTURE, 'dns = "8.8.8.8"'))).toBe('pii-fixture')
+    expect(verdict(write(FIXTURE, 'box: 65.109.1.2'))).toBe('pii-fixture')
+  })
+
+  test('the seat-level escape hatch exists and is named', () => {
+    // On by default means a false positive must have a one-setting exit that is not
+    // "edit the shared policy file". Every other policy carries one; this one did not.
+    expect(
+      verdict(write(FIXTURE, 'host = "95.216.4.19"'), {
+        FIVEDIVE_MOD_GUARD_ALLOW_FIXTURE_ID: '1',
+      }),
+    ).toBeNull()
+  })
+
   test('MUTANT: the same content OUTSIDE a fixture path is not this policy’s business', () => {
     // The rule is about what a FIXTURE contains. Product code legitimately carries a
     // real address, a real host and a real id; a guard that could not tell the two
