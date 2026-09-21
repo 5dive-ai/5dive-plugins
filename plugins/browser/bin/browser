@@ -185,6 +185,14 @@ usage() {
                                       # SCHEDULE. Never one with a person in it or a
                                       # caller mid-action. The profile is untouched:
                                       # the next command starts it again, logged in.
+  5dive browser served                # which of this seat's browsers are running right now,
+                                      # one site per line. The dashboard reads it to
+                                      # decide whether to offer "Stop browser".
+  sudo 5dive browser forget <site>    # LOG THE BOX OUT: stop the browser, then DELETE the
+                                      # profile — the cookies, the session, the stamps.
+                                      # Irreversible, and the only way back is to log in
+                                      # again. Refuses while a person is in the viewer or
+                                      # a caller holds the lease.
   5dive browser viewer <site> --bind=<session> [--ttl=600]
                                       # mint a ONE-TIME, expiring link a person logs in through
   5dive browser viewer-redeem <site> --nonce=- --session=<id>
@@ -1728,6 +1736,98 @@ cmd_evict() {
     printf '  %-20s evicted: idle %ss (the profile is untouched; the next command restores it)\n' "$site" "$age"
   done
   (( dry )) || printf '%s browser(s) evicted\n' "$stopped"
+  return 0
+}
+
+# WHICH BROWSERS ARE UP, as one site per line and nothing else (DIVE-4791).
+#
+# WHY NOT A COLUMN IN `ls`. `ls` prints "<site>  <liveness stamp>" and the
+# dashboard PARSES that line — the API reads the stamp's ISO date and the probe's
+# word out of it. Appending "served" to it would have made every served site read
+# as never-probed on every box running today's API, which is a false "Not checked
+# yet" on a site that is fine. A separate verb also fails the right way on a box
+# whose plugin predates it: unknown verb, non-zero, and the dashboard offers no
+# Stop button rather than offering one that cannot work.
+cmd_served() {
+  _require_store
+  local d site
+  for d in "$(_seat_dir)"/*/; do
+    [[ -d "$d" ]] || continue
+    site=$(basename "$d")
+    _serve_running "$d" >/dev/null || continue
+    printf '%s\n' "$site"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------- forget
+#
+# DIVE-4791 — THE WAY OUT. Until this verb there was no way for a customer to log
+# their box out of a site: `serve --stop` keeps the profile (that is its whole
+# point) and `evict` is that same stop on a timer. The only path was a root-side
+# `rm -rf` of the seat's profile directory, which is not a path a product has.
+# lodar, 2026-09-21, on his own box: "there is no option to close the connected
+# website".
+#
+# IT IS THE DELETE, AND THE DELETE IS THE POINT. A profile is a credential: the
+# cookie jar in that directory is the login. Removing it is what "log the box out"
+# MEANS, and anything short of it — stopping the browser, revoking the view —
+# leaves the session replayable by anything that can read the directory. So this
+# is irreversible by construction and says so.
+#
+# THE TWO REFUSALS ARE EVICT'S, AND FOR EVICT'S REASON. A person at the viewer is
+# mid-login, and a caller under lease is mid-action; taking the profile out from
+# under either presents as the site being broken, except that here it is also
+# unrecoverable. "Idle" is not "nobody is there" (DIVE-4588's T24c).
+#
+# DELIBERATELY NOT A CONFIRMATION FLAG. The only non-human caller is the
+# dashboard, which asks the customer first, and a `--yes` the API must always
+# pass is a rail that protects nobody while reading like one. A human typing this
+# by hand types a site name, and a wrong name is refused, not deleted.
+cmd_forget() {
+  local site=""
+  while (($#)); do
+    case "$1" in
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser forget linkedin.com"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  # FORGETTING IS THE OWNER'S ACT, like serving. A brokered seat asking to forget
+  # the box login is asking to delete a credential it cannot even read, on behalf
+  # of every other seat using it.
+  _open_site "$site" --no-broker forget "forget DELETES that login for every seat that shares it, which only the seat that owns the profile may do."
+  local dir="$_SITE_DIR"
+  [[ -d "$dir" ]] || die "$E_UNAVAILABLE" "no profile for $site on this seat — nothing to forget"
+
+  if _viewer_live "$dir"; then
+    die "$E_UNAVAILABLE" "$site has a person in the viewer right now — close the view first (5dive browser viewer-revoke $site). Deleting a profile mid-login is not recoverable."
+  fi
+  if _lease_live "$dir"; then
+    die "$E_UNAVAILABLE" "$site is $(_lease_describe "$dir" | tr -d '\n') — deleting it now would take the browser out from under that caller."
+  fi
+
+  # Stop first, and through the SAME path `serve --stop` takes: it revokes the
+  # ticket before it kills anything, and it asks the daemon to close the context
+  # rather than SIGKILL a Chrome mid-write. A stop is idempotent, so a profile
+  # that was not being served is not an error here.
+  cmd_serve "$site" --stop >/dev/null 2>&1 || true
+
+  # THE AUDIT LINE GOES IN THE SEAT DIRECTORY, not the profile's. _audit_row
+  # appends to <profile>/.5dive-audit.jsonl, and the next line of this function
+  # deletes that directory — an audit trail destroyed by the event it records is
+  # not one.
+  _audit_row "$(_seat_dir)" forget "removed the $site profile"
+
+  # Stop offering it to the other seats (DIVE-4664): the box login this seat
+  # publishes is gone, and a stale offer reads as "you can use it, you do not log
+  # in again" for a profile that no longer exists.
+  rm -f "$(_rv_offer "$(_seat)" "$site")" "$(_rv_sock "$(_seat)" "$site")" 2>/dev/null || true
+
+  rm -rf -- "${dir:?}"
+  printf 'forgot %s. The login, the cookies and the liveness stamp are gone from this box; connect again to log back in.\n' "$site"
   return 0
 }
 
@@ -3375,6 +3475,8 @@ case "${1:-}" in
   tree)  shift; cmd_tree  "$@" ;;
   lease) shift; cmd_lease "$@" ;;
   evict) shift; cmd_evict "$@" ;;
+  served) shift; cmd_served "$@" ;;
+  forget) shift; cmd_forget "$@" ;;
   shot)  shift; cmd_shot  "$@" ;;
   read)  shift; cmd_read  "$@" ;;
   snapshot) shift; cmd_snapshot "$@" ;;

@@ -3987,5 +3987,119 @@ tc 'T28b (control) ls: ...and it listed the store, so this stdout is real' \
 tn 'T28b ls: no deprecation prose in that listing' 'deprecated' "$OUT"
 tn 'T28b ls: none on its stderr either' 'is deprecated; it ships from' "$ERR"
 
+# ============ T29 DIVE-4791: `served` (what is up) and `forget` (the way out) ==
+#
+# WHAT THESE ARE MUTANTS OF. Until this row a customer could start a browser from
+# the dashboard and then had NO control over it: the only Stop lived inside the
+# handover block and vanished on the next render, and there was no way at all to
+# log the box out of a site. Two verbs answer that, and the arms that matter are
+# the ones that must NOT delete — a profile is a credential and this delete is
+# the only irreversible act in the plugin.
+
+FGSITE=forgethost.test
+FGDIR="$(mkprofile "$FGSITE" "$LIVE_DOM")"
+
+# --- T29a `served` names a running browser, and only a running one ------------
+run "$BROWSER" served
+tn 'T29a a profile that is not being served is not in `served`' "$FGSITE" "$OUT"
+t  'T29a ...and asking is not an error' 0 "$RC"
+FGPIDS="$(mkserve "$FGDIR" "$(date -u +%s)")"
+run "$BROWSER" served
+tc 'T29a a served profile is named' "$FGSITE" "$OUT"
+t  'T29a ...as the bare site name, which is the whole parse contract' "$FGSITE" "$OUT"
+
+# --- T29a2 THE `ls` LINE FORMAT IS UNCHANGED, which is why `served` exists -----
+# The dashboard parses `ls` as "<site>  <iso> <state>". Had the served marker
+# been appended there, every served site would have read as never-probed on the
+# API running today — a false "Not checked yet" on a site that is fine.
+printf '2026-09-21T10:00:00Z authenticated\n' > "$FGDIR/.5dive-liveness"
+run "$BROWSER" ls
+# THIS SITE'S LINE, not the whole listing: `ls` also prints the box-offer block,
+# which says "not being served" about somebody else's profile. An arm that reads
+# the whole output would grade that sentence instead of this row's contract.
+FGLINE="$(printf '%s\n' "$OUT" | awk -v s="$FGSITE" '$1==s {print; exit}')"
+tc 'T29a2 ls still prints the stamp verbatim after the site' \
+   '2026-09-21T10:00:00Z authenticated' "$FGLINE"
+tn 'T29a2 ...and says nothing about serving in that line' 'served' "$FGLINE"
+t  'T29a2 ...so the line still parses as "<site>  <iso> <state>", which is what the API reads' 'parses' \
+   "$(printf '%s' "$FGLINE" | grep -qE "^[[:space:]]+$FGSITE[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z [a-z-]+$" && echo parses || echo "drifted:$FGLINE")"
+
+# --- T29b A PERSON IN THE VIEWER IS NEVER FORGOTTEN ---------------------------
+# The dangerous arm, and the reason it is first: this refusal is the difference
+# between "the login broke" and "the login is gone".
+sleep 300 & FGVNC=$!
+printf 'vnc_pid=%s\nws_pid=%s\nport=6080\nvnc_port=5900\n' "$FGVNC" "$FGVNC" > "$FGDIR/.5dive-viewer"
+run "$BROWSER" forget "$FGSITE"
+t  'T29b forgetting a profile with a person in it is refused' 69 "$RC"
+tc 'T29b ...and says how to get out of it' 'viewer-revoke' "$ERR"
+t  'T29b ...and the profile is still there' 'yes' "$([[ -d "$FGDIR" ]] && echo yes || echo no)"
+t  'T29b ...cookie jar and all' 'yes' "$([[ -f "$FGDIR/.fake-dom" ]] && echo yes || echo no)"
+rm -f "$FGDIR/.5dive-viewer"; kill "$FGVNC" 2>/dev/null; wait "$FGVNC" 2>/dev/null
+
+# --- T29c A CALLER MID-ACTION IS NEVER FORGOTTEN ------------------------------
+sleep 300 & FGHOLD=$!
+mkdir -p "$FGDIR/.5dive-lease"
+printf 'token=t\nholder=otherseat\nholder_pid=%s\nkind=agent\npurpose=publish\nacquired_at=%s\nexpires_at=%s\n' \
+  "$FGHOLD" "$(date -u +%s)" "$(( $(date -u +%s) + 600 ))" > "$FGDIR/.5dive-lease/meta"
+run "$BROWSER" forget "$FGSITE"
+t  'T29c forgetting a browser under a live lease is refused' 69 "$RC"
+tc 'T29c ...and names who holds it' 'held by otherseat' "$ERR"
+t  'T29c ...and the profile is still there' 'yes' "$([[ -d "$FGDIR" ]] && echo yes || echo no)"
+kill "$FGHOLD" 2>/dev/null; wait "$FGHOLD" 2>/dev/null
+rm -rf "${FGDIR:?}/.5dive-lease"
+
+# --- T29d the delete itself: the browser stops AND the credential goes --------
+# `serve --stop` alone leaves the cookie jar on disk, which is the session
+# replayable by anything that can read the directory. "Log the box out" is the
+# directory going away; anything less is the feature not existing.
+run "$BROWSER" forget "$FGSITE"
+t  'T29d forget exits 0' 0 "$RC"
+t  'T29d ...the profile directory is gone' 'no' "$([[ -d "$FGDIR" ]] && echo yes || echo no)"
+tc 'T29d ...and it says the login is gone' 'connect again' "$OUT"
+run "$BROWSER" ls
+tn 'T29d ...so `ls` no longer lists it' "$FGSITE" "$OUT"
+run "$BROWSER" served
+tn 'T29d ...and neither does `served`' "$FGSITE" "$OUT"
+for p in $FGPIDS; do kill "$p" 2>/dev/null; done
+
+# --- T29e the audit line SURVIVES the delete it records -----------------------
+# _audit_row appends to <profile>/.5dive-audit.jsonl, and this verb deletes that
+# directory. An audit trail destroyed by the event it records is not one.
+t 'T29e forget records itself in the seat store, not in the directory it removed' 'yes' \
+  "$(grep -q '"event":"forget"' "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/.5dive-audit.jsonl" 2>/dev/null && echo yes || echo no)"
+tc 'T29e ...and the line names the site' "$FGSITE" \
+   "$(cat "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/.5dive-audit.jsonl" 2>/dev/null)"
+
+# --- T29f a site that is not here is a refusal, not a silent success ----------
+run "$BROWSER" forget neverhere.test
+t  'T29f forgetting a profile that does not exist is refused' 69 "$RC"
+run "$BROWSER" forget 'not a site'
+t  'T29f an unusable profile name is a usage error, not a path' 64 "$RC"
+run "$BROWSER" forget
+t  'T29f forget with no site names the site it wants' 64 "$RC"
+tc 'T29f ...by example' '5dive browser forget' "$ERR"
+
+# --- T29g the box offer goes with it (DIVE-4664) ------------------------------
+# A stale `.offered` tells every other seat "you use it, you do not log in
+# again" about a profile that no longer exists.
+OFSITE=offerhost.test
+OFDIR="$(mkprofile "$OFSITE" "$LIVE_DOM")"
+# The plugin derives SESSION_ROOT from the profile root's parent when the env
+# does not name one, and this harness does not name one.
+SESSROOT="${FIVEDIVE_BROWSER_PROFILE_ROOT%/*}/browser-sessions"
+mkdir -p "$SESSROOT/$SEAT"
+printf 'site=%s\nowner=%s\n' "$OFSITE" "$SEAT" > "$SESSROOT/$SEAT/$OFSITE.offered"
+run "$BROWSER" forget "$OFSITE"
+t 'T29g forget exits 0' 0 "$RC"
+t 'T29g ...and the box offer for it is withdrawn' 'no' \
+  "$([[ -f "$SESSROOT/$SEAT/$OFSITE.offered" ]] && echo yes || echo no)"
+
+# --- T29h the verbs are reachable, and documented -----------------------------
+tc 'T29h forget is dispatched' 'forget) shift; cmd_forget' "$(cat "$BROWSER")"
+tc 'T29h served is dispatched' 'served) shift; cmd_served' "$(cat "$BROWSER")"
+run bash "$BROWSER" --help
+tc 'T29h --help tells a person forget deletes the login' 'forget <site>' "$OUT$ERR"
+tc 'T29h ...and that it is the box logging out' 'LOG THE BOX OUT' "$OUT$ERR"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
