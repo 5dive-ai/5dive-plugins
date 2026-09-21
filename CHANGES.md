@@ -1,5 +1,22 @@
 ## Unreleased
 
+### Fixed — `browser setup` refuses to mint a probe timer for an account the registry does not know (DIVE-4730), browser 1.9.1
+
+`setup` mints `5dive-browser-probe@<seat>.timer`, a per-seat unit that **outlives the
+account**. On box 10 (`5dive-exact-swallow`) one has fired every six hours since 2026-09-16
+for `agent-mp` — a de-registered account whose unix user survived, one of nine orphans
+`5dive doctor --category=registry` already names. It has failed on every fire (the account is
+outside the shared group, so it cannot read the box plugin record either) into a journal
+nobody reads, and nothing on the dashboard shows it, because the dashboard lists the
+**registry**, not `/etc/passwd`.
+
+`setup` now refuses **before the store is made** when the seat is an `agent-*` account the
+registry has measured as absent, and names the reap rather than a workaround. The predicate
+is narrow in both directions: `agent-*` only (`claude` and operator accounts are not registry
+rows and never were), and a registry it could not read or parse **fails open** — a dev box is
+not evidence that an account was de-registered. `FIVEDIVE_BROWSER_ALLOW_UNREGISTERED_SEAT=1`
+is the documented one-off override.
+
 ### Added — a table-driven tool-call policy guard (DIVE-4696), mod 0.4.0
 
 Every rule in the fleet's `CLAUDE.md` files is paid on **every turn** (~1100 loads/day per the

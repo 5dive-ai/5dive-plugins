@@ -490,11 +490,51 @@ EOF
     || die "$E_UNAVAILABLE" "profile store is ready, but the scheduled browser probe could not be enabled"
 }
 
+# _seat_is_deregistered <seat> — DIVE-4730. TRUE only when the seat is an
+# `agent-*` account that this box's registry has MEASURED as absent.
+#
+# The defect: `setup` mints `5dive-browser-probe@<seat>.timer`, a per-seat unit
+# that outlives the seat. On box 10 (5dive-exact-swallow) one fired every six
+# hours from 2026-09-16 for `agent-mp` — a de-registered account whose unix user
+# survived, one of nine orphans `5dive doctor --category=registry` already
+# names. It failed on every fire (the account is outside the shared group, so it
+# cannot read the box plugin record either) into a journal nobody reads, and no
+# tile exists for it because the dashboard lists the REGISTRY. A unit minted
+# from a unix account inherits every orphan the registry has forgotten.
+#
+# THE PREDICATE IS NARROW ON PURPOSE, in both directions:
+#   - `agent-*` only. `claude`, and any operator account a human runs setup
+#     from, are not registry rows and never were; refusing them would break the
+#     ordinary case to fix a fleet one.
+#   - a registry we could not READ or PARSE fails OPEN. A dev box, a box that
+#     has never run `5dive agent create`, a box with no jq — none of those is
+#     evidence that this seat was de-registered, and refusing on "we could not
+#     check" would take setup out on every one of them. The caller says so
+#     out loud rather than letting the skipped check read as a pass.
+_seat_is_deregistered() {
+  local seat="$1" reg name verdict
+  [[ "$seat" == agent-* ]] || return 1
+  name="${seat#agent-}"
+  reg="${FIVEDIVE_AGENT_REGISTRY:-$STATE_DIR/agents.json}"
+  [[ -r "$reg" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  verdict=$(jq -r --arg n "$name" \
+    'if (.agents|type) != "object" then "unknown" elif (.agents|has($n)) then "in" else "out" end' \
+    "$reg" 2>/dev/null) || return 1
+  [[ "$verdict" == out ]]
+}
+
 cmd_setup() {
   [[ "$(id -u)" == 0 ]] || die "$E_PERM" "setup creates a root-owned store and a seat-owned subdirectory under it. Run: $SETUP_CMD"
   local seat; seat="$(_seat)"
   [[ "$seat" != root ]] || die "$E_USAGE" "refusing to make root a browser seat — run this via sudo from the seat that will own the profiles, so SUDO_USER names it."
   id -u "$seat" >/dev/null 2>&1 || die "$E_USAGE" "no unix user '$seat' — a profile is owned by a real uid or it is not isolated."
+  # DIVE-4730 — a unix account is not a seat. Refuse BEFORE the store is made:
+  # the timer is the lasting artifact, and a store for an account nobody will
+  # ever run is a directory of credentials with no owner.
+  if [[ -z "${FIVEDIVE_BROWSER_ALLOW_UNREGISTERED_SEAT:-}" ]] && _seat_is_deregistered "$seat"; then
+    die "$E_USAGE" "'$seat' is a unix account with NO entry in this box's agent registry, so it is not a seat — it is an orphan (\`5dive doctor --category=registry\` lists them). Refusing to mint a six-hourly probe timer for it: the unit outlives the account, fails on every fire into a journal nobody reads, and nothing on the dashboard shows it, because the dashboard lists the registry. Reap it (sudo 5dive doctor --category=registry --fix) or, if this account really should be a seat, register it first. To override for a one-off, set FIVEDIVE_BROWSER_ALLOW_UNREGISTERED_SEAT=1."
+  fi
   mkdir -p "$PROFILE_ROOT" || die "$E_UNAVAILABLE" "cannot create $PROFILE_ROOT"
   chown root:root "$PROFILE_ROOT" 2>/dev/null || true
   chmod 00711 "$PROFILE_ROOT"        # traverse, do not list (5-digit: clears an inherited setgid, DIVE-4348)
