@@ -1,5 +1,38 @@
 ## Unreleased
 
+### Fixed — the registry copy is now a BYTE-FOR-BYTE mirror of 5dive-ai/5dive-browser at 1.10.3 (DIVE-4835), browser 1.10.3
+
+**DIVE-4813 reached zero boxes.** The admin-tier fix — an admin agent starts the box login's
+browser itself instead of handing a human a `sudo -u` it cannot run — merged in the maintained
+repository as 1.10.3 and stopped there. Seven of the eight customer boxes DIVE-4800 measured are
+keyed `browser@5dive-plugins`, `plugin upgrade` cannot cross marketplaces, and the converge's
+`plugin add 5dive-ai/5dive-browser` is refused on such a box because a second plugin would claim
+the `browser` verb. So those boxes could not reach 1.10.3 — and raising the converger floor to
+1.10.3 ahead of this port wrote `DEGRADED — serve will REFUSE` on them, reproduced on wavy-mesa at
+08:09Z.
+
+**What changed, and it is more than DIVE-4813.** DIVE-4797 aligned this copy's VERSION NUMBER to
+1.10.2 without aligning its bytes, and said so in the manifest. The gap it left was never one fix:
+this copy was also missing DIVE-4674 (the `run`/`tree` settle), DIVE-4694/4730 (the de-registered
+seat refusal), and DIVE-4794 (the single-page-app probe, the `web.telegram.org` adapter, and the
+`logged_in_when_dom_matches` marker) — all shipped in the maintained repo between 1.10.1 and
+1.10.3. `plugins/browser/` is now `rsync -a --delete` identical to that repo's `browser/` at its
+`main`, `.claude-plugin/plugin.json` included, so `diff -r` between the two trees is EMPTY.
+
+**The deprecation notice moved rather than disappearing.** A hand-kept divergence is exactly what
+let the last two ports drift, so the copy carries none: the `_deprecated()` stderr line in
+`bin/browser` and the `DEPRECATED —` prefix in the plugin's own manifest are gone, and the notice
+now lives only in this registry's `marketplace.json` entry, which is registry-only by construction
+and cannot be overwritten by the next port. This is deliberate and it is a trade: an operator who
+runs `5dive browser --help` on a box keyed here no longer sees the migrate-away line. It was advice
+those boxes cannot act on anyway — the converge refuses to re-home a registry-keyed box by design
+("never behind the operator's back"), so migrating is a manual remove-then-add, and whether that
+re-homing ever happens automatically is an open call.
+
+**A browser release is THREE deliveries, in this order:** the maintained repo, this copy at the
+same version, then the `_BS_PLUGIN_MIN` bump in the api. The floor is `min()` over both copies.
+`community/wiki/a-forked-plugin-makes-the-converger-floor-a-min-over-both-copies.md`.
+
 ### Changed — the frozen browser copy is aligned to 1.10.2 so one converger floor covers both copies (DIVE-4797), browser 1.10.2
 
 No code change. `served` and `forget` landed here at **1.10.0** (DIVE-4791, #106) and reached zero

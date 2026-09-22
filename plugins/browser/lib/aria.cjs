@@ -267,6 +267,52 @@ async function resolveSelector(page, sel) {
   return isRef(sel) ? resolveRef(page, sel) : sel;
 }
 
+// ---- a ref that is not there YET (DIVE-4674) --------------------------------
+//
+// THE DEFECT. `resolveRef` walks the page ONCE and throws, and the step loops
+// resolved every selector through it before the switch. So a CSS `wait_for`
+// polled for the whole step timeout via page.waitForSelector, and a ref
+// `wait_for` — the same instruction, written the way this plugin tells agents to
+// write it — probed for 0 ms and failed. Measured on a GitHub issue page: `tree`
+// at the default settle showed 54 nodes and no textbox, at settle=6000 it showed
+// 76 including `textbox/Add a comment`, and `run` (which had no settle at all)
+// resolved ~50 ms after domcontentloaded and reported that no textbox was on the
+// page at all. The refusal was accurate about the instant it looked at and wrong
+// about the page.
+//
+// THE LAST ERROR IS RETHROWN UNCHANGED, deliberately. Its message is the one
+// that names the refs that ARE on the page, and the exit-code contract downstream
+// keys on `refMiss` — a wrapper saying "timed out" would lose the hint the
+// operator reads and the 70-on-step-one that stops a phantom re-read.
+async function resolveRefWithin(page, sel, { timeoutMs = 30000, pollMs = 250 } = {}) {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  for (;;) {
+    try {
+      return await resolveRef(page, sel);
+    } catch (e) {
+      // Only a refMiss is worth waiting out. Anything else (a closed page, a
+      // navigation mid-walk) is not going to resolve by being asked again.
+      if (!e.refMiss || Date.now() >= deadline) throw e;
+      await new Promise((r) => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+    }
+  }
+}
+
+// WHICH STEPS WAIT, and why it is only this one. `wait_for` exists to say "the
+// page is not ready yet"; giving it the poll makes a ref `wait_for` mean what a
+// CSS `wait_for` already meant. `fill`/`click`/`press`/`select`/`upload` keep the
+// one-shot resolve: an adapter that needs to wait says so with a `wait_for`
+// step, and a `click` that hovered for thirty seconds would turn "this is not the
+// page `tree` described" into the same wrong answer, thirty seconds later, inside
+// somebody's live account.
+async function resolveStepSelector(page, step, { timeoutMs = 30000, pollMs = 250 } = {}) {
+  const sel = step.selector;
+  if (sel === undefined) return undefined;
+  if (!isRef(sel)) return sel;
+  if (step.op === 'wait_for') return resolveRefWithin(page, sel, { timeoutMs, pollMs });
+  return resolveRef(page, sel);
+}
+
 function render(nodes, { json = false } = {}) {
   if (json) return JSON.stringify({ nodes }, null, 2);
   const w = nodes.reduce((m, n) => Math.max(m, n.role.length), 0);
@@ -276,4 +322,5 @@ function render(nodes, { json = false } = {}) {
   }).join('\n');
 }
 
-module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector, isRef, render, REF_PREFIX };
+module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
+  resolveRefWithin, resolveStepSelector, isRef, render, REF_PREFIX };

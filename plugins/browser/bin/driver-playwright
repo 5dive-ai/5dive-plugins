@@ -118,6 +118,21 @@ const STEPS = {
 };
 const STEP_TIMEOUT = Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || 30000);
 
+// THE SETTLE `run` DID NOT HAVE (DIVE-4674). `tree` and `snapshot` wait after
+// domcontentloaded because a live page is still assembling itself there; `run`
+// went from `goto` straight to the next step, so the very refs `tree` printed at
+// a settle were resolved by `run` about fifty milliseconds after DCL and missed.
+// Same knob, same bound, same reason it is NEVER `waitUntil: 'networkidle'` — a
+// web app that long-polls never idles, and waiting for it is what made a `read`
+// hang for 150s on a real box.
+//
+// A FLOOR, NOT A FIX. The settle is how long the page is given before anyone
+// looks; a genuinely late element is `wait_for`'s job, which now actually waits.
+const RUN_SETTLE_MS = Number(
+  process.env.FIVEDIVE_BROWSER_RUN_SETTLE_MS
+  || process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS
+  || 1200);
+
 // ---- THE LEASE, RE-READ BEFORE EVERY STEP (DIVE-4588) -----------------------
 //
 // bin/browser holds a per-site lease for the whole of this run and hands its
@@ -236,7 +251,7 @@ function loadPlaywright() {
   {
     die(E_NOTHING_RAN, `playwright-core is not installed for this seat, so there is no executor. ` +
       `Install the pinned version next to the plugin:  npm install --prefix ` +
-      `${__dirname}/..  (it is pinned in plugins/browser/package.json). ` +
+      `${__dirname}/..  (it is pinned in the plugin's package.json). ` +
       `This driver does NOT fall back to a throwaway browser: a run that is not inside the profile a ` +
       `person logged into by hand is not the thing that was asked for.`);
   }
@@ -440,10 +455,16 @@ async function main() {
       // BEFORE THE RESOLVE AND BEFORE THE COUNTER. Both of those touch the page,
       // and the whole point is to touch nothing once the browser is someone else's.
       assertLease(where);
-      const sel = s.selector === undefined ? undefined : await aria.resolveSelector(page, s.selector);
+      // A ref `wait_for` WAITS, like its CSS twin always did (DIVE-4674). The
+      // choice of which ops wait lives in lib/aria.cjs, shared by this loop and
+      // the other one, because the defect was that there are two of them.
+      const sel = await aria.resolveStepSelector(page, s, { timeoutMs: STEP_TIMEOUT });
       stepsRun++;  // entered, not completed — see stepsRun above
       switch (s.op) {
-        case 'goto':     await page.goto(s.url, { waitUntil: 'domcontentloaded' }); break;
+        case 'goto':
+          await page.goto(s.url, { waitUntil: 'domcontentloaded' });
+          if (RUN_SETTLE_MS > 0) await page.waitForTimeout(RUN_SETTLE_MS);
+          break;
         case 'fill':     await page.fill(sel, s.value); break;
         case 'click':    await page.click(sel); break;
         case 'wait_for': await page.waitForSelector(sel); break;

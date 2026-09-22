@@ -4,7 +4,8 @@
   "probe": {
     "url": "https://example.com/feed",
     "logged_out_when_dom_matches": "(action=[\"']?/login|id=[\"']?login-form|data-testid=[\"']?signin)",
-    "_comment": "The probe reads the DUMPED DOM, not the address bar — so the marker must be something a login PAGE contains and a logged-in page does not. Not the words 'Sign in': those appear on plenty of logged-in pages, and a probe that false-alarms daily is a probe a human learns to ignore."
+    "logged_in_when_dom_matches": "(id=[\"']?app-shell|data-testid=[\"']?account-menu)",
+    "_comment": "The probe reads the DUMPED DOM, not the address bar — so the marker must be something a login PAGE contains and a logged-in page does not. Not the words 'Sign in': those appear on plenty of logged-in pages, and a probe that false-alarms daily is a probe a human learns to ignore. `logged_in_when_dom_matches` is OPTIONAL and is for a SINGLE-PAGE APP (DIVE-4794): a site that serves one static shell for both states and decides which it is in JavaScript is not classifiable from the absence of a login form, because at the moment the probe looks the live page has not said anything yet. Naming what a LOGGED-IN page looks like does two things: the probe keeps looking until one marker or the other appears, and a page that shows neither within the budget is UNKNOWN instead of `authenticated` by elimination. Leave it out for a server-rendered site — the wait exists only where there is something to wait for, and an adapter without it probes exactly once."
   },
   "actions": {
     "publish": {

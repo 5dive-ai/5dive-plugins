@@ -118,6 +118,38 @@ const STEPS = {
 };
 const STEP_TIMEOUT = Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || 30000);
 
+// THE SETTLE `run` DID NOT HAVE (DIVE-4674). `tree` and `snapshot` wait after
+// domcontentloaded because a live page is still assembling itself there; `run`
+// went from `goto` straight to the next step, so the very refs `tree` printed at
+// a settle were resolved by `run` about fifty milliseconds after DCL and missed.
+// Same knob, same bound, same reason it is NEVER `waitUntil: 'networkidle'` — a
+// web app that long-polls never idles, and waiting for it is what made a `read`
+// hang for 150s on a real box.
+//
+// A FLOOR, NOT A FIX. The settle is how long the page is given before anyone
+// looks; a genuinely late element is `wait_for`'s job, which now actually waits.
+const RUN_SETTLE_MS = Number(
+  process.env.FIVEDIVE_BROWSER_RUN_SETTLE_MS
+  || process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS
+  || 1200);
+
+// THE WARM PATH HAS TO TAKE THE FLAG TOO (DIVE-4674). The daemon is a long-lived
+// process started before the caller typed anything, so an env var set on THIS
+// invocation of bin/browser cannot reach it — which is why `snapshot --settle`
+// was silently dropped on a served profile while working cold. The knob travels
+// in the request instead, and a request that does not carry one falls back to the
+// daemon's own environment, exactly as before.
+const settleOf = (req, fallback) => {
+  const n = Number(req && req.settle);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+const TREE_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200);
+
+// HOW LONG A PROBE MAY WAIT FOR THE PAGE TO SAY WHICH STATE IT IS IN
+// (DIVE-4794). Spent only while NOTHING is known — the loop returns the instant
+// any marker matches — so an adapter that answers at DCL pays nothing for it.
+const PROBE_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_PROBE_WAIT_MS || 8000);
+
 function die(code, msg) { process.stderr.write(`${PROG}: ${msg}\n`); process.exit(code); }
 
 // Identical to the driver's, and deliberately a second literal copy rather than a
@@ -383,20 +415,67 @@ async function pageOf(ctx) {
 // navigating it to run a background health check would yank a person's browser
 // out from under them mid-login, which is the one thing every other path here
 // refuses to do.
+//
+// ...AND A SINGLE-PAGE APP HAS NOT DECIDED ITS LOGIN STATE AT DCL+800ms
+// (DIVE-4794). Telegram Web ships ONE static shell for both states — body
+// carries `has-auth-pages` in the bytes the server sends — and the app removes
+// it only after its own network init decides it is logged in. Dumped at the
+// probe's old fixed settle, a LIVE session and a DEAD one were byte-identical
+// in the fields that matter, so an adapter marker written against the shell
+// stamped `expired` on a live login (measured 2026-09-21, 16:58Z) and every
+// acting verb then refused. No regex can separate two identical documents; the
+// missing thing was the WAIT.
+//
+// THE DAEMON DOES NOT CLASSIFY — IT ONLY KNOWS WHEN TO STOP WAITING. The
+// markers travel in the request purely as an early exit; the verdict is still
+// bin/browser's, made by grepping the document that comes back. That split is
+// deliberate: two regex engines (grep -E here, JS RegExp there) must never be
+// able to disagree about a LOGIN, so only one of them is allowed to decide.
+// A request carrying no markers waits exactly as it did before.
+const reOf = (p) => {
+  if (typeof p !== 'string' || !p) return null;
+  try { return new RegExp(p, 'i'); } catch (e) { return null; }  // bin/browser greps it anyway
+};
+
 async function probeRequest(ctx, req, send, end) {
   if (typeof req.url !== 'string' || !/^https?:\/\//.test(req.url)) {
     send({ t: 'err', msg: 'probe needs an http(s) url to load' }); return end(E_NOTHING_RAN);
   }
+  const settle = Number(process.env.FIVEDIVE_BROWSER_PROBE_SETTLE_MS || 800);
+  const until = (req.until && typeof req.until === 'object') ? req.until : {};
+  const positive = reOf(until.logged_in);
+  const marks = [reOf(until.challenge), reOf(until.logged_out), positive].filter(Boolean);
+  // THE POSITIVE MARKER IS WHAT MAKES A WAIT TERMINATE, so it is also what
+  // permits one. Every request carries a challenge marker (bin/browser has a
+  // built-in default for it), so keying the wait on "any marker" would make
+  // every probe on the box pay up to eight seconds to reach the answer it
+  // already had — including the server-rendered adapters that classify on the
+  // absence of a login form. Without a logged-in marker this is the old single
+  // settle to the millisecond.
+  const deadline = positive
+    ? Math.max(settle, Number(req.wait) > 0 ? Number(req.wait) : PROBE_WAIT_MS)
+    : settle;
+  const step = Math.min(Number(process.env.FIVEDIVE_BROWSER_PROBE_POLL_MS || 400), Math.max(1, deadline));
   let page;
   try {
     page = await ctx.newPage();
     page.setDefaultTimeout(Number(process.env.FIVEDIVE_BROWSER_PROBE_TIMEOUT || 20000));
     await page.goto(req.url, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_PROBE_SETTLE_MS || 800));
     // THE WHOLE DOCUMENT, uncapped, like the cold probe: a challenge banner is
     // as likely to be late in a large DOM as early, and a truncating capture
     // cannot see a marker past the cap. bin/browser greps what comes back.
-    const html = await page.content();
+    await page.waitForTimeout(settle);
+    let html = await page.content();
+    let waited = settle;
+    // NEVER `networkidle`: a web app that long-polls never idles, and waiting
+    // for it is what made a `read` hang for 150s on a real box. The evidence
+    // itself is the signal instead — the first document in which the page has
+    // said something about its login state is the one we answer with.
+    while (waited < deadline && !marks.some(r => r.test(html))) {
+      await page.waitForTimeout(step);
+      waited += step;
+      html = await page.content();
+    }
     send({ t: 'out', data: html.endsWith('\n') ? html : html + '\n' });
     end(0);
   } catch (e) {
@@ -461,7 +540,7 @@ async function treeRequest(ctx, req, send, end) {
     await page.goto(req.url, { waitUntil: 'domcontentloaded' });
     // NEVER network idle: a live web app long-polls and never idles — that is
     // what makes a `read` hang for 150s on a real Gmail.
-    await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
+    await page.waitForTimeout(settleOf(req, TREE_SETTLE_MS));
     const { nodes } = await aria.walk(page, { interactiveOnly: !!req.interactive });
     send({ t: 'out', data: JSON.stringify({ url: req.url, nodes }) + '\n' });
     end(0);
@@ -489,28 +568,53 @@ async function treeRequest(ctx, req, send, end) {
 // inside this seat's own 0700 artifact directory, which bin/browser made — so
 // this adds no reach, and it keeps a multi-megabyte document out of a protocol
 // framed as JSON lines.
+//
+// ...EXCEPT THAT A BROKERED CALLER IS NOT THIS SEAT (DIVE-4794). The paragraph
+// above assumes the artifact directory was made by the same seat the daemon
+// runs as. Under the box login it was not: `bin/browser` makes its staging
+// directory 0700 to the CALLER, and the daemon — the profile's owner — cannot
+// write into it. So every brokered `snapshot` died with
+// `EACCES: permission denied, open '/tmp/5dive-browser-read.XXXX/page.html'`,
+// which is the verb the skill tells an agent to reach for first, dark for every
+// seat that does not own the login (measured on a box, 2026-09-21).
+//
+// `inline` IS THE BROKERED SHAPE, and it is the same trade `render` already
+// made: the bytes come back over the socket and the CALLER writes them, in a
+// directory it owns, at a path the daemon never learns. That keeps the fix on
+// the right side of DIVE-4662 — the alternative (the caller hands over a path,
+// the owner widens it or writes there anyway) is the owning seat writing a
+// caller-chosen path, which is the rig that row said not to ship.
 async function snapshotRequest(ctx, req, send, end) {
   if (typeof req.url !== 'string' || !/^https?:\/\//.test(req.url)) {
     send({ t: 'err', msg: 'snapshot needs an http(s) url to capture' }); return end(E_NOTHING_RAN);
   }
-  if (typeof req.html !== 'string' || !req.html.startsWith('/')) {
-    send({ t: 'err', msg: 'snapshot needs an absolute path to write the captured document to' });
+  const inline = !!req.inline;
+  if (!inline && (typeof req.html !== 'string' || !req.html.startsWith('/'))) {
+    send({ t: 'err', msg: 'snapshot needs an absolute path to write the captured document to, or inline:true to have the bytes returned' });
     return end(E_NOTHING_RAN);
   }
   try {
     const page = await pageOf(ctx);
     assertLease(req, 'snapshot');
     await page.goto(req.url, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
+    await page.waitForTimeout(settleOf(req, TREE_SETTLE_MS));
     const snap = await aria.snapshot(page, { interactiveOnly: !!req.interactive });
-    fs.writeFileSync(req.html, snap.html || '', { mode: 0o600 });
-    if (req.shot) await page.screenshot({ path: req.shot, fullPage: !!req.full });
+    let png = null;
+    if (!inline) {
+      fs.writeFileSync(req.html, snap.html || '', { mode: 0o600 });
+      if (req.shot) await page.screenshot({ path: req.shot, fullPage: !!req.full });
+    } else if (req.shot) {
+      const buf = await page.screenshot({ fullPage: !!req.full });
+      png = Buffer.isBuffer(buf) ? buf.toString('base64') : Buffer.from(String(buf)).toString('base64');
+    }
     send({ t: 'out', data: JSON.stringify({
       url: snap.url || req.url,
       title: snap.title || '',
       nodes: snap.nodes || [],
       html_bytes: Buffer.byteLength(snap.html || ''),
-      png: req.shot || null,
+      png: inline ? null : (req.shot || null),
+      html_inline: inline ? (snap.html || '') : undefined,
+      png_b64: png,
     }) + '\n' });
     end(0);
   } catch (e) {
@@ -571,10 +675,18 @@ async function planRequest(ctx, req, send, end) {
       // BEFORE THE RESOLVE AND BEFORE THE COUNTER. Both touch the page, and the
       // point is to touch nothing once the browser is someone else's.
       assertLease(req, where);
-      const sel = s.selector === undefined ? undefined : await aria.resolveSelector(page, s.selector);
+      // A ref `wait_for` WAITS, like its CSS twin always did (DIVE-4674). The
+      // choice of which ops wait lives in lib/aria.cjs, shared by this loop and
+      // the other one, because the defect was that there are two of them.
+      const sel = await aria.resolveStepSelector(page, s, { timeoutMs: STEP_TIMEOUT });
       stepsRun++;
       switch (s.op) {
-        case 'goto':     await page.goto(s.url, { waitUntil: 'domcontentloaded' }); break;
+        case 'goto': {
+          await page.goto(s.url, { waitUntil: 'domcontentloaded' });
+          const ms = settleOf(req, RUN_SETTLE_MS);
+          if (ms > 0) await page.waitForTimeout(ms);
+          break;
+        }
         case 'fill':     await page.fill(sel, s.value); break;
         case 'click':    await page.click(sel); break;
         case 'wait_for': await page.waitForSelector(sel); break;
@@ -619,7 +731,16 @@ function callMode(sock) {
       if (f.t === 'log') process.stderr.write(f.line + '\n');
       else if (f.t === 'err') process.stderr.write(`${PROG}: ${f.msg}\n`);
       else if (f.t === 'out') process.stdout.write(f.data);
-      else if (f.t === 'end') { ended = true; conn.end(); process.exit(f.rc); }
+      // NEVER `process.exit` HERE (DIVE-4794). stdout is a PIPE for every caller
+      // that reads us — bin/browser runs this inside `$( … )` — and a pipe write
+      // over the OS buffer (~64 KB) is queued, not done. `process.exit` drops
+      // whatever is still queued, so a brokered `read` or `render` of a real
+      // page came back CUT: the caller's jq said `parse error: Unfinished string
+      // at EOF` and the verb died on a capture that had actually succeeded.
+      // Measured on a box 2026-09-21; invisible to any test whose payload fits
+      // in the buffer. Setting the code and ending the socket lets node flush
+      // and exit on its own, which is the only exit that cannot truncate.
+      else if (f.t === 'end') { ended = true; process.exitCode = f.rc; conn.end(); }
     }
   });
   // A DAEMON THAT DIES MID-REQUEST IS NOT A ZERO. Without this the socket simply

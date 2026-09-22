@@ -19,6 +19,8 @@ than a detail.
 5dive browser probe-all             # scheduled sweep; served profiles are skipped
 5dive browser ls                    # profiles, and when each was last seen alive
 5dive browser run <site> <action> [--key=value ...]
+5dive browser tree <site> <url> [--settle=<ms>]   # refs; --settle also on snapshot,
+                                                  # --page-settle on run
 ```
 
 ## Server mode: the browser lives on the box, you reach it through a one-time link
@@ -227,6 +229,20 @@ without a scheduled probe the agent finds out **mid-publish**. So:
   including a profile nobody had ever logged into, which is what the dashboard's Connected-sites
   tile then showed. A challenge is still named without an adapter (that marker has a default), so
   the one classification that does work with no adapter is not lost.
+- **A SINGLE-PAGE APP NEEDS A POSITIVE MARKER, AND THE PROBE WAITS FOR IT** (DIVE-4794). Telegram
+  Web serves ONE static shell for both states — `has-auth-pages` is in the bytes the server sends —
+  and removes it in JavaScript after its own network init decides it is logged in. Dumped at
+  domcontentloaded plus a fixed settle, a live session and a dead one are the same document, so a
+  marker written against the shell stamped `expired` on a live login and every acting verb refused.
+  Two changes, and they only work as a pair:
+  - an adapter may name `probe.logged_in_when_dom_matches` — what a LOGGED-IN page looks like;
+  - where it does, the probe keeps looking (up to `FIVEDIVE_BROWSER_PROBE_WAIT_MS`, default 8000,
+    returning the instant either marker appears) and a page that shows NEITHER is `UNKNOWN`, never
+    `authenticated` by elimination. That is the fail-closed half: `run` and `shot` still refuse.
+
+  An adapter with no positive marker is untouched — one look, classified on the negative alone —
+  because without something to terminate on, waiting only adds a chrome launch to reach the same
+  answer.
 - **A served profile is not probed.** Chrome allows one instance per profile directory, so a probe
   launched at a profile `serve` is holding is handed off to the running browser and returns an
   empty document. `status` says `UNKNOWN (served on :N …)` and leaves the last real verdict
@@ -305,7 +321,7 @@ promise — it does not scroll-stitch a page.
 ### `browser snapshot` — one cycle, one page instant, everything a decision needs
 
 ```
-5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full]
+5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full] [--settle=<ms>]
 ```
 
 Before an agent acts on a page it reads the same three things: **what it can click** (`tree`),
@@ -382,6 +398,36 @@ owner's own box, running the owner's own login, to their own product. That is a 
 machine they own a session to a service they own. It is not a template for anyone else's account,
 and it is not a reason to log a 5dive box into a third party's personal profile.
 
+### The settle — a floor on when anyone looks, not a fix for a late element
+
+```
+5dive browser tree     <site> <url> [--settle=<ms>]
+5dive browser snapshot <site> <url> [--settle=<ms>]
+5dive browser run      <site> <action> [--page-settle=<ms>] [--key=value ...]
+```
+
+`tree`, `snapshot` and `run` all wait after `domcontentloaded` before anything looks at the page,
+because a live application is still assembling itself there. The default is **1200 ms**
+(`FIVEDIVE_BROWSER_TREE_SETTLE_MS`, and `FIVEDIVE_BROWSER_RUN_SETTLE_MS` for `run`, which falls back
+to it). It is deliberately **never** `waitUntil: 'networkidle'`: a web app that long-polls never
+idles, and waiting for one is what made a `read` hang for 150 seconds on a real box.
+
+The number is worth setting, and here is a measurement rather than an opinion. On a GitHub issue
+page, 2026-09-20: the default `tree` returned **54 nodes and no textbox**; `--settle=6000` returned
+**76**, including `textbox/Add a comment` and `button/Comment`. An adapter quoting the refs from the
+second tree is quoting refs the first one could not see.
+
+**On `run` the flag is `--page-settle`, and the dash is the reason.** Every other `--key=value` on a
+`run` command line is an *adapter argument*, so `--settle` there would be indistinguishable from an
+adapter with a `{settle}` placeholder — the same collision `--lease-wait` exists to avoid. A
+placeholder name is `[a-zA-Z0-9_]+`, so a flag carrying a dash can never be mistaken for one.
+
+**A settle is a floor, not a fix.** It says how long the page is given before anyone looks; it does
+not make a slow element arrive. An element that is genuinely late is `wait_for`'s job — and a
+`wait_for` on a `ref=` now waits for the whole step timeout, polling the page, exactly as a
+`wait_for` on a CSS selector always did. Raising the settle to cover a late element buys the delay
+on **every** run of that adapter; a `wait_for` costs only as long as the page actually takes.
+
 ## Adapters are data, and the vocabulary is fixed
 
 An adapter is a JSON file named `<site>.json`, and it is looked for in two places, most-local
@@ -405,12 +451,13 @@ when.
 | `reddit.com` | `/login/` | `name="username"` | logged-out form in a real browser |
 | `x.com` | `/i/flow/login` | `name="username_or_email"` | logged-out form, three renders (8s, 25s, Playwright 15s); the logged-in half is unmeasured because no x.com profile exists — that gap fails SAFE (a false "expired" asks a person; never a false "authenticated") |
 | `github.com` | `/settings/profile` | `action="/session"` | BOTH halves: 3 matches on the sign-in page logged out, 0 on "Your profile" logged in |
+| `web.telegram.org` | `/k/` | out: `(page-signQR\|auth-qr-form\|…)`, **in:** `class="[^"]*chatlist` | the POSITIVE marker on both halves (9 matches on the settled live session, 0 on the shell and on a logged-out render); the logged-out marker matched 0 on the live session but its logged-out render was never observed — the K app does not paint sign-in inside the probe's window on a fresh profile. That gap fails SAFE only because of the positive marker: neither matching is `UNKNOWN`, not a login |
 
 Every shipped adapter has `"actions": {}`: they classify a session, and the actions a site's owner
 wants are theirs to write in their seat's `.adapters/`.
 
 **Why two and not one.** It was one — the package's `adapters/` — and that directory is replaced
-wholesale by `5dive plugin upgrade browser@5dive-plugins`. Measured 2026-09-14: a hand-written
+wholesale by `5dive plugin upgrade browser@5dive-browser`. Measured 2026-09-14: a hand-written
 `adapters/reddit.com.json` was there before the upgrade and gone after it, and `status reddit.com`
 went `authenticated` → `UNKNOWN (no adapter)` with nothing else changed. An adapter is your own
 data about your own site; an upgrade that eats it silently un-classifies a live session.
@@ -475,10 +522,10 @@ driver counts steps rather than trusting a place in the file, and a step counts 
 `click` may already have posted, and calling *that* "nothing ran" would suppress the re-read on an
 action that half happened.
 
-**Playwright is pinned.** `plugins/browser/package.json` names an exact `playwright-core` version,
+**Playwright is pinned.** The plugin's `package.json` (`browser/package.json` in this repo) names an exact `playwright-core` version,
 no caret: the driver speaks CDP to a Chrome holding a human's live session, and a silent minor bump
 changes the launch arguments under a credential. Install it with
-`npm install --prefix plugins/browser`; without it, `run` refuses and says so.
+`npm install --prefix <the plugin directory>`; without it, `run` refuses and says so.
 
 On a managed 5dive box nobody types that command. The nightly browser-stack converger
 (`/usr/local/bin/5dive-browser-stack-install`, shipped by 5dive-api) reads the pin out of this
@@ -492,7 +539,7 @@ throwaway browser (DIVE-4538).
 `node_modules` in every ancestor directory of the driver, so unpacking the plugin somewhere that
 happens to sit under one hands this process — the one that opens a directory full of live sessions —
 a library nobody chose. The driver looks in exactly two places, in order: the directories `NODE_PATH`
-names, if any, then `plugins/browser/node_modules`. There is no ancestor walk, so "not installed"
+names, if any, then the plugin directory's own `node_modules`. There is no ancestor walk, so "not installed"
 is a fact about those two places rather than about where the plugin was unpacked.
 
 ## Ad filtering, and the one site where you turn it off
