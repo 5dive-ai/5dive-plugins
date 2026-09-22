@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — `/model <alias>` over Telegram no longer pins the seat to a dated model (DIVE-4860), telegram 0.5.59
+
+The live switch typed the RESOLVED id (`/model claude-opus-5`) into the pane, and Claude Code
+persists whatever `/model` is given — so it overwrote the bare alias `patchSettings` had just
+written, and the seat stayed on that model through every later Claude release (the nightly heal
+fills an absent key only, by design). `applyModel` now types the bare alias it writes, so a
+picker switch floats with Claude Code's default like a hand-set alias. `MODEL_ALIASES` still
+guards the alias and drives the picker; the create path is untouched. `patchSettingsFile` moved
+to `settingsfile.ts` so the written value is read back from a real file in the test.
+
 ### Fixed — the registry copy is now a BYTE-FOR-BYTE mirror of 5dive-ai/5dive-browser at 1.10.3 (DIVE-4835), browser 1.10.3
 
 **DIVE-4813 reached zero boxes.** The admin-tier fix — an admin agent starts the box login's

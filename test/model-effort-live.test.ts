@@ -27,6 +27,10 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { patchSettingsFile } from '../plugins/telegram/settingsfile'
+import { MODEL_ALIASES } from '../plugins/telegram/commands'
 import {
   switchLine, paneConfirms, classifySwitch, switchAck, switchPending,
   SWITCH_POLL_MS, SWITCH_POLL_STEP_MS, SWITCH_MENU_RE,
@@ -131,10 +135,10 @@ const MID_TURN_B = ['  254', '  255', '  256', '❯ '].join('\n')
 const IDLE_PANE = ['✻ Cogitated for 39s · done 8:11 AM', '❯ '].join('\n')
 
 describe('the line typed into the pane', () => {
-  test('/model carries the resolved model ID, not the alias', () => {
-    // A bare alias in the TUI is not the same string settings.json takes, and
-    // the caller resolves it through MODEL_ALIASES before it gets here.
-    expect(switchLine('model', 'claude-sonnet-5')).toBe('/model claude-sonnet-5')
+  test('/model carries the value verbatim — the caller hands it the bare alias', () => {
+    // DIVE-4860: `/model <x>` persists x itself, so the caller passes the alias
+    // (see the "floats with Claude releases" arms below), never a claude-* id.
+    expect(switchLine('model', 'sonnet')).toBe('/model sonnet')
   })
   test('/effort carries the level verbatim', () => {
     expect(switchLine('effort', 'medium')).toBe('/effort medium')
@@ -463,7 +467,7 @@ describe('MUTANT: matching the pane instead of the line', () => {
 describe('MUTANT: the restart hook, restored', () => {
   const mutate = (text: string) =>
     text.replace(
-      "    after: () => { void liveSwitch('model', MODEL_ALIASES[alias]!, alias, chatId) },",
+      "    after: () => { void liveSwitch('model', alias, alias, chatId) },",
       "    after: () => { void execFileP(SUDO, ['-n', '5dive', 'agent', '_self_restart'], { timeout: 5000 }) },",
     )
 
@@ -534,5 +538,83 @@ describe('MUTANT: the confirmation path, as it shipped', () => {
     const body = fnBody(answerAnyMenu(src()), 'liveSwitch')
     expect(body).not.toContain('menuAlreadyUp ? undefined : SWITCH_MENU_RE')
     expect(body).toContain('proxyToClaudeTUI(switchLine(kind, value), SWITCH_MENU_RE)')
+  })
+})
+
+// ---------------------------------- the seat floats with Claude releases
+// DIVE-4860. `/model opus` over Telegram used to type `/model claude-opus-5`
+// into the pane, and Claude Code persisted THAT to settings.json — overwriting
+// the alias patchSettings had just written. The seat was then pinned to a dated
+// model forever: the nightly heal only fills an absent key, and a picker-written
+// id is indistinguishable from a deliberate pin. Both values applyModel hands
+// on — to settings.json and to the pane — must be the bare alias.
+describe('/model <alias> writes and types the BARE alias', () => {
+  const body = () => fnBody(src(), 'applyModel')
+
+  test('settings.json gets the alias', () => {
+    expect(body()).toContain('patchSettings({ model: alias })')
+  })
+  test('the pane gets the alias — the line Claude Code persists', () => {
+    expect(body()).toContain("liveSwitch('model', alias, alias, chatId)")
+    expect(body()).not.toMatch(/liveSwitch\('model',\s*MODEL_ALIASES\[/)
+    expect(switchLine('model', 'opus')).toBe('/model opus')
+  })
+  test('no claude-* id reaches either value', () => {
+    const b = body()
+    expect(b).not.toMatch(/patchSettings\(\{\s*model:\s*MODEL_ALIASES/)
+    expect(b).not.toMatch(/'claude-[a-z0-9-]+'/)
+  })
+
+  // Read back from a real file: the helper patchSettings delegates to.
+  test('settings.json reads back "opus", not a claude-* id', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dive4860-'))
+    try {
+      const f = join(dir, 'settings.json')
+      writeFileSync(f, JSON.stringify({ model: 'claude-opus-5', effortLevel: 'high' }))
+      patchSettingsFile(f, { model: 'opus' }, true)
+      const back = JSON.parse(readFileSync(f, 'utf8'))
+      expect(back.model).toBe('opus')
+      expect(back.model).not.toMatch(/^claude-/)
+      expect(back.effortLevel).toBe('high')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  test('server.ts routes patchSettings through that helper', () => {
+    expect(fnBody(src(), 'patchSettings')).toContain("patchSettingsFile(join(homedir(), '.claude', 'settings.json'), patch, /*addNewKeys*/ true)")
+    expect(src()).toContain("import { patchSettingsFile } from './settingsfile.ts'")
+  })
+  // The alias map is still the guard and the picker; it is just not the value.
+  test('MODEL_ALIASES still guards the alias', () => {
+    expect(body()).toContain('if (!(alias in MODEL_ALIASES))')
+    expect(Object.keys(MODEL_ALIASES)).toContain('opus')
+  })
+})
+
+describe('MUTANT: the full id, typed again', () => {
+  const backToId = (text: string) =>
+    text.replace(
+      "    after: () => { void liveSwitch('model', alias, alias, chatId) },",
+      "    after: () => { void liveSwitch('model', MODEL_ALIASES[alias]!, alias, chatId) },",
+    )
+  const settingsToId = (text: string) =>
+    text.replace('patchSettings({ model: alias })', 'patchSettings({ model: MODEL_ALIASES[alias] })')
+
+  test('both mutations actually change the file', () => {
+    expect(backToId(src()) === src()).toBe(false)
+    expect(settingsToId(src()) === src()).toBe(false)
+  })
+  test('typing MODEL_ALIASES[alias] turns the pane arm RED', () => {
+    const b = fnBody(backToId(src()), 'applyModel')
+    expect(b).not.toContain("liveSwitch('model', alias, alias, chatId)")
+    expect(b).toMatch(/liveSwitch\('model',\s*MODEL_ALIASES\[/)
+  })
+  test('writing MODEL_ALIASES[alias] turns the settings arm RED', () => {
+    const b = fnBody(settingsToId(src()), 'applyModel')
+    expect(b).not.toContain('patchSettings({ model: alias })')
+    expect(b).toMatch(/patchSettings\(\{\s*model:\s*MODEL_ALIASES/)
+  })
+  test('and the value it would type is a claude-* id', () => {
+    expect(switchLine('model', MODEL_ALIASES.opus!)).toMatch(/^\/model claude-/)
   })
 })

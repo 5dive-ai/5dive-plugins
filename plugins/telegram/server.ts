@@ -45,6 +45,7 @@ import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { patchSettingsFile } from './settingsfile.ts'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -2356,27 +2357,6 @@ function patchSettings(patch: Record<string, unknown>): void {
   patchSettingsFile(join(cwd, '.claude', 'settings.local.json'), patch, /*addNewKeys*/ false)
   patchSettingsFile(join(cwd, '.claude', 'settings.json'), patch, /*addNewKeys*/ false)
 }
-function patchSettingsFile(path: string, patch: Record<string, unknown>, addNewKeys: boolean): void {
-  let raw: string
-  try {
-    raw = readFileSync(path, 'utf8')
-  } catch (err: any) {
-    if (!addNewKeys && err?.code === 'ENOENT') return
-    throw err
-  }
-  const obj = JSON.parse(raw) as Record<string, unknown>
-  let dirty = false
-  for (const [k, v] of Object.entries(patch)) {
-    if (addNewKeys || k in obj) {
-      obj[k] = v
-      dirty = true
-    }
-  }
-  if (!dirty) return
-  const tmp = path + '.tmp'
-  writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, path)
-}
 
 // Inline keyboards for /model, /effort, /account. Callback data is parsed by
 // the bot.on('callback_query:data') handler — keep the `model:` / `effort:` /
@@ -2596,7 +2576,16 @@ function applyModel(alias: string, chatId: number): ApplyResult {
     //
     // patchSettings above STAYS — belt and braces for the next start, and the
     // thing that makes the `unconfirmed` branch honest rather than a failure.
-    after: () => { void liveSwitch('model', MODEL_ALIASES[alias]!, alias, chatId) },
+    //
+    // THE BARE ALIAS, NOT MODEL_ALIASES[alias] (DIVE-4860). `/model <x>` persists
+    // x to settings.json itself, so typing the full id overwrote the alias
+    // patchSettings had just written and pinned the seat to that dated model
+    // forever: the nightly heal only fills an ABSENT key, and a picker-written id
+    // is indistinguishable from a deliberate pin. A bare alias floats with Claude
+    // Code's default. This is a live seat's non-fresh config, so migration 13
+    // does not strip it — the create path (agent_setup/compose) keeps full ids
+    // for exactly that reason and is not this path.
+    after: () => { void liveSwitch('model', alias, alias, chatId) },
   }
 }
 // Apply path for /account: shell out to `sudo -n 5dive agent set-account
