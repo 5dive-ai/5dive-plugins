@@ -38,7 +38,11 @@ The supported customer handoff starts from **Connected sites in the 5dive dashbo
 not substitute the raw `viewer` command: it mints only one half of the relay credential.
 
 1. **Make the site classifiable before login.** `status` can say `authenticated` only when
-   an adapter supplies `probe.url` and `probe.logged_out_when_dom_matches`. Browser commands
+   an adapter supplies `probe.url` and `probe.logged_out_when_dom_matches`. **If the site is a
+   single-page app** — one static shell for both login states, decided in JavaScript — that pair
+   is not enough and the adapter must also name `probe.logged_in_when_dom_matches`: the probe then
+   waits for one marker or the other instead of classifying a page that has not decided yet, and
+   a page showing neither is `UNKNOWN` rather than a guessed login (DIVE-4794). Browser commands
    redeemed by the shipped relay run as seat `claude`, not as the agent asking for the login.
    A custom adapter for that relay seat belongs at
    `/var/lib/5dive/browser-profiles/claude/.adapters/<site>.json`; shipped adapters are the
@@ -105,6 +109,15 @@ files says so. Use `tree`, `read` or `shot` when one field really is all you wan
 
 **Never guess a selector.** A ref is `ref=<role>/<accessible name>[#n]` and is re-derived from
 the page every time, so it survives a reload — an obfuscated class name does not.
+
+**A ref that is not there yet is not a missing ref.** `tree`, `snapshot` and `run` wait 1200 ms
+after load before looking (`--settle=<ms>`, and `--page-settle=<ms>` on `run`, whose other
+`--key=value` arguments belong to the adapter). If a ref shows up at a higher settle and not at the
+default, the page is slow, not wrong — measured on a GitHub issue page: 54 nodes at the default, 76
+at `--settle=6000`. Raise the settle to orient; for an element that is genuinely late put a
+`wait_for` step in the adapter, which now polls for the whole step timeout on a `ref=` selector just
+as it always did on a CSS one. The settle is paid on every run; a `wait_for` costs only what the
+page takes.
 
 ## What will actually go wrong
 

@@ -154,17 +154,6 @@ _seat() {
   fi
 }
 
-# DEPRECATED IN THIS REGISTRY (DIVE-4691). browser ships from its own repository
-# now — 5dive-ai/5dive-browser — and this copy is frozen: it still resolves and
-# still installs, because boxes provisioned before the move name it today, but no
-# fix lands here again. The notice goes to STDERR and only on the two verbs a
-# person reads, `--help` and `status`. Never on `tree`, `read`, `snapshot`, `run`,
-# `shot`, `capture` or `ls`: their output is parsed, and a line of prose in a
-# caller's stdout is a bug, not a courtesy.
-_deprecated() {
-  printf '%s: browser@5dive-plugins is deprecated; it ships from 5dive-ai/5dive-browser now — see CHANGES.md\n' "$PROG" >&2
-}
-
 usage() {
   cat <<'USAGE'
 5dive browser — operate a site as yourself, in a profile you logged into by hand
@@ -352,6 +341,12 @@ _open_site() {  # _open_site <site> [--no-broker <verb> <why> | --may-create]
   _require_store "$site"
   _resolve_site "$site" >/dev/null
   if (( _SITE_BROKERED )); then
+    # DIVE-4813: `serve` is the one verb root can carry out FOR a brokered
+    # caller, so its advice is the verb that seat can run itself. Every other
+    # verb here is genuinely the owner's and keeps the owner's wording.
+    if [[ "$mode" == --no-broker && "$verb" == serve ]]; then
+      die "$E_PERM" "$site is the box's login, owned by the '$_SITE_OWNER' seat, and $why Start it from here:  sudo 5dive browser serve $site"
+    fi
     [[ "$mode" != --no-broker ]] || die "$E_PERM" "$site is the box's login, owned by the '$_SITE_OWNER' seat, and $why Run it as the owner:  sudo -u $_SITE_OWNER 5dive browser $verb $site"
     _broker_ready "$site" "$_SITE_DIR"
   else
@@ -434,9 +429,65 @@ _broker_ready() {  # _broker_ready <site> <profile-dir>
   (( _SITE_BROKERED )) || return 0
   _daemon_live "$2" && return 0
   die "$E_UNAVAILABLE" "$1 is logged in on this box under the '$_SITE_OWNER' seat, but nothing is serving that session right now — and '$(_seat)' cannot open the profile directly: it is mode 0700 to $_SITE_OWNER, which is what stops any seat here from replaying somebody else's login. A brokered seat acts THROUGH the running browser or not at all.
-Start one on the owning seat:  sudo -u $_SITE_OWNER 5dive browser serve $1
+Start one from here:  sudo 5dive browser serve $1
+(root re-execs that as '$_SITE_OWNER', which owns the session, so it does NOT need \`sudo -u\` — the admin grant on this box is enough. A seat without that grant asks the owner:  sudo -u $_SITE_OWNER 5dive browser serve $1)
 If that starts but says 'no warm session', this box has no playwright-core, so there is no daemon to broker through and only $_SITE_OWNER can use the profile:  npm install --prefix $(cd "$_SELF_DIR/.." && pwd)"
 }
+
+# >>> DIVE-4813 WHICH SEAT ROOT BECOMES, and why it is not always the caller
+#
+# The DIVE-4348 drop below re-execs root as SUDO_USER before any store is
+# touched, which is right for every verb that operates the CALLER's store. It
+# was wrong for the one verb a brokered seat needs and cannot have: `serve`.
+# A site the box connected sits 0700 under $BOX_SEAT; an agent seat can only act
+# THROUGH a running daemon; starting that daemon is the owner's act. So the seat
+# was handed `sudo -u claude 5dive browser serve <site>` and stopped there,
+# because the 5dive admin grant is `(root)` runas ONLY — cmd_agent_create.sh
+# says it outright: "neither an admin nor a standard agent can sudo -u claude".
+# Root was the one lever that seat held, and the drop threw it away by re-execing
+# as the seat that cannot read the profile. Measured by lodar on wavy-mesa
+# 2026-09-22: agent-claude-yak, admin tier, handed a shell command for a human.
+#
+# So for that verb root becomes the seat that OWNS the session. This is not a new
+# grant: reaching euid 0 here already required the admin sudoers class
+# (`/usr/local/bin/5dive *` as root), which a standard agent's scoped drop-in
+# does not contain. **euid 0 IS the tier check** — which is why no tier lookup
+# appears here and no sudoers class is added.
+#
+# THE TARGET IS NEVER CALLER INPUT. It is the constant $BOX_SEAT, and it is taken
+# only when the box itself says so: the caller owns no store for that site AND
+# $BOX_SEAT has published an `.offered` marker for it. Both are box state. The
+# site name reaches this only as the key to those two lookups, never as the seat.
+#
+# START ONLY. `--stop` stays the owner's, for the reason `lease --release`
+# already refuses a brokered caller: tearing down a browser that several seats
+# and a human viewer share is not something you do on another seat's behalf.
+#
+# It is a FUNCTION, not an inline block, because the caller below is gated on
+# $EUID and $EUID cannot be faked — a test of an inline block would run only
+# where the runner happens to be root and be silently blank everywhere else.
+# This takes the caller as an argument, so it grades identically at any uid.
+_root_drop_target() {  # _root_drop_target <calling-seat> <argv...> -> the seat to become
+  local caller="$1"; shift
+  local site="" stop=0 a
+  if [[ "${1:-}" == serve ]]; then
+    for a in "${@:2}"; do
+      case "$a" in
+        --stop) stop=1 ;;
+        -*) ;;
+        *) [[ -n "$site" ]] || site="$a" ;;
+      esac
+    done
+    if (( ! stop )) && [[ -n "$site" ]] \
+       && [[ "$caller" != "$BOX_SEAT" ]] \
+       && [[ ! -d "$PROFILE_ROOT/$caller/$site" ]] \
+       && [[ -f "$(_rv_offer "$BOX_SEAT" "$site")" ]]; then
+      printf '%s\n' "$BOX_SEAT"; return 0
+    fi
+  fi
+  printf '%s\n' "$caller"
+}
+# <<< DIVE-4813
 
 # Every request the broker serves leaves a row naming WHO ASKED, not only who
 # owns the profile. The owner is `claude` on every brokered row by construction,
@@ -509,11 +560,51 @@ EOF
     || die "$E_UNAVAILABLE" "profile store is ready, but the scheduled browser probe could not be enabled"
 }
 
+# _seat_is_deregistered <seat> — DIVE-4730. TRUE only when the seat is an
+# `agent-*` account that this box's registry has MEASURED as absent.
+#
+# The defect: `setup` mints `5dive-browser-probe@<seat>.timer`, a per-seat unit
+# that outlives the seat. On box 10 (5dive-exact-swallow) one fired every six
+# hours from 2026-09-16 for `agent-mp` — a de-registered account whose unix user
+# survived, one of nine orphans `5dive doctor --category=registry` already
+# names. It failed on every fire (the account is outside the shared group, so it
+# cannot read the box plugin record either) into a journal nobody reads, and no
+# tile exists for it because the dashboard lists the REGISTRY. A unit minted
+# from a unix account inherits every orphan the registry has forgotten.
+#
+# THE PREDICATE IS NARROW ON PURPOSE, in both directions:
+#   - `agent-*` only. `claude`, and any operator account a human runs setup
+#     from, are not registry rows and never were; refusing them would break the
+#     ordinary case to fix a fleet one.
+#   - a registry we could not READ or PARSE fails OPEN. A dev box, a box that
+#     has never run `5dive agent create`, a box with no jq — none of those is
+#     evidence that this seat was de-registered, and refusing on "we could not
+#     check" would take setup out on every one of them. The caller says so
+#     out loud rather than letting the skipped check read as a pass.
+_seat_is_deregistered() {
+  local seat="$1" reg name verdict
+  [[ "$seat" == agent-* ]] || return 1
+  name="${seat#agent-}"
+  reg="${FIVEDIVE_AGENT_REGISTRY:-$STATE_DIR/agents.json}"
+  [[ -r "$reg" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  verdict=$(jq -r --arg n "$name" \
+    'if (.agents|type) != "object" then "unknown" elif (.agents|has($n)) then "in" else "out" end' \
+    "$reg" 2>/dev/null) || return 1
+  [[ "$verdict" == out ]]
+}
+
 cmd_setup() {
   [[ "$(id -u)" == 0 ]] || die "$E_PERM" "setup creates a root-owned store and a seat-owned subdirectory under it. Run: $SETUP_CMD"
   local seat; seat="$(_seat)"
   [[ "$seat" != root ]] || die "$E_USAGE" "refusing to make root a browser seat — run this via sudo from the seat that will own the profiles, so SUDO_USER names it."
   id -u "$seat" >/dev/null 2>&1 || die "$E_USAGE" "no unix user '$seat' — a profile is owned by a real uid or it is not isolated."
+  # DIVE-4730 — a unix account is not a seat. Refuse BEFORE the store is made:
+  # the timer is the lasting artifact, and a store for an account nobody will
+  # ever run is a directory of credentials with no owner.
+  if [[ -z "${FIVEDIVE_BROWSER_ALLOW_UNREGISTERED_SEAT:-}" ]] && _seat_is_deregistered "$seat"; then
+    die "$E_USAGE" "'$seat' is a unix account with NO entry in this box's agent registry, so it is not a seat — it is an orphan (\`5dive doctor --category=registry\` lists them). Refusing to mint a six-hourly probe timer for it: the unit outlives the account, fails on every fire into a journal nobody reads, and nothing on the dashboard shows it, because the dashboard lists the registry. Reap it (sudo 5dive doctor --category=registry --fix) or, if this account really should be a seat, register it first. To override for a one-off, set FIVEDIVE_BROWSER_ALLOW_UNREGISTERED_SEAT=1."
+  fi
   mkdir -p "$PROFILE_ROOT" || die "$E_UNAVAILABLE" "cannot create $PROFILE_ROOT"
   chown root:root "$PROFILE_ROOT" 2>/dev/null || true
   chmod 00711 "$PROFILE_ROOT"        # traverse, do not list (5-digit: clears an inherited setgid, DIVE-4348)
@@ -650,6 +741,20 @@ _site_url() {
 _site_logged_out_marker() {
   local a; a="$(_adapter_path "$1")"
   [[ -f "$a" ]] && jq -r '.probe.logged_out_when_dom_matches // empty' "$a"
+}
+# POSITIVE EVIDENCE, AND WHY THE NEGATIVE ONE WAS NOT ENOUGH (DIVE-4794).
+# `authenticated` was always an inference: the logged-out marker did not match,
+# so we said the session was live. On a single-page app that inference is not
+# available — Telegram Web serves ONE static shell for both states and decides
+# which it is in JavaScript, so at the moment the old probe dumped the DOM a
+# live session and a dead one were the same bytes. An adapter can now name what
+# a LOGGED-IN page looks like, and where it does, `authenticated` stops being an
+# inference and becomes a match. Optional on purpose: the adapters written
+# against server-rendered sites (github, x, reddit) are unchanged and still
+# classify on the negative alone.
+_site_logged_in_marker() {
+  local a; a="$(_adapter_path "$1")"
+  [[ -f "$a" ]] && jq -r '.probe.logged_in_when_dom_matches // empty' "$a"
 }
 # THERE IS DELIBERATELY NO BYPASS BEHIND THIS. It classifies, names a human, and
 # stops. Decided 2026-09-07: "if a platform presents a security challenge, the
@@ -806,16 +911,62 @@ _probe() {
   fi
   local url; url=$(_site_url "$site")
   local marker; marker=$(_site_logged_out_marker "$site")
+  # THE PAGE MAY NOT HAVE DECIDED YET (DIVE-4794). A single-page app ships one
+  # static shell for both states and picks between them in JavaScript after its
+  # own network init — so the document at domcontentloaded+800ms says nothing,
+  # and an adapter marker written against the shell reads that silence as a
+  # verdict. Telegram Web stamped `expired` on a live login that way, and every
+  # acting verb refused on it (measured 2026-09-21). The fix is a WAIT, and it
+  # is bounded by evidence rather than by a fixed sleep: the probe looks again
+  # until the page says something or the budget runs out.
+  #
+  # ONLY WHERE THERE IS SOMETHING TO WAIT FOR. The wait needs a POSITIVE marker
+  # to terminate on — without one, "the logged-out marker has not matched" is
+  # indistinguishable from "the page has not spoken", and waiting would just add
+  # latency to every server-rendered adapter and then conclude the same thing.
+  # So an adapter with no `logged_in_when_dom_matches` probes exactly once, as
+  # it always did.
+  local positive; positive=$(_site_logged_in_marker "$site")
+  local challenge; challenge=$(_site_challenge_marker "$site")
   local dom; dom=$(mktemp) || { echo "UNKNOWN (probe did not load)"; return 0; }
-  local rc
-  if (( warm )); then
-    _daemon_call "$dir" "$(jq -nc --arg u "$url" '{op:"probe", url:$u}')" >"$dom" 2>"$dom.err"
-    rc=$?
-  else
-    "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
-          --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
-    rc=$?
-  fi
+  local total="${FIVEDIVE_BROWSER_PROBE_WAIT_MS:-8000}" poll="${FIVEDIVE_BROWSER_PROBE_POLL_MS:-400}"
+  [[ "$total" =~ ^[0-9]{1,7}$ ]] || total=8000
+  [[ "$poll"  =~ ^[1-9][0-9]{0,6}$ ]] || poll=400
+  local rc waited=0 verdict=""
+  while :; do
+    if (( warm )); then
+      # THE DAEMON DOES THE WAITING ON THIS PATH, in one tab rather than one tab
+      # per look: the markers ride along purely so it knows when to stop, and
+      # the verdict below is still made HERE, by grep, on the document it sends
+      # back. Two regex engines must never both be allowed to decide a login.
+      _daemon_call "$dir" "$(jq -nc --arg u "$url" --arg o "$marker" --arg i "$positive" \
+            --arg c "$challenge" --argjson w "$total" \
+            '{op:"probe", url:$u, wait:$w, until:{logged_out:$o, logged_in:$i, challenge:$c}}')" \
+          >"$dom" 2>"$dom.err"
+      rc=$?
+    else
+      "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
+            --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
+      rc=$?
+    fi
+    (( rc != 0 )) && break
+    [[ -s "$dom" ]] || break
+    # Challenge FIRST: a challenge page often still carries the login form's
+    # markup, so testing logged-out first would classify an interrogated live
+    # session as a dead one and send the user to re-authenticate a session that
+    # is fine.
+    if grep -qiE "$challenge" "$dom"; then verdict=challenge; break; fi
+    if [[ -n "$marker" ]] && grep -qiE "$marker" "$dom"; then verdict=expired; break; fi
+    if [[ -n "$positive" ]] && grep -qiE "$positive" "$dom"; then verdict=authenticated; break; fi
+    # Nothing yet. A warm probe has already spent the whole budget inside the
+    # daemon; a cold one buys another look, and only when a positive marker
+    # makes "not yet" a state distinct from "logged in".
+    (( warm )) && break
+    [[ -n "$positive" ]] || break
+    (( waited + poll > total )) && break
+    sleep "$(( poll / 1000 )).$(printf '%03d' "$(( poll % 1000 ))")"
+    waited=$(( waited + poll ))
+  done
   if (( rc != 0 )) || [[ ! -s "$dom" ]]; then
     # A BROWSER THAT CANNOT START IS NOT AN UNREADABLE SESSION (DIVE-4587). Both
     # arrive here as a non-zero chrome and an empty document, and collapsing them
@@ -848,33 +999,42 @@ _probe() {
     _stamp "$dir" "UNKNOWN — chrome did not load the page${why:+: $why}"
     echo "UNKNOWN (chrome did not load the page${why:+ — $why})"; return 0
   fi
-  rm -f "$dom.err"
-  # Challenge FIRST: a challenge page often still carries the login form's markup,
-  # so testing logged-out first would classify an interrogated live session as a
-  # dead one and send the user to re-authenticate a session that is fine.
-  if grep -qiE "$(_site_challenge_marker "$site")" "$dom"; then
-    rm -f "$dom"; _stamp "$dir" challenge
-    echo "CHALLENGE — human action required (we do not solve these)"; return 1
-  fi
-  if [[ -n "$marker" ]] && grep -qiE "$marker" "$dom"; then
-    rm -f "$dom"; _stamp "$dir" expired; echo "session expired — human action required"; return 1
-  fi
-  rm -f "$dom"
+  rm -f "$dom" "$dom.err"
+  case "$verdict" in
+    challenge)
+      # THERE IS DELIBERATELY NO BYPASS BEHIND THIS.
+      _stamp "$dir" challenge
+      echo "CHALLENGE — human action required (we do not solve these)"; return 1 ;;
+    expired)
+      _stamp "$dir" expired; echo "session expired — human action required"; return 1 ;;
+    authenticated)
+      _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0 ;;
+  esac
   # NO MARKER, NO VERDICT. `authenticated` is a claim about a LOGIN, and the only
   # evidence for it here is the adapter's logged-out marker failing to match. With
-  # no adapter that test is skipped (`[[ -n "$marker" ]] &&`), so every page that
-  # merely LOADED was stamped `authenticated` — observed on a profile nobody had
-  # ever logged into. The only adapter shipped is example.json, which means this
-  # was the state of every real profile, and the Connected-sites tile read it.
+  # no adapter that test is skipped, so every page that merely LOADED was stamped
+  # `authenticated` — observed on a profile nobody had ever logged into. The only
+  # adapter shipped is example.json, which means this was the state of every real
+  # profile, and the Connected-sites tile read it.
   # Reaching the challenge classification first is deliberate: its marker has a
   # built-in default, so a challenge page IS nameable with no adapter, and the
   # customer in front of a CAPTCHA still gets told to clear it rather than "we
   # cannot tell". Quiet (rc 0) like every other UNKNOWN: a state we cannot read
   # must not page a person. `run` still refuses on it — it accepts only
   # `authenticated*` — which is the fail-closed half.
-  if [[ -z "$marker" ]]; then
+  if [[ -z "$marker" && -z "$positive" ]]; then
     _stamp "$dir" unknown
     echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $(_adapter_path "$site") with probe.logged_out_when_dom_matches)"
+    return 0
+  fi
+  # A POSITIVE MARKER TURNS SILENCE INTO UNKNOWN, NOT INTO A LOGIN (DIVE-4794).
+  # This is the fail-closed half of the pair: where the adapter has told us what
+  # a logged-in page looks like and the page never showed it inside the budget,
+  # the honest answer is that we could not read the state — never `authenticated`
+  # by elimination, which is exactly the inference a single-page app breaks.
+  if [[ -n "$positive" ]]; then
+    _stamp "$dir" unknown
+    echo "UNKNOWN (the page never showed either the signed-in or the signed-out marker within ${total}ms — the state could not be read; acting verbs stay refused)"
     return 0
   fi
   _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
@@ -1357,15 +1517,25 @@ cmd_run() {
   # --key=value on this command line is an ADAPTER ARGUMENT, so a bare `--wait`
   # would be indistinguishable from an adapter with a {wait} placeholder. A flag
   # that silently eats a caller's argument is worse than a longer flag.
-  local lwait=no rest=() a
+  #
+  # --page-settle, and the DASH is what makes it safe (DIVE-4674). `tree` and
+  # `snapshot` spell this flag `--settle`, and they can: nothing else on their
+  # command line is a caller's data. Here it would be indistinguishable from an
+  # adapter with a {settle} placeholder — the exact collision --lease-wait exists
+  # to avoid. A placeholder name is [a-zA-Z0-9_]+ (bin/driver-playwright), so a
+  # flag carrying a dash can never be one, and this one cannot eat an argument.
+  local lwait=no psettle="" rest=() a
   for a in "$@"; do
     case "$a" in
-      --lease-wait)   lwait="$LEASE_WAIT_DEFAULT" ;;
-      --lease-wait=*) lwait="${a#*=}" ;;
+      --lease-wait)    lwait="$LEASE_WAIT_DEFAULT" ;;
+      --lease-wait=*)  lwait="${a#*=}" ;;
+      --page-settle=*) psettle="${a#*=}" ;;
       *) rest+=("$a") ;;
     esac
   done
   set -- ${rest+"${rest[@]}"}
+  [[ -z "$psettle" || "$psettle" =~ ^[0-9]{1,7}$ ]] \
+    || die "$E_USAGE" "--page-settle takes milliseconds; got: $psettle"
   _lease_take "$site" "$dir" "run $action" "$lwait"
   trap '_lease_and_serve_release' EXIT
 
@@ -1460,7 +1630,8 @@ cmd_run() {
     local wplan wrc=0
     wplan=$(jq -nc --argjson steps "$(jq -c --arg a "$action" '.actions[$a].steps' "$f")" \
         --argjson args "$args" --argjson l "$(_daemon_lease_json)" \
-        '{op:"plan", steps:$steps, args:$args} + $l')
+        --argjson st "$(_settle_json "$psettle")" \
+        '{op:"plan", steps:$steps, args:$args} + $st + $l')
     _daemon_call "$dir" "$wplan" || wrc=$?
     _lease_release; trap - EXIT
     if (( wrc == 70 )); then
@@ -1491,6 +1662,7 @@ cmd_run() {
   # redeeming a viewer half-way through a publish, which is when a machine typing
   # into the same window does the most damage.
   FIVEDIVE_BROWSER_PROFILE="$dir" FIVEDIVE_BROWSER_CHROME="$chrome" \
+    FIVEDIVE_BROWSER_RUN_SETTLE_MS="${psettle:-${FIVEDIVE_BROWSER_RUN_SETTLE_MS:-${FIVEDIVE_BROWSER_TREE_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}}" \
     FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
     FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
     "$driver" <<<"$plan"
@@ -1568,11 +1740,12 @@ _run_verify() {  # _run_verify <adapter-file> <action> <args-json> <executor-rc>
 # file, it survives a navigation, a browser restart and a class-name change, and
 # the browser that printed it does not have to still be running when it is used.
 cmd_tree() {
-  local site="" url="" interactive=0 json=0 wait="no"
+  local site="" url="" interactive=0 json=0 wait="no" settle=""
   while (($#)); do
     case "$1" in
       --interactive) interactive=1 ;;
       --json)   json=1 ;;
+      --settle=*) settle="${1#*=}" ;;
       --wait)   wait="$LEASE_WAIT_DEFAULT" ;;
       --wait=*) wait="${1#*=}" ;;
       -h|--help) usage; return 0 ;;
@@ -1580,8 +1753,11 @@ cmd_tree() {
       *) if [[ -z "$site" ]]; then site="$1"; else url="$1"; fi ;;
     esac; shift
   done
-  [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser tree <site> <url> [--interactive] [--json]"
+  [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser tree <site> <url> [--interactive] [--json] [--settle=<ms>]"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  # Same validation snapshot's --settle has had since DIVE-4653: a bad value is a
+  # refusal here, not a silent Number(NaN) three processes away.
+  [[ -z "$settle" || "$settle" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--settle takes milliseconds; got: $settle"
   _open_site "$site"
   local dir="$_SITE_DIR"
 
@@ -1611,7 +1787,8 @@ cmd_tree() {
     # being a handle into the browser that printed it, so which process did the
     # walk is not a property the answer carries.
     plan=$(jq -nc --arg u "$url" --argjson i "$interactive" --argjson l "$(_daemon_lease_json)" \
-        '{op:"tree", url:$u, interactive:($i==1)} + $l')
+        --argjson st "$(_settle_json "$settle")" \
+        '{op:"tree", url:$u, interactive:($i==1)} + $st + $l')
     out=$(_daemon_call "$_PG_DIR" "$plan") \
       || die "$E_UNAVAILABLE" "the warm session could not enumerate $url (its own reason is above)."
   else
@@ -1622,6 +1799,7 @@ cmd_tree() {
     plan=$(jq -nc --arg p "$_PG_DIR" --arg u "$url" --argjson i "$interactive" \
         '{profile:$p, mode:"tree", url:$u, interactive:($i==1)}')
     out=$(FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
+          FIVEDIVE_BROWSER_TREE_SETTLE_MS="${settle:-${FIVEDIVE_BROWSER_TREE_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}" \
           FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
           FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
           "$driver" <<<"$plan") \
@@ -3045,6 +3223,20 @@ cmd_links() { _cmd_read_like links "$@"; }
 # was paying three times for one answer.
 SNAP_SETTLE_DEFAULT=1200
 
+# _settle_json <ms|""> — the settle knob as a JSON fragment for a daemon request.
+#
+# IT RIDES IN THE REQUEST BECAUSE IT CANNOT RIDE IN THE ENVIRONMENT (DIVE-4674).
+# The daemon is a long-lived process started before this command line existed, so
+# FIVEDIVE_BROWSER_TREE_SETTLE_MS set here reaches the cold driver and nothing
+# else — which is why `snapshot --settle` worked on a cold profile and was
+# silently dropped on a served one. An empty value emits {} so a request that was
+# never given a settle falls back to the daemon's own default rather than pinning
+# it to this process's idea of one.
+_settle_json() {
+  [[ -n "${1:-}" ]] || { printf '{}'; return 0; }
+  jq -nc --argjson s "$1" '{settle:$s}'
+}
+
 cmd_snapshot() {
   local site="" url="" out="" interactive=0 json=0 shot=1 full=0 wait="no" settle=""
   while (($#)); do
@@ -3097,12 +3289,32 @@ cmd_snapshot() {
     # the daemon did not have, which is why `shot` and `read` still cycle a cold
     # chrome of their own; `snapshot` is that op, scoped to the one verb built
     # for it rather than retrofitted onto the other two.
+    # A BROKERED CALLER CANNOT HAND OVER A PATH (DIVE-4794). The staging
+    # directory below is 0700 to THIS seat, and the daemon runs as the profile's
+    # owner — so naming it in the request is asking another seat to write
+    # somewhere it cannot reach, and every brokered `snapshot` died on
+    # `EACCES ... open '/tmp/5dive-browser-read.XXXX/page.html'`. Widening the
+    # directory to the owning seat would fix the symptom by handing a browser
+    # session's owner a caller-chosen write, which is the exact rig DIVE-4662
+    # refused. The bytes come back instead and this seat writes them, the same
+    # trade `shot` and `read` already make over this socket.
+    local inline=0; (( _SITE_BROKERED )) && inline=1
     plan=$(jq -nc --arg u "$url" --arg h "$stage/page.html" --arg s "$png" \
         --argjson i "$interactive" --argjson f "$full" --argjson l "$(_daemon_lease_json)" \
-        '{op:"snapshot", url:$u, html:$h, shot:(if $s=="" then null else $s end),
-          interactive:($i==1), full:($f==1)} + $l')
+        --argjson n "$inline" --argjson st "$(_settle_json "$settle")" \
+        '{op:"snapshot", url:$u,
+          html:(if $n==1 then null else $h end),
+          shot:(if $n==1 then (if $s=="" then null else true end) elif $s=="" then null else $s end),
+          inline:($n==1), interactive:($i==1), full:($f==1)} + $st + $l')
     payload=$(_daemon_call "$_PG_DIR" "$plan") \
       || die "$E_UNAVAILABLE" "the warm session could not capture $url (its own reason is above)."
+    if (( inline )); then
+      jq -r '.html_inline // ""' <<<"$payload" > "$stage/page.html" \
+        || die "$E_UNAVAILABLE" "the box session returned a capture this seat could not read"
+      if [[ -n "$png" ]]; then
+        jq -r '.png_b64 // ""' <<<"$payload" | base64 -d > "$png" 2>/dev/null || : > "$png"
+      fi
+    fi
   else
     local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
     [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver — snapshot reads the page through the same executor \`run\` acts through, inside the same profile."
@@ -3454,8 +3666,15 @@ if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
     # file, which is root's. Dropping to the seat would turn it into a refusal.
     setup|adblock|-h|--help|help|"") ;;
     *)
-      _drop="${SUDO_USER}"
+      # DIVE-4813: usually the caller, and for a brokered `serve` the owner.
+      _drop="$(_root_drop_target "${SUDO_USER}" "$@")"
       id -u "$_drop" >/dev/null 2>&1 || die "$E_PERM" "SUDO_USER=$_drop is not a user on this box — refusing to operate a profile store as root"
+      if [[ "$_drop" != "${SUDO_USER}" ]]; then
+        # The audit row must name who ASKED, and the caller must not be able to
+        # forge it or to re-point the store this drop exists to open.
+        export FIVEDIVE_BROWSER_ON_BEHALF_OF="${SUDO_USER}"
+        unset FIVEDIVE_BROWSER_SEAT
+      fi
       exec runuser -u "$_drop" -- "$0" "$@"
       ;;
   esac
@@ -3463,10 +3682,13 @@ fi
 # <<< DIVE-4348
 
 case "${1:-}" in
-  -h|--help|help|"") _deprecated; usage ;;
+  -h|--help|help|"") usage ;;
+  # DIVE-4813: prints the seat root would become. Hidden, read-only, grants
+  # nothing — it is the seam the drop decision is graded through.
+  _drop-target) shift; _root_drop_target "$@" ;;
   setup) shift; cmd_setup "$@" ;;
   auth)  shift; cmd_auth  "$@" ;;
-  status) shift; _deprecated; _auth_status "${1:-}" ;;
+  status) shift; _auth_status "${1:-}" ;;
   probe-all) shift; cmd_probe_all "$@" ;;
   ls)    shift; cmd_ls    "$@" ;;
   doc)   shift; cmd_doc  "$@" ;;

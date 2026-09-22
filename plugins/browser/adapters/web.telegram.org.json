@@ -1,0 +1,10 @@
+{
+  "_comment": "MEASURED ON A BOX, 2026-09-21 (DIVE-4794, wavy-mesa + poke-two), and the halves are NOT symmetric — read the next two paragraphs before editing either marker. THE POSITIVE MARKER IS MEASURED BOTH WAYS, which is the half whose failure would LIE: on the live claude-seat session, settled (31 KB `snapshot` through the daemon) `class=\"...chatlist` matched 9 times and `auth-pages` 0; on the static shell curl serves, and on a logged-out cold profile's own render, it matched 0. THE LOGGED-OUT MARKER IS HALF-MEASURED and deliberately so: it matched 0 on the live session (so it cannot false-alarm on a good login), but the K app never rendered its sign-in page inside the probe's window on a fresh profile — 0 matches for every sign-in string — so 'it matches a logged-out page' is UNVERIFIED. That gap is safe here only because of DIVE-4794's second half: with a logged_in marker present, a page that shows neither marker is UNKNOWN and every acting verb stays refused, so the unmeasured direction asks a person instead of handing a caller a screenshot of a login form. DO NOT MARK ON THE SHELL: `has-auth-pages` on <body> and <div id=\"auth-pages\"> ship in the STATIC index for both states — the app removes them after it decides it is logged in — and an adapter written against them is what stamped `expired` on a live session at 16:58Z and made every brokered verb refuse.",
+  "site": "web.telegram.org",
+  "probe": {
+    "url": "https://web.telegram.org/k/",
+    "logged_out_when_dom_matches": "(page-signQR|auth-qr-form|Log in to Telegram by QR Code|LOG IN BY PHONE NUMBER)",
+    "logged_in_when_dom_matches": "class=\"[^\"]*chatlist"
+  },
+  "actions": {}
+}
