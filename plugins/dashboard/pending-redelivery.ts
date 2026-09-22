@@ -74,3 +74,24 @@ export function savePendingRetryState(path: string, state: PendingRetryState): v
     // Delivery must keep working if its diagnostic state cannot be persisted.
   }
 }
+
+// DIVE-4841 — the delivery tags that ride a pending push's channel `meta`.
+//
+// Claude Code validates `notifications/claude/channel` params with
+// `meta: Record<string, string>` and DROPS a notification that fails the
+// schema — silently: `notification()` resolves either way. DIVE-4125 put
+// `attempt` (number) and `redelivery` (boolean) on the meta as-is, so from
+// plugin 0.4.3 onward EVERY dashboard pending message was pushed, logged as
+// pushed, acked to the control plane, and never seen by the model, while the
+// agent-inbox drop path (all-string meta) kept working — which is how it was
+// found (a probe through the drop-dir answered "OK" 20 s after a pending push
+// of the same session was ignored). Every value here is a string, by type.
+export function pendingDeliveryMeta(
+  decision: Extract<PendingAttemptDecision, { kind: 'deliver' }>,
+): { delivered_at: string; delivery_attempt: string; redelivery: string } {
+  return {
+    delivered_at: String(decision.deliveredAt),
+    delivery_attempt: String(decision.attempt),
+    redelivery: String(decision.redelivery),
+  }
+}

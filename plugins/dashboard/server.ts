@@ -36,7 +36,7 @@ import {
   loadPendingRetryState,
   nextPendingAttempt,
   savePendingRetryState,
-} from './pending-redelivery.ts'
+ pendingDeliveryMeta } from './pending-redelivery.ts'
 
 let PLUGIN_VERSION = '?'
 try {
@@ -473,9 +473,7 @@ async function drainPendingOnce(): Promise<void> {
             user: m.from ?? 'dashboard',
             user_id: m.from ?? 'dashboard',
             ts: m.ts ?? new Date().toISOString(),
-            delivered_at: decision.deliveredAt,
-            delivery_attempt: decision.attempt,
-            redelivery: decision.redelivery,
+            ...pendingDeliveryMeta(decision),
             ...(typeof m.image_path === 'string' && m.image_path.startsWith('/')
               ? { image_path: m.image_path } : {}),
       })
