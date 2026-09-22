@@ -7,7 +7,7 @@ import { describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { nextPendingAttempt } from '../plugins/dashboard/pending-redelivery.ts'
+import { nextPendingAttempt, pendingDeliveryMeta } from '../plugins/dashboard/pending-redelivery.ts'
 
 const SERVER = join(import.meta.dir, '..', 'plugins', 'dashboard', 'server.ts')
 const BOOT_MS = 5_000
@@ -140,8 +140,8 @@ describe('dashboard pending redelivery (DIVE-4125)', () => {
       expect(h.deliveries.filter(d => d.meta.message_id === '41')).toHaveLength(3)
 
       const first = h.deliveries.filter(d => d.meta.message_id === '41')
-      expect(first.map(d => d.meta.delivery_attempt)).toEqual([1, 2, 3])
-      expect(first.map(d => d.meta.redelivery)).toEqual([false, true, true])
+      expect(first.map(d => d.meta.delivery_attempt)).toEqual(['1', '2', '3'])
+      expect(first.map(d => d.meta.redelivery)).toEqual(['false', 'true', 'true'])
       expect(new Set(first.map(d => d.meta.delivered_at)).size).toBe(3)
       const seen = new Set<string>()
       const accepted = first.filter(d => {
@@ -170,4 +170,27 @@ describe('dashboard pending redelivery (DIVE-4125)', () => {
       h.stop()
     }
   }, 20_000)
+})
+
+// DIVE-4841 — a pending push's channel meta must be all strings, or Claude
+// Code drops the notification without a word (see pendingDeliveryMeta).
+describe('dashboard pending push meta is string-only (DIVE-4841)', () => {
+  test('every delivery tag is a string, on the first attempt and on a redelivery', () => {
+    const first = nextPendingAttempt(undefined, 1_000, 1_000)
+    expect(first.kind).toBe('deliver')
+    if (first.kind !== 'deliver') return
+    const meta1 = pendingDeliveryMeta(first)
+    for (const [k, v] of Object.entries(meta1)) expect(typeof v, k).toBe('string')
+    expect(meta1.delivery_attempt).toBe('1')
+    expect(meta1.redelivery).toBe('false')
+    expect(meta1.delivered_at).toBe(new Date(1_000).toISOString())
+
+    const again = nextPendingAttempt(first.next, 1_000 + 10 * 60_000, 1_000)
+    expect(again.kind).toBe('deliver')
+    if (again.kind !== 'deliver') return
+    const meta2 = pendingDeliveryMeta(again)
+    for (const [k, v] of Object.entries(meta2)) expect(typeof v, k).toBe('string')
+    expect(meta2.redelivery).toBe('true')
+    expect(meta2.delivery_attempt).toBe('2')
+  })
 })
