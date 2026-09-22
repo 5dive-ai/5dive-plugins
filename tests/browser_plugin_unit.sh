@@ -3936,43 +3936,124 @@ t  'T27j (control) the same store at 0700 is usable, so the arm above graded the
       | grep -o authenticated | head -1)"
 rm -rf "$SQUAT"
 
-# --- T28 THE DEPRECATION NOTICE: stderr on the two human verbs, nowhere else --
+# --- T28 THE DEPRECATION NOTICE: in the REGISTRY MANIFEST, and there only -----
 #
-# WHY THIS ARM EXISTS. DIVE-4691 turned this registry entry into a deprecation
-# stub, and the notice IS the deliverable — but `grep -ri deprecat tests/` came
-# back empty when it shipped. Nothing asserted the line prints, nothing asserted
-# it stays OFF stdout, and the next edit to the case statement would have dropped
-# it in silence. The split is the whole design: `--help` and `status` are read by
-# a person, so the line goes to their stderr; `tree`, `read`, `ls`, `snapshot`,
-# `run` and `shot` have stdout a caller PARSES, and a line of prose in that
-# stream is a bug, not a courtesy. Both directions are graded, and each negative
-# arm is paired with a control that proves the verb actually ran — an absence
-# measured on a command that never dispatched grades nothing.
-DEPRLINE='browser@5dive-plugins is deprecated; it ships from 5dive-ai/5dive-browser now'
+# WHY THIS BLOCK EXISTS, AND WHY ITS SUBJECT MOVED (DIVE-4691 -> DIVE-4835).
+# DIVE-4691 turned this registry entry into a deprecation stub and shipped the
+# notice as a `_deprecated()` line inside `bin/browser`; `grep -ri deprecat
+# tests/` came back empty when it did, so T28 was written to hold that line in
+# place against the next edit to the case statement. It then did its job:
+# DIVE-4835 deleted the line and CI, not a reviewer, is what said so.
+#
+# THE DELETION IS KEPT, AND THIS IS THE CONTRACT THAT REPLACED IT.
+# `plugins/browser/` is a byte-for-byte MIRROR of 5dive-ai/5dive-browser now,
+# because the box converger's version floor is a min() over the two copies and a
+# release that lands in only one reaches nobody (wiki:
+# a-forked-plugin-makes-the-converger-floor-a-min-over-both-copies). A line that
+# exists in this copy and not upstream turns every future port from a COPY into a
+# MERGE, and a merge is where a missing hunk hides: DIVE-4835 found this copy
+# three fixes behind precisely because DIVE-4797 had aligned the version NUMBER
+# around such a divergence by hand instead of the bytes.
+#
+# So the notice lives in `.claude-plugin/marketplace.json` at this repo's ROOT —
+# outside the mirrored directory, the one file a port cannot overwrite, and the
+# text a box actually reads when it resolves `browser@5dive-plugins`.
+# THE COST, written down because it is real and it is a trade, not a win: an
+# operator who runs `5dive browser --help` on a box keyed to this copy no longer
+# sees the migrate-away line at runtime.
+#
+# The old runtime line is still the STRING these arms grade — as the thing that
+# must not come back INSIDE the mirror — and T28c puts it back in a throwaway
+# copy of the tree so that every "it is not there" below is measured by a probe
+# shown to find it when it is. With the line deleted outright, "not found" is
+# also what a broken grep, a misspelled pattern and a binary that never ran all
+# return; an absence proved by a detector that cannot detect is not an absence.
+OLDNOTICE='browser@5dive-plugins is deprecated; it ships from 5dive-ai/5dive-browser now'
+NOTICEPAT='is deprecated; it ships from'
+MARKET="$ROOT/.claude-plugin/marketplace.json"
+MIRROR="$ROOT/plugins/browser"
+_bentry()       { jq -r '.plugins[]|select(.name=="browser")|.description' "$MARKET"; }
+_notice_files() { grep -RIl -- "$NOTICEPAT" "$1" 2>/dev/null | wc -l | tr -d '[:space:]'; }
 mkprofile deprnotice.test "$LIVE_DOM" >/dev/null
 
-# --- T28a the two human verbs DO carry it, on stderr, exactly once ------------
+# --- T28a the notice IS in the registry manifest, and it is what goes red -----
+# Three things a stranded box needs, and they are graded separately because a
+# notice that says only "deprecated" leaves an operator with nowhere to go: that
+# this copy is deprecated, where the plugin ships from now, and that migrating is
+# REMOVE-then-ADD (the CLI refuses two plugins claiming the `browser` verb, so a
+# reader who adds first is simply refused — TRAP C on the row).
+tc 'T28a the marketplace entry marks this copy deprecated' 'DEPRECATED' "$(_bentry)"
+tc 'T28a ...and names where the plugin ships from now' \
+   '5dive plugin add 5dive-ai/5dive-browser' "$(_bentry)"
+tc 'T28a ...and the remove that has to come first' \
+   'plugin remove browser@5dive-plugins' "$(_bentry)"
+# Control: these read THIS entry, not the file. Another plugin in the same
+# manifest must come back unmarked, or the three arms above would pass on a
+# notice attached to anything at all.
+t 'T28a (control) no other entry in the manifest is marked deprecated' '0' \
+  "$(jq -r '[.plugins[]|select(.name!="browser" and (.description|test("DEPRECATED")))]|length' "$MARKET")"
+
+# --- T28b the notice sits where a PORT CANNOT OVERWRITE IT --------------------
+# This is the structural half and the whole reason it moved. The next port is
+# `rsync -a --delete <upstream>/browser/ plugins/browser/`; everything inside
+# that destination is replaced wholesale by a tree that has never heard of this
+# registry. The file carrying the notice must therefore sit OUTSIDE the directory
+# the marketplace entry points at.
+SRCDIR="$ROOT/$(jq -r '.plugins[]|select(.name=="browser")|.source' "$MARKET" | sed 's|^\./||')"
+t 'T28b (control) the entry source really is the mirrored directory' 'yes' \
+  "$([[ "$SRCDIR" -ef "$MIRROR" ]] && echo yes || echo no)"
+t 'T28b the notice lives outside it, where a port cannot reach' 'yes' \
+  "$([[ "$MARKET" != "$SRCDIR"/* ]] && echo yes || echo no)"
+t 'T28b and no copy of the old runtime notice survives inside the mirror' '0' \
+  "$(_notice_files "$MIRROR")"
+
+# --- T28c THE MUTANT: the same probes against a tree that DOES carry the line --
+# The deleted line, put back in a throwaway copy of the mirror and printed on
+# BOTH streams, so one mutant controls both directions. Every arm here is a
+# control for a negative in T28b/T28d: if any of these fails to see the line, the
+# corresponding "it is absent" arm is measuring nothing.
+MUT="$TMP/mirror-mutant"
+rm -rf "$MUT"; cp -a "$MIRROR" "$MUT"
+python3 - "$MUT/bin/browser" "$OLDNOTICE" <<'PY'
+import sys
+path, line = sys.argv[1], sys.argv[2]
+src = open(path).read().split('\n')
+i = src.index('set -uo pipefail')      # the first statement, ahead of any dispatch
+src[i + 1:i + 1] = ["echo '%s' >&2" % line, "echo '%s'" % line]
+open(path, 'w').write('\n'.join(src))
+PY
+t  'T28c (control) the mutant tree was built and is runnable' 'yes' \
+   "$([[ -x "$MUT/bin/browser" ]] && echo yes || echo no)"
+t  'T28c (control) the file detector FINDS the line when a tree carries it' '1' \
+   "$(_notice_files "$MUT")"
+run bash "$MUT/bin/browser" ls
+tc 'T28c (control) ...and running the mutant puts it on stderr' "$OLDNOTICE" "$ERR"
+tc 'T28c (control) ...and on stdout, so the stdout arms below can see one too' \
+   "$OLDNOTICE" "$OUT"
+
+# --- T28d no verb of the SHIPPED script carries it, on either stream ----------
+# The two human verbs are graded alongside the parsed ones now: `--help` and
+# `status` are where the line used to print, so they are where a re-added
+# divergence shows up first. Each negative keeps its control proving the verb
+# dispatched and spoke — an absence measured on a command that never ran grades
+# nothing, which is the other way this block could have gone vacuous.
 run bash "$BROWSER" --help
-t  'T28a --help still exits 0' 0 "$RC"
-tc 'T28a --help puts the deprecation notice on stderr' "$DEPRLINE" "$ERR"
-t  'T28a ...exactly once, not once per helper that wants to be helpful' 1 \
-   "$(printf '%s\n' "$ERR" | grep -c 'is deprecated; it ships from')"
-tn 'T28a ...and never on stdout, which is the usage a person pipes' 'deprecated' "$OUT"
-tc 'T28a (control) ...while the usage itself DID come out on stdout' '5dive browser' "$OUT"
+t  'T28d --help still exits 0' 0 "$RC"
+tn 'T28d --help carries no notice on stderr' "$NOTICEPAT" "$ERR"
+tn 'T28d ...nor on the stdout a person pipes' "$NOTICEPAT" "$OUT"
+tc 'T28d (control) ...while the usage itself DID come out on stdout' '5dive browser' "$OUT"
 
 run bash "$BROWSER" status deprnotice.test
-tc 'T28a status puts the notice on stderr too' "$DEPRLINE" "$ERR"
-tn 'T28a ...and status keeps its own stdout clean of it' 'deprecated' "$OUT"
-tc 'T28a (control) ...and status really ran, all the way through the probe' \
+tn 'T28d status carries none on stderr' "$NOTICEPAT" "$ERR"
+tn 'T28d ...and none on its stdout' "$NOTICEPAT" "$OUT"
+tc 'T28d (control) ...and status really ran, all the way through the probe' \
    'deprnotice.test' "$OUT"
 
-# --- T28b the PARSED verbs carry it on NEITHER stream -------------------------
 for _v in tree read snapshot run shot; do
   run bash "$BROWSER" "$_v"
-  tn "T28b $_v: no deprecation prose on the stdout a caller parses" 'deprecated' "$OUT"
-  tn "T28b $_v: none on its stderr either, which scripts read too" \
-     'is deprecated; it ships from' "$ERR"
-  tc "T28b (control) $_v: ...and it really dispatched and spoke for itself" \
+  tn "T28d $_v: none on the stdout a caller parses" "$NOTICEPAT" "$OUT"
+  tn "T28d $_v: none on its stderr either, which scripts read too" "$NOTICEPAT" "$ERR"
+  tc "T28d (control) $_v: ...and it really dispatched and spoke for itself" \
      "usage: 5dive browser $_v" "$ERR"
 done
 unset _v
@@ -3981,11 +4062,12 @@ unset _v
 # stdout case with a stream that actually has content in it rather than an empty
 # one — an absence proved on no output is not an absence.
 run bash "$BROWSER" ls
-t  'T28b ls: exits 0' 0 "$RC"
-tc 'T28b (control) ls: ...and it listed the store, so this stdout is real' \
+t  'T28d ls: exits 0' 0 "$RC"
+tc 'T28d (control) ls: ...and it listed the store, so this stdout is real' \
    'deprnotice.test' "$OUT"
-tn 'T28b ls: no deprecation prose in that listing' 'deprecated' "$OUT"
-tn 'T28b ls: none on its stderr either' 'is deprecated; it ships from' "$ERR"
+tn 'T28d ls: no notice in that listing' "$NOTICEPAT" "$OUT"
+tn 'T28d ls: none on its stderr either' "$NOTICEPAT" "$ERR"
+rm -rf "$MUT"
 
 # ============ T29 DIVE-4791: `served` (what is up) and `forget` (the way out) ==
 #

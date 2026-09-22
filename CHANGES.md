@@ -29,6 +29,17 @@ those boxes cannot act on anyway — the converge refuses to re-home a registry-
 ("never behind the operator's back"), so migrating is a manual remove-then-add, and whether that
 re-homing ever happens automatically is an open call.
 
+**The harness was told, in this change.** `tests/browser_plugin_unit.sh` T28 was written under
+DIVE-4691 to hold the `_deprecated()` line in place, and it did its job — it went red the moment the
+line was removed. The contract it asserts is retired here rather than discovered: T28 now grades that
+the notice is in the registry `marketplace.json` entry (deprecated marker, the repository it ships
+from, and the remove-then-add order a stranded box needs), that the file carrying it sits OUTSIDE the
+directory the marketplace entry points at — so the next `rsync -a --delete` port cannot overwrite it
+— and that no copy of the old runtime line survives inside the mirror. The negative arms are graded
+against a throwaway copy of the mirror with that line injected back, because an absence measured by a
+probe that has not been shown to find one is not an absence.
+
+
 **A browser release is THREE deliveries, in this order:** the maintained repo, this copy at the
 same version, then the `_BS_PLUGIN_MIN` bump in the api. The floor is `min()` over both copies.
 `community/wiki/a-forked-plugin-makes-the-converger-floor-a-min-over-both-copies.md`.
