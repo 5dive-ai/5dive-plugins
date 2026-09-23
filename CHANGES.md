@@ -1,5 +1,19 @@
 ## Unreleased
 
+### Fixed — a 👍 on the newest Telegram message no longer gets the turn's recap auto-relayed (DIVE-4889), telegram 0.5.61
+
+When a seat answered an acknowledgement with a reaction, as our rules require, the Stop hook
+(`hooks/stop-reply-check.ts`) still sent the turn's loose transcript text to the human as
+`(auto-relay) …`. It counted only `reply`/`edit_message` as an answer. The 09-11 fix for the same
+complaint (DIVE-4276) changed only the silence watchdog. 5dive-ai/5dive #1005 changed the CLI's
+shell copy of this hook, which no seat runs. `analyzeTurn` now reports `reactedNewest`: a react whose
+chat and message id are the turn's newest inbound, judged at the end of the turn. The Stop hook
+exits clean on it. A react on an older message, or one followed by a newer inbound, is contact but
+not an answer, so it still relays; it is deliberately not folded into `hadSend`. The forks
+(`telegram-{grok,agy,codex}`) have a different Stop hook (a "turn complete" ping keyed on a
+last-reply stamp that react does not write) and are a separate row; `telegram-{opencode,pi}` have
+none.
+
 ### Fixed — the registry copy of voice is now a BYTE-FOR-BYTE mirror of 5dive-ai/5dive-voice at 1.3.0 (DIVE-4880), voice 1.3.0
 
 The dashboard's Install tile installs `voice@5dive-plugins`, and this copy had not moved since it

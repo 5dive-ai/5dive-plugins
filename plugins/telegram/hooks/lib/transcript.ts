@@ -86,6 +86,7 @@ export function findRateLimitText(entries: TranscriptEntry[]): string | null {
 //   - texts: every non-empty assistant text block in turn order.
 //   - lastChatId / lastMessageId / lastThreadId: from the most-recent inbound
 //     (lastThreadId is the forum-topic id, null outside a non-General topic).
+//   - reactedNewest: a react landed on THAT newest inbound (see below).
 export type TurnAnalysis = {
   turnStart: number
   hadInbound: boolean
@@ -95,6 +96,15 @@ export type TurnAnalysis = {
   lastChatId: string | null
   lastMessageId: string | null
   lastThreadId: string | null
+  // DIVE-4889: a `react` in this turn targeted the turn's NEWEST inbound
+  // (same chat_id AND message_id as lastChatId/lastMessageId, judged at the
+  // END of the turn, so a DM arriving after the react un-credits it). That is
+  // an answer — a 👍 on an acknowledgement is what our rules ask for — so the
+  // Stop hook must not auto-relay the turn's narration on top of it. A react on
+  // an OLDER message is contact, not an answer, and does NOT set this: counting
+  // it would bury the live question (wiki: a-reaction-is-contact-but-only-
+  // sometimes-an-answer). Deliberately not folded into hadSend for that reason.
+  reactedNewest: boolean
   // DIVE-1323: this turn was triggered by an inter-agent (a2a) envelope
   // `[5dive-msg from=X ...]` (injected via UserPromptSubmit, carries no
   // telegram <channel> tag) AND no human telegram inbound landed in the turn.
@@ -237,6 +247,7 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
   let lastChatId: string | null = null
   let lastMessageId: string | null = null
   let lastThreadId: string | null = null
+  const reacts: Array<{ chatId: string; messageId: string }> = []
 
   for (const e of turn) {
     if (e.type === 'user') {
@@ -267,6 +278,11 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
           hadTool = true
           if (block.name === `${tgPrefix}reply` || block.name === `${tgPrefix}edit_message`) {
             hadSend = true
+          } else if (block.name === `${tgPrefix}react`) {
+            const input = (block.input ?? {}) as { chat_id?: unknown; message_id?: unknown }
+            if (input.chat_id != null && input.message_id != null) {
+              reacts.push({ chatId: String(input.chat_id), messageId: String(input.message_id) })
+            }
           }
         }
       }
@@ -277,7 +293,12 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
   // anywhere in the turn (a mid-turn human DM flips hadInbound → still reply).
   const a2aTurn = a2aTurnStart && !hadInbound
 
-  return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId, lastThreadId, a2aTurn }
+  const reactedNewest =
+    lastChatId !== null &&
+    lastMessageId !== null &&
+    reacts.some((r) => r.chatId === lastChatId && r.messageId === lastMessageId)
+
+  return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId, lastThreadId, reactedNewest, a2aTurn }
 }
 
 // Scan transcript entries past a given line index for any telegram tool

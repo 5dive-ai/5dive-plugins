@@ -8,6 +8,9 @@
 //   reply/edit_message sent this turn        → exit clean (proper channel
 //                                              used; loose transcript text
 //                                              is narration — do NOT relay)
+//   react on the NEWEST inbound this turn    → exit clean (DIVE-4889: the
+//                                              👍 answered it; the text is
+//                                              narration — do NOT relay)
 //   no send, transcript text present         → DM "(auto-relay) <text>"
 //                                              (the genuine "talked to the
 //                                              transcript instead of
@@ -17,7 +20,9 @@
 //   no send, no text, no tool, re-entry      → DM enriched diagnostic
 //
 // A "send" is reply OR edit_message — react / download_attachment don't
-// count, since a 👍 isn't a text answer. Deciding at the turn level
+// count, since a 👍 isn't a text answer. A react on the newest inbound is
+// still an ANSWER (reactedNewest), just not a send: a react on an older
+// message answers nothing and must keep relaying, so it is not folded in. Deciding at the turn level
 // (did the agent reach the proper channel at all?) rather than
 // per-text-block is what stops preambles and end-of-turn summaries
 // leaking out after the real reply.
@@ -237,6 +242,13 @@ signalTurnEnded()
 // transcript block is narration (preamble, progress notes, end-of-turn
 // summary), NOT a missed answer. Suppress all auto-relay.
 if (a.hadSend) process.exit(0)
+
+// DIVE-4889: a react on the turn's NEWEST inbound answered it (an ack gets a
+// 👍, never a reply — our own rule), so the loose text is narration too. The
+// 09-11 fix (DIVE-4276) taught only the silence watchdog this; this Stop hook
+// kept relaying `(auto-relay) …` on top of the 👍. A react on an OLDER message
+// does not set reactedNewest and falls through to the relay below, unchanged.
+if (a.reactedNewest) process.exit(0)
 
 // No reply/edit_message this turn. If the agent produced transcript text,
 // it "talked to the transcript instead of replying" — relay it.
