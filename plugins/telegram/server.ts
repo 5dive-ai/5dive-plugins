@@ -46,6 +46,7 @@ import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } f
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { patchSettingsFile } from './settingsfile.ts'
+import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -1863,7 +1864,9 @@ function readClaudeModelAndEffort(pid: number): { model?: string; effort?: strin
       readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'),
     )
     if (!model && typeof settings.model === 'string') model = settings.model
-    if (!effort && typeof settings.effortLevel === 'string') effort = settings.effortLevel
+    // DIVE-4865: the per-model key for the running model, else the legacy
+    // top-level key — the one CC 2.1.280+ ignores on claude-opus-5-5.
+    if (!effort) effort = effectiveEffort(settings, MODEL_ALIASES, model)
   } catch {}
   return { model, effort }
 }
@@ -2358,6 +2361,19 @@ function patchSettings(patch: Record<string, unknown>): void {
   patchSettingsFile(join(cwd, '.claude', 'settings.json'), patch, /*addNewKeys*/ false)
 }
 
+// Effort's version of patchSettings, over the same three layers (DIVE-4865). A
+// top-level `effortLevel` alone is a no-op on claude-opus-5-5 — CC 2.1.280+
+// reads `modelSettings.<model>.effortLevel` — so this writes both keys; see
+// settingsfile.ts. Not a shell-out to `5dive agent config set effort=`: hosts
+// still on CLI <= 0.49.0 would write the top-level key only, the call needs a
+// sudo grant this seat may not hold, and an upstream host has no CLI at all.
+function patchEffort(level: string): void {
+  patchEffortFile(join(homedir(), '.claude', 'settings.json'), level, MODEL_ALIASES, /*addNewKeys*/ true)
+  const cwd = process.cwd()
+  patchEffortFile(join(cwd, '.claude', 'settings.local.json'), level, MODEL_ALIASES, /*addNewKeys*/ false)
+  patchEffortFile(join(cwd, '.claude', 'settings.json'), level, MODEL_ALIASES, /*addNewKeys*/ false)
+}
+
 // Inline keyboards for /model, /effort, /account. Callback data is parsed by
 // the bot.on('callback_query:data') handler — keep the `model:` / `effort:` /
 // `account:` prefixes in sync there. Telegram caps callback_data at 64 bytes;
@@ -2640,7 +2656,7 @@ function applyEffort(level: string, chatId: number): ApplyResult {
   const me = thisAgentName()
   if (!me) return { text: `Can't determine this agent's name (not running as agent-* user).` }
   try {
-    patchSettings({ effortLevel: level })
+    patchEffort(level)
   } catch (err) {
     return { text: `Failed to update settings.json: ${err instanceof Error ? err.message : String(err)}` }
   }

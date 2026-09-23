@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Fixed — `/effort` over Telegram now changes what an Opus 5.5 seat runs (DIVE-4865), telegram 0.5.60
+
+`/effort` wrote only the top-level `effortLevel`. From Claude Code 2.1.280 that key is legacy: it
+applies to older models only, and `claude-opus-5-5` reads `modelSettings.<model>.effortLevel`,
+otherwise running its default (medium). On a seat the 5dive CLI's upgrade heal has already filled
+(DIVE-4863), the per-model keys shadowed every later `/effort` write. `/effort` now writes both keys,
+the per-model one for every catalogue id plus the seat's own model, with `max` stored per model as
+`xhigh` because Claude Code silently drops a per-model `max`. The project layers are refreshed only
+where they already carry a value. `/status` and the picker's ✓ read the per-model key first. The
+write is direct rather than a shell-out to `5dive agent config set effort=`, because hosts on CLI
+0.49.0 or older would write the top-level key only, and an upstream host has no CLI.
+
 ### Fixed — `/model <alias>` over Telegram no longer pins the seat to a dated model (DIVE-4860), telegram 0.5.59
 
 The live switch typed the RESOLVED id (`/model claude-opus-5`) into the pane, and Claude Code

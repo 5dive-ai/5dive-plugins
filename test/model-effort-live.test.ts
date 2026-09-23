@@ -360,7 +360,9 @@ describe('server.ts wiring', () => {
   })
   test('patchSettings STAYS — it is what makes the unconfirmed branch true', () => {
     expect(fnBody(src(), 'applyModel')).toContain('patchSettings')
-    expect(fnBody(src(), 'applyEffort')).toContain('patchSettings')
+    // DIVE-4865: effort's settings write is patchEffort (both keys), not the
+    // generic patchSettings — test/dive4865-effort-per-model.test.ts grades it.
+    expect(fnBody(src(), 'applyEffort')).toContain('patchEffort(level)')
   })
   test('both still return an `after`, which the callback flow reads as success', () => {
     // server.ts answers the button tap with `r.after ? 'Switching…' : 'Failed'`,
