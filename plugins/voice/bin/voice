@@ -8,57 +8,359 @@
 # the publisher, which contract §5 keeps shut.
 #
 # WHAT IT DOES, AND WHAT IT DELIBERATELY DOES NOT. It reports whether the
-# host-level voice engine this plugin needs is actually present, and names the
-# one command that installs it. It does NOT hold a conversation: the interactive
+# host-level voice engine this plugin needs is actually present, names the one
+# command that installs it, and owns the knob that matters most: WHICH BACKEND
+# hears and speaks (DIVE-4439). It does NOT hold a conversation: the interactive
 # speak/listen loop is the voice runtime's job, not the verb's, and pretending
 # otherwise here would be a stub wearing a feature's name.
+#
+# The other knobs (the OpenRouter models and voice) are reached through
+# `5dive voice config`, which is also what the dashboard's settings form calls
+# (DIVE-4875).
+#
+# WHY THE VERB DOES NOT DEFINE THE CONFIG FORMAT. The box-level engine
+# (bin/5dive-setup-voice, shipped beside this file since DIVE-4495) installs
+# /usr/local/lib/5dive/voice-backend.sh
+# and every wrapper sources it. This verb sources the SAME file rather than
+# reimplementing "where is the key, what is the default, when do we fall back".
+# Two definitions is how hearing and speaking end up disagreeing about where the
+# audio goes — and the whole value of a backend switch is that they cannot. The
+# plugin is the UI; the box half is the engine. If the engine is not installed,
+# the verb says so instead of guessing.
 set -uo pipefail
 
 VOICE_SERVICE_PORT="${VOICE_SERVICE_PORT:-8765}"
-SETUP_CMD="sudo 5dive-setup-voice"
+SETUP_CMD="sudo 5dive voice setup"
+VOICE_LIB="${VOICE_LIB:-/usr/local/lib/5dive/voice-backend.sh}"
 
 usage() {
   cat <<'USAGE'
-5dive voice — speech-to-text and text-to-speech on your own box
+5dive voice — speech-to-text and text-to-speech for your agent
 
-  5dive voice              # is the voice engine installed and warm?
+  5dive voice                          # is the engine installed and warm?
+  sudo 5dive voice setup               # install the host engine (one time)
+  5dive voice backend                  # which backend hears and speaks
+  sudo 5dive voice backend local       # (default) hearing runs on this box
+  sudo 5dive voice backend openrouter  # hearing and speaking run on OpenRouter
+  5dive voice config [--json]          # every setting and its current value
+  5dive voice config get <key>
+  sudo 5dive voice config set <key> <value>
   5dive voice --help
 
-  Speech never leaves the box: transcription runs locally against a warm
-  whisper service. Install the engine with:  sudo 5dive-setup-voice
+BACKENDS
+
+  local       Hearing runs on this box against a warm whisper service, and the
+              audio never leaves it. SPEAKING DOES NOT: the local voice is
+              edge-tts, an unofficial client for Microsoft's online voices, so
+              the reply TEXT goes to Microsoft either way. Free.
+
+  openrouter  Both halves call OpenRouter. The audio AND the reply text leave
+              the box. More accurate, and it costs about $0.00006 to hear a 20s
+              voice note and $0.0045 to speak a 300-character reply.
+              Needs a key:  sudo 5dive-write-connector openrouter.env <<< "OPENROUTER_API_KEY=sk-or-..."
+
+MODELS (openrouter only; sudo 5dive voice config set <key> <value>)
+
+  stt_model   default openai/whisper-large-v3-turbo — 99+ languages, Russian
+              among them. meta/muse-voice-transcribe-1.0 is the most accurate
+              option in ENGLISH, but Russian and Ukrainian are NOT among its
+              validated languages and code-switched speech scores badly on it.
+              Pick it only if your audio is English.
+  tts_model   default microsoft/mai-voice-2-flash — the official successor of
+              the service edge-tts scrapes.
+
+Install the engine with:  sudo 5dive voice setup
 USAGE
+}
+
+die() { printf '5dive voice: %s\n' "$1" >&2; exit "${2:-1}"; }
+
+engine_missing() {
+  printf 'The voice engine is not installed on this box. 5dive does not install it behind your back:\n  %s\n' "$SETUP_CMD"
+}
+
+# config_write_key <key> <value> — rewrite ONE key=value line of the voice
+# config, atomically (DIVE-4270's rule: a temp file in the same directory, then
+# a rename, so a reader never sees a half-written file). Every other line the
+# user or the installer put there — other keys, the explanatory comments — is
+# kept. Callers have already validated both halves; this only writes.
+config_write_key() {
+  local key="$1" value="$2"
+  mkdir -p "$VOICE_STATE_DIR" || die "could not create $VOICE_STATE_DIR"
+  chmod 755 "$VOICE_STATE_DIR" 2>/dev/null || true
+  chown root:claude "$VOICE_STATE_DIR" 2>/dev/null || true
+
+  local tmp
+  tmp="$(mktemp "$VOICE_STATE_DIR/.config.XXXXXX")" || die "could not write in $VOICE_STATE_DIR"
+  if [[ -f "$VOICE_CONFIG" ]]; then
+    grep -v "^${key}=" "$VOICE_CONFIG" > "$tmp"
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  chmod 644 "$tmp"; chown root:claude "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$VOICE_CONFIG" || { rm -f "$tmp"; die "could not install $VOICE_CONFIG"; }
+}
+
+# ---- backend subcommand -------------------------------------------------
+cmd_backend() {
+  local want="${1:-}"
+
+  [[ -r "$VOICE_LIB" ]] || { engine_missing >&2; exit 1; }
+  # shellcheck source=/dev/null
+  . "$VOICE_LIB"
+
+  if [[ -z "$want" ]]; then
+    local configured effective
+    configured=$(voice_backend_configured)
+    effective=$(voice_effective_backend 2>/dev/null)
+    printf '%s\n' "$effective"
+    if [[ "$configured" != "$effective" ]]; then
+      printf '\nConfigured as %s, but running as %s — %s' "$configured" "$effective" "$(voice_key_fix_line)" >&2
+    fi
+    return 0
+  fi
+
+  case "$want" in
+    local|openrouter) ;;
+    *) die "unknown backend '$want' (want: local | openrouter)" 2 ;;
+  esac
+
+  # CHANGING the backend decides whether this box's audio leaves the box, so it
+  # is a root act — the same shape as `sudo 5dive voice setup`. READING it is
+  # not, which is why the branch above runs unprivileged. A non-root seat gets
+  # the sudo line, never a half-applied change.
+  if [[ $EUID -ne 0 ]]; then
+    die "changing the backend needs root (it decides whether this box's audio leaves it). Run: sudo 5dive voice backend $want"
+  fi
+
+  # Refusing here rather than at the first voice note is the whole reason this
+  # is a command and not a config edit: the user finds out now, with the fix in
+  # front of them, instead of discovering it from a warning in a log.
+  if [[ "$want" == openrouter ]] && ! voice_openrouter_key >/dev/null 2>&1; then
+    printf '5dive voice: refusing to switch to openrouter — %s' "$(voice_key_fix_line)" >&2
+    exit 1
+  fi
+
+  config_write_key backend "$want"
+
+  printf 'backend: %s\n' "$want"
+  if [[ "$want" == openrouter ]]; then
+    printf '\nFrom now on this box sends voice-note AUDIO and REPLY TEXT to OpenRouter.\n'
+    printf 'Hearing: %s   Speaking: %s\n' "$(voice_stt_model)" "$(voice_tts_model)"
+    printf 'Back to local at any time:  sudo 5dive voice backend local\n'
+  else
+    printf '\nHearing runs on this box. Speaking still uses edge-tts, which sends the\n'
+    printf 'reply TEXT to Microsoft — that has always been true and is not new here.\n'
+  fi
+}
+
+# ---- config: every setting the manifest declares (DIVE-4875) -----------
+#
+# The dashboard's settings form is drawn from `fivedive.settings` in this
+# plugin's own manifest, and reads and writes through THIS subcommand — the
+# protocol the declaration promises: `<verb> config --json` answers the current
+# values, `<verb> config set <key> <value>` changes one. So the manifest is the
+# one list of what is settable and what each enum may be, and this verb reads it
+# rather than keeping a second copy that would drift from what the form offers.
+#
+# What it deliberately does NOT hold: the OpenRouter key. That is a secret, it
+# lives in the connector store (`sudo 5dive-write-connector openrouter.env`),
+# and a second place keys get written is a second place they leak from. The
+# config file records choices only.
+#
+# Values are read through the engine's own accessors (voice-backend.sh), not by
+# grepping the file here, for the reason at the top of this file: the value the
+# form shows must be the value hearing and speaking will actually use.
+MANIFEST="${VOICE_MANIFEST:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.claude-plugin/plugin.json}"
+
+# A string setting is one config line. The class keeps it one: no newline, no
+# space, no quote — and it must OPEN alphanumeric, so no value reads as a flag.
+# Model and voice ids (`openai/whisper-large-v3-turbo`, `alloy`) fit inside it.
+CONFIG_STRING_RE='^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$'
+
+config_need_manifest() {
+  command -v jq >/dev/null 2>&1 || die "jq is required to read the settings this plugin declares"
+  [[ -r "$MANIFEST" ]] || die "this voice plugin is incomplete: no $MANIFEST — reinstall it: sudo 5dive plugin upgrade voice"
+}
+
+config_keys() { jq -r '(.fivedive.settings.fields // [])[] | .key' "$MANIFEST"; }
+config_field() { jq -c --arg k "$1" '(.fivedive.settings.fields // [])[] | select(.key == $k)' "$MANIFEST"; }
+
+# config_value <key> — the value the engine will use, defaults applied.
+config_value() {
+  case "$1" in
+    backend)   voice_backend_configured ;;
+    stt_model) voice_stt_model ;;
+    tts_model) voice_tts_model ;;
+    *)         voice_config_get "$1" "$(config_field "$1" | jq -r '.default // empty')" ;;
+  esac
+}
+
+config_json() {
+  local vals='{}' notices='[]' k
+  while IFS= read -r k; do
+    [[ -n "$k" ]] || continue
+    vals=$(jq -c --arg k "$k" --arg v "$(config_value "$k")" '. + {($k): $v}' <<<"$vals")
+  done < <(config_keys)
+  # The one state the form cannot show by value alone: told to use OpenRouter,
+  # but there is no key, so every call is quietly running locally. `connector`
+  # names the store entry that fixes it; the dashboard points at its own way to
+  # add one and never takes the key itself.
+  if [[ "$(voice_backend_configured)" == openrouter ]] && ! voice_openrouter_key >/dev/null 2>&1; then
+    notices=$(jq -c '. + [{key: "backend", connector: "openrouter.env",
+      text: "Set to OpenRouter, but this server has no OpenRouter key, so voice is running on this server instead. Add a key to switch it over."}]' <<<"$notices")
+  fi
+  jq -cn --argjson values "$vals" --argjson notices "$notices" '{ok: true, values: $values, notices: $notices}'
+}
+
+cmd_config() {
+  local json=0
+  if [[ "${1:-}" == --json ]]; then json=1; shift; fi
+  local sub="${1:-}"
+
+  if [[ ! -r "$VOICE_LIB" ]]; then
+    if (( json )); then
+      jq -cn --arg cmd "$SETUP_CMD" '{ok: false, reason: "engine_missing",
+        error: "The voice engine is not installed on this server yet. Finish setup first.", command: $cmd}'
+      exit 1
+    fi
+    engine_missing >&2; exit 1
+  fi
+  # shellcheck source=/dev/null
+  . "$VOICE_LIB"
+  config_need_manifest
+
+  case "$sub" in
+    "")
+      if (( json )); then config_json; return 0; fi
+      local k
+      while IFS= read -r k; do
+        [[ -n "$k" ]] && printf '%s=%s\n' "$k" "$(config_value "$k")"
+      done < <(config_keys)
+      ;;
+    get)
+      local key="${2:-}"
+      [[ -n "$key" ]] || die "usage: 5dive voice config get <key>" 64
+      [[ -n "$(config_field "$key")" ]] || die "unknown setting '$key' (settable: $(config_keys | paste -sd' '))" 2
+      config_value "$key"
+      ;;
+    set)
+      local key="${2:-}" value="${3:-}" field type
+      [[ -n "$key" && $# -eq 3 ]] || die "usage: sudo 5dive voice config set <key> <value>" 64
+      field=$(config_field "$key")
+      [[ -n "$field" ]] || die "unknown setting '$key' (settable: $(config_keys | paste -sd' '))" 2
+      type=$(jq -r '.type' <<<"$field")
+      case "$type" in
+        enum)
+          jq -e --arg v "$value" '[.options[]? | if type == "object" then .value else . end] | index($v) != null' <<<"$field" >/dev/null \
+            || die "'$value' is not a choice for $key (want: $(jq -r '[.options[]? | if type == "object" then .value else . end] | join(" | ")' <<<"$field"))" 2
+          ;;
+        string)
+          [[ "$value" =~ $CONFIG_STRING_RE ]] \
+            || die "'$value' is not a valid $key — letters, digits and . _ : / @ + - only, starting with a letter or digit, at most 128 characters" 2
+          ;;
+        *) die "the manifest declares $key with type '$type', which this verb does not know how to set" 2 ;;
+      esac
+      # backend decides whether audio leaves the box, and already has its own
+      # verb with the keyless refusal and the plain-words notice. One path.
+      if [[ "$key" == backend ]]; then cmd_backend "$value"; return; fi
+      [[ $EUID -eq 0 ]] || die "changing voice settings needs root. Run: sudo 5dive voice config set $key $value"
+      config_write_key "$key" "$value"
+      printf '%s: %s\n' "$key" "$value"
+      ;;
+    *) die "unknown: 5dive voice config $sub (want: config [--json] | config get <key> | config set <key> <value>)" 64 ;;
+  esac
+}
+
+# ---- setup: the host half, shipped by this plugin (DIVE-4495) ----------
+#
+# The installer is a SIBLING FILE, not a program the box was expected to already
+# have. That is the whole of this row: until now `fivedive.setup.command` named
+# a bare `5dive-setup-voice`, which is written only by 5dive's own box installer
+# (5dive-api scripts/install/users.sh) — so the plugin installed fine and its
+# host half could not be installed at all on a box provisioned any other way.
+#
+# Routed through the VERB rather than named by absolute path, for the same
+# reason `browser` uses `sudo 5dive browser setup`: the dispatcher already finds
+# <installed-plugin-dir>/bin/voice by convention, so the manifest never has to
+# hardcode 5dive's version-keyed cache layout or the value of STATE_DIR. A path
+# in a publisher manifest is a path that breaks on the first box that moves it.
+#
+# `exec`, so the installer's exit status IS this verb's exit status — `plugin
+# setup` records rc on the installed.json entry and a swallowed failure there is
+# a box that reports setup done and is not.
+cmd_setup() {
+  local self installer
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  installer="$self/5dive-setup-voice"
+  [[ -f "$installer" ]] \
+    || die "this voice plugin is incomplete: no $installer — reinstall it: sudo 5dive plugin upgrade voice"
+  [[ -x "$installer" ]] \
+    || die "$installer is not executable — reinstall it: sudo 5dive plugin upgrade voice"
+  exec "$installer" "$@"
+}
+
+# ---- status (the default) ----------------------------------------------
+cmd_status() {
+  local missing=0
+  report() {  # report <label> <ok?> <detail>
+    if [[ "$2" == yes ]]; then printf '  %-22s %s\n' "$1" "$3"
+    else printf '  %-22s MISSING (%s)\n' "$1" "$3"; missing=1; fi
+  }
+
+  printf 'voice — plugin %s\n' "${FIVEDIVE_PLUGIN_KEY:-voice}"
+
+  if command -v ffmpeg >/dev/null 2>&1; then report ffmpeg yes "$(command -v ffmpeg)"
+  else report ffmpeg no "audio conversion"; fi
+
+  if command -v 5dive-transcribe >/dev/null 2>&1; then report 5dive-transcribe yes "$(command -v 5dive-transcribe)"
+  else report 5dive-transcribe no "the wrapper an agent pre-allows"; fi
+
+  if command -v 5dive-speak >/dev/null 2>&1; then report 5dive-speak yes "$(command -v 5dive-speak)"
+  else report 5dive-speak no "the wrapper that honours the backend switch"; fi
+
+  local backend="unknown"
+  if [[ -r "$VOICE_LIB" ]]; then
+    # shellcheck source=/dev/null
+    . "$VOICE_LIB"
+    backend=$(voice_effective_backend 2>/dev/null)
+    report backend yes "$backend"
+  else
+    report backend no "$VOICE_LIB not installed"
+  fi
+
+  # The local engine is only REQUIRED when the box is actually using it. On
+  # openrouter a cold whisper-service is the expected state, not a fault, and
+  # reporting it as MISSING would train users to ignore this output.
+  if [[ "$backend" == openrouter ]]; then
+    printf '  %-22s %s\n' "whisper-service" "not needed (backend=openrouter)"
+    if voice_openrouter_key >/dev/null 2>&1; then
+      printf '  %-22s %s\n' "openrouter key" "present"
+    else
+      report "openrouter key" no "backend=openrouter but no key — calls fall back to local"
+    fi
+  else
+    # A listening socket is the only honest test of "warm": the unit can be
+    # enabled and the model still not loaded, and `systemctl is-active` would
+    # call that up.
+    if (exec 3<>"/dev/tcp/127.0.0.1/$VOICE_SERVICE_PORT") 2>/dev/null; then
+      report "whisper-service" yes "listening on :$VOICE_SERVICE_PORT"
+    else
+      report "whisper-service" no "nothing listening on :$VOICE_SERVICE_PORT"
+    fi
+  fi
+
+  if (( missing )); then
+    printf '\n'; engine_missing
+    exit 1
+  fi
+  printf '\nReady. Send your agent a voice message and it will hear you.\n'
 }
 
 case "${1:-}" in
   -h|--help|help) usage; exit 0 ;;
-  "") ;;
-  *) printf 'unknown: 5dive voice %s (see: 5dive voice --help)\n' "$1" >&2; exit 64 ;;
+  "")             cmd_status ;;
+  backend)        shift; cmd_backend "${1:-}" ;;
+  setup)          shift; cmd_setup "$@" ;;
+  config)         shift; cmd_config "$@" ;;
+  *)              printf 'unknown: 5dive voice %s (see: 5dive voice --help)\n' "$1" >&2; exit 64 ;;
 esac
-
-missing=0
-report() {  # report <label> <ok?> <detail>
-  if [[ "$2" == yes ]]; then printf '  %-22s %s\n' "$1" "$3"
-  else printf '  %-22s MISSING (%s)\n' "$1" "$3"; missing=1; fi
-}
-
-printf 'voice — plugin %s\n' "${FIVEDIVE_PLUGIN_KEY:-voice}"
-
-if command -v ffmpeg >/dev/null 2>&1; then report ffmpeg yes "$(command -v ffmpeg)"
-else report ffmpeg no "audio conversion"; fi
-
-if command -v 5dive-transcribe >/dev/null 2>&1; then report 5dive-transcribe yes "$(command -v 5dive-transcribe)"
-else report 5dive-transcribe no "the wrapper an agent pre-allows"; fi
-
-# A listening socket is the only honest test of "warm": the unit can be enabled
-# and the model still not loaded, and a `systemctl is-active` would call that up.
-if (exec 3<>"/dev/tcp/127.0.0.1/$VOICE_SERVICE_PORT") 2>/dev/null; then
-  report "whisper-service" yes "listening on :$VOICE_SERVICE_PORT"
-else
-  report "whisper-service" no "nothing listening on :$VOICE_SERVICE_PORT"
-fi
-
-if (( missing )); then
-  printf '\nThe engine is not fully installed. 5dive does not install it behind your back:\n  %s\n' "$SETUP_CMD"
-  exit 1
-fi
-printf '\nReady. Send your agent a voice message and it will hear you.\n'

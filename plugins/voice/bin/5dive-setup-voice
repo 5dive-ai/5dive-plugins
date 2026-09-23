@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# `5dive-setup-voice` — the voice plugin's OWN host-half installer (DIVE-4495).
+#
+# WHY IT LIVES HERE. Until this file, the voice plugin was installable and its
+# host half was not: `plugin add` said installed, `5dive voice` reported every
+# component MISSING forever, and both the terminal hint and the dashboard button
+# pointed at `sudo 5dive-setup-voice`. That program is written by the 5dive BOX
+# INSTALLER (5dive-api `scripts/install/users.sh`, from `scripts/inc/`), so it
+# exists on a 5dive-provisioned box and on nothing else — no dev host, no
+# self-hosted box, no box whose provision predates it. A plugin whose host half
+# only works where 5dive's own provisioning ran is not an installable plugin; it
+# is a feature of the provisioner wearing a plugin's name.
+#
+# So the plugin ships it, exactly as `browser` ships `bin/browser`, and
+# `plugin add` is what puts the installer on the box. Nothing has to be there
+# beforehand. The 5dive-api copy stays where it is — removing it would strand
+# every box already running it — and this one is now the source a plugin user
+# gets.
+#
+# HOW IT IS REACHED. `fivedive.setup.command` is `sudo 5dive voice setup`, the
+# verb route, which is what `browser` does (`sudo 5dive browser setup`). The
+# alternative — naming this file by its installed absolute path — would hardcode
+# 5dive's version-keyed cache layout and the value of STATE_DIR into a publisher
+# manifest, which is the coupling the plugin contract exists to remove. The verb
+# dispatcher already resolves <installed-plugin-dir>/bin/voice by convention, and
+# `voice setup` execs this file as its sibling.
+#
+# It self-elevates with its own `sudo` because that is DIVE-4475's contract: the
+# setup command is "the same string a human was told to paste", so it is written
+# for a NON-root caller, and `plugin setup` drops to the calling seat precisely
+# so that inner `sudo` re-derives SUDO_USER honestly.
+#
+# WHAT IT DOES (unchanged from the 5dive-api original, which stays the behaviour
+# of record):
+#   1. apt install ffmpeg
+#   2. pip install faster-whisper + edge-tts into /home/claude/.venv
+#   3. /usr/local/bin/whisper-service + whisper-service.service (warm model, :8765)
+#   4. /usr/local/lib/5dive/voice-backend.sh + /usr/local/bin/5dive-transcribe
+#      and /usr/local/bin/5dive-speak (cp + curl behind single binaries so
+#      agents can pre-allow Bash(5dive-transcribe:*) instead of getting a
+#      Telegram permission prompt for cp + curl on every voice message)
+#   5. $STATE_DIR/voice — where the backend choice is recorded (DIVE-4439)
+#   6. Append Voice section to /home/claude/projects/CLAUDE.md
+set -euo pipefail
+
+VENV="/home/claude/.venv"
+# Overridable so an ACCEPTANCE run can be staged against a scratch file: the real
+# target is the fleet-wide rules file every agent on the box loads every turn,
+# and a test run must not be able to append to it by accident.
+CLAUDE_MD="${CLAUDE_MD:-/home/claude/projects/CLAUDE.md}"
+MARKER_OLD="<!-- 5dive-setup-voice: voice section -->"
+MARKER_V2="<!-- 5dive-setup-voice: voice section v2 -->"
+MARKER="<!-- 5dive-setup-voice: voice section v3 -->"
+WHISPER_MODEL="${WHISPER_MODEL:-small}"
+# DIVE-4439. The backend choice is host state, not plugin code, so it does NOT
+# live in the plugin's version-keyed cache dir — that path is keyed on version
+# and an upgrade would silently reset the box to `local`. See the wiki page
+# a-plugin-config-file-does-not-live-in-the-version-keyed-cache.
+VOICE_STATE_DIR="${VOICE_STATE_DIR:-${STATE_DIR:-/var/lib/5dive}/voice}"
+VOICE_LIB="/usr/local/lib/5dive/voice-backend.sh"
+
+# The payloads this installer writes onto the box. In 5dive-api these were
+# @-include directives spliced by the provisioning preprocessor before the
+# script shipped (the literal spelling is deliberately not written here: a
+# grep that proves none survived must not match this comment). A plugin has no such pass — `plugin add` copies the tree
+# verbatim — so they are REAL FILES next to this one and are read at run time.
+PAYLOAD_DIR="${PAYLOAD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)}"
+
+B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; X=$'\e[0m'
+say()  { printf '\n%s== %s ==%s\n\n' "$B" "$*" "$X"; }
+ok()   { printf '%s✓ %s%s\n' "$G" "$*" "$X"; }
+warn() { printf '%s! %s%s\n' "$Y" "$*" "$X"; }
+die()  { printf '%s✗ %s%s\n' "$R" "$*" "$X" >&2; exit 1; }
+
+# payload <name> — the path of a shipped payload, or a refusal that names it.
+#
+# Checked BEFORE anything is written rather than at each use: a half-installed
+# voice engine (service up, wrappers missing) reports MISSING from `5dive voice`
+# in a way that looks like the bug this row closed, so an incomplete plugin tree
+# must fail loudly and early instead of part-way through step 4.
+payload() {
+  local p="$PAYLOAD_DIR/$1"
+  [[ -f "$p" ]] || die "the voice plugin is missing $1 (looked in $PAYLOAD_DIR) — reinstall it: sudo 5dive plugin upgrade voice"
+  printf '%s\n' "$p"
+}
+
+# DIVE-4398 / DIVE-4270, one layer down. This script is REGENERATED and re-run
+# on every nightly (update.sh runs `5dive-setup-voice wrapper`), and the files
+# it writes are scripts that agents EXECUTE. A truncating `cat >` rewrites the
+# destination's own inode, and a bash already running that inode keeps reading
+# it by byte offset — so a transcribe that overlaps the ~03:07 refresh resumes
+# inside the new bytes, mid-token. update.sh fixed this for its own writes; the
+# guard has to exist here too, because a guard restated in three places is a
+# guard that silently goes missing from one.
+#
+# Temp file IN THE SAME DIRECTORY, then mv -f: an atomic rename, so the path
+# points at a new inode and every already-running reader finishes on the old
+# one. SAME DIRECTORY IS LOAD-BEARING — a cross-filesystem mv is a copy onto
+# the old inode, i.e. the bug again.
+#
+#   write_atomic <dst> [<mode>] [<owner:group>]   # content on stdin
+write_atomic() {
+  local dst="$1" mode="${2:-}" owner="${3:-}" dir tmp
+  dir="$(dirname "$dst")"
+  mkdir -p "$dir"
+  tmp="$(mktemp "$dir/.$(basename "$dst").XXXXXX")" \
+    || die "write_atomic: could not create a temp file in $dir for $dst"
+  if ! cat > "$tmp"; then
+    rm -f "$tmp"
+    die "write_atomic: failed writing $dst"
+  fi
+  if [[ -n "$mode" ]]; then
+    chmod "$mode" "$tmp" || { rm -f "$tmp"; die "write_atomic: chmod $mode $dst"; }
+  fi
+  if [[ -n "$owner" ]]; then
+    chown "$owner" "$tmp" || { rm -f "$tmp"; die "write_atomic: chown $owner $dst"; }
+  fi
+  mv -f "$tmp" "$dst" || { rm -f "$tmp"; die "write_atomic: could not install $dst"; }
+}
+
+require_root() {
+  [[ $EUID -eq 0 ]] || die "Run with sudo (installs apt packages + systemd unit):  sudo 5dive voice setup"
+}
+
+# Drop to `claude` for the venv. `runuser` first, `sudo -u` as the fallback, and
+# the difference is the same one DIVE-4475 hit: `sudo -u` asks the sudoers
+# POLICY for permission to become the target, and this fleet narrows runas on
+# purpose (DIVE-3263), so a drop a policy can deny is a drop that stops working
+# first on the hardened boxes. `runuser` is root-only by construction and
+# consults no policy. We are already root here (require_root), so it cannot be
+# refused.
+as_claude() {
+  if command -v runuser >/dev/null 2>&1; then runuser -u claude -- "$@"
+  else sudo -u claude -- "$@"; fi
+}
+
+step_apt() {
+  say "Step 1/6 — ffmpeg (apt)"
+  if command -v ffmpeg >/dev/null; then
+    ok "ffmpeg already present"
+    return
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
+  ok "ffmpeg installed"
+}
+
+step_pip() {
+  say "Step 2/6 — faster-whisper + edge-tts (pip, claude venv)"
+  if [[ ! -d "$VENV" ]]; then
+    as_claude python3 -m venv "$VENV"
+    ok "created venv at $VENV"
+  fi
+  as_claude "$VENV/bin/pip" install --quiet --upgrade faster-whisper edge-tts
+  # edge-tts is used directly by agents; whisper is called via the HTTP service
+  # below, so no need to symlink faster-whisper.
+  if [[ -x "$VENV/bin/edge-tts" ]]; then
+    ln -sf "$VENV/bin/edge-tts" /usr/local/bin/edge-tts
+  fi
+  ok "faster-whisper + edge-tts installed"
+}
+
+step_service() {
+  say "Step 3/6 — whisper-service (warm HTTP, port 8765, model=$WHISPER_MODEL)"
+
+  write_atomic /usr/local/bin/whisper-service 755 < "$(payload whisper-service.py)"
+
+  cat > /etc/systemd/system/whisper-service.service <<EOF
+[Unit]
+Description=Warm faster-whisper transcription service (port 8765)
+After=network.target
+
+[Service]
+Type=simple
+User=claude
+Environment=WHISPER_MODEL=${WHISPER_MODEL}
+Environment=WHISPER_COMPUTE_TYPE=int8
+Environment=WHISPER_DEVICE=cpu
+ExecStart=${VENV}/bin/python /usr/local/bin/whisper-service
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now whisper-service
+
+  # First start downloads the model (~100MB–1.5GB depending on size) and loads
+  # it into memory. Poll /health until it's ready so first transcribe is fast.
+  printf 'Warming up (downloading + loading "%s" model)...\n' "$WHISPER_MODEL"
+  for _ in $(seq 1 180); do
+    if curl -fsS --max-time 2 http://127.0.0.1:8765/health >/dev/null 2>&1; then
+      ok "whisper-service ready at http://127.0.0.1:8765"
+      return
+    fi
+    sleep 2
+  done
+  warn "whisper-service not healthy after 6min — check: journalctl -u whisper-service"
+}
+
+step_wrapper() {
+  say "Step 4/6 — voice-backend lib + 5dive-transcribe / 5dive-speak wrappers"
+
+  # One definition of "which backend, and can it run" — sourced by both
+  # wrappers AND by the voice plugin's `5dive voice backend` verb. Restating it
+  # per wrapper is how hearing and speaking end up disagreeing about where the
+  # audio goes; the whole point of DIVE-4439's switch is that they cannot.
+  mkdir -p /usr/local/lib/5dive
+  write_atomic /usr/local/lib/5dive/voice-backend.sh 644 < "$(payload voice-backend.sh)"
+  ok "voice-backend lib installed at $VOICE_LIB"
+
+  write_atomic /usr/local/bin/5dive-transcribe 755 < "$(payload 5dive-transcribe.sh)"
+  ok "5dive-transcribe installed at /usr/local/bin/5dive-transcribe"
+
+  write_atomic /usr/local/bin/5dive-speak 755 < "$(payload 5dive-speak.sh)"
+  ok "5dive-speak installed at /usr/local/bin/5dive-speak"
+}
+
+step_state() {
+  say "Step 5/6 — backend state dir ($VOICE_STATE_DIR)"
+
+  # Root-writable, group-readable. READING the choice is every seat's business
+  # (both wrappers do it on every utterance); CHANGING it decides whether this
+  # box's audio leaves the box, so it is a root act — the same shape as
+  # `sudo 5dive voice setup` itself. `5dive voice backend openrouter` run by a
+  # non-root seat prints the sudo line rather than half-working.
+  mkdir -p "$VOICE_STATE_DIR"
+  chmod 755 "$VOICE_STATE_DIR"
+  chown root:claude "$VOICE_STATE_DIR" 2>/dev/null || true
+
+  if [[ -f "$VOICE_STATE_DIR/config" ]]; then
+    ok "backend already configured: $(grep -m1 "^backend=" "$VOICE_STATE_DIR/config" 2>/dev/null || echo "backend=local")"
+    return
+  fi
+  # local is the default and stays the default. Nothing about this row changes
+  # what an unconfigured box does.
+  write_atomic "$VOICE_STATE_DIR/config" 644 root:claude <<'VOICECFG'
+# 5dive voice backend. Change with: sudo 5dive voice backend local|openrouter
+#
+#   local       hearing runs on this box (faster-whisper). Speaking uses
+#               edge-tts, which sends the REPLY TEXT to Microsoft.
+#   openrouter  both halves call OpenRouter. Audio and reply text leave the box.
+#               Needs a key in /etc/5dive/connectors/openrouter.env.
+backend=local
+
+# Only read when backend=openrouter.
+# stt_model: openai/whisper-large-v3-turbo is the default — 99+ languages
+#   including Russian. meta/muse-voice-transcribe-1.0 is more accurate in
+#   English and does NOT validate Russian or Ukrainian; pick it deliberately.
+# stt_model=openai/whisper-large-v3-turbo
+# tts_model=microsoft/mai-voice-2-flash
+# tts_voice=alloy
+# edge_voice=en-US-AriaNeural
+VOICECFG
+  ok "wrote $VOICE_STATE_DIR/config (backend=local)"
+}
+
+step_claudemd() {
+  say "Step 6/6 — Append Voice section to $CLAUDE_MD"
+
+  if [[ ! -f "$CLAUDE_MD" ]]; then
+    warn "$CLAUDE_MD not found — skipping append."
+    return
+  fi
+
+  if grep -qF "$MARKER" "$CLAUDE_MD"; then
+    ok "Voice section already present (v3) — not re-appending."
+    return
+  fi
+
+  # v1 marker present from an earlier setup run — strip the old block (marker
+  # to end of file; voice section is appended last by design) before writing
+  # the v2 block. If the user has manually added content after the v1 marker,
+  # they'll need to restore it from the .bak we leave behind.
+  local old_marker=""
+  if   grep -qF "$MARKER_V2"  "$CLAUDE_MD"; then old_marker="$MARKER_V2"
+  elif grep -qF "$MARKER_OLD" "$CLAUDE_MD"; then old_marker="$MARKER_OLD"; fi
+  if [[ -n "$old_marker" ]]; then
+    cp -a "$CLAUDE_MD" "${CLAUDE_MD}.bak"
+    sed -i "\|${old_marker}|,\$d" "$CLAUDE_MD"
+    warn "Removed the previous voice section. Backup at ${CLAUDE_MD}.bak."
+  fi
+
+  cat >> "$CLAUDE_MD" <<EOF
+
+$MARKER
+# Voice
+- Voice transcription: \`5dive-transcribe <path>\` outputs the transcribed text on stdout (\`--json\` for the full backend response).
+- Voice replies: \`5dive-speak "<text>"\` prints the path to a Telegram-ready OGG/Opus file. Use it instead of calling edge-tts directly — it is the only thing that honours the backend switch.
+- Which backend: \`5dive voice backend\` prints it; \`sudo 5dive voice backend local|openrouter\` changes it. \`local\` is the default. On \`local\`, hearing runs on this box (warm whisper-service at http://127.0.0.1:8765, unit \`whisper-service.service\`) but SPEAKING still sends the reply text to Microsoft, because edge-tts is an online voice service. On \`openrouter\`, both the audio and the reply text leave the box.
+- When receiving a Telegram voice message, always transcribe it before responding.
+- **Reply order for speed**: ALWAYS send the text reply first (so the user sees it immediately), then generate and send the voice attachment as a follow-up message. Never bundle them together — text first, voice second.
+EOF
+
+  chown claude:claude "$CLAUDE_MD" 2>/dev/null || true
+  ok "Voice section appended."
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: sudo 5dive voice setup [all|apt|pip|service|wrapper|state|claudemd]
+
+  all       (default) Run all six steps in order
+  apt       Install ffmpeg
+  pip       Install faster-whisper + edge-tts into /home/claude/.venv
+  service   Install whisper-service + systemd unit (warm model on port 8765)
+  wrapper   Install the voice-backend lib + 5dive-transcribe + 5dive-speak
+  state     Create the backend state dir and seed it with backend=local
+  claudemd  Append Voice section to /home/claude/projects/CLAUDE.md
+
+The backend stays `local` unless you change it:  sudo 5dive voice backend openrouter
+`openrouter` sends audio AND reply text off the box, and needs a key in
+/etc/5dive/connectors/openrouter.env.
+
+Env:
+  WHISPER_MODEL=small   (tiny|base|small|medium|large-v3)
+USAGE
+}
+
+main() {
+  local cmd="${1:-all}"
+  case "$cmd" in
+    -h|--help|help) usage; return ;;
+  esac
+  require_root
+  # Fail on an incomplete plugin tree BEFORE the first apt install, not in the
+  # middle of step 4 with a service already enabled.
+  local p
+  for p in whisper-service.py voice-backend.sh 5dive-transcribe.sh 5dive-speak.sh; do
+    payload "$p" >/dev/null
+  done
+  case "$cmd" in
+    apt)      step_apt ;;
+    pip)      step_pip ;;
+    service)  step_service ;;
+    wrapper)  step_wrapper ;;
+    state)    step_state ;;
+    claudemd) step_claudemd ;;
+    all)      step_apt; step_pip; step_service; step_wrapper; step_state; step_claudemd ;;
+    *)        usage; exit 1 ;;
+  esac
+}
+
+main "$@"
