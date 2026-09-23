@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — the registry copy of voice is now a BYTE-FOR-BYTE mirror of 5dive-ai/5dive-voice at 1.3.0 (DIVE-4880), voice 1.3.0
+
+The dashboard's Install tile installs `voice@5dive-plugins`, and this copy had not moved since it
+arrived (DIVE-4202): 1.0.0, with no `backend` verb (DIVE-4439), no host installer
+`bin/5dive-setup-voice` or `lib/` (DIVE-4495), and no `fivedive.settings` declaration (DIVE-4875) —
+so a dashboard install never got the local/OpenRouter switch and the settings panel never appeared
+for it. `plugins/voice/` is now `rsync -a --delete` of 5dive-voice's `voice/` at main (1f32297);
+`diff -r` is empty. The old `plugins/voice/README.md` goes with it, because the maintained repo keeps
+its README at the root; the registry-only prose lives in `marketplace.json`, which a port cannot
+overwrite. Every later voice release lands in both copies, the same rule as browser (DIVE-4835).
+
 ### Fixed — `/effort` over Telegram now changes what an Opus 5.5 seat runs (DIVE-4865), telegram 0.5.60
 
 `/effort` wrote only the top-level `effortLevel`. From Claude Code 2.1.280 that key is legacy: it

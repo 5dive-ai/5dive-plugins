@@ -1,13 +1,13 @@
 {
   "name": "voice",
-  "version": "1.0.0",
-  "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box.",
+  "version": "1.3.0",
+  "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box, or on OpenRouter if you choose.",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com",
     "url": "https://5dive.ai"
   },
-  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/voice",
+  "homepage": "https://github.com/5dive-ai/5dive-voice",
   "license": "MIT",
   "keywords": [
     "voice",
@@ -23,7 +23,7 @@
     "verbs": [
       {
         "name": "voice",
-        "summary": "talk to your agent by voice",
+        "summary": "talk to your agent by voice; pick where hearing and speaking run",
         "installs": "channel"
       }
     ],
@@ -37,8 +37,51 @@
       "review": "official"
     },
     "setup": {
-      "hint": "voice needs a host-level engine that 5dive will not install behind your back: ffmpeg, faster-whisper and edge-tts, plus a warm transcription service on port 8765.",
-      "command": "sudo 5dive-setup-voice"
+      "hint": "voice needs a host-level engine that 5dive will not install behind your back: ffmpeg, faster-whisper and edge-tts, plus a warm transcription service on port 8765. The plugin ships the installer, so this runs off the copy `plugin add` already put on your box. It stays on this box by default; `sudo 5dive voice backend openrouter` moves hearing and speaking to OpenRouter.",
+      "command": "sudo 5dive voice setup"
+    },
+    "settings": {
+      "verb": "voice",
+      "fields": [
+        {
+          "key": "backend",
+          "label": "Where hearing and speaking run",
+          "type": "enum",
+          "options": [
+            {
+              "value": "local",
+              "label": "On this server"
+            },
+            {
+              "value": "openrouter",
+              "label": "OpenRouter"
+            }
+          ],
+          "default": "local",
+          "help": "On this server, your voice notes never leave it; replies are still spoken by Microsoft's online voices. OpenRouter is more accurate and sends both the audio and the reply text to OpenRouter, which needs an OpenRouter key on this server."
+        },
+        {
+          "key": "stt_model",
+          "label": "Hearing model (OpenRouter)",
+          "type": "string",
+          "default": "openai/whisper-large-v3-turbo",
+          "help": "Used only on OpenRouter. The default understands 99+ languages. meta/muse-voice-transcribe-1.0 is more accurate in English but not validated for Russian or Ukrainian."
+        },
+        {
+          "key": "tts_model",
+          "label": "Speaking model (OpenRouter)",
+          "type": "string",
+          "default": "microsoft/mai-voice-2-flash",
+          "help": "Used only on OpenRouter."
+        },
+        {
+          "key": "tts_voice",
+          "label": "Speaking voice (OpenRouter)",
+          "type": "string",
+          "default": "alloy",
+          "help": "Used only on OpenRouter. A voice name the speaking model offers."
+        }
+      ]
     }
   }
 }
