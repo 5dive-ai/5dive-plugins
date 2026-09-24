@@ -182,6 +182,11 @@ usage() {
                                       # Irreversible, and the only way back is to log in
                                       # again. Refuses while a person is in the viewer or
                                       # a caller holds the lease.
+  5dive browser capture <site> [--url=<probe url>] [--out=<dir>]
+                                      # save the probe page signed OUT (two throwaway
+                                      # profiles) and signed IN (this login), 0600, for
+                                      # `sudo 5dive reflex login-marker` to draft a login
+                                      # check from. Owner only; classifies nothing.
   5dive browser viewer <site> --bind=<session> [--ttl=600]
                                       # mint a ONE-TIME, expiring link a person logs in through
   5dive browser viewer-redeem <site> --nonce=- --session=<id>
@@ -1960,6 +1965,121 @@ cmd_served() {
   return 0
 }
 
+# --------------------------------------------------------------------- capture
+#
+# DIVE-4929 — BOTH HALVES OF A LOGIN CHECK, ON DISK, IN ONE COMMAND. An adapter's
+# probe.logged_out_when_dom_matches is only trusted once it has been measured on
+# the site's RENDERED signed-out page AND its signed-in page (README, "Shipped
+# adapters"). Four sites have that. For every other site the measurement was a
+# hand-run headless chrome per half, which is why nobody ran it. `5dive reflex
+# login-marker` (the 5dive CLI, DIVE-4928) drafts the marker from exactly these
+# two files; this verb makes them.
+#
+#   signed-out.html  the probe URL in a THROWAWAY profile — the probe's own
+#   signed-out-2.html command (headless, --virtual-time-budget=8000), so it is the
+#                    page the probe will see when this login expires. TWICE, in
+#                    two fresh profiles: a sign-in page carries per-render tokens
+#                    (GitHub's required_field_<hex> honeypots), and only a token
+#                    both renders share can be a marker. reflex reads both.
+#   signed-in.html   the same URL in THIS login's profile: through the session
+#                    daemon when the site is served (a second chrome cannot open a
+#                    profile the served one holds), cold otherwise.
+#
+# THE OWNER'S ACT, NOT A BROKERED ONE. The signed-in render is the account's own
+# page — messages, names, whatever the probe URL shows — written to a file. A
+# seat using the box login may `read` a page only once the site probes
+# `authenticated`; a capture exists precisely for sites that CANNOT be classified
+# yet, so letting a brokered seat run it would hand out the page the page verbs
+# withhold. The files are 0600 in a 0700 directory under the owner's home.
+#
+# NO VERDICT. Capture classifies nothing and writes no adapter; it prints where
+# the files are and the command that reads them.
+cmd_capture() {
+  local site="" url="" out=""
+  while (($#)); do
+    case "$1" in
+      -h|--help) usage; return 0 ;;
+      --url=*) url="${1#*=}" ;;
+      --out=*) out="${1#*=}" ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) [[ -z "$site" ]] || die "$E_USAGE" "one site at a time"; site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser capture linkedin.com [--url=https://www.linkedin.com/feed/]"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  _open_site "$site" --no-broker capture "a capture writes this login's signed-in page to a file, which only the login's owner may do."
+  local dir="$_SITE_DIR"
+  [[ -n "$url" ]] || url="$(_site_url "$site")"
+  [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || die "$E_USAGE" "--url must be an http(s) URL"
+  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box"
+  local served=0
+  if _serve_running "$dir" >/dev/null; then
+    _daemon_live "$dir" || die "$E_UNAVAILABLE" "$site is served and its browser holds the profile, but no session daemon answers to render through. Stop it first:  5dive browser serve $site --stop"
+    command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is needed to talk to the served session"
+    served=1
+  fi
+  [[ -n "$out" ]] || out="${HOME:?}/.5dive/browser-captures/$site/$(date -u +%Y%m%dT%H%M%SZ)"
+  ( umask 077; mkdir -p "$out" ) || die "$E_UNAVAILABLE" "cannot create $out"
+  chmod 700 "$out" 2>/dev/null || true
+  [[ -z "$(ls -A "$out" 2>/dev/null)" ]] || die "$E_USAGE" "$out is not empty; a capture never overwrites one"
+  local cold orc=0 k f
+  for k in 1 2; do
+    f="$out/signed-out.html"; (( k == 2 )) && f="$out/signed-out-2.html"
+    cold=$(mktemp -d) || die "$E_UNAVAILABLE" "mktemp failed"
+    ( umask 077
+      "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$cold" \
+        --virtual-time-budget=8000 --dump-dom "$url" >"$f" 2>/dev/null ) || orc=$?
+    rm -rf "$cold"
+    (( orc == 0 )) || break
+  done
+  local irc how
+  if (( served )); then
+    how=daemon
+    ( umask 077
+      _daemon_call "$dir" "$(jq -nc --arg u "$url" --arg o "$(_site_logged_out_marker "$site")" \
+            --arg i "$(_site_logged_in_marker "$site")" --arg c "$(_site_challenge_marker "$site")" \
+            --argjson w "${FIVEDIVE_BROWSER_PROBE_WAIT_MS:-8000}" \
+            '{op:"probe", url:$u, wait:$w, until:{logged_out:$o, logged_in:$i, challenge:$c}}')" \
+        >"$out/signed-in.html" 2>/dev/null )
+    irc=$?
+  else
+    how=cold
+    ( umask 077
+      "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
+        --virtual-time-budget=8000 --dump-dom "$url" >"$out/signed-in.html" 2>/dev/null )
+    irc=$?
+  fi
+  chmod 600 "$out"/*.html 2>/dev/null || true
+  local ob ob2 ib; ob=$(wc -c <"$out/signed-out.html" 2>/dev/null || echo 0); ob2=$(wc -c <"$out/signed-out-2.html" 2>/dev/null || echo 0)
+  ib=$(wc -c <"$out/signed-in.html" 2>/dev/null || echo 0)
+  _audit_row "$dir" capture "$url"
+  if (( orc != 0 || ob == 0 || ob2 == 0 || irc != 0 || ib == 0 )); then
+    die "$E_UNAVAILABLE" "the capture is incomplete (signed-out: rc=$orc, ${ob}+${ob2} bytes; signed-in via $how: rc=$irc, ${ib} bytes) — kept in $out for a look; nothing downstream should read it"
+  fi
+  # Two warnings, never refusals: the files are still what they are, and the
+  # reader (reflex) makes its own call. But the most likely wrong capture is a
+  # profile that is not logged in at all, and that one should be said out loud.
+  local ch; ch=$(_site_challenge_marker "$site")
+  grep -qiE "$ch" "$out/signed-out.html" && echo "warning: the signed-out render looks like a challenge page, not a sign-in page" >&2
+  grep -qiE "$ch" "$out/signed-in.html" && echo "warning: the signed-in render looks like a challenge page — clear it in the viewer first" >&2
+  # Byte equality misses the real case: a sign-in page carries a fresh CSRF token
+  # per render, so two signed-out renders never match byte for byte. The TITLE is
+  # what a person would compare (measured on github.com: "Sign in to GitHub" twice
+  # on a profile nobody had logged into, 61854 bytes each, different bytes).
+  local to ti
+  to=$({ grep -oiE '<title[^>]*>[^<]{1,200}' "$out/signed-out.html" 2>/dev/null || true; } | head -n1)
+  ti=$({ grep -oiE '<title[^>]*>[^<]{1,200}' "$out/signed-in.html" 2>/dev/null || true; } | head -n1)
+  if cmp -s "$out/signed-out.html" "$out/signed-in.html" || [[ -n "$to" && "$to" == "$ti" ]]; then
+    echo "warning: both renders show the same page${to:+ (${to#*>})} — this profile may not be logged in (5dive browser auth $site)" >&2
+  fi
+  local a; a="$(_adapter_path "$site")"
+  printf 'captured %s (%s)\n  signed out: %s  (%s bytes, throwaway profile)\n              %s  (%s bytes, a second throwaway profile)\n  signed in:  %s  (%s bytes, %s)\n' \
+    "$site" "$url" "$out/signed-out.html" "$ob" "$out/signed-out-2.html" "$ob2" "$out/signed-in.html" "$ib" \
+    "$([[ "$how" == daemon ]] && echo "the served session" || echo "this login's profile")"
+  printf 'draft its login check (shadow; writes nothing):\n  sudo 5dive reflex login-marker %s --url=%s --logged-out=%s --logged-out=%s --logged-in=%s%s\n' \
+    "$site" "$url" "$out/signed-out.html" "$out/signed-out-2.html" "$out/signed-in.html" "$([[ -f "$a" ]] && printf ' --compare=%s' "$a")"
+}
+
 # ---------------------------------------------------------------------- forget
 #
 # DIVE-4791 — THE WAY OUT. Until this verb there was no way for a customer to log
@@ -2397,7 +2517,10 @@ cmd_serve() {
     dsock="$(_serve_sock_path "$site" "$dir")"
     [[ "$dsock" == "$dir/"* ]] || dbroker=--broker
     rm -f "$dsock"
+    # The start URL is the cold path's last argument below, handed to the daemon
+    # so a warm serve opens the SITE and not about:blank (DIVE-4944).
     DISPLAY=":$disp" FIVEDIVE_BROWSER_CHROME="$chrome_path" \
+      FIVEDIVE_BROWSER_START_URL="$(_site_url "$site")" \
       "$daemon" serve "$dir" "$dsock" $dbroker >"$rdy" 2>"$derr" &
     dpid=$!
     # READY IS A LINE THE DAEMON PRINTS WHEN THE CONTEXT IS OPEN AND THE SOCKET
@@ -3725,6 +3848,7 @@ case "${1:-}" in
   served) shift; cmd_served "$@" ;;
   forget) shift; cmd_forget "$@" ;;
   shot)  shift; cmd_shot  "$@" ;;
+  capture) shift; cmd_capture "$@" ;;
   read)  shift; cmd_read  "$@" ;;
   snapshot) shift; cmd_snapshot "$@" ;;
   # Not in usage: the session daemon re-enters here as the profile's owner.
