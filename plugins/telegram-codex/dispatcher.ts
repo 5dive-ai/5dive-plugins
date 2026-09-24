@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import {
   chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync,
   unlinkSync, watch, writeFileSync,
@@ -14,6 +14,9 @@ import {
   HEALTH_HEARTBEAT_MS, HEALTH_SCHEMA, writeHealth,
   type ChannelHealth, type HealthFailure,
 } from './health.ts'
+import {
+  ALLOW_UNSUPPORTED_ENV, DISPATCHER_STATE_SCHEMA, checkCodex, migrateState, parseCodexVersion,
+} from './compat.ts'
 
 const STATE_DIR = process.env.CODEX_DISPATCHER_STATE_DIR
   ?? join(homedir(), '.codex', 'channels', 'dispatcher')
@@ -25,6 +28,56 @@ const CODEX_BIN = process.env.CODEX_BIN ?? 'codex'
 const BUN_BIN = process.execPath
 const CHANNELS = new Set((process.env.CODEX_DISPATCHER_CHANNELS ?? 'telegram').split(',').filter(Boolean))
 
+const BRIDGE_VERSION: string = (() => {
+  try {
+    return String(JSON.parse(readFileSync(join(import.meta.dir, 'package.json'), 'utf8')).version ?? 'unknown')
+  } catch { return 'unknown' }
+})()
+
+// ── the compatibility handshake (DIVE-3969) ─────────────────────────────────
+//
+// Settled before anything is started: a Codex this bridge cannot drive is
+// refused by name, instead of surfacing as an app-server exit code that the
+// run-loop restarts forever. The table and the measurements are in compat.ts.
+
+function probeCodexVersion(): string | null {
+  const r = spawnSync(CODEX_BIN, ['--version'], { encoding: 'utf8', timeout: 15_000 })
+  if (r.error || r.status !== 0) return null
+  return String(r.stdout ?? '')
+}
+
+/** The saved state as found: null when there is none, the raw text when it
+ *  does not parse (migrateState sets that aside rather than overwrite it). */
+function readStateRaw(): unknown {
+  let text: string
+  try { text = readFileSync(STATE_FILE, 'utf8') } catch { return null }
+  try { return JSON.parse(text) } catch { return text }
+}
+
+const codexCompat = checkCodex(probeCodexVersion(), process.env[ALLOW_UNSUPPORTED_ENV] === '1')
+
+// `--check`: the canary/upgrade preflight. Reports whether THIS tree can run
+// against THIS Codex and THIS saved state, then exits without starting,
+// creating or rewriting anything. release.sh runs it before every promote.
+if (process.argv.includes('--check')) {
+  const loaded = migrateState(readStateRaw())
+  const report = {
+    ok: codexCompat.ok,
+    bridgeVersion: BRIDGE_VERSION,
+    codex: codexCompat,
+    state: {
+      file: STATE_FILE,
+      schema: DISPATCHER_STATE_SCHEMA,
+      migrated: loaded.migrated,
+      ...(loaded.quarantine ? { quarantine: loaded.quarantine } : {}),
+    },
+  }
+  process.stdout.write(`${JSON.stringify(report)}\n`)
+  process.stderr.write(`codex-dispatcher --check: ${codexCompat.ok ? 'ok' : 'REFUSED'} — bridge ${BRIDGE_VERSION}; ${codexCompat.detail}`
+    + `${loaded.quarantine ? `; ${loaded.quarantine} (would be set aside)` : ''}\n`)
+  process.exit(codexCompat.ok ? 0 : 1)
+}
+
 for (const dir of [STATE_DIR, INBOX_DIR, OUTBOX_DIR, join(OUTBOX_DIR, 'telegram'), join(OUTBOX_DIR, 'dashboard')]) {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
 }
@@ -35,12 +88,6 @@ for (const dir of [STATE_DIR, INBOX_DIR, OUTBOX_DIR, join(OUTBOX_DIR, 'telegram'
 // the bridge itself on an interval. `updatedAt` is the liveness signal: a
 // record that stopped moving is positive evidence of a dead bridge, which is
 // the reading the pane-banner probe could never produce. See health.ts.
-
-const BRIDGE_VERSION: string = (() => {
-  try {
-    return String(JSON.parse(readFileSync(join(import.meta.dir, 'package.json'), 'utf8')).version ?? 'unknown')
-  } catch { return 'unknown' }
-})()
 
 const health: ChannelHealth = {
   schema: HEALTH_SCHEMA,
@@ -54,7 +101,24 @@ const health: ChannelHealth = {
   listening: [],
   bound: false,
   queueDepth: 0,
+  codex: {
+    version: codexCompat.version,
+    minimum: codexCompat.minimum,
+    testedMax: codexCompat.testedMax,
+    tested: codexCompat.tested,
+  },
 }
+
+// An unsupported pair is a NAMED failure: written to the handshake (which the
+// classifier reports rather than restarts) and to the lifecycle log, then exit.
+if (!codexCompat.ok) {
+  process.stderr.write(`codex-dispatcher: refusing to start: ${codexCompat.detail}\n`)
+  recordLifecycle(STATE_DIR, 'crash', 'codex-dispatcher', `unsupported pair: ${codexCompat.detail}`)
+  health.failure = { at: new Date().toISOString(), channel: 'bridge', cause: codexCompat.detail }
+  writeHealth(STATE_DIR, health)
+  process.exit(78) // EX_CONFIG
+}
+if (!codexCompat.tested) process.stderr.write(`codex-dispatcher: warning: ${codexCompat.detail}\n`)
 
 function publishHealth(): void {
   health.updatedAt = new Date().toISOString()
@@ -174,8 +238,11 @@ function atomicJson(path: string, value: unknown): void {
 
 function stateStore() {
   return {
-    load() {
-      try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')) } catch { return null }
+    load: readStateRaw,
+    quarantine(reason: string) {
+      const aside = `${STATE_FILE}.quarantined-${Date.now()}`
+      try { renameSync(STATE_FILE, aside) } catch {}
+      process.stderr.write(`codex-dispatcher: ${reason}; moved to ${aside}\n`)
     },
     save(state: unknown) {
       atomicJson(STATE_FILE, state)
@@ -203,10 +270,17 @@ rpc.onNotification = (method, params) => {
 }
 
 async function initialize(): Promise<void> {
-  await rpc.request('initialize', {
-    clientInfo: { name: '5dive_channel_dispatcher', title: '5dive Channel Dispatcher', version: '0.1.0' },
+  const init = await rpc.request('initialize', {
+    clientInfo: { name: '5dive_channel_dispatcher', title: '5dive Channel Dispatcher', version: BRIDGE_VERSION },
     capabilities: null,
   })
+  // The app-server's own word on its version beats `codex --version`: it is
+  // the process actually serving this bridge.
+  const served = parseCodexVersion(init?.userAgent)
+  if (served && health.codex) {
+    health.codex.version = served
+    health.codex.tested = checkCodex(served).tested
+  }
   rpc.notify('initialized', {})
   await dispatcher.initialize()
   // BOUND means a live Codex thread, not "the process started". Everything

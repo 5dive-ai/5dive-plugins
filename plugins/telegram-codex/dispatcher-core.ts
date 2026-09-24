@@ -1,3 +1,5 @@
+import { migrateState } from './compat.ts'
+
 export type DispatchSource = 'telegram' | 'dashboard' | 'agent'
 
 export type DispatchRoute = {
@@ -15,6 +17,8 @@ export type DispatchMessage = {
 }
 
 export type DispatcherState = {
+  /** DISPATCHER_STATE_SCHEMA (compat.ts). Absent on files written before P10. */
+  schema?: number
   threadId?: string
   seen: string[]
   pending: DispatchMessage[]
@@ -47,8 +51,11 @@ export interface RpcPort {
 }
 
 export interface StateStore {
-  load(): DispatcherState | null
+  /** The parsed file as found; `migrateState` decides what it is. */
+  load(): unknown
   save(state: DispatcherState): void
+  /** Move an unreadable state file aside (kept, never deleted). */
+  quarantine?(reason: string): void
 }
 
 export interface DispatchSink {
@@ -115,7 +122,19 @@ export class ChannelDispatcher {
     private readonly sink: DispatchSink,
     private readonly cwd: string,
   ) {
-    this.state = store.load() ?? { seen: [], pending: [] }
+    const loaded = migrateState<DispatcherState>(store.load())
+    this.state = loaded.state
+    if (loaded.quarantine) {
+      // DIVE-3969: typically a rollback below the bridge that wrote the file.
+      // Start clean rather than resume a thread or replay a queue on a misread,
+      // and say so on the next turn — the same sentence as any lost thread.
+      store.quarantine?.(loaded.quarantine)
+      this.state.recovery = {
+        kind: 'thread-lost',
+        at: new Date().toISOString(),
+        detail: `${loaded.quarantine}, so it was set aside and none of the earlier conversation is in context`,
+      }
+    }
   }
 
   snapshot(): DispatcherState {

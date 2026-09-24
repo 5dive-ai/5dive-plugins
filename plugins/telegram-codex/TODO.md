@@ -7,7 +7,15 @@ ordered by UX criticality unless noted.
 
 ## Still open
 
-- 5dive `--channels=telegram` codex provisioning (handed off to main).
+- Republish `@5dive/telegram-codex-mcp` on npm. 0.5.7 is the newest published
+  version, and `.mcp.json` pins it for the Codex plugin install. Publishing
+  needs the npm credential.
+- 5dive's `install.sh` extracts `CODEX_PLUGIN_TARBALL` under a
+  `5dive-plugins-main/` prefix, so pinning the tarball to a commit does not
+  work. A fleet-wide rollback is therefore a revert on `main`. See the README
+  "Upgrade, canary and rollback" section.
+- 5dive's health reader does not show the handshake's new `codex` block
+  (version, tested) yet.
 
 ## Won't port
 
@@ -22,6 +30,15 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.20 — DIVE-3969: compatibility and rollback hardening. The dispatcher
+  refuses Codex below 0.136.0 by name (measured: older app-servers reject
+  `--stdio`), records the Codex version in `health.json`, versions
+  `state.json` (idempotent migration; a newer or corrupt file is quarantined,
+  not misread), adds `bun dispatcher.ts --check` and `release.sh`
+  (check/promote/rollback). CI checks the package `files` closure, the
+  manifest versions, and the commands the docs name.
+- 5dive `--channels=telegram` codex provisioning (DIVE-3960/3961): codex
+  seats are provisioned with the dispatcher and Telegram/dashboard adapters.
 - v0.5.13 — DIVE-3965: a restart no longer loses the thread silently. A clean
   stop and a crash are different sentences in the chat, a stale thread says so,
   and the recovery context rides the NEXT turn instead of replaying the
