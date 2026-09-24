@@ -70,6 +70,13 @@ export type ChannelHealth = {
   /** The app-server handshake completed and a thread is live. */
   bound: boolean
   threadId?: string
+  /** The model the live THREAD runs, as the app-server reported it — not the
+   *  config. Differs from `configuredModel` only while a switch is in flight or
+   *  when the override was refused (DIVE-4924). */
+  threadModel?: string
+  threadEffort?: string
+  /** The model the seat config named when this bridge started. */
+  configuredModel?: string
   lastInboundAt?: string
   lastOutboundAt?: string
   /** Messages accepted and not yet started. */
@@ -258,4 +265,31 @@ export function readHealth(stateDir: string): ChannelHealth | null {
   } catch {
     return null
   }
+}
+
+/**
+ * The `/status` model line (DIVE-4924). The seat config says what was ASKED
+ * for; only the bridge's record says what the conversation actually RUNS. They
+ * are printed as one line when they agree and as two when they do not, so a
+ * switch in flight — or an override the thread refused — is visible instead of
+ * being reported as done. A stale or absent record is not believed: the line
+ * then says nothing about the conversation rather than repeat an old reading.
+ */
+export function modelStatusLines(
+  configured: { model: string | null; effort: string | null },
+  health: ChannelHealth | null,
+  now: number,
+): string[] {
+  const fmt = (model: string, effort?: string | null) => `${model}${effort ? ` · ${effort}` : ''}`
+  const lines: string[] = []
+  if (configured.model) lines.push(`model: ${fmt(configured.model, configured.effort)}`)
+  const updated = health ? Date.parse(health.updatedAt) : NaN
+  const live = health?.schema === HEALTH_SCHEMA && Number.isFinite(updated)
+    && now - updated <= staleAfterMs(health)
+  if (!live || !health?.threadModel) return lines
+  const sameModel = health.threadModel === configured.model
+  const sameEffort = !configured.effort || !health.threadEffort || health.threadEffort === configured.effort
+  if (sameModel && sameEffort) return lines
+  lines.push(`conversation: ${fmt(health.threadModel, health.threadEffort)} (still running — differs from the configured model)`)
+  return lines
 }

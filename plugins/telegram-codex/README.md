@@ -31,6 +31,14 @@ an app-server or adapter failure. Thread sandbox and approval settings are
 inherited from Codex configuration; because this headless dispatcher has no
 approval UI, app-server approval requests are declined rather than escalated.
 
+The model and reasoning effort follow the seat config on every start: the
+dispatcher reads them through app-server `config/read` and passes them to
+`thread/resume` and each `turn/start`, because a resumed thread otherwise keeps
+the model it was saved with. So `/model` (or a `config.toml` edit) plus a
+restart switches the EXISTING conversation, history intact. `health.json`
+records `threadModel`/`threadEffort` as the app-server reports them, and
+`/status` prints a `conversation:` line whenever that differs from the config.
+
 Dashboard delivery keeps using `~/.claude/channels/dashboard/` as a runtime-
 neutral compatibility path because shelld writes durable inbound drops there.
 To attach a local file in dispatcher mode, Codex emits a non-empty caption plus

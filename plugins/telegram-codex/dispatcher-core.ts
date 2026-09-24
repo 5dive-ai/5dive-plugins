@@ -33,7 +33,30 @@ export type DispatcherState = {
    * duplicate work Codex may already have done before it died.
    */
   recovery?: RecoveryContext
+  /**
+   * What the THREAD is running, as the app-server last reported it — never what
+   * config.toml says. The two diverge exactly when a resumed thread keeps the
+   * model it was saved with (DIVE-4924), so a reader that wants "which model
+   * will answer" must read this, not the seat config.
+   */
+  threadModel?: ThreadModel
 }
+
+/** A model choice. `effort` is a Codex reasoning effort (`low`, `high`, …). */
+export type ModelSelection = { model?: string; effort?: string }
+
+export type ThreadModel = ModelSelection & {
+  at: string
+  /** Which app-server answer this came from — the proof of the reading. */
+  from: 'thread/start' | 'thread/resume' | 'turn/start' | 'thread/settings/updated' | 'model/rerouted'
+}
+
+/**
+ * Reads the seat's CONFIGURED model at startup. Resolves null when the config
+ * cannot be read, and the dispatcher then leaves the thread's own choice alone —
+ * the pre-DIVE-4924 behaviour, never a guess.
+ */
+export type ConfiguredModel = () => Promise<ModelSelection | null>
 
 export type RecoveryContext = {
   /** `thread-lost` is the stronger fact: no earlier conversation is in context. */
@@ -108,14 +131,23 @@ export class ChannelDispatcher {
   private state: DispatcherState
   private serial: Promise<unknown> = Promise.resolve()
   private itemText = new Map<string, string>()
+  /** The seat config's choice, read once per start: a model switch is a config
+   *  write plus a restart, so a restart is exactly when it can change. */
+  private configured: ModelSelection = {}
 
   constructor(
     private readonly rpc: RpcPort,
     private readonly store: StateStore,
     private readonly sink: DispatchSink,
     private readonly cwd: string,
+    private readonly readConfigured?: ConfiguredModel,
   ) {
     this.state = store.load() ?? { seen: [], pending: [] }
+  }
+
+  /** What the seat config asked for at the last start (empty when unreadable). */
+  configuredModel(): ModelSelection {
+    return { ...this.configured }
   }
 
   snapshot(): DispatcherState {
@@ -139,9 +171,19 @@ export class ChannelDispatcher {
       this.state.active = undefined
       this.state.cleanExit = undefined
       let threadLost = ''
+      this.configured = await this.loadConfigured()
       if (this.state.threadId) {
         try {
-          await this.rpc.request('thread/resume', { threadId: this.state.threadId })
+          // A resumed thread keeps the model its rollout was saved with, NOT the
+          // one config.toml names now (DIVE-4924: the seat said Astra, the
+          // thread answered on Sol). So the configured choice is passed as an
+          // override — history is kept, the model is the seat's.
+          const resumed = await this.rpc.request('thread/resume', {
+            threadId: this.state.threadId,
+            ...(this.configured.model ? { model: this.configured.model } : {}),
+            ...(this.configured.effort ? { config: { model_reasoning_effort: this.configured.effort } } : {}),
+          })
+          this.recordModel('thread/resume', resumed?.model, resumed?.reasoningEffort)
         } catch (err) {
           // A thread the app-server no longer has is not a fatal condition, but
           // it is not a silent one either: the conversation the person on the
@@ -161,6 +203,7 @@ export class ChannelDispatcher {
         const id = started?.thread?.id
         if (typeof id !== 'string' || !id) throw new Error('thread/start returned no thread id')
         this.state.threadId = id
+        this.recordModel('thread/start', started?.model, started?.reasoningEffort)
       }
 
       const facts: string[] = []
@@ -227,6 +270,17 @@ export class ChannelDispatcher {
 
   async notification(method: string, params: any): Promise<void> {
     await this.enqueueSerial(async () => {
+      if (method === 'thread/settings/updated' && params?.threadId === this.state.threadId) {
+        this.recordModel('thread/settings/updated', params?.threadSettings?.model, params?.threadSettings?.effort)
+        this.persist()
+        return
+      }
+      if (method === 'model/rerouted' && params?.threadId === this.state.threadId) {
+        // The app-server swapped the model mid-turn; effort is unchanged by it.
+        this.recordModel('model/rerouted', params?.toModel, this.state.threadModel?.effort)
+        this.persist()
+        return
+      }
       if (method === 'item/agentMessage/delta') {
         const key = `${params?.turnId ?? ''}:${params?.itemId ?? ''}`
         this.itemText.set(key, (this.itemText.get(key) ?? '') + String(params?.delta ?? ''))
@@ -269,10 +323,20 @@ export class ChannelDispatcher {
       clientUserMessageId: message.id,
       turnTrigger: `5dive:${message.route.source}`,
       input: inputFor(message, recovery),
+      // Every turn re-asserts the seat's choice. The resume override already
+      // sets it; this makes the TURN the guarantee rather than one handshake.
+      ...(this.configured.model ? { model: this.configured.model } : {}),
+      ...(this.configured.effort ? { effort: this.configured.effort } : {}),
     })
     const turnId = result?.turn?.id
     if (typeof turnId !== 'string' || !turnId) throw new Error('turn/start returned no turn id')
     this.state.active = { turnId, routeKey: routeKey(message.route), route: message.route, message }
+    // An accepted turn override IS the thread's model from here on (measured on
+    // codex 0.153.3: the rollout's turn_context follows it even when the resume
+    // reported the old one), and the app-server sends no settings event for it.
+    if (this.configured.model) {
+      this.recordModel('turn/start', this.configured.model, this.configured.effort ?? this.state.threadModel?.effort)
+    }
     // Consumed only once the turn it rode on actually exists: a `turn/start`
     // that threw leaves the context in state for the retry.
     if (recovery) this.state.recovery = undefined
@@ -290,6 +354,29 @@ export class ChannelDispatcher {
       this.state.pending.unshift(next)
       this.persist()
       throw err
+    }
+  }
+
+  private async loadConfigured(): Promise<ModelSelection> {
+    if (!this.readConfigured) return {}
+    try {
+      const got = await this.readConfigured()
+      const out: ModelSelection = {}
+      if (typeof got?.model === 'string' && got.model.trim()) out.model = got.model.trim()
+      if (typeof got?.effort === 'string' && got.effort.trim()) out.effort = got.effort.trim()
+      return out
+    } catch {
+      return {}
+    }
+  }
+
+  private recordModel(from: ThreadModel['from'], model: unknown, effort: unknown): void {
+    if (typeof model !== 'string' || !model) return
+    this.state.threadModel = {
+      model,
+      ...(typeof effort === 'string' && effort ? { effort } : {}),
+      at: new Date().toISOString(),
+      from,
     }
   }
 

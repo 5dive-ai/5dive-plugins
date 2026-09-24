@@ -315,6 +315,171 @@ lines.on('line', line => {
     }
   }, 15_000)
 
+  // ── DIVE-4924: the seat's model applies to the EXISTING conversation ─────
+  //
+  // The fake app-server below is sticky the way the real one is: a resumed
+  // thread keeps the model its rollout was saved with unless the resume or the
+  // turn names another. `turnContext` is the analogue of the rollout's
+  // `turn_context` — the model a turn ACTUALLY ran on — and it is the only thing
+  // these tests believe. `configured` is the analogue of `agent info`, which
+  // reads config.toml and was already saying Astra while the thread ran Sol.
+  function stickyHarness(opts: { saved?: string; configured?: { model?: string; effort?: string } | 'throws' }) {
+    const threadModel = new Map<string, { model: string; effort: string }>([
+      ['thread-old', { model: opts.saved ?? 'gpt-6-sol', effort: 'high' }],
+    ])
+    const turnContext: Array<{ model: string; effort: string }> = []
+    const requests: Array<{ method: string; params: Record<string, any> }> = []
+    let n = 1
+    const rpc: RpcPort = {
+      async request(method, params: Record<string, any>) {
+        requests.push({ method, params })
+        if (method === 'thread/resume') {
+          const t = threadModel.get(params.threadId)!
+          if (params.model) t.model = params.model
+          if (params.config?.model_reasoning_effort) t.effort = params.config.model_reasoning_effort
+          return { thread: { id: params.threadId }, model: t.model, reasoningEffort: t.effort }
+        }
+        if (method === 'turn/start') {
+          const t = threadModel.get(params.threadId)!
+          if (params.model) t.model = params.model
+          if (params.effort) t.effort = params.effort
+          turnContext.push({ ...t })
+          return { turn: { id: `turn-${n++}` } }
+        }
+        throw new Error(`unexpected ${method}`)
+      },
+    }
+    let saved: DispatcherState | null = { threadId: 'thread-old', seen: [], pending: [] }
+    const configured = opts.configured
+    const dispatcher = new ChannelDispatcher(
+      rpc,
+      { load: () => structuredClone(saved), save: s => { saved = structuredClone(s) } },
+      { publish: async () => {} },
+      '/workspace',
+      configured === undefined ? undefined
+        : async () => { if (configured === 'throws') throw new Error('config/read unsupported'); return configured },
+    )
+    return { dispatcher, requests, turnContext, persisted: () => saved }
+  }
+
+  test('a config switch to Astra makes the next reply in the SAME thread run on Astra', async () => {
+    const h = stickyHarness({ configured: { model: 'gpt-6-astra', effort: 'high' } })
+    await h.dispatcher.initialize()
+    await h.dispatcher.submit(telegram('tg-astra', 'same question again'))
+
+    // History kept: the saved thread was resumed, never replaced.
+    expect(h.requests.map(r => r.method)).toEqual(['thread/resume', 'turn/start'])
+    expect(h.persisted()?.threadId).toBe('thread-old')
+    // The turn itself — not the config — ran on Astra.
+    expect(h.turnContext).toEqual([{ model: 'gpt-6-astra', effort: 'high' }])
+    expect(h.requests[0]!.params).toMatchObject({ threadId: 'thread-old', model: 'gpt-6-astra' })
+    expect(h.requests[1]!.params).toMatchObject({ model: 'gpt-6-astra', effort: 'high' })
+  })
+
+  test('the pre-fix shape (no configured model) reproduces the sticky Sol reply', async () => {
+    // Control: the same fake with the reading switched off is exactly the
+    // reported failure — config says Astra somewhere, the turn runs Sol.
+    const h = stickyHarness({})
+    await h.dispatcher.initialize()
+    await h.dispatcher.submit(telegram('tg-sol'))
+    expect(h.turnContext).toEqual([{ model: 'gpt-6-sol', effort: 'high' }])
+    expect(h.requests[0]!.params).toEqual({ threadId: 'thread-old' })
+  })
+
+  test('the thread model is reported from the app-server, not from config', async () => {
+    const h = stickyHarness({ configured: { model: 'gpt-6-astra' } })
+    await h.dispatcher.initialize()
+    expect(h.dispatcher.configuredModel()).toEqual({ model: 'gpt-6-astra' })
+    expect(h.persisted()?.threadModel).toMatchObject({ model: 'gpt-6-astra', effort: 'high', from: 'thread/resume' })
+
+    // A refused override is not reported as a switch: the app-server's own
+    // later word wins over what the dispatcher asked for.
+    await h.dispatcher.notification('thread/settings/updated', {
+      threadId: 'thread-old', threadSettings: { model: 'gpt-6-sol', effort: 'medium' },
+    })
+    expect(h.persisted()?.threadModel).toMatchObject({ model: 'gpt-6-sol', effort: 'medium', from: 'thread/settings/updated' })
+    await h.dispatcher.notification('model/rerouted', { threadId: 'thread-old', turnId: 't', fromModel: 'gpt-6-sol', toModel: 'gpt-6-astra' })
+    expect(h.persisted()?.threadModel).toMatchObject({ model: 'gpt-6-astra', effort: 'medium', from: 'model/rerouted' })
+    // Another thread's settings never overwrite this one's.
+    await h.dispatcher.notification('thread/settings/updated', { threadId: 'other', threadSettings: { model: 'x' } })
+    expect(h.persisted()?.threadModel?.model).toBe('gpt-6-astra')
+    // An accepted turn override is recorded: the turn ran on it.
+    await h.dispatcher.submit(telegram('tg-turn'))
+    expect(h.turnContext.at(-1)?.model).toBe('gpt-6-astra')
+    expect(h.persisted()?.threadModel).toMatchObject({ model: 'gpt-6-astra', from: 'turn/start' })
+  })
+
+  test('an unreadable config leaves the thread model alone instead of guessing', async () => {
+    const h = stickyHarness({ configured: 'throws' })
+    await h.dispatcher.initialize()
+    await h.dispatcher.submit(telegram('tg-x'))
+    expect(h.requests[0]!.params).toEqual({ threadId: 'thread-old' })
+    expect(h.requests[1]!.params.model).toBeUndefined()
+    expect(h.turnContext).toEqual([{ model: 'gpt-6-sol', effort: 'high' }])
+  })
+
+  test('/model and a hand edit take the same road: dispatcher boot reads config/read and resumes with it', async () => {
+    // `/model` is `agent config set model=…` + `_self_restart`; a hand edit of
+    // config.toml + `_self_restart` is the same two facts. Both land here: a
+    // fresh dispatcher process against a saved thread. So this drives the real
+    // entrypoint against a fake app-server whose config names Astra.
+    const dir = mkdtempSync(join(tmpdir(), 'dive4924-boot-'))
+    const stateDir = join(dir, 'state')
+    const log = join(dir, 'requests.jsonl')
+    const fakeCodex = join(dir, 'fake-codex.ts')
+    writeFileSync(fakeCodex, `#!/usr/bin/env bun
+import { appendFileSync } from 'node:fs'
+import { createInterface } from 'node:readline'
+const lines = createInterface({ input: process.stdin })
+lines.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.id == null) return
+  appendFileSync(${JSON.stringify(log)}, JSON.stringify(request) + '\\n')
+  let result = {}
+  if (request.method === 'config/read') result = { config: { model: 'gpt-6-astra', model_reasoning_effort: 'high' }, origins: {}, layers: null }
+  if (request.method === 'thread/resume') result = { thread: { id: request.params.threadId }, model: request.params.model ?? 'gpt-6-sol', reasoningEffort: 'high' }
+  process.stdout.write(JSON.stringify({ id: request.id, result }) + '\\n')
+})
+`)
+    chmodSync(fakeCodex, 0o755)
+    const { mkdirSync } = await import('node:fs')
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ threadId: 'thread-old', seen: [], pending: [] }))
+
+    const child = Bun.spawn(['bun', join(import.meta.dir, '..', 'plugins', 'telegram-codex', 'dispatcher.ts')], {
+      cwd: dir,
+      env: {
+        ...process.env,
+        CODEX_BIN: fakeCodex,
+        CODEX_DISPATCHER_CHANNELS: '',
+        CODEX_DISPATCHER_STATE_DIR: stateDir,
+        CODEX_DISPATCHER_WORKDIR: dir,
+      },
+      stdin: 'pipe', stdout: 'ignore', stderr: 'ignore',
+    })
+    try {
+      const deadline = Date.now() + 10_000
+      let health: any = null
+      while (Date.now() < deadline) {
+        try { health = JSON.parse(readFileSync(join(stateDir, 'health.json'), 'utf8')) } catch {}
+        if (health?.threadModel) break
+        await Bun.sleep(50)
+      }
+      const reqs = readFileSync(log, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+      const methods = reqs.map((r: any) => r.method)
+      expect(methods.indexOf('config/read')).toBeGreaterThan(methods.indexOf('initialize'))
+      expect(methods.indexOf('config/read')).toBeLessThan(methods.indexOf('thread/resume'))
+      expect(reqs.find((r: any) => r.method === 'thread/resume').params).toEqual({
+        threadId: 'thread-old', model: 'gpt-6-astra', config: { model_reasoning_effort: 'high' },
+      })
+      expect(health).toMatchObject({ threadId: 'thread-old', threadModel: 'gpt-6-astra', threadEffort: 'high', configuredModel: 'gpt-6-astra' })
+    } finally {
+      child.kill('SIGTERM')
+      await child.exited
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 15_000)
+
   test('package entrypoint makes dispatcher primary and retains MCP fallback', async () => {
     const pkg = await Bun.file(new URL('../plugins/telegram-codex/package.json', import.meta.url)).json()
     const entry = await Bun.file(new URL('../plugins/telegram-codex/dispatcher.ts', import.meta.url)).text()

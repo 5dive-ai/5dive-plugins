@@ -38,6 +38,7 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
+import { modelStatusLines, readHealth } from './health.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 
 const PLUGIN_VERSION = (() => {
@@ -951,9 +952,13 @@ async function statusText(senderName: string): Promise<string> {
   const now = Date.now()
   const lines = [`Paired as ${senderName}.`, '']
   lines.push(`status: ${bridgeStatus()}`)
-  const model = readConfigModel()
-  const effort = readConfigKey('model_reasoning_effort')
-  if (model) lines.push(`model: ${model}${effort ? ` · ${effort}` : ''}`)
+  // DIVE-4924: config is what was asked for; the dispatcher's record is what
+  // the conversation runs. Both, when they differ.
+  lines.push(...modelStatusLines(
+    { model: readConfigModel(), effort: readConfigKey('model_reasoning_effort') },
+    readHealth(DISPATCHER_STATE_DIR),
+    now,
+  ))
   lines.push(`uptime: ${formatDuration(agentUptimeMs())}`)
   const lastAct = lastActivityMs()
   lines.push(`last activity: ${lastAct ? `${formatDuration(now - lastAct)} ago` : '(none this session)'}`)
