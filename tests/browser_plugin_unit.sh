@@ -159,7 +159,11 @@ if [[ -f "${d:-/nonexistent}/.fake-dom.1" ]]; then
   fi
   exit 0
 fi
-cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null || echo "<html><body>feed</body></html>"
+# DIVE-4929: a THROWAWAY profile (the signed-out half of `capture`) has no DOM
+# parked in it; FAKE_COLD_DOM names what the fake serves there. Unset, the
+# fallback is exactly what it always was.
+cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null || cat "${FAKE_COLD_DOM:-/nonexistent}" 2>/dev/null \
+  || echo "<html><body>feed</body></html>"
 CHROME
 chmod +x "$FAKEBIN/google-chrome"
 export PATH="$FAKEBIN:$PATH"
@@ -3416,8 +3420,13 @@ const first = mkpage('first');
 exports.chromium = {
   launchPersistentContext: async (profile, opts) => {
     rec({ call: 'launch', profile, args: opts.args, headless: opts.headless,
+          sandbox: opts.chromiumSandbox === true,
           xdg: process.env.XDG_CONFIG_HOME === undefined ? '<unset>' : process.env.XDG_CONFIG_HOME });
     if (process.env.DPWNOLAUNCH) throw new Error('stub: this box cannot open the profile');
+    // DPWSANDBOXFAIL: a box where Chrome will not start sandboxed (DIVE-4944, T31c).
+    if (process.env.DPWSANDBOXFAIL && opts.chromiumSandbox === true) {
+      throw new Error('stub: No usable sandbox!');
+    }
     return { pages: () => [first], newPage: async () => mkpage('extra'), close: async () => rec({ call: 'close' }) };
   },
 };
@@ -3508,6 +3517,9 @@ dserve warm.test
 WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
 LB="$(launches)"
 CB="$(jq -rs '[.[]|select(.call=="close")]|length' "$DREC")"
+# Since DIVE-4944 `serve` itself loads the site into the first tab, so the step
+# order below is read from what the RUN wrote, not from the whole record.
+N25C="$(wc -l < "$DREC")"
 dwarm "$BROWSER" run warm.test publish --body=hello
 t  'T25c a run through the warm session succeeds' 0 "$RC"
 tc 'T25c ...and the verdict is still the out-of-band re-read' 'verified: publish is live' "$OUT"
@@ -3518,7 +3530,7 @@ t  'T25c ...it was never stopped and restarted' 'yes' \
 # THE POINT OF THE WHOLE ROW, as a number: not one new browser was launched.
 t  'T25c ...and NOT ONE Chrome was launched to do it' "$LB" "$(launches)"
 t  'T25c ...the steps reached the page, in order' 'goto fill click' \
-   "$(jq -rs '[.[]|select(.kind=="first")|select(.call|IN("goto","fill","click"))|.call]|join(" ")' "$DREC")"
+   "$(tail -n +"$(( N25C + 1 ))" "$DREC" | jq -rs '[.[]|select(.kind=="first")|select(.call|IN("goto","fill","click"))|.call]|join(" ")')"
 t  'T25c ...with the caller argument substituted as a VALUE' 'hello' \
    "$(jq -rs '[.[]|select(.call=="fill")|.val]|last' "$DREC")"
 t  'T25c ...and the session was NOT closed when the command finished' "$CB" \
@@ -3651,6 +3663,51 @@ t  'T25i ...the socket is gone with it, wherever serve had put it' 'no' \
 tc 'T25i ...and it was ASKED to go before it was killed' 'shutdown' \
    "$(sed -n '/^cmd_serve/,/^}/p' "$BROWSER")"
 tc 'T25i ...the profile is still reported as the durable half' 'profile is untouched' "$OUT"
+
+# --- T31 a warm serve OPENS THE SITE, sandboxed (DIVE-4944) -------------------
+# lodar, old-clay, 2026-09-24: the viewer showed about:blank under a "--no-sandbox"
+# warning bar. The daemon was launched with no start URL (the cold path passed
+# one) and with the sandbox off. Each arm reads only the records THIS serve wrote.
+since() { tail -n +"$(( $1 + 1 ))" "$DREC"; }
+N0="$(wc -l < "$DREC")"
+dserve warm.test
+t  'T31a a warm serve still comes up' 0 "$RC"
+tc 'T31a ...as a warm session' 'warm session' "$OUT"
+t  'T31a ...and its first tab is sent to the SITE, not left on about:blank' \
+   'https://warm.test.test/feed' \
+   "$(since "$N0" | jq -rs '[.[]|select(.call=="goto" and .kind=="first")]|first|.url // "none"')"
+if [[ "$(id -u)" == 0 ]]; then T31_SB=false; T31_NS=1; else T31_SB=true; T31_NS=0; fi
+t  'T31b ...Chrome is launched sandboxed unless this runs as root' "$T31_SB" \
+   "$(since "$N0" | jq -rs '[.[]|select(.call=="launch")]|last|.sandbox')"
+t  'T31b ...and --no-sandbox is passed only when it is not' "$T31_NS" \
+   "$(since "$N0" | jq -rs '[.[]|select(.call=="launch")]|last|[.args[]?|select(.=="--no-sandbox")]|length')"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+
+# A box where the sandbox will not start keeps its session: one retry without it,
+# and the reason is written down instead of the browser being lost.
+if [[ "$(id -u)" != 0 ]]; then
+  N0="$(wc -l < "$DREC")"
+  dserve warm.test DPWSANDBOXFAIL=1
+  t  'T31c a box whose Chrome will not start sandboxed still gets a warm session' 0 "$RC"
+  tc 'T31c ...a warm one, not the cold fallback' 'warm session' "$OUT"
+  t  'T31c ...by exactly one retry, sandboxed first and then without it' 'true false' \
+     "$(since "$N0" | jq -rs '[.[]|select(.call=="launch")|.sandbox|tostring]|join(" ")')"
+  tc 'T31c ...and the reason is kept in the daemon log' 'without the sandbox' \
+     "$(cat "$WDIR/.5dive-session.err" 2>/dev/null)"
+  env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+fi
+
+# Only http(s) is opened. An adapter is a public surface, so its probe URL is
+# not trusted to point the person's browser at a local file.
+mkprofile file.test "$LIVE_DOM" >/dev/null
+printf '{ "site": "file.test", "probe": { "url": "file:///etc/hostname" }, "actions": {} }\n' \
+  > "$FIVEDIVE_BROWSER_ADAPTER_DIR/file.test.json"
+N0="$(wc -l < "$DREC")"
+dserve file.test
+t  'T31d a non-http start URL still serves' 0 "$RC"
+t  'T31d ...but the first tab is not sent to it' 'none' \
+   "$(since "$N0" | jq -rs '[.[]|select(.call=="goto" and .kind=="first")]|first|.url // "none"')"
+env PATH="$SPATH" "$BROWSER" serve file.test --stop >/dev/null 2>&1
 
 # --- T25j a second caller mid-request waits a BOUNDED time, then is refused ----
 # DIVE-4927 replaced the on-the-spot refusal with a bounded wait; the behaviour
@@ -4998,6 +5055,82 @@ tc 'T29h served is dispatched' 'served) shift; cmd_served' "$(cat "$BROWSER")"
 run bash "$BROWSER" --help
 tc 'T29h --help tells a person forget deletes the login' 'forget <site>' "$OUT$ERR"
 tc 'T29h ...and that it is the box logging out' 'LOG THE BOX OUT' "$OUT$ERR"
+
+# --- T30 capture: both halves of a login check, on disk (DIVE-4929) ---------
+# `5dive reflex login-marker` (5dive CLI, DIVE-4928) drafts a site's login check
+# from a signed-out and a signed-in render of its probe page. This verb makes the
+# two files. Its load-bearing properties: the halves really are different
+# profiles, the files are the owner's alone, and a brokered seat cannot use it to
+# pull the signed-in page of a site that no verdict has cleared for reading.
+CAPSITE=capture.test
+CAPIN='<html><head><title>Inbox</title></head><body><nav id="account-menu">me</nav></body></html>'
+CAPOUT='<html><head><title>Sign in</title></head><body><form action="/session"><input name="login"></form></body></html>'
+CAPDIR="$(mkprofile "$CAPSITE" "$CAPIN")"
+export FAKE_COLD_DOM="$TMP/cap-cold.html"; printf '%s' "$CAPOUT" > "$FAKE_COLD_DOM"
+CAPO="$TMP/cap-out-1"
+run "$BROWSER" capture "$CAPSITE" --url=https://capture.test/settings --out="$CAPO"
+t  'T30a capture exits 0' 0 "$RC"
+t  'T30a the signed-out half is the THROWAWAY profile render' "$CAPOUT" "$(cat "$CAPO/signed-out.html" 2>/dev/null)"
+t  'T30a the signed-in half is THIS login'"'"'s profile render' "$CAPIN" "$(cat "$CAPO/signed-in.html" 2>/dev/null)"
+t  'T30a a second signed-out render, also from a throwaway profile' "$CAPOUT" "$(cat "$CAPO/signed-out-2.html" 2>/dev/null)"
+t  'T30a all three files are 0600' '600 600 600' "$(stat -c %a "$CAPO/signed-out.html" "$CAPO/signed-out-2.html" "$CAPO/signed-in.html" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+t  'T30a the directory is 0700' 700 "$(stat -c %a "$CAPO" 2>/dev/null)"
+tc 'T30a it prints the reflex command that reads all three files' "reflex login-marker $CAPSITE --url=https://capture.test/settings --logged-out=$CAPO/signed-out.html --logged-out=$CAPO/signed-out-2.html --logged-in=$CAPO/signed-in.html" "$OUT"
+tc 'T30a the capture is an audit row on the profile' '"event":"capture"' "$(cat "$CAPDIR/.5dive-audit.jsonl" 2>/dev/null)"
+t  'T30a no adapter was written' no "$([[ -e "$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json" ]] && echo yes || echo no)"
+tn 'T30a no adapter, so no --compare' '--compare=' "$OUT"
+# The default --url is the probe URL, and a site WITH an adapter gets --compare.
+mkadapter "$CAPSITE" "file://$TMP/artifact.html" 'PUBLISHED'
+run "$BROWSER" capture "$CAPSITE" --out="$TMP/cap-out-2"
+t  'T30b with no --url, the adapter'"'"'s probe URL is captured' 0 "$RC"
+tc 'T30b ...and named in the command' '--url=https://capture.test.test/feed' "$OUT"
+tc 'T30b an existing adapter is offered as the hand marker to compare' "--compare=$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json" "$OUT"
+rm -f "$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json"
+# A capture never overwrites.
+run "$BROWSER" capture "$CAPSITE" --url=https://capture.test/settings --out="$CAPO"
+t  'T30c a non-empty --out is refused' 64 "$RC"
+t  'T30c ...and the earlier capture is untouched' "$CAPIN" "$(cat "$CAPO/signed-in.html" 2>/dev/null)"
+# A profile that is not logged in renders the same page twice. Say so.
+IDSITE=capture-same.test
+mkprofile "$IDSITE" "$CAPOUT" >/dev/null
+run "$BROWSER" capture "$IDSITE" --url=https://capture-same.test/ --out="$TMP/cap-out-3"
+t  'T30d identical renders still exit 0 (the files are what they are)' 0 "$RC"
+tc 'T30d ...with a warning that the profile may not be logged in' 'may not be logged in' "$ERR"
+# The real case is NOT byte-identical: a sign-in page carries a fresh token per
+# render. Same title, different bytes, must still warn.
+TSITE=capture-title.test
+mkprofile "$TSITE" '<html><head><title>Sign in</title></head><body><input name="tok" value="zz"></body></html>' >/dev/null
+run "$BROWSER" capture "$TSITE" --url=https://capture-title.test/ --out="$TMP/cap-out-5"
+tc 'T30d same page title with different bytes still warns (per-render tokens)' 'may not be logged in' "$ERR"
+run "$BROWSER" capture nosuchprofile.test --out="$TMP/cap-out-4"
+t  'T30e no profile for the site: refused' 69 "$RC"
+run "$BROWSER" capture 'not a site'
+t  'T30e an unusable name is a usage error' 64 "$RC"
+# THE BROKERED REFUSAL. A seat using the box login must not get a file of the
+# owner's signed-in page for a site nothing has cleared for reading.
+BRKSITE=capture-box.test
+mkprofile "$BRKSITE" "$CAPIN" "$BOXSEAT" >/dev/null
+printf 'site=%s\nowner=%s\n' "$BRKSITE" "$BOXSEAT" > "$RVROOT/$BOXSEAT/$BRKSITE.offered"
+capbrk() {  # <browser bin> -> rc; the capture a brokered seat attempts
+  local o="$TMP/cap-brk-$RANDOM"
+  env FIVEDIVE_BROWSER_SEAT="$OTHER" "$1" capture "$BRKSITE" --url=https://capture-box.test/ --out="$o" >/dev/null 2>"$TMP/.capbrk.e"
+  local rc=$?
+  [[ -e "$o/signed-in.html" ]] && return 99
+  return "$rc"
+}
+capbrk "$BROWSER"; BRC=$?
+t  'T30f a brokered seat is refused (77) and gets no file' 77 "$BRC"
+tc 'T30f ...and is told the owner runs it' "sudo -u $BOXSEAT 5dive browser capture" "$(cat "$TMP/.capbrk.e")"
+CAPMUT="$TMP/browser-capture-mutant"
+sed 's|_open_site "$site" --no-broker capture "|_open_site "$site" "" capture "|' "$BROWSER" > "$CAPMUT"; chmod +x "$CAPMUT"
+cp "$ROOT/plugins/browser/bin/session-daemon" "$TMP/session-daemon" 2>/dev/null || true
+t  'T30f mutant applied' yes "$(cmp -s "$CAPMUT" "$BROWSER" && echo no || echo yes)"
+capbrk "$CAPMUT"; MRC=$?
+t  'T30f MUTANT (broker refusal dropped): the brokered capture is NOT refused' yes "$([[ "$MRC" != 77 ]] && echo yes || echo no)"
+unset FAKE_COLD_DOM
+tc 'T30g capture is dispatched' 'capture) shift; cmd_capture' "$(cat "$BROWSER")"
+run bash "$BROWSER" --help
+tc 'T30g --help names it' 'capture <site>' "$OUT$ERR"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

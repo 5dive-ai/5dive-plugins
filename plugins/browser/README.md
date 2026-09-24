@@ -462,6 +462,31 @@ wholesale by `5dive plugin upgrade browser@5dive-browser`. Measured 2026-09-14: 
 went `authenticated` → `UNKNOWN (no adapter)` with nothing else changed. An adapter is your own
 data about your own site; an upgrade that eats it silently un-classifies a live session.
 
+**Drafting a login check for a new site: `capture`, then reflex (DIVE-4929).** Measuring a
+marker used to mean running headless chrome by hand, once per half. Now it is one command from the
+login's owner:
+
+```
+5dive browser capture linkedin.com --url=https://www.linkedin.com/feed/
+sudo 5dive reflex login-marker linkedin.com --url=… --logged-out=…/signed-out.html \
+     --logged-out=…/signed-out-2.html --logged-in=…/signed-in.html
+```
+
+- **What `capture` saves.** It saves the probe page three times, as 0600 files in a 0700 directory
+  under the owner's home: twice signed OUT (two throwaway profiles, the probe's own command) and
+  once signed IN (this login, or the served session). It classifies nothing and writes no
+  adapter.
+- **Why two signed-out renders.** A sign-in page carries tokens that change on every render, such
+  as GitHub's `required_field_<hex>` honeypot fields. Only a token that both renders share can be
+  a marker.
+- **Who may run it.** A brokered seat is refused. The signed-in page is the account's own, and a
+  capture exists for exactly the sites no probe verdict has cleared for reading.
+- **What the second command does.** It is the 5dive CLI's shadow proposer. The code lists
+  candidate markers and keeps only those that match every signed-out render and never the signed-in
+  one. The reflex model picks one. Nothing is written: a person copies a proposal into
+  `.adapters/` after reading it. With `--compare=<this site's adapter>` it scores the pick against a
+  hand-written marker.
+
 Its steps come from a closed vocabulary —
 `goto fill click wait_for select upload press` — and a step outside it is a **load-time refusal**.
 There is no `eval`, no `script` and no free-text instruction step, because any of those would make
