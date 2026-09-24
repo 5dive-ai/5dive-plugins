@@ -725,7 +725,8 @@ async function planRequest(ctx, req, send, end) {
         // A SELECTOR IS NEVER INTERPOLATED — an argument that could choose which
         // element gets clicked is the hole, and `ref=<role>/<name>` is a selector
         // by this rule too.
-        out[field] = field === 'selector' ? s[field] : interpOrThrow(s[field], args, `step ${i + 1} (${s.op})`);
+        // `literal` (DIVE-4943): `act`'s values are the agent's own text, typed as given.
+        out[field] = field === 'selector' || req.literal ? s[field] : interpOrThrow(s[field], args, `step ${i + 1} (${s.op})`);
       }
       return out;
     });
@@ -737,7 +738,7 @@ async function planRequest(ctx, req, send, end) {
   // that throws may already have navigated, a click may already have posted. The
   // expensive direction is claiming nothing ran when something did — that is the
   // blind retry that double-posts.
-  let stepsRun = 0;
+  let stepsRun = 0, needsOwner = null;
   let page;
   try { page = await pageOf(ctx); }
   catch (e) {
@@ -756,6 +757,12 @@ async function planRequest(ctx, req, send, end) {
       // choice of which ops wait lives in lib/aria.cjs, shared by this loop and
       // the other one, because the defect was that there are two of them.
       const sel = await aria.resolveStepSelector(page, s, { timeoutMs: STEP_TIMEOUT });
+      // THE OWNER'S FOUR (DIVE-4943) — the same check, in the same place, as the
+      // one-shot driver's loop; lib/aria.cjs holds it so the two cannot differ.
+      if (req.guard && !req.approved) {
+        const risk = await aria.stepRisk(page, s, sel);
+        if (risk) { needsOwner = { ...risk, step: i + 1, op: s.op }; break; }
+      }
       stepsRun++;
       switch (s.op) {
         case 'goto': {
@@ -780,11 +787,33 @@ async function planRequest(ctx, req, send, end) {
         'there is nothing to re-read.' });
       return end(E_NOTHING_RAN);
     }
+    await sendReport(page, req, send);
     return end(E_FAILED);
   }
+  if (needsOwner) send({ t: 'err', msg: aria.NEEDS_OWNER_PREFIX.trim() + ' ' + JSON.stringify(needsOwner) });
+  await sendReport(page, req, send);
   // THE SESSION STAYS WARM AND THE PAGE STAYS WHERE IT IS. Closing the context
   // here would give back exactly the launch this daemon exists to stop paying.
-  end(0);
+  end(needsOwner ? aria.E_NEEDS_OWNER : 0);
+}
+
+// `act`'s re-read (DIVE-4943), sent back INLINE: the caller may be a brokered
+// seat that cannot hand this process a path (the DIVE-4794 trade `snapshot`
+// already makes). One `out` line of JSON, and only when the request asked.
+async function sendReport(page, req, send) {
+  if (!req.report) return;
+  try {
+    const after = await aria.pageAfter(page, { settleMs: settleOf(req, RUN_SETTLE_MS) });
+    let png = null;
+    if (req.report.shot) {
+      const buf = await page.screenshot({});
+      png = Buffer.isBuffer(buf) ? buf.toString('base64') : Buffer.from(String(buf)).toString('base64');
+    }
+    send({ t: 'out', data: JSON.stringify({ act_report: true, url: after.url, title: after.title,
+      html_inline: after.html, png_b64: png }) + '\n' });
+  } catch (e) {
+    send({ t: 'err', msg: `the steps ran but the page could not be re-read afterwards: ${e.message}` });
+  }
 }
 
 // ---------------------------------------------------------------- call mode

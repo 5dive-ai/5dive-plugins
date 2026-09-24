@@ -1,7 +1,7 @@
 {
   "name": "browser",
-  "version": "1.10.6",
-  "description": "Persistent human-authenticated browser sessions — log into a site once by hand, then let deterministic adapters operate it. Never solves a security challenge; it stops and asks you.",
+  "version": "1.11.0",
+  "description": "Browse and act on any website with nothing connected; where it must be you, persistent human-authenticated sessions you log into once by hand (several accounts per site). Paying, posting, sending and deleting wait for your yes. Never solves a security challenge; it stops and asks you.",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com",

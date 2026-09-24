@@ -21,7 +21,29 @@ than a detail.
 5dive browser run <site> <action> [--key=value ...]
 5dive browser tree <site> <url> [--settle=<ms>]   # refs; --settle also on snapshot,
                                                   # --page-settle on run
+5dive browser act <url> --steps=<json> [--expect=<regex>] [--approved=<id>]
+sudo 5dive browser approve <id> [--deny]          # the owner's yes to a pay/post/send/delete
 ```
+
+## The browser works with nothing connected, and it acts (DIVE-4943)
+
+Every page verb (`read links shot snapshot tree act`) takes a **URL in place of `<site>`** and
+resolves the profile once, in `_route_site`: the host's one connected login; the **public profile**
+`_public` when the host has none (per seat, nothing logged in, no login probe, never listed as a
+connected site); a refusal naming the accounts when there are several (`github.com_work`,
+`github.com_personal` — a profile is `<site>_<label>`, and which account acts is the owner's call).
+
+`act` runs agent-written steps in the fixed vocabulary (`goto fill click wait_for select press`)
+through the same executors, lease and login gate as `run`, and grades `--expect` against the page
+as the steps left it. **Paying, publishing, sending and deleting stop before the step** (exit 73):
+the executor reads the live element's label (`lib/aria.cjs` `stepRisk`, shared by both step loops),
+records the ask with a screenshot, and waits for `sudo 5dive browser approve <id>`, a root-owned
+grant bound to the exact steps, good once for 30 minutes. It catches the literal buttons, not
+intent: an order behind a button labelled "Continue" is not caught.
+
+A connected site with **no adapter** is no longer refused outright by the page gate: it proceeds
+unless the page is visibly a sign-in (password field, a form posting to a login path, a sign-in URL
+after redirects) or a challenge, and says every time that no adapter confirmed the login.
 
 ## Server mode: the browser lives on the box, you reach it through a one-time link
 
