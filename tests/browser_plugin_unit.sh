@@ -1826,6 +1826,32 @@ awk '/5dive:connect-site-flow:begin/{p=1} p{print} /5dive:connect-site-flow:end/
 t 'T14b the Claude skill and harness-neutral doc share one fenced workflow' 'same' \
   "$(cmp -s "$SKILLFLOW" "$DOCFLOW" && echo same || echo DRIFT)"
 
+# --- T14c DIVE-4943 scope 8: a skill that sends an agent TO the browser for web work.
+# The defect: the only skill the plugin shipped pointed agents AWAY from it ("Not
+# for fetching a public page (use a normal fetch)"), so an agent asked to "go to
+# <site> and …" never reached for `act`. Each arm is one way that recurs: the
+# skill missing, a description that does not fire on a web task, a body that
+# drops the owner-approval stop, or the old pointer-away line coming back.
+USKILL="$ROOT/plugins/browser/skills/use-browser/SKILL.md"
+t  'T14c the use-browser skill ships with the plugin' 'yes' \
+   "$([[ -f "$USKILL" ]] && echo yes || echo no)"
+UTXT="$(cat "$USKILL" 2>/dev/null)"
+UDESC="$(grep -m1 '^description:' "$USKILL" 2>/dev/null)"
+tc 'T14c ...with frontmatter naming it' 'name: use-browser' "$UTXT"
+tc 'T14c ...firing on "go to <site> and"' 'go to <site> and' "$UDESC"
+tc 'T14c ...firing on buy/book/fill/submit' 'buy/book/fill/submit' "$UDESC"
+tc 'T14c ...firing on what a fetch cannot do' 'normal fetch cannot do' "$UDESC"
+tc 'T14c ...saying it works with nothing connected' 'NOTHING connected' "$UDESC"
+tc 'T14c ...teaching snapshot --interactive' 'snapshot <url> --interactive' "$UTXT"
+tc 'T14c ...teaching act by ref' 'act <url> --steps=' "$UTXT"
+tc 'T14c ...teaching verify with --expect' '--expect=' "$UTXT"
+tc 'T14c ...naming the owner-approval exit' 'exits **73**' "$UTXT"
+tc 'T14c ...saying the owner, not the agent, approves' 'not you' "$UTXT"
+tc 'T14c ...forbidding rephrasing around the stop' 'Do not rephrase the steps' "$UTXT"
+tc 'T14c ...never guessing between two accounts' 'never guess' "$UTXT"
+tn 'T14c connect-site no longer sends agents to a normal fetch' 'use a normal fetch' "$SKILLTXT"
+tc 'T14c ...and points web work at use-browser instead' 'use-browser skill' "$SKILLTXT"
+
 # A skills/ dir with no 'skill' capability installs clean and registers NOTHING
 # (cmd_plugin.sh warns and moves on) — the silent half-ship this arm forbids.
 t  'T14c the manifest declares the skill capability, or the skill is never registered' 'yes' \

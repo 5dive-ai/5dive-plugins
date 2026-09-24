@@ -8,7 +8,8 @@ in full in that repo's CHANGES: `act <url> --steps=<json>` (agents click and typ
 verb takes a URL and runs in the host's one login or a public profile, so a box with nothing
 connected can browse; several accounts per site as `<site>_<label>`; a generic sign-in check for
 sites with no adapter; and paying, posting, sending and deleting stop (exit 73) until
-`sudo 5dive browser approve <id>`. `tests/browser_plugin_unit.sh` is upstream's with `browser/` read
+`sudo 5dive browser approve <id>`. A new `use-browser` skill sends agents to the browser for web
+tasks, and `connect-site` stops pointing them at a normal fetch. `tests/browser_plugin_unit.sh` is upstream's with `browser/` read
 as `plugins/browser/`, plus this registry's TR28 arms.
 
 ### Fixed — the registry copy carries the hired-agent login fix, at browser 1.10.4 (DIVE-4927)

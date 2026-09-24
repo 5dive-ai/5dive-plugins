@@ -1,6 +1,6 @@
 ---
 name: connect-site
-description: Get a human logged into a site on the box, then use that logged-in session. Use when you need a site the agent has no session for — "log in to X", "connect my X account", "the agent needs a logged-in X", "open a browser on the box", "X says I'm signed out" — or when `5dive browser status` is not `authenticated`. Not for fetching a public page (use a normal fetch) and not for anything a site's API already does.
+description: Get a human logged into a site on the box, then use that logged-in session. Use when you need a site the agent has no session for — "log in to X", "connect my X account", "the agent needs a logged-in X", "open a browser on the box", "X says I'm signed out" — or when `5dive browser status` is not `authenticated`. Not for browsing or acting on a public page — the browser does that with nothing connected (the use-browser skill) — and not for anything a site's API already does.
 ---
 
 # connect-site — use the bound dashboard handoff, then stop and check
