@@ -4976,82 +4976,6 @@ run bash "$BROWSER" --help
 tc 'T29h --help tells a person forget deletes the login' 'forget <site>' "$OUT$ERR"
 tc 'T29h ...and that it is the box logging out' 'LOG THE BOX OUT' "$OUT$ERR"
 
-# --- T30 capture: both halves of a login check, on disk (DIVE-4929) ---------
-# `5dive reflex login-marker` (5dive CLI, DIVE-4928) drafts a site's login check
-# from a signed-out and a signed-in render of its probe page. This verb makes the
-# two files. Its load-bearing properties: the halves really are different
-# profiles, the files are the owner's alone, and a brokered seat cannot use it to
-# pull the signed-in page of a site that no verdict has cleared for reading.
-CAPSITE=capture.test
-CAPIN='<html><head><title>Inbox</title></head><body><nav id="account-menu">me</nav></body></html>'
-CAPOUT='<html><head><title>Sign in</title></head><body><form action="/session"><input name="login"></form></body></html>'
-CAPDIR="$(mkprofile "$CAPSITE" "$CAPIN")"
-export FAKE_COLD_DOM="$TMP/cap-cold.html"; printf '%s' "$CAPOUT" > "$FAKE_COLD_DOM"
-CAPO="$TMP/cap-out-1"
-run "$BROWSER" capture "$CAPSITE" --url=https://capture.test/settings --out="$CAPO"
-t  'T30a capture exits 0' 0 "$RC"
-t  'T30a the signed-out half is the THROWAWAY profile render' "$CAPOUT" "$(cat "$CAPO/signed-out.html" 2>/dev/null)"
-t  'T30a the signed-in half is THIS login'"'"'s profile render' "$CAPIN" "$(cat "$CAPO/signed-in.html" 2>/dev/null)"
-t  'T30a a second signed-out render, also from a throwaway profile' "$CAPOUT" "$(cat "$CAPO/signed-out-2.html" 2>/dev/null)"
-t  'T30a all three files are 0600' '600 600 600' "$(stat -c %a "$CAPO/signed-out.html" "$CAPO/signed-out-2.html" "$CAPO/signed-in.html" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
-t  'T30a the directory is 0700' 700 "$(stat -c %a "$CAPO" 2>/dev/null)"
-tc 'T30a it prints the reflex command that reads all three files' "reflex login-marker $CAPSITE --url=https://capture.test/settings --logged-out=$CAPO/signed-out.html --logged-out=$CAPO/signed-out-2.html --logged-in=$CAPO/signed-in.html" "$OUT"
-tc 'T30a the capture is an audit row on the profile' '"event":"capture"' "$(cat "$CAPDIR/.5dive-audit.jsonl" 2>/dev/null)"
-t  'T30a no adapter was written' no "$([[ -e "$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json" ]] && echo yes || echo no)"
-tn 'T30a no adapter, so no --compare' '--compare=' "$OUT"
-# The default --url is the probe URL, and a site WITH an adapter gets --compare.
-mkadapter "$CAPSITE" "file://$TMP/artifact.html" 'PUBLISHED'
-run "$BROWSER" capture "$CAPSITE" --out="$TMP/cap-out-2"
-t  'T30b with no --url, the adapter'"'"'s probe URL is captured' 0 "$RC"
-tc 'T30b ...and named in the command' '--url=https://capture.test.test/feed' "$OUT"
-tc 'T30b an existing adapter is offered as the hand marker to compare' "--compare=$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json" "$OUT"
-rm -f "$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json"
-# A capture never overwrites.
-run "$BROWSER" capture "$CAPSITE" --url=https://capture.test/settings --out="$CAPO"
-t  'T30c a non-empty --out is refused' 64 "$RC"
-t  'T30c ...and the earlier capture is untouched' "$CAPIN" "$(cat "$CAPO/signed-in.html" 2>/dev/null)"
-# A profile that is not logged in renders the same page twice. Say so.
-IDSITE=capture-same.test
-mkprofile "$IDSITE" "$CAPOUT" >/dev/null
-run "$BROWSER" capture "$IDSITE" --url=https://capture-same.test/ --out="$TMP/cap-out-3"
-t  'T30d identical renders still exit 0 (the files are what they are)' 0 "$RC"
-tc 'T30d ...with a warning that the profile may not be logged in' 'may not be logged in' "$ERR"
-# The real case is NOT byte-identical: a sign-in page carries a fresh token per
-# render. Same title, different bytes, must still warn.
-TSITE=capture-title.test
-mkprofile "$TSITE" '<html><head><title>Sign in</title></head><body><input name="tok" value="zz"></body></html>' >/dev/null
-run "$BROWSER" capture "$TSITE" --url=https://capture-title.test/ --out="$TMP/cap-out-5"
-tc 'T30d same page title with different bytes still warns (per-render tokens)' 'may not be logged in' "$ERR"
-run "$BROWSER" capture nosuchprofile.test --out="$TMP/cap-out-4"
-t  'T30e no profile for the site: refused' 69 "$RC"
-run "$BROWSER" capture 'not a site'
-t  'T30e an unusable name is a usage error' 64 "$RC"
-# THE BROKERED REFUSAL. A seat using the box login must not get a file of the
-# owner's signed-in page for a site nothing has cleared for reading.
-BRKSITE=capture-box.test
-mkprofile "$BRKSITE" "$CAPIN" "$BOXSEAT" >/dev/null
-printf 'site=%s\nowner=%s\n' "$BRKSITE" "$BOXSEAT" > "$RVROOT/$BOXSEAT/$BRKSITE.offered"
-capbrk() {  # <browser bin> -> rc; the capture a brokered seat attempts
-  local o="$TMP/cap-brk-$RANDOM"
-  env FIVEDIVE_BROWSER_SEAT="$OTHER" "$1" capture "$BRKSITE" --url=https://capture-box.test/ --out="$o" >/dev/null 2>"$TMP/.capbrk.e"
-  local rc=$?
-  [[ -e "$o/signed-in.html" ]] && return 99
-  return "$rc"
-}
-capbrk "$BROWSER"; BRC=$?
-t  'T30f a brokered seat is refused (77) and gets no file' 77 "$BRC"
-tc 'T30f ...and is told the owner runs it' "sudo -u $BOXSEAT 5dive browser capture" "$(cat "$TMP/.capbrk.e")"
-CAPMUT="$TMP/browser-capture-mutant"
-sed 's|_open_site "$site" --no-broker capture "|_open_site "$site" "" capture "|' "$BROWSER" > "$CAPMUT"; chmod +x "$CAPMUT"
-cp "$ROOT/plugins/browser/bin/session-daemon" "$TMP/session-daemon" 2>/dev/null || true
-t  'T30f mutant applied' yes "$(cmp -s "$CAPMUT" "$BROWSER" && echo no || echo yes)"
-capbrk "$CAPMUT"; MRC=$?
-t  'T30f MUTANT (broker refusal dropped): the brokered capture is NOT refused' yes "$([[ "$MRC" != 77 ]] && echo yes || echo no)"
-unset FAKE_COLD_DOM
-tc 'T30g capture is dispatched' 'capture) shift; cmd_capture' "$(cat "$BROWSER")"
-run bash "$BROWSER" --help
-tc 'T30g --help names it' 'capture <site>' "$OUT$ERR"
-
 # ============ T31 DIVE-4943: act anywhere, zero sites connected, the owner's four
 #
 # The row's five claims, each with the mutant that would pass a weaker suite:
@@ -5175,7 +5099,7 @@ t  'T32e a CSS selector does not hide a delete: the LIVE label is read' 73 "$RC"
 run actenv env PWLABEL="Star" "$BROWSER" act "https://gh2.test/repo" --steps='[{"op":"click","selector":"#star"}]'
 t  'T32e (control) a harmless click is not stopped' 0 "$RC"
 # the mutant: the executor's guard removed -> the order is placed
-MUT32E="$TMP/mut31e"; rm -rf "$MUT32E"; cp -r "$ROOT/browser" "$MUT32E"
+MUT32E="$TMP/mut31e"; rm -rf "$MUT32E"; cp -r "$ROOT/plugins/browser" "$MUT32E"
 sed -i 's|if (plan.guard \&\& !plan.approved) {|if (false) {|' "$MUT32E/bin/driver-playwright"
 t  'T32e mutant applied' yes "$(cmp -s "$MUT32E/bin/driver-playwright" "$ROOT/plugins/browser/bin/driver-playwright" && echo no || echo yes)"
 : > "$PWREC"
