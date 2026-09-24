@@ -1,6 +1,6 @@
 {
   "name": "@5dive/telegram-codex-mcp",
-  "version": "0.5.20",
+  "version": "0.5.21",
   "description": "Telegram bridge for OpenAI Codex CLI, delivered as a stdio MCP server: wait for messages, reply, edit, react, and download attachments from a Telegram bot.",
   "license": "Apache-2.0",
   "type": "module",
@@ -26,14 +26,26 @@
     "server.ts",
     "dispatcher.ts",
     "dispatcher-core.ts",
+    "compat.ts",
     "health.ts",
     "lifecycle.ts",
     "tna.ts",
-    "README.md"
+    "access-core.ts",
+    "banner.ts",
+    "viewer-link.ts",
+    "pair.ts",
+    "release.sh",
+    "hooks/",
+    "hooks.json",
+    "skills/",
+    "AGENTS.md",
+    "README.md",
+    "TODO.md"
   ],
   "scripts": {
     "start": "bun dispatcher.ts",
-    "start:mcp-fallback": "bun server.ts"
+    "start:mcp-fallback": "bun server.ts",
+    "check": "bun dispatcher.ts --check"
   },
   "publishConfig": {
     "access": "public"

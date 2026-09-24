@@ -83,6 +83,9 @@ export type ChannelHealth = {
   queueDepth: number
   active?: { turnId: string; source: string; startedAt: string }
   failure?: HealthFailure
+  /** The Codex half of the pair (DIVE-3969, compat.ts). Optional, so it is not
+   *  a schema bump: a reader that predates it simply does not show it. */
+  codex?: { version: string | null; minimum: string; testedMax: string; tested: boolean }
 }
 
 export type HealthState =
@@ -230,6 +233,7 @@ export function renderHealth(v: HealthVerdict, health: ChannelHealth | null): st
   if (!health) return `${v.state} — ${v.detail}`
   const bits = [
     `bridge ${health.bridgeVersion}`,
+    ...(health.codex ? [`codex ${health.codex.version ?? '?'}${health.codex.tested ? '' : ' (untested)'}`] : []),
     `queue ${health.queueDepth}`,
     `in ${health.lastInboundAt ?? 'never'}`,
     `out ${health.lastOutboundAt ?? 'never'}`,

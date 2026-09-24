@@ -221,6 +221,59 @@ bun start
 DM your bot. The channel adapter submits the message directly to app-server and
 routes streamed agent messages back. No model-owned listen loop is involved.
 
+## Compatibility
+
+The dispatcher checks the pair before it starts anything. `codex --version`
+below the floor is refused by name — written to `health.json` as the bridge's
+failure cause and to `lifecycle.log` — instead of surfacing as an app-server
+exit code that a supervisor restarts forever.
+
+| Component | Supported | Notes |
+| --- | --- | --- |
+| Codex CLI (dispatcher) | **>= 0.136.0**; tested through 0.156.1 | 0.135.0 and older reject `app-server --stdio` (measured on 0.100–0.135). Newer than the tested range is allowed and recorded as untested. |
+| Codex CLI (MCP fallback) | any release with MCP servers + hooks | `server.ts` never starts app-server. |
+| Dispatcher state (`state.json`) | schema 1; files with no `schema` migrate in place | Idempotent. A file from a newer bridge, or one that does not parse, is moved to `state.json.quarantined-<ms>` and the next turn says the earlier conversation is not in context. |
+| Health handshake (`health.json`) | schema 1 | 5dive's reader reports a schema it does not know as unreadable and never guesses. The `codex` block is optional, so it is not a schema bump. |
+| npm package (`@5dive/telegram-codex-mcp`) | 0.5.7 is the newest published | `.mcp.json` pins it for the Codex plugin install. The dispatcher is not in that package. |
+
+`CODEX_DISPATCHER_ALLOW_UNSUPPORTED=1` bypasses the floor for a deliberate
+canary. Do not set it on a seat: below the floor app-server exits before the
+first request.
+
+## Upgrade, canary and rollback
+
+5dive boxes run the dispatcher from `/usr/local/lib/5dive/telegram-codex`.
+`install.sh --upgrade` copies this directory from the `main` branch, so merging
+here reaches every box at its next upgrade. To take a change onto one box
+first, use `release.sh`:
+
+```sh
+# 1. stage the candidate with its dependencies
+cp -a plugins/telegram-codex /tmp/tcx-candidate
+(cd /tmp/tcx-candidate && bun install --production)
+
+# 2. preflight as the seat user: its Codex, its saved state; starts nothing
+sudo -u agent-codex -H env CODEX_BIN=$(command -v codex) \
+  bash /tmp/tcx-candidate/release.sh check /tmp/tcx-candidate
+
+# 3. make it live (the old tree is kept), then restart ONE seat and watch it
+sudo bash /tmp/tcx-candidate/release.sh promote /tmp/tcx-candidate
+sudo 5dive agent restart codex
+cat /home/agent-codex/.codex/channels/dispatcher/health.json   # bridgeVersion, codex, bound
+
+# 4. if it misbehaves: swap back and restart
+sudo bash /usr/local/lib/5dive/telegram-codex/release.sh rollback
+sudo 5dive agent restart codex
+```
+
+`check` prints one JSON line (`ok`, `codex`, `state`) and exits 1 on an
+unsupported pair. `promote` runs the same check and changes nothing when it
+fails. `rollback` swaps the live tree with the previous one, so running it again
+rolls forward. State stays compatible in both directions: a pre-0.5.20 bridge
+ignores the `schema` field, and a newer schema is quarantined, not misread.
+A box-local rollback lasts until that box's next `install.sh --upgrade`.
+Rolling back the whole fleet means reverting on `main`.
+
 ## Differences from the Claude Code build
 
 | Concern               | `telegram/` (Claude Code)              | `telegram-codex/` (this)         |
@@ -256,4 +309,10 @@ relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
 - v0.2.3 — silence-watchdog backoff: first ping in a silence stretch trips at the base threshold (default 2 min); the 2nd ping needs ~20 min of additional silence, the 3rd+ needs ~30 min (cap). A real `reply` resets the counter. Stops the "⏳ still working…" message from feeling like a 2-minute heartbeat during long silent runs.
 - v0.2.4 — `PLUGIN_VERSION` now reads from `package.json` at startup instead of a hardcoded const, so `/ping` / `/status` / `setMyCommands` report the actual shipped version. Previous PATCH bumps shipped the code but `/status` kept showing `0.2.1`.
 - v0.2.5 — silence-watchdog base default raised from 2 min → 10 min. With backoff (1× / 10× / 15×), the cadence on a truly silent run is now ~10 min, then +100 min, then +150 min cap — far less surprise during normal back-and-forth where the user just sent a slash command 2 minutes ago. Override via `CODEX_SILENCE_WATCHDOG_MS` as before.
-- v0.2.6 — silence-watchdog is now **off by default**. With `notify-user` auto-seeded, the agent already acks + edits progress updates; the watchdog ping was a redundant heartbeat that just felt like noise. Opt back in with `CODEX_SILENCE_WATCHDOG_ENABLED=1`. (this)
+- v0.2.6 — silence-watchdog is now **off by default**. With `notify-user` auto-seeded, the agent already acks + edits progress updates; the watchdog ping was a redundant heartbeat that just felt like noise. Opt back in with `CODEX_SILENCE_WATCHDOG_ENABLED=1`.
+- v0.2.7–v0.5.12 — kept in lockstep with the Claude `telegram` build (inbox, gate cards, task buttons, single-flight poller, `/model`). `TODO.md` and the git history have the per-release detail.
+- DIVE-3960 — the primary entrypoint is the app-server dispatcher (`bun start`), and MCP polling becomes the fallback.
+- DIVE-3964 — `health.json` handshake: bound/listening, last inbound and outbound, queue depth and a named failure cause, refreshed every 15s.
+- v0.5.13 — DIVE-3965: a clean stop and a crash are different sentences in the chat. Recovery context rides the next turn.
+- v0.5.20 — DIVE-3969: compatibility handshake. Codex below 0.136.0 is refused by name, `state.json` is versioned with idempotent migration and quarantine, `bun dispatcher.ts --check` preflights a tree, `release.sh` does canary, promote and rollback, and CI checks the packaged file list, versions and documented commands.
+- v0.5.21 — DIVE-4924: a model switch applies to the EXISTING conversation. The dispatcher reads the seat model/effort via app-server `config/read` and passes them to `thread/resume` and every `turn/start`; `health.json` records the thread's actual model and `/status` prints a `conversation:` line when it differs from the config.

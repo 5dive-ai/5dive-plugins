@@ -269,7 +269,10 @@ describe('Codex app-server channel dispatcher', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dive3960-lifecycle-'))
     const stateDir = join(dir, 'state')
     const fakeCodex = join(dir, 'fake-codex.ts')
+    // DIVE-3969: the dispatcher asks `codex --version` before it starts
+    // anything, so the fake answers it the way a supported Codex does.
     writeFileSync(fakeCodex, `#!/usr/bin/env bun
+if (process.argv.includes('--version')) { console.log('codex-cli 0.156.1'); process.exit(0) }
 import { createInterface } from 'node:readline'
 const lines = createInterface({ input: process.stdin })
 lines.on('line', line => {
@@ -430,6 +433,8 @@ lines.on('line', line => {
     writeFileSync(fakeCodex, `#!/usr/bin/env bun
 import { appendFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
+// DIVE-3969's startup handshake refuses a Codex that cannot name its version.
+if (process.argv.includes('--version')) { console.log('codex-cli 0.153.3'); process.exit(0) }
 const lines = createInterface({ input: process.stdin })
 lines.on('line', line => {
   const request = JSON.parse(line)
