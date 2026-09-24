@@ -1,5 +1,10 @@
 # telegram-codex MCP — guidance for the Codex agent
 
+> **MCP fallback only.** Under the primary dispatcher (`bun start`), inbound
+> messages arrive as ordinary turns, and your assistant messages are routed
+> back to the channel they came from. Do not call these tools there. This
+> guide applies when the bridge runs as `bun run start:mcp-fallback`.
+
 This MCP server bridges a Telegram bot to your Codex session. The user
 reads Telegram, not your stdout. You must use the tools below to talk
 back — anything you print to the terminal never reaches the user's phone.

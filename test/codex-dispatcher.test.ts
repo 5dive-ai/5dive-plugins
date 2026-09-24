@@ -269,7 +269,10 @@ describe('Codex app-server channel dispatcher', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dive3960-lifecycle-'))
     const stateDir = join(dir, 'state')
     const fakeCodex = join(dir, 'fake-codex.ts')
+    // DIVE-3969: the dispatcher asks `codex --version` before it starts
+    // anything, so the fake answers it the way a supported Codex does.
     writeFileSync(fakeCodex, `#!/usr/bin/env bun
+if (process.argv.includes('--version')) { console.log('codex-cli 0.156.1'); process.exit(0) }
 import { createInterface } from 'node:readline'
 const lines = createInterface({ input: process.stdin })
 lines.on('line', line => {
