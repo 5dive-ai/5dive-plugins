@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Added — the registry copy carries `act`, public browsing and owner approval, at browser 1.11.0 (DIVE-4943)
+
+`plugins/browser/` is `rsync -a --delete` identical to 5dive-ai/5dive-browser's `browser/` on the
+DIVE-4943 branch (1.11.0, which includes 1.10.5's `capture`), and `diff -r` is empty. What it adds,
+in full in that repo's CHANGES: `act <url> --steps=<json>` (agents click and type on refs); any page
+verb takes a URL and runs in the host's one login or a public profile, so a box with nothing
+connected can browse; several accounts per site as `<site>_<label>`; a generic sign-in check for
+sites with no adapter; and paying, posting, sending and deleting stop (exit 73) until
+`sudo 5dive browser approve <id>`. `tests/browser_plugin_unit.sh` is upstream's with `browser/` read
+as `plugins/browser/`, plus this registry's TR28 arms.
+
 ### Fixed — the registry copy carries the hired-agent login fix, at browser 1.10.4 (DIVE-4927)
 
 `plugins/browser/` is again `rsync -a --delete` identical to 5dive-ai/5dive-browser's `browser/`

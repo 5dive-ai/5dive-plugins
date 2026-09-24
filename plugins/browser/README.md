@@ -21,7 +21,29 @@ than a detail.
 5dive browser run <site> <action> [--key=value ...]
 5dive browser tree <site> <url> [--settle=<ms>]   # refs; --settle also on snapshot,
                                                   # --page-settle on run
+5dive browser act <url> --steps=<json> [--expect=<regex>] [--approved=<id>]
+sudo 5dive browser approve <id> [--deny]          # the owner's yes to a pay/post/send/delete
 ```
+
+## The browser works with nothing connected, and it acts (DIVE-4943)
+
+Every page verb (`read links shot snapshot tree act`) takes a **URL in place of `<site>`** and
+resolves the profile once, in `_route_site`: the host's one connected login; the **public profile**
+`_public` when the host has none (per seat, nothing logged in, no login probe, never listed as a
+connected site); a refusal naming the accounts when there are several (`github.com_work`,
+`github.com_personal` — a profile is `<site>_<label>`, and which account acts is the owner's call).
+
+`act` runs agent-written steps in the fixed vocabulary (`goto fill click wait_for select press`)
+through the same executors, lease and login gate as `run`, and grades `--expect` against the page
+as the steps left it. **Paying, publishing, sending and deleting stop before the step** (exit 73):
+the executor reads the live element's label (`lib/aria.cjs` `stepRisk`, shared by both step loops),
+records the ask with a screenshot, and waits for `sudo 5dive browser approve <id>`, a root-owned
+grant bound to the exact steps, good once for 30 minutes. It catches the literal buttons, not
+intent: an order behind a button labelled "Continue" is not caught.
+
+A connected site with **no adapter** is no longer refused outright by the page gate: it proceeds
+unless the page is visibly a sign-in (password field, a form posting to a login path, a sign-in URL
+after redirects) or a challenge, and says every time that no adapter confirmed the login.
 
 ## Server mode: the browser lives on the box, you reach it through a one-time link
 
@@ -461,6 +483,31 @@ wholesale by `5dive plugin upgrade browser@5dive-browser`. Measured 2026-09-14: 
 `adapters/reddit.com.json` was there before the upgrade and gone after it, and `status reddit.com`
 went `authenticated` → `UNKNOWN (no adapter)` with nothing else changed. An adapter is your own
 data about your own site; an upgrade that eats it silently un-classifies a live session.
+
+**Drafting a login check for a new site: `capture`, then reflex (DIVE-4929).** Measuring a
+marker used to mean running headless chrome by hand, once per half. Now it is one command from the
+login's owner:
+
+```
+5dive browser capture linkedin.com --url=https://www.linkedin.com/feed/
+sudo 5dive reflex login-marker linkedin.com --url=… --logged-out=…/signed-out.html \
+     --logged-out=…/signed-out-2.html --logged-in=…/signed-in.html
+```
+
+- **What `capture` saves.** It saves the probe page three times, as 0600 files in a 0700 directory
+  under the owner's home: twice signed OUT (two throwaway profiles, the probe's own command) and
+  once signed IN (this login, or the served session). It classifies nothing and writes no
+  adapter.
+- **Why two signed-out renders.** A sign-in page carries tokens that change on every render, such
+  as GitHub's `required_field_<hex>` honeypot fields. Only a token that both renders share can be
+  a marker.
+- **Who may run it.** A brokered seat is refused. The signed-in page is the account's own, and a
+  capture exists for exactly the sites no probe verdict has cleared for reading.
+- **What the second command does.** It is the 5dive CLI's shadow proposer. The code lists
+  candidate markers and keeps only those that match every signed-out render and never the signed-in
+  one. The reflex model picks one. Nothing is written: a person copies a proposal into
+  `.adapters/` after reading it. With `--compare=<this site's adapter>` it scores the pick against a
+  hand-written marker.
 
 Its steps come from a closed vocabulary —
 `goto fill click wait_for select upload press` — and a step outside it is a **load-time refusal**.

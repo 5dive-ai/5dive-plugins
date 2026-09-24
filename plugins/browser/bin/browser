@@ -112,6 +112,24 @@ SYSTEMD_DIR="${FIVEDIVE_BROWSER_SYSTEMD_DIR:-/etc/systemd/system}"
 SYSTEMCTL="${FIVEDIVE_BROWSER_SYSTEMCTL:-systemctl}"
 
 E_USAGE=64; E_UNAVAILABLE=69; E_PERM=77; E_COLD=75
+# 73: an act reached a step the OWNER must allow (pay, publish, send, delete) and
+# stopped before it. Distinct from every refusal above because the fix is not a
+# login, a box repair or a retry — it is a person saying yes (DIVE-4943).
+E_NEEDS_OWNER=73
+
+# THE PUBLIC PROFILE (DIVE-4943 scope 5). The browser used to do nothing at all on a
+# box with zero connected sites: every page verb took a <site>, and a <site> with no
+# login was "no profile — auth it". Most of the web needs no login, so a URL whose host
+# has NO connected account runs here: a per-seat profile with nothing logged in and no
+# login probe, because there is nothing to be logged into. A leading underscore can
+# never be a host, so it cannot collide with a real site's profile, and every verb
+# that LISTS sites (ls, served, status, probe-all) skips it — the dashboard's
+# Connected-sites list is logins, and this is not one.
+PUBLIC_SITE="_public"
+# How long an owner's yes stays good for, and it is short on purpose: the owner
+# approved THIS click on THIS page, and a yes that outlived the page it was about
+# would approve whatever the page became.
+APPROVAL_TTL=1800
 
 die() { printf '%s: %s\n' "$PROG" "$2" >&2; exit "$1"; }
 
@@ -156,7 +174,21 @@ _seat() {
 
 usage() {
   cat <<'USAGE'
-5dive browser — operate a site as yourself, in a profile you logged into by hand
+5dive browser — browse and act on any website; use your own logins where it must be you
+
+  Any page verb takes a URL in place of <site> and picks the profile itself: the
+  host's connected login if there is exactly one, the PUBLIC profile (nothing
+  logged in) if there is none. Nothing has to be connected to use the browser.
+  5dive browser snapshot <url> --interactive   # what is on the page, with refs
+  5dive browser act <url> --steps='[{"op":"click","selector":"ref=button/Star"}]'
+                                      # click / fill / select / press on refs, in one
+                                      # tab under one lease; --expect=<regex> grades
+                                      # the page the steps left. Paying, posting,
+                                      # sending and deleting STOP (exit 73) and name
+                                      # the owner's ask; re-run with --approved=<id>.
+  sudo 5dive browser approvals        # the owner: what agents are waiting to be allowed
+  sudo 5dive browser approve <id> [--deny]
+                                      # the owner's yes: those exact steps, once, 30 min
 
   5dive browser setup                 # one-time, as root: create the profile store
   5dive browser auth <site>           # open a browser; log in yourself, once
@@ -182,6 +214,11 @@ usage() {
                                       # Irreversible, and the only way back is to log in
                                       # again. Refuses while a person is in the viewer or
                                       # a caller holds the lease.
+  5dive browser capture <site> [--url=<probe url>] [--out=<dir>]
+                                      # save the probe page signed OUT (two throwaway
+                                      # profiles) and signed IN (this login), 0600, for
+                                      # `sudo 5dive reflex login-marker` to draft a login
+                                      # check from. Owner only; classifies nothing.
   5dive browser viewer <site> --bind=<session> [--ttl=600]
                                       # mint a ONE-TIME, expiring link a person logs in through
   5dive browser viewer-redeem <site> --nonce=- --session=<id>
@@ -241,6 +278,10 @@ usage() {
   passes and the name the profile directory takes, and a name with a dot in it is
   used verbatim. A bare label (`linkedin`) is a different profile and is guessed
   as <label>.com, which is a guess and not the contract.
+
+  SEVERAL ACCOUNTS ON ONE SITE: a profile is <site>_<label> — `github.com_work`,
+  `github.com_personal`. Given a URL with two such logins, a verb refuses and names
+  them rather than guess; name the one the owner asked for.
 USAGE
 }
 
@@ -338,6 +379,17 @@ _site_dir() { _resolve_site "$1"; }
 # directory it is cannot be delivered down a pipe. Callers read $_SITE_DIR.
 _open_site() {  # _open_site <site> [--no-broker <verb> <why> | --may-create]
   local site="$1" mode="${2:-}" verb="${3:-}" why="${4:-}"
+  # The public profile is this seat's own and holds no login, so its first use
+  # creates it — the one profile nobody is ever asked to `auth`. It is never
+  # brokered: a seat browsing the public web has no reason to borrow the box
+  # owner's cookies for it, and every reason not to.
+  if _is_public "$site"; then
+    _require_store
+    [[ -d "$(_seat_dir)" ]] || die "$E_UNAVAILABLE" "this seat has no browser store of its own to keep a public profile in. Create it once: $SETUP_CMD"
+    _SITE_OWNER="$(_seat)"; _SITE_BROKERED=0; _SITE_DIR="$(_own_site_dir "$site")"
+    _ensure_profile_dir "$_SITE_DIR"
+    return 0
+  fi
   _require_store "$site"
   _resolve_site "$site" >/dev/null
   if (( _SITE_BROKERED )); then
@@ -374,17 +426,31 @@ _adapter_dirs() {
 # naming the read-only package directory there is how a customer's hand-written
 # adapter came to be in the place an upgrade deletes.
 _adapter_path() {
-  local d
+  local d b; b="$(_site_base "$1")"
   while IFS= read -r d; do
-    [[ -f "$d/$1.json" ]] && { printf '%s\n' "$d/$1.json"; return 0; }
+    [[ -f "$d/$b.json" ]] && { printf '%s\n' "$d/$b.json"; return 0; }
   done < <(_adapter_dirs)
-  printf '%s\n' "$(_adapter_dirs | head -1)/$1.json"
+  printf '%s\n' "$(_adapter_dirs | head -1)/$b.json"
 }
 
 _valid_site() {
   # A site name becomes a directory name. Keep it to a shape that cannot traverse.
+  [[ "$1" == "$PUBLIC_SITE" ]] && return 0
   [[ "$1" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ && "$1" != *..* ]]
 }
+
+# SEVERAL ACCOUNTS ON ONE SITE (DIVE-4943 scope 6). A profile is <site>[_<label>]:
+# `github.com_work` and `github.com_personal` are two logins to github.com. The
+# underscore is the separator because it can never occur in a host name, so the
+# split is unambiguous. Everything that is about the SITE — its adapter, its probe
+# URL, which hosts it may render — keys on the part before it; everything that is
+# about the LOGIN — the directory, the lease, the served browser — keys on the whole
+# name. A profile with no label is exactly what it always was.
+_site_base() {
+  [[ "$1" == "$PUBLIC_SITE" ]] && { printf '%s\n' "$1"; return 0; }
+  printf '%s\n' "${1%%_*}"
+}
+_is_public() { [[ "$1" == "$PUBLIC_SITE" ]]; }
 
 # FAIL CLOSED, and note it audits the SEAT dir, not just the site dir: a correct
 # 0700 site dir inside a group-writable seat dir is still readable by whoever owns
@@ -733,9 +799,10 @@ _site_url() {
   # viewer onto a random subreddit instead of a login page, and `status` probed
   # the same wrong host. One function decides this for auth, serve, status and
   # the viewer, so there is exactly one place it can drift.
-  case "$1" in
-    *.*) echo "https://$1/" ;;
-    *)   echo "https://$1.com/" ;;
+  local b; b="$(_site_base "$1")"
+  case "$b" in
+    *.*) echo "https://$b/" ;;
+    *)   echo "https://$b.com/" ;;
   esac
 }
 _site_logged_out_marker() {
@@ -791,6 +858,7 @@ _auth_status() {
   for d in "$seat_dir"/*/; do
     [[ -d "$d" ]] || continue
     site=$(basename "$d")
+    _is_public "$site" && continue   # the public profile is not a login (DIVE-4943)
     [[ -z "$only" || "$only" == "$site" ]] || continue
     found=1
     _audit "$d" 700
@@ -861,6 +929,28 @@ _chrome_launch_error() {
   return 0
 }
 
+# What a sign-in page looks like when nobody wrote an adapter for the site: a
+# password input, or a form that posts to a login, sign-in, session or auth path.
+# Deliberately NOT the words "Sign in" — that string is on plenty of logged-in pages.
+GENERIC_SIGNIN_MARKER='type=["'"'"']?password|autocomplete=["'"'"']?current-password|<form[^>]*action=["'"'"'][^"'"'"']*(log-?in|sign-?in|sign_in|/session|/auth)'
+GENERIC_SIGNIN_URL='[/.](log-?in|sign-?in|signin|sign_in|auth|sso|session|account/login|accounts/login)([/?#.]|$)'
+
+# _signin_guard <html-file> [<final-url>] — the render itself, re-checked, for a
+# site whose login no adapter confirmed. The probe looked at the site's front page;
+# the page the agent asked for can still redirect to a sign-in, and handing that
+# back as evidence is the one thing the guard exists to stop.
+_signin_guard() {
+  (( _GENERIC_UNCONFIRMED )) || return 0
+  local f="$1" u="${2:-}"
+  if [[ -n "$u" ]] && grep -qiE "$GENERIC_SIGNIN_URL" <<<"$u"; then
+    die "$E_COLD" "the page redirected to a sign-in ($u). Refusing rather than handing back the sign-in page as if it were the page you asked for; no evidence was written. If this account should be signed in, a person logs in again: 5dive browser auth $_PG_SITE"
+  fi
+  if [[ -s "$f" ]] && grep -qiE "$GENERIC_SIGNIN_MARKER" "$f"; then
+    die "$E_COLD" "the page that came back is a sign-in form, not the page you asked for. Refusing; no evidence was written. If this account should be signed in, a person logs in again: 5dive browser auth $_PG_SITE"
+  fi
+  return 0
+}
+
 _probe() {
   local site="$1" dir="$2"
   # SERVED MEANS WE CANNOT LOOK, AND SAYING SO IS THE WHOLE FIX. Chrome allows one
@@ -928,6 +1018,15 @@ _probe() {
   # it always did.
   local positive; positive=$(_site_logged_in_marker "$site")
   local challenge; challenge=$(_site_challenge_marker "$site")
+  # THE GENERIC CHECK (DIVE-4943 scope 2), and only for a page verb's gate: with no
+  # adapter, the one thing we can still recognise is a page that is VISIBLY a
+  # sign-in — a password field, or a form that posts to a login/session/auth path.
+  # `status` keeps its UNKNOWN (the tile's memory must not claim a login nobody
+  # confirmed); only the gate in front of a render reads this.
+  local generic=0
+  if [[ -z "$marker" && -z "$positive" && "${_PROBE_GENERIC:-0}" == 1 ]]; then
+    generic=1; marker="$GENERIC_SIGNIN_MARKER"
+  fi
   local dom; dom=$(mktemp) || { echo "UNKNOWN (probe did not load)"; return 0; }
   local total="${FIVEDIVE_BROWSER_PROBE_WAIT_MS:-8000}" poll="${FIVEDIVE_BROWSER_PROBE_POLL_MS:-400}"
   [[ "$total" =~ ^[0-9]{1,7}$ ]] || total=8000
@@ -1022,6 +1121,10 @@ _probe() {
   # cannot tell". Quiet (rc 0) like every other UNKNOWN: a state we cannot read
   # must not page a person. `run` still refuses on it — it accepts only
   # `authenticated*` — which is the fail-closed half.
+  if (( generic )); then
+    echo "unconfirmed (no adapter for $site; checked $(date -u +%Y-%m-%dT%H:%MZ))"
+    return 0
+  fi
   if [[ -z "$marker" && -z "$positive" ]]; then
     _stamp "$dir" unknown
     echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $(_adapter_path "$site") with probe.logged_out_when_dom_matches)"
@@ -1054,6 +1157,7 @@ cmd_probe_all() {
     [[ -d "$d" ]] || continue
     found=1
     site=$(basename "$d")
+    _is_public "$site" && continue   # the public profile is not a login (DIVE-4943)
     _audit "$d" 700
     if _serve_running "$d" >/dev/null; then
       printf '  %-20s skipped: served\n' "$site"
@@ -1097,6 +1201,7 @@ cmd_ls() {
   for d in "$(_seat_dir)"/*/; do
     [[ -d "$d" ]] || continue
     site=$(basename "$d")
+    _is_public "$site" && continue   # the public profile is not a login (DIVE-4943)
     printf '  %-20s %s\n' "$site" "$(cat "$d/.5dive-liveness" 2>/dev/null || echo 'never probed')"
   done
   _ls_box_offers
@@ -1954,10 +2059,126 @@ cmd_served() {
   for d in "$(_seat_dir)"/*/; do
     [[ -d "$d" ]] || continue
     site=$(basename "$d")
+    _is_public "$site" && continue   # the public profile is not a login (DIVE-4943)
     _serve_running "$d" >/dev/null || continue
     printf '%s\n' "$site"
   done
   return 0
+}
+
+# --------------------------------------------------------------------- capture
+#
+# DIVE-4929 — BOTH HALVES OF A LOGIN CHECK, ON DISK, IN ONE COMMAND. An adapter's
+# probe.logged_out_when_dom_matches is only trusted once it has been measured on
+# the site's RENDERED signed-out page AND its signed-in page (README, "Shipped
+# adapters"). Four sites have that. For every other site the measurement was a
+# hand-run headless chrome per half, which is why nobody ran it. `5dive reflex
+# login-marker` (the 5dive CLI, DIVE-4928) drafts the marker from exactly these
+# two files; this verb makes them.
+#
+#   signed-out.html  the probe URL in a THROWAWAY profile — the probe's own
+#   signed-out-2.html command (headless, --virtual-time-budget=8000), so it is the
+#                    page the probe will see when this login expires. TWICE, in
+#                    two fresh profiles: a sign-in page carries per-render tokens
+#                    (GitHub's required_field_<hex> honeypots), and only a token
+#                    both renders share can be a marker. reflex reads both.
+#   signed-in.html   the same URL in THIS login's profile: through the session
+#                    daemon when the site is served (a second chrome cannot open a
+#                    profile the served one holds), cold otherwise.
+#
+# THE OWNER'S ACT, NOT A BROKERED ONE. The signed-in render is the account's own
+# page — messages, names, whatever the probe URL shows — written to a file. A
+# seat using the box login may `read` a page only once the site probes
+# `authenticated`; a capture exists precisely for sites that CANNOT be classified
+# yet, so letting a brokered seat run it would hand out the page the page verbs
+# withhold. The files are 0600 in a 0700 directory under the owner's home.
+#
+# NO VERDICT. Capture classifies nothing and writes no adapter; it prints where
+# the files are and the command that reads them.
+cmd_capture() {
+  local site="" url="" out=""
+  while (($#)); do
+    case "$1" in
+      -h|--help) usage; return 0 ;;
+      --url=*) url="${1#*=}" ;;
+      --out=*) out="${1#*=}" ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) [[ -z "$site" ]] || die "$E_USAGE" "one site at a time"; site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser capture linkedin.com [--url=https://www.linkedin.com/feed/]"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  _open_site "$site" --no-broker capture "a capture writes this login's signed-in page to a file, which only the login's owner may do."
+  local dir="$_SITE_DIR"
+  [[ -n "$url" ]] || url="$(_site_url "$site")"
+  [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || die "$E_USAGE" "--url must be an http(s) URL"
+  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box"
+  local served=0
+  if _serve_running "$dir" >/dev/null; then
+    _daemon_live "$dir" || die "$E_UNAVAILABLE" "$site is served and its browser holds the profile, but no session daemon answers to render through. Stop it first:  5dive browser serve $site --stop"
+    command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is needed to talk to the served session"
+    served=1
+  fi
+  [[ -n "$out" ]] || out="${HOME:?}/.5dive/browser-captures/$site/$(date -u +%Y%m%dT%H%M%SZ)"
+  ( umask 077; mkdir -p "$out" ) || die "$E_UNAVAILABLE" "cannot create $out"
+  chmod 700 "$out" 2>/dev/null || true
+  [[ -z "$(ls -A "$out" 2>/dev/null)" ]] || die "$E_USAGE" "$out is not empty; a capture never overwrites one"
+  local cold orc=0 k f
+  for k in 1 2; do
+    f="$out/signed-out.html"; (( k == 2 )) && f="$out/signed-out-2.html"
+    cold=$(mktemp -d) || die "$E_UNAVAILABLE" "mktemp failed"
+    ( umask 077
+      "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$cold" \
+        --virtual-time-budget=8000 --dump-dom "$url" >"$f" 2>/dev/null ) || orc=$?
+    rm -rf "$cold"
+    (( orc == 0 )) || break
+  done
+  local irc how
+  if (( served )); then
+    how=daemon
+    ( umask 077
+      _daemon_call "$dir" "$(jq -nc --arg u "$url" --arg o "$(_site_logged_out_marker "$site")" \
+            --arg i "$(_site_logged_in_marker "$site")" --arg c "$(_site_challenge_marker "$site")" \
+            --argjson w "${FIVEDIVE_BROWSER_PROBE_WAIT_MS:-8000}" \
+            '{op:"probe", url:$u, wait:$w, until:{logged_out:$o, logged_in:$i, challenge:$c}}')" \
+        >"$out/signed-in.html" 2>/dev/null )
+    irc=$?
+  else
+    how=cold
+    ( umask 077
+      "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
+        --virtual-time-budget=8000 --dump-dom "$url" >"$out/signed-in.html" 2>/dev/null )
+    irc=$?
+  fi
+  chmod 600 "$out"/*.html 2>/dev/null || true
+  local ob ob2 ib; ob=$(wc -c <"$out/signed-out.html" 2>/dev/null || echo 0); ob2=$(wc -c <"$out/signed-out-2.html" 2>/dev/null || echo 0)
+  ib=$(wc -c <"$out/signed-in.html" 2>/dev/null || echo 0)
+  _audit_row "$dir" capture "$url"
+  if (( orc != 0 || ob == 0 || ob2 == 0 || irc != 0 || ib == 0 )); then
+    die "$E_UNAVAILABLE" "the capture is incomplete (signed-out: rc=$orc, ${ob}+${ob2} bytes; signed-in via $how: rc=$irc, ${ib} bytes) — kept in $out for a look; nothing downstream should read it"
+  fi
+  # Two warnings, never refusals: the files are still what they are, and the
+  # reader (reflex) makes its own call. But the most likely wrong capture is a
+  # profile that is not logged in at all, and that one should be said out loud.
+  local ch; ch=$(_site_challenge_marker "$site")
+  grep -qiE "$ch" "$out/signed-out.html" && echo "warning: the signed-out render looks like a challenge page, not a sign-in page" >&2
+  grep -qiE "$ch" "$out/signed-in.html" && echo "warning: the signed-in render looks like a challenge page — clear it in the viewer first" >&2
+  # Byte equality misses the real case: a sign-in page carries a fresh CSRF token
+  # per render, so two signed-out renders never match byte for byte. The TITLE is
+  # what a person would compare (measured on github.com: "Sign in to GitHub" twice
+  # on a profile nobody had logged into, 61854 bytes each, different bytes).
+  local to ti
+  to=$({ grep -oiE '<title[^>]*>[^<]{1,200}' "$out/signed-out.html" 2>/dev/null || true; } | head -n1)
+  ti=$({ grep -oiE '<title[^>]*>[^<]{1,200}' "$out/signed-in.html" 2>/dev/null || true; } | head -n1)
+  if cmp -s "$out/signed-out.html" "$out/signed-in.html" || [[ -n "$to" && "$to" == "$ti" ]]; then
+    echo "warning: both renders show the same page${to:+ (${to#*>})} — this profile may not be logged in (5dive browser auth $site)" >&2
+  fi
+  local a; a="$(_adapter_path "$site")"
+  printf 'captured %s (%s)\n  signed out: %s  (%s bytes, throwaway profile)\n              %s  (%s bytes, a second throwaway profile)\n  signed in:  %s  (%s bytes, %s)\n' \
+    "$site" "$url" "$out/signed-out.html" "$ob" "$out/signed-out-2.html" "$ob2" "$out/signed-in.html" "$ib" \
+    "$([[ "$how" == daemon ]] && echo "the served session" || echo "this login's profile")"
+  printf 'draft its login check (shadow; writes nothing):\n  sudo 5dive reflex login-marker %s --url=%s --logged-out=%s --logged-out=%s --logged-in=%s%s\n' \
+    "$site" "$url" "$out/signed-out.html" "$out/signed-out-2.html" "$out/signed-in.html" "$([[ -f "$a" ]] && printf ' --compare=%s' "$a")"
 }
 
 # ---------------------------------------------------------------------- forget
@@ -2814,7 +3035,9 @@ _viewer_live() {
 # A subdomain passes: the login lives on the registrable name (app.5dive.com is
 # reached with 5dive.com's cookies) and that is consumer 1's whole shape.
 _shot_host_ok() {  # _shot_host_ok <site> <host>
-  local base="$1" host="$2"
+  local base host="$2"
+  _is_public "$1" && return 0   # the public profile renders any site; it holds no login to misattribute
+  base="$(_site_base "$1")"
   [[ "$base" == *.* ]] || base="$base.com"
   [[ "$host" == "$base" || "$host" == *".$base" ]]
 }
@@ -2833,9 +3056,10 @@ _shot_host_ok() {  # _shot_host_ok <site> <host>
 #
 # Publishes _PG_DIR (the profile dir) and _PG_CHROME (the binary), and may arm
 # the EXIT trap that puts back a serve it stopped.
-_PG_DIR=""; _PG_CHROME=""; _PG_WARM=0
+_PG_DIR=""; _PG_CHROME=""; _PG_WARM=0; _PG_SITE=""
 _page_open() {  # _page_open <site> <url>
   local site="$1" url="$2"
+  _PG_SITE="$site"
   # SCHEME AND HOST, before the store is even opened. file:// and chrome:// are
   # not pages of a site and have no business being rendered by a verb whose whole
   # contract is "a page of the site you logged into".
@@ -2916,11 +3140,22 @@ _page_open() {  # _page_open <site> <url>
 # of the sign-in page handed over as the artifact. Lifted out of _page_open under
 # DIVE-4621 because the warm path reaches it by a different road, and a second
 # copy of a positive list is a second place for a state to fall through.
+_GENERIC_UNCONFIRMED=0
 _page_open_probe() {
   local site="$1" dir="$2"
-  local state; state=$(_probe "$site" "$dir")
+  # THE PUBLIC PROFILE HAS NO LOGIN TO PROBE (DIVE-4943 scope 5). Asking it "are
+  # you signed in" has no answer and would refuse every page on the web.
+  _is_public "$site" && return 0
+  local state; state=$(_PROBE_GENERIC=1 _probe "$site" "$dir")
   case "$state" in
     authenticated*) : ;;
+    unconfirmed*)
+      # A CONNECTED SITE WITH NO ADAPTER (DIVE-4943 scope 2). The page was not a
+      # sign-in form and not a challenge, so it proceeds — and says, every time,
+      # that nothing here confirmed the login. The render itself is checked again
+      # for a sign-in form before any evidence is written (_signin_guard).
+      _GENERIC_UNCONFIRMED=1
+      printf '%s: %s — no adapter confirmed the %s login; the generic check found no sign-in form or challenge, so this proceeds.\n' "$PROG" "$state" "$site" >&2 ;;
     BROKEN*)
       die "$E_UNAVAILABLE" "$state. Nothing was rendered and nothing was read: a browser that will not start is a box fault, not a verdict about the $site session." ;;
     CHALLENGE*)
@@ -3188,6 +3423,7 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
     fi
   fi
 
+  _signin_guard "$stage/page.html"
   _derive_capture "$stage" "$url" "$chrome" "$capture"
 
   install -m 00600 "$stage/page.html" "$out/page.html" || die "$E_UNAVAILABLE" "cannot install page.html in $out"
@@ -3354,6 +3590,7 @@ cmd_snapshot() {
   fi
 
   [[ -s "$stage/page.html" ]] || die "$E_UNAVAILABLE" "the capture produced no document; no evidence files were written"
+  _signin_guard "$stage/page.html" "$(jq -r '.url // ""' <<<"$payload" 2>/dev/null)"
 
   # The SAME derivation `read` uses, over the bytes the walk above came from.
   _derive_capture "$stage" "$url" "$_PG_CHROME" snapshot
@@ -3403,6 +3640,323 @@ cmd_snapshot() {
   (( shot )) && [[ -s "$out/page.png" ]] && printf '    page.png        the same tab, the same instant\n'
   printf '%s: one browser cycle for all of it — quote a ref straight into `run`.\n' "$PROG" >&2
   return 0
+}
+
+# ======================================================= act (DIVE-4943)
+#
+# THE BROWSER COULD READ AND COULD NOT ACT. The only acting verb was `run`, which
+# executes an adapter's recipe, and every shipped adapter has `actions: {}` — so
+# no agent on any box could click or type anything. `act` is the generic half:
+# the agent reads refs off `snapshot --interactive`, and hands back a short list
+# of steps in the SAME fixed vocabulary `run` uses (goto fill click wait_for
+# select press), executed by the SAME executors, under the same lease.
+#
+# WHAT IS THE SAME AS `run`, on purpose: the lease, the login gate, the step
+# vocabulary re-validated by the executor, the lease re-read before every step,
+# and a verdict that is a RE-READ rather than the executor's word — here the page
+# as the steps left it, graded against --expect.
+#
+# WHAT IS DIFFERENT: the steps come from the agent, not a reviewed file. So four
+# kinds of step are the OWNER's to allow — paying, publishing, sending,
+# deleting — and the executor stops in front of one (lib/aria.cjs stepRisk,
+# checked on the live element, not on how the agent spelled it) and exits 73.
+# The refusal writes the ask down and names it; `sudo 5dive browser approve <id>`
+# is the owner's yes, and `--approved=<id>` spends it, once, on exactly the steps
+# it was asked about.
+#
+# ONE CALL, ONE PAGE. The steps of one `act` run in one tab under one lease. With
+# a served (warm) browser the tab also survives between calls, so `act` with no
+# URL continues on the page the last call left; without one, the next call starts
+# from a fresh load.
+ACT_VOCAB='goto fill click wait_for select press'
+ACT_MAX_STEPS=40
+
+_approval_dir() {  # _approval_dir [<seat>] — where a seat's pending asks and grants live
+  local seat="${1:-$(_seat)}" home
+  if [[ -n "${FIVEDIVE_BROWSER_APPROVAL_DIR:-}" ]]; then printf '%s\n' "$FIVEDIVE_BROWSER_APPROVAL_DIR"; return 0; fi
+  home="$(getent passwd "$seat" 2>/dev/null | cut -d: -f6)"
+  [[ -n "$home" ]] || return 1
+  printf '%s\n' "$home/.5dive/browser-approvals"
+}
+# WHO MAY SAY YES. Root by default: the box owner's surfaces (the dashboard, the
+# owner's own shell) reach the box as root, and an agent seat does not write a
+# root-owned file by accident. It is not a defence against an agent with sudo
+# that decides to forge its owner's consent — nothing inside the box is — and it
+# is not pretending to be one. The override exists for the harness, which has
+# one uid and no root.
+_grant_uid() { printf '%s\n' "${FIVEDIVE_BROWSER_GRANT_UID:-0}"; }
+
+_act_hash() {  # _act_hash <site> <steps-json> — what an approval is bound to
+  printf '%s\n%s\n' "$1" "$(jq -cS . <<<"$2")" | sha256sum | cut -d' ' -f1
+}
+
+_act_grant_ok() {  # _act_grant_ok <id> <hash> -> 0 if a live grant for exactly these steps exists
+  local id="$1" want="$2" d g
+  d="$(_approval_dir)" || return 1
+  g="$d/$id.granted"
+  [[ -f "$g" && ! -L "$g" ]] || return 1
+  [[ "$(stat -c %u "$g")" == "$(_grant_uid)" ]] || return 1
+  [[ "$(jq -r '.hash // ""' "$g" 2>/dev/null)" == "$want" ]] || return 2
+  local exp; exp="$(jq -r '.expires_at // 0' "$g" 2>/dev/null)"
+  [[ "$exp" =~ ^[0-9]+$ ]] && (( exp > $(date +%s) )) || return 3
+  return 0
+}
+
+cmd_act() {
+  local site="" url="" steps="" expect="" approved="" out="" json=0 wait="no" settle="" shot=1
+  while (($#)); do
+    case "$1" in
+      --steps=*)    steps="${1#*=}" ;;
+      --steps-file=*) [[ -r "${1#*=}" ]] || die "$E_USAGE" "cannot read ${1#*=}"; steps="$(cat -- "${1#*=}")" ;;
+      --expect=*)   expect="${1#*=}" ;;
+      --approved=*) approved="${1#*=}" ;;
+      --out=*)      out="${1#*=}" ;;
+      --json)       json=1 ;;
+      --no-shot)    shot=0 ;;
+      --settle=*)   settle="${1#*=}" ;;
+      --wait)       wait="$LEASE_WAIT_DEFAULT" ;;
+      --wait=*)     wait="${1#*=}" ;;
+      -h|--help)
+        printf '%s act [<site>] <url> --steps=<json> [--expect=<regex>] [--approved=<id>] [--out=<dir>] [--json]\n' "$PROG"
+        printf '  <url> may be omitted to continue on the page a served browser is already on.\n'
+        return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac; shift
+  done
+  [[ -n "$site" && -n "$steps" ]] || die "$E_USAGE" "usage: 5dive browser act <url> --steps='[{\"op\":\"click\",\"selector\":\"ref=button/Star\"}]'"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  [[ -z "$settle" || "$settle" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--settle takes milliseconds; got: $settle"
+  [[ -z "$approved" || "$approved" =~ ^[a-z0-9._-]+-[0-9a-f]{12}$ ]] || die "$E_USAGE" "--approved takes the id a refusal printed; got: $approved"
+  command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to read the steps"
+
+  # THE STEPS, VALIDATED HERE AND AGAIN BY THE EXECUTOR. `upload` is not in the
+  # vocabulary for `act`: it takes a path on this box, and an agent choosing which
+  # of the box's files leave it for a site is not a click.
+  jq -e 'type=="array" and length>0' <<<"$steps" >/dev/null 2>&1 \
+    || die "$E_USAGE" "--steps is a JSON array of steps, e.g. [{\"op\":\"click\",\"selector\":\"ref=button/Star\"}]"
+  local n; n=$(jq 'length' <<<"$steps")
+  (( n <= ACT_MAX_STEPS )) || die "$E_USAGE" "$n steps is more than one act ($ACT_MAX_STEPS). Split it: a long script run blind is the shape that ends up somewhere nobody looked."
+  local bad; bad=$(jq -r --arg v " $ACT_VOCAB " '[.[] | (.op // "") as $o | select(($v|contains(" "+$o+" "))|not) | $o] | first // empty' <<<"$steps")
+  [[ -z "$bad" ]] || die "$E_USAGE" "'$bad' is not an act step. The vocabulary is: $ACT_VOCAB"
+  if [[ -n "$url" ]]; then
+    steps=$(jq -c --arg u "$url" '[{op:"goto", url:$u}] + .' <<<"$steps")
+  fi
+  # Every page a goto opens must be one this profile may render — the same scoping
+  # rule as `shot`, so a login cannot be walked to another site's page by a step.
+  local g host
+  while IFS= read -r g; do
+    [[ -n "$g" ]] || continue
+    [[ "$g" =~ ^https?://[^/]+ ]] || die "$E_USAGE" "act opens only http(s) pages; got: $g"
+    host="${g#*://}"; host="${host%%/*}"; host="${host%%\?*}"; host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
+    _shot_host_ok "$site" "$host" || die "$E_USAGE" "$g is not a page of '$site' (its host is $host) — a login is scoped to its own site. Give act the URL on its own and it picks the right profile."
+  done < <(jq -r '.[] | select(.op=="goto") | .url // ""' <<<"$steps")
+
+  local hash; hash="$(_act_hash "$site" "$steps")"
+  local is_approved=false
+  if [[ -n "$approved" ]]; then
+    local grc=0; _act_grant_ok "$approved" "$hash" || grc=$?
+    case "$grc" in
+      0) is_approved=true ;;
+      2) die "$E_NEEDS_OWNER" "approval $approved was given for different steps. An owner's yes covers exactly what they were shown; ask again for these." ;;
+      3) die "$E_NEEDS_OWNER" "approval $approved has expired (a yes lasts $((APPROVAL_TTL/60)) minutes). Ask again." ;;
+      *) die "$E_NEEDS_OWNER" "approval $approved has not been given. The owner approves it with: sudo 5dive browser approve $approved" ;;
+    esac
+  fi
+
+  # OPEN THE PAGE THROUGH THE ONE GUARDED ROAD. With a URL that is _page_open —
+  # lease, host scope, login gate. Without one, the only page there is to act on
+  # is the one a served browser is holding, so a live session is required.
+  _PG_WARM=1; _PG_PURPOSE="act"
+  _open_site "$site"
+  if [[ -n "$url" ]]; then
+    _lease_take "$site" "$_SITE_DIR" "act" "$wait"
+    trap '_lease_and_serve_release' EXIT
+    _page_open "$site" "$url"
+  else
+    _daemon_live "$_SITE_DIR" || die "$E_USAGE" "no URL, and no served $site browser holding a page to continue on. Give act the URL to start from."
+    _lease_take "$site" "$_SITE_DIR" "act" "$wait"
+    trap '_lease_and_serve_release' EXIT
+    _PG_SITE="$site"; _PG_DIR="$_SITE_DIR"
+    _page_open_probe "$site" "$_SITE_DIR"
+  fi
+
+  out="$(_read_output_dir "$site" "$out" "$_PG_DIR")" || exit $?
+  local stage; stage="$(mktemp -d /tmp/5dive-browser-read.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the act's re-read"
+  _READ_STAGE="$stage"; trap '_read_cleanup' EXIT
+  local errf="$stage/exec.err" drc=0 payload="" plan
+  if _daemon_live "$_PG_DIR"; then
+    plan=$(jq -nc --argjson s "$steps" --argjson a "$is_approved" --argjson sh "$shot" \
+        --argjson l "$(_daemon_lease_json)" --argjson st "$(_settle_json "$settle")" \
+        '{op:"plan", steps:$s, args:{}, literal:true, guard:true, approved:$a, report:{shot:($sh==1)}} + $st + $l')
+    payload=$(_daemon_call "$_PG_DIR" "$plan" 2>"$errf") || drc=$?
+    local rep; rep=$(grep -F '"act_report":true' <<<"$payload" | tail -1)
+    if [[ -n "$rep" ]]; then
+      jq -r '.html_inline // ""' <<<"$rep" > "$stage/page.html"
+      jq -c '{url, title}' <<<"$rep" > "$stage/after.json"
+      if (( shot )); then jq -r '.png_b64 // ""' <<<"$rep" | base64 -d > "$stage/page.png" 2>/dev/null || :; fi
+    fi
+  else
+    local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
+    [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver — act runs through the same executor as run."
+    local chrome; chrome=$(command -v "$_PG_CHROME" 2>/dev/null || printf '%s' "$_PG_CHROME")
+    local png=""; (( shot )) && png="$stage/page.png"
+    plan=$(jq -nc --arg p "$_PG_DIR" --argjson s "$steps" --argjson a "$is_approved" \
+        --arg h "$stage/page.html" --arg m "$stage/after.json" --arg sh "$png" \
+        '{profile:$p, steps:$s, args:{}, literal:true, guard:true, approved:$a,
+          report:{html:$h, meta:$m, shot:(if $sh=="" then null else $sh end)}}')
+    FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
+      FIVEDIVE_BROWSER_RUN_SETTLE_MS="${settle:-${FIVEDIVE_BROWSER_RUN_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}" \
+      FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
+      FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
+      "$driver" <<<"$plan" >/dev/null 2>"$errf" || drc=$?
+  fi
+  cat "$errf" >&2
+  _shot_restore
+  _lease_release
+
+  if (( drc == 70 )); then
+    die "$E_UNAVAILABLE" "the executor refused before it ran a single step, so nothing happened on the page (its own reason is above)."
+  fi
+
+  local f
+  for f in page.html page.png after.json; do
+    [[ -s "$stage/$f" ]] && install -m 00600 "$stage/$f" "$out/$f"
+  done
+  local final title
+  final=$(jq -r '.url // ""' "$stage/after.json" 2>/dev/null)
+  title=$(jq -r '.title // ""' "$stage/after.json" 2>/dev/null)
+
+  if (( drc == E_NEEDS_OWNER )); then
+    local why; why=$(grep -o '5dive-needs-owner: {.*}' "$errf" | tail -1 | sed 's/^5dive-needs-owner: //')
+    [[ -n "$why" ]] || why='{}'
+    local cls label step
+    cls=$(jq -r '.cls // "act"' <<<"$why"); label=$(jq -r '.label // ""' <<<"$why"); step=$(jq -r '.step // "?"' <<<"$why")
+    local verb; case "$cls" in pay) verb="pay or place an order" ;; publish) verb="post or publish" ;; send) verb="send a message" ;; delete) verb="delete something" ;; *) verb="do something only the owner can allow" ;; esac
+    local id="" ad=""
+    if ad="$(_approval_dir)" && mkdir -p "$ad" && chmod 700 "$ad"; then
+      id="$(_seat)-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+      jq -n --arg id "$id" --arg seat "$(_seat)" --arg site "$site" --arg h "$hash" --argjson s "$steps" \
+           --arg cls "$cls" --arg label "$label" --arg step "$step" --arg page "$final" --arg shot "$out/page.png" \
+           --argjson at "$(date +%s)" \
+           '{id:$id, seat:$seat, site:$site, hash:$h, steps:$s, class:$cls, label:$label, step:$step, page:$page, screenshot:$shot, asked_at:$at}' \
+           > "$ad/$id.json" || id=""
+    fi
+    printf '%s: STOPPED before step %s — it would %s ("%s") on %s. That is the owner'"'"'s call, not the agent'"'"'s.\n' "$PROG" "$step" "$verb" "$label" "$(_site_base "$site")" >&2
+    printf '  Ask the owner, with the screenshot: "I am about to %s on %s: \"%s\". OK?"\n' "$verb" "$(_site_base "$site")" "$label" >&2
+    [[ -s "$out/page.png" ]] && printf '  screenshot: %s/page.png (the page right before that step)\n' "$out" >&2
+    if [[ -n "$id" ]]; then
+      printf '  When the owner says yes: sudo 5dive browser approve %s   — then re-run this exact act with --approved=%s\n' "$id" "$id" >&2
+    else
+      printf '  (the ask could not be recorded for an approval id on this seat; nothing was approved)\n' >&2
+    fi
+    if (( json )); then
+      jq -nc --arg id "$id" --arg cls "$cls" --arg label "$label" --arg step "$step" --arg page "$final" --arg o "$out" \
+        '{verdict:"needs_owner", approval:$id, class:$cls, label:$label, step:($step|tonumber? // $step), page:$page, artifacts:$o}'
+    fi
+    exit "$E_NEEDS_OWNER"
+  fi
+
+  # A GRANT IS SPENT ONCE, whatever the steps then did: it was a yes to one try.
+  if [[ "$is_approved" == true ]]; then
+    local gd; gd="$(_approval_dir)" && rm -f -- "${gd:?}/${approved:?}.granted" "${gd:?}/${approved:?}.json" 2>/dev/null
+  fi
+
+  _signin_guard "$stage/page.html" "$final"
+
+  local verdict rc
+  if [[ -n "$expect" ]]; then
+    if [[ -s "$out/page.html" ]] && grep -qiE -- "$expect" "$out/page.html"; then verdict=verified; rc=0
+    else verdict=not_verified; rc=1; fi
+  else
+    verdict=$([[ "$drc" == 0 ]] && echo executed || echo step_failed); rc=$(( drc == 0 ? 0 : 1 ))
+  fi
+  if (( json )); then
+    jq -nc --arg v "$verdict" --arg u "$final" --arg t "$title" --arg o "$out" --argjson d "$drc" \
+      '{verdict:$v, url:$u, title:$t, executor_rc:$d, artifacts:$o}'
+    return "$rc"
+  fi
+  printf '%s\n  %s\n  %s\n' "$title" "$final" "$out"
+  case "$verdict" in
+    verified)     printf 'verified: the page after the steps matches --expect\n' ;;
+    not_verified) printf '%s: NOT VERIFIED — the executor exited %s, but the page after the steps does not match --expect. Look at %s/page.png before retrying: if it went through and we misread, a retry does it twice.\n' "$PROG" "$drc" "$out" >&2 ;;
+    executed)     printf 'done: every step ran. Nothing re-graded it (no --expect) — read %s/page.png or snapshot the page before you report success.\n' "$out" ;;
+    step_failed)  printf '%s: a step failed (the executor exited %s). Some steps may have run; look at %s/page.png before retrying.\n' "$PROG" "$drc" "$out" >&2 ;;
+  esac
+  return "$rc"
+}
+
+# THE OWNER'S YES (DIVE-4943). Root only — see _grant_uid. It prints what is being
+# approved before it approves it, and a grant is bound to the exact steps, expires,
+# and is spent by one run.
+_approval_request_files() {
+  if [[ -n "${FIVEDIVE_BROWSER_APPROVAL_DIR:-}" ]]; then ls -1 "$FIVEDIVE_BROWSER_APPROVAL_DIR"/*.json 2>/dev/null; return 0; fi
+  local h
+  while IFS=: read -r _ _ _ _ _ h _; do
+    [[ -d "$h/.5dive/browser-approvals" ]] && ls -1 "$h/.5dive/browser-approvals"/*.json 2>/dev/null
+  done < /etc/passwd
+  return 0
+}
+cmd_approvals() {
+  [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner lists pending asks: sudo 5dive browser approvals"
+  local f found=0
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    found=1
+    jq -r '"\(.id)\t\(.site)\t\(.class)\t\"\(.label)\"\tstep \(.step)\t\(.page)"' "$f" 2>/dev/null
+  done < <(_approval_request_files)
+  (( found )) || printf 'no pending asks\n'
+}
+cmd_approve() {
+  local id="${1:-}" deny=0
+  [[ "${2:-}" == --deny ]] && deny=1
+  [[ "$id" =~ ^[a-z0-9._-]+-[0-9a-f]{12}$ ]] || die "$E_USAGE" "usage: sudo 5dive browser approve <id> [--deny]  (the id an act's refusal printed)"
+  [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner approves: sudo 5dive browser approve $id"
+  local seat="${id%-*}" d
+  d="$(_approval_dir "$seat")" || die "$E_USAGE" "no seat '$seat' on this box"
+  local req="$d/$id.json"
+  [[ -f "$req" && ! -L "$req" ]] || die "$E_USAGE" "no pending ask $id (it was already spent, denied, or never asked)"
+  jq -r '"\(.seat) wants to \(.class) on \(.site): \"\(.label)\" (step \(.step) of \(.steps|length))\n  page: \(.page)\n  screenshot: \(.screenshot)"' "$req"
+  if (( deny )); then rm -f -- "${req:?}"; printf 'denied: %s\n' "$id"; return 0; fi
+  local g="$d/$id.granted" tmp
+  tmp="$(mktemp "$d/.grant.XXXXXX")" || die "$E_UNAVAILABLE" "cannot write the grant in $d"
+  if jq -n --arg id "$id" --arg h "$(jq -r .hash "$req")" --argjson exp "$(( $(date +%s) + APPROVAL_TTL ))" \
+       --arg by "${SUDO_USER:-$(id -un)}" '{id:$id, hash:$h, expires_at:$exp, approved_by:$by}' > "$tmp" \
+     && chmod 0644 "$tmp" && mv -f -- "$tmp" "$g"; then
+    printf 'approved: %s — good for %s minutes, for exactly those steps, once.\n' "$id" "$((APPROVAL_TTL/60))"
+  else
+    rm -f -- "${tmp:?}"; die "$E_UNAVAILABLE" "cannot write the grant in $d"
+  fi
+}
+
+# WHICH PROFILE A URL RUNS IN (DIVE-4943 scopes 5 and 6). A page verb given a URL
+# instead of a profile name resolves it here, the one place the rule lives:
+#   no connected account for the host  -> the public profile (nothing logged in)
+#   exactly one                         -> that login
+#   several (github.com_work, github.com_personal) -> REFUSED, naming them: which
+#     account acts is the owner's to say, and a guess posts as the wrong person.
+_route_site() {  # _route_site <url> -> the profile name
+  local url="$1" host
+  host="${url#*://}"; host="${host%%/*}"; host="${host%%\?*}"; host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
+  local -a hits=()
+  local d s
+  for d in "$(_seat_dir)"/*/; do
+    [[ -d "$d" ]] || continue
+    s="$(basename "$d")"; _is_public "$s" && continue
+    _shot_host_ok "$s" "$host" && hits+=("$s")
+  done
+  local o
+  for o in "$(_rv_dir "$BOX_SEAT")"/*.offered; do
+    [[ -f "$o" ]] || continue
+    s="$(basename "$o" .offered)"
+    [[ " ${hits[*]-} " == *" $s "* ]] && continue
+    _shot_host_ok "$s" "$host" && hits+=("$s")
+  done
+  case "${#hits[@]}" in
+    0) printf '%s\n' "$PUBLIC_SITE" ;;
+    1) printf '%s\n' "${hits[0]}" ;;
+    *) die "$E_USAGE" "$host has ${#hits[@]} connected accounts: ${hits[*]}. Which one acts is the owner's call — ask them, then name it: 5dive browser <verb> <profile> $url" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -3689,7 +4243,7 @@ if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   case "${1:-}" in
     # `adblock` joins `setup` here: it writes the MACHINE-WIDE chrome policy
     # file, which is root's. Dropping to the seat would turn it into a refusal.
-    setup|adblock|-h|--help|help|"") ;;
+    setup|adblock|approve|approvals|-h|--help|help|"") ;;
     *)
       # DIVE-4813: usually the caller, and for a brokered `serve` the owner.
       _drop="$(_root_drop_target "${SUDO_USER}" "$@")"
@@ -3705,6 +4259,18 @@ if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   esac
 fi
 # <<< DIVE-4348
+
+# A URL WHERE A PROFILE NAME GOES (DIVE-4943 scope 5). `read https://…` picks its
+# own profile — the host's one login, or the public profile when there is none —
+# so an agent on a box with nothing connected can still use the browser at all.
+case "${1:-}" in
+  read|links|shot|snapshot|tree|act)
+    if [[ "${2:-}" =~ ^https?:// ]]; then
+      _v="$1"; _u="$2"; shift 2
+      _r="$(_route_site "$_u")" || exit $?
+      set -- "$_v" "$_r" "$_u" "$@"
+    fi ;;
+esac
 
 case "${1:-}" in
   -h|--help|help|"") usage ;;
@@ -3725,8 +4291,12 @@ case "${1:-}" in
   served) shift; cmd_served "$@" ;;
   forget) shift; cmd_forget "$@" ;;
   shot)  shift; cmd_shot  "$@" ;;
+  capture) shift; cmd_capture "$@" ;;
   read)  shift; cmd_read  "$@" ;;
   snapshot) shift; cmd_snapshot "$@" ;;
+  act)   shift; cmd_act "$@" ;;
+  approve) shift; cmd_approve "$@" ;;
+  approvals) shift; cmd_approvals "$@" ;;
   # Not in usage: the session daemon re-enters here as the profile's owner.
   _broker-lease) shift; cmd_broker_lease "$@" ;;
   _broker-audit) shift; cmd_broker_audit "$@" ;;

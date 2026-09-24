@@ -370,6 +370,21 @@ async function snapshotMode(plan) {
   process.exit(0);
 }
 
+// `act`'s re-read (DIVE-4943): the page as the steps left it, to the files
+// bin/browser named. Never fatal — a missing re-read is reported by bin/browser
+// as "not verified", which is the honest answer, and must not turn a step that
+// DID run into "nothing ran".
+async function writeReport(page, report) {
+  try {
+    const after = await aria.pageAfter(page, { settleMs: RUN_SETTLE_MS });
+    if (report.html) fs.writeFileSync(report.html, after.html || '', { mode: 0o600 });
+    if (report.meta) fs.writeFileSync(report.meta, JSON.stringify({ url: after.url, title: after.title }), { mode: 0o600 });
+    if (report.shot) await page.screenshot({ path: report.shot });
+  } catch (e) {
+    process.stderr.write(`${PROG}: the steps ran but the page could not be re-read afterwards: ${e.message}\n`);
+  }
+}
+
 async function main() {
   const raw = fs.readFileSync(0, 'utf8');
   let plan;
@@ -421,7 +436,10 @@ async function main() {
       // `ref=<role>/<name>` selector (DIVE-4588) is a selector by this rule too
       // and gets the same refusal: an argument that could choose the ROLE and
       // NAME of the element to click is the same hole with nicer syntax.
-      out[field] = field === 'selector' ? s[field] : interp(s[field], args, `step ${i + 1} (${s.op})`);
+      // `act` (DIVE-4943) sends the agent's own text, which has no adapter
+      // arguments to fill and may legitimately contain a literal `{word}`; it
+      // says so with `literal`, and the value is typed exactly as given.
+      out[field] = field === 'selector' || plan.literal ? s[field] : interp(s[field], args, `step ${i + 1} (${s.op})`);
     }
     return out;
   });
@@ -439,9 +457,9 @@ async function main() {
   // where a second caller cannot get a laxer one.
   const ctx = await openProfile(profile);
 
-  let rc = 0;
+  let rc = 0, needsOwner = null, page = null;
   try {
-    const page = ctx.pages()[0] || await ctx.newPage();
+    page = ctx.pages()[0] || await ctx.newPage();
     page.setDefaultTimeout(STEP_TIMEOUT);
     for (let i = 0; i < resolved.length; i++) {
       const s = resolved[i];
@@ -459,6 +477,17 @@ async function main() {
       // choice of which ops wait lives in lib/aria.cjs, shared by this loop and
       // the other one, because the defect was that there are two of them.
       const sel = await aria.resolveStepSelector(page, s, { timeoutMs: STEP_TIMEOUT });
+      // THE OWNER'S FOUR (DIVE-4943), checked on the live element BEFORE the
+      // counter: a refused step was not entered, so a refusal on step one is
+      // still "nothing ran". Only `act` sets guard; an adapter recipe is a
+      // reviewed file and keeps its own contract.
+      if (plan.guard && !plan.approved) {
+        const risk = await aria.stepRisk(page, s, sel);
+        if (risk) {
+          needsOwner = { ...risk, step: i + 1, op: s.op };
+          break;
+        }
+      }
       stepsRun++;  // entered, not completed — see stepsRun above
       switch (s.op) {
         case 'goto':
@@ -474,6 +503,11 @@ async function main() {
       }
       process.stderr.write(`  ${where} ok\n`);
     }
+    if (needsOwner) {
+      process.stderr.write(aria.NEEDS_OWNER_PREFIX + JSON.stringify(needsOwner) + '\n');
+      rc = aria.E_NEEDS_OWNER;
+    }
+    if (plan.report && (stepsRun || needsOwner)) await writeReport(page, plan.report);
   } catch (e) {
     // A STEP FAILURE IS NOT A VERDICT AND MUST NOT BE DRESSED AS ONE. bin/browser
     // re-reads the artifact by a different path whatever this exits, because
@@ -484,6 +518,8 @@ async function main() {
     if (rc === E_NOTHING_RAN) {
       process.stderr.write(`${PROG}: the browser opened but not one step ran, so nothing was ` +
         `published and there is nothing to re-read.\n`);
+    } else if (plan.report && page) {
+      await writeReport(page, plan.report);
     }
   } finally {
     try { await ctx.close(); } catch (e) { /* the verdict is the re-read, not this */ }

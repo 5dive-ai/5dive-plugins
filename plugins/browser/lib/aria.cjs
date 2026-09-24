@@ -313,6 +313,84 @@ async function resolveStepSelector(page, step, { timeoutMs = 30000, pollMs = 250
   return resolveRef(page, sel);
 }
 
+// ---- THE OWNER'S FOUR (DIVE-4943) ------------------------------------------
+//
+// An agent may click and type anywhere, but four kinds of act are the owner's to
+// allow: paying, publishing, sending and deleting. They are named by what the
+// element SAYS, read off the live page at the moment before the step, and not by
+// the selector the agent wrote: `#btn-3` and `ref=button/Place your order` are
+// the same click, and a rule keyed on how the agent spelled the target would
+// be walked by spelling it differently.
+//
+// WHAT IS READ. For `click`: the element's accessible label (aria-label, the
+// visible text, a button's value, its title), plus the ref's own name when the
+// step used a ref. For `press`: Enter submits the element's form, so it is the
+// label of that form's submit button; a modifier+Enter is the send/post shortcut
+// on every composer that has one (X, Slack, GitHub comments), so it is refused
+// as `send` without reading anything — a composer rarely carries a label that
+// says so, and guessing "harmless" there is the expensive direction.
+//
+// IT IS A GUARD, NOT A CLASSIFIER OF INTENT. It catches the literal buttons. An
+// agent that submits an order through a button labelled "Continue" is not caught
+// here, and saying so is better than a pattern list that pretends otherwise.
+const RISK = [
+  ['pay', /\b(buy|buy now|purchase|place (your |my )?order|order now|confirm (order|purchase|payment)|complete (order|purchase|payment)|pay( now)?|checkout|check out|proceed to (checkout|payment)|subscribe|donate|book now|start (free )?trial|upgrade( now)?)\b/i],
+  ['publish', /\b(post|publish|tweet|reply|repost|retweet|share|comment|submit|save and publish|go live)\b/i],
+  ['send', /\b(send|send now|send message|send email)\b/i],
+  ['delete', /\b(delete|remove|discard|erase|trash|destroy|deactivate|close (my )?account|unsubscribe|empty trash)\b/i],
+];
+function classifyLabel(label) {
+  const l = String(label || '').replace(/\s+/g, ' ').trim();
+  if (!l) return null;
+  for (const [cls, re] of RISK) if (re.test(l)) return cls;
+  return null;
+}
+// In the page. Kept tiny and free of closures: page.evaluate serialises it.
+function _labelIn(arg) {
+  const el = document.querySelector(arg.sel);
+  if (!el) return '';
+  const txt = (n) => n ? [n.getAttribute && n.getAttribute('aria-label'), n.innerText, n.value, n.title]
+    .filter((x) => typeof x === 'string' && x.trim()).join(' ').slice(0, 160) : '';
+  if (arg.op !== 'press') return txt(el);
+  const form = el.form || (el.closest && el.closest('form'));
+  if (!form) return '';
+  const sub = form.querySelector('button[type=submit],input[type=submit],button:not([type])');
+  return txt(sub) || String(form.getAttribute('action') || '');
+}
+async function stepRisk(page, step, sel) {
+  if (!step || (step.op !== 'click' && step.op !== 'press')) return null;
+  if (step.op === 'press') {
+    const key = String(step.key || '');
+    if (!/(^|\+)Enter$/i.test(key)) return null;
+    if (/(Control|Meta|Ctrl|Cmd)\+/i.test(key)) return { cls: 'send', label: key };
+  }
+  const refName = isRef(step.selector) ? refBody(step.selector).replace(/^[^/]*\//, '').replace(/#\d+$/, '') : '';
+  let live = '';
+  try { live = await page.evaluate(_labelIn, { sel, op: step.op, riskOf: true }); } catch (e) { live = ''; }
+  const label = [refName, live].filter(Boolean).join(' | ').slice(0, 200);
+  const cls = classifyLabel(label);
+  return cls ? { cls, label } : null;
+}
+// THE RE-READ AFTER AN ACT (DIVE-4943). The executor's "step ok" says a click
+// was dispatched, not what the page did with it. So after the last step the page
+// is read again — where it ended up, its title, its document — and that, not the
+// step log, is what bin/browser grades `--expect` against. It is read from the
+// page as it now stands, never by navigating: a reload would throw away the very
+// draft or cart the act just built.
+async function pageAfter(page, { settleMs = 0 } = {}) {
+  if (settleMs > 0) { try { await page.waitForTimeout(settleMs); } catch (e) { /* the read still runs */ } }
+  const out = { url: '', title: '', html: '' };
+  try { out.url = String(await page.url()); } catch (e) { /* recorded empty */ }
+  try { out.title = String(await page.title()); } catch (e) { /* recorded empty */ }
+  try { out.html = String(await page.content()); } catch (e) { /* recorded empty */ }
+  return out;
+}
+
+// The line bin/browser keys on. One line, a fixed prefix, JSON after it, so the
+// refusal can name the ask without a second parser for prose.
+const NEEDS_OWNER_PREFIX = '5dive-needs-owner: ';
+const E_NEEDS_OWNER = 73;
+
 function render(nodes, { json = false } = {}) {
   if (json) return JSON.stringify({ nodes }, null, 2);
   const w = nodes.reduce((m, n) => Math.max(m, n.role.length), 0);
@@ -323,4 +401,5 @@ function render(nodes, { json = false } = {}) {
 }
 
 module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
-  resolveRefWithin, resolveStepSelector, isRef, render, REF_PREFIX };
+  resolveRefWithin, resolveStepSelector, isRef, render, REF_PREFIX,
+  classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER };

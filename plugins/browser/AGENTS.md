@@ -90,6 +90,39 @@ The view is ephemeral; the login profile is durable. Revoke promptly: a live vie
 keyboard attached to the person's account.
 <!-- 5dive:connect-site-flow:end -->
 
+## You can use the browser with NOTHING connected
+
+Give any page verb a URL instead of a site and it picks the profile itself: the host's one
+connected login, or the **public profile** (nothing logged in) when there is none. So on a
+fresh box `5dive browser snapshot https://example.com/ --interactive` just works. Connecting a
+site is only for pages where it must be the owner — their inbox, their cart, their repo.
+
+If the owner has two accounts on one site (`github.com_work`, `github.com_personal`), a URL
+alone is refused and the refusal names both. **Ask the owner which one, never guess**, then
+name it: `5dive browser act github.com_work <url> --steps=…`.
+
+## Acting: `act`, on refs, and the four things you must ask about first
+
+```bash
+5dive browser snapshot <url> --interactive          # read the refs
+5dive browser act <url> --steps='[{"op":"click","selector":"ref=button/Star"}]'
+5dive browser act <url> --steps='[{"op":"fill","selector":"ref=textbox/Title","value":"Bug: …"},
+                                  {"op":"click","selector":"ref=button/Save draft"}]' --expect='Draft saved'
+```
+
+Steps are `goto fill click wait_for select press`, run in order, in one tab. Without a URL,
+`act` continues on the page a served browser is holding. `--expect=<regex>` is graded against
+the page as the steps left it; without it the command only says the steps ran — look at the
+`page.png` it writes before you tell anyone it worked.
+
+**Paying, posting, sending and deleting are the owner's call.** `act` stops in front of any
+such button (read off the live page, whatever selector you used; Ctrl/Cmd+Enter counts as
+send) and exits **73** with the ask and a screenshot. Relay the ask to the owner with the
+screenshot. Only on their explicit yes is it approved (`sudo 5dive browser approve <id>`, which
+the owner or their dashboard runs); then re-run the SAME act with `--approved=<id>`. A yes
+covers exactly those steps, once, for 30 minutes. Do not rephrase the steps to get around the
+stop — a button renamed is still an order placed.
+
 ## Working the page: ONE snapshot per decision
 
 ```bash
