@@ -1,5 +1,28 @@
 ## Unreleased
 
+### Fixed — the registry copy carries the hired-agent login fix, at browser 1.10.4 (DIVE-4927)
+
+`plugins/browser/` is again `rsync -a --delete` identical to 5dive-ai/5dive-browser's `browser/`
+at main (ef490b56, 1.10.4), and `diff -r` between the two trees is empty. It brings in 5dive-browser
+#8:
+- **A brokered lease is held by the calling seat.** The lease used to be anchored to a child
+  process that exited at once, so another seat's hold read as free.
+- **`_holder_live` reads `/proc`,** so another uid's holder is no longer read as dead.
+- **A leased request waits out a status probe that is already running** (up to
+  `FIVEDIVE_BROWSER_BUSY_WAIT_MS`, default 60s), instead of being refused with a message that
+  blamed the caller.
+
+It also brings in #9's version, 1.10.4. The box converger's floor is a min() over both copies, so
+lodar/5dive-api#234 (floor 1.10.3 → 1.10.4) merges only after this is on main: a floor above what
+this copy offers sends every browser@5dive-plugins box to degraded.
+
+The harness moved with it. CI here runs `tests/browser_plugin_unit.sh`, and the trimmed copy it
+held still asserted the refusal #8 removed (T25j: "did not hold it"), so the mirror alone went red
+(891 passed, 3 failed, T25j among them). The file is now 5dive-browser's harness at ef490b56 with
+`browser/` read as `plugins/browser/`, plus this registry's deprecation-notice arms, renamed
+T28 → TR28 because upstream now uses T28 for the late-ref wait. Apart from those two changes it is
+the same file.
+
 ### Fixed — a 👍 on the newest Telegram message no longer gets the turn's recap auto-relayed (DIVE-4889), telegram 0.5.61
 
 When a seat answered an acknowledgement with a reaction, as our rules require, the Stop hook

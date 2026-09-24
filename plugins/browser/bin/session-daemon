@@ -117,6 +117,22 @@ const STEPS = {
   press:    ['selector', 'key'],
 };
 const STEP_TIMEOUT = Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || 30000);
+// How long a request waits for the one in flight before it is refused (DIVE-4927).
+const BUSY_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_BUSY_WAIT_MS || 60000);
+
+// THE LEASE ANCHOR MUST BE THE CALLER'S OWN PROCESS (DIVE-4927). A brokered
+// lease is held for as long as its anchor pid lives, and the caller names that
+// pid — so the kernel has to agree it is the connected seat's, or a caller could
+// anchor its lease to any long-lived process on the box and hold the browser
+// until the TTL. The real uid is read out of /proc, not taken from the request.
+function anchorOf(req, who) {
+  const a = Number(req.anchor);
+  if (!Number.isInteger(a) || a <= 0) return '';
+  let st;
+  try { st = fs.readFileSync(`/proc/${a}/status`, 'utf8'); } catch (e) { return null; }
+  const m = st.match(/^Uid:\s+(\d+)/m);
+  return m && Number(m[1]) === who.uid ? String(a) : null;
+}
 
 // THE SETTLE `run` DID NOT HAVE (DIVE-4674). `tree` and `snapshot` wait after
 // domcontentloaded because a live page is still assembling itself there; `run`
@@ -272,7 +288,9 @@ async function serveMode(profile, sock, broker) {
   // real playwright context always has it.
   if (typeof ctx.on === 'function') ctx.on('close', () => { cleanup(); process.exit(0); });
 
-  let busy = false;
+  // WHAT IS IN FLIGHT, not only THAT something is: a refusal that cannot say
+  // who has the browser sends the caller to a `lease --status` that reads free.
+  let busy = null;
   const cleanup = () => { try { fs.unlinkSync(sock); } catch (e) { /* already gone */ } };
 
   const server = net.createServer((conn) => {
@@ -335,20 +353,39 @@ async function serveMode(profile, sock, broker) {
           send({ t: 'err', msg: `lease act must be acquire, release or status; got '${act}'` });
           return end(E_NOTHING_RAN);
         }
+        const anchor = act === 'acquire' ? anchorOf(req, who) : '';
+        if (anchor === null) {
+          send({ t: 'err', msg: `the lease anchor ${req.anchor} is not a process of the calling seat, so it cannot hold this browser. Nothing was taken.` });
+          return end(E_PERM);
+        }
         const r = brokerCall(['_broker-lease', site, act,
-          String(req.purpose || 'brokered'), String(req.ttl || ''), String(req.token || '')], behalf);
+          String(req.purpose || 'brokered'), String(req.ttl || ''), String(req.token || ''), anchor], behalf);
         if (r.stderr) send({ t: 'err', msg: String(r.stderr).trim() });
         if (r.stdout) send({ t: 'out', data: String(r.stdout) });
         return end(r.status === null ? E_UNAVAILABLE : r.status);
       }
 
-      // ONE REQUEST AT A TIME, AND A REFUSAL RATHER THAN A QUEUE. The per-site
-      // lease already serialises callers, so a second request arriving mid-run is
-      // a caller that did not take the lease — and queueing it would hold it
-      // behind a lease it does not have and then run it. 70 says "nothing ran",
-      // which is the true thing and the one bin/browser can act on.
-      if (busy) { send({ t: 'err', msg: 'this session is already executing a request — the per-site lease is what serialises callers, and whoever sent this did not hold it. Nothing ran.' }); return end(E_NOTHING_RAN); }
-      busy = true;
+      // ONE REQUEST AT A TIME — AND A SHORT WAIT, THEN A REFUSAL (DIVE-4927).
+      // This used to refuse on the spot, on the theory that the lease already
+      // serialises callers so a second request mid-run must be one that skipped
+      // it. That theory is false: `status` probes WITHOUT the lease (it only
+      // looks, in its own tab), and a leased caller's request landing inside one
+      // was refused and told it "did not hold" a lease it did hold — measured on
+      // a box, twice, from a second seat, while `lease --status` read free.
+      // Waiting is safe because the lease is not enforced HERE: every acting op
+      // re-reads the lease file before each step (assertLease), so a request
+      // that waited behind somebody else's still refuses if the lease moved.
+      // Bounded, and a refusal after the bound says what is in flight.
+      if (busy) {
+        const until = Date.now() + BUSY_WAIT_MS;
+        while (busy && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
+      }
+      if (busy) {
+        const secs = Math.round((Date.now() - busy.since) / 1000);
+        send({ t: 'err', msg: `this session is still busy with a '${busy.op}' request from ${busy.seat || 'the owner'}, running for ${secs}s; waited ${Math.round(BUSY_WAIT_MS / 1000)}s for it. Nothing ran.` });
+        return end(E_NOTHING_RAN);
+      }
+      busy = { op: String(req.op), seat: behalf, since: Date.now() };
       try {
         if (behalf) brokerCall(['_broker-audit', site, req.op, String(req.url || '')], behalf);
         if (req.op === 'probe') await probeRequest(ctx, req, send, end);
@@ -360,7 +397,7 @@ async function serveMode(profile, sock, broker) {
       } catch (e) {
         send({ t: 'err', msg: e && e.message ? e.message : String(e) });
         end(E_FAILED);
-      } finally { busy = false; }
+      } finally { busy = null; }
     });
   });
 

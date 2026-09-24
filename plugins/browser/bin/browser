@@ -1229,9 +1229,23 @@ _lease_live() {  # _lease_live <profile-dir>
   local pid exp now
   pid=$(_kv "$m" holder_pid); exp=$(_kv "$m" expires_at); now=$(date -u +%s)
   [[ -n "$pid" && -n "$exp" ]] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
+  _holder_live "$pid" || return 1
   (( now < exp )) || return 1
   return 0
+}
+
+# ALIVE WHOEVER OWNS IT (DIVE-4927). A brokered lease is anchored to the
+# CALLING seat's process, and the one asking "is that holder still there?" is
+# usually the owner — a different uid. `kill -0` on another uid's process is
+# EPERM, which reads exactly like "no such process", so every brokered lease
+# was reapable by the owner the instant it was written. /proc is the check that
+# does not depend on who is asking; a zombie is not a holder.
+_holder_live() {  # _holder_live <pid>
+  local p="$1"
+  [[ "$p" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$p" 2>/dev/null || [[ -d "/proc/$p" ]] || return 1
+  local st; st=$(sed -n 's/.*) \([A-Za-z]\).*/\1/p' "/proc/$p/stat" 2>/dev/null)
+  [[ "$st" != Z ]]
 }
 
 # Remove a lease nobody holds. Under its own lock: see property 2 above.
@@ -1289,8 +1303,8 @@ _lease_write() {  # _lease_write <profile-dir> <token> <kind> <purpose> <ttl> [<
 }
 
 # Try ONCE. Echoes the token and returns 0, or returns 1 having printed nothing.
-_lease_try() {  # _lease_try <profile-dir> <kind> <purpose> <ttl>
-  local d="${1:?}" kind="$2" purpose="$3" ttl="$4"
+_lease_try() {  # _lease_try <profile-dir> <kind> <purpose> <ttl> [<holder-pid>]
+  local d="${1:?}" kind="$2" purpose="$3" ttl="$4" hpid="${5:-$$}"
   local ld; ld="$(_lease_dir "$d")"
   if ! mkdir "$ld" 2>/dev/null; then
     _lease_live "$d" && return 1
@@ -1298,7 +1312,7 @@ _lease_try() {  # _lease_try <profile-dir> <kind> <purpose> <ttl>
     mkdir "$ld" 2>/dev/null || return 1
   fi
   local token; token=$(_lease_token_new)
-  _lease_write "$d" "$token" "$kind" "$purpose" "$ttl"
+  _lease_write "$d" "$token" "$kind" "$purpose" "$ttl" "$hpid"
   printf '%s\n' "$token"
 }
 
@@ -1382,7 +1396,15 @@ _lease_and_serve_release() { _lease_release; _shot_restore; }
 # loses the race retries on the same one-second cadence and says who has it.
 _lease_take_brokered() {  # <site> <dir> <purpose> <wait> <ttl>
   local site="$1" d="$2" purpose="$3" wait="$4" ttl="$5" token="" waited=0 req
-  req=$(jq -nc --arg p "$purpose" --argjson t "$ttl" '{op:"lease", act:"acquire", purpose:$p, ttl:$t}')
+  # THE ANCHOR IS THIS PROCESS (DIVE-4927). The lease is written by a
+  # `_broker-lease` the daemon spawns as the owner, and that child exits the
+  # moment it has printed the token — so a lease anchored to IT was dead on
+  # arrival: `lease --status` read "free" under a live brokered run, and any
+  # caller could reap it mid-action. `$$` is this verb's own shell, alive for as
+  # long as the verb holds the browser. The daemon only accepts a pid that the
+  # KERNEL says belongs to the connected seat, so this cannot pin someone else.
+  req=$(jq -nc --arg p "$purpose" --argjson t "$ttl" --argjson a "$$" \
+        '{op:"lease", act:"acquire", purpose:$p, ttl:$t, anchor:$a}')
   while :; do
     token=$(_daemon_call "$d" "$req" 2>/dev/null) || token=""
     [[ -n "$token" ]] && break
@@ -3613,8 +3635,8 @@ ok_doc() { printf '%s: %s\n' "$PROG" "$1"; }
 # from SO_PEERCRED — the kernel's answer about the socket's peer, not a name the
 # request asked to be called. A caller cannot set it for itself: it never runs
 # this program, the daemon does.
-cmd_broker_lease() {  # _broker-lease <site> acquire|release [<purpose>] [<ttl>] [<token>]
-  local site="${1:-}" act="${2:-}" purpose="${3:-brokered}" ttl="${4:-}" token="${5:-}"
+cmd_broker_lease() {  # _broker-lease <site> acquire|release [<purpose>] [<ttl>] [<token>] [<anchor-pid>]
+  local site="${1:-}" act="${2:-}" purpose="${3:-brokered}" ttl="${4:-}" token="${5:-}" anchor="${6:-}"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
   local d; d="$(_own_site_dir "$site")"
   [[ -d "$d" ]] || die "$E_UNAVAILABLE" "no profile for $site under $(_seat)"
@@ -3622,8 +3644,11 @@ cmd_broker_lease() {  # _broker-lease <site> acquire|release [<purpose>] [<ttl>]
   (( ttl > LEASE_TTL_MAX )) && ttl="$LEASE_TTL_MAX"
   case "$act" in
     acquire)
+      # The daemon has already checked the anchor against SO_PEERCRED. Without
+      # one (an older caller) the lease falls back to this process, as before.
       local t
-      t=$(_lease_try "$d" agent "$purpose" "$ttl") \
+      [[ "$anchor" =~ ^[1-9][0-9]*$ ]] || anchor=$$
+      t=$(_lease_try "$d" agent "$purpose" "$ttl" "$anchor") \
         || die "$E_UNAVAILABLE" "$(_lease_describe "$d")"
       _serve_touch "$d"; _audit_row "$d" lease-acquire "$purpose"
       printf '%s\n' "$t" ;;
