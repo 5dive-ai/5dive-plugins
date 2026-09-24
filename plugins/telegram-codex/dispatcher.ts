@@ -128,6 +128,9 @@ function publishHealth(): void {
   try {
     const snap = dispatcher.snapshot()
     health.threadId = snap.threadId
+    health.threadModel = snap.threadModel?.model
+    health.threadEffort = snap.threadModel?.effort
+    health.configuredModel = dispatcher.configuredModel().model
     health.queueDepth = snap.pending.length
     health.active = snap.active
       ? { turnId: snap.active.turnId, source: snap.active.route.source, startedAt: health.active?.turnId === snap.active.turnId ? health.active.startedAt : new Date().toISOString() }
@@ -264,7 +267,15 @@ async function publish(route: DispatchRoute, text: string, meta: Record<string, 
 }
 
 const rpc = new JsonRpcProcess()
-const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish }, WORKDIR)
+// The seat's configured model, resolved by the app-server itself — profiles,
+// project layers and `-c` overrides included — so the dispatcher never parses
+// config.toml a second, subtly different way (DIVE-4924).
+async function configuredModel() {
+  const read = await rpc.request('config/read', { cwd: WORKDIR })
+  return { model: read?.config?.model ?? undefined, effort: read?.config?.model_reasoning_effort ?? undefined }
+}
+
+const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish }, WORKDIR, configuredModel)
 rpc.onNotification = (method, params) => {
   void dispatcher.notification(method, params).catch(err => fatal(`event ${method} failed: ${err}`))
 }

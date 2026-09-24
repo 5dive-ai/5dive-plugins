@@ -31,6 +31,14 @@ an app-server or adapter failure. Thread sandbox and approval settings are
 inherited from Codex configuration; because this headless dispatcher has no
 approval UI, app-server approval requests are declined rather than escalated.
 
+The model and reasoning effort follow the seat config on every start: the
+dispatcher reads them through app-server `config/read` and passes them to
+`thread/resume` and each `turn/start`, because a resumed thread otherwise keeps
+the model it was saved with. So `/model` (or a `config.toml` edit) plus a
+restart switches the EXISTING conversation, history intact. `health.json`
+records `threadModel`/`threadEffort` as the app-server reports them, and
+`/status` prints a `conversation:` line whenever that differs from the config.
+
 Dashboard delivery keeps using `~/.claude/channels/dashboard/` as a runtime-
 neutral compatibility path because shelld writes durable inbound drops there.
 To attach a local file in dispatcher mode, Codex emits a non-empty caption plus
@@ -307,3 +315,4 @@ relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
 - DIVE-3964 — `health.json` handshake: bound/listening, last inbound and outbound, queue depth and a named failure cause, refreshed every 15s.
 - v0.5.13 — DIVE-3965: a clean stop and a crash are different sentences in the chat. Recovery context rides the next turn.
 - v0.5.20 — DIVE-3969: compatibility handshake. Codex below 0.136.0 is refused by name, `state.json` is versioned with idempotent migration and quarantine, `bun dispatcher.ts --check` preflights a tree, `release.sh` does canary, promote and rollback, and CI checks the packaged file list, versions and documented commands.
+- v0.5.21 — DIVE-4924: a model switch applies to the EXISTING conversation. The dispatcher reads the seat model/effort via app-server `config/read` and passes them to `thread/resume` and every `turn/start`; `health.json` records the thread's actual model and `/status` prints a `conversation:` line when it differs from the config.

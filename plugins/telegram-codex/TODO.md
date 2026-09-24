@@ -30,6 +30,10 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.21 — DIVE-4924: `/model` or a `config.toml` edit plus restart now
+  moves the existing conversation to the new model (history kept): the
+  configured model/effort ride `thread/resume` and each `turn/start`, and
+  `health.json`/`/status` report the thread's actual model.
 - v0.5.20 — DIVE-3969: compatibility and rollback hardening. The dispatcher
   refuses Codex below 0.136.0 by name (measured: older app-servers reject
   `--stdio`), records the Codex version in `health.json`, versions

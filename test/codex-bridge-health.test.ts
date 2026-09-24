@@ -7,6 +7,7 @@ import {
   HEALTH_HEARTBEAT_MS,
   HEALTH_SCHEMA,
   classifyHealth,
+  modelStatusLines,
   readHealth,
   renderHealth,
   staleAfterMs,
@@ -215,5 +216,33 @@ describe('the file on disk', () => {
 
   test('writing to an unwritable path never throws', () => {
     expect(() => writeHealth('/proc/nope/nowhere', record())).not.toThrow()
+  })
+})
+
+describe('/status model line (DIVE-4924)', () => {
+  const cfg = { model: 'gpt-6-astra', effort: 'high' }
+  const now = NOW.getTime()
+
+  test('one line when the conversation runs what the config names', () => {
+    expect(modelStatusLines(cfg, record({ threadModel: 'gpt-6-astra', threadEffort: 'high' }), now))
+      .toEqual(['model: gpt-6-astra · high'])
+  })
+
+  test('a thread still on the old model is shown, not hidden behind the config', () => {
+    const lines = modelStatusLines(cfg, record({ threadModel: 'gpt-6-sol', threadEffort: 'high' }), now)
+    expect(lines).toHaveLength(2)
+    expect(lines[0]).toBe('model: gpt-6-astra · high')
+    expect(lines[1]).toStartWith('conversation: gpt-6-sol · high')
+  })
+
+  test('an effort mismatch alone is a mismatch', () => {
+    expect(modelStatusLines(cfg, record({ threadModel: 'gpt-6-astra', threadEffort: 'low' }), now)).toHaveLength(2)
+  })
+
+  test('a stale, absent, or pre-4924 record says nothing about the conversation', () => {
+    expect(modelStatusLines(cfg, record({ threadModel: 'gpt-6-sol', updatedAt: ago(3_600_000) }), now)).toEqual(['model: gpt-6-astra · high'])
+    expect(modelStatusLines(cfg, null, now)).toEqual(['model: gpt-6-astra · high'])
+    expect(modelStatusLines(cfg, record(), now)).toEqual(['model: gpt-6-astra · high'])
+    expect(modelStatusLines({ model: null, effort: null }, null, now)).toEqual([])
   })
 })
