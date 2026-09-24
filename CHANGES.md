@@ -16,9 +16,12 @@ It also brings in #9's version, 1.10.4. The box converger's floor is a min() ove
 lodar/5dive-api#234 (floor 1.10.3 → 1.10.4) merges only after this is on main: a floor above what
 this copy offers sends every browser@5dive-plugins box to degraded.
 
-The test harness here is left as it was. It is this registry's trimmed copy. The full harness is
-5dive-browser's `tests/browser_plugin_unit.sh`, which passed 984/0 at this tree (1d369c3, #9's
-graded head).
+The harness moved with it. CI here runs `tests/browser_plugin_unit.sh`, and the trimmed copy it
+held still asserted the refusal #8 removed (T25j: "did not hold it"), so the mirror alone went red
+(891 passed, 3 failed, T25j among them). The file is now 5dive-browser's harness at ef490b56 with
+`browser/` read as `plugins/browser/`, plus this registry's deprecation-notice arms, renamed
+T28 → TR28 because upstream now uses T28 for the late-ref wait. Apart from those two changes it is
+the same file.
 
 ### Fixed — a 👍 on the newest Telegram message no longer gets the turn's recap auto-relayed (DIVE-4889), telegram 0.5.61
 

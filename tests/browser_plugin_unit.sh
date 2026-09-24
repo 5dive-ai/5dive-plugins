@@ -143,6 +143,22 @@ for a in "$@"; do case "$a" in --user-data-dir=*) d="${a#*=}" ;; esac; done
 # `auth` runs headed in the foreground, and both would then hang forever.
 hl=; ws=; for a in "$@"; do case "$a" in --headless) hl=1 ;; --window-size=*) ws=1 ;; esac; done
 [[ -n "$ws" && -z "$hl" ]] && exec sleep 300
+# DIVE-4794: COUNT THE LOADS, and let a profile park a SEQUENCE of them. A
+# single-page app serves the same shell to a live session and a dead one and
+# only decides later, so an arm that grades "the probe waited" needs a fake that
+# ANSWERS DIFFERENTLY THE SECOND TIME. `.fake-dom.N` is that; `.fake-n` is how
+# an arm proves the probe looked more than once (or, for the control, exactly
+# once). A profile with no sequence parked behaves exactly as before.
+n=0
+if [[ -n "${d:-}" && -d "$d" ]]; then
+  n=$(cat "$d/.fake-n" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$d/.fake-n"
+fi
+if [[ -f "${d:-/nonexistent}/.fake-dom.1" ]]; then
+  if [[ -f "$d/.fake-dom.$n" ]]; then cat "$d/.fake-dom.$n"; else
+    last=$(ls "$d"/.fake-dom.[0-9]* 2>/dev/null | sort -V | tail -1); cat "$last"
+  fi
+  exit 0
+fi
 cat "${d:-/nonexistent}/.fake-dom" 2>/dev/null || echo "<html><body>feed</body></html>"
 CHROME
 chmod +x "$FAKEBIN/google-chrome"
@@ -267,6 +283,104 @@ t  'T2c6 a root caller with SUDO_USER re-executes as the seat before touching a 
 t  'T2c7 ...but setup and adblock stay root'"'"'s' 'yes' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|adblock|-h|--help|help|"") ;;' && echo yes || echo no)"
 t  'T2c8 ...and no OTHER verb joined them' '2' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -oP '^\s+\K[a-z|]+(?=\|-h\|--help)' | tr '|' '\n' | grep -c .)"
 
+# DIVE-4813 — WHICH SEAT ROOT BECOMES. An admin agent asked to open a site the
+# box had connected under `claude` and was told to run `sudo -u claude 5dive
+# browser serve <site>` — a runas the 5dive admin grant does not contain, so the
+# agent handed the shell command back to a human (lodar, wavy-mesa, 2026-09-22).
+# Root is the one lever that seat holds and the DIVE-4348 drop above spent it
+# re-execing as the seat that cannot read the profile. Now, for `serve` on a site
+# the box offers and the caller has no store for, root becomes the OWNER.
+#
+# WHY THESE ARMS DRIVE A FUNCTION AND NOT THE ENTRYPOINT. The drop is gated on
+# $EUID, and `_seat`'s own comment at the top of this file says it: a fake `id
+# -u` cannot move $EUID. An arm written against the inline block would therefore
+# grade the real thing only where the runner happens to be root — green-by-
+# blankness on a developer box, live in CI, and nobody can tell which from the
+# output. So the decision is a function taking the caller as an ARGUMENT, and
+# `_drop-target` is the hidden verb that reaches it. Same answer at any uid.
+#
+# THE LOAD-BEARING ARMS ARE THE CONTROLS. This change turns a behaviour ON, so
+# "the brokered case picks the owner" is the cheap half — a function that
+# returned $BOX_SEAT unconditionally passes it. Every arm below it names a case
+# that must still pick the CALLER, and the mutants at the end delete one guard
+# each and prove the matching control goes red.
+DT="$TMP/droptarget"
+mkdir -p "$DT/profiles/claude/boxsite" "$DT/profiles/agent-yak" "$DT/sessions/claude"
+: > "$DT/sessions/claude/boxsite.offered"
+dt() {  # dt <caller> <argv...> -> the seat root would become
+  env FIVEDIVE_BROWSER_PROFILE_ROOT="$DT/profiles" \
+      FIVEDIVE_BROWSER_SESSION_ROOT="$DT/sessions" \
+      FIVEDIVE_BROWSER_BOX_SEAT=claude \
+      "${DTB:-$BROWSER}" _drop-target "$@"
+}
+t  'T2c9 a brokered serve makes root become the seat that OWNS the session' \
+   'claude' "$(dt agent-yak serve boxsite)"
+# The reason the row exists: the advice the agent used to get names a runas the
+# admin sudoers class does not grant, so it could only be executed by a human.
+tn 'T2c9a ...and the refusal it replaces no longer sends a brokered seat to sudo -u for serve' \
+   'Start one on the owning seat:  sudo -u' "$(cat "$ROOT/plugins/browser/bin/browser")"
+tc 'T2c9b ...the brokered refusal names a verb the seat can run itself' \
+   'sudo 5dive browser serve $1' "$(cat "$ROOT/plugins/browser/bin/browser")"
+
+# --- the controls. Each names a case that must still resolve to the CALLER ---
+mkdir -p "$DT/profiles/agent-yak/boxsite"
+t  'T2c10 CONTROL a seat with its OWN login for the site keeps using it' \
+   'agent-yak' "$(dt agent-yak serve boxsite)"
+rmdir "$DT/profiles/agent-yak/boxsite"
+t  'T2c11 CONTROL --stop is never carried out on the owner behalf' \
+   'agent-yak' "$(dt agent-yak serve boxsite --stop)"
+t  'T2c11a ...whichever side of the site name it is written on' \
+   'agent-yak' "$(dt agent-yak serve --stop boxsite)"
+t  'T2c12 CONTROL a site the box does not OFFER is not brokered' \
+   'agent-yak' "$(dt agent-yak serve neveroffered)"
+t  'T2c13 CONTROL no other verb is carried out on the owner behalf' \
+   'agent-yak agent-yak agent-yak agent-yak' \
+   "$(echo "$(dt agent-yak shot boxsite https://x.test/) $(dt agent-yak auth boxsite) $(dt agent-yak snapshot boxsite) $(dt agent-yak forget boxsite)")"
+t  'T2c14 CONTROL serve with no site named resolves to the caller' \
+   'agent-yak' "$(dt agent-yak serve)"
+# The target is a CONSTANT, never the caller's argv: a site name shaped like a
+# seat must not become the seat root becomes.
+t  'T2c15 CONTROL the site name cannot steer which seat root becomes' \
+   'agent-yak' "$(dt agent-yak serve root)"
+t  'T2c16 CONTROL the caller is returned unchanged when it IS the box seat' \
+   'claude' "$(dt claude serve boxsite)"
+# The drop exists to open the OWNER's store, and it records who asked. A caller
+# that could set either env var could re-point the first or forge the second.
+tc 'T2c17 the on-behalf drop scrubs the caller store override' \
+   'unset FIVEDIVE_BROWSER_SEAT' "$(cat "$ROOT/plugins/browser/bin/browser")"
+tc 'T2c18 ...and names the asking seat in the audit row it cannot forge' \
+   'export FIVEDIVE_BROWSER_ON_BEHALF_OF="${SUDO_USER}"' "$(cat "$ROOT/plugins/browser/bin/browser")"
+
+# --- the mutants. One guard deleted each; the named control must go RED -------
+# A mutation arm that cannot prove its own edit LANDED is an arm that passes on a
+# typo, so each one greps the mutant for the change before it grades anything —
+# and reports a broken edit as MUTATION-NOT-APPLIED / MUTATION-BROKE-SYNTAX
+# rather than as a survived property, which is the shape that passes silently.
+# The markers are LINE-EXACT where the condition alone is not unique: the
+# offer-marker test also appears in _resolve_site, and a marker matching two
+# sites cannot say which one the sed moved.
+mutdt() {  # mutdt <sed-expr> <marker-that-must-be-GONE>
+  local m="$DT/mut-browser"
+  sed "$1" "$BROWSER" > "$m"; chmod +x "$m"
+  if grep -qF -e "$2" "$m"; then echo "MUTATION-NOT-APPLIED"; return 0; fi
+  bash -n "$m" 2>/dev/null || { echo "MUTATION-BROKE-SYNTAX"; return 0; }
+  DTB="$m" dt "${@:3}"
+}
+t  'T2c19 MUTANT dropping the own-store guard breaks T2c10' 'claude' \
+   "$(mkdir -p "$DT/profiles/agent-yak/boxsite"
+      mutdt '/\[\[ ! -d "$PROFILE_ROOT\/$caller\/$site" \]\]/d' \
+            '! -d "$PROFILE_ROOT/$caller/$site"' agent-yak serve boxsite
+      rmdir "$DT/profiles/agent-yak/boxsite")"
+t  'T2c20 MUTANT dropping the offer-marker guard breaks T2c12' 'claude' \
+   "$(mutdt 's|&& \[\[ -f "$(_rv_offer "$BOX_SEAT" "$site")" \]\]; then|; then|' \
+            '&& [[ -f "$(_rv_offer "$BOX_SEAT" "$site")" ]]; then' agent-yak serve neveroffered)"
+t  'T2c21 MUTANT dropping the --stop guard breaks T2c11' 'claude' \
+   "$(mutdt 's|if (( ! stop )) \&\& \[\[ -n "$site" \]\]|if [[ -n "$site" ]]|' \
+            'if (( ! stop )) && [[ -n "$site" ]]' agent-yak serve boxsite --stop)"
+t  'T2c22 MUTANT dropping the serve-only guard breaks T2c13' 'claude' \
+   "$(mutdt 's|if \[\[ "${1:-}" == serve \]\]; then|if true; then|' \
+            'if [[ "${1:-}" == serve ]]; then' agent-yak shot boxsite https://x.test/)"
+
 # DIVE-4519 iteration 2 — setup owns the schedule, and these arms DRIVE setup.
 #
 # WHY THE GREPS THEY REPLACE GRADED NOTHING. The first cut of T2c8 matched three
@@ -285,6 +399,7 @@ t  'T2c8 ...and no OTHER verb joined them' '2' "$(grep -A6 'if \[\[ \$EUID -eq 0
 # installed — then assert on the files that land and the commands that ran.
 SETUPBIN="$TMP/setupbin"; mkdir -p "$SETUPBIN"
 REALID="$(command -v id)"
+REALCHOWN="$(command -v chown)"
 cat > "$SETUPBIN/id" <<ID
 #!/usr/bin/env bash
 # fake root for \`id -u\`, and ONLY for that: \`id -u <user>\` (setup's "is the
@@ -367,6 +482,108 @@ t  'T2c8 ...the seat store survives the failure, so a rerun is a no-op' '700' \
    "$(stat -c '%a' "$TMP/setup-store/$SEAT" 2>/dev/null)"
 setup_run
 t  'T2c8 ...and the rerun, once systemd takes it, succeeds' 0 "$RC"
+rm -rf "$SDIR" "$TMP/setup-store"
+
+# ---- DIVE-4730: a unix account is not a seat --------------------------------
+# `setup` mints a per-seat timer that OUTLIVES the account. On box 10 one fired
+# every six hours from 2026-09-16 for `agent-mp`, a de-registered account whose
+# unix user survived — failing on every fire into a journal nobody reads, with
+# no tile anywhere because the dashboard lists the REGISTRY, not /etc/passwd.
+# These arms drive the real cmd_setup with a real registry file, because the
+# thing under test is a refusal BEFORE the store is made and a grep cannot see
+# which side of `mkdir` a guard sits on.
+REG4730="$TMP/agents-4730.json"
+# FIVEDIVE_BROWSER_SEAT, not SUDO_USER: `_seat()` reads the SHELL's $EUID, which
+# the fake `id -u` cannot move, so under a non-root runner the SUDO_USER branch
+# is never taken and every arm below would silently grade the real seat.
+setup_run_as() {  # setup_run_as <seat> [registry]
+  run env PATH="$SETUPBIN:$PATH" FIVEDIVE_BROWSER_SEAT="$1" \
+      FIVEDIVE_AGENT_REGISTRY="${2-$REG4730}" \
+      FIVEDIVE_BROWSER_PROFILE_ROOT="$TMP/setup-store" \
+      FIVEDIVE_BROWSER_SYSTEMD_DIR="$SDIR" \
+      FIVEDIVE_BROWSER_SYSTEMCTL=systemctl \
+      SYSTEMCTL_LOG="$SYSTEMCTL_LOG" SYSTEMCTL_RC=0 \
+      "$BROWSER" setup
+}
+printf '{"agents":{"%s":{"type":"claude","isolation":"sandboxed"}}}\n' "${SEAT#agent-}" > "$REG4730"
+
+# The orphan. `id -u` must succeed for it or setup refuses one step earlier and
+# the arm grades the wrong guard — so the fake `id` answers for this one name.
+cat > "$SETUPBIN/id" <<ID
+#!/usr/bin/env bash
+[[ "\$*" == "-u" ]] && { echo 0; exit 0; }
+[[ "\$*" == "-u agent-dive4730ghost" ]] && { echo 4730; exit 0; }
+[[ "\$*" == "-u dive4730operator" ]] && { echo 4731; exit 0; }
+exec "$REALID" "\$@"
+ID
+chmod +x "$SETUPBIN/id"
+# ...and `chown`, for the same two fabricated names. The first cut of the
+# non-agent arm below named a REAL account (`claude`): it exists on a 5dive box
+# and on no CI runner, so the arm died at setup's "is this a real uid" check
+# with 64 and graded nothing. A fabricated name makes the arm say what it means
+# — the registry guard does not govern a non-`agent-*` account — on any runner,
+# but nothing can chown a store to a uid that does not exist, so the two calls
+# that would are answered here. Every other path still reaches the real chown.
+cat > "$SETUPBIN/chown" <<CH
+#!/usr/bin/env bash
+[[ "\$*" == *dive4730operator* || "\$*" == *dive4730ghost* ]] && exit 0
+exec "$REALCHOWN" "\$@"
+CH
+chmod +x "$SETUPBIN/chown"
+
+: > "$SYSTEMCTL_LOG"; rm -rf "$SDIR" "$TMP/setup-store"
+setup_run_as agent-dive4730ghost
+t  'T2c9 an agent-* account absent from the registry is refused' 64 "$RC"
+tc 'T2c9 ...and told it is an orphan, not a seat'  'NO entry in this box'"'"'s agent registry' "$ERR"
+tc 'T2c9 ...and pointed at the reap, not at a workaround' '--category=registry --fix' "$ERR"
+# THE MUTANT THE MESSAGE CANNOT CATCH: move the guard below the store/timer
+# work, or drop the `die`. Both leave the sentence in the file and the artifacts
+# on the box, and only these two arms see it.
+t  'T2c9 ...and NO timer is enabled for it'  '' "$(grep -F 'dive4730ghost' "$SYSTEMCTL_LOG" || true)"
+t  'T2c9 ...and NO profile store is made for it' 'no' \
+   "$([[ -d "$TMP/setup-store/agent-dive4730ghost" ]] && echo yes || echo no)"
+
+# POSITIVE CONTROL, or "refuses everything" would pass every arm above: the seat
+# that IS in the registry still sets up, timer and all.
+: > "$SYSTEMCTL_LOG"; rm -rf "$SDIR" "$TMP/setup-store"
+setup_run_as "$SEAT"
+t  'T2c9 a REGISTERED seat still sets up'  0 "$RC"
+tc 'T2c9 ...and still gets its timer'      "enable --now 5dive-browser-probe@$SEAT.timer" "$(cat "$SYSTEMCTL_LOG")"
+
+# FAILS OPEN on a registry it could not read. A dev box, or a box that never ran
+# `agent create`, is not evidence that this account was de-registered — and a
+# guard that refused there would take setup out on every one of them.
+: > "$SYSTEMCTL_LOG"; rm -rf "$SDIR" "$TMP/setup-store"
+setup_run_as agent-dive4730ghost "$TMP/no-such-registry.json"
+t  'T2c9 an unreadable registry fails OPEN, it does not refuse on "we could not check"' 0 "$RC"
+
+# A non-`agent-*` seat is not a registry row and never was — refusing one would
+# break the ordinary operator case to fix a fleet one. The name is fabricated
+# and absent from $REG4730 on purpose: absent-from-the-registry is exactly the
+# condition that refuses an `agent-*` account one arm above, so this arm is the
+# discriminator for the `agent-*` half of the guard, not a second run of it.
+: > "$SYSTEMCTL_LOG"; rm -rf "$SDIR" "$TMP/setup-store"
+setup_run_as dive4730operator
+t  'T2c9 a non-agent-* account is not governed by the registry and is not refused' 0 "$RC"
+tn 'T2c9 ...and not by the orphan message either' 'NO entry in this box' "$ERR"
+
+# And the override, for the one-off the message names.
+: > "$SYSTEMCTL_LOG"; rm -rf "$SDIR" "$TMP/setup-store"
+run env PATH="$SETUPBIN:$PATH" FIVEDIVE_BROWSER_SEAT=agent-dive4730ghost \
+    FIVEDIVE_BROWSER_ALLOW_UNREGISTERED_SEAT=1 \
+    FIVEDIVE_AGENT_REGISTRY="$REG4730" \
+    FIVEDIVE_BROWSER_PROFILE_ROOT="$TMP/setup-store" \
+    FIVEDIVE_BROWSER_SYSTEMD_DIR="$SDIR" FIVEDIVE_BROWSER_SYSTEMCTL=systemctl \
+    SYSTEMCTL_LOG="$SYSTEMCTL_LOG" "$BROWSER" setup
+t  'T2c9 the documented override actually overrides' 0 "$RC"
+
+cat > "$SETUPBIN/id" <<ID
+#!/usr/bin/env bash
+[[ "\$*" == "-u" ]] && { echo 0; exit 0; }
+exec "$REALID" "\$@"
+ID
+chmod +x "$SETUPBIN/id"
+rm -f "$SETUPBIN/chown"
 rm -rf "$SDIR" "$TMP/setup-store"
 
 # A site name becomes a directory name.
@@ -2015,6 +2232,7 @@ cat > "$PWROOT/node_modules/playwright-core/index.js" <<'PWJS'
 // it is a tape of what the driver asked for, which is what the arms grade.
 const fs = require('fs');
 const rec = (o) => fs.appendFileSync(process.env.PWREC, JSON.stringify(o) + '\n');
+let markWalks = 0;   // DIVE-4674: how many times the ref layer has asked THIS process
 const page = {
   setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t }),
   goto: async (url, o) => rec({ call: 'goto', url }),
@@ -2041,8 +2259,23 @@ const page = {
   // that lives in our code. The walk itself is graded directly against a DOM
   // shim in T23a — a stub cannot grade a function it is standing in for.
   evaluate: async (fn, arg) => {
-    rec({ call: 'evaluate', fnlen: String(fn).length, mark: (arg && arg.mark) || null,
+    const mark = (arg && arg.mark) || null;
+    if (mark) markWalks++;
+    rec({ call: 'evaluate', fnlen: String(fn).length, mark, walkN: mark ? markWalks : null,
           interactiveOnly: !!(arg && arg.interactiveOnly), snapshot: !!(arg && arg.snapshot) });
+    // PWWALK_MISS=<n> (DIVE-4674) — A REF THAT IS NOT THERE YET, which is a shape
+    // no other fixture here can produce: the first <n> mark-walks find nothing
+    // and the (n+1)th finds it. Every existing arm sees a page whose answer never
+    // changes, so "resolved once" and "resolved on the fourth look" are the same
+    // tape to them; that is exactly why a ref `wait_for` that never waited was
+    // invisible to this suite. Inert unless the variable is set.
+    if (mark && process.env.PWWALK_MISS) {
+      if (markWalks <= Number(process.env.PWWALK_MISS)) {
+        return { nodes: [{ role: 'textbox', name: 'Something Else', ref: 'textbox/Something Else' }],
+                 marker: null };
+      }
+      return { nodes: [], marker: 'late-1' };
+    }
     if (process.env.PWWALK) return JSON.parse(fs.readFileSync(process.env.PWWALK, 'utf8'));
     return { nodes: [], marker: null };
   },
@@ -3129,9 +3362,13 @@ printf '{ "name": "playwright-core", "version": "0.0.0-daemon-stub", "main": "in
 cat > "$DSTUB/node_modules/playwright-core/index.js" <<'DPWJS'
 const fs = require('fs');
 const rec = (o) => fs.appendFileSync(process.env.PWREC, JSON.stringify(o) + '\n');
+let markWalks = 0;   // DIVE-4674, see the driver stub
 const mkpage = (kind) => ({
   setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t, kind }),
-  goto: async (url) => rec({ call: 'goto', url, kind }),
+  // DPWGOTO_MS: a page that takes real time to load, so two requests can
+  // overlap in the daemon (DIVE-4927, T27m). Unset, a goto is instant as before.
+  goto: async (url) => { rec({ call: 'goto', url, kind });
+    if (process.env.DPWGOTO_MS) await new Promise((r) => setTimeout(r, Number(process.env.DPWGOTO_MS))); },
   content: async () => { rec({ call: 'content', kind }); return fs.readFileSync(process.env.DPWDOM, 'utf8'); },
   fill: async (sel, val) => {
     rec({ call: 'fill', sel, val, kind });
@@ -3144,7 +3381,19 @@ const mkpage = (kind) => ({
   waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel, kind }),
   waitForTimeout: async (ms) => rec({ call: 'waitForTimeout', ms, kind }),
   evaluate: async (fn, arg) => {
-    rec({ call: 'evaluate', kind, mark: (arg && arg.mark) || null, snapshot: !!(arg && arg.snapshot) });
+    const mark = (arg && arg.mark) || null;
+    if (mark) markWalks++;
+    rec({ call: 'evaluate', kind, mark, walkN: mark ? markWalks : null, snapshot: !!(arg && arg.snapshot) });
+    // PWWALK_MISS: the same not-there-yet page the driver stub can produce
+    // (DIVE-4674). The warm loop is a SECOND copy of the step loop, so it needs
+    // the same fixture or half the product stays ungraded.
+    if (mark && process.env.PWWALK_MISS) {
+      if (markWalks <= Number(process.env.PWWALK_MISS)) {
+        return { nodes: [{ role: 'textbox', name: 'Something Else', ref: 'textbox/Something Else' }],
+                 marker: null };
+      }
+      return { nodes: [], marker: 'late-1' };
+    }
     if (arg && arg.snapshot && process.env.DPWSNAP) return JSON.parse(fs.readFileSync(process.env.DPWSNAP, 'utf8'));
     return { nodes: [], marker: null };
   },
@@ -3403,8 +3652,10 @@ tc 'T25i ...and it was ASKED to go before it was killed' 'shutdown' \
    "$(sed -n '/^cmd_serve/,/^}/p' "$BROWSER")"
 tc 'T25i ...the profile is still reported as the durable half' 'profile is untouched' "$OUT"
 
-# --- T25j a second caller mid-request is refused, not queued ------------------
-tc 'T25j a busy session refuses rather than queueing' 'did not hold it' \
+# --- T25j a second caller mid-request waits a BOUNDED time, then is refused ----
+# DIVE-4927 replaced the on-the-spot refusal with a bounded wait; the behaviour
+# is graded in T27m. What stays here is the refusal's shape once the bound runs out.
+tc 'T25j a busy session still refuses once the wait is spent' 'still busy with' \
    "$(cat "$DAEMONBIN")"
 tc 'T25j ...and says nothing ran, so no artifact is re-read as evidence' 'Nothing ran' \
    "$(cat "$DAEMONBIN")"
@@ -3713,12 +3964,18 @@ mkdir -p "$RVROOT/$BOXSEAT"; chmod 711 "$RVROOT"; chmod 750 "$RVROOT/$BOXSEAT"
 
 DREC3="$TMP/dpw-record-4664.jsonl"; : > "$DREC3"
 BOXDOM="$TMP/box.dom"; printf '%s' "$LIVE_DOM" > "$BOXDOM"
+# The page-side walk `snapshot` runs (T27k). The stub answers a snapshot
+# evaluate from this file, and it is the DAEMON that evaluates — so it has to be
+# in the environment `bserve` starts, not the caller's.
+BOXSNAP="$TMP/box-snap.json"
+jq -n --arg html "$LIVE_DOM" '{nodes:[{ref:"button/Compose", role:"button", name:"Compose", tag:"button"}],
+  marker:null, title:"Box Page", url:"https://box.test/feed", html:$html}' > "$BOXSNAP"
 bserve() {  # the OWNER serves, out of the OWNER's store
   # The daemon is a child of this serve and inherits its environment, so the
   # re-entered `bin/browser` the broker uses for leases and audit rows resolves
   # `_seat` to the OWNER — which is exactly what `holder` has to be.
   run env PATH="$SPATH" DISPLAY= NODE_PATH="$DSTUB/node_modules" PWREC="$DREC3" DPWDOM="$BOXDOM" \
-      FIVEDIVE_BROWSER_SEAT="$BOXSEAT" "$@" "$BROWSER" serve box.test
+      DPWSNAP="$BOXSNAP" FIVEDIVE_BROWSER_SEAT="$BOXSEAT" "$@" "$BROWSER" serve box.test
 }
 bstop() { env PATH="$SPATH" FIVEDIVE_BROWSER_SEAT="$BOXSEAT" "$BROWSER" serve box.test --stop; }
 # A SECOND SEAT, with no store of its own. NOT $SPATH: that PATH's chrome is the
@@ -3906,6 +4163,118 @@ t  'T27i ...with the whole evidence triple' 'yes' \
 t  'T27i ...and the metadata says what actually rendered it' 'session-daemon' \
    "$(jq -r '.capture' "$TMP/brokeread/page.meta.json" 2>/dev/null)"
 t  'T27i ...still not one chrome of its own' "$BL3" "$(blaunches)"
+
+# --- T27k DIVE-4794: a brokered `snapshot` cannot hand the owner a path -------
+#
+# THE DEFECT, measured on a box 2026-09-21. `snapshot` staged its artifacts in a
+# mktemp directory 0700 to the CALLER and named that path in the request. The
+# daemon runs as the profile's OWNER, so it could not write there, and every
+# brokered snapshot died on `EACCES: permission denied, open
+# '/tmp/5dive-browser-read.XXXX/page.html'` — the verb the skill tells an agent
+# to reach for first, dark for every seat that does not own the login, while
+# `status` and `tree` (whose data comes back over the socket) worked.
+#
+# WHY THE ARM GRADES THE REQUEST AND NOT THE ERROR. Both seats here are the same
+# uid — the suite has no second one — so the owner CAN write the caller's
+# staging directory and the EACCES cannot be reproduced by permissions. What can
+# be graded is the thing that caused it: whether a caller-chosen absolute path
+# is in the request at all. The recorder below is a `session-daemon` wrapper that
+# tees each request to a file before exec'ing the real one, so the arm reads the
+# exact bytes the daemon received.
+REQREC="$TMP/brokered-requests.jsonl"; : > "$REQREC"
+cat > "$TMP/daemon-recorder" <<REC
+#!/usr/bin/env bash
+if [[ "\$1" == call ]]; then
+  tmp=\$(mktemp); cat > "\$tmp"; cat "\$tmp" >> "$REQREC"
+  exec "$DAEMONBIN" "\$@" < "\$tmp"
+fi
+exec "$DAEMONBIN" "\$@"
+REC
+chmod +x "$TMP/daemon-recorder"
+bother env FIVEDIVE_BROWSER_SESSION_DAEMON="$TMP/daemon-recorder" \
+    "$BROWSER" snapshot box.test https://box.test/feed --out="$TMP/brokesnap"
+t  'T27k a brokered snapshot captures the page' 0 "$RC"
+t  'T27k ...and the document is on disk, written by the seat that owns the directory' 'yes' \
+   "$([[ -s "$TMP/brokesnap/page.html" ]] && echo yes || echo no)"
+t  'T27k ...and it is the DOCUMENT, not an empty file the caller made' 'yes' \
+   "$(grep -q 'id="feed"' "$TMP/brokesnap/page.html" 2>/dev/null && echo yes || echo no)"
+t  'T27k ...with the refs beside it, from the same look' 'button/Compose' \
+   "$(jq -r '.nodes[0].ref' "$TMP/brokesnap/tree.json" 2>/dev/null)"
+t  'T27k ...the daemon was asked for BYTES' 'true' \
+   "$(jq -rs '[.[]|select(.op=="snapshot")]|last|.inline' "$REQREC" 2>/dev/null)"
+t  'T27k ...and was never handed a path in the caller-owned staging directory' 'null' \
+   "$(jq -rs '[.[]|select(.op=="snapshot")]|last|.html' "$REQREC" 2>/dev/null)"
+t  'T27k ...the screenshot is not a caller-chosen path either' 'no-path' \
+   "$(jq -rs '[.[]|select(.op=="snapshot")]|last|.shot|if type=="string" then . else "no-path" end' "$REQREC" 2>/dev/null)"
+t  'T27k (control) the OWNER still gets the cheap path-writing shape' 'false' \
+   "$(env PATH="$SPATH" NODE_PATH="$DSTUB/node_modules" PWREC="$DREC3" DPWDOM="$BOXDOM" DPWSNAP="$BOXSNAP" \
+        FIVEDIVE_BROWSER_SEAT="$BOXSEAT" FIVEDIVE_BROWSER_SESSION_DAEMON="$TMP/daemon-recorder" \
+        "$BROWSER" snapshot box.test https://box.test/feed --out="$TMP/ownersnap" >/dev/null 2>&1; \
+      jq -rs '[.[]|select(.op=="snapshot")]|last|.inline' "$REQREC" 2>/dev/null)"
+bstop >/dev/null 2>&1
+
+# --- T27m DIVE-4927: a brokered lease is HELD, and a leased caller is not refused
+#
+# THE DEFECT, measured on exact-swallow 2026-09-24: a second seat's brokered
+# `read` and `run` against the box's github.com login were refused with "whoever
+# sent this did not hold [the lease]", while `lease --status` read FREE. Two
+# faults, one arm each, and a control for each:
+#   the lease was anchored to the `_broker-lease` child the daemon spawns, which
+#   exits at once — so it was dead on arrival, and `kill -0` from the owner on a
+#   caller's pid is EPERM anyway, which read as dead too;
+#   the daemon refused ANY request that arrived while another ran, including a
+#   leased caller's request landing inside an unleased `status` probe.
+bserve >/dev/null 2>&1
+sleep 60 & ANCHOR_PID=$!
+TOK="$(env PATH="$SPATH" "$DAEMONBIN" call "$BSOCK" \
+  <<<"{\"op\":\"lease\",\"act\":\"acquire\",\"purpose\":\"t27m\",\"anchor\":$ANCHOR_PID}" 2>/dev/null)"
+t  'T27m a brokered caller takes the lease' 'yes' "$([[ -n "$TOK" ]] && echo yes || echo no)"
+run env PATH="$SPATH" FIVEDIVE_BROWSER_SEAT="$BOXSEAT" "$BROWSER" lease box.test --status
+tc 'T27m ...and the OWNER sees it held, while the caller lives' 'busy: held by' "$OUT"
+tc 'T27m ...naming the seat that asked' "on behalf of $(id -un)" "$OUT"
+t  'T27m ...anchored to the caller process, not the broker child that wrote it' "$ANCHOR_PID" \
+   "$(grep '^holder_pid=' "$BDIR/.5dive-lease/meta" 2>/dev/null | cut -d= -f2)"
+kill "$ANCHOR_PID" 2>/dev/null; wait "$ANCHOR_PID" 2>/dev/null
+run env PATH="$SPATH" FIVEDIVE_BROWSER_SEAT="$BOXSEAT" "$BROWSER" lease box.test --status
+tc 'T27m (control) ...and free again once the caller is gone, with nobody releasing it' 'free' "$OUT"
+rm -rf "$BDIR/.5dive-lease"
+# The anchor is the KERNEL's to vouch for: a pid of another uid is refused.
+if [[ "$(id -u)" != 0 ]]; then
+  run env PATH="$SPATH" "$DAEMONBIN" call "$BSOCK" <<<'{"op":"lease","act":"acquire","purpose":"t27m","anchor":1}'
+  t  'T27m an anchor that is not the calling seat process is refused' 77 "$RC"
+  tc 'T27m ...saying why' 'not a process of the calling seat' "$ERR"
+  t  'T27m ...and no lease was written' 'no' "$([[ -e "$BDIR/.5dive-lease/meta" ]] && echo yes || echo no)"
+else
+  printf 'NOTE: T27m foreign-anchor arm not run (as root every pid is this uid'"'"'s to vouch for).\n'
+fi
+# THE SEAT'S OWN VERB CARRIES ITS OWN PID. Recorded through the T27k wrapper.
+: > "$REQREC"
+bother env FIVEDIVE_BROWSER_SESSION_DAEMON="$TMP/daemon-recorder" "$BROWSER" run box.test publish --body=anchored
+t  'T27m a brokered run still succeeds' 0 "$RC"
+t  'T27m ...and its acquire named an anchor pid' 'yes' \
+   "$(jq -rs '[.[]|select(.op=="lease" and .act=="acquire")]|last|.anchor|type=="number"' "$REQREC" 2>/dev/null | sed 's/true/yes/;s/false/no/')"
+bstop >/dev/null 2>&1
+
+# A LEASED caller's request landing inside an UNLEASED probe waits its turn.
+bserve DPWGOTO_MS=1500 >/dev/null 2>&1
+env PATH="$SPATH" "$DAEMONBIN" call "$BSOCK" <<<'{"op":"probe","url":"https://box.test/"}' >/dev/null 2>&1 &
+PROBE_PID=$!
+sleep 0.4
+bother "$BROWSER" run box.test publish --body=queued
+t  'T27m a brokered run that lands inside a status probe is not refused' 0 "$RC"
+tc 'T27m ...it ran once the probe finished' 'verified: publish is live' "$OUT"
+tn 'T27m ...and was not told it skipped a lease it held' 'did not hold' "$ERR"
+wait "$PROBE_PID" 2>/dev/null
+bstop >/dev/null 2>&1
+# CONTROL: the wait is BOUNDED, and a refusal past it names what is in flight.
+bserve DPWGOTO_MS=1500 FIVEDIVE_BROWSER_BUSY_WAIT_MS=200 >/dev/null 2>&1
+env PATH="$SPATH" "$DAEMONBIN" call "$BSOCK" <<<'{"op":"probe","url":"https://box.test/"}' >/dev/null 2>&1 &
+PROBE_PID=$!
+sleep 0.4
+run env PATH="$SPATH" "$DAEMONBIN" call "$BSOCK" <<<'{"op":"probe","url":"https://box.test/"}'
+t  'T27m (control) past the bound the second request is refused' 70 "$RC"
+tc 'T27m (control) ...naming the op in flight' "still busy with a 'probe' request" "$ERR"
+wait "$PROBE_PID" 2>/dev/null
 bstop >/dev/null 2>&1
 
 # --- T27j the seat override grants NOTHING, which is why it can exist ---------
@@ -3936,12 +4305,459 @@ t  'T27j (control) the same store at 0700 is usable, so the arm above graded the
       | grep -o authenticated | head -1)"
 rm -rf "$SQUAT"
 
-# --- T28 THE DEPRECATION NOTICE: in the REGISTRY MANIFEST, and there only -----
+# ================================================== T28 a ref that is not there YET
+#
+# THE DEFECT (DIVE-4674). Both step loops resolved every selector through a
+# ONE-SHOT `aria.resolveSelector` before the switch. A CSS `wait_for` then polled
+# for the whole step timeout inside page.waitForSelector; a ref `wait_for` — the
+# same instruction, written the way this plugin tells agents to write it — probed
+# for 0 ms and threw. And `run` had no settle after `goto` at all, while `tree`
+# and `snapshot` both waited 1200 ms, so `run` looked at a page roughly fifty
+# milliseconds after domcontentloaded and truthfully reported that the element
+# `tree` had just listed was not there.
+#
+# WHY THE SUITE COULD NOT SEE IT. Every fixture above answers the walk the same
+# way every time, so "resolved once" and "resolved on the fourth look" leave a
+# byte-identical tape. PWWALK_MISS (both stubs) is the missing shape: a page that
+# answers "no" N times and then "yes".
+#
+# THE LOOP EXISTS TWICE — bin/driver-playwright (cold) and bin/session-daemon
+# (warm) — so T28f grades the second one through a REAL daemon rather than
+# trusting that the same patch was applied to both.
+
+_mkwaitpkg() {  # _mkwaitpkg <dir> — a plugin tree with its own lib, mutable per arm
+  mkdir -p "$1/bin"
+  cp "$ROOT/plugins/browser/bin/driver-playwright" "$1/bin/driver-playwright"
+  cp -r "$ROOT/plugins/browser/lib" "$1/lib"
+}
+# An adapter whose SECOND step is a ref wait_for, then a plain click. The ref is
+# the shape agents are told to use and the shape the old code could not wait for.
+mkrefadapter() {  # mkrefadapter <site> <verify-url> <expect>
+  cat > "$FIVEDIVE_BROWSER_ADAPTER_DIR/$1.json" <<JSON
+{ "site": "$1",
+  "probe": { "url": "https://$1.test/feed", "logged_out_when_dom_matches": "action=\"/login\"" },
+  "actions": { "publish": {
+      "steps": [ {"op":"goto","url":"https://$1.test/compose"},
+                 {"op":"wait_for","selector":"ref=textbox/Add a comment"},
+                 {"op":"click","selector":"#pub"} ],
+      "verify": { "url": "$2", "expect": "$3" } } } }
+JSON
+}
+WAITREC="$TMP/t27-record.jsonl"
+# THE DRIVER IS GRADED DIRECTLY wherever an exit code is the claim. `run` through
+# bin/browser re-reads the verify URL OUT OF BAND when a step fails, and every
+# fixture in this file verifies against the one $TMP/artifact.html an early arm
+# wrote 'PUBLISHED' into — so an rc of 0 from the front door is equally true of a
+# tree where the step never ran. The step loop's own rc is not.
+DRVPLAN() { jq -nc --arg p "$1" --argjson st "$2" '{profile:$p, steps:$st, args:{}}'; }
+LATEDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/late.test"
+mkprofile late.test "$LIVE_DOM" >/dev/null
+mkrefadapter late.test "file://$TMP/artifact.html" 'PUBLISHED'
+unset FIVEDIVE_BROWSER_DRIVER
+
+# --- T28a a ref wait_for WAITS, and succeeds once the element arrives ---------
+: > "$WAITREC"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=3 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 \
+    "$BROWSER" run late.test publish
+t  'T28a the whole command path completes (NOT the grade: see the re-read note above)' 0 "$RC"
+WALKS="$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)]|length' "$WAITREC")"
+t  'T28a ...because the ref layer looked more than once' 'yes' \
+   "$([[ "${WALKS:-0}" -ge 4 ]] && echo yes || echo no)"
+t  'T28a ...and every look asked for the SAME ref' 'textbox/Add a comment' \
+   "$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)|.mark]|unique|join(",")' "$WAITREC")"
+t  'T28a ...then handed the resolved marker to waitForSelector, as before' \
+   '[data-5dive-ref="late-1"]' \
+   "$(jq -rs '[.[]|select(.call=="waitForSelector")|.sel]|last' "$WAITREC")"
+t  'T28a ...and the step AFTER it ran, so the action completed' 'click' \
+   "$(jq -rs '[.[]|select(.call=="click")|.call]|last' "$WAITREC")"
+# The same plan at the DRIVER, where no re-read can paper over a failed step.
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=3 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$DRV" <<<"$(DRVPLAN "$LATEDIR" '[{"op":"wait_for","selector":"ref=textbox/Add a comment"},{"op":"click","selector":"#pub"}]')" \
+    >/dev/null 2>&1; RC28A=$?
+t  'T28a THE GRADE: the driver itself exits 0 on a late ref' 0 "$RC28A"
+t  'T28a ...and the click really ran, on the tape, not on a re-read' 1 \
+   "$(jq -rs '[.[]|select(.call=="click")]|length' "$WAITREC")"
+
+# --- T28b beyond the timeout it is still a refusal, with the SAME message -----
+# The exit codes are the contract bin/browser keys on, so they are graded at the
+# driver, where they are decided, rather than through the out-of-band re-read.
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=99999 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=400 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$DRV" <<<"$(DRVPLAN "$LATEDIR" '[{"op":"wait_for","selector":"ref=textbox/Add a comment"}]')" \
+    >/dev/null 2>"$TMP/t27b.err"; RC27B=$?
+t  'T28b a ref wait_for that never arrives, as step ONE, still exits 70' 70 "$RC27B"
+tc 'T28b ...with the refMiss message unchanged, not a "timed out"' \
+   'matches nothing on this page' "$(cat "$TMP/t27b.err")"
+tc 'T28b ...and still naming what IS on the page, which is the hint an operator reads' \
+   'Refs of that role on this page' "$(cat "$TMP/t27b.err")"
+t  'T28b ...having polled rather than probed once' 'yes' \
+   "$([[ "$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)]|length' "$WAITREC")" -ge 2 ]] && echo yes || echo no)"
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=99999 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=400 FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$DRV" <<<"$(DRVPLAN "$LATEDIR" '[{"op":"goto","url":"https://late.test/c"},{"op":"wait_for","selector":"ref=textbox/Add a comment"}]')" \
+    >/dev/null 2>"$TMP/t27b2.err"; RC27B2=$?
+t  'T28b ...and exits 1, not 70, once a step has already run' 1 "$RC27B2"
+
+# --- T28c MUTANT: put the one-shot resolve back, and T28a must go red ---------
+# Non-vacuous in BOTH directions: the unmutated copy of the same package is run
+# first, so a red below is the mutation and not the fixture.
+MUTPKG="$TMP/t27-mutant"; _mkwaitpkg "$MUTPKG"
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=3 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$MUTPKG/bin/driver-playwright" \
+    <<<"$(DRVPLAN "$LATEDIR" '[{"op":"wait_for","selector":"ref=textbox/Add a comment"}]')" \
+    >/dev/null 2>&1; RC27C0=$?
+t  'T28c (anchor) the UNMUTATED copy of the package resolves the late ref' 0 "$RC27C0"
+# The mutation: wait_for stops being the op that waits — exactly the pre-fix tree.
+perl -0pi -e "s/if \(step\.op === 'wait_for'\) return resolveRefWithin\(page, sel, \{ timeoutMs, pollMs \}\);/\/* MUTANT (DIVE-4674): the one-shot resolve, restored *\//" \
+  "$MUTPKG/lib/aria.cjs"
+t  'T28c (anchor) the mutation really landed in the copy' 'yes' \
+   "$(grep -q 'MUTANT (DIVE-4674)' "$MUTPKG/lib/aria.cjs" && echo yes || echo no)"
+t  'T28c (anchor) ...and the shipped lib is untouched' 'yes' \
+   "$(grep -q 'MUTANT (DIVE-4674)' "$ROOT/plugins/browser/lib/aria.cjs" && echo no || echo yes)"
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=3 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$MUTPKG/bin/driver-playwright" \
+    <<<"$(DRVPLAN "$LATEDIR" '[{"op":"wait_for","selector":"ref=textbox/Add a comment"}]')" \
+    >/dev/null 2>"$TMP/t27c.err"; RC27C=$?
+t  'T28c MUTANT: with the one-shot resolve back, the late ref is a refusal' 70 "$RC27C"
+t  'T28c ...and it looked exactly ONCE, which is the whole defect' 1 \
+   "$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)]|length' "$WAITREC")"
+
+# --- T28d `run` settles after goto, the way tree and snapshot always did ------
+: > "$WAITREC"
+mkadapter settle.test "file://$TMP/artifact.html" 'PUBLISHED'
+mkprofile settle.test "$LIVE_DOM" >/dev/null
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" \
+    "$BROWSER" run settle.test publish --page-settle=777 --body=hi
+t  'T28d a run with --page-settle succeeds' 0 "$RC"
+t  'T28d ...and the goto is followed by a settle of exactly that many ms' '777' \
+   "$(jq -rs '[.[]|select(.call=="waitForTimeout")|.ms]|last' "$WAITREC")"
+: > "$WAITREC"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" \
+    "$BROWSER" run settle.test publish --page-settle=0 --body=hi
+t  'T28d ...and --page-settle=0 waits NOT AT ALL, rather than waiting zero' 0 \
+   "$(jq -rs '[.[]|select(.call=="waitForTimeout")]|length' "$WAITREC")"
+run env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" \
+    "$BROWSER" run settle.test publish --page-settle=abc --body=hi
+t  'T28d a --page-settle that is not milliseconds is refused here, not three processes away' 64 "$RC"
+tc 'T28d ...naming what it wanted' 'takes milliseconds' "$ERR"
+# The flag carries a DASH so it can never be mistaken for an adapter argument:
+# a placeholder name is [a-zA-Z0-9_]+, and {body} above proves adapter args still
+# arrive intact alongside it.
+t  'T28d ...and an adapter argument on the same line still reached the page' 'hi' \
+   "$(jq -rs '[.[]|select(.call=="fill")|.val]|last' "$WAITREC")"
+
+# --- T28e/f the WARM half: the settle rides in the REQUEST, and the loop polls -
+#
+# BOTH HALVES ARE GRADED THROUGH A REAL session-daemon, not through the source.
+# The daemon is a second copy of the step loop in a long-lived process that was
+# started before this command line existed — which is why an environment variable
+# set by bin/browser reaches the cold driver and nothing else, and why
+# `snapshot --settle` worked cold and was silently dropped on a served profile.
+# A text arm would pass on a tree where the knob is parsed and then thrown away.
+mkprofile latewarm.test "$LIVE_DOM" >/dev/null
+mkrefadapter latewarm.test "file://$TMP/artifact.html" 'PUBLISHED'
+: > "$DREC"
+# PROBE_SETTLE is pinned to a value nothing else here uses. `run` on a warm
+# profile asks the daemon for a liveness probe FIRST, and probeRequest has a
+# settle of its own (800 ms by default) — so an arm that just read the tape's
+# waits would grade the probe and call it the run's settle. Measured: it did.
+dserve latewarm.test PWWALK_MISS=3 FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_PROBE_SETTLE_MS=11
+t  'T28f (precondition) the warm session is up' 0 "$RC"
+LAUNCH_BEFORE="$(launches)"
+dwarm "$BROWSER" run latewarm.test publish
+t  'T28f a ref wait_for inside the WARM loop waits too' 0 "$RC"
+t  'T28f ...the daemon looked more than once' 'yes' \
+   "$([[ "$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)]|length' "$DREC")" -ge 4 ]] && echo yes || echo no)"
+t  'T28f ...and it resolved to the marker, then waited on it' '[data-5dive-ref="late-1"]' \
+   "$(jq -rs '[.[]|select(.call=="waitForSelector")|.sel]|last' "$DREC")"
+t  'T28f ...without launching a browser to do any of it' "$LAUNCH_BEFORE" "$(launches)"
+
+# The knob has to REACH that process. Each arm asks for a settle no default could
+# produce and reads back what the warm page was actually told to wait.
+: > "$DREC"
+dwarm "$BROWSER" tree latewarm.test "https://latewarm.test/x" --settle=4321 >/dev/null 2>&1
+t  'T28e tree --settle reaches the WARM session' '4321' \
+   "$(jq -rs '[.[]|select(.call=="waitForTimeout" and .ms!=11)|.ms]|last' "$DREC")"
+: > "$DREC"
+dwarm "$BROWSER" snapshot latewarm.test "https://latewarm.test/x" --out="$TMP/t27-snap" --settle=4322 >/dev/null 2>&1
+t  'T28e snapshot --settle reaches it too — it was parsed and dropped before' '4322' \
+   "$(jq -rs '[.[]|select(.call=="waitForTimeout" and .ms!=11)|.ms]|last' "$DREC")"
+: > "$DREC"
+dwarm "$BROWSER" run latewarm.test publish --page-settle=4323 >/dev/null 2>&1
+t  'T28e run --page-settle reaches it, and settles after the goto' '4323' \
+   "$(jq -rs '[.[]|select(.call=="waitForTimeout" and .ms!=11)|.ms]|last' "$DREC")"
+: > "$DREC"
+dwarm "$BROWSER" run latewarm.test publish --page-settle=0 >/dev/null 2>&1
+t  'T28e ...and a warm run with --page-settle=0 waits not at all' 0 \
+   "$(jq -rs '[.[]|select(.call=="waitForTimeout" and .ms!=11)]|length' "$DREC")"
+t  'T28e (anchor) ...and the 11ms the filter drops really is the liveness probe' 'yes' \
+   "$([[ "$(jq -rs '[.[]|select(.call=="waitForTimeout" and .ms==11)]|length' "$DREC")" -ge 1 ]] && echo yes || echo no)"
+env PATH="$SPATH" "$BROWSER" serve latewarm.test --stop >/dev/null 2>&1
+
+# --- T28g ONLY wait_for waits — the asymmetry is graded, not just asserted ----
+#
+# The row allowed either choice for fill/click/press/select/upload and asked for
+# the one taken to be STATED AND GRADED. A sentence in lib/aria.cjs is not a
+# grade: an edit that hands every op the poll — a `click` hovering for the whole
+# step timeout inside somebody's live account, the exact harm this change argues
+# against — reds nothing unless an arm counts the looks. Measured: with the
+# asymmetry deleted from the shipped lib, the whole suite still passed except
+# T28c's mutation-plumbing anchors, which are about the perl edit and not about
+# behaviour at all.
+#
+# PWWALK_MISS=1 is the smallest page that can tell the two apart: a one-shot
+# resolve looks ONCE and refuses, a polling one looks twice and proceeds. The
+# step timeout is left long on purpose, so a poll would have every chance.
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=1 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$DRV" <<<"$(DRVPLAN "$LATEDIR" '[{"op":"click","selector":"ref=textbox/Add a comment"}]')" \
+    >/dev/null 2>"$TMP/t28g.err"; RC28G=$?
+t  'T28g a ref click does not wait: it refuses on the page it was given' 70 "$RC28G"
+t  'T28g ...having looked EXACTLY ONCE, which is what the one-shot resolve means' 1 \
+   "$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)]|length' "$WAITREC")"
+tc 'T28g ...with the same refMiss text, not a timeout' 'matches nothing on this page' \
+   "$(cat "$TMP/t28g.err")"
+t  'T28g ...and nothing was clicked on the way out' 0 \
+   "$(jq -rs '[.[]|select(.call=="click")]|length' "$WAITREC")"
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=1 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$DRV" <<<"$(DRVPLAN "$LATEDIR" '[{"op":"fill","selector":"ref=textbox/Add a comment","value":"hi"}]')" \
+    >/dev/null 2>&1; RC28G2=$?
+t  'T28g a ref fill does not wait either' 70 "$RC28G2"
+t  'T28g ...one look, and nothing typed into a page that was not the one described' 1 \
+   "$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)]|length' "$WAITREC")"
+t  'T28g ...and no fill reached the page' 0 \
+   "$(jq -rs '[.[]|select(.call=="fill")]|length' "$WAITREC")"
+
+# MUTANT, in its own copy of the package: delete the asymmetry so every op polls.
+# This is the regression the arms above exist to catch, and it must flip them —
+# on BEHAVIOUR (the click now succeeds after a second look), not on plumbing.
+SYMPKG="$TMP/t28-sym-mutant"; _mkwaitpkg "$SYMPKG"
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=1 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$SYMPKG/bin/driver-playwright" \
+    <<<"$(DRVPLAN "$LATEDIR" '[{"op":"click","selector":"ref=textbox/Add a comment"}]')" \
+    >/dev/null 2>&1; RC28H0=$?
+t  'T28h (anchor) the UNMUTATED copy refuses the ref click, exactly as shipped' 70 "$RC28H0"
+perl -0pi -e "s/  if \(step\.op === 'wait_for'\) return resolveRefWithin\(page, sel, \{ timeoutMs, pollMs \}\);\n  return resolveRef\(page, sel\);/  \/* MUTANT-SYM (DIVE-4674): every op polls, the asymmetry deleted *\/\n  return resolveRefWithin(page, sel, { timeoutMs, pollMs });/" \
+  "$SYMPKG/lib/aria.cjs"
+t  'T28h (anchor) the mutation really landed in the copy' 'yes' \
+   "$(grep -q 'MUTANT-SYM (DIVE-4674)' "$SYMPKG/lib/aria.cjs" && echo yes || echo no)"
+t  'T28h (anchor) ...and the shipped lib still only gives the poll to wait_for' 'yes' \
+   "$(grep -q "if (step.op === 'wait_for') return resolveRefWithin" "$ROOT/plugins/browser/lib/aria.cjs" && echo yes || echo no)"
+: > "$WAITREC"
+env NODE_PATH="$PWROOT/node_modules" PWREC="$WAITREC" PWWALK_MISS=1 \
+    FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_CHROME=/bin/true \
+    "$SYMPKG/bin/driver-playwright" \
+    <<<"$(DRVPLAN "$LATEDIR" '[{"op":"click","selector":"ref=textbox/Add a comment"}]')" \
+    >/dev/null 2>&1; RC28H=$?
+t  'T28h MUTANT: with every op polling, the ref click stops refusing' 0 "$RC28H"
+t  'T28h ...because it looked a SECOND time — the count is the whole difference' 2 \
+   "$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)]|length' "$WAITREC")"
+t  'T28h ...and the click it should never have reached went through' 1 \
+   "$(jq -rs '[.[]|select(.call=="click")]|length' "$WAITREC")"
+
+# --- T28i the WARM loop holds the same asymmetry ------------------------------
+# The daemon is the second copy of the step loop, so the choice has to be graded
+# there too or half the product is ungraded. Its walk counter lives in a process
+# that outlives the command, so this is the FIRST ref walk of a FRESH session.
+mkprofile clickwarm.test "$LIVE_DOM" >/dev/null
+cat > "$FIVEDIVE_BROWSER_ADAPTER_DIR/clickwarm.test.json" <<'JSON'
+{ "site": "clickwarm.test",
+  "probe": { "url": "https://clickwarm.test/feed", "logged_out_when_dom_matches": "action=\"/login\"" },
+  "actions": { "publish": {
+      "steps": [ {"op":"goto","url":"https://clickwarm.test/compose"},
+                 {"op":"click","selector":"ref=textbox/Add a comment"} ],
+      "verify": { "url": "https://clickwarm.test/feed", "expect": "posts" } } } }
+JSON
+dserve clickwarm.test PWWALK_MISS=1 FIVEDIVE_BROWSER_STEP_TIMEOUT=8000 FIVEDIVE_BROWSER_PROBE_SETTLE_MS=11
+t  'T28i (precondition) the warm session is up' 0 "$RC"
+: > "$DREC"
+dwarm "$BROWSER" run clickwarm.test publish >/dev/null 2>&1
+t  'T28i the WARM loop does not wait for a ref click either: exactly one look' 1 \
+   "$(jq -rs '[.[]|select(.call=="evaluate" and .mark!=null)]|length' "$DREC")"
+t  'T28i ...and no click reached the warm page' 0 \
+   "$(jq -rs '[.[]|select(.call=="click")]|length' "$DREC")"
+env PATH="$SPATH" "$BROWSER" serve clickwarm.test --stop >/dev/null 2>&1
+
+
+# ============ T29 DIVE-4794: a probe that reads the shell cannot classify an SPA
+#
+# THE DEFECT, measured on a box 2026-09-21. Telegram Web ships ONE static shell
+# for both login states — `has-auth-pages` on <body> in the bytes the server
+# sends — and removes it in JavaScript once its own network init decides it is
+# logged in. The probe dumped the DOM at domcontentloaded plus a fixed settle,
+# which is before that decision, so a LIVE session and a DEAD one were identical
+# in every field a marker could read. An adapter written against the shell then
+# stamped `expired` on a live login and every acting verb refused; the fail-open
+# alternative (mark on the sign-in CONTENT) read `authenticated` on a cold
+# expired profile. No regex separates two identical documents — the missing
+# thing was the WAIT, and something POSITIVE to wait for.
+#
+# The mutants these arms exist to kill:
+#   drop the retry loop        -> T29a: the page that decides late reads UNKNOWN.
+#   wait, but keep inferring   -> T29c: a page that never speaks reads
+#                                 `authenticated` by elimination, which is the
+#                                 fail-open shape flagged on the row.
+#   wait on EVERY adapter      -> T29f: the server-rendered control pays a second
+#                                 load it does not need.
+#   test logged-in first       -> T29d/T29e: a dead session, and a challenge,
+#                                 both classified as a live login.
+SHELL_DOM='<html><body class="animation-level-2 has-auth-pages rounded-sections"><div id="auth-pages"></div></body></html>'
+CHATLIST_DOM='<html><body class="animation-level-2"><div class="chatlist custom-scroll"><div class="chatlist-chat">a chat</div></div></body></html>'
+SIGNIN_DOM='<html><body class="has-auth-pages"><div id="auth-pages"><div class="page-signQR">Log in to Telegram by QR Code</div></div></body></html>'
+spa_adapter() {  # spa_adapter <site> [--no-positive]
+  local pos='"logged_in_when_dom_matches": "class=\"[^\"]*chatlist",'
+  [[ "${2:-}" == --no-positive ]] && pos=''
+  cat > "$FIVEDIVE_BROWSER_ADAPTER_DIR/$1.json" <<JSON
+{ "site": "$1",
+  "probe": { "url": "https://$1/k/",
+             $pos
+             "logged_out_when_dom_matches": "(page-signQR|auth-qr-form)" },
+  "actions": {} }
+JSON
+}
+spaprobe() { run env FIVEDIVE_BROWSER_PROBE_WAIT_MS=1500 FIVEDIVE_BROWSER_PROBE_POLL_MS=300 "$BROWSER" status "$1"; }
+loads() { cat "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/$1/.fake-n" 2>/dev/null || echo 0; }
+
+# --- T29a the page that has not decided yet is waited for ---------------------
+SPAD="$(mkprofile spa.test "$SHELL_DOM")"
+printf '%s' "$SHELL_DOM"    > "$SPAD/.fake-dom.1"
+printf '%s' "$CHATLIST_DOM" > "$SPAD/.fake-dom.2"
+spa_adapter spa.test
+spaprobe spa.test
+tc 'T29a a session whose page decides after the first look reads AUTHENTICATED' 'authenticated' "$OUT"
+t  'T29a ...quietly, because a live session is not an alert' 0 "$RC"
+t  'T29a ...and the only reason it could was that the probe looked AGAIN' 2 "$(loads spa.test)"
+
+# --- T29b ...and the verdict is the LIVENESS FILE's too, not just the print ---
+t  'T29b the tile remembers a live session, not the shell it saw first' 'authenticated' \
+   "$(awk '{print $2}' "$SPAD/.5dive-liveness" 2>/dev/null | tail -1)"
+
+# --- T29c a page that never says anything is UNKNOWN, NEVER authenticated -----
+SILD="$(mkprofile spasilent.test "$SHELL_DOM")"
+printf '%s' "$SHELL_DOM" > "$SILD/.fake-dom.1"
+printf '%s' "$SHELL_DOM" > "$SILD/.fake-dom.2"
+spa_adapter spasilent.test
+spaprobe spasilent.test
+tc 'T29c a page that never shows either marker is UNKNOWN' 'UNKNOWN' "$OUT"
+tn 'T29c ...and is NOT called authenticated by elimination' 'authenticated' "$OUT"
+t  'T29c ...quietly: a state we cannot read must not page a person' 0 "$RC"
+t  'T29c ...it really did spend the budget looking' 'waited' \
+   "$([[ "$(loads spasilent.test)" -ge 2 ]] && echo waited || echo "looked once")"
+run env FIVEDIVE_BROWSER_PROBE_WAIT_MS=900 FIVEDIVE_BROWSER_PROBE_POLL_MS=300 \
+    "$BROWSER" shot spasilent.test https://spasilent.test/k/ --out="$TMP/spasilent.png"
+tn 'T29c ...and the fail-closed half holds: `shot` refuses on UNKNOWN' 0 "$RC"
+t  'T29c ...writing no evidence at all' 'no' \
+   "$([[ -e "$TMP/spasilent.png" ]] && echo yes || echo no)"
+
+# --- T29d the logged-out marker still outranks the positive one ---------------
+DEADD="$(mkprofile spadead.test "$SIGNIN_DOM")"
+spa_adapter spadead.test
+spaprobe spadead.test
+tc 'T29d a rendered sign-in page is expired, and it names a person' 'session expired' "$OUT"
+t  'T29d ...loudly, with the status a caller can branch on, not a quiet 0' 75 "$RC"
+BOTHD="$(mkprofile spaboth.test "$SIGNIN_DOM$CHATLIST_DOM")"
+spa_adapter spaboth.test
+spaprobe spaboth.test
+tc 'T29d ...and a document carrying BOTH markers is read as the dead one' 'session expired' "$OUT"
+
+# --- T29e a challenge is still classified first -------------------------------
+CHD="$(mkprofile spachal.test "<html><body><div class=\"g-recaptcha\"></div><div class=\"chatlist\">x</div></body></html>")"
+spa_adapter spachal.test
+spaprobe spachal.test
+tc 'T29e a challenge page is a challenge even when the chatlist is behind it' 'CHALLENGE' "$OUT"
+
+# --- T29f (CONTROL) an adapter with no positive marker is UNCHANGED -----------
+# The wait is not free — it is another whole chrome launch — and this is the arm
+# that keeps it off every server-rendered adapter we already ship.
+LEGD="$(mkprofile legacy4794.test "$LIVE_DOM")"
+printf '%s' "$LIVE_DOM" > "$LEGD/.fake-dom.1"
+printf '%s' "$DEAD_DOM" > "$LEGD/.fake-dom.2"
+spa_adapter legacy4794.test --no-positive
+spaprobe legacy4794.test
+tc 'T29f (control) a site that classifies on the negative alone still reads authenticated' 'authenticated' "$OUT"
+t  'T29f (control) ...in exactly ONE load: no adapter pays for a wait it cannot use' 1 "$(loads legacy4794.test)"
+
+# --- T29g the shipped Telegram adapter, graded against both documents ---------
+# The markers are a public surface and this is the only place they are checked
+# against the two renders they were read off. Both halves matter, and in
+# opposite directions: a positive marker that matches the SHELL manufactures the
+# exact lie `shot` and `run` exist to refuse.
+TGA="$ROOT/plugins/browser/adapters/web.telegram.org.json"
+run jq -e . "$TGA";                                            t 'T29g the adapter is valid JSON' 0 "$RC"
+t  'T29g it probes the K app, not the bare host' 'https://web.telegram.org/k/' "$(jq -r '.probe.url' "$TGA")"
+TGIN="$(jq -r '.probe.logged_in_when_dom_matches' "$TGA")"
+TGOUT="$(jq -r '.probe.logged_out_when_dom_matches' "$TGA")"
+t  'T29g it names what a LOGGED-IN page looks like' 'yes' "$([[ -n "$TGIN" && "$TGIN" != null ]] && echo yes || echo no)"
+t  'T29g the logged-in marker matches the settled chatlist' 'match' \
+   "$(grep -qiE "$TGIN" <<<"$CHATLIST_DOM" && echo match || echo miss)"
+t  'T29g ...and does NOT match the static shell both states ship' 'miss' \
+   "$(grep -qiE "$TGIN" <<<"$SHELL_DOM" && echo match || echo miss)"
+t  'T29g the logged-out marker matches the rendered sign-in page' 'match' \
+   "$(grep -qiE "$TGOUT" <<<"$SIGNIN_DOM" && echo match || echo miss)"
+t  'T29g ...and does NOT match a live chatlist' 'miss' \
+   "$(grep -qiE "$TGOUT" <<<"$CHATLIST_DOM" && echo match || echo miss)"
+t  'T29g NEITHER marker keys on the shell, which is the whole defect' 'miss miss' \
+   "$(grep -qiE "$TGOUT" <<<"$SHELL_DOM" && printf match || printf miss; printf ' '; \
+      grep -qiE "$TGIN" <<<"$SHELL_DOM" && printf match || printf miss)"
+t  'T29g the unmeasured half is NAMED in the file, not silently shipped' 'yes' \
+   "$(jq -r '._comment' "$TGA" | grep -qi 'UNVERIFIED\|half-measured' && echo yes || echo no)"
+
+# ============ T30 DIVE-4794: the client half exited before stdout was flushed
+#
+# THE DEFECT, measured on a box 2026-09-21: a brokered `read` of a real page
+# came back as `jq: parse error: Unfinished string at EOF`. `callMode` wrote the
+# payload to stdout and then called `process.exit(rc)` on the `end` frame —
+# stdout is a PIPE for every caller (bin/browser runs it inside `$( … )`), a
+# pipe write past the OS buffer is queued rather than done, and `process.exit`
+# drops what is queued. So a capture that SUCCEEDED arrived truncated, and the
+# verb died on it. Invisible to every arm whose payload fits in the buffer,
+# which is why this one is deliberately two megabytes.
+BIGSOCK="$TMP/big.sock"
+cat > "$TMP/bigserve.js" <<'JS'
+const net = require('net'), fs = require('fs');
+const sock = process.argv[2], n = Number(process.argv[3]);
+try { fs.unlinkSync(sock); } catch (e) {}
+const srv = net.createServer((c) => {
+  c.once('data', () => {
+    c.write(JSON.stringify({ t: 'out', data: 'x'.repeat(n) + '\n' }) + '\n');
+    c.write(JSON.stringify({ t: 'end', rc: 0 }) + '\n');
+  });
+});
+srv.listen(sock, () => process.stdout.write('ready\n'));
+setTimeout(() => process.exit(0), 30000);
+JS
+node "$TMP/bigserve.js" "$BIGSOCK" 2000000 >"$TMP/bigserve.out" 2>&1 &
+BIGPID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -S "$BIGSOCK" ]] && break; sleep 0.2; done
+BIGBYTES="$("$DAEMONBIN" call "$BIGSOCK" <<<'{"op":"ping"}' | wc -c)"
+t  'T30a a two-megabyte payload arrives WHOLE through the client half' 2000001 "$BIGBYTES"
+BIGRC=0; "$DAEMONBIN" call "$BIGSOCK" <<<'{"op":"ping"}' >/dev/null || BIGRC=$?
+t  'T30a ...and the daemon-s own exit code still comes back' 0 "$BIGRC"
+kill "$BIGPID" 2>/dev/null; rm -f "$BIGSOCK"
+
+
+# --- TR28 THE DEPRECATION NOTICE: in the REGISTRY MANIFEST, and there only -----
+# (Labelled T28 until DIVE-4927. The upstream harness this file mirrors took
+# T28 for the late-ref wait, so the registry-only arms are TR28 now.)
 #
 # WHY THIS BLOCK EXISTS, AND WHY ITS SUBJECT MOVED (DIVE-4691 -> DIVE-4835).
 # DIVE-4691 turned this registry entry into a deprecation stub and shipped the
 # notice as a `_deprecated()` line inside `bin/browser`; `grep -ri deprecat
-# tests/` came back empty when it did, so T28 was written to hold that line in
+# tests/` came back empty when it did, so TR28 was written to hold that line in
 # place against the next edit to the case statement. It then did its job:
 # DIVE-4835 deleted the line and CI, not a reviewer, is what said so.
 #
@@ -3963,7 +4779,7 @@ rm -rf "$SQUAT"
 # sees the migrate-away line at runtime.
 #
 # The old runtime line is still the STRING these arms grade — as the thing that
-# must not come back INSIDE the mirror — and T28c puts it back in a throwaway
+# must not come back INSIDE the mirror — and TR28c puts it back in a throwaway
 # copy of the tree so that every "it is not there" below is measured by a probe
 # shown to find it when it is. With the line deleted outright, "not found" is
 # also what a broken grep, a misspelled pattern and a binary that never ran all
@@ -3976,41 +4792,41 @@ _bentry()       { jq -r '.plugins[]|select(.name=="browser")|.description' "$MAR
 _notice_files() { grep -RIl -- "$NOTICEPAT" "$1" 2>/dev/null | wc -l | tr -d '[:space:]'; }
 mkprofile deprnotice.test "$LIVE_DOM" >/dev/null
 
-# --- T28a the notice IS in the registry manifest, and it is what goes red -----
+# --- TR28a the notice IS in the registry manifest, and it is what goes red -----
 # Three things a stranded box needs, and they are graded separately because a
 # notice that says only "deprecated" leaves an operator with nowhere to go: that
 # this copy is deprecated, where the plugin ships from now, and that migrating is
 # REMOVE-then-ADD (the CLI refuses two plugins claiming the `browser` verb, so a
 # reader who adds first is simply refused — TRAP C on the row).
-tc 'T28a the marketplace entry marks this copy deprecated' 'DEPRECATED' "$(_bentry)"
-tc 'T28a ...and names where the plugin ships from now' \
+tc 'TR28a the marketplace entry marks this copy deprecated' 'DEPRECATED' "$(_bentry)"
+tc 'TR28a ...and names where the plugin ships from now' \
    '5dive plugin add 5dive-ai/5dive-browser' "$(_bentry)"
-tc 'T28a ...and the remove that has to come first' \
+tc 'TR28a ...and the remove that has to come first' \
    'plugin remove browser@5dive-plugins' "$(_bentry)"
 # Control: these read THIS entry, not the file. Another plugin in the same
 # manifest must come back unmarked, or the three arms above would pass on a
 # notice attached to anything at all.
-t 'T28a (control) no other entry in the manifest is marked deprecated' '0' \
+t 'TR28a (control) no other entry in the manifest is marked deprecated' '0' \
   "$(jq -r '[.plugins[]|select(.name!="browser" and (.description|test("DEPRECATED")))]|length' "$MARKET")"
 
-# --- T28b the notice sits where a PORT CANNOT OVERWRITE IT --------------------
+# --- TR28b the notice sits where a PORT CANNOT OVERWRITE IT --------------------
 # This is the structural half and the whole reason it moved. The next port is
 # `rsync -a --delete <upstream>/browser/ plugins/browser/`; everything inside
 # that destination is replaced wholesale by a tree that has never heard of this
 # registry. The file carrying the notice must therefore sit OUTSIDE the directory
 # the marketplace entry points at.
 SRCDIR="$ROOT/$(jq -r '.plugins[]|select(.name=="browser")|.source' "$MARKET" | sed 's|^\./||')"
-t 'T28b (control) the entry source really is the mirrored directory' 'yes' \
+t 'TR28b (control) the entry source really is the mirrored directory' 'yes' \
   "$([[ "$SRCDIR" -ef "$MIRROR" ]] && echo yes || echo no)"
-t 'T28b the notice lives outside it, where a port cannot reach' 'yes' \
+t 'TR28b the notice lives outside it, where a port cannot reach' 'yes' \
   "$([[ "$MARKET" != "$SRCDIR"/* ]] && echo yes || echo no)"
-t 'T28b and no copy of the old runtime notice survives inside the mirror' '0' \
+t 'TR28b and no copy of the old runtime notice survives inside the mirror' '0' \
   "$(_notice_files "$MIRROR")"
 
-# --- T28c THE MUTANT: the same probes against a tree that DOES carry the line --
+# --- TR28c THE MUTANT: the same probes against a tree that DOES carry the line --
 # The deleted line, put back in a throwaway copy of the mirror and printed on
 # BOTH streams, so one mutant controls both directions. Every arm here is a
-# control for a negative in T28b/T28d: if any of these fails to see the line, the
+# control for a negative in TR28b/TR28d: if any of these fails to see the line, the
 # corresponding "it is absent" arm is measuring nothing.
 MUT="$TMP/mirror-mutant"
 rm -rf "$MUT"; cp -a "$MIRROR" "$MUT"
@@ -4022,38 +4838,38 @@ i = src.index('set -uo pipefail')      # the first statement, ahead of any dispa
 src[i + 1:i + 1] = ["echo '%s' >&2" % line, "echo '%s'" % line]
 open(path, 'w').write('\n'.join(src))
 PY
-t  'T28c (control) the mutant tree was built and is runnable' 'yes' \
+t  'TR28c (control) the mutant tree was built and is runnable' 'yes' \
    "$([[ -x "$MUT/bin/browser" ]] && echo yes || echo no)"
-t  'T28c (control) the file detector FINDS the line when a tree carries it' '1' \
+t  'TR28c (control) the file detector FINDS the line when a tree carries it' '1' \
    "$(_notice_files "$MUT")"
 run bash "$MUT/bin/browser" ls
-tc 'T28c (control) ...and running the mutant puts it on stderr' "$OLDNOTICE" "$ERR"
-tc 'T28c (control) ...and on stdout, so the stdout arms below can see one too' \
+tc 'TR28c (control) ...and running the mutant puts it on stderr' "$OLDNOTICE" "$ERR"
+tc 'TR28c (control) ...and on stdout, so the stdout arms below can see one too' \
    "$OLDNOTICE" "$OUT"
 
-# --- T28d no verb of the SHIPPED script carries it, on either stream ----------
+# --- TR28d no verb of the SHIPPED script carries it, on either stream ----------
 # The two human verbs are graded alongside the parsed ones now: `--help` and
 # `status` are where the line used to print, so they are where a re-added
 # divergence shows up first. Each negative keeps its control proving the verb
 # dispatched and spoke — an absence measured on a command that never ran grades
 # nothing, which is the other way this block could have gone vacuous.
 run bash "$BROWSER" --help
-t  'T28d --help still exits 0' 0 "$RC"
-tn 'T28d --help carries no notice on stderr' "$NOTICEPAT" "$ERR"
-tn 'T28d ...nor on the stdout a person pipes' "$NOTICEPAT" "$OUT"
-tc 'T28d (control) ...while the usage itself DID come out on stdout' '5dive browser' "$OUT"
+t  'TR28d --help still exits 0' 0 "$RC"
+tn 'TR28d --help carries no notice on stderr' "$NOTICEPAT" "$ERR"
+tn 'TR28d ...nor on the stdout a person pipes' "$NOTICEPAT" "$OUT"
+tc 'TR28d (control) ...while the usage itself DID come out on stdout' '5dive browser' "$OUT"
 
 run bash "$BROWSER" status deprnotice.test
-tn 'T28d status carries none on stderr' "$NOTICEPAT" "$ERR"
-tn 'T28d ...and none on its stdout' "$NOTICEPAT" "$OUT"
-tc 'T28d (control) ...and status really ran, all the way through the probe' \
+tn 'TR28d status carries none on stderr' "$NOTICEPAT" "$ERR"
+tn 'TR28d ...and none on its stdout' "$NOTICEPAT" "$OUT"
+tc 'TR28d (control) ...and status really ran, all the way through the probe' \
    'deprnotice.test' "$OUT"
 
 for _v in tree read snapshot run shot; do
   run bash "$BROWSER" "$_v"
-  tn "T28d $_v: none on the stdout a caller parses" "$NOTICEPAT" "$OUT"
-  tn "T28d $_v: none on its stderr either, which scripts read too" "$NOTICEPAT" "$ERR"
-  tc "T28d (control) $_v: ...and it really dispatched and spoke for itself" \
+  tn "TR28d $_v: none on the stdout a caller parses" "$NOTICEPAT" "$OUT"
+  tn "TR28d $_v: none on its stderr either, which scripts read too" "$NOTICEPAT" "$ERR"
+  tc "TR28d (control) $_v: ...and it really dispatched and spoke for itself" \
      "usage: 5dive browser $_v" "$ERR"
 done
 unset _v
@@ -4062,11 +4878,11 @@ unset _v
 # stdout case with a stream that actually has content in it rather than an empty
 # one — an absence proved on no output is not an absence.
 run bash "$BROWSER" ls
-t  'T28d ls: exits 0' 0 "$RC"
-tc 'T28d (control) ls: ...and it listed the store, so this stdout is real' \
+t  'TR28d ls: exits 0' 0 "$RC"
+tc 'TR28d (control) ls: ...and it listed the store, so this stdout is real' \
    'deprnotice.test' "$OUT"
-tn 'T28d ls: no notice in that listing' "$NOTICEPAT" "$OUT"
-tn 'T28d ls: none on its stderr either' "$NOTICEPAT" "$ERR"
+tn 'TR28d ls: no notice in that listing' "$NOTICEPAT" "$OUT"
+tn 'TR28d ls: none on its stderr either' "$NOTICEPAT" "$ERR"
 rm -rf "$MUT"
 
 # ============ T29 DIVE-4791: `served` (what is up) and `forget` (the way out) ==
