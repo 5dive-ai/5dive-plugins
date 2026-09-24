@@ -2618,7 +2618,10 @@ cmd_serve() {
     dsock="$(_serve_sock_path "$site" "$dir")"
     [[ "$dsock" == "$dir/"* ]] || dbroker=--broker
     rm -f "$dsock"
+    # The start URL is the cold path's last argument below, handed to the daemon
+    # so a warm serve opens the SITE and not about:blank (DIVE-4944).
     DISPLAY=":$disp" FIVEDIVE_BROWSER_CHROME="$chrome_path" \
+      FIVEDIVE_BROWSER_START_URL="$(_site_url "$site")" \
       "$daemon" serve "$dir" "$dsock" $dbroker >"$rdy" 2>"$derr" &
     dpid=$!
     # READY IS A LINE THE DAEMON PRINTS WHEN THE CONTEXT IS OPEN AND THE SOCKET

@@ -3475,8 +3475,13 @@ const first = mkpage('first');
 exports.chromium = {
   launchPersistentContext: async (profile, opts) => {
     rec({ call: 'launch', profile, args: opts.args, headless: opts.headless,
+          sandbox: opts.chromiumSandbox === true,
           xdg: process.env.XDG_CONFIG_HOME === undefined ? '<unset>' : process.env.XDG_CONFIG_HOME });
     if (process.env.DPWNOLAUNCH) throw new Error('stub: this box cannot open the profile');
+    // DPWSANDBOXFAIL: a box where Chrome will not start sandboxed (DIVE-4944, T31c).
+    if (process.env.DPWSANDBOXFAIL && opts.chromiumSandbox === true) {
+      throw new Error('stub: No usable sandbox!');
+    }
     return { pages: () => [first], newPage: async () => mkpage('extra'), close: async () => rec({ call: 'close' }) };
   },
 };
@@ -3567,6 +3572,9 @@ dserve warm.test
 WPID="$(dkv "$WDIR/.5dive-serve" daemon_pid)"
 LB="$(launches)"
 CB="$(jq -rs '[.[]|select(.call=="close")]|length' "$DREC")"
+# Since DIVE-4944 `serve` itself loads the site into the first tab, so the step
+# order below is read from what the RUN wrote, not from the whole record.
+N25C="$(wc -l < "$DREC")"
 dwarm "$BROWSER" run warm.test publish --body=hello
 t  'T25c a run through the warm session succeeds' 0 "$RC"
 tc 'T25c ...and the verdict is still the out-of-band re-read' 'verified: publish is live' "$OUT"
@@ -3577,7 +3585,7 @@ t  'T25c ...it was never stopped and restarted' 'yes' \
 # THE POINT OF THE WHOLE ROW, as a number: not one new browser was launched.
 t  'T25c ...and NOT ONE Chrome was launched to do it' "$LB" "$(launches)"
 t  'T25c ...the steps reached the page, in order' 'goto fill click' \
-   "$(jq -rs '[.[]|select(.kind=="first")|select(.call|IN("goto","fill","click"))|.call]|join(" ")' "$DREC")"
+   "$(tail -n +"$(( N25C + 1 ))" "$DREC" | jq -rs '[.[]|select(.kind=="first")|select(.call|IN("goto","fill","click"))|.call]|join(" ")')"
 t  'T25c ...with the caller argument substituted as a VALUE' 'hello' \
    "$(jq -rs '[.[]|select(.call=="fill")|.val]|last' "$DREC")"
 t  'T25c ...and the session was NOT closed when the command finished' "$CB" \
@@ -3710,6 +3718,51 @@ t  'T25i ...the socket is gone with it, wherever serve had put it' 'no' \
 tc 'T25i ...and it was ASKED to go before it was killed' 'shutdown' \
    "$(sed -n '/^cmd_serve/,/^}/p' "$BROWSER")"
 tc 'T25i ...the profile is still reported as the durable half' 'profile is untouched' "$OUT"
+
+# --- T31 a warm serve OPENS THE SITE, sandboxed (DIVE-4944) -------------------
+# lodar, old-clay, 2026-09-24: the viewer showed about:blank under a "--no-sandbox"
+# warning bar. The daemon was launched with no start URL (the cold path passed
+# one) and with the sandbox off. Each arm reads only the records THIS serve wrote.
+since() { tail -n +"$(( $1 + 1 ))" "$DREC"; }
+N0="$(wc -l < "$DREC")"
+dserve warm.test
+t  'T31a a warm serve still comes up' 0 "$RC"
+tc 'T31a ...as a warm session' 'warm session' "$OUT"
+t  'T31a ...and its first tab is sent to the SITE, not left on about:blank' \
+   'https://warm.test.test/feed' \
+   "$(since "$N0" | jq -rs '[.[]|select(.call=="goto" and .kind=="first")]|first|.url // "none"')"
+if [[ "$(id -u)" == 0 ]]; then T31_SB=false; T31_NS=1; else T31_SB=true; T31_NS=0; fi
+t  'T31b ...Chrome is launched sandboxed unless this runs as root' "$T31_SB" \
+   "$(since "$N0" | jq -rs '[.[]|select(.call=="launch")]|last|.sandbox')"
+t  'T31b ...and --no-sandbox is passed only when it is not' "$T31_NS" \
+   "$(since "$N0" | jq -rs '[.[]|select(.call=="launch")]|last|[.args[]?|select(.=="--no-sandbox")]|length')"
+env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+
+# A box where the sandbox will not start keeps its session: one retry without it,
+# and the reason is written down instead of the browser being lost.
+if [[ "$(id -u)" != 0 ]]; then
+  N0="$(wc -l < "$DREC")"
+  dserve warm.test DPWSANDBOXFAIL=1
+  t  'T31c a box whose Chrome will not start sandboxed still gets a warm session' 0 "$RC"
+  tc 'T31c ...a warm one, not the cold fallback' 'warm session' "$OUT"
+  t  'T31c ...by exactly one retry, sandboxed first and then without it' 'true false' \
+     "$(since "$N0" | jq -rs '[.[]|select(.call=="launch")|.sandbox|tostring]|join(" ")')"
+  tc 'T31c ...and the reason is kept in the daemon log' 'without the sandbox' \
+     "$(cat "$WDIR/.5dive-session.err" 2>/dev/null)"
+  env PATH="$SPATH" "$BROWSER" serve warm.test --stop >/dev/null 2>&1
+fi
+
+# Only http(s) is opened. An adapter is a public surface, so its probe URL is
+# not trusted to point the person's browser at a local file.
+mkprofile file.test "$LIVE_DOM" >/dev/null
+printf '{ "site": "file.test", "probe": { "url": "file:///etc/hostname" }, "actions": {} }\n' \
+  > "$FIVEDIVE_BROWSER_ADAPTER_DIR/file.test.json"
+N0="$(wc -l < "$DREC")"
+dserve file.test
+t  'T31d a non-http start URL still serves' 0 "$RC"
+t  'T31d ...but the first tab is not sent to it' 'none' \
+   "$(since "$N0" | jq -rs '[.[]|select(.call=="goto" and .kind=="first")]|first|.url // "none"')"
+env PATH="$SPATH" "$BROWSER" serve file.test --stop >/dev/null 2>&1
 
 # --- T25j a second caller mid-request waits a BOUNDED time, then is refused ----
 # DIVE-4927 replaced the on-the-spot refusal with a bounded wait; the behaviour
@@ -5025,157 +5078,157 @@ actenv() { env FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" FIVEDIVE_BROWSER_SESSION_ROO
                NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$W31" "$@"; }
 STAR='[{"op":"click","selector":"ref=button/Star"}]'
 
-# --- T31a zero connected sites: read + act on a public page -------------------
+# --- T32a zero connected sites: read + act on a public page -------------------
 : > "$PWREC"
 run actenv "$BROWSER" act "https://public-web.test/repo" --steps="$STAR" --out="$TMP/act31a"
-t  'T31a act on a public page exits 0 on a box with no profiles' 0 "$RC"
-t  'T31a ...it ran in the public profile, not a login' "$P31/$SEAT/_public" \
+t  'T32a act on a public page exits 0 on a box with no profiles' 0 "$RC"
+t  'T32a ...it ran in the public profile, not a login' "$P31/$SEAT/_public" \
    "$(jq -rs '[.[]|select(.call=="launch")|.profile]|first' "$PWREC")"
-t  'T31a ...the steps reached the page: the goto, then the click' 'goto click' \
+t  'T32a ...the steps reached the page: the goto, then the click' 'goto click' \
    "$(jq -rs '[.[]|select(.call|IN("goto","click"))|.call]|join(" ")' "$PWREC")"
-t  'T31a ...and the page after the steps was re-read to disk' 'yes' \
+t  'T32a ...and the page after the steps was re-read to disk' 'yes' \
    "$([[ -s "$TMP/act31a/page.html" && -s "$TMP/act31a/after.json" ]] && echo yes || echo no)"
-tc 'T31a ...with no --expect it says nothing re-graded it' 'Nothing re-graded it' "$OUT"
+tc 'T32a ...with no --expect it says nothing re-graded it' 'Nothing re-graded it' "$OUT"
 run actenv env PATH="$READPATH" READARGV="$TMP/r31-argv" READ_HTML="$READHTML" "$BROWSER" \
     read "https://public-web.test/article/1" --out="$TMP/read31a"
-t  'T31a read of a public page exits 0 on the same box' 0 "$RC"
-tc 'T31a ...and extracted the page' 'useful authenticated article content' "$(cat "$TMP/read31a/page.md" 2>/dev/null)"
+t  'T32a read of a public page exits 0 on the same box' 0 "$RC"
+tc 'T32a ...and extracted the page' 'useful authenticated article content' "$(cat "$TMP/read31a/page.md" 2>/dev/null)"
 run actenv "$BROWSER" ls
-tn 'T31a the public profile is not listed as a connected site' '_public' "$OUT"
+tn 'T32a the public profile is not listed as a connected site' '_public' "$OUT"
 # the mutant: a <site> is required again (the dispatcher's URL route removed)
-MUT31="$TMP/browser-noroute"
-sed 's|^  read\|links\|shot\|snapshot\|tree\|act)$|  __never_routed__)|' "$BROWSER" > "$MUT31"; chmod +x "$MUT31"
-t  'T31a mutant applied' yes "$(cmp -s "$MUT31" "$BROWSER" && echo no || echo yes)"
-run actenv "$MUT31" act "https://public-web.test/repo" --steps="$STAR"
-t  'T31a MUTANT (no URL route): the zero-site box cannot act' yes "$([[ "$RC" != 0 ]] && echo yes || echo no)"
+MUT32="$TMP/browser-noroute"
+sed 's|^  read\|links\|shot\|snapshot\|tree\|act)$|  __never_routed__)|' "$BROWSER" > "$MUT32"; chmod +x "$MUT32"
+t  'T32a mutant applied' yes "$(cmp -s "$MUT32" "$BROWSER" && echo no || echo yes)"
+run actenv "$MUT32" act "https://public-web.test/repo" --steps="$STAR"
+t  'T32a MUTANT (no URL route): the zero-site box cannot act' yes "$([[ "$RC" != 0 ]] && echo yes || echo no)"
 
-# --- T31b/c a connected site with no adapter ----------------------------------
+# --- T32b/c a connected site with no adapter ----------------------------------
 d=$(FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" mkprofile noadapter.test "$LIVE_DOM")
 : > "$PWREC"
 run actenv "$BROWSER" act "https://noadapter.test/x" --steps="$STAR" --out="$TMP/act31b"
-t  'T31b a live no-adapter login proceeds' 0 "$RC"
-t  'T31b ...in that login, not the public profile' "$d" "$(jq -rs '[.[]|select(.call=="launch")|.profile]|first' "$PWREC")"
-tc 'T31b ...and says no adapter confirmed the login' 'no adapter confirmed the noadapter.test login' "$ERR"
+t  'T32b a live no-adapter login proceeds' 0 "$RC"
+t  'T32b ...in that login, not the public profile' "$d" "$(jq -rs '[.[]|select(.call=="launch")|.profile]|first' "$PWREC")"
+tc 'T32b ...and says no adapter confirmed the login' 'no adapter confirmed the noadapter.test login' "$ERR"
 FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" mkprofile signin.test \
   '<html><body><form action="/x"><input type="password" name="p"></form></body></html>' >/dev/null
 : > "$PWREC"
 run actenv "$BROWSER" act "https://signin.test/x" --steps="$STAR"
-t  'T31c a no-adapter page that is a sign-in form is refused (75)' 75 "$RC"
-t  'T31c ...before anything touched the page' 0 "$(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
-MUT31G="$TMP/browser-nogeneric"
-sed 's|state=$(_PROBE_GENERIC=1 _probe|state=$(_probe|' "$BROWSER" > "$MUT31G"; chmod +x "$MUT31G"
-t  'T31c mutant applied' yes "$(cmp -s "$MUT31G" "$BROWSER" && echo no || echo yes)"
-run actenv "$MUT31G" act "https://noadapter.test/x" --steps="$STAR"
-t  'T31c MUTANT (no generic check): the LIVE no-adapter login is refused again' 75 "$RC"
+t  'T32c a no-adapter page that is a sign-in form is refused (75)' 75 "$RC"
+t  'T32c ...before anything touched the page' 0 "$(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
+MUT32G="$TMP/browser-nogeneric"
+sed 's|state=$(_PROBE_GENERIC=1 _probe|state=$(_probe|' "$BROWSER" > "$MUT32G"; chmod +x "$MUT32G"
+t  'T32c mutant applied' yes "$(cmp -s "$MUT32G" "$BROWSER" && echo no || echo yes)"
+run actenv "$MUT32G" act "https://noadapter.test/x" --steps="$STAR"
+t  'T32c MUTANT (no generic check): the LIVE no-adapter login is refused again' 75 "$RC"
 # the render itself is re-checked: the site's front page was fine, the page asked for is a sign-in
 : > "$PWREC"
 run actenv env PWURL="https://noadapter.test/login?next=/x" "$BROWSER" act "https://noadapter.test/x" --steps="$STAR"
-t  'T31c a page that ENDS on a sign-in URL is refused after the fact' 75 "$RC"
-tc 'T31c ...naming the redirect' 'redirected to a sign-in' "$ERR"
+t  'T32c a page that ENDS on a sign-in URL is refused after the fact' 75 "$RC"
+tc 'T32c ...naming the redirect' 'redirected to a sign-in' "$ERR"
 
-# --- T31d several accounts on one site ----------------------------------------
+# --- T32d several accounts on one site ----------------------------------------
 dw=$(FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" mkprofile gh.test_work "$LIVE_DOM")
 FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" mkprofile gh.test_personal "$LIVE_DOM" >/dev/null
 : > "$PWREC"
 run actenv "$BROWSER" act "https://gh.test/repo" --steps="$STAR"
-t  'T31d two accounts for one host: refused, never guessed' 64 "$RC"
-tc 'T31d ...naming both' 'gh.test_personal gh.test_work' "$ERR"
-t  'T31d ...and nothing was launched' 0 "$(jq -rs '[.[]|select(.call=="launch")]|length' "$PWREC")"
+t  'T32d two accounts for one host: refused, never guessed' 64 "$RC"
+tc 'T32d ...naming both' 'gh.test_personal gh.test_work' "$ERR"
+t  'T32d ...and nothing was launched' 0 "$(jq -rs '[.[]|select(.call=="launch")]|length' "$PWREC")"
 run actenv "$BROWSER" act gh.test_work "https://gh.test/repo" --steps="$STAR"
-t  'T31d the named account acts' 0 "$RC"
-t  'T31d ...in its own profile' "$dw" "$(jq -rs '[.[]|select(.call=="launch")|.profile]|first' "$PWREC")"
+t  'T32d the named account acts' 0 "$RC"
+t  'T32d ...in its own profile' "$dw" "$(jq -rs '[.[]|select(.call=="launch")|.profile]|first' "$PWREC")"
 run actenv "$BROWSER" act gh.test_work "https://other.test/repo" --steps="$STAR"
-t  'T31d an account is still scoped to its site' 64 "$RC"
+t  'T32d an account is still scoped to its site' 64 "$RC"
 
-# --- T31e the owner's four -----------------------------------------------------
+# --- T32e the owner's four -----------------------------------------------------
 ORDER='[{"op":"click","selector":"ref=button/Place your order"}]'
 : > "$PWREC"
 run actenv env PWLABEL="Place your order" "$BROWSER" act "https://shop.test/cart" --steps="$ORDER" --out="$TMP/act31e"
-t  'T31e placing an order stops with 73' 73 "$RC"
-t  'T31e ...BEFORE the click reached the page' 0 "$(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
-tc 'T31e ...naming the class and the button' 'pay or place an order ("Place your order' "$ERR"
-tc 'T31e ...and the ask, with the approve command' 'sudo 5dive browser approve' "$ERR"
-t  'T31e ...with a screenshot of the page before it' yes "$([[ -s "$TMP/act31e/page.png" ]] && echo yes || echo no)"
+t  'T32e placing an order stops with 73' 73 "$RC"
+t  'T32e ...BEFORE the click reached the page' 0 "$(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
+tc 'T32e ...naming the class and the button' 'pay or place an order ("Place your order' "$ERR"
+tc 'T32e ...and the ask, with the approve command' 'sudo 5dive browser approve' "$ERR"
+t  'T32e ...with a screenshot of the page before it' yes "$([[ -s "$TMP/act31e/page.png" ]] && echo yes || echo no)"
 AID=$(sed -n 's/.*browser approve \([^ ]*\) .*/\1/p' <<<"$ERR" | head -1)
-t  'T31e ...and a recorded ask' yes "$([[ -n "$AID" && -f "$A31/$AID.json" ]] && echo yes || echo no)"
+t  'T32e ...and a recorded ask' yes "$([[ -n "$AID" && -f "$A31/$AID.json" ]] && echo yes || echo no)"
 run actenv env PWLABEL="Place your order" "$BROWSER" act "https://shop.test/cart" --steps="$ORDER" --approved="$AID"
-t  'T31e an ask nobody answered is still refused' 73 "$RC"
+t  'T32e an ask nobody answered is still refused' 73 "$RC"
 run actenv "$BROWSER" approve "$AID"
-t  'T31e a non-owner cannot approve' 77 "$RC"
+t  'T32e a non-owner cannot approve' 77 "$RC"
 run actenv env FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" "$BROWSER" approve "$AID"
-t  'T31e the owner approves' 0 "$RC"
-tc 'T31e ...seeing what they approve' 'Place your order' "$OUT"
+t  'T32e the owner approves' 0 "$RC"
+tc 'T32e ...seeing what they approve' 'Place your order' "$OUT"
 run actenv env PWLABEL="Place your order" FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" "$BROWSER" act "https://shop.test/cart" \
     --steps='[{"op":"click","selector":"ref=button/Place your order"},{"op":"click","selector":"#more"}]' --approved="$AID"
-t  'T31e a yes does not cover different steps' 73 "$RC"
-tc 'T31e ...and says so' 'different steps' "$ERR"
+t  'T32e a yes does not cover different steps' 73 "$RC"
+tc 'T32e ...and says so' 'different steps' "$ERR"
 : > "$PWREC"
 run actenv env PWLABEL="Place your order" FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" "$BROWSER" act "https://shop.test/cart" --steps="$ORDER" --approved="$AID"
-t  'T31e the approved steps run' 0 "$RC"
-t  'T31e ...and the click happens' 1 "$(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
+t  'T32e the approved steps run' 0 "$RC"
+t  'T32e ...and the click happens' 1 "$(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
 run actenv env PWLABEL="Place your order" FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" "$BROWSER" act "https://shop.test/cart" --steps="$ORDER" --approved="$AID"
-t  'T31e a yes is spent by one run' 73 "$RC"
+t  'T32e a yes is spent by one run' 73 "$RC"
 run actenv "$BROWSER" act "https://x-web.test/home" --steps='[{"op":"press","selector":"ref=textbox/Post text","key":"Control+Enter"}]'
-t  'T31e Ctrl+Enter in a composer is a send, and stops' 73 "$RC"
+t  'T32e Ctrl+Enter in a composer is a send, and stops' 73 "$RC"
 run actenv env PWLABEL="Delete repository" "$BROWSER" act "https://gh2.test/settings" --steps='[{"op":"click","selector":"#danger"}]'
-t  'T31e a CSS selector does not hide a delete: the LIVE label is read' 73 "$RC"
+t  'T32e a CSS selector does not hide a delete: the LIVE label is read' 73 "$RC"
 run actenv env PWLABEL="Star" "$BROWSER" act "https://gh2.test/repo" --steps='[{"op":"click","selector":"#star"}]'
-t  'T31e (control) a harmless click is not stopped' 0 "$RC"
+t  'T32e (control) a harmless click is not stopped' 0 "$RC"
 # the mutant: the executor's guard removed -> the order is placed
-MUT31E="$TMP/mut31e"; rm -rf "$MUT31E"; cp -r "$ROOT/browser" "$MUT31E"
-sed -i 's|if (plan.guard \&\& !plan.approved) {|if (false) {|' "$MUT31E/bin/driver-playwright"
-t  'T31e mutant applied' yes "$(cmp -s "$MUT31E/bin/driver-playwright" "$ROOT/plugins/browser/bin/driver-playwright" && echo no || echo yes)"
+MUT32E="$TMP/mut31e"; rm -rf "$MUT32E"; cp -r "$ROOT/browser" "$MUT32E"
+sed -i 's|if (plan.guard \&\& !plan.approved) {|if (false) {|' "$MUT32E/bin/driver-playwright"
+t  'T32e mutant applied' yes "$(cmp -s "$MUT32E/bin/driver-playwright" "$ROOT/plugins/browser/bin/driver-playwright" && echo no || echo yes)"
 : > "$PWREC"
-run actenv env PWLABEL="Place your order" "$MUT31E/bin/browser" act "https://shop.test/cart" --steps="$ORDER"
-t  'T31e MUTANT (guard removed): the order is placed without asking' '0 1' \
+run actenv env PWLABEL="Place your order" "$MUT32E/bin/browser" act "https://shop.test/cart" --steps="$ORDER"
+t  'T32e MUTANT (guard removed): the order is placed without asking' '0 1' \
    "$RC $(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
 # the warm session enforces the same rule, from the same shared function
-t  'T31e the session daemon checks the same guard' yes \
+t  'T32e the session daemon checks the same guard' yes \
    "$(grep -q 'aria.stepRisk(page, s, sel)' "$ROOT/plugins/browser/bin/session-daemon" && echo yes || echo no)"
 
-# --- T31f act's own refusals ---------------------------------------------------
+# --- T32f act's own refusals ---------------------------------------------------
 run actenv "$BROWSER" act "https://public-web.test/" --steps='[{"op":"upload","selector":"#f","path":"/etc/passwd"}]'
-t  'T31f upload is not an act step' 64 "$RC"
+t  'T32f upload is not an act step' 64 "$RC"
 run actenv "$BROWSER" act noadapter.test "https://noadapter.test/" --steps='[{"op":"goto","url":"https://evil.test/"}]'
-t  'T31f a goto cannot walk a login to another host' 64 "$RC"
+t  'T32f a goto cannot walk a login to another host' 64 "$RC"
 run actenv "$BROWSER" act "https://public-web.test/" --steps='not json'
-t  'T31f steps must be a JSON array' 64 "$RC"
+t  'T32f steps must be a JSON array' 64 "$RC"
 : > "$PWREC"
 run actenv "$BROWSER" act "https://public-web.test/" --steps='[{"op":"fill","selector":"#q","value":"literal {braces} stay"}]'
-t  'T31f the agent'"'"'s text is typed as given, braces and all' 'literal {braces} stay' \
+t  'T32f the agent'"'"'s text is typed as given, braces and all' 'literal {braces} stay' \
    "$(jq -rs '[.[]|select(.call=="fill")|.val]|first' "$PWREC")"
 
-# --- T31g the label table ------------------------------------------------------
-t  'T31g labels classify' 'pay publish null send delete null null null' \
+# --- T32g the label table ------------------------------------------------------
+t  'T32g labels classify' 'pay publish null send delete null null null' \
    "$(node -e '
      const a=require(process.argv[1]);
      console.log(["Place your order","Post","Posts","Send","Delete repository","Add to cart","Star","Search"]
        .map(x=>a.classifyLabel(x)).map(String).join(" "));' "$ROOT/plugins/browser/lib/aria.cjs")"
-tc 'T31g act is dispatched' 'act)   shift; cmd_act' "$(cat "$BROWSER")"
+tc 'T32g act is dispatched' 'act)   shift; cmd_act' "$(cat "$BROWSER")"
 run bash "$BROWSER" --help
-tc 'T31g --help names act' 'browser act' "$OUT$ERR"
+tc 'T32g --help names act' 'browser act' "$OUT$ERR"
 
-# --- T31h the warm session enforces the same stop -------------------------------
+# --- T32h the warm session enforces the same stop -------------------------------
 # The served browser is a SECOND copy of the step loop (session-daemon), so the
 # guard is graded there too, through the real daemon over its socket.
 mkprofile warmact.test "$LIVE_DOM" >/dev/null
 DPWLABEL="$TMP/dpw.label"; printf 'Send' > "$DPWLABEL"
 dserve warmact.test DPWLABEL="$DPWLABEL"
-t  'T31h a warm session is up for the act arms' 0 "$RC"
+t  'T32h a warm session is up for the act arms' 0 "$RC"
 LB31="$(launches)"; : > "$TMP/.drec-mark"; DREC_LINES=$(wc -l < "$DREC")
 dwarm "$BROWSER" act warmact.test "https://warmact.test/inbox" --steps='[{"op":"click","selector":"#send"}]' --out="$TMP/act31h"
-t  'T31h the warm session stops a send (73)' 73 "$RC"
-t  'T31h ...before the click' 0 "$(tail -n +$((DREC_LINES+1)) "$DREC" | jq -rs '[.[]|select(.call=="click")]|length')"
-t  'T31h ...in the browser that was already up (no launch)' "$LB31" "$(launches)"
-tc 'T31h ...and names the ask' 'sudo 5dive browser approve' "$ERR"
+t  'T32h the warm session stops a send (73)' 73 "$RC"
+t  'T32h ...before the click' 0 "$(tail -n +$((DREC_LINES+1)) "$DREC" | jq -rs '[.[]|select(.call=="click")]|length')"
+t  'T32h ...in the browser that was already up (no launch)' "$LB31" "$(launches)"
+tc 'T32h ...and names the ask' 'sudo 5dive browser approve' "$ERR"
 printf 'Star' > "$DPWLABEL"; DREC_LINES=$(wc -l < "$DREC")
 dwarm "$BROWSER" act warmact.test --steps='[{"op":"click","selector":"#star"}]' --out="$TMP/act31h2" --expect='feed'
-t  'T31h (control) a harmless click with NO url continues on the held page and verifies' 0 "$RC"
+t  'T32h (control) a harmless click with NO url continues on the held page and verifies' 0 "$RC"
 # The login probe opens its OWN tab (kind "extra") and may navigate there; the
 # held page is kind "first", and that is the one that must not be reloaded.
-t  'T31h ...the click reached the held page, and the held page was not reloaded' '1 0' \
+t  'T32h ...the click reached the held page, and the held page was not reloaded' '1 0' \
    "$(tail -n +$((DREC_LINES+1)) "$DREC" | jq -rs '[([.[]|select(.call=="click")]|length), ([.[]|select(.call=="goto" and .kind=="first")]|length)]|join(" ")')"
-t  'T31h ...and the re-read came back over the socket' 'yes' \
+t  'T32h ...and the re-read came back over the socket' 'yes' \
    "$([[ -s "$TMP/act31h2/page.html" ]] && grep -q feed "$TMP/act31h2/page.html" && echo yes || echo no)"
 env PATH="$SPATH" "$BROWSER" serve warmact.test --stop >/dev/null 2>&1
 
@@ -5314,6 +5367,82 @@ tn 'TR28d ls: no notice in that listing' "$NOTICEPAT" "$OUT"
 tn 'TR28d ls: none on its stderr either' "$NOTICEPAT" "$ERR"
 rm -rf "$MUT"
 
+
+# --- T30 capture: both halves of a login check, on disk (DIVE-4929) ---------
+# `5dive reflex login-marker` (5dive CLI, DIVE-4928) drafts a site's login check
+# from a signed-out and a signed-in render of its probe page. This verb makes the
+# two files. Its load-bearing properties: the halves really are different
+# profiles, the files are the owner's alone, and a brokered seat cannot use it to
+# pull the signed-in page of a site that no verdict has cleared for reading.
+CAPSITE=capture.test
+CAPIN='<html><head><title>Inbox</title></head><body><nav id="account-menu">me</nav></body></html>'
+CAPOUT='<html><head><title>Sign in</title></head><body><form action="/session"><input name="login"></form></body></html>'
+CAPDIR="$(mkprofile "$CAPSITE" "$CAPIN")"
+export FAKE_COLD_DOM="$TMP/cap-cold.html"; printf '%s' "$CAPOUT" > "$FAKE_COLD_DOM"
+CAPO="$TMP/cap-out-1"
+run "$BROWSER" capture "$CAPSITE" --url=https://capture.test/settings --out="$CAPO"
+t  'T30a capture exits 0' 0 "$RC"
+t  'T30a the signed-out half is the THROWAWAY profile render' "$CAPOUT" "$(cat "$CAPO/signed-out.html" 2>/dev/null)"
+t  'T30a the signed-in half is THIS login'"'"'s profile render' "$CAPIN" "$(cat "$CAPO/signed-in.html" 2>/dev/null)"
+t  'T30a a second signed-out render, also from a throwaway profile' "$CAPOUT" "$(cat "$CAPO/signed-out-2.html" 2>/dev/null)"
+t  'T30a all three files are 0600' '600 600 600' "$(stat -c %a "$CAPO/signed-out.html" "$CAPO/signed-out-2.html" "$CAPO/signed-in.html" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+t  'T30a the directory is 0700' 700 "$(stat -c %a "$CAPO" 2>/dev/null)"
+tc 'T30a it prints the reflex command that reads all three files' "reflex login-marker $CAPSITE --url=https://capture.test/settings --logged-out=$CAPO/signed-out.html --logged-out=$CAPO/signed-out-2.html --logged-in=$CAPO/signed-in.html" "$OUT"
+tc 'T30a the capture is an audit row on the profile' '"event":"capture"' "$(cat "$CAPDIR/.5dive-audit.jsonl" 2>/dev/null)"
+t  'T30a no adapter was written' no "$([[ -e "$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json" ]] && echo yes || echo no)"
+tn 'T30a no adapter, so no --compare' '--compare=' "$OUT"
+# The default --url is the probe URL, and a site WITH an adapter gets --compare.
+mkadapter "$CAPSITE" "file://$TMP/artifact.html" 'PUBLISHED'
+run "$BROWSER" capture "$CAPSITE" --out="$TMP/cap-out-2"
+t  'T30b with no --url, the adapter'"'"'s probe URL is captured' 0 "$RC"
+tc 'T30b ...and named in the command' '--url=https://capture.test.test/feed' "$OUT"
+tc 'T30b an existing adapter is offered as the hand marker to compare' "--compare=$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json" "$OUT"
+rm -f "$FIVEDIVE_BROWSER_ADAPTER_DIR/$CAPSITE.json"
+# A capture never overwrites.
+run "$BROWSER" capture "$CAPSITE" --url=https://capture.test/settings --out="$CAPO"
+t  'T30c a non-empty --out is refused' 64 "$RC"
+t  'T30c ...and the earlier capture is untouched' "$CAPIN" "$(cat "$CAPO/signed-in.html" 2>/dev/null)"
+# A profile that is not logged in renders the same page twice. Say so.
+IDSITE=capture-same.test
+mkprofile "$IDSITE" "$CAPOUT" >/dev/null
+run "$BROWSER" capture "$IDSITE" --url=https://capture-same.test/ --out="$TMP/cap-out-3"
+t  'T30d identical renders still exit 0 (the files are what they are)' 0 "$RC"
+tc 'T30d ...with a warning that the profile may not be logged in' 'may not be logged in' "$ERR"
+# The real case is NOT byte-identical: a sign-in page carries a fresh token per
+# render. Same title, different bytes, must still warn.
+TSITE=capture-title.test
+mkprofile "$TSITE" '<html><head><title>Sign in</title></head><body><input name="tok" value="zz"></body></html>' >/dev/null
+run "$BROWSER" capture "$TSITE" --url=https://capture-title.test/ --out="$TMP/cap-out-5"
+tc 'T30d same page title with different bytes still warns (per-render tokens)' 'may not be logged in' "$ERR"
+run "$BROWSER" capture nosuchprofile.test --out="$TMP/cap-out-4"
+t  'T30e no profile for the site: refused' 69 "$RC"
+run "$BROWSER" capture 'not a site'
+t  'T30e an unusable name is a usage error' 64 "$RC"
+# THE BROKERED REFUSAL. A seat using the box login must not get a file of the
+# owner's signed-in page for a site nothing has cleared for reading.
+BRKSITE=capture-box.test
+mkprofile "$BRKSITE" "$CAPIN" "$BOXSEAT" >/dev/null
+printf 'site=%s\nowner=%s\n' "$BRKSITE" "$BOXSEAT" > "$RVROOT/$BOXSEAT/$BRKSITE.offered"
+capbrk() {  # <browser bin> -> rc; the capture a brokered seat attempts
+  local o="$TMP/cap-brk-$RANDOM"
+  env FIVEDIVE_BROWSER_SEAT="$OTHER" "$1" capture "$BRKSITE" --url=https://capture-box.test/ --out="$o" >/dev/null 2>"$TMP/.capbrk.e"
+  local rc=$?
+  [[ -e "$o/signed-in.html" ]] && return 99
+  return "$rc"
+}
+capbrk "$BROWSER"; BRC=$?
+t  'T30f a brokered seat is refused (77) and gets no file' 77 "$BRC"
+tc 'T30f ...and is told the owner runs it' "sudo -u $BOXSEAT 5dive browser capture" "$(cat "$TMP/.capbrk.e")"
+CAPMUT="$TMP/browser-capture-mutant"
+sed 's|_open_site "$site" --no-broker capture "|_open_site "$site" "" capture "|' "$BROWSER" > "$CAPMUT"; chmod +x "$CAPMUT"
+cp "$ROOT/plugins/browser/bin/session-daemon" "$TMP/session-daemon" 2>/dev/null || true
+t  'T30f mutant applied' yes "$(cmp -s "$CAPMUT" "$BROWSER" && echo no || echo yes)"
+capbrk "$CAPMUT"; MRC=$?
+t  'T30f MUTANT (broker refusal dropped): the brokered capture is NOT refused' yes "$([[ "$MRC" != 77 ]] && echo yes || echo no)"
+unset FAKE_COLD_DOM
+tc 'T30g capture is dispatched' 'capture) shift; cmd_capture' "$(cat "$BROWSER")"
+run bash "$BROWSER" --help
+tc 'T30g --help names it' 'capture <site>' "$OUT$ERR"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

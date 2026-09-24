@@ -168,12 +168,27 @@ const PROBE_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_PROBE_WAIT_MS || 8000)
 
 function die(code, msg) { process.stderr.write(`${PROG}: ${msg}\n`); process.exit(code); }
 
+// THE SANDBOX IS ON (DIVE-4944). This daemon's Chrome is the one a PERSON looks at
+// through the viewer, and it holds a logged-in session while it loads pages from
+// the open web. It launched with --no-sandbox from DIVE-4621 on, which (1) turned
+// off Chrome's renderer sandbox for exactly the browser that most needs it and
+// (2) painted "You are using an unsupported command-line flag: --no-sandbox" across
+// the top of every customer's viewer (lodar, old-clay, 2026-09-24). The cold
+// serve path never passed the flag and ran sandboxed on the same boxes, so the
+// sandbox works wherever serve already did. Two cases still launch without it:
+// root, where Chrome refuses to start sandboxed at all, and a launch that fails
+// sandboxed (serve retries once and says why, rather than losing the session).
+function sandboxWanted() {
+  if (process.env.FIVEDIVE_BROWSER_NO_SANDBOX === '1') return false;
+  return !(typeof process.getuid === 'function' && process.getuid() === 0);
+}
+
 // Identical to the driver's, and deliberately a second literal copy rather than a
 // shared import: the refusal is a security claim, and a claim that lives in one
 // place is a claim one edit can remove from both callers at once.
-function launchArgs() {
+function launchArgs(sandbox) {
   const extra = (process.env.FIVEDIVE_BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);
-  const args = ['--no-sandbox', '--disable-gpu', ...extra];
+  const args = [...(sandbox ? [] : ['--no-sandbox']), '--disable-gpu', ...extra];
   const bad = args.filter(a => /^--remote-debugging/.test(a));
   if (bad.length) {
     die(E_NOTHING_RAN, `refusing to launch with ${bad.join(' ')}. The daemon holds CDP over the child's ` +
@@ -267,16 +282,41 @@ async function serveMode(profile, sock, broker) {
     'browser the profile was logged in with, so the executable is passed in rather than guessed here.');
 
   const { chromium } = loadPlaywright();
+  const launch = (sandbox) => chromium.launchPersistentContext(profile, {
+    headless: false,
+    executablePath: chrome,
+    args: launchArgs(sandbox),
+    chromiumSandbox: sandbox,
+    viewport: null,
+  });
   let ctx;
   try {
-    ctx = await chromium.launchPersistentContext(profile, {
-      headless: false,
-      executablePath: chrome,
-      args: launchArgs(),
-      viewport: null,
-    });
+    ctx = await launch(sandboxWanted());
   } catch (e) {
-    die(E_UNAVAILABLE, `could not open the ${profile} profile: ${e.message}`);
+    if (!sandboxWanted()) die(E_UNAVAILABLE, `could not open the ${profile} profile: ${e.message}`);
+    process.stderr.write(`${PROG}: NOTE — Chrome would not start with its sandbox ` +
+      `(${String(e.message).split('\n')[0]}); starting it without the sandbox.\n`);
+    try {
+      ctx = await launch(false);
+    } catch (e2) {
+      die(E_UNAVAILABLE, `could not open the ${profile} profile: ${e2.message}`);
+    }
+  }
+
+  // OPEN THE SITE (DIVE-4944). `serve` exists so a person can log in, and the
+  // cold path it replaced launched Chrome AT the site. Playwright's persistent
+  // context opens about:blank instead, so from DIVE-4621 until this line every
+  // Connect showed the customer an empty page. Not awaited: `ready` must not wait
+  // on a slow site, and a request that navigates the same tab first simply
+  // supersedes this load. A failure is noted and the session stays up, because
+  // a blank tab the person can type into beats no browser at all.
+  const startUrl = process.env.FIVEDIVE_BROWSER_START_URL || '';
+  if (/^https?:\/\//i.test(startUrl)) {
+    Promise.resolve()
+      .then(() => ctx.pages()[0] || ctx.newPage())
+      .then((p) => p.goto(startUrl, { waitUntil: 'domcontentloaded' }))
+      .catch((e) => process.stderr.write(`${PROG}: NOTE — could not open ${startUrl}: ` +
+        `${String(e && e.message).split('\n')[0]}\n`));
   }
 
   // THE BROWSER IS THE DAEMON'S REASON TO EXIST. When Chrome goes, the daemon

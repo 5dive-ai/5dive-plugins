@@ -3,7 +3,7 @@
 ### Added — the registry copy carries `act`, public browsing and owner approval, at browser 1.11.0 (DIVE-4943)
 
 `plugins/browser/` is `rsync -a --delete` identical to 5dive-ai/5dive-browser's `browser/` on the
-DIVE-4943 branch (1.11.0, which includes 1.10.5's `capture`), and `diff -r` is empty. What it adds,
+DIVE-4943 branch (1.11.0, which includes 1.10.5's `capture` and 1.10.6's Connect fix), and `diff -r` is empty. What it adds,
 in full in that repo's CHANGES: `act <url> --steps=<json>` (agents click and type on refs); any page
 verb takes a URL and runs in the host's one login or a public profile, so a box with nothing
 connected can browse; several accounts per site as `<site>_<label>`; a generic sign-in check for
@@ -11,6 +11,22 @@ sites with no adapter; and paying, posting, sending and deleting stop (exit 73) 
 `sudo 5dive browser approve <id>`. A new `use-browser` skill sends agents to the browser for web
 tasks, and `connect-site` stops pointing them at a normal fetch. `tests/browser_plugin_unit.sh` is upstream's with `browser/` read
 as `plugins/browser/`, plus this registry's TR28 arms.
+
+### Fixed — the registry copy carries Connect-opens-the-site and the sandboxed viewer, at browser 1.10.6 (DIVE-4944)
+
+`plugins/browser/` is `rsync -a --delete` identical to 5dive-ai/5dive-browser's `browser/` at 1.10.6.
+It carries two releases this copy did not have:
+
+- **1.10.6 (DIVE-4944).** Connect opened `about:blank` instead of the site, under a
+  "--no-sandbox" warning bar, on every site since the 09-20 warm session. The daemon now opens
+  the site's URL on start and launches Chrome sandboxed, retrying once without the sandbox if it
+  must.
+- **1.10.5 (DIVE-4929).** `browser capture <site>` saves both halves of a login check. It is an
+  additive owner-only verb; DIVE-4929 notes that this mirror owes it.
+
+The harness takes both releases' test hunks with `browser/` read as `plugins/browser/`. The
+registry-only TR28 arms are unchanged. The converger floor (5dive-api) moves to 1.10.6 only after
+both copies carry it.
 
 ### Fixed — the registry copy carries the hired-agent login fix, at browser 1.10.4 (DIVE-4927)
 
