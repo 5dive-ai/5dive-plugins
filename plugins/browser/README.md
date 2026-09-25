@@ -623,6 +623,43 @@ The off list lives at `/var/lib/5dive/browser/ubol/adblock-off` and IS the sourc
 truth: the nightly root converge re-renders the policy file from it, so a host you
 remove from that list comes back filtered.
 
+## Limits: sites that block datacenter IPs
+
+A box is a datacenter IP, and some sites refuse those outright ("Request blocked by network
+security", "suspicious network"), at login or on every page. The fix is the customer's own
+proxy — any residential proxy that gives you a URL:
+
+```
+5dive browser proxy set http://user:pass@host:port   # or: … proxy set -  (reads stdin)
+5dive browser proxy show                             # password masked
+5dive browser proxy clear                            # go out directly again
+```
+
+- **Per seat, and it is a credential.** One line, 0600, at `<profile root>/<seat>/.5dive-proxy`
+  inside the seat's 0700 directory. It is never logged, never echoed back (`show` masks the
+  password), and never in `status`. `proxy set -` keeps it out of shell history and `ps`.
+- **Both browsers use it.** The served browser (`serve`, the session daemon) and a cold run
+  (`run`, `act`, `tree`, `snapshot` with no browser up) hand it to Playwright's launch as
+  `proxy: {server, username, password}`. That is the reason it is not a Chrome flag: Chrome's
+  `--proxy-server` cannot carry a username and password, and every paid proxy uses them. With
+  nothing set, no `proxy` key is passed at all — the launch is exactly what it was before. A
+  setting that cannot be read refuses the launch, and a proxied `serve` whose daemon will not
+  start refuses rather than falling back to plain Chrome from the box's own IP.
+- **A browser already running keeps its route.** `set` and `clear` name the served browsers
+  still on the old one and do not restart them (a person may be mid-login in the viewer, or an
+  agent mid-publish). `serve <site> --stop` moves one; the next command starts it again.
+- **Switching the proxy mid-session can end a site's login** — the site sees a new IP. Set the
+  proxy before connecting a site, not after.
+- **Box logins follow the box seat's setting** (`claude`). A site connected for the whole box
+  runs in that seat's browser, as that seat, so another seat's `proxy set` does not reach it.
+- **HTTP(S) proxies may carry a login; SOCKS ones may not.** Chrome under Playwright refuses
+  SOCKS authentication at launch, so `proxy set` refuses it up front. Most providers offer an
+  `http://` endpoint too.
+- **What still goes out directly:** anything that starts its own plain Chrome rather than the
+  Playwright one — the scheduled login check (`probe-all`/`status`) on a site that is not
+  served, a cold `read`/`shot`/`capture`, and `auth` on a machine with a display. Keep a
+  proxied site served so those go through the one browser that holds the route.
+
 ## Shipped, and what is still named so nobody assumes it
 
 - **The customer-facing FLOW is live.** The dashboard's Connected sites tile went to production on

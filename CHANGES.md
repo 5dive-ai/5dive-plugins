@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Added — the registry copy carries `proxy set`, at browser 1.12.0 (DIVE-4951)
+
+`plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.12.0, byte-identical. A box's browser can
+go out through the customer's own proxy (`5dive browser proxy set <scheme://user:pass@host:port>`,
+`show` masked, `clear`) for sites that block datacenter IPs; both Playwright launches pass it as
+`proxy: {server, username, password}`, and an unset seat launches exactly as before. Full entry in
+5dive-browser's CHANGES.md. `tests/browser_plugin_unit.sh` carries upstream's T33 arms with
+`browser/` read as `plugins/browser/`.
+
 ### Added — the Telegram /task card answers gates and says why a row is blocked (DIVE-4949), telegram 0.5.62
 
 `/task_<id>` could not answer a gate and could not say why a row was blocked, so lodar had to ask in

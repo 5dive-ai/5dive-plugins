@@ -48,6 +48,9 @@ const net = require('net');
 const path = require('path');
 const cp = require('child_process');
 const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
+// DIVE-4951: the seat's own proxy — the same parser the cold driver uses, so the
+// served browser and a cold run cannot leave through two different routes.
+const proxy = require(path.join(__dirname, '..', 'lib', 'proxy.cjs'));
 
 // DIVE-4587: Chrome keeps its crashpad DB under $XDG_CONFIG_HOME whatever
 // --user-data-dir says, and 5dive boxes share one XDG_CONFIG_HOME across every
@@ -281,6 +284,10 @@ async function serveMode(profile, sock, broker) {
   if (!chrome) die(E_UNAVAILABLE, 'no chrome named for this daemon — a session must be held in the same ' +
     'browser the profile was logged in with, so the executable is passed in rather than guessed here.');
 
+  // DIVE-4951. Read ONCE, at start: a running daemon keeps the route it launched
+  // with, and `proxy set`/`clear` say so rather than moving a live login's IP.
+  let viaProxy;
+  try { viaProxy = proxy.launchProxy(profile); } catch (e) { die(E_UNAVAILABLE, e.message); }
   const { chromium } = loadPlaywright();
   const launch = (sandbox) => chromium.launchPersistentContext(profile, {
     headless: false,
@@ -288,6 +295,7 @@ async function serveMode(profile, sock, broker) {
     args: launchArgs(sandbox),
     chromiumSandbox: sandbox,
     viewport: null,
+    ...(viaProxy ? { proxy: viaProxy } : {}),
   });
   let ctx;
   try {

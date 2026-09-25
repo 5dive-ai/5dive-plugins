@@ -38,6 +38,11 @@ confirmed the login. If you hit the sign-in refusal on a page that must be the o
 switch to the `connect-site` skill. Never type the owner's password yourself, and never try to
 get past a CAPTCHA or other challenge.
 
+**Blocked from a server IP** ("Request blocked by network security", "suspicious network"):
+some sites block server IPs; `5dive browser proxy set <url>` sends this box's browser through
+your own proxy. That is the owner's proxy and the owner's call — tell them, and use only a URL
+they give you. Switching the proxy mid-session can end a site's login (the site sees a new IP).
+
 **Two accounts on one site** (`github.com_work`, `github.com_personal`): a URL alone is refused
 and the refusal names both. **Ask the owner which one, never guess**, then name it:
 `5dive browser act github.com_work <url> --steps=…`.

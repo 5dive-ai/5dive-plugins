@@ -49,6 +49,8 @@ const path = require('path');
 // resolve code by walking ancestor node_modules, and a bare require('aria')
 // would reintroduce exactly that.
 const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
+// DIVE-4951: the seat's own proxy, parsed in ONE place for both launch sites.
+const proxy = require(path.join(__dirname, '..', 'lib', 'proxy.cjs'));
 
 // DO NOT DELETE THIS. It is not dead code — it is the fix for DIVE-4587, and the
 // full mechanism is written out at the top of bin/browser. In one paragraph:
@@ -267,6 +269,9 @@ async function openProfile(profile, { headless = true } = {}) {
     die(E_NOTHING_RAN, 'no chrome named for this run — a run must use the same browser the profile was ' +
       'logged in with, so the executable is passed in rather than guessed here.');
   }
+  // DIVE-4951. Unset adds NO key, so the launch is exactly what it was before.
+  let viaProxy;
+  try { viaProxy = proxy.launchProxy(profile); } catch (e) { die(E_NOTHING_RAN, e.message); }
   const { chromium } = loadPlaywright();
   try {
     return await chromium.launchPersistentContext(profile, {
@@ -274,6 +279,7 @@ async function openProfile(profile, { headless = true } = {}) {
       executablePath: chrome,
       args: launchArgs(),
       viewport: { width: 1280, height: 800 },
+      ...(viaProxy ? { proxy: viaProxy } : {}),
     });
   } catch (e) {
     die(E_NOTHING_RAN, `could not open the ${profile} profile: ${e.message}`);

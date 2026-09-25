@@ -118,9 +118,12 @@ keyboard attached to the person's account.
   a browser other seats and a human viewer may be using, which is not yours to do on their
   behalf. Stop only what your own seat serves.
 - **Some sites block datacenter IPs at login** ("your request has been blocked",
-  "suspicious network"). That is the site's anti-bot policy meeting a VM's IP — it is not
-  our bug, there is no flag for it, and the honest answer to the human is that this site
-  cannot be logged into from the box. Say so and stop.
+  "suspicious network", "Request blocked by network security"). That is the site's policy
+  meeting a VM's IP, not our bug. Tell the human: some sites block server IPs;
+  `5dive browser proxy set <url>` sends this box's browser through your own proxy. The proxy is
+  theirs — use only a URL they give you, never pick a provider. Logins connected for the whole
+  box follow the `claude` seat's setting, so set it there. Switching the proxy mid-session can
+  end a site's login (the site sees a new IP), so set it before connecting, not after.
 - **A challenge is classified BEFORE a logged-out state**, because a challenge page still
   carries the login markup. Trust the label; do not re-derive it from the HTML.
 - **Sessions die on the site's schedule, not ours.** A scheduled check must skip a profile
