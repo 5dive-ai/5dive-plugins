@@ -287,8 +287,13 @@ t  'T2c6 a root caller with SUDO_USER re-executes as the seat before touching a 
 # DIVE-4943 added `approve` and `approvals`: the owner's yes to an act is a
 # ROOT-owned grant file (bin/browser _grant_uid), so dropping to the seat would
 # turn the owner's yes into the agent's — the one thing that verb must not be.
-t  'T2c7 ...but setup, adblock and the owner'"'"'s approve stay root'"'"'s' 'yes' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|adblock|approve|approvals|-h|--help|help|"") ;;' && echo yes || echo no)"
-t  'T2c8 ...and no OTHER verb joined them' '4' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -oP '^\s+\K[a-z|]+(?=\|-h\|--help)' | tr '|' '\n' | grep -c .)"
+# DIVE-4992 added `_connect`: the privileged half of an agent's Connect request.
+# It reads root-only request codes and the connectord token, and it drops to the
+# relay seat itself, only for serve/viewer/status. Dropped to the CALLER, it
+# would be the agent registering its own bind — the one thing the owner's tap
+# exists to prevent.
+t  'T2c7 ...but setup, adblock, the owner'"'"'s approve and the Connect relay stay root'"'"'s' 'yes' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|adblock|approve|approvals|_connect|-h|--help|help|"") ;;' && echo yes || echo no)"
+t  'T2c8 ...and no OTHER verb joined them' '5' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -oP '^\s+\K[a-z_|]+(?=\|-h\|--help)' | tr '|' '\n' | grep -c .)"
 
 # DIVE-4813 — WHICH SEAT ROOT BECOMES. An admin agent asked to open a site the
 # box had connected under `claude` and was told to run `sudo -u claude 5dive

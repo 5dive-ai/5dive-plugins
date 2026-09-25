@@ -4807,7 +4807,9 @@ _connect_done() {  # <caller> <code> <sender>
   printf 'site=%s\nstatus_rc=%s\nstatus=%s\n' "$site" "$rc" "$(printf '%s\n' "$out" | grep -v '^$' | tail -1)"
 }
 
-# `_connect` — the privileged half. Parameters arrive NUL-separated on stdin so
+# `_connect` — the privileged half. It is in the root-kept verb list at the
+# DIVE-4348 drop below: it holds the request codes and the connectord token,
+# and drops to the relay seat itself, only for the browser verbs. Parameters arrive NUL-separated on stdin so
 # the grant can stay one exact command path with no argument wildcard, and a
 # code never sits in the process table.
 cmd_connect_priv() {
@@ -4862,8 +4864,6 @@ if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   case "${1:-}" in
     # `adblock` joins `setup` here: it writes the MACHINE-WIDE chrome policy
     # file, which is root's. Dropping to the seat would turn it into a refusal.
-    # `_connect` (DIVE-4992) is root's: it holds the request codes and the
-    # connectord token, and drops to the relay seat itself for the browser.
     setup|adblock|approve|approvals|_connect|-h|--help|help|"") ;;
     *)
       # DIVE-4813: usually the caller, and for a brokered `serve` the owner.
