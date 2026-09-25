@@ -608,6 +608,34 @@ sudo 5dive reflex login-marker linkedin.com --url=… --logged-out=…/signed-ou
   `.adapters/` after reading it. With `--compare=<this site's adapter>` it scores the pick against a
   hand-written marker.
 
+**The browser does both, and the owner approves (DIVE-4997).** You no longer run the two commands
+above by hand:
+
+```
+5dive browser propose linkedin.com          # capture + reflex, stored PENDING
+sudo 5dive browser adapters pending         # the pick, and every candidate with its counts
+sudo 5dive browser adapters approve linkedin.com [--marker=m3]
+sudo 5dive browser adapters reject linkedin.com
+5dive browser adapters drift                # does every adapter here still classify?
+```
+
+- **It starts on its own.** When the probe meets a login with no adapter and reflex is configured
+  (`5dive reflex status --json` → `configured:true`), it starts a `propose` in the background (the
+  six-hourly `probe-all` timer runs it inline instead), at most once every 6 hours per site. It never re-proposes a site the owner rejected.
+- **Nothing is used until the owner approves.** The proposal lives in the seat's
+  `.adapters-pending/`, which nothing reads adapters from.
+- **What approve checks.** It refuses a proposal with no signed-in render, and one with a challenge
+  page on either half. It re-counts the chosen marker on the stored renders: a signed-out marker must
+  match both signed-out renders and never the signed-in one, and a signed-in marker the reverse.
+- **What approve writes.** The seat's `.adapters/<site>.json`, never over an existing file and never
+  into the package's `adapters/`. The `_comment` says reflex proposed it and who approved it, when,
+  and with what counts. The renders are then deleted.
+- **Who.** `propose` is run by the login's owner. `approve` and `reject` are run by the box owner:
+  root, never an agent seat's sudo.
+- **Drift.** `drift` re-takes the same measurement for every adapter on the seat, and `probe-all`
+  runs it once a day. It is how a marker that decayed gets seen: the shipped Telegram one matched
+  the signed-out shell for days before anyone looked.
+
 Its steps come from a closed vocabulary —
 `goto fill click wait_for select upload press` — and a step outside it is a **load-time refusal**.
 There is no `eval`, no `script` and no free-text instruction step, because any of those would make

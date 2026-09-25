@@ -108,8 +108,11 @@ not substitute the raw `viewer` command: it mints only one half of the relay cre
    second probe returns `UNKNOWN (served on :N …)` and cannot confirm the login. Stopping the
    browser preserves the profile and the login.
 6. **Read the terminal result.** `authenticated` makes the profile usable. `session expired`
-   or `CHALLENGE` still needs a person. `UNKNOWN (no adapter …)` means step 1 is incomplete;
-   another `UNKNOWN` names a browser/box read failure and is not permission to act. Only after
+   or `CHALLENGE` still needs a person. `UNKNOWN (no adapter …)` means step 1 is incomplete.
+   When reflex is configured, the box drafts that login check itself (DIVE-4997). Once the line
+   says a check is waiting, tell the owner to approve it: `sudo 5dive browser adapters pending`,
+   then `adapters approve <site>`. Never approve one yourself; an agent seat's sudo is refused.
+   Another `UNKNOWN` names a browser/box read failure and is not permission to act. Only after
    `authenticated` may an agent use `run`, `snapshot`, `shot`, `read`, or `links` for that site.
 
 The view is ephemeral; the login profile is durable. Revoke promptly: a live viewer is a

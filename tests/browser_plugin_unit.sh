@@ -123,6 +123,10 @@ export FIVEDIVE_BROWSER_SESSION_DAEMON="$TMP/no-session-daemon"
 # owner-ask` when the CLI has it; on a developer box that is the live owner's
 # Telegram. T36 points this at a recording fake; everywhere else it is absent.
 export FIVEDIVE_BROWSER_CLI="$TMP/no-5dive-cli"
+# DIVE-4997: a login with no adapter starts a reflex proposal in the background,
+# and probe-all re-measures adapters once a day. Both are graded in
+# tests/browser_reflex_propose_unit.sh; here they would race every probe arm.
+export FIVEDIVE_BROWSER_AUTO_PROPOSE=0 FIVEDIVE_BROWSER_DRIFT_ON_PROBE=0
 run() { local o="$TMP/.o" e="$TMP/.e"; "$@" >"$o" 2>"$e"; RC=$?; OUT=$(cat "$o"); ERR=$(cat "$e"); return 0; }
 
 SEAT="$(id -un)"
@@ -296,8 +300,10 @@ t  'T2c6 a root caller with SUDO_USER re-executes as the seat before touching a 
 # relay seat itself, only for serve/viewer/status. Dropped to the CALLER, it
 # would be the agent registering its own bind — the one thing the owner's tap
 # exists to prevent.
-t  'T2c7 ...but setup, adblock, the owner'"'"'s approve and the Connect relay stay root'"'"'s' 'yes' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|adblock|approve|approvals|_connect|-h|--help|help|"") ;;' && echo yes || echo no)"
-t  'T2c8 ...and no OTHER verb joined them' '5' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -oP '^\s+\K[a-z_|]+(?=\|-h\|--help)' | tr '|' '\n' | grep -c .)"
+t  'T2c7 ...but setup, adblock, the owner'"'"'s approve and the Connect relay stay root'"'"'s' 'yes' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|adblock|approve|approvals|adapters|_connect|-h|--help|help|"") ;;' && echo yes || echo no)"
+# DIVE-4997 added `adapters` (the owner's approve/reject/pending of a reflex
+# login check: root reads every seat's proposals and writes AS the seat), so six.
+t  'T2c8 ...and no OTHER verb joined them' '6' "$(grep -A6 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -oP '^\s+\K[a-z_|]+(?=\|-h\|--help)' | tr '|' '\n' | grep -c .)"
 
 # DIVE-4813 — WHICH SEAT ROOT BECOMES. An admin agent asked to open a site the
 # box had connected under `claude` and was told to run `sudo -u claude 5dive
