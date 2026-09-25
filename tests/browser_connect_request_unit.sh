@@ -232,7 +232,7 @@ seam_block=$(awk '/^if \[\[ \$EUID -ne 0 \]\]; then$/{p=1} p{print} p&&/^fi$/{ex
 for v in FIVEDIVE_BROWSER_CONNECT_DIR FIVEDIVE_CONNECTOR_DIR FIVEDIVE_CONNECTORD_ENV FIVEDIVE_PROVISIONING_ENV FIVEDIVE_SHELLD_URL FIVEDIVE_TELEGRAM_API FIVEDIVE_BROWSER_CONNECT_SELF FIVEDIVE_BROWSER_CONNECT_PRIV; do
   t "S1 $v is read only inside the non-root block" "$(grep -c "$v" "$BROWSER")" "$(grep -c "$v" <<<"$seam_block")"
 done
-t  "S2 _connect stays root under sudo (not dropped to the seat)" 1 "$(grep -c 'setup|adblock|approve|approvals|_connect|' "$BROWSER")"
+t  "S2 _connect stays root under sudo (not dropped to the seat)" 1 "$(grep -c 'setup|adblock|approve|approvals|adapters|_connect|' "$BROWSER")"
 tc "S3 the bot token rides curl's stdin, not argv" "| curl -sS --connect-timeout 5 --max-time 15 --config -" "$(grep -A1 'printf .url = ' "$BROWSER")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
