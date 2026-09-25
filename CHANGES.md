@@ -1,5 +1,26 @@
 ## Unreleased
 
+### Added — the Telegram /task card answers gates and says why a row is blocked (DIVE-4949), telegram 0.5.62
+
+`/task_<id>` could not answer a gate and could not say why a row was blocked, so lodar had to ask in
+chat why DIVE-4927 was blocked. The card now:
+
+- **Answers the gate from the card.** A decision gate below tier 2 that waits on a human gets one
+  button per option, with ⭐ on the recommendation. An approval gets Approve and Deny. A tap re-reads
+  the row and refuses if the gate was answered, re-routed, raised to tier 2 or given new options
+  since the card was sent. It then answers through `task answer --channel-proof`, the same route the
+  /inbox ✅ button uses, and the CLI still enforces tier<2. A tier-2 gate gets **Send the answer
+  buttons**, which runs `task inbox --send --only=<id>` (5dive-cli, same branch) so the CLI re-sends
+  that gate's own alert with its nonce buttons. Secret, manual and agent-routed gates get no buttons.
+- **Shows the row's state.** Park reason and wake time with a ⏰ Wake now button (`task unpark`),
+  open blockers, one delivery line (PR, grade, merge, "owed a close"), verifier and reviewer, the
+  last gate outcome once no gate is live, and created/updated age.
+- **Puts the result above the body**, so the 1500-character body clamp no longer hides it.
+- **Adds Open PR and Dashboard link buttons.**
+
+Only `plugins/telegram` changes. The telegram-grok, -agy, -codex, -pi and -opencode forks keep the
+previous card. `test/task-card.test.ts` runs the real `buildTaskDetail` on fixture rows.
+
 ### Added — the registry copy carries `act`, public browsing and owner approval, at browser 1.11.0 (DIVE-4943)
 
 `plugins/browser/` is `rsync -a --delete` identical to 5dive-ai/5dive-browser's `browser/` on the
