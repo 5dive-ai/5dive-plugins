@@ -220,10 +220,11 @@ function loadPlaywright() {
 // {key} -> args.key, as a VALUE. Same refusal as the driver's: a fill that posts
 // the literal "{body}" has published garbage to a real account, and the
 // out-of-band verify cannot tell you it was garbage — the artifact really is live.
-function interpOrThrow(s, args, where) {
+// `enc` (DIVE-4984): a value going into a URL is encoded, as in the driver.
+function interpOrThrow(s, args, where, enc) {
   if (typeof s !== 'string') return s;
   const out = s.replace(/\{([a-zA-Z0-9_]+)\}/g, (m, k) =>
-    Object.prototype.hasOwnProperty.call(args, k) ? args[k] : m);
+    Object.prototype.hasOwnProperty.call(args, k) ? (enc ? enc(String(args[k])) : args[k]) : m);
   const left = out.match(/\{[a-zA-Z0-9_]+\}/);
   if (left) {
     const e = new Error(`${where} still contains ${left[0]} — no --${left[0].slice(1, -1)}=<value> was passed. ` +
@@ -742,7 +743,8 @@ async function planRequest(ctx, req, send, end) {
         // element gets clicked is the hole, and `ref=<role>/<name>` is a selector
         // by this rule too.
         // `literal` (DIVE-4943): `act`'s values are the agent's own text, typed as given.
-        out[field] = field === 'selector' || req.literal ? s[field] : interpOrThrow(s[field], args, `step ${i + 1} (${s.op})`);
+        out[field] = field === 'selector' || req.literal ? s[field]
+          : interpOrThrow(s[field], args, `step ${i + 1} (${s.op})`, field === 'url' ? encodeURIComponent : null);
       }
       return out;
     });
@@ -777,7 +779,10 @@ async function planRequest(ctx, req, send, end) {
       // one-shot driver's loop; lib/aria.cjs holds it so the two cannot differ.
       if (req.guard && !req.approved) {
         const risk = await aria.stepRisk(page, s, sel);
-        if (risk) { needsOwner = { ...risk, step: i + 1, op: s.op }; break; }
+        // The owner's policy (DIVE-4982), exactly as the one-shot driver reads it.
+        if (risk && Array.isArray(req.allow_kinds) && req.allow_kinds.includes(risk.cls)) {
+          send({ t: 'err', msg: aria.OWNER_ALLOWED_PREFIX.trim() + ' ' + JSON.stringify({ ...risk, step: i + 1, op: s.op }) });
+        } else if (risk) { needsOwner = { ...risk, step: i + 1, op: s.op }; break; }
       }
       stepsRun++;
       switch (s.op) {
@@ -825,6 +830,7 @@ async function sendReport(page, req, send) {
       settleMs: settleOf(req, RUN_SETTLE_MS), waitFor: r.wait_for || null, waitTimeoutMs: STEP_TIMEOUT,
       expect: r.expect || null, expectWaitMs: Number(r.expect_wait_ms) || 0,
       walk: r.tree ? { interactiveOnly: !!r.interactive } : null,
+      scope: r.scope || null,
     });
     let png = null;
     if (r.shot) {
@@ -833,7 +839,7 @@ async function sendReport(page, req, send) {
     }
     send({ t: 'out', data: JSON.stringify({ act_report: true, url: after.url, title: after.title,
       html_inline: after.html, png_b64: png, text: after.text, nodes: after.nodes,
-      wait_for: after.wait_for, expect_polled_ms: after.expect_polled_ms }) + '\n' });
+      wait_for: after.wait_for, expect_polled_ms: after.expect_polled_ms, scope: after.scope }) + '\n' });
   } catch (e) {
     send({ t: 'err', msg: `the steps ran but the page could not be re-read afterwards: ${e.message}` });
   }

@@ -18,13 +18,14 @@ than a detail.
 5dive browser status                # per-site auth state; run this on a SCHEDULE
 5dive browser probe-all             # scheduled sweep; served profiles are skipped
 5dive browser ls                    # profiles, and when each was last seen alive
-5dive browser run <site> <action> [--key=value ...]
+5dive browser run <site> <action> [--key=value ...] [--approved-id=<id>]
 5dive browser tree <site> <url> [--settle=<ms>]   # refs; --settle also on snapshot,
                                                   # --page-settle on run
 5dive browser act <url> --steps=<json> [--expect=<regex>] [--approved=<id>]
 5dive browser snapshot <url> --wait-for='[role=main]'   # capture when the page shows it;
                                                   # also on read and act (exit 76: not ready)
 sudo 5dive browser approve <id> [--deny]          # the owner's yes to a pay/post/send/delete
+sudo 5dive browser approvals policy set send=allow   # the owner's standing answer per kind
 ```
 
 ## The browser works with nothing connected, and it acts (DIVE-4943)
@@ -42,6 +43,38 @@ the executor reads the live element's label (`lib/aria.cjs` `stepRisk`, shared b
 records the ask with a screenshot, and waits for `sudo 5dive browser approve <id>`, a root-owned
 grant bound to the exact steps, good once for 30 minutes. It catches the literal buttons, not
 intent: an order behind a button labelled "Continue" is not caught.
+
+`run` stops the same way where the adapter's action says **`"guard": true`** (DIVE-4984): a
+recipe is a reviewed file, but when its arguments choose the recipient and the words — a mail —
+sending is still the owner's call. The ask records the `--key=value` arguments and `approve` shows
+them; the yes is bound to that action with those arguments, and is spent with
+`run … --approved-id=<id>` (a dashed flag, so it can never be an adapter's `{placeholder}`). An
+action without `guard` keeps the contract it had.
+
+**What the owner says yes to (DIVE-4982).** The ask carries a `payload`, read off the page just
+before the step, in the form or dialog around the button: for a send the recipients, the subject
+and the body's first line; for a pay the payee (or the site) and the amount; for a publish the
+first 280 characters of the text; for a delete the row or item it belongs to. Bidi and control
+characters are stripped from it and from the button label. `approvals` and `approve` print it.
+A page that shows none of it gets an ask that says so; the button label is never passed off as
+a payload.
+
+**The owner's policy per kind.** `5dive browser approvals policy [--json]` prints
+`{"pay":"ask","publish":"ask","send":"ask","delete":"ask"}` (also as JSON when
+`FIVEDIVE_JSON_MODE=1`, which is how the 5dive CLI passes `--json` on). The owner changes it
+with `sudo 5dive browser approvals policy set <kind>=ask|allow`. The file lives at
+`/var/lib/5dive/browser-profiles/.approval-policy.json`, root-owned `0644`: every seat reads it,
+none writes it, and one the granting uid does not own is ignored. With `allow`, that kind's step
+runs without asking and is logged, with the payload and the act's screenshot, to
+`allowed.jsonl` in the seat's approvals directory.
+
+**A seat cannot answer an ask.** An agent seat's `sudo 5dive …` grant is root, and measured, a
+seat approved its own ask that way. `approve` and `approve --deny` from `sudo` by an `agent-*`
+user are refused unless they carry `--human-proof=<nonce>`, whose sha256 matches the request's
+`nonce_hash`. That hash is written as root by the 5dive CLI's `owner-ask`, which sends the ask to
+the owner with Approve and Decline buttons; after an exit-73 stop, `act` (or a guarded `run`) hands the request to
+`5dive owner-ask browser <request-file>` when the CLI has that verb, fail-soft. A root login,
+sudo from the owner's own account, and the dashboard approve exactly as before.
 
 A connected site with **no adapter** is no longer refused outright by the page gate: it proceeds
 unless the page is visibly a sign-in (password field, a form posting to a login path, a sign-in URL
@@ -525,10 +558,24 @@ when.
 | `reddit.com` | `/login/` | `name="username"` | logged-out form in a real browser |
 | `x.com` | `/i/flow/login` | `name="username_or_email"` | logged-out form, three renders (8s, 25s, Playwright 15s); the logged-in half is unmeasured because no x.com profile exists — that gap fails SAFE (a false "expired" asks a person; never a false "authenticated") |
 | `github.com` | `/settings/profile` | `action="/session"` | BOTH halves: 3 matches on the sign-in page logged out, 0 on "Your profile" logged in |
+| `google.com` | none | none | **the login check is not measured**, so there is no probe: `status google.com` reads UNKNOWN and `run google.com send` refuses (75) before a step, which is the fail-closed half. Measure it with `capture google.com` and reflex (below), and put the probe in the seat's `.adapters/google.com.json`. The `send` action's steps and its Sent-folder verify were measured on a live Gmail on 2026-09-25 (see the file's `_comment`) |
 | `web.telegram.org` | `/k/` | out: `(page-signQR\|auth-qr-form\|…)`, **in:** `class="[^"]*chatlist` | the POSITIVE marker on both halves (9 matches on the settled live session, 0 on the shell and on a logged-out render); the logged-out marker matched 0 on the live session but its logged-out render was never observed — the K app does not paint sign-in inside the probe's window on a fresh profile. That gap fails SAFE only because of the positive marker: neither matching is `UNKNOWN`, not a login |
 
-Every shipped adapter has `"actions": {}`: they classify a session, and the actions a site's owner
-wants are theirs to write in their seat's `.adapters/`.
+Every shipped adapter but one has `"actions": {}`: they classify a session, and the actions a
+site's owner wants are theirs to write in their seat's `.adapters/`. The one is google.com's
+`send` (DIVE-4984):
+
+```bash
+5dive browser run google.com send --to=<addr> --subject='<subject>' --body='<text>'
+# -> exit 73 and an approval id; the owner: sudo 5dive browser approve <id>
+5dive browser run google.com send --to=<addr> --subject='<subject>' --body='<text>' --approved-id=<id>
+# -> verified: send is live at https://mail.google.com/mail/u/0/#sent (re-read in this profile)
+```
+
+It opens full-screen compose with To and Subject in the URL (Gmail drops a `body=` parameter, so
+the body is typed), stops in front of Send until the owner's yes (`guard: true`), waits for
+Gmail's "Message sent" before letting the browser go, and is verified by the Sent folder, read in
+the same profile, on its newest row — never by the toast.
 
 **Why two and not one.** It was one — the package's `adapters/` — and that directory is replaced
 wholesale by `5dive plugin upgrade browser@5dive-browser`. Measured 2026-09-14: a hand-written
@@ -577,6 +624,22 @@ the driver's. A DOM assertion on the page you just acted on catches neither fail
 
 - posted the wrong thing (draft, truncated, wrong account) and reported success;
 - published fine but reported failure — so the retry double-posts.
+
+**Where the artifact is not public, the re-read is in the session (DIVE-4984).** The default
+re-read is a plain fetch with no cookies, which is right for a permalink anybody can open and
+wrong for a Sent folder: fetched from outside the login it is the sign-in page, so every Gmail
+send read NOT VERIFIED. An action's verify can say so:
+
+| field | what it does |
+|---|---|
+| `verify.in_session: true` | re-read `verify.url` through the executor that acted — the warm session when one holds the profile, the one-shot driver otherwise — in the same profile, still under the lease. Still a fresh load of a different URL, never the page the steps left. The window is `--expect`'s: `FIVEDIVE_BROWSER_EXPECT_WAIT_MS` (5000) |
+| `verify.wait_for` | wait for this before reading (the `--wait-for` grammar: CSS, `ref=`, `text=`) |
+| `verify.scope` | grade only the FIRST element that matches (the newest row of a list), so an older artifact with the same name further down cannot pass for the new one; nothing matching is NOT VERIFIED |
+
+`wait_for` and `scope` need a page, so either one without `in_session` is refused when the
+adapter loads. Arguments go in as what they are: into any `url` (a step's or the verify's)
+URL-encoded, so a subject with `&`, `#` or a space stays one parameter, and into `verify.expect`
+regex-escaped, so "Q3 (draft)" matches itself. A `fill` value is typed exactly as given.
 
 ## The executor
 

@@ -1,0 +1,25 @@
+{
+  "_comment": "MEASURED 2026-09-25 on a box with a google.com login, through `act` (browser 1.11.0), and NOTHING ELSE is relied on here. A compose URL with to= and su= opens full-screen compose with both fields filled, and Gmail DROPS a body= parameter (the first draft had an empty body), so the body is typed. The body fills at div[role=textbox][aria-label=\"Message Body\"]. The Send button is a div[role=button] whose aria-label STARTS with Send (live: 'Send (Ctrl-Enter) Send', with bidi marks around the shortcut); clicking it is a `send` (exit 73) until the owner says yes, and after the yes the 'Message sent' toast appears. The Sent folder at #sent then lists the mail as a row under [role=main] carrying its subject. THERE IS NO PROBE, deliberately: what a signed-out google.com page carries that a signed-in one does not was not measured, and a marker written from memory is the one that stamps a logged-out profile `authenticated`. Until someone measures it (`5dive browser capture google.com`, then `5dive reflex login-marker`) and adds `probe`, `status google.com` reads UNKNOWN and `run google.com send` refuses before a single step. That is the fail-closed half, not a bug.",
+  "site": "google.com",
+  "actions": {
+    "send": {
+      "_comment": "`guard: true`: the executor stops in front of the Send click (exit 73) exactly as `act` does, because the caller's arguments choose who gets the mail and what it says. The owner's yes (sudo 5dive browser approve <id>) is bound to this action with these exact --to/--subject/--body, once; re-run with --approved-id=<id>. The last step holds the tab until Gmail says the mail went: closing the browser the instant Send is clicked can cut the send off. It is a hold, not the verdict. If it never appears the step fails, and the re-read of Sent still decides.",
+      "guard": true,
+      "steps": [
+        { "op": "goto", "url": "https://mail.google.com/mail/u/0/?view=cm&fs=1&to={to}&su={subject}" },
+        { "op": "wait_for", "selector": "div[role=button][aria-label^=\"Send\"]" },
+        { "op": "fill", "selector": "div[role=textbox][aria-label=\"Message Body\"]", "value": "{body}" },
+        { "op": "click", "selector": "div[role=button][aria-label^=\"Send\"]" },
+        { "op": "wait_for", "selector": "text=Message sent" }
+      ],
+      "verify": {
+        "_comment": "The Sent folder is not a public page: a plain fetch of it is the sign-in page, so `in_session` re-reads it in this profile. `scope` grades only the FIRST row under [role=main], the newest mail, so an older mail with the same subject further down cannot pass for this one. That the first such row is the newest mail is Gmail's newest-first order, not a row-by-row measurement; the owner's live send is what confirms it. A first match that is not the new mail reads NOT VERIFIED, never verified.",
+        "in_session": true,
+        "url": "https://mail.google.com/mail/u/0/#sent",
+        "wait_for": "[role=main] tr",
+        "scope": "[role=main] tr",
+        "expect": "{subject}"
+      }
+    }
+  }
+}

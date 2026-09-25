@@ -191,10 +191,14 @@ function die(code, msg) { process.stderr.write(`${PROG}: ${msg}\n`); process.exi
 // is wrong: a fill that posts the literal text "{body}" has published garbage to
 // a real account, and the out-of-band verify cannot tell you it was garbage
 // because the artifact really is live.
-function interp(s, args, where) {
+//
+// `enc` (DIVE-4984): a value going into a URL is ENCODED. A subject with `&`, `#`
+// or a space spliced raw into `?su=` ends the parameter early, and the composer
+// opens with half the subject and the rest read as other parameters.
+function interp(s, args, where, enc) {
   if (typeof s !== 'string') return s;
   const out = s.replace(/\{([a-zA-Z0-9_]+)\}/g, (m, k) =>
-    Object.prototype.hasOwnProperty.call(args, k) ? args[k] : m);
+    Object.prototype.hasOwnProperty.call(args, k) ? (enc ? enc(String(args[k])) : args[k]) : m);
   const left = out.match(/\{[a-zA-Z0-9_]+\}/);
   if (left) {
     die(E_NOTHING_RAN, `${where} still contains ${left[0]} — no --${left[0].slice(1, -1)}=<value> was passed. ` +
@@ -394,11 +398,12 @@ async function writeReport(page, report) {
       settleMs: RUN_SETTLE_MS, waitFor: report.wait_for || null, waitTimeoutMs: STEP_TIMEOUT,
       expect: report.expect || null, expectWaitMs: Number(report.expect_wait_ms) || 0,
       walk: report.tree ? { interactiveOnly: !!report.interactive } : null,
+      scope: report.scope || null,
     });
     if (report.html) fs.writeFileSync(report.html, after.html || '', { mode: 0o600 });
     if (report.meta) {
       fs.writeFileSync(report.meta, JSON.stringify({ url: after.url, title: after.title, text: after.text,
-        wait_for: after.wait_for, expect_polled_ms: after.expect_polled_ms }), { mode: 0o600 });
+        wait_for: after.wait_for, expect_polled_ms: after.expect_polled_ms, scope: after.scope }), { mode: 0o600 });
     }
     if (report.tree && after.nodes) {
       fs.writeFileSync(report.tree, JSON.stringify({ url: after.url, title: after.title, nodes: after.nodes }), { mode: 0o600 });
@@ -463,7 +468,8 @@ async function main() {
       // `act` (DIVE-4943) sends the agent's own text, which has no adapter
       // arguments to fill and may legitimately contain a literal `{word}`; it
       // says so with `literal`, and the value is typed exactly as given.
-      out[field] = field === 'selector' || plan.literal ? s[field] : interp(s[field], args, `step ${i + 1} (${s.op})`);
+      out[field] = field === 'selector' || plan.literal ? s[field]
+        : interp(s[field], args, `step ${i + 1} (${s.op})`, field === 'url' ? encodeURIComponent : null);
     }
     return out;
   });
@@ -507,7 +513,11 @@ async function main() {
       // reviewed file and keeps its own contract.
       if (plan.guard && !plan.approved) {
         const risk = await aria.stepRisk(page, s, sel);
-        if (risk) {
+        // THE OWNER'S POLICY (DIVE-4982): a kind they set to "allow" runs without
+        // asking, and is REPORTED — bin/browser writes it to their log.
+        if (risk && Array.isArray(plan.allow_kinds) && plan.allow_kinds.includes(risk.cls)) {
+          process.stderr.write(aria.OWNER_ALLOWED_PREFIX + JSON.stringify({ ...risk, step: i + 1, op: s.op }) + '\n');
+        } else if (risk) {
           needsOwner = { ...risk, step: i + 1, op: s.op };
           break;
         }
