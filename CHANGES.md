@@ -22,7 +22,8 @@ relay the tap yet; `connect-request` refuses those seats up front rather than se
 
 `plugins/browser/` reaches 1.15.0 (5dive-browser ab73a52) inside the 1.16.0 mirror above; there was no separate 1.15.0 mirror. A
 blocked send/pay/publish/delete now shows what it would do (recipient, subject, first line; payee and amount; text; item),
-`approvals policy set <kind>=ask|allow` is the owner's only, and an agent seat's `sudo … approve` needs the owner's proof.
+`approvals policy set <kind>=ask|allow` is the owner's only (`approvals policy` prints JSON on `--json` and on
+`FIVEDIVE_JSON_MODE=1`), and an agent seat's `sudo … approve` needs the owner's proof, `--human-proof=<nonce>`.
 Full entry in 5dive-browser's CHANGES.md. `tests/browser_plugin_unit.sh` carries upstream's DIVE-4982 arms with `browser/` read as
 `plugins/browser/`.
 
