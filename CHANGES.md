@@ -1,5 +1,23 @@
 ## Unreleased
 
+### Added — an agent's "Connect <site>" button: the owner taps in Telegram, the box binds (DIVE-4992), telegram 0.5.63, browser 1.14.0
+
+An agent that needed the owner logged into a site could only walk them through the dashboard. Now
+`5dive browser connect-request <site> --reason=<why>` makes root send the seat's paired owner a
+**Connect <site>** button. The Claude Code Telegram bridge relays the tap to root
+(`sudo -n 5dive browser _connect`, parameters on stdin). Root checks the code, the seat and the
+owner, starts the browser, registers the viewer bind with shelld on loopback, and returns the
+one-time URL. The bridge edits the message to carry that URL as a code entity with previews off,
+plus a **Done** button. Done revokes the view, stops the browser and probes, and the verdict replaces
+the link. The agent's session gets a `[browser connect] …` channel message at each step.
+
+The Connect branch runs straight after the allowFrom check and before every other callback branch.
+If the generic agent-keyboard bridge ran first, it would hand the one-time code to the agent's
+session. `test/browser-connect.test.ts` pins that order. `plugins/browser/` mirrors
+5dive-ai/5dive-browser at 1.14.0 byte-identical, and `tests/browser_connect_request_unit.sh` is
+upstream's new harness with `browser/` read as `plugins/browser/`. The grok-based forks do not
+relay the tap yet; `connect-request` refuses those seats up front rather than send a dead button.
+
 ### Added — the registry copy carries `--wait-for`, loading-screen flags and a retrying `--expect`, at browser 1.13.0 (DIVE-4983)
 
 `plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.13.0 (1065e8e), byte-identical. `snapshot`, `read`

@@ -235,6 +235,11 @@ usage() {
   5dive browser viewer-redeem <site> --nonce=- --session=<id>
                                       # the relay's gate: consumes the link, prints the loopback target
   5dive browser viewer-revoke <site>  # kill the view; the browser stays logged in
+  5dive browser connect-request <site> [--reason=<why>]
+                                      # ask your paired owner, over Telegram, to log in:
+                                      # they get a "Connect <site>" button, their tap opens
+                                      # the one-time link, their "Done" tap checks the login.
+                                      # Nothing is bound until they tap.
 
   5dive browser adblock status              # is ad filtering on, and which sites is it off for
   sudo 5dive browser adblock off <site>     # this site breaks under filtering — stop filtering it
@@ -4557,6 +4562,292 @@ cmd_broker_audit() {  # _broker-audit <site> <event> [<detail>]
 }
 
 
+# >>> DIVE-4992 the AGENT asks, the OWNER taps, the box binds
+#
+# An agent that needs the owner logged into a site used to have nothing to hand
+# over: the viewer link needs a bind registered with the relay, and only the
+# dashboard's session (the connectord token) could do that. So it walked the
+# owner through the dashboard by hand. Now:
+#
+#   1. the agent runs `5dive browser connect-request <site> --reason=<why>`;
+#   2. ROOT mints a one-time request code, keeps only its hash, and sends the
+#      agent's paired owner a Telegram message with a "Connect <site>" button
+#      whose callback carries the code. The seat never holds the code before
+#      the tap: it goes from root straight into the button;
+#   3. the owner's tap reaches that seat's Telegram plugin, which hands the code
+#      and the tapper's id back to root (`_connect tap`). Root re-checks the
+#      code, that the tap came through the SAME seat, and that the tapper is
+#      that seat's paired owner — then does exactly what the dashboard's Connect
+#      does, on the box: serve (auth first when there is no profile), mint a
+#      viewer with a fresh bind, register the bind with shelld over loopback.
+#      The one-time URL goes back to the plugin, which sends it as code;
+#   4. the owner's "Done" tap (`_connect done`) revokes the view, stops the
+#      browser and probes, in that order, so the login is stamped honestly.
+#
+# No tap, no bind: a request by itself binds nothing. The control plane is not
+# involved at all, so DIVE-462's zero standing access is untouched, and the
+# automation token is not used.
+#
+# WHAT THIS DOES NOT CLAIM. The caller is a seat that already relays the owner's
+# other taps through the same plugin process, so a seat can always forward a real
+# tap it received. And a root-all seat can do everything root does here by
+# itself. The boundary is for the seat that is NOT root: it cannot mint a
+# request code, read one, or register a bind.
+CONNECT_DIR="$STATE_DIR/browser-connect"
+CONNECT_REQ_TTL=900          # the owner has 15 minutes to tap Connect
+CONNECT_DONE_TTL=7200        # and two hours to tap Done after that
+CONNECT_VIEW_TTL=$VIEWER_TTL_DEFAULT
+CONNECT_REASON_MAX=200
+CONNECT_CONNECTORS_DIR=/etc/5dive/connectors
+CONNECT_CONNECTORD_ENV=/etc/5dive/connectord.env
+CONNECT_PROVISIONING_ENV=/etc/5dive/provisioning.env
+CONNECT_SHELLD_URL=http://127.0.0.1:3101
+CONNECT_TG_API=https://api.telegram.org
+CONNECT_SELF="$0"
+CONNECT_PRIV=(sudo -n /usr/local/bin/5dive browser _connect)
+# TEST SEAMS, honoured only WITHOUT root. Unprivileged, every one of them points
+# the caller at its OWN files with its OWN rights, so none of them can grant
+# anything; under root the paths are fixed, whatever the environment says.
+if [[ $EUID -ne 0 ]]; then
+  CONNECT_DIR="${FIVEDIVE_BROWSER_CONNECT_DIR:-$CONNECT_DIR}"
+  CONNECT_CONNECTORS_DIR="${FIVEDIVE_CONNECTOR_DIR:-$CONNECT_CONNECTORS_DIR}"
+  CONNECT_CONNECTORD_ENV="${FIVEDIVE_CONNECTORD_ENV:-$CONNECT_CONNECTORD_ENV}"
+  CONNECT_PROVISIONING_ENV="${FIVEDIVE_PROVISIONING_ENV:-$CONNECT_PROVISIONING_ENV}"
+  CONNECT_SHELLD_URL="${FIVEDIVE_SHELLD_URL:-$CONNECT_SHELLD_URL}"
+  CONNECT_TG_API="${FIVEDIVE_TELEGRAM_API:-$CONNECT_TG_API}"
+  CONNECT_SELF="${FIVEDIVE_BROWSER_CONNECT_SELF:-$CONNECT_SELF}"
+  [[ -n "${FIVEDIVE_BROWSER_CONNECT_PRIV:-}" ]] && CONNECT_PRIV=("$FIVEDIVE_BROWSER_CONNECT_PRIV" _connect)
+fi
+
+# Who asked. Under root it is the kernel's answer through sudo (env_reset sets
+# SUDO_UID itself), never a flag; a direct root call has no seat and is refused.
+_connect_caller() {
+  if [[ $EUID -eq 0 ]]; then
+    [[ "${SUDO_UID:-}" =~ ^[0-9]+$ && "${SUDO_UID}" != 0 ]] || return 1
+    getent passwd "$SUDO_UID" | cut -d: -f1
+  else
+    id -un
+  fi
+}
+
+# The caller's Telegram channel: bot token, and the owner DMs in its allowFrom.
+# Sets CONNECT_TG_TOKEN, CONNECT_TG_OWNERS (space-separated), CONNECT_TG_TYPE.
+# Only Claude Code's bridge carries the tap handler in this release; a runtime
+# whose bridge would show a dead button is refused up front instead.
+_connect_channel() {
+  local seat="$1" name home t d tf
+  CONNECT_TG_TOKEN="" CONNECT_TG_OWNERS="" CONNECT_TG_TYPE=""
+  name="${seat#agent-}"
+  tf="$CONNECT_CONNECTORS_DIR/telegram-${name}.env"
+  [[ -r "$tf" ]] && CONNECT_TG_TOKEN=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$tf" | head -1)
+  home=$(getent passwd "$seat" | cut -d: -f6)
+  [[ $EUID -ne 0 && -n "${FIVEDIVE_BROWSER_CONNECT_HOME:-}" ]] && home="$FIVEDIVE_BROWSER_CONNECT_HOME"
+  for t in claude codex grok pi gemini; do
+    d="$home/.$t/channels/telegram/access.json"
+    [[ -r "$d" ]] || continue
+    CONNECT_TG_TYPE="$t"
+    CONNECT_TG_OWNERS=$(jq -r '(.allowFrom // [])[] | tostring | select(test("^[0-9]+$"))' "$d" 2>/dev/null | tr '\n' ' ')
+    break
+  done
+  [[ -n "$CONNECT_TG_TOKEN" && -n "$CONNECT_TG_TYPE" ]]
+}
+
+_connect_is_owner() {  # <seat> <telegram user id>
+  [[ "$2" =~ ^[0-9]+$ ]] || return 1
+  _connect_channel "$1" || return 1
+  [[ " $CONNECT_TG_OWNERS " == *" $2 "* ]]
+}
+
+# One Bot API call. The token is on curl's STDIN, never argv, so it is not in
+# the process table while root holds it.
+_connect_tg() {  # <method> [curl --data-urlencode args...]
+  local method="$1"; shift
+  printf 'url = "%s/bot%s/%s"\n' "$CONNECT_TG_API" "$CONNECT_TG_TOKEN" "$method" \
+    | curl -sS --connect-timeout 5 --max-time 15 --config - "$@" 2>/dev/null
+}
+
+_connect_file() { printf '%s/%s' "$CONNECT_DIR" "$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)"; }
+
+_connect_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+_connect_request() {  # <caller> <site> <reason>
+  local caller="$1" site="$2" reason="$3" code f now exp label text kb sent=0 o resp
+  _valid_site "$site" && [[ "$site" != "$PUBLIC_SITE" ]] \
+    || die "$E_USAGE" "'$site' is not a site a person can log in to"
+  reason=$(printf '%s' "$reason" | tr -d '\000-\037\177' | cut -c1-"$CONNECT_REASON_MAX")
+  _connect_channel "$caller" \
+    || die "$E_UNAVAILABLE" "seat '$caller' has no paired Telegram channel, so there is nobody to ask. Ask the owner to use Connected sites in the 5dive dashboard."
+  [[ "$CONNECT_TG_TYPE" == claude ]] \
+    || die "$E_UNAVAILABLE" "this seat's Telegram bridge ($CONNECT_TG_TYPE) cannot relay a Connect tap yet. Ask the owner to use Connected sites in the 5dive dashboard."
+  [[ -n "$CONNECT_TG_OWNERS" ]] \
+    || die "$E_UNAVAILABLE" "seat '$caller' has no paired owner on Telegram yet, so there is nobody to ask."
+
+  mkdir -p "$CONNECT_DIR" && chmod 700 "$CONNECT_DIR" || die "$E_UNAVAILABLE" "cannot create $CONNECT_DIR"
+  code=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  f=$(_connect_file "$code")
+  now=$(date -u +%s); exp=$(( now + CONNECT_REQ_TTL ))
+  ( umask 077; printf 'op=request\nseat=%s\nsite=%s\nexpires_at=%s\ncreated_at=%s\n' \
+      "$caller" "$site" "$exp" "$now" > "$f" )
+
+  label="${caller#agent-}"
+  text="🔐 ${label} asks you to log in to ${site} in the browser on your box."
+  [[ -n "$reason" ]] && text+=$'\n'"Why: ${reason}"
+  text+=$'\n\n'"Tap Connect for a one-time login link. Nothing opens unless you tap. You log in yourself; ${label} never sees your password."
+  kb=$(jq -nc --arg t "Connect ${site}" --arg d "bconn:${code}" '{inline_keyboard:[[{text:$t,callback_data:$d}]]}')
+  for o in $CONNECT_TG_OWNERS; do
+    resp=$(_connect_tg sendMessage --data-urlencode "chat_id=$o" --data-urlencode "text=$text" --data-urlencode "reply_markup=$kb")
+    [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == true ]] && sent=$((sent + 1))
+  done
+  if (( sent == 0 )); then
+    rm -f "$f"
+    die "$E_UNAVAILABLE" "Telegram did not accept the Connect message, so nobody was asked. Nothing was bound."
+  fi
+  printf 'asked the owner to connect %s (%s message%s). Nothing is bound until they tap; the request expires %s.\n' \
+    "$site" "$sent" "$([[ $sent == 1 ]] || echo s)" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'You will get a channel message when they tap and when they finish. Then `5dive browser status %s` has the verdict.\n' "$site"
+}
+
+# Claim a code exactly once: the rename is atomic, so two taps (or a tap and a
+# replay) cannot both win.
+_connect_claim() {  # <caller> <code> <op> <sender>  -> sets CONNECT_SITE; prints nothing
+  local caller="$1" code="$2" op="$3" sender="$4" f claimed seat exp
+  [[ "$code" =~ ^[0-9a-f]{48}$ ]] || die "$E_PERM" "that button is not a valid Connect code"
+  f=$(_connect_file "$code")
+  [[ -f "$f" ]] || die "$E_PERM" "that button is not live (already used, expired, or never issued)"
+  [[ "$(_connect_field "$f" op)" == "$op" ]] || die "$E_PERM" "that button is not live (already used, expired, or never issued)"
+  seat=$(_connect_field "$f" seat)
+  [[ "$seat" == "$caller" ]] \
+    || die "$E_PERM" "that button was issued to another seat's bot, not this one"
+  _connect_is_owner "$caller" "$sender" \
+    || die "$E_PERM" "only this seat's paired owner can use that button"
+  exp=$(_connect_field "$f" expires_at)
+  claimed="$f.claimed.$$"
+  mv "$f" "$claimed" 2>/dev/null || die "$E_PERM" "that button is not live (already used, expired, or never issued)"
+  if [[ ! "$exp" =~ ^[0-9]+$ ]] || (( exp <= $(date -u +%s) )); then
+    rm -f "$claimed"
+    die "$E_PERM" "that button has expired. Ask the agent to send a new one."
+  fi
+  CONNECT_SITE=$(_connect_field "$claimed" site)
+  rm -f "$claimed"
+}
+
+# Run a browser verb as the relay seat, exactly as shelld's
+# `sudo -n 5dive browser …` does for the dashboard. The audit row names who asked.
+_connect_as_box() {
+  if [[ $EUID -eq 0 ]]; then
+    runuser -u "$BOX_SEAT" -- env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
+      -u FIVEDIVE_BROWSER_SEAT FIVEDIVE_BROWSER_ON_BEHALF_OF="$CONNECT_CALLER" "$CONNECT_SELF" "$@"
+  else
+    "$CONNECT_SELF" "$@"
+  fi
+}
+
+_connect_tap() {  # <caller> <code> <sender>
+  local caller="$1" code="$2" sender="$3" site out err rc path exp bind token host done_code f
+  _connect_claim "$caller" "$code" request "$sender"
+  site="$CONNECT_SITE"
+  _valid_site "$site" || die "$E_PERM" "the request names no usable site"
+
+  err=$(mktemp); trap 'rm -f "$err"' EXIT
+  # serve first, so an existing profile resolves the way it always has; auth
+  # only when serve says there is no profile, then serve once more (DIVE-4895).
+  rc=0; _connect_as_box serve "$site" >/dev/null 2>"$err" || rc=$?
+  if (( rc != 0 )) && grep -q '\bno profile for\b' "$err"; then
+    rc=0; _connect_as_box auth "$site" >/dev/null 2>"$err" || rc=$?
+    (( rc == 0 )) && { rc=0; _connect_as_box serve "$site" >/dev/null 2>"$err" || rc=$?; }
+  fi
+  (( rc == 0 )) || die "$E_UNAVAILABLE" "the browser for $site did not start: $(tail -1 "$err")"
+
+  bind=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  rc=0; out=$(_connect_as_box viewer "$site" "--bind=$bind" "--ttl=$CONNECT_VIEW_TTL" 2>"$err") || rc=$?
+  (( rc == 0 )) || die "$E_UNAVAILABLE" "could not open a view of $site: $(tail -1 "$err")"
+  path=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
+  if [[ ! "$path" =~ ^/browser/viewer/[A-Za-z0-9._-]{1,64}/[0-9a-f]{64}$ ]]; then
+    _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+    die "$E_UNAVAILABLE" "the box returned an unusable viewer link; nothing was sent"
+  fi
+  # ONE CLOCK ORIGIN, the ticket's (same reason as the dashboard's route).
+  exp=$(sed -n 's/.*expires \([0-9-]*T[0-9:]*Z\).*/\1/p' "$err" | head -1)
+  exp=$(date -u -d "$exp" +%s 2>/dev/null || true)
+  if [[ ! "$exp" =~ ^[0-9]+$ ]]; then
+    _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+    die "$E_UNAVAILABLE" "the box did not say when the link expires; nothing was sent"
+  fi
+
+  token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$CONNECT_CONNECTORD_ENV" 2>/dev/null | head -1)
+  host=$(sed -n 's/^FIVE_DOMAIN=//p' "$CONNECT_PROVISIONING_ENV" 2>/dev/null | head -1)
+  if [[ -z "$token" || ! "$host" =~ ^[A-Za-z0-9.-]+$ ]] \
+     || ! printf 'header = "authorization: Bearer %s"\n' "$token" \
+          | curl -sS -f --max-time 10 --config - -X POST -H 'content-type: application/json' \
+              --data "$(jq -nc --arg s "$site" --arg b "$bind" --argjson e "$exp" '{site:$s,bind:$b,expiresAt:$e}')" \
+              "$CONNECT_SHELLD_URL/shell/browser-viewer-bind" >/dev/null 2>&1; then
+    # A ticket whose bind was never registered can only ever be refused.
+    _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+    die "$E_UNAVAILABLE" "the box's relay did not accept the login link; nothing was sent"
+  fi
+
+  done_code=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  f=$(_connect_file "$done_code")
+  ( umask 077; printf 'op=done\nseat=%s\nsite=%s\nexpires_at=%s\n' \
+      "$caller" "$site" "$(( $(date -u +%s) + CONNECT_DONE_TTL ))" > "$f" )
+  printf 'site=%s\nurl=https://%s%s\nexpires=%s\ndone=%s\n' \
+    "$site" "$host" "$path" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)" "$done_code"
+}
+
+_connect_done() {  # <caller> <code> <sender>
+  local caller="$1" code="$2" sender="$3" site out rc
+  _connect_claim "$caller" "$code" done "$sender"
+  site="$CONNECT_SITE"
+  _valid_site "$site" || die "$E_PERM" "the request names no usable site"
+  # revoke -> stop -> probe, in that order: a served profile cannot be probed
+  # honestly, and only this last command may stamp the liveness file.
+  _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+  _connect_as_box serve "$site" --stop >/dev/null 2>&1 || true
+  rc=0; out=$(_connect_as_box status "$site" 2>&1) || rc=$?
+  printf 'site=%s\nstatus_rc=%s\nstatus=%s\n' "$site" "$rc" "$(printf '%s\n' "$out" | grep -v '^$' | tail -1)"
+}
+
+# `_connect` — the privileged half. Parameters arrive NUL-separated on stdin so
+# the grant can stay one exact command path with no argument wildcard, and a
+# code never sits in the process table.
+cmd_connect_priv() {
+  local -a w=(); local a
+  while IFS= read -r -d '' a; do w+=("$a"); done
+  CONNECT_CALLER=$(_connect_caller) && [[ -n "$CONNECT_CALLER" ]] \
+    || die "$E_PERM" "_connect must be reached through sudo from an agent seat"
+  case "${w[0]:-}" in
+    request) (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect request <site> <reason>"
+             _connect_request "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
+    tap)     (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect tap <code> <telegram user id>"
+             _connect_tap "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
+    done)    (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect done <code> <telegram user id>"
+             _connect_done "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
+    *) die "$E_USAGE" "_connect: request, tap or done" ;;
+  esac
+}
+
+# `connect-request` — the agent's verb. Unprivileged: it only hands the request
+# to root, which is where the code is minted and the button sent.
+cmd_connect_request() {
+  local site="" reason="" rc=0
+  while (($#)); do
+    case "$1" in
+      --reason=*) reason="${1#*=}" ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) [[ -z "$site" ]] || die "$E_USAGE" "one site at a time"; site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser connect-request booking.com --reason=\"to search hotels for you\""
+  _valid_site "$site" && [[ "$site" != "$PUBLIC_SITE" ]] || die "$E_USAGE" "'$site' is not a site a person can log in to"
+  printf '%s\0' request "$site" "$reason" | "${CONNECT_PRIV[@]}" || rc=$?
+  if (( rc == 1 )) && [[ "${CONNECT_PRIV[0]}" == sudo ]] && ! sudo -n -l /usr/local/bin/5dive browser _connect >/dev/null 2>&1; then
+    die "$E_PERM" "this seat has no grant to send a Connect request. Ask the owner to use Connected sites in the 5dive dashboard."
+  fi
+  return "$rc"
+}
+# <<< DIVE-4992
+
 # >>> DIVE-4348 a root caller operates the SEAT's store — as the seat
 # The dashboard reaches every verb through shelld's whitelist, which is
 # `sudo -n /usr/local/bin/5dive browser …`: root, with SUDO_USER=claude. _seat
@@ -4571,7 +4862,9 @@ if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   case "${1:-}" in
     # `adblock` joins `setup` here: it writes the MACHINE-WIDE chrome policy
     # file, which is root's. Dropping to the seat would turn it into a refusal.
-    setup|adblock|approve|approvals|-h|--help|help|"") ;;
+    # `_connect` (DIVE-4992) is root's: it holds the request codes and the
+    # connectord token, and drops to the relay seat itself for the browser.
+    setup|adblock|approve|approvals|_connect|-h|--help|help|"") ;;
     *)
       # DIVE-4813: usually the caller, and for a brokered `serve` the owner.
       _drop="$(_root_drop_target "${SUDO_USER}" "$@")"
@@ -4634,5 +4927,8 @@ case "${1:-}" in
   viewer) shift; cmd_viewer "$@" ;;
   viewer-redeem) shift; cmd_viewer_redeem "$@" ;;
   viewer-revoke) shift; cmd_viewer_revoke "$@" ;;
+  connect-request) shift; cmd_connect_request "$@" ;;
+  # Not in usage: the privileged half, reached only as `sudo -n … browser _connect`.
+  _connect) shift; cmd_connect_priv "$@" ;;
   *) die "$E_USAGE" "unknown: $PROG $1 (see: $PROG --help)" ;;
 esac

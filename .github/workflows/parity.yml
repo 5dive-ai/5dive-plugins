@@ -71,6 +71,10 @@ jobs:
       # silence, not a green.
       - name: browser plugin harness
         run: bash tests/browser_plugin_unit.sh
+      # DIVE-4992: the agent-initiated Connect request and its privileged half,
+      # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
+      - name: browser connect-request harness
+        run: bash tests/browser_connect_request_unit.sh
       # DIVE-4397: the unprivileged-first 5dive reader, and the arms that assert
       # all five telegram forks still route through it. `bun test` does not reach
       # it — the module is driven with an injected exec function from bash, and

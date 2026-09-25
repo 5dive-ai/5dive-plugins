@@ -1,6 +1,6 @@
 {
   "name": "browser",
-  "version": "1.13.0",
+  "version": "1.14.0",
   "description": "Browse and act on any website with nothing connected; where it must be you, persistent human-authenticated sessions you log into once by hand (several accounts per site). Paying, posting, sending and deleting wait for your yes. Never solves a security challenge; it stops and asks you.",
   "author": {
     "name": "5dive",

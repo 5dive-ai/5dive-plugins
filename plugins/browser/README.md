@@ -62,6 +62,8 @@ reaches it through a viewer that is handed out as a **one-time, expiring, sessio
 5dive browser viewer <site> --bind=<session> [--ttl=600]     # mint a one-time link
 5dive browser viewer-redeem <site> --nonce=- --session=<id>  # the relay's gate; consumes the link
 5dive browser viewer-revoke <site>                           # kill the view, keep the login
+5dive browser connect-request <site> --reason=<why>          # ask the paired owner: a Connect
+                                                             # button in Telegram; their tap binds
 ```
 
 A successful `viewer-redeem` prints the two things the relay needs, and prints them exactly once:
