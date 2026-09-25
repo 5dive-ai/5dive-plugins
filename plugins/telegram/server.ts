@@ -46,6 +46,7 @@ import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } f
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, renderConnectLink, renderConnectVerdict, connectAgentNote, connectFailureText, type ConnectTap } from './browser-connect.ts'
+import { relayOwnerAskTap } from './owner-ask.ts'
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
@@ -4677,6 +4678,18 @@ async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: 
   notifyAgentOfConnect(ctx, connectAgentNote('verdict', v.site, `\`5dive browser status ${v.site}\` said: ${v.status || 'nothing'}`))
 }
 
+// DIVE-4982: `owner-ask tap` runs only as root (it refuses any other uid), so
+// the unprivileged-first runner would only ever collect that refusal. Spawned
+// per owner tap, never on a timer, like `browser _connect` above. A refusal
+// exits non-zero with its {ok:false} envelope on stdout, so stdout is kept.
+async function runOwnerAsk(args: string[]): Promise<string> {
+  try {
+    return (await execFileP(SUDO, ['-n', '5dive', ...args], { timeout: 45_000 })).stdout
+  } catch (err) {
+    return String((err as { stdout?: unknown })?.stdout ?? '')
+  }
+}
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   const access = loadAccess()
@@ -4694,6 +4707,18 @@ bot.on('callback_query:data', async ctx => {
     await handleBrowserConnectTap(ctx, connectTap, senderId)
     return
   }
+
+  // DIVE-4982: Approve / Decline on a browser ask. Relayed to root before the
+  // generic agent-keyboard bridge, which would hand the owner's nonce into the
+  // agent's session. The CLI decides; see owner-ask.ts.
+  const ownerAsked = await relayOwnerAskTap(data, senderId, ctx.callbackQuery.message?.text, {
+    run: runOwnerAsk,
+    answer: text => ctx.answerCallbackQuery({ text }).then(() => {}, () => {}),
+    edit: text => ctx.editMessageText(text).then(() => true, () => false),
+    dropButtons: () => ctx.editMessageReplyMarkup().then(() => {}, () => {}),
+    log: line => process.stderr.write(`telegram channel: ${line}\n`),
+  })
+  if (ownerAsked) return
 
   // Tap-to-answer for a human-gate ping (DIVE-117). The DIVE-105 notify DM
   // carries inline buttons for decision(--options)/approval gates; a tap lands

@@ -12,6 +12,17 @@ challenge page, and when the caller is an agent seat's sudo. `adapters drift` re
 and flags one that no longer classifies both halves; `probe-all` runs it once a day.
 `tests/browser_reflex_propose_unit.sh` is upstream's harness with the path read as `plugins/browser/`.
 
+### Added — Approve / Decline on a browser ask now works from a seat's own Telegram bot (DIVE-4982), telegram 0.5.64
+
+A browser send, pay, publish or delete that stopped with exit 73 reaches the owner with **Approve**
+(`bap:<12hex>:<nonce>`) and **Decline** (`bdn:<12hex>:<nonce>`), sent by `5dive owner-ask browser`. On a seat
+running its own bot, the Claude Code bridge did not know these buttons: a tap went to the generic
+agent-keyboard bridge, which put the button, nonce included, into the agent's session, and nothing was
+approved. The bridge now relays the tap to `sudo -n 5dive --json owner-ask tap <data> --tap-uid=<from.id>`,
+as the team-bot listener does, and the CLI decides. The owner sees `✅ Approved — <id>` or `❌ Declined — <id>`
+added to the message, or the CLI's reason on the tap; a malformed `bap:`/`bdn:` gets "expired". Pinned by
+`test/owner-ask-relay.test.ts`, with mutant arms. The grok-based forks do not relay the tap yet.
+
 ### Added — an agent's "Connect <site>" button: the owner taps in Telegram, the box binds (DIVE-4992), telegram 0.5.63, browser 1.16.0
 
 An agent that needed the owner logged into a site could only walk them through the dashboard. Now
