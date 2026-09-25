@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Added — the registry copy carries `--wait-for`, loading-screen flags and a retrying `--expect`, at browser 1.13.0 (DIVE-4983)
+
+`plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.13.0 (1065e8e), byte-identical. `snapshot`, `read`
+and `act` take `--wait-for=<selector|text>`. A known loading screen is flagged instead of returned as the page
+with rc 0. `read` caps its idle wait on never-idle apps and returns what loaded. `act --expect` retries for a
+few seconds against the full visible text, toasts and aria-live regions included, so a late "Message sent" no
+longer reads as a failure an agent would retry (double-send). The windows are tunable per seat: `FIVEDIVE_BROWSER_EXPECT_WAIT_MS`
+(the `--expect` retry window) and `FIVEDIVE_BROWSER_READ_CAP_MS` (the cap on `read`'s idle wait). Full entry in 5dive-browser's CHANGES.md.
+`tests/browser_plugin_unit.sh` carries upstream's T34 arms with `browser/` read as `plugins/browser/`.
+
 ### Added — the registry copy carries `proxy set`, at browser 1.12.0 (DIVE-4951)
 
 `plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.12.0, byte-identical. A box's browser can

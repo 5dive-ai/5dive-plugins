@@ -1139,9 +1139,6 @@ port_state() {
 SRVBIN="$TMP/srvbin"; mkdir -p "$SRVBIN"
 cat > "$SRVBIN/google-chrome" <<'SRVC'
 #!/usr/bin/env bash
-# A capture's metadata asks the browser for its version; answer at once, or the
-# `sleep 300` below holds the pipe open and the capture waits five minutes.
-if [[ "${1:-}" == --version ]]; then echo 'Google Chrome 153.0.8010.36'; exit 0; fi
 for a in "$@"; do case "$a" in --headless) exec sleep 0 ;; esac; done
 exec sleep 300
 SRVC
@@ -2279,16 +2276,9 @@ cat > "$PWROOT/node_modules/playwright-core/index.js" <<'PWJS'
 const fs = require('fs');
 const rec = (o) => fs.appendFileSync(process.env.PWREC, JSON.stringify(o) + '\n');
 let markWalks = 0;   // DIVE-4674: how many times the ref layer has asked THIS process
-// DIVE-4983: A PAGE THAT CHANGES AFTER IT LOADS. `clock` is the page's age in
-// the waits the product ASKED for (waitForTimeout), reset by the two things that
-// start a new page state: a goto and a click. PWLATE_MS is when the late state
-// arrives; PWWALK_LATE / PWHTML_LATE / PWTEXT_LATE are what the page shows then.
-// Unset, every answer is the one it always was.
-let clock = 0;
-const late = () => !!process.env.PWLATE_MS && clock >= Number(process.env.PWLATE_MS);
 const page = {
   setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t }),
-  goto: async (url, o) => { clock = 0; rec({ call: 'goto', url }); },
+  goto: async (url, o) => rec({ call: 'goto', url }),
   fill: async (sel, val) => {
     rec({ call: 'fill', sel, val });
     // PWPREEMPT_FILE: a PERSON arrives mid-run. Writing the lease file from
@@ -2301,12 +2291,11 @@ const page = {
     }
   },
   click: async (sel) => {
-    clock = 0;
     rec({ call: 'click', sel });
     if (process.env.PWFAIL) throw new Error('stub: the step failed');
   },
   waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel }),
-  waitForTimeout: async (ms) => { clock += Number(ms) || 0; rec({ call: 'waitForTimeout', ms }); },
+  waitForTimeout: async (ms) => rec({ call: 'waitForTimeout', ms }),
   // DIVE-4588. The ref layer runs its walk with page.evaluate, so the tape has
   // to carry it. PWWALK parks the answer the walk would have produced in a real
   // page; the arms then grade what the DRIVER does with it, which is the half
@@ -2316,12 +2305,6 @@ const page = {
     // DIVE-4943: the owner-approval guard reads the live element's label through
     // evaluate. PWLABEL parks what the page would have said.
     if (arg && arg.riskOf) { rec({ call: 'label', sel: arg.sel, op: arg.op }); return process.env.PWLABEL || ''; }
-    // DIVE-4983: "is it on screen yet" and "what does the page say". The
-    // predicate itself is graded against a DOM shim in T34g; here the stub only
-    // answers on the clock, and the tape shows the product ASKED.
-    if (arg && arg.visibleOf) { rec({ call: 'visible', target: arg.target, mode: arg.mode, at: clock });
-      return !process.env.PWLATE_MS || late(); }
-    if (arg && arg.textOf) return (late() && process.env.PWTEXT_LATE) || process.env.PWTEXT || '';
     const mark = (arg && arg.mark) || null;
     if (mark) markWalks++;
     rec({ call: 'evaluate', fnlen: String(fn).length, mark, walkN: mark ? markWalks : null,
@@ -2339,7 +2322,6 @@ const page = {
       }
       return { nodes: [], marker: 'late-1' };
     }
-    if (late() && process.env.PWWALK_LATE) return JSON.parse(fs.readFileSync(process.env.PWWALK_LATE, 'utf8'));
     if (process.env.PWWALK) return JSON.parse(fs.readFileSync(process.env.PWWALK, 'utf8'));
     return { nodes: [], marker: null };
   },
@@ -2354,7 +2336,7 @@ const page = {
   // DIVE-4943: `act` re-reads the page as the steps left it.
   url: () => process.env.PWURL || 'https://stub.test/after',
   title: async () => process.env.PWTITLE || 'stub after',
-  content: async () => (late() && process.env.PWHTML_LATE) || process.env.PWHTML || '<html><body>stub after</body></html>',
+  content: async () => process.env.PWHTML || '<html><body>stub after</body></html>',
   setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p }),
   press: async (sel, key) => rec({ call: 'press', sel, key }),
 };
@@ -3433,18 +3415,13 @@ cat > "$DSTUB/node_modules/playwright-core/index.js" <<'DPWJS'
 const fs = require('fs');
 const rec = (o) => fs.appendFileSync(process.env.PWREC, JSON.stringify(o) + '\n');
 let markWalks = 0;   // DIVE-4674, see the driver stub
-// DIVE-4983: the driver stub's page clock, per tab, with the late state named by
-// FILES (DPWSNAP_LATE, DPWDOM_LATE) and DPWTEXT/DPWTEXT_LATE, fixed at `serve`.
-const mkpage = (kind) => { let clock = 0;
-  const late = () => !!process.env.DPWLATE_MS && clock >= Number(process.env.DPWLATE_MS);
-  return {
+const mkpage = (kind) => ({
   setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t, kind }),
   // DPWGOTO_MS: a page that takes real time to load, so two requests can
   // overlap in the daemon (DIVE-4927, T27m). Unset, a goto is instant as before.
-  goto: async (url) => { clock = 0; rec({ call: 'goto', url, kind });
+  goto: async (url) => { rec({ call: 'goto', url, kind });
     if (process.env.DPWGOTO_MS) await new Promise((r) => setTimeout(r, Number(process.env.DPWGOTO_MS))); },
-  content: async () => { rec({ call: 'content', kind });
-    return fs.readFileSync((late() && process.env.DPWDOM_LATE) || process.env.DPWDOM, 'utf8'); },
+  content: async () => { rec({ call: 'content', kind }); return fs.readFileSync(process.env.DPWDOM, 'utf8'); },
   fill: async (sel, val) => {
     rec({ call: 'fill', sel, val, kind });
     if (process.env.PWPREEMPT_FILE) {
@@ -3452,9 +3429,9 @@ const mkpage = (kind) => { let clock = 0;
         'token=belongs-to-the-person-at-the-viewer\nholder=someone\nholder_pid=1\nkind=human\n');
     }
   },
-  click: async (sel) => { clock = 0; rec({ call: 'click', sel, kind }); if (process.env.PWFAIL) throw new Error('stub: the step failed'); },
+  click: async (sel) => { rec({ call: 'click', sel, kind }); if (process.env.PWFAIL) throw new Error('stub: the step failed'); },
   waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel, kind }),
-  waitForTimeout: async (ms) => { clock += Number(ms) || 0; rec({ call: 'waitForTimeout', ms, kind }); },
+  waitForTimeout: async (ms) => rec({ call: 'waitForTimeout', ms, kind }),
   // DIVE-4943: `act` re-reads the page the steps left, and the owner-approval
   // guard reads the live label. The daemon's env is fixed at `serve` time, so the
   // label an arm wants is read from a FILE per call (DPWLABEL), not from env.
@@ -3465,9 +3442,6 @@ const mkpage = (kind) => { let clock = 0;
       rec({ call: 'label', kind });
       try { return fs.readFileSync(process.env.DPWLABEL, 'utf8').trim(); } catch (e) { return ''; }
     }
-    if (arg && arg.visibleOf) { rec({ call: 'visible', target: arg.target, kind, at: clock });
-      return !process.env.DPWLATE_MS || late(); }
-    if (arg && arg.textOf) return (late() && process.env.DPWTEXT_LATE) || process.env.DPWTEXT || '';
     const mark = (arg && arg.mark) || null;
     if (mark) markWalks++;
     rec({ call: 'evaluate', kind, mark, walkN: mark ? markWalks : null, snapshot: !!(arg && arg.snapshot) });
@@ -3481,7 +3455,6 @@ const mkpage = (kind) => { let clock = 0;
       }
       return { nodes: [], marker: 'late-1' };
     }
-    if (arg && arg.snapshot && late() && process.env.DPWSNAP_LATE) return JSON.parse(fs.readFileSync(process.env.DPWSNAP_LATE, 'utf8'));
     if (arg && arg.snapshot && process.env.DPWSNAP) return JSON.parse(fs.readFileSync(process.env.DPWSNAP, 'utf8'));
     return { nodes: [], marker: null };
   },
@@ -3499,7 +3472,7 @@ const mkpage = (kind) => { let clock = 0;
   setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p, kind }),
   press: async (sel, key) => rec({ call: 'press', sel, key, kind }),
   close: async () => rec({ call: 'pageclose', kind }),
-}; };
+});
 const first = mkpage('first');
 exports.chromium = {
   launchPersistentContext: async (profile, opts) => {
@@ -5519,290 +5492,6 @@ for f in README.md skills/use-browser/SKILL.md skills/connect-site/SKILL.md AGEN
 done
 tn 'T33m connect-site no longer says there is no fix' 'there is no flag for it' \
    "$(tr -s '[:space:]' ' ' < "$ROOT/plugins/browser/skills/connect-site/SKILL.md")"
-
-# ============ T34 DIVE-4983: ready, not settled — wait for the page, name a splash
-#
-# THE DEFECT, measured on a live Gmail inbox (2026-09-25): `snapshot` handed back
-# the loading splash — 4 nodes, help links and "Try reloading the page" — with
-# rc 0, as if it were the inbox; `read` never came back (virtual time does not run
-# out on a page that long-polls); `act --expect='Message sent'` printed NOT
-# VERIFIED on a mail that was in the Sent folder, because its one re-read came
-# before the toast. Each arm is the mutant of one of those:
-#   T34a  a known splash is NAMED and exits 76, never rc 0 as if it were the page
-#   T34b  a page that never goes quiet: `read` comes back under the cap, partial
-#   T34c  a toast 1.5 s after the click verifies inside --expect's window; a window
-#         of 0 (the old single read) goes red on the same act
-#   T34d  `snapshot --wait-for` waits for a late element, and its refs include it
-#   T34e  the WARM loop does the same, and `read --wait-for` rides it
-#   T34f  MUTANT: the wait gutted in a copy of the package, T34d goes red
-#   T34g  the page-side predicates, graded against a DOM shim
-#   T34h  the flags are documented where agents and people read them
-#
-# Time here is the STUB's page clock (the waits the product asks for), so "1.5 s
-# later" costs no real second and cannot flake; T34b is the one arm on a real
-# clock, because the cap it grades is a wall clock.
-unset FIVEDIVE_BROWSER_DRIVER
-GM_URL='https://mail.google.com/mail/u/0/#inbox'
-mkprofile mail.google.com "$LIVE_DOM" >/dev/null
-# THE SPLASH. Built from what the capture measured — its four refs and its "If
-# you're having trouble loading" line — not a byte copy of Gmail's document. The
-# loaded inbox carries the same sentence in a hidden element, which is the case
-# the node bound in the table exists for.
-SPLASH_HTML='<html><head><title>Gmail</title></head><body><div id="loading"><div>Loading…</div><div id="stb">If you'"'"'re having trouble loading Gmail, <a href="https://support.google.com/mail">Gmail help center</a>. <a href="#">Try reloading the page</a>, or use the <button>basic HTML view</button>. Still stuck? Visit the <a href="https://support.google.com/">help center</a>.</div></div></body></html>'
-INBOX_HTML='<html><head><title>Inbox - Gmail</title></head><body><div id="loading" style="display:none">If you'"'"'re having trouble loading Gmail</div><div role="main"><h1>Inbox</h1><p>Your inbox, loaded: every conversation the account has, with the toolbar and the folders around it.</p></div></body></html>'
-T34SPLASH="$TMP/t34-splash.json"; T34INBOX="$TMP/t34-inbox.json"
-jq -n --arg html "$SPLASH_HTML" --arg u "$GM_URL" '{
-  nodes: [ {ref:"link/Gmail help center", role:"link", name:"Gmail help center", tag:"a"},
-           {ref:"link/Try reloading the page", role:"link", name:"Try reloading the page", tag:"a"},
-           {ref:"button/basic HTML view", role:"button", name:"basic HTML view", tag:"button"},
-           {ref:"link/help center", role:"link", name:"help center", tag:"a"} ],
-  marker: null, title: "Gmail", url: $u, html: $html }' > "$T34SPLASH"
-jq -n --arg html "$INBOX_HTML" --arg u "$GM_URL" '{
-  nodes: (([ "Compose", "Refresh", "Older" ] | map({ref:("button/" + .), role:"button", name:., tag:"div"}))
-        + ([ "Inbox", "Starred", "Sent", "Drafts" ] | map({ref:("link/" + .), role:"link", name:., tag:"a"}))
-        + [ {ref:"textbox/Search mail", role:"textbox", name:"Search mail", tag:"input"},
-            {ref:"main/", role:"main", name:"", tag:"div"} ]),
-  marker: null, title: "Inbox - Gmail", url: $u, html: $html }' > "$T34INBOX"
-t34env() { env PATH="$READPATH" NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" "$@"; }
-
-# --- T34a a known splash is NAMED, and it is not rc 0 -----------------------
-: > "$PWREC"; rm -rf "$TMP/t34a"
-run t34env PWWALK="$T34SPLASH" "$BROWSER" snapshot mail.google.com "$GM_URL" --interactive --out="$TMP/t34a"
-t  'T34a the Gmail splash is NOT exit 0' 76 "$RC"
-tc 'T34a ...it is named as a loading screen' 'LOADING SCREEN' "$ERR"
-tc 'T34a ...with what to do about it' '--wait-for=' "$ERR"
-t  'T34a page.meta.json names it, and marks the capture partial' 'gmail true' \
-   "$(jq -r '"\(.loading_screen) \(.partial)"' "$TMP/t34a/page.meta.json" 2>/dev/null)"
-tc 'T34a page.md says so, where an agent actually reads' 'loading_screen: "gmail"' "$(cat "$TMP/t34a/page.md" 2>/dev/null)"
-t  'T34a the evidence still ships — the picture is how a person sees what the agent got' 'yes' \
-   "$([[ -s "$TMP/t34a/tree.json" && -s "$TMP/t34a/page.png" ]] && echo yes || echo no)"
-tn 'T34a ...and stdout no longer reads like a page' 'one page instant, one capture' "$OUT"
-run t34env PWWALK="$T34SPLASH" "$BROWSER" snapshot mail.google.com "$GM_URL" --interactive --json --out="$TMP/t34a-json"
-t  'T34a --json carries it too, still 76' '76 gmail true' "$RC $(jq -r '"\(.loading_screen) \(.partial)"' <<<"$OUT" 2>/dev/null)"
-# CONTROLS, or the arm grades the sentence and not the splash: the LOADED app keeps
-# the same sentence hidden and is the page; the same markup on another host is not
-# Gmail's splash, because the table is keyed by host.
-run t34env PWWALK="$T34INBOX" "$BROWSER" snapshot mail.google.com "$GM_URL" --interactive --out="$TMP/t34a-inbox"
-t  'T34a (control) the loaded inbox, carrying the same hidden sentence, is the page' 0 "$RC"
-t  'T34a (control) ...and nothing is named' 'null null' \
-   "$(jq -r '"\(.loading_screen) \(.partial)"' "$TMP/t34a-inbox/page.meta.json" 2>/dev/null)"
-mkprofile splash.test "$LIVE_DOM" >/dev/null
-jq '.url = "https://splash.test/x"' "$T34SPLASH" > "$TMP/t34-splash-other.json"
-run t34env PWWALK="$TMP/t34-splash-other.json" "$BROWSER" snapshot splash.test "https://splash.test/x" --out="$TMP/t34a-other"
-t  'T34a (control) the same markup on another host is not a known splash' 0 "$RC"
-t  'T34a the table is one line per screen' 1 "$(grep -c '^  .gmail|' "$BROWSER")"
-
-# --- T34d snapshot --wait-for waits for a LATE element -----------------------
-: > "$PWREC"; rm -rf "$TMP/t34d"
-run t34env PWWALK="$T34SPLASH" PWWALK_LATE="$T34INBOX" PWLATE_MS=1500 \
-    "$BROWSER" snapshot mail.google.com "$GM_URL" --interactive --wait-for='[role=main]' --out="$TMP/t34d"
-t  'T34d snapshot --wait-for on a page that loads late exits 0' 0 "$RC"
-tc 'T34d ...and its refs include the element that arrived late' 'button/Compose' \
-   "$(jq -r '.nodes[].ref' "$TMP/t34d/tree.json" 2>/dev/null)"
-t  'T34d ...the wait is recorded, met, when the element arrived' 'true 1500' \
-   "$(jq -r '"\(.wait_for.met) \(.wait_for.waited_ms)"' "$TMP/t34d/page.meta.json" 2>/dev/null)"
-t  'T34d ...having asked the page for exactly that target, more than once' '[role=main] yes' \
-   "$(jq -rs '[.[]|select(.call=="visible")] | "\(map(.target)|unique|join(",")) \(if length > 1 then "yes" else "no" end)"' "$PWREC")"
-t  'T34d ...and it is not flagged: the page it captured is the inbox' 'null' \
-   "$(jq -r '.loading_screen' "$TMP/t34d/page.meta.json" 2>/dev/null)"
-# CONTROL: the same late page with no --wait-for is captured at the settle — the
-# splash — so the arm above is the wait working, not a fixture that was never late.
-rm -rf "$TMP/t34d0"
-run t34env PWWALK="$T34SPLASH" PWWALK_LATE="$T34INBOX" PWLATE_MS=1500 \
-    "$BROWSER" snapshot mail.google.com "$GM_URL" --interactive --out="$TMP/t34d0"
-t  'T34d (control) without --wait-for the same page is the splash (76)' 76 "$RC"
-tn 'T34d (control) ...and has no Compose' 'button/Compose' "$(jq -r '.nodes[].ref' "$TMP/t34d0/tree.json" 2>/dev/null)"
-# An element that never comes is NOT READY — bounded by the step timeout, and
-# never a hang or a 0. A neutral host, so the splash rule is not what fires.
-mkprofile late.snap.test "$LIVE_DOM" >/dev/null
-jq '.url = "https://late.snap.test/x"' "$T34INBOX" > "$TMP/t34-neutral.json"
-rm -rf "$TMP/t34d2"
-run t34env PWWALK="$TMP/t34-neutral.json" PWLATE_MS=99999999 FIVEDIVE_BROWSER_STEP_TIMEOUT=1000 \
-    "$BROWSER" snapshot late.snap.test "https://late.snap.test/x" --wait-for='text=Compose' --out="$TMP/t34d2"
-t  'T34d a --wait-for that never appears is NOT READY (76)' 76 "$RC"
-tc 'T34d ...naming it and the bound' 'did not appear within 1000 ms' "$ERR"
-t  'T34d ...and the capture is partial, unmet' 'true false' \
-   "$(jq -r '"\(.partial) \(.wait_for.met)"' "$TMP/t34d2/page.meta.json" 2>/dev/null)"
-run t34env "$BROWSER" snapshot late.snap.test "https://late.snap.test/x" --wait-for=
-t  'T34d an empty --wait-for is refused up front' 64 "$RC"
-
-# --- T34b a page that never goes quiet: read comes back under the cap --------
-IDLEBIN="$TMP/idlebin"; mkdir -p "$IDLEBIN"
-cat > "$IDLEBIN/google-chrome" <<'ICHROME'
-#!/usr/bin/env bash
-# A PAGE THAT NEVER GOES QUIET. --virtual-time-budget does not advance while a
-# request is pending, so on a long-polling page --dump-dom never returns; Chrome's
-# --timeout=<ms> stops the load after that many REAL ms and dumps what loaded.
-# This fake is that contract and no more: the /never-idle page hangs unless
-# --timeout is given, and dumps that long after it is. FAKE_IGNORES_TIMEOUT is a
-# Chrome that does not honour the flag, for the backstop arm.
-if [[ "${1:-}" == --version ]]; then echo 'Google Chrome 153.0.8010.36'; exit 0; fi
-to=""; u=""; d=""
-for a in "$@"; do case "$a" in --user-data-dir=*) d="${a#*=}" ;; --timeout=*) to="${a#*=}" ;; -*) ;; *) u="$a" ;; esac; done
-page='<html><head><title>Inbox</title></head><body><main><h1>Inbox</h1><p>The part of the inbox that had loaded when the page was stopped, which is enough words for the extractor to keep as the article.</p></main></body></html>'
-case "$u" in
-  */never-idle) [[ -z "$to" || -n "${FAKE_IGNORES_TIMEOUT:-}" ]] && exec sleep 300
-                sleep "$(awk -v m="$to" 'BEGIN{printf "%.3f", m/1000}')"; printf '%s\n' "$page" ;;
-  */quiet)      printf '%s\n' "$page" ;;
-  *)            cat "$d/.fake-dom" 2>/dev/null ;;
-esac
-ICHROME
-chmod +x "$IDLEBIN/google-chrome"
-mkprofile idle.test "$LIVE_DOM" >/dev/null
-S34=$(date +%s)
-run timeout 30 env PATH="$IDLEBIN:$PATH" FIVEDIVE_BROWSER_READ_CAP_MS=1500 \
-    "$BROWSER" read idle.test "https://idle.test/never-idle" --out="$TMP/t34b"
-E34=$(( $(date +%s) - S34 ))
-t  'T34b read of a page that never goes quiet comes back, exit 0' 0 "$RC"
-t  'T34b ...in seconds, not the 200 s it was killed at' 'yes' "$([[ $E34 -lt 20 ]] && echo yes || echo "no:${E34}s")"
-t  'T34b ...marked partial in page.meta.json' 'true' "$(jq -r .partial "$TMP/t34b/page.meta.json" 2>/dev/null)"
-tc 'T34b ...and in page.md, where the agent reads it' 'partial: true' "$(cat "$TMP/t34b/page.md" 2>/dev/null)"
-tc 'T34b ...holding what HAD loaded' 'enough words for the extractor' "$(cat "$TMP/t34b/page.md" 2>/dev/null)"
-tc 'T34b ...and a NOTE saying it is partial' 'still loading at the 1500 ms cap' "$ERR"
-run env PATH="$IDLEBIN:$PATH" FIVEDIVE_BROWSER_READ_CAP_MS=1500 \
-    "$BROWSER" read idle.test "https://idle.test/quiet" --out="$TMP/t34b0"
-t  'T34b (control) a page that finishes on its own is not partial' '0 null' \
-   "$RC $(jq -r .partial "$TMP/t34b0/page.meta.json" 2>/dev/null)"
-# THE BACKSTOP: a Chrome that does not honour --timeout is killed a few seconds
-# past the cap, and read says so — it does not hang and it does not write a page.
-S34=$(date +%s)
-run timeout 30 env PATH="$IDLEBIN:$PATH" FAKE_IGNORES_TIMEOUT=1 FIVEDIVE_BROWSER_READ_CAP_MS=1000 \
-    "$BROWSER" read idle.test "https://idle.test/never-idle" --out="$TMP/t34b2"
-E34=$(( $(date +%s) - S34 ))
-t  'T34b a Chrome that ignores the cap is killed, and read is NOT READY (76)' 76 "$RC"
-t  'T34b ...within seconds of the cap' 'yes' "$([[ $E34 -lt 20 ]] && echo yes || echo "no:${E34}s")"
-tc 'T34b ...saying why' 'never finished loading' "$ERR"
-t  'T34b ...and writing no page' 'no' "$([[ -e "$TMP/t34b2/page.md" ]] && echo yes || echo no)"
-# read --wait-for, cold: the executor renders it (a --dump-dom cannot wait for an element)
-rm -rf "$TMP/t34b3"
-run t34env PWWALK="$T34SPLASH" PWWALK_LATE="$T34INBOX" PWLATE_MS=1500 \
-    "$BROWSER" read mail.google.com "$GM_URL" --wait-for='[role=main]' --out="$TMP/t34b3"
-t  'T34b read --wait-for exits 0 on the late page' 0 "$RC"
-t  'T34b ...rendered through the executor, and says so' 'playwright true' \
-   "$(jq -r '"\(.capture) \(.wait_for.met)"' "$TMP/t34b3/page.meta.json" 2>/dev/null)"
-tc 'T34b ...and the document is the loaded one' 'Your inbox, loaded' "$(cat "$TMP/t34b3/page.md" 2>/dev/null)"
-
-# --- T34c a toast after the click: --expect waits for it --------------------
-# The toast's words are split across tags, so the document alone never matches:
-# the arm also proves --expect reads the TEXT a person sees.
-TOAST0='<html><body><div id="compose"><p>To: someone@example.test</p><p>Subject: hello from the act arm</p></div></body></html>'
-TOAST1='<html><body><div id="compose"><p>Subject: hello from the act arm</p></div><div role="alert" aria-live="polite">Message <span>sent</span></div></body></html>'
-t34toast() { run actenv env PWHTML="$TOAST0" PWHTML_LATE="$TOAST1" PWTEXT="To: someone@example.test" \
-               PWTEXT_LATE="Subject: hello from the act arm Message sent" PWLATE_MS=1500 "$@"; }
-: > "$PWREC"; rm -rf "$TMP/t34c"
-t34toast "$BROWSER" act "https://public-web.test/compose" --steps='[{"op":"click","selector":"#go"}]' \
-    --expect='Message sent' --out="$TMP/t34c"
-t  'T34c a toast 1.5 s after the click verifies inside the window' 0 "$RC"
-tc 'T34c ...as verified' 'verified: the page after the steps matches --expect' "$OUT"
-t  'T34c ...the re-read that matched is the one that shipped' '1500' \
-   "$(jq -r .expect_polled_ms "$TMP/t34c/after.json" 2>/dev/null)"
-tc 'T34c ...and it carries the toast' 'Message sent' "$(jq -r .text "$TMP/t34c/after.json" 2>/dev/null)"
-t  'T34c (anchor) the document alone does not match — the text a person reads did' 'no' \
-   "$(grep -qiE 'Message sent' "$TMP/t34c/page.html" && echo yes || echo no)"
-t  'T34c an act leaves the snapshot triple too: page.md, page.meta.json, tree.json' 'yes' \
-   "$([[ -s "$TMP/t34c/page.md" && -s "$TMP/t34c/page.meta.json" && -s "$TMP/t34c/tree.json" ]] && echo yes || echo no)"
-# THE MUTANT THE ROW NAMES: the window set to 0 is the old single read.
-rm -rf "$TMP/t34c0"
-t34toast "$BROWSER" act "https://public-web.test/compose" --steps='[{"op":"click","selector":"#go"}]' \
-    --expect='Message sent' --expect-wait=0 --out="$TMP/t34c0"
-t  'T34c MUTANT: with the window at 0, the same act is NOT VERIFIED' 1 "$RC"
-tc 'T34c MUTANT ...and says so' 'NOT VERIFIED' "$ERR"
-run actenv "$BROWSER" act "https://public-web.test/compose" --steps='[{"op":"click","selector":"#go"}]' --expect=x --expect-wait=soon
-t  'T34c an --expect-wait that is not milliseconds is refused' 64 "$RC"
-# act --wait-for: the re-read waits for the page, and --interactive narrows the refs
-: > "$PWREC"; rm -rf "$TMP/t34c2"
-run actenv env PWWALK="$T34SPLASH" PWWALK_LATE="$T34INBOX" PWLATE_MS=1500 "$BROWSER" act "https://public-web.test/compose" \
-    --steps='[{"op":"click","selector":"#go"}]' --wait-for='[role=main]' --interactive --out="$TMP/t34c2"
-t  'T34c act --wait-for leaves the refs of the page it waited for' '0 yes' \
-   "$RC $(jq -r '.nodes[].ref' "$TMP/t34c2/tree.json" 2>/dev/null | grep -qx 'button/Compose' && echo yes || echo no)"
-
-# --- T34e the WARM loop waits too ----------------------------------------------
-mkprofile warm34.test "$LIVE_DOM" >/dev/null
-jq '.url = "https://warm34.test/inbox"' "$T34SPLASH" > "$TMP/t34w-early.json"
-jq '.url = "https://warm34.test/inbox"' "$T34INBOX" > "$TMP/t34w-late.json"
-printf '%s' "$TOAST1" > "$TMP/t34w-late.dom"
-dserve warm34.test DPWLATE_MS=1500 DPWSNAP="$TMP/t34w-early.json" DPWSNAP_LATE="$TMP/t34w-late.json" \
-       DPWDOM_LATE="$TMP/t34w-late.dom" DPWTEXT_LATE="Message sent"
-t  'T34e (precondition) the warm session is up' 0 "$RC"
-L34="$(launches)"; N34=$(wc -l < "$DREC")
-dwarm "$BROWSER" snapshot warm34.test "https://warm34.test/inbox" --wait-for='[role=main]' --out="$TMP/t34e"
-t  'T34e a warm snapshot --wait-for exits 0' 0 "$RC"
-tc 'T34e ...with the late element in its refs' 'button/Compose' "$(jq -r '.nodes[].ref' "$TMP/t34e/tree.json" 2>/dev/null)"
-t  'T34e ...the daemon asked the page, and the wait is recorded' 'yes true' \
-   "$([[ "$(tail -n +$((N34+1)) "$DREC" | jq -rs '[.[]|select(.call=="visible")]|length')" -ge 2 ]] && echo yes || echo no) $(jq -r '.wait_for.met' "$TMP/t34e/page.meta.json" 2>/dev/null)"
-t  'T34e ...in the browser already open' "$L34" "$(launches)"
-dwarm "$BROWSER" act warm34.test "https://warm34.test/compose" --steps='[{"op":"click","selector":"#go"}]' \
-    --expect='Message sent' --out="$TMP/t34e2"
-t  'T34e a warm act verifies a toast that arrives after the settle' 0 "$RC"
-t  'T34e ...by re-reading, not by luck' 'yes' \
-   "$([[ "$(jq -r '.expect_polled_ms // 0' "$TMP/t34e2/after.json" 2>/dev/null)" -gt 0 ]] && echo yes || echo no)"
-t  'T34e ...and the warm act leaves refs too' 'yes' "$([[ -s "$TMP/t34e2/tree.json" && -s "$TMP/t34e2/page.md" ]] && echo yes || echo no)"
-dwarm "$BROWSER" act warm34.test "https://warm34.test/compose" --steps='[{"op":"click","selector":"#go"}]' \
-    --expect='Message sent' --expect-wait=0 --out="$TMP/t34e3"
-t  'T34e MUTANT: the warm window at 0 is NOT VERIFIED on the same toast' 1 "$RC"
-dwarm "$BROWSER" read warm34.test "https://warm34.test/inbox" --wait-for='[role=main]' --out="$TMP/t34e4"
-t  'T34e read --wait-for on a served profile renders in the warm session' '0 session-daemon true' \
-   "$RC $(jq -r '"\(.capture) \(.wait_for.met)"' "$TMP/t34e4/page.meta.json" 2>/dev/null)"
-env PATH="$SPATH" "$BROWSER" serve warm34.test --stop >/dev/null 2>&1
-
-# --- T34f MUTANT: gut the wait in a copy, and T34d must go red ----------------
-# Non-vacuous both ways: the UNMUTATED copy passes T34d's claim first.
-MUT34="$TMP/t34-mutant"; rm -rf "$MUT34"; cp -r "$ROOT/plugins/browser" "$MUT34"
-rm -rf "$TMP/t34f0"
-run t34env PWWALK="$T34SPLASH" PWWALK_LATE="$T34INBOX" PWLATE_MS=1500 \
-    "$MUT34/bin/browser" snapshot mail.google.com "$GM_URL" --interactive --wait-for='[role=main]' --out="$TMP/t34f0"
-t  'T34f (anchor) the UNMUTATED copy captures the late element' '0 yes' \
-   "$RC $(jq -r '.nodes[].ref' "$TMP/t34f0/tree.json" 2>/dev/null | grep -qx 'button/Compose' && echo yes || echo no)"
-perl -0pi -e 's/(  const t = String\(target \|\| .{2}\);\n  let waited = 0;\n)/$1  return { target: t, met: true, waited_ms: 0 }; \/\* MUTANT (DIVE-4983): capture at the settle, as before \*\/\n/' \
-  "$MUT34/lib/aria.cjs"
-t  'T34f (anchor) the mutation landed in the copy' 'yes' \
-   "$(grep -q 'MUTANT (DIVE-4983)' "$MUT34/lib/aria.cjs" && echo yes || echo no)"
-t  'T34f (anchor) ...and the shipped lib is untouched' 'yes' \
-   "$(grep -q 'MUTANT (DIVE-4983)' "$ROOT/plugins/browser/lib/aria.cjs" && echo no || echo yes)"
-rm -rf "$TMP/t34f"
-run t34env PWWALK="$T34SPLASH" PWWALK_LATE="$T34INBOX" PWLATE_MS=1500 \
-    "$MUT34/bin/browser" snapshot mail.google.com "$GM_URL" --interactive --wait-for='[role=main]' --out="$TMP/t34f"
-t  'T34f MUTANT: with the wait gutted, the late element is missing from the refs' 'no' \
-   "$(jq -r '.nodes[].ref' "$TMP/t34f/tree.json" 2>/dev/null | grep -qx 'button/Compose' && echo yes || echo no)"
-t  'T34f MUTANT ...and what it captured is the splash, caught by the table' 76 "$RC"
-
-# --- T34g the page-side predicates, graded against a DOM shim -----------------
-cat > "$TMP/t34-visible.js" <<'VIS'
-const { _visibleIn, _textIn } = require(process.env.ARIA);
-const el = (shown) => ({ getClientRects: () => (shown ? [{}] : []), ownerDocument: doc });
-const doc = { defaultView: { getComputedStyle: () => ({ display: 'block', visibility: 'visible' }) } };
-const MAIN = el(true), HIDDEN = el(false);
-const LIVE = { textContent: 'Saved to drafts' };
-global.document = {
-  body: { innerText: 'Inbox\n  Compose   Message sent' },
-  querySelectorAll: (s) => {
-    if (s === '[role=main') throw new SyntaxError('not a selector');
-    if (s === '[role=main]') return [MAIN];
-    if (s === '#spinner') return [HIDDEN];
-    if (s.includes('aria-live')) return [LIVE];
-    return [];
-  },
-};
-const v = (target, mode) => _visibleIn({ target, mode: mode || 'auto' });
-console.log([v('[role=main]'), v('#spinner'), v('Compose'), v('message   SENT', 'text'), v('Nope', 'text'),
-             v('[role=main'), v('Loading')].join(' '));
-console.log(_textIn());
-VIS
-VIS34="$(ARIA="$ROOT/plugins/browser/lib/aria.cjs" node "$TMP/t34-visible.js" 2>&1)"
-t  'T34g css shown / css hidden / bare word as text / text= any case / text= absent / bad css / absent word' \
-   'true false true true false false false' "$(head -1 <<<"$VIS34")"
-tc 'T34g the text --expect reads includes a live region innerText left out' 'Saved to drafts' "$VIS34"
-
-# --- T34h documented where agents and people read it -------------------------
-run bash "$BROWSER" --help
-tc 'T34h --help names --wait-for' '--wait-for' "$OUT$ERR"
-tc 'T34h --help names --expect-wait' '--expect-wait' "$OUT$ERR"
-for f in README.md AGENTS.md; do
-  tc "T34h $f documents --wait-for" '--wait-for' "$(cat "$ROOT/plugins/browser/$f")"
-  tc "T34h $f documents the loading-screen exit" '76' "$(cat "$ROOT/plugins/browser/$f")"
-done
-tc 'T34h CHANGES.md names the knobs' 'FIVEDIVE_BROWSER_EXPECT_WAIT_MS' "$(cat "$ROOT/CHANGES.md")"
-tc 'T34h CHANGES.md names the read cap' 'FIVEDIVE_BROWSER_READ_CAP_MS' "$(cat "$ROOT/CHANGES.md")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

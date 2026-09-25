@@ -22,6 +22,8 @@ than a detail.
 5dive browser tree <site> <url> [--settle=<ms>]   # refs; --settle also on snapshot,
                                                   # --page-settle on run
 5dive browser act <url> --steps=<json> [--expect=<regex>] [--approved=<id>]
+5dive browser snapshot <url> --wait-for='[role=main]'   # capture when the page shows it;
+                                                  # also on read and act (exit 76: not ready)
 sudo 5dive browser approve <id> [--deny]          # the owner's yes to a pay/post/send/delete
 ```
 
@@ -343,7 +345,7 @@ promise — it does not scroll-stitch a page.
 ### `browser snapshot` — one cycle, one page instant, everything a decision needs
 
 ```
-5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full] [--settle=<ms>]
+5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full] [--settle=<ms>] [--wait-for=<target>]
 ```
 
 Before an agent acts on a page it reads the same three things: **what it can click** (`tree`),
@@ -385,8 +387,8 @@ empty writes **no** evidence at all.
 ### `browser read` — Markdown and provenance from the authenticated page
 
 ```
-5dive browser read <site> <url> [--out=<dir>] [--json] [--wait=<ms>]
-5dive browser links <site> <url> [--out=<dir>] [--wait=<ms>]
+5dive browser read <site> <url> [--out=<dir>] [--json] [--wait=<ms>] [--wait-for=<target>]
+5dive browser links <site> <url> [--out=<dir>] [--wait=<ms>] [--wait-for=<target>]
 ```
 
 `read` reuses `shot`'s site boundary, private profile audit, live-viewer refusal and positive
@@ -449,6 +451,54 @@ not make a slow element arrive. An element that is genuinely late is `wait_for`'
 `wait_for` on a `ref=` now waits for the whole step timeout, polling the page, exactly as a
 `wait_for` on a CSS selector always did. Raising the settle to cover a late element buys the delay
 on **every** run of that adapter; a `wait_for` costs only as long as the page actually takes.
+
+### Ready, not settled: `--wait-for`, loading screens, `read`'s cap, `--expect`'s window (DIVE-4983)
+
+```
+5dive browser snapshot <url> --interactive --wait-for='[role=main]'
+5dive browser read     <site> <url> --wait-for='text=Inbox'
+5dive browser act      <url> --steps=<json> --expect='Message sent' [--expect-wait=<ms>] [--wait-for=<target>]
+```
+
+A settle is a guess at how long a page takes, and on a web app it is the wrong guess. Measured on a
+Gmail inbox, 2026-09-25: `snapshot --interactive` returned the loading splash (4 nodes: help links
+and "Try reloading the page") with exit 0; `read` was still running when `timeout 200` killed it;
+and `act --expect='Message sent'` printed NOT VERIFIED on a mail that was in the Sent folder,
+because its one re-read came before the toast.
+
+- **`--wait-for=<target>` on `snapshot`, `read` and `act`.** The capture is taken once the page
+  shows the target, bounded by the step timeout (`FIVEDIVE_BROWSER_STEP_TIMEOUT`, 30 s); the settle
+  runs after it. A target is a CSS selector, `ref=<role>/<name>` as `snapshot` prints it, or
+  `text=<words>`; a bare word that matches no element (`Compose`) is also looked for as visible
+  text. On `act` it is the re-read after the last step that waits. `read --wait-for` renders
+  through the executor or the warm session, since a `--dump-dom` cannot wait for an element
+  (`capture` in `page.meta.json` says which). A target that never appears is **exit 76**, and what
+  was captured still ships, marked `partial: true`.
+- **A known loading screen is named, never exit 0.** One table in `bin/browser`,
+  `LOADING_SCREENS`, one line per screen: a name, the host, a sentence in the document, and a
+  ceiling on interactive nodes. Gmail's splash is the first row. A match prints `LOADING SCREEN`,
+  writes `loading_screen` and `partial: true` into `page.meta.json` and `page.md`, keeps the
+  evidence (the PNG is how a person sees what the agent got) and exits **76**. The node ceiling is
+  what separates the splash from the loaded app, which keeps the same sentence in a hidden element.
+- **`read` never waits past a wall clock.** `--wait` is Chrome's *virtual* time, which does not
+  advance while a request is pending, so on a page that long-polls it never runs out. Chrome is
+  now told to stop loading at `FIVEDIVE_BROWSER_READ_CAP_MS` (default 30000) real milliseconds and
+  dump what it has, and that capture is `partial: true`. A Chrome that does not stop is killed a
+  few seconds later and `read` exits 76 with nothing written, rather than hanging.
+- **`--expect` is re-read for a window.** After the last step, `act` reads the page again until
+  `--expect` matches or `--expect-wait` ms pass (default 5000, `FIVEDIVE_BROWSER_EXPECT_WAIT_MS`),
+  against the document **and** the text a person sees, toasts and `aria-live` regions included. The
+  read that matched is the one that ships, so `page.png` shows the toast. `--expect-wait=0` is the
+  old single read. The verdict is still `grep -iE` in `bin/browser`; the executor's poll is only an
+  early exit, so a pattern JavaScript reads differently costs the window, never a wrong answer.
+- **`act` leaves what `snapshot` leaves:** `tree.json` (`--interactive` narrows it), `page.md` and
+  `page.meta.json`, beside `page.html`, `page.png` and `after.json`, all from the page the steps left.
+
+**76 is not 75.** 75 means the session is cold and a person has to log in again. 76 means the
+session is fine and the page was not ready: wait for it. Do not re-authenticate, and do not re-run
+an `act`'s steps. A browser served before this release runs the old daemon, which ignores
+`--wait-for`; that is reported as *not honoured* (76), never as met. `serve <site> --stop` and
+`serve <site>` again picks up the new one.
 
 ## Adapters are data, and the vocabulary is fixed
 
