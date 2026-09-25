@@ -168,8 +168,10 @@ page takes.
   kernel, so the lease and the audit row say `holder=claude on_behalf_of=<your seat>`. You
   cannot set that field and should not try to.
 - **Some sites block datacenter IPs at login.** "Request blocked by network security" is the
-  site's anti-bot policy meeting a VM's IP — not our bug, no flag for it. Tell the human the
-  site cannot be logged into from the box, and stop.
+  site's policy meeting a VM's IP, not our bug. Tell the human: some sites block server IPs;
+  `5dive browser proxy set <url>` sends this box's browser through your own proxy. Use only a
+  proxy URL they give you. Box logins follow the `claude` seat's setting. Switching the proxy
+  mid-session can end a site's login (the site sees a new IP).
 - **A challenge is classified before a logged-out state**, because a challenge page still
   carries the login form's markup. Trust the label instead of re-reading the HTML.
 - **Sessions die on the site's schedule.** A scheduled check skips a served profile and probes

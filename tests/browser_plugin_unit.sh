@@ -2343,7 +2343,9 @@ const page = {
 exports.chromium = {
   launchPersistentContext: async (profile, opts) => {
     // xdg: DIVE-4587 — what the child would inherit. '<unset>' is the fix working.
-    rec({ call: 'launch', profile, args: opts.args, executablePath: opts.executablePath, headless: opts.headless, xdg: process.env.XDG_CONFIG_HOME === undefined ? '<unset>' : process.env.XDG_CONFIG_HOME });
+    // proxy: DIVE-4951 — '<absent>' means NO KEY, which is the unset contract.
+    rec({ call: 'launch', profile, args: opts.args, executablePath: opts.executablePath, headless: opts.headless, xdg: process.env.XDG_CONFIG_HOME === undefined ? '<unset>' : process.env.XDG_CONFIG_HOME,
+          proxy: Object.prototype.hasOwnProperty.call(opts, 'proxy') ? opts.proxy : '<absent>' });
     // PWNOPAGE: THE BROWSER REALLY OPENS AND THEN CANNOT HAND OVER A PAGE.
     // Every other shape here returns a working page, which is exactly why five
     // anchored mutants missed the window between the launch and step one
@@ -3476,7 +3478,8 @@ exports.chromium = {
   launchPersistentContext: async (profile, opts) => {
     rec({ call: 'launch', profile, args: opts.args, headless: opts.headless,
           sandbox: opts.chromiumSandbox === true,
-          xdg: process.env.XDG_CONFIG_HOME === undefined ? '<unset>' : process.env.XDG_CONFIG_HOME });
+          xdg: process.env.XDG_CONFIG_HOME === undefined ? '<unset>' : process.env.XDG_CONFIG_HOME,
+          proxy: Object.prototype.hasOwnProperty.call(opts, 'proxy') ? opts.proxy : '<absent>' });
     if (process.env.DPWNOLAUNCH) throw new Error('stub: this box cannot open the profile');
     // DPWSANDBOXFAIL: a box where Chrome will not start sandboxed (DIVE-4944, T31c).
     if (process.env.DPWSANDBOXFAIL && opts.chromiumSandbox === true) {
@@ -5367,6 +5370,128 @@ unset FAKE_COLD_DOM
 tc 'T30g capture is dispatched' 'capture) shift; cmd_capture' "$(cat "$BROWSER")"
 run bash "$BROWSER" --help
 tc 'T30g --help names it' 'capture <site>' "$OUT$ERR"
+
+# --- T33 the seat's own proxy (DIVE-4951) ---------------------------------------
+# Some sites block datacenter IPs; the fix is the customer's own proxy, which is
+# a URL with a password in it. The arms grade the four things that can go wrong:
+#   the launch ignores it          -> T33d (cold driver) / T33f (served daemon)
+#   an UNSET box launches changed  -> T33a / T33g: NO `proxy` key at all
+#   the password leaks             -> T33b/c/i/j/k: masked, and in no output or log
+#   a bad setting goes out direct  -> T33j/T33l: refused, nothing launched
+PXPASS='pxS3cret-4951-zz'
+PXURL="http://pxuser:${PXPASS}@proxy.test:8080"
+PXWANT="$(jq -nc --arg p "$PXPASS" '{server:"http://proxy.test:8080",username:"pxuser",password:$p}')"
+mkprofile proxied.test "$LIVE_DOM" >/dev/null
+PXDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/proxied.test"
+PXFILE="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/.5dive-proxy"
+rm -f "$PXFILE"
+pxdrv() {  # the COLD launch: the real driver, one goto, through the recording stub
+  : > "$PWREC"
+  printf '{"profile":"%s","steps":[{"op":"goto","url":"https://proxied.test/"}],"args":{}}' "$PXDIR" | \
+    env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true "$DRV" \
+        >"$TMP/.pxo" 2>"$TMP/.pxe"; RC=$?; OUT=$(cat "$TMP/.pxo"); ERR=$(cat "$TMP/.pxe")
+}
+pxlaunch() { jq -c 'select(.call=="launch")|.proxy' "$1" | tail -1; }
+
+run "$BROWSER" proxy show
+t  'T33a proxy show with nothing set' 0 "$RC"
+tc 'T33a ...says the browser goes out directly' 'proxy: none' "$OUT"
+pxdrv
+t  'T33a an UNSET cold launch runs' 0 "$RC"
+t  'T33a ...and carries NO proxy key at all (byte-for-byte the old launch)' '"<absent>"' "$(pxlaunch "$PWREC")"
+
+run "$BROWSER" proxy set "$PXURL"
+t  'T33b proxy set takes a user:pass URL' 0 "$RC"
+tc 'T33b ...and echoes it back MASKED' 'http://pxuser:****@proxy.test:8080' "$OUT"
+tn 'T33b ...the password is in neither stdout nor stderr' "$PXPASS" "$OUT$ERR"
+t  'T33b ...stored 0600' '600' "$(stat -c '%a' "$PXFILE" 2>/dev/null)"
+t  'T33b ...inside the seat'"'"'s 0700 root, next to the profiles and not in one' '700' \
+   "$(stat -c '%a' "$(dirname "$PXFILE")")"
+t  'T33b ...and it is not silent about what it changes' 'yes' \
+   "$(grep -qE 'applies to the next browser|already running' <<<"$OUT" && echo yes || echo no)"
+
+run "$BROWSER" proxy show
+tc 'T33c show masks the password' 'pxuser:****@proxy.test:8080' "$OUT"
+tn 'T33c ...and never prints it' "$PXPASS" "$OUT$ERR"
+
+pxdrv
+t  'T33d a cold launch with a proxy set runs' 0 "$RC"
+t  'T33d ...and hands Playwright {server,username,password} — what the setting WROTE is what the driver READ' \
+   "$PXWANT" "$(pxlaunch "$PWREC")"
+tn 'T33d ...never as a chrome arg (--proxy-server cannot carry a login, and argv is in ps)' "$PXPASS" \
+   "$(jq -c 'select(.call=="launch")|.args' "$PWREC")"
+tn 'T33d ...and the driver printed no part of it' "$PXPASS" "$OUT$ERR"
+
+# The SERVED browser is the other launch, in its own process: graded through the
+# real daemon, not the source.
+dserve proxied.test
+t  'T33e serve with a proxy set holds a warm session' 0 "$RC"
+tc 'T33e ...it is the daemon (warm), not the plain-Chrome fallback' 'warm session' "$OUT"
+t  'T33f the daemon'"'"'s launch carries the same {server,username,password}' "$PXWANT" "$(pxlaunch "$DREC")"
+tn 'T33f ...serve printed no part of it' "$PXPASS" "$OUT$ERR"
+# NO LOG LINE ANYWHERE: every file the store and the rendezvous hold — daemon
+# stderr, audit rows, pidfiles, lease files — except the setting itself.
+t  'T33k the password is in no file under the profile store or the rendezvous but the setting' '' \
+   "$(grep -rlF -- "$PXPASS" "$FIVEDIVE_BROWSER_PROFILE_ROOT" "$TMP/browser-sessions" 2>/dev/null | grep -vxF "$PXFILE")"
+# A LIVE browser keeps its route, and set/clear must SAY so rather than go quiet.
+run "$BROWSER" proxy set "$PXURL"
+tc 'T33f set while served names the browser still on the old route' 'proxied.test' "$OUT"
+tc 'T33f ...and the command that moves it' 'serve <site> --stop' "$OUT"
+tc 'T33f ...and that a new IP can end the login' 'new IP' "$OUT"
+env PATH="$SPATH" "$BROWSER" serve proxied.test --stop >/dev/null 2>&1
+
+run "$BROWSER" proxy clear
+t  'T33g proxy clear' 0 "$RC"
+t  'T33g ...removes the setting' 'no' "$([[ -e "$PXFILE" ]] && echo yes || echo no)"
+dserve proxied.test
+t  'T33g an UNSET served launch carries NO proxy key' '"<absent>"' "$(pxlaunch "$DREC")"
+env PATH="$SPATH" "$BROWSER" serve proxied.test --stop >/dev/null 2>&1
+pxdrv
+t  'T33g ...and neither does the cold one after clear' '"<absent>"' "$(pxlaunch "$PWREC")"
+
+printf '%s\n' "$PXURL" | "$BROWSER" proxy set - >"$TMP/.pxo" 2>"$TMP/.pxe"; RC=$?
+t  'T33h `proxy set -` reads the URL from stdin (out of shell history and ps)' 0 "$RC"
+t  'T33h ...and stores the same setting' "$PXURL" "$(cat "$PXFILE" 2>/dev/null)"
+tn 'T33h ...without printing it' "$PXPASS" "$(cat "$TMP/.pxo" "$TMP/.pxe")"
+
+run "$BROWSER" proxy set "socks5://pxuser:${PXPASS}@proxy.test:1080"
+t  'T33i SOCKS with a login is refused up front (Chrome cannot authenticate to it)' 64 "$RC"
+tn 'T33i ...and the refusal does not repeat the password' "$PXPASS" "$OUT$ERR"
+t  'T33i ...and the good setting is left as it was' "$PXURL" "$(cat "$PXFILE" 2>/dev/null)"
+run "$BROWSER" proxy set "http://pxuser:${PXPASS}@proxy.test"
+t  'T33i a URL with no port is refused' 64 "$RC"
+tn 'T33i ...without echoing it' "$PXPASS" "$OUT$ERR"
+
+# A SETTING THAT IS THERE AND UNUSABLE FAILS CLOSED. Going out direct instead is
+# the route the person set a proxy to avoid, and a new IP under a live login.
+printf 'not a proxy %s\n' "$PXPASS" > "$PXFILE"; chmod 600 "$PXFILE"
+pxdrv
+t  'T33j a garbled setting refuses the cold launch (70: nothing ran)' 70 "$RC"
+tc 'T33j ...naming the setting' 'proxy setting' "$ERR"
+tn 'T33j ...not its contents' "$PXPASS" "$ERR"
+t  'T33j ...and NOTHING launched' '' "$(pxlaunch "$PWREC")"
+dserve proxied.test
+tn 'T33l a garbled setting gets no warm session' 'warm session' "$OUT"
+tc 'T33l ...and serve does NOT fall back to plain Chrome from this box'"'"'s own IP' 'NOT being served' "$ERR"
+t  'T33l ...and exits unavailable' 69 "$RC"
+tn 'T33l ...without printing the setting' "$PXPASS" "$OUT$ERR"
+t  'T33l ...and left no served browser behind' '' "$(env PATH="$SPATH" "$BROWSER" served 2>/dev/null | grep -x proxied.test)"
+env PATH="$SPATH" "$BROWSER" serve proxied.test --stop >/dev/null 2>&1
+rm -f "$PXFILE"
+# CONTROL for T33l: with the setting gone, the same serve comes up warm — so the
+# refusal above was the proxy rule, not a daemon that never starts here.
+dserve proxied.test
+tc 'T33l (control) with no setting the same serve is warm' 'warm session' "$OUT"
+env PATH="$SPATH" "$BROWSER" serve proxied.test --stop >/dev/null 2>&1
+
+run bash "$BROWSER" --help
+tc 'T33m --help names proxy set' 'browser proxy set' "$OUT$ERR"
+for f in README.md skills/use-browser/SKILL.md skills/connect-site/SKILL.md AGENTS.md; do
+  tc "T33m $f tells the reader the fix exists" '5dive browser proxy set' "$(tr -s '[:space:]' ' ' < "$ROOT/plugins/browser/$f")"
+  tc "T33m $f says a switch can end a login" 'new IP' "$(tr -s '[:space:]' ' ' < "$ROOT/plugins/browser/$f")"
+done
+tn 'T33m connect-site no longer says there is no fix' 'there is no flag for it' \
+   "$(tr -s '[:space:]' ' ' < "$ROOT/plugins/browser/skills/connect-site/SKILL.md")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

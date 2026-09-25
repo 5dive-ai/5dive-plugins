@@ -228,6 +228,13 @@ usage() {
   5dive browser adblock status              # is ad filtering on, and which sites is it off for
   sudo 5dive browser adblock off <site>     # this site breaks under filtering — stop filtering it
   sudo 5dive browser adblock on  <site>     # filter it again
+  5dive browser proxy set <scheme://user:pass@host:port>
+                                      # some sites block server IPs: send THIS seat's
+                                      # browser out through your own proxy instead.
+                                      # `proxy set -` reads it from stdin. A browser
+                                      # already running keeps its route until restarted.
+  5dive browser proxy show            # the proxy in use, password masked
+  5dive browser proxy clear           # go out directly from this box again
 
   5dive browser doc [--append=<file>]
                                       # print the agent-facing workflow doc (any harness),
@@ -2655,6 +2662,15 @@ cmd_serve() {
     return 0
   fi
 
+  # A PROXIED SEAT DOES NOT FALL BACK TO PLAIN CHROME (DIVE-4951). The fallback
+  # below cannot carry the proxy's login, so it would serve the site from this
+  # box's own IP — the route the person set a proxy to avoid, and a new IP under
+  # a live login. No browser, said plainly, beats that.
+  if [[ -f "$(_proxy_file)" ]]; then
+    kill "$xpid" 2>/dev/null; wait "$xpid" 2>/dev/null || true
+    die "$E_UNAVAILABLE" "$site is NOT being served: this seat has a proxy set (\`5dive browser proxy show\`) and only the session daemon can use it — plain Chrome cannot carry a proxy login, and serving from this box's own IP is what the proxy is there to avoid. Fix the daemon (the NOTE above says why it did not start), or \`5dive browser proxy clear\`."
+  fi
+
   # KEEP CHROME'S STDERR. The version this replaces sent it to /dev/null, so the
   # single sentence explaining why the browser died was destroyed before anyone
   # could read it, and every later caller had only a pid to go on. 0600, in the
@@ -4128,6 +4144,117 @@ cmd_adblock() {
   return 0
 }
 
+# ----------------------------------------------------------------------- proxy
+#
+# DIVE-4951 — THIS SEAT'S BROWSER GOES OUT THROUGH THE CUSTOMER'S OWN PROXY. Some
+# sites refuse a datacenter IP ("Request blocked by network security") and a box
+# is one. Every paid residential proxy is a URL with a username and password in
+# it, which Chrome's --proxy-server cannot carry, so the setting is handed to
+# Playwright's launch options (lib/proxy.cjs) by BOTH launch sites: the served
+# browser (session-daemon) and the cold one (driver-playwright).
+#
+# IT IS A CREDENTIAL. One line, 0600, in the seat's own 0700 profile root, next
+# to the site profiles and never inside one. Nothing here echoes it: `show`
+# masks the password, every refusal names the rule and not the value, and it
+# goes into no audit row and no `status`. `set -` reads it from stdin so it does
+# not have to sit in shell history or in `ps`.
+#
+# A RUNNING BROWSER IS NOT RESTARTED. The daemon read the setting when it
+# started; stopping it here would throw a person out of a viewer mid-login or cut
+# an agent's publish between two steps. So set/clear NAME the browsers still on
+# the old route and the command that moves them — never silently.
+_PROXY_FILE_NAME=.5dive-proxy   # the same name lib/proxy.cjs reads; T33 grades that they agree
+_proxy_file() { printf '%s/%s\n' "$(_seat_dir)" "$_PROXY_FILE_NAME"; }
+_proxy_get() {
+  local f; f="$(_proxy_file)"
+  [[ -f "$f" ]] || return 1
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$f" | grep -v -e '^$' -e '^#' | head -1
+}
+# scheme://[user[:pass]@]host:port — and nothing else, because anything else is a
+# URL Playwright would either reject at launch (a browser that never starts) or
+# quietly read differently from how the person meant it.
+_PROXY_RE='^(https?|socks[45])://(([^/?#[:space:]]+)@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?):([0-9]{1,5})/?$'
+_proxy_mask() {  # the password becomes ****; the scheme, user and host stay readable
+  [[ "$1" =~ $_PROXY_RE ]] || { printf '(unreadable — run `5dive browser proxy set` again)\n'; return 0; }
+  local scheme="${BASH_REMATCH[1]}" ui="${BASH_REMATCH[3]}" host="${BASH_REMATCH[4]}" port="${BASH_REMATCH[6]}"
+  if [[ -z "$ui" ]]; then printf '%s://%s:%s\n' "$scheme" "$host" "$port"
+  elif [[ "$ui" == *:* ]]; then printf '%s://%s:****@%s:%s\n' "$scheme" "${ui%%:*}" "$host" "$port"
+  else printf '%s://%s@%s:%s\n' "$scheme" "$ui" "$host" "$port"; fi
+}
+_proxy_served_note() {
+  local d site; local -a up=()
+  for d in "$(_seat_dir)"/*/; do
+    [[ -d "$d" ]] || continue
+    _serve_running "$d" >/dev/null || continue
+    site=$(basename "$d"); up+=("$site")
+  done
+  if (( ${#up[@]} == 0 )); then
+    printf '%s: applies to the next browser this seat starts. None is running now.\n' "$PROG"
+  else
+    printf '%s: %s already running and keep%s the route %s started with: %s\n' "$PROG" \
+      "$( (( ${#up[@]} == 1 )) && echo 'one browser is' || echo "${#up[@]} browsers are")" \
+      "$( (( ${#up[@]} == 1 )) && echo 's' )" "$( (( ${#up[@]} == 1 )) && echo 'it' || echo 'they')" \
+      "$(printf '%s ' "${up[@]}")"
+    printf '%s: to switch one now: 5dive browser serve <site> --stop — the next command starts it again on the new route. The site sees a new IP, and some sites end the login when that happens.\n' "$PROG"
+  fi
+  # THE BOX'S LOGINS ARE NOT THIS SEAT'S BROWSER (DIVE-4664). A site this seat
+  # uses through the box runs in $BOX_SEAT's served browser, as $BOX_SEAT, with
+  # $BOX_SEAT's setting — saying nothing would let a person set a proxy here and
+  # watch the connected site keep failing from the datacenter IP.
+  if [[ "$(_seat)" != "$BOX_SEAT" ]]; then
+    printf '%s: sites connected for the whole box run in %s'"'"'s browser and follow %s'"'"'s proxy setting, not this one.\n' "$PROG" "$BOX_SEAT" "$BOX_SEAT"
+  fi
+}
+cmd_proxy() {
+  local sub="${1:-show}"; shift 2>/dev/null || true
+  case "$sub" in
+    show|set|clear) ;;
+    *) die "$E_USAGE" "unknown proxy subcommand '$sub' — expected set, show or clear" ;;
+  esac
+  [[ -d "$PROFILE_ROOT" ]] || die "$E_UNAVAILABLE" "no profile store at $PROFILE_ROOT. 5dive does not create it behind your back: $SETUP_CMD"
+  [[ -d "$(_seat_dir)" ]] || die "$E_UNAVAILABLE" "seat '$(_seat)' has no browser of its own on this box, so there is nothing to route. Sites connected for the whole box run in $BOX_SEAT's browser and follow $BOX_SEAT's proxy setting."
+  _audit "$(_seat_dir)" 700 || die "$E_UNAVAILABLE" "the profile root $(_seat_dir) is not this seat's 0700 directory — refusing to write a credential into it"
+  local f; f="$(_proxy_file)"
+  case "$sub" in
+    show)
+      local cur; if cur="$(_proxy_get)" && [[ -n "$cur" ]]; then
+        printf 'proxy: %s\n' "$(_proxy_mask "$cur")"
+      else
+        printf 'proxy: none — this seat'"'"'s browser goes out directly from this box\n'
+      fi
+      return 0 ;;
+    clear)
+      if [[ -e "$f" ]]; then rm -f "$f" || die "$E_UNAVAILABLE" "could not remove $f"
+        printf '%s: proxy cleared — this seat'"'"'s browser goes out directly from this box again.\n' "$PROG"
+      else
+        printf '%s: no proxy was set.\n' "$PROG"; return 0
+      fi
+      _proxy_served_note; return 0 ;;
+  esac
+
+  # set
+  local url="${1:-}"
+  if [[ -z "$url" || "$url" == - ]]; then
+    [[ -z "$url" && -t 0 ]] && die "$E_USAGE" "proxy set which proxy? e.g. \`5dive browser proxy set http://user:pass@host:port\`, or \`… proxy set -\` to read it from stdin (it then stays out of your shell history)"
+    IFS= read -r url || true
+    url="${url%$'\r'}"
+  fi
+  (( $# <= 1 )) || die "$E_USAGE" "proxy set takes ONE url"
+  # NEVER THE VALUE IN A REFUSAL: a mistyped proxy URL is still a password.
+  [[ "$url" =~ $_PROXY_RE ]] || die "$E_USAGE" "that is not a proxy URL this browser can use. It must be scheme://[user:pass@]host:port with scheme http, https, socks5 or socks4 and an explicit port; percent-encode any / ? # in the password (e.g. / as %2F)."
+  local scheme="${BASH_REMATCH[1]}" ui="${BASH_REMATCH[3]}" port="${BASH_REMATCH[6]}"
+  (( 10#$port >= 1 && 10#$port <= 65535 )) || die "$E_USAGE" "that proxy URL's port is not 1-65535"
+  # Chrome under Playwright cannot authenticate to a SOCKS proxy — it refuses at
+  # launch, which would be a browser that never starts, discovered later.
+  [[ -n "$ui" && "$scheme" == socks* ]] && die "$E_USAGE" "Chrome cannot log in to a SOCKS proxy with a username and password. Use your provider's http:// endpoint (most residential providers offer one on another port), or a SOCKS endpoint that allows this box's IP without a login."
+  local tmp="$f.tmp.$$"
+  ( umask 077; printf '%s\n' "$url" > "$tmp" ) && chmod 600 "$tmp" && mv -f "$tmp" "$f" \
+    || { rm -f "$tmp"; die "$E_UNAVAILABLE" "could not write the proxy setting to $f"; }
+  printf '%s: proxy set: %s\n' "$PROG" "$(_proxy_mask "$url")"
+  _proxy_served_note
+  return 0
+}
+
 cmd_doc() {
   local target=""
   for a in "$@"; do
@@ -4287,6 +4414,7 @@ case "${1:-}" in
   ls)    shift; cmd_ls    "$@" ;;
   doc)   shift; cmd_doc  "$@" ;;
   adblock) shift; cmd_adblock "$@" ;;
+  proxy) shift; cmd_proxy "$@" ;;
   run)   shift; cmd_run   "$@" ;;
   tree)  shift; cmd_tree  "$@" ;;
   lease) shift; cmd_lease "$@" ;;
