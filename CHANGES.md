@@ -3,23 +3,39 @@
 ### Added — the Telegram /task card answers gates and says why a row is blocked (DIVE-4949), telegram 0.5.62
 
 `/task_<id>` could not answer a gate and could not say why a row was blocked, so lodar had to ask in
-chat why DIVE-4927 was blocked. The card now:
+chat why DIVE-4927 was blocked. Long rows also overflowed Telegram's limit and were cut mid-result.
+The card now:
 
 - **Answers the gate from the card.** A decision gate below tier 2 that waits on a human gets one
   button per option, with ⭐ on the recommendation. An approval gets Approve and Deny. A tap re-reads
   the row and refuses if the gate was answered, re-routed, raised to tier 2 or given new options
-  since the card was sent. It then answers through `task answer --channel-proof`, the same route the
-  /inbox ✅ button uses, and the CLI still enforces tier<2. A tier-2 gate gets **Send the answer
-  buttons**, which runs `task inbox --send --only=<id>` (5dive-cli, same branch) so the CLI re-sends
-  that gate's own alert with its nonce buttons. Secret, manual and agent-routed gates get no buttons.
-- **Shows the row's state.** Park reason and wake time with a ⏰ Wake now button (`task unpark`),
-  open blockers, one delivery line (PR, grade, merge, "owed a close"), verifier and reviewer, the
-  last gate outcome once no gate is live, and created/updated age.
-- **Puts the result above the body**, so the 1500-character body clamp no longer hides it.
-- **Adds Open PR and Dashboard link buttons.**
+  since the card was sent. It then answers through `task answer --channel-proof`, the same route
+  the /inbox ✅ button uses, and the CLI still enforces tier<2. Every other gate a human owes (tier 2,
+  unknown tier, secret, manual, free-text decision) gets **Send the answer buttons**. That runs
+  `task inbox --send --only=<id>` (5dive-cli, same branch), and the CLI re-sends the gate's own
+  alert with its nonce buttons. The card no longer tells a phone user to run a shell command.
+  ✅ Done and 🚫 Cancel are hidden while a gate is live, because both would be refused.
+- **Shows the row's state**, each line only when it applies:
+  - "parked: <reason> · wakes in 6h", with ⏰ Wake now (`task unpark`) in place of Do now;
+  - open blockers;
+  - one delivery line (PR, grade, merge, "owed a close");
+  - verifier and reviewer;
+  - "human owner: <name>" on boxes with two or more humans;
+  - the last gate outcome;
+  - age.
+
+  All times are relative. A row with no PR, verifier or park gains only the age line.
+- **Shows a recurring template as a schedule** ("every Monday 10:00 UTC · last run 4d ago · next run
+  in 3d"), with no Do now, Escalate, Done or Cancel, because Done and Cancel would end the template.
+- **Fits a 3,900-character budget.** The header gains `(/task_<id>)` and the title is clamped at 120
+  characters. The gate and state lines come first, then the result's first paragraph, then the body
+  with markdown markers stripped, clamped to whatever room is left. /task_5114 goes from 7,181 to
+  3,896 characters and /task_5119 from 8,903 to 3,896.
+- **Adds Open PR and Dashboard link buttons**, on closed rows too.
 
 Only `plugins/telegram` changes. The telegram-grok, -agy, -codex, -pi and -opencode forks keep the
-previous card. `test/task-card.test.ts` runs the real `buildTaskDetail` on fixture rows.
+previous card, and `test/task-detail-gate.test.ts` still checks their DIVE-3340 shell route.
+`test/task-card.test.ts` runs the real `buildTaskDetail` on fixture rows.
 
 ### Added — the registry copy carries `act`, public browsing and owner approval, at browser 1.11.0 (DIVE-4943)
 

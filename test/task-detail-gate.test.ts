@@ -35,6 +35,10 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+// DIVE-4949: the claude lineage's gate block picks its answer route from
+// cardGateAction (the card now carries the answer control), so the executed
+// snippet gets it as a free name. The forks never reference it.
+import { cardGateAction } from '../plugins/telegram/taskcard.ts'
 
 // SIX, matching task-needs-human.test.ts: telegram-opencode has no /inbox but it does
 // have buildTaskDetail, so it is in scope here.
@@ -84,8 +88,8 @@ function gateBlock(fork: string): string {
  *  throws loudly if that ever stops being true, rather than silently rendering less. */
 function render(fork: string, t: Record<string, unknown>): string {
   const body = `const lines = []; ${gateBlock(fork)}; return lines`
-  const fn = new Function('t', body) as (t: unknown) => string[]
-  return fn(t).join('\n')
+  const fn = new Function('t', 'cardGateAction', body) as (t: unknown, c: unknown) => string[]
+  return fn(t, cardGateAction).join('\n')
 }
 
 const DECISION = {
@@ -119,13 +123,18 @@ describe.each(LINEAGES)('DIVE-3340 /task_<id> surfaces a pending gate (%s)', (fo
 
   // THE ARM THE ROW ASKED FOR. The pre-DIVE-3340 view rendered none of this, and
   // passed every test that only checked the four buttons were present.
-  test('the ANSWER ROUTE is named, with the ident the reader would type', () => {
+  // DIVE-4949 (amendment 2 §5): on the claude lineage the answer control is ON the
+  // card and the shell route is gone — the phone reader has no terminal. The four
+  // shell-route arms below therefore grade the FORKS; plugins/telegram is graded by
+  // the DIVE-4949 describe at the bottom of this file.
+  const legacy = fork !== 'telegram'
+  test.if(legacy)('the ANSWER ROUTE is named, with the ident the reader would type', () => {
     for (const fixture of [DECISION, MANUAL, SECRET]) {
       expect(render(fork, fixture)).toContain('5dive task answer DIVE-350')
     }
   })
 
-  test('a decision gate gets the --value form', () => {
+  test.if(legacy)('a decision gate gets the --value form', () => {
     expect(render(fork, DECISION)).toContain('--value=<answer>')
   })
 
@@ -133,7 +142,7 @@ describe.each(LINEAGES)('DIVE-3340 /task_<id> surfaces a pending gate (%s)', (fo
   // refuses. A secret must never be typed into chat (Telegram keeps history) and a
   // manual gate records that the step was PERFORMED — both take NO --value. A single
   // hardcoded sentence would pass the arm above and be wrong on two of three types.
-  test.each([['manual', MANUAL], ['secret', SECRET]] as const)(
+  test.if(legacy).each([['manual', MANUAL], ['secret', SECRET]] as const)(
     'a %s gate is told NO --value, and never shown the --value form', (_name, fixture) => {
       const out = render(fork, fixture)
       expect(out).toContain('NO --value')
@@ -147,7 +156,7 @@ describe.each(LINEAGES)('DIVE-3340 /task_<id> surfaces a pending gate (%s)', (fo
   // The clause that makes the keyboard legible instead of just present. Both close
   // verbs ARE refused over an open gate; saying so is the difference between a
   // reader who answers and a reader who concludes the row is dead.
-  test('the reader is told Done and Cancel will be REFUSED until it is answered', () => {
+  test.if(legacy)('the reader is told Done and Cancel will be REFUSED until it is answered', () => {
     const out = render(fork, DECISION)
     expect(out).toContain('REFUSED')
     expect(out).toMatch(/Done and .*Cancel/)
@@ -207,8 +216,9 @@ describe.each(LINEAGES)('DIVE-3340 /task_<id> surfaces a pending gate (%s)', (fo
     expect(out).not.toContain('HUMAN ANSWER')
     expect(out).toContain('routed agent reviewer')
     // ...and the refusal warning still stands, because the close verbs do not care
-    // who the gate is routed to.
-    expect(out).toContain('REFUSED')
+    // who the gate is routed to. (DIVE-4949: on the claude lineage the two verbs are
+    // hidden instead, and the card says so.)
+    expect(out).toMatch(fork === 'telegram' ? /Done and .*Cancel are hidden/ : /REFUSED/)
   })
 
   // An ask carrying options must not be truncated — chopping the last option makes a
@@ -229,8 +239,11 @@ describe.each(LINEAGES)('DIVE-3340 /task_<id> surfaces a pending gate (%s)', (fo
 // not exist. Asserted in BOTH directions so neither the pointer nor its absence can
 // quietly flip.
 describe('DIVE-3340 the /inbox recovery pointer is claude-lineage only', () => {
-  test('plugins/telegram names it', () => {
-    expect(render('telegram', MANUAL)).toContain('/inbox')
+  // DIVE-4949: superseded on the claude lineage — the card's own "Send the answer
+  // buttons" re-sends THIS gate's alert, which is the recovery the pointer offered.
+  test('plugins/telegram offers the card re-send instead of the /inbox pointer', () => {
+    expect(render('telegram', MANUAL)).toContain('Send the answer buttons')
+    expect(render('telegram', MANUAL)).not.toContain('/inbox')
   })
   // DIVE-3340 iter2: and it is withheld on an AGENT-ROUTED gate even on the claude
   // lineage, because /inbox deliberately does not list one. The pointer is now
@@ -241,5 +254,44 @@ describe('DIVE-3340 the /inbox recovery pointer is claude-lineage only', () => {
   })
   test.each(LINEAGES.filter((l) => l !== 'telegram'))('%s does not', (fork) => {
     expect(render(fork, MANUAL)).not.toContain('/inbox')
+  })
+})
+
+// DIVE-4949 (amendment 2 §5): the claude lineage's gate block names NO shell command
+// — the paired human reads it on a phone — and names the control on the card instead.
+describe('DIVE-4949 plugins/telegram gate block: the answer control is on the card', () => {
+  const T1 = { ...DECISION, status: 'blocked', gate_live: 1, needs_human: 1, tier: 1 }
+  test.each([
+    ['tier<2 decision', T1],
+    ['tier-2 decision', { ...T1, tier: 2 }],
+    ['manual', { ...MANUAL, status: 'blocked', gate_live: 1, needs_human: 1, tier: 2 }],
+    ['secret', { ...SECRET, status: 'blocked', gate_live: 1, needs_human: 1, tier: 2 }],
+  ] as const)('%s: no `5dive` shell command, no --value form', (_n, fx) => {
+    const out = render('telegram', fx)
+    expect(out.length).toBeGreaterThan(80)
+    expect(out).not.toContain('5dive task')
+    expect(out).not.toContain('--value')
+  })
+  test('a tier<2 decision points at the buttons, and its options are not repeated as text', () => {
+    const out = render('telegram', T1)
+    expect(out).toContain('tap below')
+    expect(out).not.toContain('options: A|B')
+    expect(out).toContain('rec: B')
+  })
+  test('a tier-2 gate points at the re-send button', () => {
+    expect(render('telegram', { ...T1, tier: 2 })).toContain('Send the answer buttons')
+  })
+  test('a secret is still sent out-of-band, never into the chat', () => {
+    expect(render('telegram', { ...SECRET, status: 'blocked', gate_live: 1, needs_human: 1, tier: 2 })).toContain('out-of-band')
+  })
+  test('Done and Cancel are said to be HIDDEN, not refused', () => {
+    const out = render('telegram', T1)
+    expect(out).toMatch(/Done and .*Cancel are hidden/)
+    expect(out).not.toContain('REFUSED')
+  })
+  test('an agent-routed gate asks nothing of the reader', () => {
+    const out = render('telegram', { ...T1, needs_human: 0, routed_reviewer: 'ops' })
+    expect(out).toContain('nothing for you to do — ops answers it')
+    expect(out).not.toContain('Send the answer buttons')
   })
 })

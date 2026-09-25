@@ -41,6 +41,98 @@ export function relTime(ts: unknown, now: number): string | null {
   return d > 0 ? `in ${span}` : `${span} ago`
 }
 
+const STAMP_RE = /\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?Z?\b/g
+
+/** Every CLI stamp inside a free string, made relative. Every time on the card is. */
+export function relStamps(s: string, now: number): string {
+  // " at <stamp>" reads "at 18h ago" once relative, so the "at" goes with the stamp.
+  return s.replace(new RegExp(`( at)? (${STAMP_RE.source})`, 'g'), (m, _at, ts) => ` ${relTime(ts, now) ?? ts}`)
+    .replace(STAMP_RE, m => relTime(m, now) ?? m)
+}
+
+/** The result's SUMMARY: the one-or-two-sentence field the lifecycle rule defines.
+ *  `result` accumulates appended deliveries and grades (DIVE-2483), so everything
+ *  from the first `CHANGED:`, `--- appended` or blank line on is withheld. */
+export function resultSummary(result: unknown, max = 400): string {
+  let r = String(result ?? '').replace(/\r/g, '').trim()
+  const cut = r.search(/\n\s*\n|(^|\n)\s*CHANGED:|(^|\n)\s*--- appended/)
+  if (cut > 0) r = r.slice(0, cut)
+  r = r.replace(/\s+/g, ' ').trim()
+  return r.length > max ? r.slice(0, max - 1) + '…' : r
+}
+
+/** Heading, bold and fence markers stripped: they arrive in Telegram as literal
+ *  `##` and `**` (plain-text send). The words stay. */
+export function stripMarkdown(body: unknown): string {
+  return String(body ?? '')
+    .replace(/^\s*```.*$/gm, '')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/__(.+?)__/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+export const CARD_BUDGET = 3900
+
+/**
+ * Assemble the card to a BUDGET instead of leaning on the transport's 4096 guard,
+ * which cut /task_5114 (7,181 chars) mid-result and dropped the park note entirely.
+ * Priority: head (header, gate, state) → result summary → body, clamped to what is
+ * left → footer. The head is never cut unless it alone overruns, and then hard.
+ */
+export function fitCard(head: string[], result: string, body: string, footer: string[], budget = CARD_BUDGET): string {
+  const pre = [...head, ...(result ? ['', `result: ${result}`] : [])].join('\n')
+  const post = footer.join('\n')
+  const room = budget - pre.length - post.length - 4
+  let text = pre
+  if (body && room >= 120) {
+    const b = body.length > room ? body.slice(0, room - 16).trimEnd() + '\n…(truncated)' : body
+    text += '\n\n' + b
+  }
+  text += '\n' + post
+  return text.length > budget ? text.slice(0, budget - 1) + '…' : text
+}
+
+const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+/**
+ * A recurring template's schedule in words, plus its next run, for the SIMPLE shapes
+ * only: fixed minute + hour, every day or one weekday. The heartbeat evaluates cron
+ * in UTC (_cron_matches, `date -u`). Anything richer returns the raw expression and
+ * no next run, so this never becomes a second copy of the CLI's cron grammar.
+ */
+export function cronWords(expr: unknown, now: number): { words: string; next: number | null } {
+  const raw = String(expr ?? '').trim()
+  const f = raw.split(/\s+/)
+  const plain = { words: `cron \`${raw}\` (UTC)`, next: null }
+  if (f.length !== 5 || !/^\d{1,2}$/.test(f[0]!) || !/^\d{1,2}$/.test(f[1]!) || f[2] !== '*' || f[3] !== '*') return plain
+  const mi = Number(f[0]), hr = Number(f[1])
+  if (mi > 59 || hr > 23) return plain
+  const hhmm = `${String(hr).padStart(2, '0')}:${String(mi).padStart(2, '0')}`
+  let dow: number | null = null
+  if (f[4] !== '*') {
+    if (!/^[0-7]$/.test(f[4]!)) return plain
+    dow = Number(f[4]) % 7
+  }
+  const d = new Date(now)
+  let next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hr, mi)
+  for (let i = 0; i < 8 && (next <= now || (dow !== null && new Date(next).getUTCDay() !== dow)); i++) next += 86_400_000
+  return { words: `${dow === null ? 'every day' : `every ${DOW[dow]}`} ${hhmm} UTC`, next }
+}
+
+/** A template is a schedule, not a task: say when it runs, not that it is `todo`. */
+export function recurringLine(t: any, now: number): string | null {
+  if (t?.kind !== 'recurring') return null
+  const c = cronWords(t.schedule, now)
+  const parts = [`🔁 recurring template: ${c.words}`]
+  const last = relTime(t.last_fired_at, now)
+  parts.push(last ? `last run ${last}` : 'never run')
+  if (c.next !== null && t.status === 'todo') parts.push(`next run ${relTime(new Date(c.next).toISOString(), now)}`)
+  if (t.status !== 'todo') parts.push(`not firing (status ${t.status})`)
+  return parts.join(' · ')
+}
+
 function one(s: unknown, max: number): string {
   const v = String(s ?? '').replace(/\s+/g, ' ').trim()
   return v.length > max ? v.slice(0, max - 1) + '…' : v
@@ -62,16 +154,18 @@ export function isParked(t: any): boolean {
 }
 
 /** The lines the card was missing. `blockedBy` is `task show --json`'s data.blocked_by. */
-export function taskStateLines(t: any, blockedBy: any[], gateLive: boolean, now: number): string[] {
+export function taskStateLines(t: any, blockedBy: any[], gateLive: boolean, now: number, humanCount = 0): string[] {
   const out: string[] = []
   const open = t.status !== 'done' && t.status !== 'cancelled'
+  const rec = recurringLine(t, now)
+  if (rec) out.push(rec)
 
-  // 1. WHY BLOCKED + WHEN IT UNBLOCKS. The one that cost the round.
+  // 1. WHY BLOCKED + WHEN IT UNBLOCKS. The one that cost the round. Relative time
+  // only (lodar 00:11Z: "days ago hours ago not the timestamp").
   if (open && (t.park_reason || t.wake_at)) {
     const wake = relTime(t.wake_at, now)
     const wakeTxt = wake ? (wake.endsWith('ago') ? `wake was due ${wake}` : `wakes ${wake}`) : ''
-    out.push(`⏸ parked${wakeTxt ? ` — ${wakeTxt}` : ''}${t.wake_at ? ` (${String(t.wake_at)} UTC)` : ''}`)
-    if (t.park_reason) out.push(`   why: ${one(t.park_reason, 300)}`)
+    out.push(`⏸ parked${t.park_reason ? `: ${one(t.park_reason, 300)}` : ''}${wakeTxt ? ` · ${wakeTxt}` : ''}`)
   }
   const openBlockers = (Array.isArray(blockedBy) ? blockedBy : []).filter(
     b => b && b.status !== 'done' && b.status !== 'cancelled',
@@ -99,11 +193,20 @@ export function taskStateLines(t: any, blockedBy: any[], gateLive: boolean, now:
   if (t.routed_reviewer) who.push(`reviewer: ${t.routed_reviewer}`)
   if (who.length) out.push(who.join('  ·  '))
 
+  // 3b. WHOSE ROW, on a box with several people (lodar 00:15Z). The count comes from
+  // `human ls` (amendment 4): at 0 or 1 human the line is noise, so it is withheld.
+  if (humanCount >= 2 && t.human_owner) out.push(`human owner: ${t.human_owner_name || t.human_owner}`)
+
   // 4. LAST GATE OUTCOME. Today an answered gate disappears from the card. `gate`
-  // is the CLI's own verdict string (_task_gate_header_sql) — rendered, not rebuilt.
+  // is the CLI's own verdict string (_task_gate_header_sql) — rendered, not rebuilt;
+  // only its stamps are made relative and its shell pointer cut.
   if (!gateLive && t.gate && t.gate !== 'none') {
-    const g = String(t.gate).replace(/\s*Full record:.*$/, '').replace(/;\s*the live row carries no gate\.?/, '')
-    out.push(`gate: ${one(g, 200)}`)
+    const g = relStamps(
+      String(t.gate).replace(/\s*Full record:.*$/, '').replace(/[;:]?\s*5dive task gate-history \S+/, '')
+        .replace(/;\s*the live row carries no gate\.?/, ''),
+      now,
+    )
+    out.push(`last gate: ${one(g, 200)}`)
   }
 
   // 5. AGE.
@@ -150,10 +253,11 @@ function tierOf(t: any): number | null {
 /**
  * Which answer control the card offers. Every branch reads a CLI verdict:
  *   not live / routed to an agent       → none (not his to answer)
- *   secret / manual                     → none (text route; secrets never enter chat)
- *   tier 2, or tier unknown             → resend (the CLI mints the nonce buttons)
  *   tier<2 decision with options        → one button per option, ⭐ on the rec
  *   tier<2 approval                     → Approve / Deny
+ *   everything else a human owes        → resend (the CLI re-sends the gate's own
+ *     (tier 2, unknown tier, secret,       alert with its nonce buttons; the phone
+ *      manual, free-text decision)         user has no terminal — amendment 2 §5)
  * An UNKNOWN tier reads as 2, the CLI's own fail-safe direction (inbox.sh NULLIF):
  * the worst case is a re-sent alert, never a plugin-minted control on a hard gate.
  */
@@ -161,13 +265,17 @@ export function cardGateAction(t: any, gateLive: boolean, needsHuman: boolean): 
   if (!gateLive) return { kind: 'none', why: 'no live gate' }
   if (!needsHuman) return { kind: 'none', why: 'routed to an agent' }
   const type = String(t.need_type ?? '')
-  if (type === 'secret' || type === 'manual') return { kind: 'none', why: `${type} gate` }
+  const resend: CardGateAction = { kind: 'resend', data: `gresend:${t.id}` }
+  // secret / manual: the CLI's own alert carries their `provided` / `done` taps,
+  // nonce-sealed. The card never answers them itself, and never with a value.
+  if (type === 'secret' || type === 'manual') return resend
   const tier = tierOf(t)
-  if (tier === null || tier >= 2) return { kind: 'resend', data: `gresend:${t.id}` }
+  if (tier === null || tier >= 2) return resend
   const tag = optionsTag(t.need_options)
   if (type === 'decision') {
     const opts = splitOptions(t.need_options)
-    if (!opts.length) return { kind: 'none', why: 'decision without options' }
+    // A free-text decision has nothing to put on a button; its alert takes a reply.
+    if (!opts.length) return resend
     const rec = String(t.recommend ?? '').trim()
     return {
       kind: 'buttons',
@@ -186,7 +294,7 @@ export function cardGateAction(t: any, gateLive: boolean, needsHuman: boolean): 
       ],
     }
   }
-  return { kind: 'none', why: `no card control for a ${type || 'typeless'} gate` }
+  return resend
 }
 
 export type CardTap =
