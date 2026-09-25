@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Added — the registry copy carries reflex-drafted login checks the owner approves, and adapter drift, at browser 1.17.0 (DIVE-4997)
+
+`plugins/browser` mirrors 5dive-ai/5dive-browser at 1.17.0 byte for byte. A login with no adapter gets
+a reflex proposal (`5dive browser propose <site>`, which the probe also starts on its own, inline under `probe-all`, when
+`reflex status --json` says `configured:true`). The proposal is stored PENDING in the seat's
+`.adapters-pending/`. The owner reads the pick and every candidate with `sudo 5dive browser adapters
+pending`. `adapters approve` re-counts the chosen marker on the stored renders, then writes the seat's
+`.adapters/<site>.json`. It refuses when the proposal has no signed-in render, when either half is a
+challenge page, and when the caller is an agent seat's sudo. `adapters drift` re-measures every adapter
+and flags one that no longer classifies both halves; `probe-all` runs it once a day.
+`tests/browser_reflex_propose_unit.sh` is upstream's harness with the path read as `plugins/browser/`.
+
 ### Added — an agent's "Connect <site>" button: the owner taps in Telegram, the box binds (DIVE-4992), telegram 0.5.63, browser 1.16.0
 
 An agent that needed the owner logged into a site could only walk them through the dashboard. Now

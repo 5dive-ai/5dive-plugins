@@ -237,6 +237,23 @@ usage() {
                                       # profiles) and signed IN (this login), 0600, for
                                       # `sudo 5dive reflex login-marker` to draft a login
                                       # check from. Owner only; classifies nothing.
+  5dive browser propose <site> [--url=<probe url>] [--spa]
+                                      # capture, then have reflex draft this site's login
+                                      # check. Stored PENDING, never used until the owner
+                                      # approves. The probe starts one on its own for a
+                                      # login with no adapter when reflex is configured.
+  sudo 5dive browser adapters pending [--json]
+                                      # the owner: every drafted login check, with reflex's
+                                      # pick AND every candidate's counts on each half
+  sudo 5dive browser adapters approve <site> [--marker=mN] [--signed-in=mN]
+                                      # write it to the seat's .adapters/<site>.json, after
+                                      # re-counting it on the stored renders. Refused with
+                                      # no signed-in render, or on a challenge page.
+  sudo 5dive browser adapters reject <site>   # delete it and its renders; not re-proposed
+  5dive browser adapters drift [<site>] [--json]
+                                      # re-capture each login with an adapter and flag a
+                                      # marker that no longer classifies both halves
+                                      # (probe-all runs it once a day). Exit 1 if one drifted.
   5dive browser viewer <site> --bind=<session> [--ttl=600]
                                       # mint a ONE-TIME, expiring link a person logs in through
   5dive browser viewer-redeem <site> --nonce=- --session=<id>
@@ -1155,13 +1172,16 @@ _probe() {
   # cannot tell". Quiet (rc 0) like every other UNKNOWN: a state we cannot read
   # must not page a person. `run` still refuses on it — it accepts only
   # `authenticated*` — which is the fail-closed half.
+  # DIVE-4997: a login with no adapter is exactly what reflex can draft one for.
   if (( generic )); then
-    echo "unconfirmed (no adapter for $site; checked $(date -u +%Y-%m-%dT%H:%MZ))"
+    _maybe_propose "$site" "$dir"
+    echo "unconfirmed (no adapter for $site; checked $(date -u +%Y-%m-%dT%H:%MZ))$(_pending_note "$site")"
     return 0
   fi
   if [[ -z "$marker" && -z "$positive" ]]; then
     _stamp "$dir" unknown
-    echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $(_adapter_path "$site") with probe.logged_out_when_dom_matches)"
+    _maybe_propose "$site" "$dir"
+    echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $(_adapter_path "$site") with probe.logged_out_when_dom_matches)$(_pending_note "$site")"
     return 0
   fi
   # A POSITIVE MARKER TURNS SILENCE INTO UNKNOWN, NOT INTO A LOGIN (DIVE-4794).
@@ -1187,6 +1207,7 @@ _stamp() {
 cmd_probe_all() {
   _require_store
   local d site output found=0 broken=0 arc
+  _PROPOSE_QUEUE_FILE="$(mktemp)" || _PROPOSE_QUEUE_FILE=""
   for d in "$(_seat_dir)"/*/; do
     [[ -d "$d" ]] || continue
     found=1
@@ -1214,6 +1235,28 @@ cmd_probe_all() {
   # traffic would be the eviction making things slower than it found them.
   if [[ "${FIVEDIVE_BROWSER_EVICT_ON_PROBE:-1}" == 1 ]]; then
     ( cmd_evict ) || printf '%s: the idle sweep did not complete; browsers were left up\n' "$PROG" >&2
+  fi
+  # The logins the loop found with no adapter (DIVE-4997): drafted here, inline.
+  if [[ -s "${_PROPOSE_QUEUE_FILE:-}" ]]; then
+    local q qo
+    while IFS= read -r q; do
+      [[ -n "$q" ]] || continue
+      if qo=$( cmd_propose "$q" 2>&1 ); then
+        printf '  %-20s a login check drafted by reflex is waiting for the owner: sudo 5dive browser adapters pending\n' "$q"
+      else
+        printf '  %-20s no login check proposed: %s\n' "$q" "$(printf '%s' "$qo" | tail -n1 | sed "s/^$PROG: //")"
+      fi
+    done < "$_PROPOSE_QUEUE_FILE"
+  fi
+  [[ -n "${_PROPOSE_QUEUE_FILE:-}" ]] && rm -f -- "$_PROPOSE_QUEUE_FILE"
+  _PROPOSE_QUEUE_FILE=""
+  # DRIFT RIDES IT TOO (DIVE-4997), and for the same reason: it needs a clock and
+  # this is the clock. At most once per DRIFT_EVERY_S (a day), because it renders
+  # every adapter site three times. A drifted marker is printed, never a red unit:
+  # like an expired session it is a result, and the fix is a person's.
+  if [[ "${FIVEDIVE_BROWSER_DRIFT_ON_PROBE:-1}" == 1 ]] && _drift_due; then
+    local dout; dout=$( cmd_adapters_drift 2>&1 ) && true
+    grep -q DRIFTED <<<"$dout" && printf '%s\nA login check above no longer classifies both halves. Draft a new one: move the adapter aside, then 5dive browser propose <site>\n' "$dout"
   fi
 
   # A FAILED LAUNCH IS THE ONE THING THAT FAILS THIS TIMER (DIVE-4587). Expired
@@ -2346,6 +2389,486 @@ cmd_capture() {
     "$([[ "$how" == daemon ]] && echo "the served session" || echo "this login's profile")"
   printf 'draft its login check (shadow; writes nothing):\n  sudo 5dive reflex login-marker %s --url=%s --logged-out=%s --logged-out=%s --logged-in=%s%s\n' \
     "$site" "$url" "$out/signed-out.html" "$out/signed-out-2.html" "$out/signed-in.html" "$([[ -f "$a" ]] && printf ' --compare=%s' "$a")"
+}
+
+# ------------------------------------------------ propose / adapters (DIVE-4997)
+#
+# REFLEX DRAFTS THE LOGIN CHECK, THE OWNER APPROVES IT. A site with no adapter
+# cannot probe `authenticated`, so every page verb refuses it, and until now the
+# only way out was a person writing `logged_out_when_dom_matches` by hand. The
+# pieces existed: `capture` (DIVE-4929) takes both halves, and `5dive reflex
+# login-marker` (5dive CLI, DIVE-4928) lists the candidate markers, keeps only
+# those that separate the halves, and has the model pick one. DIVE-4931 measured
+# it on a real box and decided it leaves shadow under three conditions, which are
+# what this section is:
+#
+#   (a) a proposal is built WITH a signed-in render, so the code verified both
+#       halves. `propose` always captures one; `approve` refuses a proposal whose
+#       signed-in render is missing, and re-counts the chosen marker on the stored
+#       renders, with the probe's own engine, before it writes anything.
+#   (b) the owner sees the candidate list, not only the pick. Confidence was 0.20
+#       to 0.61, and the Telegram pick was a valid but weak audio-player class a
+#       person would not choose. So `adapters pending` prints every candidate
+#       with its counts on each half, and `approve --marker=mN` takes any of them.
+#   (c) challenge and no-candidate refusals stay refusals. A challenge on EITHER
+#       half is refused here, before reflex is asked (reflex itself checks only
+#       the signed-out half), and a proposal with no candidate is never stored.
+#
+# WHERE THINGS LIVE. The proposal and its renders are in the seat's own
+# `.adapters-pending/` (0700, leading dot like `.adapters/`, so the `*/` glob that
+# enumerates sites never sees it). Nothing reads adapters from there. `approve`
+# writes the seat's `.adapters/<site>.json`, and never the package's `adapters/`,
+# which an upgrade replaces (DIVE-4524). The renders are deleted when the
+# proposal is approved or rejected: the signed-in one is the account's own page.
+#
+# WHO. `propose` is the login owner's act, for capture's reason (a brokered seat
+# is refused). `approve` and `reject` are the box owner's: root, and not an agent
+# seat's sudo, which is DIVE-4982's rule for approvals. The file is written AS
+# the seat, never by root into a directory the seat controls.
+#
+# WHEN, without anyone typing `propose`: the probe meets a login with no adapter
+# (the status the dashboard reads after Connect, or a page verb's gate) and
+# starts one in the background, at most once per PROPOSE_RETRY_S per site, and
+# never again for a site the owner rejected.
+PENDING_SEAT_SUBDIR=".adapters-pending"
+PROPOSE_RETRY_S="${FIVEDIVE_BROWSER_PROPOSE_RETRY_S:-21600}"
+DRIFT_EVERY_S="${FIVEDIVE_BROWSER_DRIFT_EVERY_S:-86400}"
+# reflex login-marker's own title test (a challenge interstitial can carry none
+# of the body tokens: reddit's "Prove your humanity").
+CHALLENGE_TITLE_MARKER='(captcha|prove your humanity|are you a robot|just a moment|verify you are human|access denied|attention required)'
+
+_pending_dir() { printf '%s\n' "$PROFILE_ROOT/${1:-$(_seat)}/$PENDING_SEAT_SUBDIR"; }
+_adapter_write_dir() {  # <seat> — where approve writes; the first place the probe reads
+  if [[ -n "${FIVEDIVE_BROWSER_ADAPTER_DIR:-}" ]]; then printf '%s\n' "$FIVEDIVE_BROWSER_ADAPTER_DIR"
+  else printf '%s\n' "$PROFILE_ROOT/$1/$ADAPTER_SEAT_SUBDIR"; fi
+}
+# The probe's engine, counted: grep -oiE, zero is an answer and not a failure.
+_marker_count() { { grep -oiE -- "$1" "$2" 2>/dev/null || true; } | wc -l | tr -d ' '; }
+_render_title() { { grep -oiE '<title[^>]*>[^<]{1,200}' "$1" 2>/dev/null || true; } | head -n1 | sed -E 's/<title[^>]*>//'; }
+_render_is_challenge() {  # <site> <html>
+  grep -qiE "$(_site_challenge_marker "$1")" "$2" 2>/dev/null && return 0
+  grep -qiE "$CHALLENGE_TITLE_MARKER" <<<"$(_render_title "$2")"
+}
+# Run as <seat>: root drops, a seat is already itself.
+_as_seat() {  # <seat> <cmd...>
+  local seat="$1"; shift
+  if [[ $EUID -eq 0 && "$seat" != root ]]; then runuser -u "$seat" -- "$@"; else "$@"; fi
+}
+
+# How to reach `5dive reflex`. The key is root's (/etc/5dive/reflex-openrouter.key),
+# so a seat with the grant goes through sudo; without it the plain CLI still works
+# for a custom endpoint, and otherwise says why it cannot.
+_reflex_cli() {
+  if [[ -n "${FIVEDIVE_BROWSER_CLI:-}" ]]; then _RFX=("$FIVEDIVE_BROWSER_CLI" reflex); return 0; fi
+  if [[ $EUID -ne 0 ]] && sudo -n -l /usr/local/bin/5dive reflex login-marker >/dev/null 2>&1; then
+    _RFX=(sudo -n /usr/local/bin/5dive reflex); return 0
+  fi
+  command -v 5dive >/dev/null 2>&1 || return 1
+  _RFX=(5dive reflex)
+}
+# `configured`, not "has a key": a custom endpoint needs none (DIVE-4932).
+_reflex_configured() {
+  local o; o=$(timeout 20 "${_RFX[@]}" status --json 2>/dev/null) || return 1
+  [[ "$(jq -r '.configured // false' <<<"$o" 2>/dev/null)" == true ]]
+}
+
+_propose_stamp() {  # <pending-dir> <base> <state> [<why>]
+  ( umask 077; printf '%s %s %s\n' "$(date -u +%s)" "$3" "${4:-}" > "$1/$2.attempt" ) 2>/dev/null || true
+}
+_propose_refuse() {  # <rc> <pending-dir> <base> <renders> <why>
+  rm -rf -- "${4:?}"
+  _propose_stamp "$2" "$3" refused "$5"
+  die "$1" "$5"
+}
+
+cmd_propose() {
+  local site="" url="" spa=0 auto=0
+  while (($#)); do
+    case "$1" in
+      --url=*) url="${1#*=}" ;;
+      --spa) spa=1 ;;
+      --auto) auto=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) [[ -z "$site" ]] || die "$E_USAGE" "one site at a time"; site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser propose linkedin.com"
+  { _valid_site "$site" && ! _is_public "$site"; } || die "$E_USAGE" "'$site' is not a site a person logs in to"
+  _open_site "$site" --no-broker propose "a proposal captures this login's signed-in page, which only the login's owner may do."
+  local dir="$_SITE_DIR" base have; base="$(_site_base "$site")"
+  have="$(_adapter_path "$site")"
+  [[ -f "$have" ]] && die "$E_USAGE" "$base already has an adapter ($have). reflex proposes a login check only for a site with none. To see whether that one still classifies, run: 5dive browser adapters drift $site"
+  _reflex_cli || die "$E_UNAVAILABLE" "there is no 5dive CLI on this box, so there is no reflex to ask"
+  local pd; pd="$(_pending_dir)"
+  ( umask 077; mkdir -p "$pd" ) && chmod 700 "$pd" || die "$E_UNAVAILABLE" "cannot create $pd"
+  _audit "$pd" 700
+  local pf="$pd/$base.json" rd="$pd/$base.renders"
+  [[ -e "$pf" ]] && die "$E_USAGE" "a login check for $base is already waiting for the owner: sudo 5dive browser adapters pending"
+  exec {_PLK}>"$pd/.$base.lock"
+  flock -n "$_PLK" || die "$E_UNAVAILABLE" "a login check for $base is already being drafted"
+  _reflex_configured || _propose_refuse "$E_UNAVAILABLE" "$pd" "$base" "$rd" \
+    "reflex is not configured on this box, so nothing can propose a login check. The owner turns it on in the dashboard: Company → Settings → Reflex."
+  if (( auto )); then
+    # The probe that started us may still hold the profile (one chrome per
+    # --user-data-dir), and so may the page verb it gated. Wait for it to let go.
+    sleep "${FIVEDIVE_BROWSER_PROPOSE_DELAY_S:-20}"
+    local w=0
+    while [[ -L "$dir/SingletonLock" ]] && ! _serve_running "$dir" >/dev/null && (( w < 120 )); do sleep 2; w=$((w+2)); done
+  fi
+  rm -rf -- "${rd:?}"
+  _propose_stamp "$pd" "$base" started
+  local cout rc=0
+  cout=$(cmd_capture "$site" ${url:+"--url=$url"} --out="$rd" 2>&1) || rc=$?
+  (( rc == 0 )) || _propose_refuse "$rc" "$pd" "$base" "$rd" "the capture did not complete, so nothing was proposed: $(printf '%s' "$cout" | tail -n1)"
+  [[ -n "$url" ]] || url="$(_site_url "$site")"
+  local so="$rd/signed-out.html" so2="$rd/signed-out-2.html" si="$rd/signed-in.html" f half
+  for f in "$so" "$so2" "$si"; do
+    half="signed-out"; [[ "$f" == "$si" ]] && half="signed-in"
+    _render_is_challenge "$site" "$f" && _propose_refuse "$E_UNAVAILABLE" "$pd" "$base" "$rd" \
+      "the $half render of $base is a challenge page (captcha or verification), not a $half page. Nothing was proposed.$([[ $half == signed-in ]] && echo " Clear it in the viewer, then run: 5dive browser propose $site")"
+  done
+  # Byte equality misses the real case (a fresh CSRF token per render), so the title
+  # is what says "this profile is not logged in". A proposal off two signed-out
+  # pages has no signed-in half, whatever the file is called.
+  local to ti; to="$(_render_title "$so")"; ti="$(_render_title "$si")"
+  if cmp -s "$so" "$si" || [[ -n "$to" && "$to" == "$ti" ]]; then
+    _propose_refuse "$E_COLD" "$pd" "$base" "$rd" "both renders of $base show the same page${to:+ ($to)}, so this profile is not logged in and there is no signed-in half to verify against. Nothing was proposed. Log in first: 5dive browser auth $site"
+  fi
+  local -a lm=(login-marker "$base" "--url=$url" "--logged-out=$so" "--logged-out=$so2" "--logged-in=$si" --json)
+  [[ -n "${FIVEDIVE_BROWSER_REFLEX_BACKEND:-}" ]] && lm+=("--backend=$FIVEDIVE_BROWSER_REFLEX_BACKEND")
+  local rep=""
+  (( spa )) && lm+=(--spa)
+  rep=$("${_RFX[@]}" "${lm[@]}" 2>"$pd/.$base.err") || rc=$?
+  # A single-page app paints no sign-in inside the probe's window (Telegram's K
+  # app), so the signed-out half has nothing to offer and the check has to be the
+  # POSITIVE marker. That is --spa, and reflex asks for it only when needed.
+  if (( rc == 0 && ! spa )) && [[ "$(jq -r '.logged_out.candidates | length' <<<"$rep" 2>/dev/null)" == 0 ]]; then
+    spa=1; rep=$("${_RFX[@]}" "${lm[@]}" --spa 2>"$pd/.$base.err") || rc=$?
+  fi
+  local rerr; rerr="$(tail -n1 "$pd/.$base.err" 2>/dev/null)"; rm -f -- "$pd/.$base.err"
+  (( rc == 0 )) || _propose_refuse "$E_UNAVAILABLE" "$pd" "$base" "$rd" "reflex did not propose a login check for $base (exit $rc): ${rerr:-no reason given}"
+  jq -e '(.logged_out | type) == "object"' <<<"$rep" >/dev/null 2>&1 \
+    || _propose_refuse "$E_UNAVAILABLE" "$pd" "$base" "$rd" "reflex answered, but not with a login-marker report; nothing was proposed"
+  local nout nin
+  nout=$(jq -r '.logged_out.candidates | length' <<<"$rep"); nin=$(jq -r '(.logged_in.candidates // []) | length' <<<"$rep")
+  (( nout + nin > 0 )) || _propose_refuse "$E_UNAVAILABLE" "$pd" "$base" "$rd" \
+    "no marker separates the signed-out page of $base from the signed-in one (0 candidates on either half), so there is nothing to propose. It stays a site without a login check."
+  local tmp; tmp="$(mktemp "$pd/.proposal.XXXXXX")" || die "$E_UNAVAILABLE" "cannot write in $pd"
+  if jq -n --arg site "$base" --arg profile "$site" --arg seat "$(_seat)" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg url "$url" --argjson spa "$spa" --argjson r "$rep" \
+        '{site:$site, profile:$profile, seat:$seat, proposed_at:$at, probe_url:$url,
+          signed_in_render:($r.signed_in_render == true), spa:($spa == 1), reflex:$r}' > "$tmp" \
+     && chmod 600 "$tmp" && mv -f -- "$tmp" "$pf"; then :; else
+    rm -f -- "${tmp:?}"; _propose_refuse "$E_UNAVAILABLE" "$pd" "$base" "$rd" "cannot write the proposal in $pd"
+  fi
+  _propose_stamp "$pd" "$base" proposed
+  _audit_row "$dir" propose "$base"
+  _proposal_print "$pf"
+}
+
+# One proposal, for a person: the pick, then EVERY candidate with its counts.
+_proposal_print() {  # <proposal-file>
+  jq -r '
+    def half($h; $name; $other):
+      if $h == null then empty
+      elif ($h.candidates | length) == 0 then "  \($name) marker: no candidates"
+      else
+        "  \($name) marker: " + (if $h.choice == "none" or $h.choice == null
+            then "reflex picked none\(if $h.error then " (\($h.error))" else "" end) — choose one below, or reject"
+            else "reflex picked \($h.choice)\(if $h.confidence != null then " at confidence \($h.confidence)" else "" end)" end),
+        ($h.candidates[] | "    \(.key)\t\(.marker)\t(signed out \(.out), signed in \(.in // "unmeasured"))\(if .key == $h.choice then "   <- pick" else "" end)")
+      end;
+    "\(.site)  (seat \(.seat), proposed \(.proposed_at), \(.reflex.backend // "reflex")\(if .reflex.model then " " + .reflex.model else "" end))",
+    "  probe url: \(.probe_url)",
+    (if .signed_in_render then empty else "  NO SIGNED-IN RENDER: this proposal cannot be approved" end),
+    half(.reflex.logged_out; "signed-out"; "in"),
+    half(.reflex.logged_in; "signed-in"; "out"),
+    "  approve: sudo 5dive browser adapters approve \(.site)   (add --marker=mN or --signed-in=mN to choose another candidate)",
+    "  reject:  sudo 5dive browser adapters reject \(.site)"' "$1"
+}
+
+# Every proposal this caller may see. Root sees every seat's, a seat its own. A
+# file is a proposal only if its seat's uid owns it and it is not a link: root
+# reads these, and a link is how a seat would point root at something else.
+_pending_files() {  # [<base>] [<seat>]
+  local want="${1:-}" only="${2:-}" s f own
+  if [[ $EUID -eq 0 ]]; then
+    for s in "$PROFILE_ROOT"/*/; do s="$(basename "$s")"; [[ -z "$only" || "$s" == "$only" ]] && printf '%s\n' "$s"; done
+  else
+    s="$(_seat)"; [[ -z "$only" || "$s" == "$only" ]] && printf '%s\n' "$s"
+  fi | while IFS= read -r s; do
+    [[ -d "$PROFILE_ROOT/$s/$PENDING_SEAT_SUBDIR" && ! -L "$PROFILE_ROOT/$s/$PENDING_SEAT_SUBDIR" ]] || continue
+    own="$(stat -c %u "$PROFILE_ROOT/$s" 2>/dev/null)"
+    for f in "$PROFILE_ROOT/$s/$PENDING_SEAT_SUBDIR"/*.json; do
+      [[ -f "$f" && ! -L "$f" && "$(stat -c %u "$f")" == "$own" ]] || continue
+      [[ -z "$want" || "$(basename "$f" .json)" == "$want" ]] || continue
+      printf '%s\n' "$f"
+    done
+  done
+}
+
+_adapters_owner() {  # <verb> <site>
+  [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner may $1 a login check: sudo 5dive browser adapters $1 $2"
+  _sudo_is_seat && die "$E_PERM" "an agent seat ($SUDO_USER) cannot $1 a login check, its own or another seat's. The owner does, from their shell or the dashboard."
+  return 0
+}
+
+_adapters_pick() {  # <site> <seat|""> -> sets _AP_FILE, _AP_SEAT
+  local site="$1" seat="$2"; local -a hits=()
+  mapfile -t hits < <(_pending_files "$(_site_base "$site")" "$seat")
+  (( ${#hits[@]} )) || die "$E_USAGE" "no login check for $site is waiting${seat:+ on seat $seat} (sudo 5dive browser adapters pending lists them)"
+  if (( ${#hits[@]} > 1 )); then
+    local s; s=$(for f in "${hits[@]}"; do basename "$(dirname "$(dirname "$f")")"; done | paste -sd '|')
+    die "$E_USAGE" "several seats have a login check for $site waiting; say which: --seat=$s"
+  fi
+  _AP_FILE="${hits[0]}"; _AP_SEAT="$(basename "$(dirname "$(dirname "$_AP_FILE")")")"
+}
+
+_adapters_pending() {
+  local json=0 a; [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && json=1
+  for a in "$@"; do case "$a" in --json) json=1 ;; *) die "$E_USAGE" "usage: 5dive browser adapters pending [--json]" ;; esac; done
+  local -a fs=(); mapfile -t fs < <(_pending_files)
+  if (( json )); then
+    if (( ${#fs[@]} )); then jq -s . "${fs[@]}"; else echo '[]'; fi
+    return 0
+  fi
+  (( ${#fs[@]} )) || { printf 'no login checks waiting\n'; return 0; }
+  local f; for f in "${fs[@]}"; do _proposal_print "$f"; echo; done
+}
+
+_adapters_approve() {
+  local site="" seat="" okey="" ikey="" a
+  for a in "$@"; do
+    case "$a" in
+      --seat=*) seat="${a#*=}" ;;
+      --marker=*) okey="${a#*=}" ;;
+      --signed-in=*) ikey="${a#*=}" ;;
+      -*) die "$E_USAGE" "usage: sudo 5dive browser adapters approve <site> [--marker=mN|none] [--signed-in=mN|none] [--seat=<seat>]" ;;
+      *) [[ -z "$site" ]] || die "$E_USAGE" "one site at a time"; site="$a" ;;
+    esac
+  done
+  [[ -n "$site" ]] && _valid_site "$site" || die "$E_USAGE" "usage: sudo 5dive browser adapters approve <site> [--marker=mN] [--signed-in=mN]"
+  _adapters_owner approve "$site"
+  _adapters_pick "$site" "$seat"
+  local pf="$_AP_FILE" seat="$_AP_SEAT" base; base="$(basename "$pf" .json)"
+  local rd; rd="$(dirname "$pf")/$base.renders"
+  local so="$rd/signed-out.html" so2="$rd/signed-out-2.html" si="$rd/signed-in.html" f
+  # (a): no signed-in render, no approve. The path is fixed, never read from the
+  # proposal, and every render must still be there to be re-counted.
+  [[ "$(jq -r '.signed_in_render' "$pf")" == true && -f "$si" && ! -L "$si" && -s "$si" ]] \
+    || die "$E_PERM" "the login check for $base was not built with a signed-in render, so its markers were verified on one half only and it cannot be approved. Draft it again from a logged-in profile: 5dive browser propose $base"
+  for f in "$so" "$so2"; do
+    [[ -f "$f" && ! -L "$f" && -s "$f" ]] || die "$E_PERM" "a signed-out render of $base is gone ($f), so the marker cannot be re-checked; nothing was written. Draft it again: 5dive browser propose $base"
+  done
+  # (c): a challenge on either half is a refusal here too, whoever wrote the file.
+  for f in "$so" "$so2" "$si"; do
+    _render_is_challenge "$base" "$f" && die "$E_PERM" "a render of $base is a challenge page ($f), and a login check drafted off one would read every later challenge as a login state. Nothing was written."
+  done
+  [[ -n "$okey" ]] || okey="$(jq -r '.reflex.logged_out.choice // "none"' "$pf")"
+  [[ -n "$ikey" ]] || ikey="$(jq -r '.reflex.logged_in.choice // "none"' "$pf")"
+  local om="" im=""
+  if [[ "$okey" != none ]]; then
+    om="$(jq -r --arg k "$okey" '(.reflex.logged_out.candidates // [])[] | select(.key == $k) | .marker' "$pf")"
+    [[ -n "$om" ]] || die "$E_USAGE" "$okey is not a signed-out candidate for $base (sudo 5dive browser adapters pending lists them)"
+  fi
+  if [[ "$ikey" != none ]]; then
+    im="$(jq -r --arg k "$ikey" '(.reflex.logged_in.candidates // [])[] | select(.key == $k) | .marker' "$pf")"
+    [[ -n "$im" ]] || die "$E_USAGE" "$ikey is not a signed-in candidate for $base (sudo 5dive browser adapters pending lists them)"
+  fi
+  [[ -n "$om$im" ]] || die "$E_USAGE" "reflex picked no marker for $base. Choose one of the candidates: sudo 5dive browser adapters approve $base --marker=mN (or --signed-in=mN); sudo 5dive browser adapters pending lists them"
+  # Re-count on the stored renders, with the probe's engine. A signed-out marker
+  # matches every signed-out render and never the signed-in one; a signed-in
+  # marker the reverse. What the proposal file SAYS the counts were is not read.
+  local c1=0 c2=0 ci=0 d1=0 d2=0 di=0
+  if [[ -n "$om" ]]; then
+    c1=$(_marker_count "$om" "$so"); c2=$(_marker_count "$om" "$so2"); ci=$(_marker_count "$om" "$si")
+    (( c1 >= 1 && c2 >= 1 && ci == 0 )) || die "$E_PERM" "$om does not separate the renders of $base (signed out $c1 and $c2, signed in $ci), so it cannot tell a live login from an expired one. Nothing was written."
+  fi
+  if [[ -n "$im" ]]; then
+    d1=$(_marker_count "$im" "$so"); d2=$(_marker_count "$im" "$so2"); di=$(_marker_count "$im" "$si")
+    (( di >= 1 && d1 == 0 && d2 == 0 )) || die "$E_PERM" "$im does not separate the renders of $base (signed in $di, signed out $d1 and $d2), so a signed-out profile could read as signed in. Nothing was written."
+  fi
+  local wd target; wd="$(_adapter_write_dir "$seat")"; target="$wd/$base.json"
+  [[ "$(realpath -m -- "$wd")" != "$(realpath -m -- "$ADAPTER_PKG_DIR")" ]] \
+    || die "$E_PERM" "refusing to write into the plugin's own adapters/ ($ADAPTER_PKG_DIR): an upgrade replaces it. An approved login check belongs in the seat's .adapters/."
+  [[ -e "$target" || -L "$target" ]] && die "$E_USAGE" "$target already exists; nothing was overwritten. Move it aside first if this proposal should replace it."
+  local by="${SUDO_USER:-$(id -un)}" now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local adapter
+  adapter=$(jq --arg om "$om" --arg im "$im" --arg okey "$okey" --arg ikey "$ikey" --arg by "$by" --arg now "$now" \
+      --argjson c "[$c1,$c2,$ci]" --argjson d "[$d1,$d2,$di]" '
+    . as $p | $p.reflex as $r
+    | def side($h; $key; $cnt; $kind):
+        if $key == "none" then null else
+          {key: $key, marker: ($h.candidates[] | select(.key == $key) | .marker),
+           reflex_choice: $h.choice, confidence: $h.confidence, candidates: ($h.candidates | length),
+           signed_out: [$cnt[0], $cnt[1]], signed_in: $cnt[2]} end;
+      side($r.logged_out; $okey; $c; "out") as $o | side($r.logged_in // {candidates: []}; $ikey; $d; "in") as $i
+    | {_comment: ("PROPOSED BY REFLEX (\($r.backend // "reflex")\(if $r.model then " " + $r.model else "" end)) on \($p.proposed_at) from two signed-out renders and one signed-in render of \($p.probe_url), and APPROVED by \($by) on \($now) (DIVE-4997). "
+          + (if $o then "Signed-out marker \($o.key) of \($o.candidates) candidates (reflex picked \($o.reflex_choice)\(if $o.confidence != null then " at \($o.confidence)" else "" end)): \($o.signed_out[0]) and \($o.signed_out[1]) matches signed out, \($o.signed_in) signed in. " else "" end)
+          + (if $i then "Signed-in marker \($i.key) of \($i.candidates) candidates (reflex picked \($i.reflex_choice)\(if $i.confidence != null then " at \($i.confidence)" else "" end)): \($i.signed_in) matches signed in, \($i.signed_out[0]) and \($i.signed_out[1]) signed out. " else "" end)
+          + "Re-check it any time: 5dive browser adapters drift \($p.profile)"),
+       site: $p.site,
+       probe: ({url: $p.probe_url}
+               + (if $o then {logged_out_when_dom_matches: $om} else {} end)
+               + (if $i then {logged_in_when_dom_matches: $im} else {} end)),
+       actions: {},
+       _reflex: {proposed_at: $p.proposed_at, approved_at: $now, approved_by: $by, backend: $r.backend, model: $r.model,
+                 logged_out: $o, logged_in: $i}}' "$pf") || die "$E_UNAVAILABLE" "could not compose the adapter for $base"
+  # AS THE SEAT: the directory is the seat's, and root writing into a directory
+  # another uid controls is how a planted link turns into a root write elsewhere.
+  printf '%s\n' "$adapter" | _as_seat "$seat" bash -c '
+    umask 077; mkdir -p "$1" && chmod 700 "$1" || exit 1
+    t=$(mktemp "$1/.approved.XXXXXX") || exit 1
+    if cat > "$t" && chmod 600 "$t" && mv -fT -- "$t" "$2"; then exit 0; fi
+    rm -f -- "$t"; exit 1' _ "$wd" "$target" \
+    || die "$E_UNAVAILABLE" "could not write $target"
+  local prof; prof="$(jq -r '.profile // .site' "$pf")"
+  _as_seat "$seat" rm -rf -- "$rd" "$pf"
+  _as_seat "$seat" bash -c 'umask 077; printf "%s approved %s\n" "$(date -u +%s)" "$2" > "$1"' _ "$(dirname "$pf")/$base.attempt" "$by" 2>/dev/null || true
+  printf 'approved: %s is written to %s and the probe reads it from now on.\n' "$base" "$target"
+  [[ -n "$om" ]] && printf '  signed out when the page matches  %s\n' "$om"
+  [[ -n "$im" ]] && printf '  signed in when the page matches   %s\n' "$im"
+  printf '  the renders were deleted. Check it: 5dive browser status %s\n' "$prof"
+}
+
+_adapters_reject() {
+  local site="" seat="" a
+  for a in "$@"; do
+    case "$a" in
+      --seat=*) seat="${a#*=}" ;;
+      -*) die "$E_USAGE" "usage: sudo 5dive browser adapters reject <site> [--seat=<seat>]" ;;
+      *) site="$a" ;;
+    esac
+  done
+  [[ -n "$site" ]] && _valid_site "$site" || die "$E_USAGE" "usage: sudo 5dive browser adapters reject <site>"
+  _adapters_owner reject "$site"
+  _adapters_pick "$site" "$seat"
+  local pf="$_AP_FILE" base; base="$(basename "$_AP_FILE" .json)"
+  _as_seat "$_AP_SEAT" rm -rf -- "$(dirname "$pf")/$base.renders" "$pf"
+  # A rejected site is not proposed again on its own; `propose` by hand still works.
+  _as_seat "$_AP_SEAT" bash -c 'umask 077; printf "%s rejected %s\n" "$(date -u +%s)" "$2" > "$1"' _ "$(dirname "$pf")/$base.attempt" "${SUDO_USER:-$(id -un)}" 2>/dev/null || true
+  printf 'rejected: the login check for %s is deleted with its renders, and it will not be proposed again on its own.\n' "$base"
+}
+
+# THE PROBE'S HOOK. Background and silent: the probe's stdout is what the tile
+# reads, and a proposal is a capture plus a model call, far too slow to wait on.
+_maybe_propose() {  # <site> <dir>
+  [[ "${FIVEDIVE_BROWSER_AUTO_PROPOSE:-1}" == 1 ]] || return 0
+  (( _SITE_BROKERED )) && return 0
+  _is_public "$1" && return 0
+  local pd base st; pd="$(_pending_dir)"; base="$(_site_base "$1")"
+  [[ -e "$pd/$base.json" ]] && return 0
+  if [[ -f "$pd/$base.attempt" ]]; then
+    st=$(cat "$pd/$base.attempt" 2>/dev/null)
+    [[ "$st" == *" rejected"* ]] && return 0
+    (( $(date -u +%s) - ${st%% *} < PROPOSE_RETRY_S )) 2>/dev/null && return 0
+  fi
+  ( umask 077; mkdir -p "$pd" ) 2>/dev/null && chmod 700 "$pd" 2>/dev/null || return 0
+  _propose_stamp "$pd" "$base" queued
+  # Under probe-all (the systemd timer) a background child dies with the oneshot
+  # unit's cgroup when the probe exits, mid-capture. So there the site is queued
+  # in a file (this runs inside a command substitution, where a variable would
+  # be lost) and probe-all drafts it inline once its loop is done.
+  if [[ -n "${_PROPOSE_QUEUE_FILE:-}" ]]; then printf '%s\n' "$1" >> "$_PROPOSE_QUEUE_FILE"; return 0; fi
+  setsid "$0" propose "$1" --auto </dev/null >/dev/null 2>&1 &
+  return 0
+}
+# What the probe line adds when a proposal is waiting, so an agent that reads the
+# state can tell the owner there is something to approve.
+_pending_note() {  # <site>
+  [[ -e "$(_pending_dir)/$(_site_base "$1").json" ]] || return 0
+  printf ' — a login check drafted by reflex is waiting for the owner: sudo 5dive browser adapters pending'
+}
+
+# ----------------------------------------------------------- adapters drift
+#
+# A HAND MARKER DECAYS SILENTLY. DIVE-4931 found the shipped Telegram adapter's
+# signed-in marker matching the signed-out shell: the page changed, the marker did
+# not, and a signed-out profile read `authenticated`. Nothing looked, because the
+# only measurement is the one taken when the file is written. This re-takes it:
+# `capture` for each of this seat's logins that has an adapter, the same counts
+# approve takes, and a verdict per marker. It runs from probe-all at most once per
+# DRIFT_EVERY_S, and on its own. The renders are deleted after counting.
+cmd_adapters_drift() {
+  local only="" json=0 a; [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && json=1
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      -*) die "$E_USAGE" "usage: 5dive browser adapters drift [<site>] [--json]" ;;
+      *) only="$a" ;;
+    esac
+  done
+  _require_store
+  local seat_dir; seat_dir="$(_seat_dir)"
+  local pd; pd="$(_pending_dir)"
+  ( umask 077; mkdir -p "$pd" ) && chmod 700 "$pd" || die "$E_UNAVAILABLE" "cannot create $pd"
+  local d site ad om im tmp rc out rows="" row n1 n2 ni m1 m2 mi verdict why
+  for d in "$seat_dir"/*/; do
+    [[ -d "$d" ]] || continue
+    site="$(basename "$d")"; _is_public "$site" && continue
+    [[ -z "$only" || "$only" == "$site" ]] || continue
+    ad="$(_adapter_path "$site")"; [[ -f "$ad" ]] || continue
+    om="$(_site_logged_out_marker "$site")"; im="$(_site_logged_in_marker "$site")"
+    [[ -n "$om$im" ]] || continue
+    tmp="$(mktemp -d "$pd/.drift.XXXXXX")" && rmdir "$tmp" || continue
+    rc=0; out=$(cmd_capture "$site" --out="$tmp" 2>&1) || rc=$?
+    verdict=ok why=""; n1=null n2=null ni=null m1=null m2=null mi=null
+    if (( rc )); then
+      verdict=unmeasured why="the capture did not complete: $(printf '%s' "$out" | tail -n1)"
+    elif _render_is_challenge "$site" "$tmp/signed-out.html" || _render_is_challenge "$site" "$tmp/signed-out-2.html" || _render_is_challenge "$site" "$tmp/signed-in.html"; then
+      verdict=unmeasured why="a render is a challenge page, so neither half can be counted"
+    elif cmp -s "$tmp/signed-out.html" "$tmp/signed-in.html" \
+         || { [[ -n "$(_render_title "$tmp/signed-out.html")" ]] && [[ "$(_render_title "$tmp/signed-out.html")" == "$(_render_title "$tmp/signed-in.html")" ]]; }; then
+      verdict=unmeasured why="both renders show the same page, so this profile is not logged in and there is no signed-in half (5dive browser auth $site)"
+    else
+      if [[ -n "$om" ]]; then
+        n1=$(_marker_count "$om" "$tmp/signed-out.html"); n2=$(_marker_count "$om" "$tmp/signed-out-2.html"); ni=$(_marker_count "$om" "$tmp/signed-in.html")
+        if (( n1 == 0 || n2 == 0 )); then verdict=drifted why="the signed-out marker no longer matches the signed-out page, so an expired login would not read as expired"
+        elif (( ni > 0 )); then verdict=drifted why="the signed-out marker also matches the live login, so it reads as expired (or this profile is signed out: 5dive browser status $site)"; fi
+      fi
+      if [[ -n "$im" ]]; then
+        m1=$(_marker_count "$im" "$tmp/signed-out.html"); m2=$(_marker_count "$im" "$tmp/signed-out-2.html"); mi=$(_marker_count "$im" "$tmp/signed-in.html")
+        if (( m1 > 0 || m2 > 0 )); then verdict=drifted why="${why:+$why; }the signed-in marker matches the signed-out page, so a signed-out profile reads as signed in"
+        elif (( mi == 0 )); then verdict=drifted why="${why:+$why; }the signed-in marker no longer appears on the live login, so it reads UNKNOWN"; fi
+      fi
+    fi
+    rm -rf -- "${tmp:?}"
+    row=$(jq -nc --arg site "$site" --arg ad "$ad" --arg v "$verdict" --arg why "$why" --arg om "$om" --arg im "$im" \
+          --argjson n1 "$n1" --argjson n2 "$n2" --argjson ni "$ni" --argjson m1 "$m1" --argjson m2 "$m2" --argjson mi "$mi" \
+      '{site:$site, adapter:$ad, verdict:$v, why:(if $why == "" then null else $why end),
+        logged_out: (if $om == "" then null else {marker:$om, signed_out:[$n1,$n2], signed_in:$ni} end),
+        logged_in:  (if $im == "" then null else {marker:$im, signed_out:[$m1,$m2], signed_in:$mi} end)}')
+    rows+="$row"$'\n'
+  done
+  local all; all=$(printf '%s' "$rows" | jq -sc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{checked_at:$at, sites:.}')
+  ( umask 077; printf '%s\n' "$all" > "$seat_dir/.5dive-drift.json" ) 2>/dev/null || true
+  if (( json )); then printf '%s\n' "$all"; else
+    jq -r 'if (.sites | length) == 0 then "no logins with a login check to re-measure" else
+      .sites[] | "  \(.site)\t\(.verdict | ascii_upcase)\(if .why then " — " + .why else "" end)",
+        (if .logged_out then "      signed-out marker \(.logged_out.marker): signed out \(.logged_out.signed_out | map(tostring) | join("/")), signed in \(.logged_out.signed_in)" else empty end),
+        (if .logged_in then "      signed-in marker \(.logged_in.marker): signed in \(.logged_in.signed_in), signed out \(.logged_in.signed_out | map(tostring) | join("/"))" else empty end)
+      end' <<<"$all"
+  fi
+  jq -e '[.sites[] | select(.verdict == "drifted")] | length == 0' <<<"$all" >/dev/null && return 0
+  return 1
+}
+_drift_due() {
+  local f; f="$(_seat_dir)/.5dive-drift.json"
+  [[ -f "$f" ]] || return 0
+  (( $(date +%s) - $(stat -c %Y "$f") >= DRIFT_EVERY_S ))
+}
+
+cmd_adapters() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    pending|"") _adapters_pending "$@" ;;
+    approve) _adapters_approve "$@" ;;
+    reject)  _adapters_reject "$@" ;;
+    drift)   cmd_adapters_drift "$@" ;;
+    -h|--help) usage ;;
+    *) die "$E_USAGE" "usage: 5dive browser adapters pending|approve|reject|drift" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------- forget
@@ -5170,11 +5693,15 @@ cmd_connect_request() {
 # seat before any store is touched. `setup` stays root's by design (it chowns).
 # runuser keeps the environment (FIVEDIVE_* overrides survive) and sets HOME/USER
 # to the seat's, which is what Chrome and the adapters need.
+# DIVE-4997: the owner's `adapters pending|approve|reject` stay root (they read
+# every seat's proposals and write AS that seat); `adapters drift` captures, so it
+# is the seat's, like every other verb.
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
-  case "${1:-}" in
+  _v1="${1:-}"; [[ "$_v1" == adapters && "${2:-}" == drift ]] && _v1=adapters-drift
+  case "$_v1" in
     # `adblock` joins `setup` here: it writes the MACHINE-WIDE chrome policy
     # file, which is root's. Dropping to the seat would turn it into a refusal.
-    setup|adblock|approve|approvals|_connect|-h|--help|help|"") ;;
+    setup|adblock|approve|approvals|adapters|_connect|-h|--help|help|"") ;;
     *)
       # DIVE-4813: usually the caller, and for a brokered `serve` the owner.
       _drop="$(_root_drop_target "${SUDO_USER}" "$@")"
@@ -5224,6 +5751,8 @@ case "${1:-}" in
   forget) shift; cmd_forget "$@" ;;
   shot)  shift; cmd_shot  "$@" ;;
   capture) shift; cmd_capture "$@" ;;
+  propose) shift; cmd_propose "$@" ;;
+  adapters) shift; cmd_adapters "$@" ;;
   read)  shift; cmd_read  "$@" ;;
   snapshot) shift; cmd_snapshot "$@" ;;
   act)   shift; cmd_act "$@" ;;

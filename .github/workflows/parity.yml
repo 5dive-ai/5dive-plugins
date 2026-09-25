@@ -75,6 +75,10 @@ jobs:
       # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
       - name: browser connect-request harness
         run: bash tests/browser_connect_request_unit.sh
+      # DIVE-4997: reflex drafts a login check, the owner approves it, drift —
+      # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
+      - name: browser reflex-propose harness
+        run: bash tests/browser_reflex_propose_unit.sh
       # DIVE-4397: the unprivileged-first 5dive reader, and the arms that assert
       # all five telegram forks still route through it. `bun test` does not reach
       # it — the module is driven with an injected exec function from bash, and
