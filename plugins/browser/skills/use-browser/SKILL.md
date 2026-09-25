@@ -58,9 +58,14 @@ Ctrl/Cmd+Enter counts as send) and exits **73** with the ask, a screenshot and a
 
 - Relay the ask to the owner **with the screenshot**, in plain words: what will be bought,
   posted, sent or deleted, and where.
+- Relay the ask's payload (who it goes to, what it says, the amount, the item), not the button's
+  name. If the ask says the page showed none, say that and send the screenshot.
 - Only on their explicit yes is it approved: `sudo 5dive browser approve <id>`, which the owner
-  or their dashboard runs — not you. Then re-run the SAME act with `--approved=<id>`. A yes covers
-  exactly those steps, once, for 30 minutes.
+  or their dashboard runs, or their Approve button on Telegram — not you (from a seat it is
+  refused). Then re-run the SAME act with `--approved=<id>`. A yes covers exactly those steps,
+  once, for 30 minutes.
+- `5dive browser approvals policy` shows the owner's standing answer per kind. `allow` means that
+  kind runs without stopping; it is still logged for the owner.
 - **Do not rephrase the steps to get around the stop.** A button renamed is still an order
   placed. The check reads literal button labels, so a purchase behind a button labelled
   "Continue" is not caught by it — that one is on you: if a step will pay, post, send or delete,

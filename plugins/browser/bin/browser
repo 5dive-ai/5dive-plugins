@@ -197,9 +197,16 @@ usage() {
                                       # Paying, posting, sending and deleting STOP
                                       # (exit 73) and name the owner's ask; re-run
                                       # with --approved=<id>.
-  sudo 5dive browser approvals        # the owner: what agents are waiting to be allowed
-  sudo 5dive browser approve <id> [--deny]
-                                      # the owner's yes: those exact steps, once, 30 min
+  sudo 5dive browser approvals        # the owner: what agents are waiting to be allowed,
+                                      # with what each would send, pay, post or delete
+  sudo 5dive browser approve <id> [--deny] [--human-proof=<nonce>]
+                                      # the owner's yes: those exact steps, once, 30 min.
+                                      # From an agent seat's sudo it needs the proof the
+                                      # owner was handed (their Telegram Approve button).
+  5dive browser approvals policy [--json]
+  sudo 5dive browser approvals policy set <pay|publish|send|delete>=ask|allow
+                                      # the owner's standing answer per kind: ask (73) or
+                                      # allow (the step runs and is logged)
 
   5dive browser setup                 # one-time, as root: create the profile store
   5dive browser auth <site>           # open a browser; log in yourself, once
@@ -235,6 +242,11 @@ usage() {
   5dive browser viewer-redeem <site> --nonce=- --session=<id>
                                       # the relay's gate: consumes the link, prints the loopback target
   5dive browser viewer-revoke <site>  # kill the view; the browser stays logged in
+  5dive browser connect-request <site> [--reason=<why>]
+                                      # ask your paired owner, over Telegram, to log in:
+                                      # they get a "Connect <site>" button, their tap opens
+                                      # the one-time link, their "Done" tap checks the login.
+                                      # Nothing is bound until they tap.
 
   5dive browser adblock status              # is ad filtering on, and which sites is it off for
   sudo 5dive browser adblock off <site>     # this site breaks under filtering — stop filtering it
@@ -1822,7 +1834,8 @@ cmd_run() {
     wplan=$(jq -nc --argjson steps "$(jq -c --arg a "$action" '.actions[$a].steps' "$f")" \
         --argjson args "$args" --argjson l "$(_daemon_lease_json)" \
         --argjson st "$(_settle_json "$psettle")" --argjson g "$guard" --argjson ap "$is_approved" \
-        '{op:"plan", steps:$steps, args:$args, guard:$g, approved:$ap} + $st + $l')
+        --argjson ak "$(_policy_allowed)" \
+        '{op:"plan", steps:$steps, args:$args, guard:$g, approved:$ap, allow_kinds:$ak} + $st + $l')
     _daemon_call "$dir" "$wplan" 2>"$errf" || wrc=$?
     cat "$errf" >&2
     _run_finish "$site" "$action" "$f" "$args" "$hash" "$approved" "$wrc" "$errf" "$dir" "the warm session"
@@ -1843,8 +1856,8 @@ cmd_run() {
   [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver. Set FIVEDIVE_BROWSER_DRIVER to an executable that drives a REAL Chrome profile (the Browser Hand shape: extension + local relay), or reinstall the plugin so its own driver is back. This never falls back to a throwaway browser: an action that did not run inside the profile a person logged into by hand is not the thing that was asked for."
 
   local plan; plan=$(jq -c --arg a "$action" --arg profile "$dir" --argjson args "$args" \
-      --argjson g "$guard" --argjson ap "$is_approved" \
-      '{profile: $profile, steps: .actions[$a].steps, args: $args, guard: $g, approved: $ap}' "$f")
+      --argjson g "$guard" --argjson ap "$is_approved" --argjson ak "$(_policy_allowed)" \
+      '{profile: $profile, steps: .actions[$a].steps, args: $args, guard: $g, approved: $ap, allow_kinds: $ak}' "$f")
   # THE LEASE TRAVELS WITH THE PLAN, and it is what the executor re-checks before
   # every single step. Handing it over once and trusting the first check would be
   # a lease that protects keystroke one: the case it has to cover is a PERSON
@@ -1887,6 +1900,7 @@ _run_finish() {  # <site> <action> <adapter> <args> <hash> <approved-id> <execut
   if [[ -n "$approved" ]]; then
     local gd; gd="$(_approval_dir)" && rm -f -- "${gd:?}/${approved:?}.granted" "${gd:?}/${approved:?}.json" 2>/dev/null
   fi
+  _policy_log "$site" "$errf" "" ""
 
   local vrc=0
   if [[ "$(jq -r --arg a "$action" '.actions[$a].verify.in_session == true' "$f")" == true ]]; then
@@ -3993,6 +4007,45 @@ _approval_dir() {  # _approval_dir [<seat>] — where a seat's pending asks and 
 # one uid and no root.
 _grant_uid() { printf '%s\n' "${FIVEDIVE_BROWSER_GRANT_UID:-0}"; }
 
+# ...BUT ROOT REACHED FROM A SEAT IS NOT THE OWNER (DIVE-4982). Measured: an agent
+# seat ran `sudo 5dive browser approve <its own ask>` and was granted, recorded as
+# `approved_by: agent-<seat>` — a seat's `sudo 5dive …` grant IS root, so the uid
+# check above passed. sudo names who invoked it in SUDO_USER; an `agent-*` caller
+# is a seat, and a seat's yes needs a proof only the owner was handed (the nonce
+# whose sha256 the owner-ask delivery wrote into the request). A root login and
+# sudo from the owner's own account are unchanged. It stops a seat's `sudo 5dive`
+# grant, which is what seats hold; it is not a sandbox for a seat with a root shell.
+_sudo_is_seat() { [[ "${SUDO_USER:-}" == agent-* ]]; }
+
+# THE OWNER'S POLICY PER KIND (DIVE-4982): "ask" (the default, exit 73) or "allow"
+# (the step runs and is logged). One root-owned 0644 file in the profile store's
+# root-owned 0711 directory: every seat can read it, none can write it. A file that
+# is not owned by the uid that grants is not a policy, and everything reads "ask".
+APPROVAL_KINDS="pay publish send delete"
+_policy_file() { printf '%s\n' "${FIVEDIVE_BROWSER_APPROVAL_POLICY:-$PROFILE_ROOT/.approval-policy.json}"; }
+_policy_json() {
+  local f cur='{}'; f="$(_policy_file)"
+  if [[ -f "$f" && ! -L "$f" && "$(stat -c %u "$f" 2>/dev/null)" == "$(_grant_uid)" ]]; then
+    cur=$(jq -c 'if type == "object" then . else {} end' "$f" 2>/dev/null) || cur='{}'
+  fi
+  jq -nc --argjson c "$cur" \
+    '{pay:"ask", publish:"ask", send:"ask", delete:"ask"} | with_entries(.value = (if $c[.key] == "allow" then "allow" else "ask" end))'
+}
+_policy_allowed() { _policy_json | jq -c '[to_entries[] | select(.value == "allow") | .key]'; }
+
+# One line an owner can read for a request's payload, in a fixed order; empty when
+# the page gave none, and the caller then SAYS so rather than showing the label.
+_payload_line() {  # <payload-json>
+  jq -r 'if type != "object" then "" else
+    [ (if (.to // []) | length > 0 then "to " + (.to | join(", ")) else empty end),
+      (if .subject then "subject \"" + .subject + "\"" else empty end),
+      (if .first_line then "\"" + .first_line + "\"" else empty end),
+      (if .payee then "to " + .payee else empty end),
+      (if .amount then .amount else empty end),
+      (if .text then "\"" + .text + "\"" else empty end),
+      (if .item then "\"" + .item + "\"" else empty end) ] | join(" · ") end' <<<"${1:-null}" 2>/dev/null
+}
+
 _act_hash() {  # _act_hash <site> <steps-json> — what an approval is bound to
   printf '%s\n%s\n' "$1" "$(jq -cS . <<<"$2")" | sha256sum | cut -d' ' -f1
 }
@@ -4013,35 +4066,76 @@ _act_grant_ok() {  # _act_grant_ok <id> <hash> -> 0 if a live grant for exactly 
 # by `act` and by a guarded `run` (DIVE-4984). The executor's 5dive-needs-owner
 # line in <stderr-file> says which step stopped and why; <args> is the run's
 # --key=value arguments (null for act), so the owner sees who a mail goes to
-# and what it says before saying yes. Sets _ASK_ID _ASK_CLS _ASK_LABEL _ASK_STEP.
+# and what it says before saying yes. Sets _ASK_ID _ASK_CLS _ASK_LABEL _ASK_STEP
+# _ASK_PAYLOAD.
+#
+# WHAT THE OWNER IS SAYING YES TO (DIVE-4982) is the payload the executor read off
+# the page before the step — recipients, subject, first line; payee, amount; the
+# post; the item — not the button's label. A page that showed none is SAID to have
+# shown none: the label is never passed off as one.
 _owner_ask() {  # <site> <hash> <steps-json> <stderr-file> <page> <screenshot> <args-json|null> <verb> <flag>
   local site="$1" hash="$2" steps="$3" errf="$4" page="$5" shot="$6" args="$7" me="$8" flag="$9"
   local why; why=$(grep -o '5dive-needs-owner: {.*}' "$errf" | tail -1 | sed 's/^5dive-needs-owner: //')
   [[ -n "$why" ]] || why='{}'
   _ASK_CLS=$(jq -r '.cls // "act"' <<<"$why"); _ASK_LABEL=$(jq -r '.label // ""' <<<"$why"); _ASK_STEP=$(jq -r '.step // "?"' <<<"$why")
+  _ASK_PAYLOAD=$(jq -c '.payload | if type == "object" then . else {} end' <<<"$why" 2>/dev/null) || _ASK_PAYLOAD='{}'
+  local pline; pline="$(_payload_line "$_ASK_PAYLOAD")"
   local verb; case "$_ASK_CLS" in pay) verb="pay or place an order" ;; publish) verb="post or publish" ;; send) verb="send a message" ;; delete) verb="delete something" ;; *) verb="do something only the owner can allow" ;; esac
   _ASK_ID=""; local ad=""
   if ad="$(_approval_dir)" && mkdir -p "$ad" && chmod 700 "$ad"; then
     _ASK_ID="$(_seat)-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     jq -n --arg id "$_ASK_ID" --arg seat "$(_seat)" --arg site "$site" --arg h "$hash" --argjson s "$steps" \
          --arg cls "$_ASK_CLS" --arg label "$_ASK_LABEL" --arg step "$_ASK_STEP" --arg page "$page" --arg shot "$shot" \
-         --argjson at "$(date +%s)" --argjson args "$args" \
-         '{id:$id, seat:$seat, site:$site, hash:$h, steps:$s, class:$cls, label:$label, step:$step, page:$page, screenshot:$shot, asked_at:$at}
+         --argjson at "$(date +%s)" --argjson args "$args" --argjson pl "$_ASK_PAYLOAD" \
+         '{id:$id, seat:$seat, site:$site, hash:$h, steps:$s, class:$cls, label:$label, step:$step, page:$page, screenshot:$shot, asked_at:$at, payload:$pl}
           + (if $args == null then {} else {args:$args} end)' \
          > "$ad/$_ASK_ID.json" || _ASK_ID=""
   fi
   printf '%s: STOPPED before step %s — it would %s ("%s") on %s. That is the owner'"'"'s call, not the agent'"'"'s.\n' "$PROG" "$_ASK_STEP" "$verb" "$_ASK_LABEL" "$(_site_base "$site")" >&2
+  local what; what=": $pline"
+  [[ -n "$pline" ]] || what=" — the page did not show what it will ${_ASK_CLS/publish/post}; see the screenshot"
   if [[ -n "$shot" ]]; then
-    printf '  Ask the owner, with the screenshot: "I am about to %s on %s: \"%s\". OK?"\n' "$verb" "$(_site_base "$site")" "$_ASK_LABEL" >&2
+    printf '  Ask the owner, with the screenshot: "I am about to %s on %s%s. OK?"\n' "$verb" "$(_site_base "$site")" "$what" >&2
     [[ -s "$shot" ]] && printf '  screenshot: %s (the page right before that step)\n' "$shot" >&2
   else
-    printf '  Ask the owner: "I am about to %s on %s: \"%s\". OK?"\n' "$verb" "$(_site_base "$site")" "$_ASK_LABEL" >&2
+    printf '  Ask the owner: "I am about to %s on %s%s. OK?"\n' "$verb" "$(_site_base "$site")" "${what%; see the screenshot}" >&2
   fi
   if [[ -n "$_ASK_ID" ]]; then
     printf '  When the owner says yes: sudo 5dive browser approve %s   — then re-run this exact %s with %s=%s\n' "$_ASK_ID" "$me" "$flag" "$_ASK_ID" >&2
+    _owner_ask_deliver "$ad/$_ASK_ID.json"
   else
     printf '  (the ask could not be recorded for an approval id on this seat; nothing was approved)\n' >&2
   fi
+}
+
+# THE ASK REACHES THE OWNER WHERE THEY ARE (DIVE-4982). `sudo 5dive browser
+# approve` is a shell command, and an owner who is on Telegram has no shell. When
+# the 5dive CLI carries `owner-ask`, it is handed the request: it mints the proof
+# the owner's tap will carry, writes its hash into the request, and sends the
+# payload with Approve / Decline. Fail-soft on purpose: a CLI without the verb, or
+# with no route to the owner, leaves the ask exactly as it was — printed here.
+_owner_ask_deliver() {  # <request-file>
+  local cli="${FIVEDIVE_BROWSER_CLI:-5dive}" o rc=0
+  command -v "$cli" >/dev/null 2>&1 || return 0
+  o=$(timeout 30 "$cli" owner-ask browser "$1" 2>/dev/null) || rc=$?
+  (( rc == 0 )) && [[ -n "$o" ]] && printf '  %s\n' "$o" >&2
+  return 0
+}
+
+# A STEP THE OWNER'S POLICY LET THROUGH IS STILL WRITTEN DOWN (DIVE-4982): one JSON
+# line per step in the seat's approvals directory, beside the asks, with the payload
+# and the screenshot the act left — "allow" means "do not ask me", not "do not tell me".
+_policy_log() {  # <site> <stderr-file> <page> <screenshot>
+  local site="$1" errf="$2" page="$3" shot="$4" line ad
+  grep -q '5dive-owner-allowed: {' "$errf" 2>/dev/null || return 0
+  ad="$(_approval_dir)" && mkdir -p "$ad" && chmod 700 "$ad" || return 0
+  while IFS= read -r line; do
+    jq -c --arg seat "$(_seat)" --arg site "$site" --arg page "$page" --arg shot "$shot" --argjson at "$(date +%s)" \
+      '{at:$at, seat:$seat, site:$site, class:.cls, label:.label, payload:(.payload // {}), step:.step, page:$page, screenshot:$shot, allowed_by:"policy"}' \
+      <<<"$line" >> "$ad/allowed.jsonl" 2>/dev/null || continue
+    printf '%s: ALLOWED by the owner'"'"'s policy (%s=allow): step %s, %s — logged in %s/allowed.jsonl\n' "$PROG" \
+      "$(jq -r .cls <<<"$line")" "$(jq -r .step <<<"$line")" "$(_payload_line "$(jq -c '.payload // {}' <<<"$line")")" "$ad" >&2
+  done < <(grep -o '5dive-owner-allowed: {.*}' "$errf" | sed 's/^5dive-owner-allowed: //')
 }
 
 cmd_act() {
@@ -4133,7 +4227,9 @@ cmd_act() {
   out="$(_read_output_dir "$site" "$out" "$_PG_DIR")" || exit $?
   local stage; stage="$(mktemp -d /tmp/5dive-browser-read.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the act's re-read"
   _READ_STAGE="$stage"; trap '_read_cleanup' EXIT
-  local errf="$stage/exec.err" drc=0 payload="" plan report
+  local errf="$stage/exec.err" drc=0 payload="" plan report allow_kinds
+  # The kinds the owner lets through without asking, read once, before a step.
+  allow_kinds="$(_policy_allowed)"
   # WHAT THE RE-READ AFTER THE LAST STEP WAITS FOR (DIVE-4983), the same for both
   # executors: --wait-for, then the settle, then --expect polled for its window.
   report=$(jq -nc --arg wf "$wait_for" --arg e "$expect" --argjson ew "$expect_wait" --argjson i "$interactive" \
@@ -4142,7 +4238,8 @@ cmd_act() {
   if _daemon_live "$_PG_DIR"; then
     plan=$(jq -nc --argjson s "$steps" --argjson a "$is_approved" --argjson sh "$shot" \
         --argjson l "$(_daemon_lease_json)" --argjson st "$(_settle_json "$settle")" --argjson r "$report" \
-        '{op:"plan", steps:$s, args:{}, literal:true, guard:true, approved:$a,
+        --argjson ak "$allow_kinds" \
+        '{op:"plan", steps:$s, args:{}, literal:true, guard:true, approved:$a, allow_kinds:$ak,
           report:({shot:($sh==1), tree:true} + $r)} + $st + $l')
     payload=$(_daemon_call "$_PG_DIR" "$plan" 2>"$errf") || drc=$?
     local rep; rep=$(grep -F '"act_report":true' <<<"$payload" | tail -1)
@@ -4159,8 +4256,8 @@ cmd_act() {
     local png=""; (( shot )) && png="$stage/page.png"
     plan=$(jq -nc --arg p "$_PG_DIR" --argjson s "$steps" --argjson a "$is_approved" \
         --arg h "$stage/page.html" --arg m "$stage/after.json" --arg sh "$png" \
-        --arg t "$stage/tree.json" --argjson r "$report" \
-        '{profile:$p, steps:$s, args:{}, literal:true, guard:true, approved:$a,
+        --arg t "$stage/tree.json" --argjson r "$report" --argjson ak "$allow_kinds" \
+        '{profile:$p, steps:$s, args:{}, literal:true, guard:true, approved:$a, allow_kinds:$ak,
           report:({html:$h, meta:$m, tree:$t, shot:(if $sh=="" then null else $sh end)} + $r)}')
     FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
       FIVEDIVE_BROWSER_RUN_SETTLE_MS="${settle:-${FIVEDIVE_BROWSER_RUN_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}" \
@@ -4188,7 +4285,8 @@ cmd_act() {
     _owner_ask "$site" "$hash" "$steps" "$errf" "$final" "$out/page.png" null "act" "--approved"
     if (( json )); then
       jq -nc --arg id "$_ASK_ID" --arg cls "$_ASK_CLS" --arg label "$_ASK_LABEL" --arg step "$_ASK_STEP" --arg page "$final" --arg o "$out" \
-        '{verdict:"needs_owner", approval:$id, class:$cls, label:$label, step:($step|tonumber? // $step), page:$page, artifacts:$o}'
+        --argjson pl "$_ASK_PAYLOAD" \
+        '{verdict:"needs_owner", approval:$id, class:$cls, label:$label, payload:$pl, step:($step|tonumber? // $step), page:$page, artifacts:$o}'
     fi
     exit "$E_NEEDS_OWNER"
   fi
@@ -4197,6 +4295,7 @@ cmd_act() {
   if [[ "$is_approved" == true ]]; then
     local gd; gd="$(_approval_dir)" && rm -f -- "${gd:?}/${approved:?}.granted" "${gd:?}/${approved:?}.json" 2>/dev/null
   fi
+  _policy_log "$site" "$errf" "$final" "$out/page.png"
 
   _signin_guard "$stage/page.html" "$final"
 
@@ -4262,27 +4361,91 @@ _approval_request_files() {
   return 0
 }
 cmd_approvals() {
+  [[ "${1:-}" == policy ]] && { shift; cmd_approval_policy "$@"; return; }
   [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner lists pending asks: sudo 5dive browser approvals"
-  local f found=0
+  local f found=0 pl
   while IFS= read -r f; do
     [[ -f "$f" ]] || continue
     found=1
-    jq -r '"\(.id)\t\(.site)\t\(.class)\t\"\(.label)\"\tstep \(.step)\t\(.page)"' "$f" 2>/dev/null
+    pl="$(_payload_line "$(jq -c '.payload // {}' "$f" 2>/dev/null)")"
+    jq -r --arg pl "${pl:-(no payload: see the screenshot)}" \
+      '"\(.id)\t\(.site)\t\(.class)\t\($pl)\tstep \(.step)\t\(.page)"' "$f" 2>/dev/null
   done < <(_approval_request_files)
   (( found )) || printf 'no pending asks\n'
 }
+
+# `approvals policy` (DIVE-4982) — the contract the dashboard toggle is built on:
+#   read:  5dive browser approvals policy [--json]   -> {"pay":"ask","publish":"ask","send":"ask","delete":"ask"}
+#   write: sudo 5dive browser approvals policy set <kind>=ask|allow [...]   (the owner only)
+# The 5dive CLI strips --json before a plugin verb runs and sets FIVEDIVE_JSON_MODE=1,
+# so that variable is JSON too, not only the literal flag.
+cmd_approval_policy() {
+  local json=0 set=0 a
+  [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && json=1
+  local -a pairs=()
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      set) set=1 ;;
+      *=*) pairs+=("$a") ;;
+      -h|--help) printf 'usage: 5dive browser approvals policy [--json]\n       sudo 5dive browser approvals policy set <%s>=ask|allow ...\n' "${APPROVAL_KINDS// /|}"; return 0 ;;
+      *) die "$E_USAGE" "approvals policy: unexpected '$a' — usage: approvals policy [--json] | approvals policy set <kind>=ask|allow" ;;
+    esac
+  done
+  if (( set )); then
+    (( ${#pairs[@]} )) || die "$E_USAGE" "approvals policy set <kind>=ask|allow — kinds: $APPROVAL_KINDS"
+    [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner sets the approval policy: sudo 5dive browser approvals policy set ${pairs[0]}"
+    _sudo_is_seat && die "$E_PERM" "an agent seat ($SUDO_USER) cannot change what it has to ask about. The owner sets it, from their own shell or the dashboard."
+    local cur k v; cur="$(_policy_json)"
+    for a in "${pairs[@]}"; do
+      k="${a%%=*}"; v="${a#*=}"
+      [[ " $APPROVAL_KINDS " == *" $k "* ]] || die "$E_USAGE" "'$k' is not a kind; the kinds are: $APPROVAL_KINDS"
+      [[ "$v" == ask || "$v" == allow ]] || die "$E_USAGE" "$k=$v: the value is ask or allow"
+      cur=$(jq -c --arg k "$k" --arg v "$v" '.[$k] = $v' <<<"$cur")
+    done
+    local f d tmp; f="$(_policy_file)"; d="$(dirname "$f")"
+    tmp="$(mktemp "$d/.approval-policy.XXXXXX")" || die "$E_UNAVAILABLE" "cannot write the policy in $d"
+    if jq . <<<"$cur" > "$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$f"; then :; else
+      rm -f -- "${tmp:?}"; die "$E_UNAVAILABLE" "cannot write the policy at $f"
+    fi
+  fi
+  if (( json )); then _policy_json; return 0; fi
+  _policy_json | jq -r 'to_entries[] | "\(.key)\t\(.value)"'
+}
 cmd_approve() {
-  local id="${1:-}" deny=0
-  [[ "${2:-}" == --deny ]] && deny=1
+  local id="" deny=0 proof="" a
+  for a in "$@"; do
+    case "$a" in
+      --deny) deny=1 ;;
+      --human-proof=*) proof="${a#*=}" ;;
+      -*) die "$E_USAGE" "usage: sudo 5dive browser approve <id> [--deny] [--human-proof=<nonce>]" ;;
+      *) [[ -z "$id" ]] && id="$a" ;;
+    esac
+  done
   [[ "$id" =~ ^[a-z0-9._-]+-[0-9a-f]{12}$ ]] || die "$E_USAGE" "usage: sudo 5dive browser approve <id> [--deny]  (the id an act's refusal printed)"
   [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner approves: sudo 5dive browser approve $id"
   local seat="${id%-*}" d
   d="$(_approval_dir "$seat")" || die "$E_USAGE" "no seat '$seat' on this box"
   local req="$d/$id.json"
   [[ -f "$req" && ! -L "$req" ]] || die "$E_USAGE" "no pending ask $id (it was already spent, denied, or never asked)"
-  # A guarded `run` (DIVE-4984) carries its arguments: for a mail, the owner's yes
-  # is a yes to a recipient and to words, and those are what it shows.
-  jq -r '"\(.seat) wants to \(.class) on \(.site): \"\(.label)\" (step \(.step) of \(.steps|length))"
+  # A SEAT'S SUDO IS NOT THE OWNER'S YES (DIVE-4982). From an agent seat the answer
+  # needs the owner's proof: the nonce the owner-ask delivery handed the owner, whose
+  # sha256 it wrote into the request. The request is trusted for that only when the
+  # uid that grants owns it — a seat can rewrite a file it owns, hash and all.
+  if _sudo_is_seat; then
+    [[ -n "$proof" ]] || die "$E_PERM" "an agent seat ($SUDO_USER) cannot answer an ask — its own or another seat's. The owner answers: from their shell (sudo 5dive browser approve $id), the dashboard, or the Approve button the ask sent them."
+    local want; want="$(jq -r '.nonce_hash // ""' "$req" 2>/dev/null)"
+    [[ "$want" =~ ^[0-9a-f]{64}$ && "$(stat -c %u "$req")" == "$(_grant_uid)" ]] \
+      || die "$E_PERM" "ask $id carries no owner proof to check against (it was never delivered to the owner), so a seat cannot answer it."
+    [[ "$(printf '%s' "$proof" | sha256sum | cut -d' ' -f1)" == "$want" ]] \
+      || die "$E_PERM" "that --human-proof is not the one the owner was handed for $id."
+  fi
+  # What the page showed (DIVE-4982), then the button. A guarded `run` (DIVE-4984)
+  # carries its arguments too: for a mail, the owner's yes is a yes to a recipient
+  # and to words, and those are what it shows.
+  local pl; pl="$(_payload_line "$(jq -c '.payload // {}' "$req" 2>/dev/null)")"
+  jq -r --arg pl "${pl:-(the page did not show it — look at the screenshot)}" \
+     '"\(.seat) wants to \(.class) on \(.site): \($pl) (step \(.step) of \(.steps|length); button \"\(.label)\")"
          + (if .args then "\n  with: " + (.args | to_entries | map("--\(.key)=\(.value|@json)") | join(" ")) else "" end)
          + (if (.page // "") != "" then "\n  page: \(.page)" else "" end)
          + (if (.screenshot // "") != "" then "\n  screenshot: \(.screenshot)" else "" end)' "$req"
@@ -4709,6 +4872,294 @@ cmd_broker_audit() {  # _broker-audit <site> <event> [<detail>]
 }
 
 
+# >>> DIVE-4992 the AGENT asks, the OWNER taps, the box binds
+#
+# An agent that needs the owner logged into a site used to have nothing to hand
+# over: the viewer link needs a bind registered with the relay, and only the
+# dashboard's session (the connectord token) could do that. So it walked the
+# owner through the dashboard by hand. Now:
+#
+#   1. the agent runs `5dive browser connect-request <site> --reason=<why>`;
+#   2. ROOT mints a one-time request code, keeps only its hash, and sends the
+#      agent's paired owner a Telegram message with a "Connect <site>" button
+#      whose callback carries the code. The seat never holds the code before
+#      the tap: it goes from root straight into the button;
+#   3. the owner's tap reaches that seat's Telegram plugin, which hands the code
+#      and the tapper's id back to root (`_connect tap`). Root re-checks the
+#      code, that the tap came through the SAME seat, and that the tapper is
+#      that seat's paired owner — then does exactly what the dashboard's Connect
+#      does, on the box: serve (auth first when there is no profile), mint a
+#      viewer with a fresh bind, register the bind with shelld over loopback.
+#      The one-time URL goes back to the plugin, which sends it as code;
+#   4. the owner's "Done" tap (`_connect done`) revokes the view, stops the
+#      browser and probes, in that order, so the login is stamped honestly.
+#
+# No tap, no bind: a request by itself binds nothing. The control plane is not
+# involved at all, so DIVE-462's zero standing access is untouched, and the
+# automation token is not used.
+#
+# WHAT THIS DOES NOT CLAIM. The caller is a seat that already relays the owner's
+# other taps through the same plugin process, so a seat can always forward a real
+# tap it received. And a root-all seat can do everything root does here by
+# itself. The boundary is for the seat that is NOT root: it cannot mint a
+# request code, read one, or register a bind.
+CONNECT_DIR="$STATE_DIR/browser-connect"
+CONNECT_REQ_TTL=900          # the owner has 15 minutes to tap Connect
+CONNECT_DONE_TTL=7200        # and two hours to tap Done after that
+CONNECT_VIEW_TTL=$VIEWER_TTL_DEFAULT
+CONNECT_REASON_MAX=200
+CONNECT_CONNECTORS_DIR=/etc/5dive/connectors
+CONNECT_CONNECTORD_ENV=/etc/5dive/connectord.env
+CONNECT_PROVISIONING_ENV=/etc/5dive/provisioning.env
+CONNECT_SHELLD_URL=http://127.0.0.1:3101
+CONNECT_TG_API=https://api.telegram.org
+CONNECT_SELF="$0"
+CONNECT_PRIV=(sudo -n /usr/local/bin/5dive browser _connect)
+# TEST SEAMS, honoured only WITHOUT root. Unprivileged, every one of them points
+# the caller at its OWN files with its OWN rights, so none of them can grant
+# anything; under root the paths are fixed, whatever the environment says.
+if [[ $EUID -ne 0 ]]; then
+  CONNECT_DIR="${FIVEDIVE_BROWSER_CONNECT_DIR:-$CONNECT_DIR}"
+  CONNECT_CONNECTORS_DIR="${FIVEDIVE_CONNECTOR_DIR:-$CONNECT_CONNECTORS_DIR}"
+  CONNECT_CONNECTORD_ENV="${FIVEDIVE_CONNECTORD_ENV:-$CONNECT_CONNECTORD_ENV}"
+  CONNECT_PROVISIONING_ENV="${FIVEDIVE_PROVISIONING_ENV:-$CONNECT_PROVISIONING_ENV}"
+  CONNECT_SHELLD_URL="${FIVEDIVE_SHELLD_URL:-$CONNECT_SHELLD_URL}"
+  CONNECT_TG_API="${FIVEDIVE_TELEGRAM_API:-$CONNECT_TG_API}"
+  CONNECT_SELF="${FIVEDIVE_BROWSER_CONNECT_SELF:-$CONNECT_SELF}"
+  [[ -n "${FIVEDIVE_BROWSER_CONNECT_PRIV:-}" ]] && CONNECT_PRIV=("$FIVEDIVE_BROWSER_CONNECT_PRIV" _connect)
+fi
+
+# Who asked. Under root it is the kernel's answer through sudo (env_reset sets
+# SUDO_UID itself), never a flag; a direct root call has no seat and is refused.
+_connect_caller() {
+  if [[ $EUID -eq 0 ]]; then
+    [[ "${SUDO_UID:-}" =~ ^[0-9]+$ && "${SUDO_UID}" != 0 ]] || return 1
+    getent passwd "$SUDO_UID" | cut -d: -f1
+  else
+    id -un
+  fi
+}
+
+# The caller's Telegram channel: bot token, and the owner DMs in its allowFrom.
+# Sets CONNECT_TG_TOKEN, CONNECT_TG_OWNERS (space-separated), CONNECT_TG_TYPE.
+# Only Claude Code's bridge carries the tap handler in this release; a runtime
+# whose bridge would show a dead button is refused up front instead.
+_connect_channel() {
+  local seat="$1" name home t d tf
+  CONNECT_TG_TOKEN="" CONNECT_TG_OWNERS="" CONNECT_TG_TYPE=""
+  name="${seat#agent-}"
+  tf="$CONNECT_CONNECTORS_DIR/telegram-${name}.env"
+  [[ -r "$tf" ]] && CONNECT_TG_TOKEN=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$tf" | head -1)
+  home=$(getent passwd "$seat" | cut -d: -f6)
+  [[ $EUID -ne 0 && -n "${FIVEDIVE_BROWSER_CONNECT_HOME:-}" ]] && home="$FIVEDIVE_BROWSER_CONNECT_HOME"
+  for t in claude codex grok pi gemini; do
+    d="$home/.$t/channels/telegram/access.json"
+    [[ -r "$d" ]] || continue
+    CONNECT_TG_TYPE="$t"
+    CONNECT_TG_OWNERS=$(jq -r '(.allowFrom // [])[] | tostring | select(test("^[0-9]+$"))' "$d" 2>/dev/null | tr '\n' ' ')
+    break
+  done
+  [[ -n "$CONNECT_TG_TOKEN" && -n "$CONNECT_TG_TYPE" ]]
+}
+
+_connect_is_owner() {  # <seat> <telegram user id>
+  [[ "$2" =~ ^[0-9]+$ ]] || return 1
+  _connect_channel "$1" || return 1
+  [[ " $CONNECT_TG_OWNERS " == *" $2 "* ]]
+}
+
+# One Bot API call. The token is on curl's STDIN, never argv, so it is not in
+# the process table while root holds it.
+_connect_tg() {  # <method> [curl --data-urlencode args...]
+  local method="$1"; shift
+  printf 'url = "%s/bot%s/%s"\n' "$CONNECT_TG_API" "$CONNECT_TG_TOKEN" "$method" \
+    | curl -sS --connect-timeout 5 --max-time 15 --config - "$@" 2>/dev/null
+}
+
+_connect_file() { printf '%s/%s' "$CONNECT_DIR" "$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)"; }
+
+_connect_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+_connect_request() {  # <caller> <site> <reason>
+  local caller="$1" site="$2" reason="$3" code f now exp label text kb sent=0 o resp
+  _valid_site "$site" && [[ "$site" != "$PUBLIC_SITE" ]] \
+    || die "$E_USAGE" "'$site' is not a site a person can log in to"
+  reason=$(printf '%s' "$reason" | tr -d '\000-\037\177' | cut -c1-"$CONNECT_REASON_MAX")
+  _connect_channel "$caller" \
+    || die "$E_UNAVAILABLE" "seat '$caller' has no paired Telegram channel, so there is nobody to ask. Ask the owner to use Connected sites in the 5dive dashboard."
+  [[ "$CONNECT_TG_TYPE" == claude ]] \
+    || die "$E_UNAVAILABLE" "this seat's Telegram bridge ($CONNECT_TG_TYPE) cannot relay a Connect tap yet. Ask the owner to use Connected sites in the 5dive dashboard."
+  [[ -n "$CONNECT_TG_OWNERS" ]] \
+    || die "$E_UNAVAILABLE" "seat '$caller' has no paired owner on Telegram yet, so there is nobody to ask."
+
+  mkdir -p "$CONNECT_DIR" && chmod 700 "$CONNECT_DIR" || die "$E_UNAVAILABLE" "cannot create $CONNECT_DIR"
+  code=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  f=$(_connect_file "$code")
+  now=$(date -u +%s); exp=$(( now + CONNECT_REQ_TTL ))
+  ( umask 077; printf 'op=request\nseat=%s\nsite=%s\nexpires_at=%s\ncreated_at=%s\n' \
+      "$caller" "$site" "$exp" "$now" > "$f" )
+
+  label="${caller#agent-}"
+  text="🔐 ${label} asks you to log in to ${site} in the browser on your box."
+  [[ -n "$reason" ]] && text+=$'\n'"Why: ${reason}"
+  text+=$'\n\n'"Tap Connect for a one-time login link. Nothing opens unless you tap. You log in yourself; ${label} never sees your password."
+  kb=$(jq -nc --arg t "Connect ${site}" --arg d "bconn:${code}" '{inline_keyboard:[[{text:$t,callback_data:$d}]]}')
+  for o in $CONNECT_TG_OWNERS; do
+    resp=$(_connect_tg sendMessage --data-urlencode "chat_id=$o" --data-urlencode "text=$text" --data-urlencode "reply_markup=$kb")
+    [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == true ]] && sent=$((sent + 1))
+  done
+  if (( sent == 0 )); then
+    rm -f "$f"
+    die "$E_UNAVAILABLE" "Telegram did not accept the Connect message, so nobody was asked. Nothing was bound."
+  fi
+  printf 'asked the owner to connect %s (%s message%s). Nothing is bound until they tap; the request expires %s.\n' \
+    "$site" "$sent" "$([[ $sent == 1 ]] || echo s)" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'You will get a channel message when they tap and when they finish. Then `5dive browser status %s` has the verdict.\n' "$site"
+}
+
+# Claim a code exactly once: the rename is atomic, so two taps (or a tap and a
+# replay) cannot both win.
+_connect_claim() {  # <caller> <code> <op> <sender>  -> sets CONNECT_SITE; prints nothing
+  local caller="$1" code="$2" op="$3" sender="$4" f claimed seat exp
+  [[ "$code" =~ ^[0-9a-f]{48}$ ]] || die "$E_PERM" "that button is not a valid Connect code"
+  f=$(_connect_file "$code")
+  [[ -f "$f" ]] || die "$E_PERM" "that button is not live (already used, expired, or never issued)"
+  [[ "$(_connect_field "$f" op)" == "$op" ]] || die "$E_PERM" "that button is not live (already used, expired, or never issued)"
+  seat=$(_connect_field "$f" seat)
+  [[ "$seat" == "$caller" ]] \
+    || die "$E_PERM" "that button was issued to another seat's bot, not this one"
+  _connect_is_owner "$caller" "$sender" \
+    || die "$E_PERM" "only this seat's paired owner can use that button"
+  exp=$(_connect_field "$f" expires_at)
+  claimed="$f.claimed.$$"
+  mv "$f" "$claimed" 2>/dev/null || die "$E_PERM" "that button is not live (already used, expired, or never issued)"
+  if [[ ! "$exp" =~ ^[0-9]+$ ]] || (( exp <= $(date -u +%s) )); then
+    rm -f "$claimed"
+    die "$E_PERM" "that button has expired. Ask the agent to send a new one."
+  fi
+  CONNECT_SITE=$(_connect_field "$claimed" site)
+  rm -f "$claimed"
+}
+
+# Run a browser verb as the relay seat, exactly as shelld's
+# `sudo -n 5dive browser …` does for the dashboard. The audit row names who asked.
+_connect_as_box() {
+  if [[ $EUID -eq 0 ]]; then
+    runuser -u "$BOX_SEAT" -- env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
+      -u FIVEDIVE_BROWSER_SEAT FIVEDIVE_BROWSER_ON_BEHALF_OF="$CONNECT_CALLER" "$CONNECT_SELF" "$@"
+  else
+    "$CONNECT_SELF" "$@"
+  fi
+}
+
+_connect_tap() {  # <caller> <code> <sender>
+  local caller="$1" code="$2" sender="$3" site out err rc path exp bind token host done_code f
+  _connect_claim "$caller" "$code" request "$sender"
+  site="$CONNECT_SITE"
+  _valid_site "$site" || die "$E_PERM" "the request names no usable site"
+
+  err=$(mktemp); trap 'rm -f "$err"' EXIT
+  # serve first, so an existing profile resolves the way it always has; auth
+  # only when serve says there is no profile, then serve once more (DIVE-4895).
+  rc=0; _connect_as_box serve "$site" >/dev/null 2>"$err" || rc=$?
+  if (( rc != 0 )) && grep -q '\bno profile for\b' "$err"; then
+    rc=0; _connect_as_box auth "$site" >/dev/null 2>"$err" || rc=$?
+    (( rc == 0 )) && { rc=0; _connect_as_box serve "$site" >/dev/null 2>"$err" || rc=$?; }
+  fi
+  (( rc == 0 )) || die "$E_UNAVAILABLE" "the browser for $site did not start: $(tail -1 "$err")"
+
+  bind=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  rc=0; out=$(_connect_as_box viewer "$site" "--bind=$bind" "--ttl=$CONNECT_VIEW_TTL" 2>"$err") || rc=$?
+  (( rc == 0 )) || die "$E_UNAVAILABLE" "could not open a view of $site: $(tail -1 "$err")"
+  path=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
+  if [[ ! "$path" =~ ^/browser/viewer/[A-Za-z0-9._-]{1,64}/[0-9a-f]{64}$ ]]; then
+    _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+    die "$E_UNAVAILABLE" "the box returned an unusable viewer link; nothing was sent"
+  fi
+  # ONE CLOCK ORIGIN, the ticket's (same reason as the dashboard's route).
+  exp=$(sed -n 's/.*expires \([0-9-]*T[0-9:]*Z\).*/\1/p' "$err" | head -1)
+  exp=$(date -u -d "$exp" +%s 2>/dev/null || true)
+  if [[ ! "$exp" =~ ^[0-9]+$ ]]; then
+    _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+    die "$E_UNAVAILABLE" "the box did not say when the link expires; nothing was sent"
+  fi
+
+  token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$CONNECT_CONNECTORD_ENV" 2>/dev/null | head -1)
+  host=$(sed -n 's/^FIVE_DOMAIN=//p' "$CONNECT_PROVISIONING_ENV" 2>/dev/null | head -1)
+  if [[ -z "$token" || ! "$host" =~ ^[A-Za-z0-9.-]+$ ]] \
+     || ! printf 'header = "authorization: Bearer %s"\n' "$token" \
+          | curl -sS -f --max-time 10 --config - -X POST -H 'content-type: application/json' \
+              --data "$(jq -nc --arg s "$site" --arg b "$bind" --argjson e "$exp" '{site:$s,bind:$b,expiresAt:$e}')" \
+              "$CONNECT_SHELLD_URL/shell/browser-viewer-bind" >/dev/null 2>&1; then
+    # A ticket whose bind was never registered can only ever be refused.
+    _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+    die "$E_UNAVAILABLE" "the box's relay did not accept the login link; nothing was sent"
+  fi
+
+  done_code=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  f=$(_connect_file "$done_code")
+  ( umask 077; printf 'op=done\nseat=%s\nsite=%s\nexpires_at=%s\n' \
+      "$caller" "$site" "$(( $(date -u +%s) + CONNECT_DONE_TTL ))" > "$f" )
+  printf 'site=%s\nurl=https://%s%s\nexpires=%s\ndone=%s\n' \
+    "$site" "$host" "$path" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)" "$done_code"
+}
+
+_connect_done() {  # <caller> <code> <sender>
+  local caller="$1" code="$2" sender="$3" site out rc
+  _connect_claim "$caller" "$code" done "$sender"
+  site="$CONNECT_SITE"
+  _valid_site "$site" || die "$E_PERM" "the request names no usable site"
+  # revoke -> stop -> probe, in that order: a served profile cannot be probed
+  # honestly, and only this last command may stamp the liveness file.
+  _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+  _connect_as_box serve "$site" --stop >/dev/null 2>&1 || true
+  rc=0; out=$(_connect_as_box status "$site" 2>&1) || rc=$?
+  printf 'site=%s\nstatus_rc=%s\nstatus=%s\n' "$site" "$rc" "$(printf '%s\n' "$out" | grep -v '^$' | tail -1)"
+}
+
+# `_connect` — the privileged half. It is in the root-kept verb list at the
+# DIVE-4348 drop below: it holds the request codes and the connectord token,
+# and drops to the relay seat itself, only for the browser verbs. Parameters arrive NUL-separated on stdin so
+# the grant can stay one exact command path with no argument wildcard, and a
+# code never sits in the process table.
+cmd_connect_priv() {
+  local -a w=(); local a
+  while IFS= read -r -d '' a; do w+=("$a"); done
+  CONNECT_CALLER=$(_connect_caller) && [[ -n "$CONNECT_CALLER" ]] \
+    || die "$E_PERM" "_connect must be reached through sudo from an agent seat"
+  case "${w[0]:-}" in
+    request) (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect request <site> <reason>"
+             _connect_request "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
+    tap)     (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect tap <code> <telegram user id>"
+             _connect_tap "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
+    done)    (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect done <code> <telegram user id>"
+             _connect_done "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
+    *) die "$E_USAGE" "_connect: request, tap or done" ;;
+  esac
+}
+
+# `connect-request` — the agent's verb. Unprivileged: it only hands the request
+# to root, which is where the code is minted and the button sent.
+cmd_connect_request() {
+  local site="" reason="" rc=0
+  while (($#)); do
+    case "$1" in
+      --reason=*) reason="${1#*=}" ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) [[ -z "$site" ]] || die "$E_USAGE" "one site at a time"; site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser connect-request booking.com --reason=\"to search hotels for you\""
+  _valid_site "$site" && [[ "$site" != "$PUBLIC_SITE" ]] || die "$E_USAGE" "'$site' is not a site a person can log in to"
+  printf '%s\0' request "$site" "$reason" | "${CONNECT_PRIV[@]}" || rc=$?
+  if (( rc == 1 )) && [[ "${CONNECT_PRIV[0]}" == sudo ]] && ! sudo -n -l /usr/local/bin/5dive browser _connect >/dev/null 2>&1; then
+    die "$E_PERM" "this seat has no grant to send a Connect request. Ask the owner to use Connected sites in the 5dive dashboard."
+  fi
+  return "$rc"
+}
+# <<< DIVE-4992
+
 # >>> DIVE-4348 a root caller operates the SEAT's store — as the seat
 # The dashboard reaches every verb through shelld's whitelist, which is
 # `sudo -n /usr/local/bin/5dive browser …`: root, with SUDO_USER=claude. _seat
@@ -4723,7 +5174,7 @@ if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   case "${1:-}" in
     # `adblock` joins `setup` here: it writes the MACHINE-WIDE chrome policy
     # file, which is root's. Dropping to the seat would turn it into a refusal.
-    setup|adblock|approve|approvals|-h|--help|help|"") ;;
+    setup|adblock|approve|approvals|_connect|-h|--help|help|"") ;;
     *)
       # DIVE-4813: usually the caller, and for a brokered `serve` the owner.
       _drop="$(_root_drop_target "${SUDO_USER}" "$@")"
@@ -4786,5 +5237,8 @@ case "${1:-}" in
   viewer) shift; cmd_viewer "$@" ;;
   viewer-redeem) shift; cmd_viewer_redeem "$@" ;;
   viewer-revoke) shift; cmd_viewer_revoke "$@" ;;
+  connect-request) shift; cmd_connect_request "$@" ;;
+  # Not in usage: the privileged half, reached only as `sudo -n … browser _connect`.
+  _connect) shift; cmd_connect_priv "$@" ;;
   *) die "$E_USAGE" "unknown: $PROG $1 (see: $PROG --help)" ;;
 esac

@@ -37,6 +37,26 @@ sudo journalctl -u shelld -n 200 --no-pager \
 The other safe probe is a **deliberately bad nonce**: a refusal is a pure refusal and
 spends nothing. A good nonce is the customer's only redemption.
 
+## When YOU need the owner logged in: ask with a button (DIVE-4992)
+
+Do not walk the owner through the dashboard, and never hand them a link you made
+yourself. Ask from your own seat:
+
+```bash
+5dive browser connect-request <site> --reason="<one line: why you need it>"
+```
+
+Your paired owner gets a Telegram message with a **Connect <site>** button. Nothing is
+bound until they tap it. Their tap opens the browser on the box and sends them the
+one-time link as code, from root, not from you: you never see it, so you cannot spend it.
+They log in, then tap **Done**. Done revokes the view, stops the browser and probes, in
+that order. You get a channel message at each step, `[browser connect] …`. After the
+Done message, `5dive browser status <site>` has the verdict. Do not poll while you wait.
+
+If `connect-request` refuses because the seat has no paired owner, its Telegram bridge
+cannot relay the tap, or it has no grant, fall back to the owner's own path, the shipped
+flow below.
+
 <!-- 5dive:connect-site-flow:begin -->
 ## The shipped flow
 

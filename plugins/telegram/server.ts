@@ -9,7 +9,7 @@
  * Telegram's Bot API has no history or search. Reply-only tools.
  */
 
-import { execFile } from 'child_process'
+import { execFile, spawn } from 'child_process'
 import { promisify } from 'util'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -45,6 +45,7 @@ import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, renderConnectLink, renderConnectVerdict, connectAgentNote, connectFailureText, type ConnectTap } from './browser-connect.ts'
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
@@ -4600,12 +4601,97 @@ function tapFailText(prefix: string, e: unknown): string {
 //   anything else              → bridged to the session as a channel inbound
 //                                (DIVE-279: agent-sent custom keyboards)
 // Security mirrors the text-reply path: allowFrom must contain the sender.
+// DIVE-4992: the privileged half of an agent's Connect <site> request. Spawned
+// only on an owner's tap, never on a timer, so a seat without the grant costs
+// one refused sudo per human tap rather than the DIVE-4397 mail loop. The
+// parameters go on stdin so the code never sits in the process table.
+function runConnectPriv(stdin: string, timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise(resolve => {
+    let stdout = ''
+    let stderr = ''
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(SUDO, ['-n', FIVEDIVE, 'browser', '_connect'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    } catch (err) {
+      resolve({ code: -1, stdout: '', stderr: String(err) })
+      return
+    }
+    const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs)
+    child.stdout?.on('data', d => { if (stdout.length < 65536) stdout += String(d) })
+    child.stderr?.on('data', d => { if (stderr.length < 65536) stderr += String(d) })
+    child.on('error', err => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: stderr || String(err) }) })
+    child.on('close', code => { clearTimeout(timer); resolve({ code: code ?? -1, stdout, stderr }) })
+    child.stdin?.end(stdin)
+  })
+}
+
+function notifyAgentOfConnect(ctx: Context, content: string): void {
+  const chatId = String(ctx.callbackQuery?.message?.chat.id ?? ctx.from?.id ?? '')
+  markInbound()
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content,
+      meta: {
+        chat_id: chatId,
+        user: ctx.from?.username ?? String(ctx.from?.id ?? ''),
+        user_id: String(ctx.from?.id ?? ''),
+        ts: new Date().toISOString(),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver browser-connect note to Claude: ${err}\n`)
+  })
+}
+
+async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: string): Promise<void> {
+  await ctx.answerCallbackQuery({ text: tap.op === 'tap' ? 'Opening the browser…' : 'Checking the login…' }).catch(() => {})
+  // Drop the button now: a second tap while root works could only be refused.
+  await ctx.editMessageReplyMarkup().catch(() => {})
+  let stdin: string
+  try {
+    stdin = connectStdin(tap, senderId)
+  } catch {
+    return
+  }
+  const r = await runConnectPriv(stdin, tap.op === 'tap' ? 240_000 : 150_000)
+  if (tap.op === 'tap') {
+    const link = r.code === 0 ? parseConnectLink(r.stdout) : null
+    if (!link) {
+      await ctx.editMessageText(connectFailureText(r.stderr)).catch(() => {})
+      return
+    }
+    const m = renderConnectLink(link)
+    await ctx
+      .editMessageText(m.text, { entities: m.entities, link_preview_options: m.link_preview_options, reply_markup: m.reply_markup })
+      .catch(() => {})
+    notifyAgentOfConnect(ctx, connectAgentNote('opened', link.site))
+    return
+  }
+  const v = r.code === 0 ? parseConnectVerdict(r.stdout) : null
+  if (!v) {
+    await ctx.editMessageText(connectFailureText(r.stderr)).catch(() => {})
+    return
+  }
+  await ctx.editMessageText(renderConnectVerdict(v)).catch(() => {})
+  notifyAgentOfConnect(ctx, connectAgentNote('verdict', v.site, `\`5dive browser status ${v.site}\` said: ${v.status || 'nothing'}`))
+}
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   const access = loadAccess()
   const senderId = String(ctx.from.id)
   if (!access.allowFrom.includes(senderId)) {
     await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+
+  // DIVE-4992: an agent's Connect <site> button. Checked here, before the
+  // generic agent-keyboard bridge below, which would otherwise hand the code
+  // into the agent's session instead of to root.
+  const connectTap = parseConnectTap(data)
+  if (connectTap) {
+    await handleBrowserConnectTap(ctx, connectTap, senderId)
     return
   }
 

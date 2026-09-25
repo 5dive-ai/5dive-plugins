@@ -779,7 +779,10 @@ async function planRequest(ctx, req, send, end) {
       // one-shot driver's loop; lib/aria.cjs holds it so the two cannot differ.
       if (req.guard && !req.approved) {
         const risk = await aria.stepRisk(page, s, sel);
-        if (risk) { needsOwner = { ...risk, step: i + 1, op: s.op }; break; }
+        // The owner's policy (DIVE-4982), exactly as the one-shot driver reads it.
+        if (risk && Array.isArray(req.allow_kinds) && req.allow_kinds.includes(risk.cls)) {
+          send({ t: 'err', msg: aria.OWNER_ALLOWED_PREFIX.trim() + ' ' + JSON.stringify({ ...risk, step: i + 1, op: s.op }) });
+        } else if (risk) { needsOwner = { ...risk, step: i + 1, op: s.op }; break; }
       }
       stepsRun++;
       switch (s.op) {

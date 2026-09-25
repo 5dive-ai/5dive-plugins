@@ -31,6 +31,26 @@ agents use the reply tool's MarkdownV2 code span; the Telegram transport enforce
 rule. Other chat adapters must use their equivalent code formatting. A web dashboard may
 offer copy-only text or a copy button, but must not prefetch the URL.
 
+## When YOU need the owner logged in: ask with a button (DIVE-4992)
+
+Do not walk the owner through the dashboard, and never hand them a link you made
+yourself. Ask from your own seat:
+
+```bash
+5dive browser connect-request <site> --reason="<one line: why you need it>"
+```
+
+Your paired owner gets a Telegram message with a **Connect <site>** button. Nothing is
+bound until they tap it. Their tap opens the browser on the box and sends them the
+one-time link as code, from root, not from you: you never see it, so you cannot spend it.
+They log in, then tap **Done**. Done revokes the view, stops the browser and probes, in
+that order. You get a channel message at each step, `[browser connect] …`. After the
+Done message, `5dive browser status <site>` has the verdict. Do not poll while you wait.
+
+If `connect-request` refuses because the seat has no paired owner, its Telegram bridge
+cannot relay the tap, or it has no grant, fall back to the owner's own path, the shipped
+flow below.
+
 <!-- 5dive:connect-site-flow:begin -->
 ## The shipped flow
 
@@ -141,6 +161,14 @@ and reads the Sent folder back in the same login (`verify.in_session`); only
 anything else — never send it again blind.** Exit 75 before anything ran means this box has no
 measured google.com login check yet (the adapter ships without one): tell the owner, it is theirs
 to measure with `5dive browser capture google.com`.
+
+The ask shows what the step will act on (recipients, subject and first line of a mail; payee and
+amount; the post's text; the item deleted). Relay THAT to the owner, not the button's name. If
+it says the page showed none of it, say so and send the screenshot. **Never approve an ask
+yourself:** `sudo 5dive browser approve` from your seat is refused, and trying to get around that
+is exactly what it exists to stop. The owner may have set a standing answer per kind
+(`5dive browser approvals policy` shows it). A kind set to `allow` runs without stopping, and it
+is still logged for them to read.
 
 ## Working the page: ONE snapshot per decision
 

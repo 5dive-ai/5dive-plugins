@@ -25,6 +25,7 @@ than a detail.
 5dive browser snapshot <url> --wait-for='[role=main]'   # capture when the page shows it;
                                                   # also on read and act (exit 76: not ready)
 sudo 5dive browser approve <id> [--deny]          # the owner's yes to a pay/post/send/delete
+sudo 5dive browser approvals policy set send=allow   # the owner's standing answer per kind
 ```
 
 ## The browser works with nothing connected, and it acts (DIVE-4943)
@@ -50,6 +51,31 @@ them; the yes is bound to that action with those arguments, and is spent with
 `run … --approved-id=<id>` (a dashed flag, so it can never be an adapter's `{placeholder}`). An
 action without `guard` keeps the contract it had.
 
+**What the owner says yes to (DIVE-4982).** The ask carries a `payload`, read off the page just
+before the step, in the form or dialog around the button: for a send the recipients, the subject
+and the body's first line; for a pay the payee (or the site) and the amount; for a publish the
+first 280 characters of the text; for a delete the row or item it belongs to. Bidi and control
+characters are stripped from it and from the button label. `approvals` and `approve` print it.
+A page that shows none of it gets an ask that says so; the button label is never passed off as
+a payload.
+
+**The owner's policy per kind.** `5dive browser approvals policy [--json]` prints
+`{"pay":"ask","publish":"ask","send":"ask","delete":"ask"}` (also as JSON when
+`FIVEDIVE_JSON_MODE=1`, which is how the 5dive CLI passes `--json` on). The owner changes it
+with `sudo 5dive browser approvals policy set <kind>=ask|allow`. The file lives at
+`/var/lib/5dive/browser-profiles/.approval-policy.json`, root-owned `0644`: every seat reads it,
+none writes it, and one the granting uid does not own is ignored. With `allow`, that kind's step
+runs without asking and is logged, with the payload and the act's screenshot, to
+`allowed.jsonl` in the seat's approvals directory.
+
+**A seat cannot answer an ask.** An agent seat's `sudo 5dive …` grant is root, and measured, a
+seat approved its own ask that way. `approve` and `approve --deny` from `sudo` by an `agent-*`
+user are refused unless they carry `--human-proof=<nonce>`, whose sha256 matches the request's
+`nonce_hash`. That hash is written as root by the 5dive CLI's `owner-ask`, which sends the ask to
+the owner with Approve and Decline buttons; after an exit-73 stop, `act` (or a guarded `run`) hands the request to
+`5dive owner-ask browser <request-file>` when the CLI has that verb, fail-soft. A root login,
+sudo from the owner's own account, and the dashboard approve exactly as before.
+
 A connected site with **no adapter** is no longer refused outright by the page gate: it proceeds
 unless the page is visibly a sign-in (password field, a form posting to a login path, a sign-in URL
 after redirects) or a challenge, and says every time that no adapter confirmed the login.
@@ -69,6 +95,8 @@ reaches it through a viewer that is handed out as a **one-time, expiring, sessio
 5dive browser viewer <site> --bind=<session> [--ttl=600]     # mint a one-time link
 5dive browser viewer-redeem <site> --nonce=- --session=<id>  # the relay's gate; consumes the link
 5dive browser viewer-revoke <site>                           # kill the view, keep the login
+5dive browser connect-request <site> --reason=<why>          # ask the paired owner: a Connect
+                                                             # button in Telegram; their tap binds
 ```
 
 A successful `viewer-redeem` prints the two things the relay needs, and prints them exactly once:

@@ -513,7 +513,11 @@ async function main() {
       // reviewed file and keeps its own contract.
       if (plan.guard && !plan.approved) {
         const risk = await aria.stepRisk(page, s, sel);
-        if (risk) {
+        // THE OWNER'S POLICY (DIVE-4982): a kind they set to "allow" runs without
+        // asking, and is REPORTED — bin/browser writes it to their log.
+        if (risk && Array.isArray(plan.allow_kinds) && plan.allow_kinds.includes(risk.cls)) {
+          process.stderr.write(aria.OWNER_ALLOWED_PREFIX + JSON.stringify({ ...risk, step: i + 1, op: s.op }) + '\n');
+        } else if (risk) {
           needsOwner = { ...risk, step: i + 1, op: s.op };
           break;
         }

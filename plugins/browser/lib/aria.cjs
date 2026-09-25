@@ -357,19 +357,103 @@ function _labelIn(arg) {
   const sub = form.querySelector('button[type=submit],input[type=submit],button:not([type])');
   return txt(sub) || String(form.getAttribute('action') || '');
 }
+// WHAT THE OWNER IS SAYING YES TO (DIVE-4982). A button label is not an answer to
+// "OK?": measured on a Gmail send, the ask read `"Send (Ctrl-Enter) Send". OK?`,
+// with no recipient, no subject and no text. So before the step, the page is read
+// for what the step will act on — in the form or dialog around the button, the
+// document if there is none:
+//   send     to (every address in a To/Cc/Bcc field or recipient chip), subject,
+//            first_line of the body
+//   pay      payee (a field that names one, else the site), amount (a price on
+//            the button, else on a "total" line, else the first on the page)
+//   publish  text, the first 280 characters of the composer
+//   delete   item: the row, list item or dialog heading the button belongs to
+// It is a READ of well-known shapes, not an understanding of the page: a field it
+// does not recognise is missing from the payload, and bin/browser then says the
+// page did not show it — it never fills the gap with the button's label.
+// In the page, so it closes over nothing.
+function _payloadIn(arg) {
+  function norm(x) { return String(x || '').replace(/\s+/g, ' ').trim(); }
+  function text(n) { return n ? norm(n.innerText || n.textContent || n.value || '') : ''; }
+  function all(root, q) { try { return Array.prototype.slice.call(root.querySelectorAll(q)); } catch (e) { return []; } }
+  var el = null;
+  try { el = arg.sel ? document.querySelector(arg.sel) : null; } catch (e) { el = null; }
+  if (!el && arg.op === 'press') el = document.activeElement || null;
+  var root = (el && el.closest && el.closest('form,[role=dialog],dialog')) || document;
+  var first = function (q) { var n = all(root, q); for (var i = 0; i < n.length; i++) { var v = text(n[i]); if (v) return v; } return ''; };
+  var out = {};
+  if (arg.cls === 'send') {
+    var to = [], seen = {};
+    all(root, '[email],input[name=to],input[name=cc],input[name=bcc],textarea[name=to],[aria-label^="To"],[aria-label^="Cc"],[aria-label^="Bcc"]').forEach(function (n) {
+      var v = (n.getAttribute && n.getAttribute('email')) || n.value || text(n);
+      (String(v || '').match(/[^\s<>,;"'()]+@[^\s<>,;"'()]+/g) || []).forEach(function (a) { if (!seen[a]) { seen[a] = 1; to.push(a); } });
+    });
+    if (to.length) out.to = to;
+    var subj = first('input[name=subject],input[name=subjectbox],[aria-label="Subject"],input[placeholder="Subject"]');
+    if (subj) out.subject = subj;
+    var body = all(root, '[aria-label="Message Body"],[aria-label="Message body"],textarea[name=body],[role=textbox][contenteditable=true],[contenteditable=true],textarea');
+    for (var i = 0; i < body.length; i++) {
+      var raw = String(body[i].innerText || body[i].value || body[i].textContent || '');
+      var line = raw.split(/\r?\n/).map(norm).filter(Boolean)[0] || '';
+      if (line) { out.first_line = line.slice(0, 200); break; }
+    }
+  } else if (arg.cls === 'pay') {
+    var money = /(?:[$€£¥₽₹]|\b(?:USD|EUR|GBP|RUB|INR|JPY|CAD|AUD)\b)\s?\d(?:[\d.,]*\d)?|\d(?:[\d.,]*\d)?\s?(?:[$€£¥₽₹]|\b(?:USD|EUR|GBP|RUB|INR|JPY|CAD|AUD)\b)/;
+    var m = text(el).match(money);
+    if (!m) { var lines = String((root.innerText || root.textContent || '')).split(/\r?\n/);
+      for (var j = 0; j < lines.length && !m; j++) if (/total/i.test(lines[j])) m = lines[j].match(money);
+      if (!m) m = String(root.innerText || root.textContent || '').match(money); }
+    if (m) out.amount = norm(m[0]);
+    var payee = first('[aria-label*="payee" i],[data-payee],[name=payee]');
+    out.payee = payee || String((document.location && document.location.hostname) || '');
+  } else if (arg.cls === 'publish') {
+    var t = first('[role=textbox],[contenteditable=true],textarea');
+    if (t) out.text = t.slice(0, 280);
+  } else if (arg.cls === 'delete') {
+    var item = el && el.closest ? el.closest('tr,li,[role=row],[role=listitem],article') : null;
+    var name = item ? text(item) : first('[role=dialog] h1,[role=dialog] h2,dialog h1,dialog h2,[role=dialog] [role=heading]');
+    if (name) out.item = name.slice(0, 160);
+  }
+  return out;
+}
+
+// Bidi and control characters out of anything an owner reads (DIVE-4982): the
+// live Send label carried U+202A/U+202C, which can turn what is displayed around
+// the shortcut into something else; C0/C1 can move a terminal's cursor.
+const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+function cleanText(x) {
+  return String(x == null ? '' : x).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .replace(UNSAFE_CHARS, '').replace(/\s+/g, ' ').trim();
+}
+function cleanPayload(p) {
+  const out = {};
+  if (!p || typeof p !== 'object') return out;
+  for (const [k, v] of Object.entries(p)) {
+    if (Array.isArray(v)) { const a = v.map(cleanText).filter(Boolean); if (a.length) out[k] = a; }
+    else { const c = cleanText(v); if (c) out[k] = c; }
+  }
+  return out;
+}
+
 async function stepRisk(page, step, sel) {
   if (!step || (step.op !== 'click' && step.op !== 'press')) return null;
+  let cls = null, label = '';
   if (step.op === 'press') {
     const key = String(step.key || '');
     if (!/(^|\+)Enter$/i.test(key)) return null;
-    if (/(Control|Meta|Ctrl|Cmd)\+/i.test(key)) return { cls: 'send', label: key };
+    if (/(Control|Meta|Ctrl|Cmd)\+/i.test(key)) { cls = 'send'; label = key; }
   }
-  const refName = isRef(step.selector) ? refBody(step.selector).replace(/^[^/]*\//, '').replace(/#\d+$/, '') : '';
-  let live = '';
-  try { live = await page.evaluate(_labelIn, { sel, op: step.op, riskOf: true }); } catch (e) { live = ''; }
-  const label = [refName, live].filter(Boolean).join(' | ').slice(0, 200);
-  const cls = classifyLabel(label);
-  return cls ? { cls, label } : null;
+  if (!cls) {
+    const refName = isRef(step.selector) ? refBody(step.selector).replace(/^[^/]*\//, '').replace(/#\d+$/, '') : '';
+    let live = '';
+    try { live = await page.evaluate(_labelIn, { sel, op: step.op, riskOf: true }); } catch (e) { live = ''; }
+    label = [refName, live].filter(Boolean).join(' | ').slice(0, 200);
+    cls = classifyLabel(label);
+  }
+  if (!cls) return null;
+  let payload = {};
+  try { payload = await page.evaluate(_payloadIn, { sel, op: step.op, cls, payloadOf: true }); } catch (e) { payload = {}; }
+  return { cls, label: cleanText(label), payload: cleanPayload(payload) };
 }
 // ---- READY, NOT SETTLED (DIVE-4983) -----------------------------------------
 //
@@ -528,6 +612,9 @@ async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 3
 // refusal can name the ask without a second parser for prose.
 const NEEDS_OWNER_PREFIX = '5dive-needs-owner: ';
 const E_NEEDS_OWNER = 73;
+// ...and the line for a step the owner's POLICY allowed without asking (DIVE-4982):
+// the step runs, and bin/browser writes it to the owner's log.
+const OWNER_ALLOWED_PREFIX = '5dive-owner-allowed: ';
 
 function render(nodes, { json = false } = {}) {
   if (json) return JSON.stringify({ nodes }, null, 2);
@@ -540,5 +627,6 @@ function render(nodes, { json = false } = {}) {
 
 module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
   resolveRefWithin, resolveStepSelector, isRef, render, REF_PREFIX,
-  classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER,
+  classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER, OWNER_ALLOWED_PREFIX,
+  _payloadIn, cleanText, cleanPayload,
   waitForVisible, _visibleIn, _textIn, _scopeIn };

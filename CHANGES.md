@@ -1,5 +1,32 @@
 ## Unreleased
 
+### Added — an agent's "Connect <site>" button: the owner taps in Telegram, the box binds (DIVE-4992), telegram 0.5.63, browser 1.16.0
+
+An agent that needed the owner logged into a site could only walk them through the dashboard. Now
+`5dive browser connect-request <site> --reason=<why>` makes root send the seat's paired owner a
+**Connect <site>** button. The Claude Code Telegram bridge relays the tap to root
+(`sudo -n 5dive browser _connect`, parameters on stdin). Root checks the code, the seat and the
+owner, starts the browser, registers the viewer bind with shelld on loopback, and returns the
+one-time URL. The bridge edits the message to carry that URL as a code entity with previews off,
+plus a **Done** button. Done revokes the view, stops the browser and probes, and the verdict replaces
+the link. The agent's session gets a `[browser connect] …` channel message at each step.
+
+The Connect branch runs straight after the allowFrom check and before every other callback branch.
+If the generic agent-keyboard bridge ran first, it would hand the one-time code to the agent's
+session. `test/browser-connect.test.ts` pins that order. `plugins/browser/` mirrors
+5dive-ai/5dive-browser at 1.16.0 byte-identical, and `tests/browser_connect_request_unit.sh` is
+upstream's new harness with `browser/` read as `plugins/browser/`. The grok-based forks do not
+relay the tap yet; `connect-request` refuses those seats up front rather than send a dead button.
+
+### Added — the registry copy carries the approval ask with its payload, a per-kind owner policy and no self-approve, at browser 1.15.0 (DIVE-4982)
+
+`plugins/browser/` reaches 1.15.0 (5dive-browser ab73a52) inside the 1.16.0 mirror above; there was no separate 1.15.0 mirror. A
+blocked send/pay/publish/delete now shows what it would do (recipient, subject, first line; payee and amount; text; item),
+`approvals policy set <kind>=ask|allow` is the owner's only (`approvals policy` prints JSON on `--json` and on
+`FIVEDIVE_JSON_MODE=1`), and an agent seat's `sudo … approve` needs the owner's proof, `--human-proof=<nonce>`.
+Full entry in 5dive-browser's CHANGES.md. `tests/browser_plugin_unit.sh` carries upstream's DIVE-4982 arms with `browser/` read as
+`plugins/browser/`.
+
 ### Added — the registry copy carries `run google.com send` (a Gmail message, the owner's yes, read back in Sent), at browser 1.14.0 (DIVE-4984)
 
 `plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.14.0 (bc0d182), byte-identical. A new `google.com`
