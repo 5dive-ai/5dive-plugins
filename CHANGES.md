@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Added — the registry copy carries `run google.com send` (a Gmail message, the owner's yes, read back in Sent), at browser 1.14.0 (DIVE-4984)
+
+`plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.14.0 (bc0d182), byte-identical. A new `google.com`
+adapter sends one Gmail message with `5dive browser run google.com send --to --subject --body`. It stops in
+front of Send with exit 73 until the owner approves, and `--approved-id=<id>` spends that yes once. After
+sending it re-reads Sent in the same profile, using the new adapter knob `verify.in_session` (with
+`verify.wait_for` and `verify.scope`), because a cookieless curl only ever saw the sign-in page. `{key}`
+arguments are now URL-encoded in step and verify URLs. The adapter ships without a login `probe`, so
+`run google.com send` refuses with 75 until one is measured and added. Full entry in 5dive-browser's
+CHANGES.md. `tests/browser_plugin_unit.sh` carries upstream's T35 arms with `browser/` read as `plugins/browser/`.
+
 ### Added — the registry copy carries `--wait-for`, loading-screen flags and a retrying `--expect`, at browser 1.13.0 (DIVE-4983)
 
 `plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.13.0 (1065e8e), byte-identical. `snapshot`, `read`

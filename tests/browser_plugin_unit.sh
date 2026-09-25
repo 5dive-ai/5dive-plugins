@@ -227,7 +227,7 @@ t 'T1f the registry marketplace lists it' 'browser' \
 # plugins any more, and `plugin add` resolves this plugin by CLONING this repo.
 # So the way a file goes missing on a real box is now exactly one thing: it is
 # not COMMITTED here. Grade that, against git, not against a list.
-for f in plugins/browser/.claude-plugin/plugin.json plugins/browser/README.md plugins/browser/bin/browser plugins/browser/adapters/example.json \
+for f in plugins/browser/.claude-plugin/plugin.json plugins/browser/README.md plugins/browser/bin/browser plugins/browser/adapters/example.json plugins/browser/adapters/google.com.json \
          plugins/browser/lib/extract.bundle.cjs plugins/browser/lib/extract.src.mjs plugins/browser/lib/pins.json; do
   t "T1g $f is committed, so a clone of this repo carries it" "yes" \
     "$(git -C "$ROOT" ls-files --error-unmatch "$f" >/dev/null 2>&1 && echo yes || echo no)"
@@ -2322,6 +2322,10 @@ const page = {
     if (arg && arg.visibleOf) { rec({ call: 'visible', target: arg.target, mode: arg.mode, at: clock });
       return !process.env.PWLATE_MS || late(); }
     if (arg && arg.textOf) return (late() && process.env.PWTEXT_LATE) || process.env.PWTEXT || '';
+    // DIVE-4984: a verify's scope — the one element it grades. PWSCOPE parks what
+    // the page's first match would say ({html,text}); unset, nothing matched.
+    if (arg && arg.scopeOf) { rec({ call: 'scope', scope: arg.scope, at: clock });
+      return process.env.PWSCOPE ? JSON.parse(process.env.PWSCOPE) : null; }
     const mark = (arg && arg.mark) || null;
     if (mark) markWalks++;
     rec({ call: 'evaluate', fnlen: String(fn).length, mark, walkN: mark ? markWalks : null,
@@ -3468,6 +3472,9 @@ const mkpage = (kind) => { let clock = 0;
     if (arg && arg.visibleOf) { rec({ call: 'visible', target: arg.target, kind, at: clock });
       return !process.env.DPWLATE_MS || late(); }
     if (arg && arg.textOf) return (late() && process.env.DPWTEXT_LATE) || process.env.DPWTEXT || '';
+    // DIVE-4984: the scope a verify grades, from a FILE (the env is fixed at serve).
+    if (arg && arg.scopeOf) { rec({ call: 'scope', scope: arg.scope, kind });
+      try { return JSON.parse(fs.readFileSync(process.env.DPWSCOPE, 'utf8')); } catch (e) { return null; } }
     const mark = (arg && arg.mark) || null;
     if (mark) markWalks++;
     rec({ call: 'evaluate', kind, mark, walkN: mark ? markWalks : null, snapshot: !!(arg && arg.snapshot) });
@@ -5803,6 +5810,221 @@ for f in README.md AGENTS.md; do
 done
 tc 'T34h CHANGES.md names the knobs' 'FIVEDIVE_BROWSER_EXPECT_WAIT_MS' "$(cat "$ROOT/CHANGES.md")"
 tc 'T34h CHANGES.md names the read cap' 'FIVEDIVE_BROWSER_READ_CAP_MS' "$(cat "$ROOT/CHANGES.md")"
+
+# ============ T35 DIVE-4984: `run google.com send` — one command, the owner's yes, read back in Sent
+#
+# The adapter is data measured on a live Gmail (its _comment says what); these
+# arms grade the product under it, each against the mutant a weaker suite passes:
+#   T35a  {to}/{subject} reach the compose URL ENCODED, and the body is FILLED and
+#         never put in the URL (Gmail drops body=)
+#   T35b  the Send click stops with 73 until the owner says yes; the yes shows who
+#         and what, covers these arguments only, and is spent once
+#   T35c  the verify reads Sent THROUGH THE EXECUTOR, in the profile — not curl
+#   T35d  an OLDER mail with the same subject further down the list does not pass
+#   T35e  MUTANT: `in_session` ignored (the curl path) goes red on the same send
+#   T35f  the warm session does all of it too
+#   T35g  the page-side scope against a DOM shim; the file as shipped fails closed
+#   T35h  documented where agents and people read it
+unset FIVEDIVE_BROWSER_DRIVER
+GADAPT="$ROOT/plugins/browser/adapters/google.com.json"
+# THE SHIPPED FILE, plus a probe this suite can answer. It ships with none —
+# nothing measured google.com's signed-out page — so `run` on the file as shipped
+# refuses (T35g); every other arm needs a session that probes `authenticated`.
+jq '.probe = {url:"https://google.com/", logged_out_when_dom_matches:"action=\"/login\""}' "$GADAPT" \
+  > "$FIVEDIVE_BROWSER_ADAPTER_DIR/google.com.json"
+mkprofile google.com "$LIVE_DOM" >/dev/null
+GDIR="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/google.com"
+A35="$TMP/t35/approvals"
+# curl is a RECORDER here, answering what Google answers a cookieless fetch of the
+# Sent folder: the sign-in page. An arm that reaches it took the curl path.
+CURLBIN="$TMP/t35/bin"; mkdir -p "$CURLBIN"; CURLREC="$TMP/t35/curl.rec"; : > "$CURLREC"
+cat > "$CURLBIN/curl" <<CURL
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CURLREC"
+printf '<html><body><form action="https://accounts.google.com/v3/signin"><input type="password"></form></body></html>\n'
+CURL
+chmod +x "$CURLBIN/curl"
+TO35='ops+test@example.test'
+SUBJ35='Q3 (draft) & more #1'
+BODY35='hello & welcome #2, see the list (below)'
+# The measured label, bidi marks and all.
+SEND35=$'Send ‪(Ctrl-Enter)‬ Send'
+# The newest Sent row, as the page's first [role=main] tr would give it.
+ROW35='{"html":"<tr><td>me</td><td>Q3 (draft) &amp; more #1 - hello &amp; welcome</td></tr>","text":"me Q3 (draft) & more #1 - hello & welcome #2 9:46 AM"}'
+t35env() { env PATH="$CURLBIN:$PATH" FIVEDIVE_BROWSER_APPROVAL_DIR="$A35" FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 \
+             FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" \
+             PWLABEL="$SEND35" "$@"; }
+t35send() {  # t35send <approval-id|-> [env assignments...] — the send, with the fixed arguments
+  local id="$1"; shift
+  local ap=(); [[ "$id" != - ]] && ap=(--approved-id="$id")
+  run t35env "$@" "${T35BIN:-$BROWSER}" run google.com send --to="$TO35" --subject="$SUBJ35" --body="$BODY35" ${ap+"${ap[@]}"}
+}
+aid35() { sed -n 's/.*browser approve \([^ ]*\) .*/\1/p' <<<"$ERR" | head -1; }
+t35yes() {  # ask once, and say yes as the owner -> YES35 is a live grant for the fixed send
+  t35send - "$@"; YES35="$(aid35)"
+  run t35env "$BROWSER" approve "$YES35"
+}
+
+# --- T35a/b the first try: stopped at the Send button, and what reached the page
+: > "$PWREC"; : > "$CURLREC"
+t35send -
+t  'T35b without the owner'"'"'s yes, the send stops with 73' 73 "$RC"
+t  'T35b ...BEFORE the click reached the page' 0 "$(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
+tc 'T35b ...naming it a send, on the Send button' 'send a message ("Send' "$ERR"
+tc 'T35b ...and the ask, with the flag run re-runs with' 'then re-run this exact run with --approved-id=' "$ERR"
+t  'T35b ...nothing was sent, so nothing was re-read: one page load, no curl' '1 0' \
+   "$(jq -rs '[.[]|select(.call=="goto")]|length' "$PWREC") $(wc -l < "$CURLREC")"
+AID35="$(aid35)"
+t  'T35b ...and the recorded ask carries who it goes to and what it says' "$TO35|$SUBJ35|$BODY35" \
+   "$(jq -r '"\(.args.to)|\(.args.subject)|\(.args.body)"' "$A35/$AID35.json" 2>/dev/null)"
+G35="$(jq -rs '[.[]|select(.call=="goto")|.url]|first' "$PWREC")"
+t  'T35a {to} and {subject} reach the compose URL encoded' \
+   'https://mail.google.com/mail/u/0/?view=cm&fs=1&to=ops%2Btest%40example.test&su=Q3%20(draft)%20%26%20more%20%231' "$G35"
+t  'T35a ...the body is FILLED, exactly as given' "$BODY35" "$(jq -rs '[.[]|select(.call=="fill")|.val]|first' "$PWREC")"
+t  'T35a ...into the measured body field' 'div[role=textbox][aria-label="Message Body"]' \
+   "$(jq -rs '[.[]|select(.call=="fill")|.sel]|first' "$PWREC")"
+tn 'T35a ...and it is never in the URL, where Gmail drops it' 'welcome' "$G35"
+t  'T35a ...after the Send button was there to wait for' 'waitForSelector fill' \
+   "$(jq -rs '[.[]|select(.call|IN("waitForSelector","fill"))|.call]|join(" ")' "$PWREC")"
+# THE OLD SPLICE, in a copy: the raw & ends su= early and # starts a fragment.
+MUT35A="$TMP/t35/mut-raw"; rm -rf "$MUT35A"; cp -r "$ROOT/plugins/browser" "$MUT35A"
+sed -i "s|field === 'url' ? encodeURIComponent : null|null|" "$MUT35A/bin/driver-playwright"
+t  'T35a mutant applied' yes "$(cmp -s "$MUT35A/bin/driver-playwright" "$ROOT/plugins/browser/bin/driver-playwright" && echo no || echo yes)"
+: > "$PWREC"
+T35BIN="$MUT35A/bin/browser" t35send -
+t  'T35a MUTANT (raw splice): the subject arrives cut at the &' 'yes' \
+   "$(jq -rs '[.[]|select(.call=="goto")|.url]|first' "$PWREC" | grep -qF '&su=Q3 (draft) & more #1' && echo yes || echo no)"
+
+# --- T35b the owner's yes -------------------------------------------------------
+run env FIVEDIVE_BROWSER_APPROVAL_DIR="$A35" "$BROWSER" approve "$AID35"
+t  'T35b a non-owner cannot approve' 77 "$RC"
+run t35env "$BROWSER" approve "$AID35"
+t  'T35b the owner approves' 0 "$RC"
+tc 'T35b ...seeing who it goes to' "--to=\"$TO35\"" "$OUT"
+tc 'T35b ...and what it says' "--body=\"$BODY35\"" "$OUT"
+run t35env "$BROWSER" run google.com send --to="$TO35" --subject="$SUBJ35 (edited)" --body="$BODY35" --approved-id="$AID35"
+t  'T35b a yes does not cover a different subject' 73 "$RC"
+tc 'T35b ...and says so' 'different run' "$ERR"
+run t35env "$BROWSER" run google.com send --to="$TO35" --subject="$SUBJ35" --body="$BODY35" --approved-id=nobody-000000000000
+t  'T35b an id nobody approved is refused' 73 "$RC"
+
+# --- T35c the approved send, verified IN THE PROFILE ---------------------------
+: > "$PWREC"; : > "$CURLREC"
+t35send "$AID35" PWSCOPE="$ROW35"
+t  'T35c the approved send runs and verifies' 0 "$RC"
+tc 'T35c ...read back in the Sent folder, in this profile' \
+   'verified: send is live at https://mail.google.com/mail/u/0/#sent (re-read in this profile)' "$OUT"
+t  'T35c ...the Send click happened, once' 1 "$(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
+t  'T35c ...and the tab was held until Gmail said it went' 'text=Message sent' \
+   "$(jq -rs '[.[]|select(.call=="waitForSelector")|.sel]|last' "$PWREC")"
+t  'T35c ...curl was never asked' 0 "$(wc -l < "$CURLREC")"
+t  'T35c ...the re-read was a fresh load of #sent, after the steps' 'https://mail.google.com/mail/u/0/#sent' \
+   "$(jq -rs '[.[]|select(.call=="goto")|.url]|last' "$PWREC")"
+t  'T35c ...in the same profile, both times' "$GDIR $GDIR" \
+   "$(jq -rs '[.[]|select(.call=="launch")|.profile]|join(" ")' "$PWREC")"
+t  'T35c ...waiting for the list, and grading its first row' '[role=main] tr|[role=main] tr' \
+   "$(jq -rs '([.[]|select(.call=="visible")|.target]|last) + "|" + ([.[]|select(.call=="scope")|.scope]|last)' "$PWREC")"
+t35send "$AID35" PWSCOPE="$ROW35"
+t  'T35c a yes is spent by one send' 73 "$RC"
+
+# --- T35d an OLDER mail with the same subject ------------------------------------
+# The list carries the subject — on last week's mail, below the newest row.
+OLDPAGE35='<html><body><div role="main"><table><tr><td>me</td><td>Weekly numbers - hi</td></tr><tr><td>me</td><td>Q3 (draft) &amp; more #1 - last week</td></tr></table></div></body></html>'
+OLDTEXT35='me Weekly numbers - hi 9:47 AM me Q3 (draft) & more #1 - last week Sep 18'
+NEWER35='{"html":"<tr><td>me</td><td>Weekly numbers - hi</td></tr>","text":"me Weekly numbers - hi 9:47 AM"}'
+t35yes
+t35send "$YES35" PWHTML="$OLDPAGE35" PWTEXT="$OLDTEXT35" PWSCOPE="$NEWER35"
+t  'T35d an older mail with the subject, below the newest row, is NOT verified' 1 "$RC"
+tc 'T35d ...and says so' 'NOT VERIFIED' "$ERR"
+# THE ANCHOR: the same page graded whole passes — the scope is what caught it.
+mkdir -p "$TMP/t35/noscope"
+jq 'del(.actions.send.verify.scope)' "$FIVEDIVE_BROWSER_ADAPTER_DIR/google.com.json" > "$TMP/t35/noscope/google.com.json"
+t35yes
+t35send "$YES35" FIVEDIVE_BROWSER_ADAPTER_DIR="$TMP/t35/noscope" PWHTML="$OLDPAGE35" PWTEXT="$OLDTEXT35" PWSCOPE="$NEWER35"
+t  'T35d (anchor) without verify.scope the same page passes — the false pass the scope stops' 0 "$RC"
+t35yes
+t35send "$YES35"
+t  'T35d a Sent list with no row at all is NOT verified' 1 "$RC"
+tc 'T35d ...naming the scope that matched nothing' '[role=main] tr matched nothing' "$ERR"
+
+# --- T35e MUTANT: in_session ignored ------------------------------------------------
+# Non-vacuous both ways: the unmutated copy verifies the same send first.
+MUT35="$TMP/t35/mut-curl"; rm -rf "$MUT35"; cp -r "$ROOT/plugins/browser" "$MUT35"
+t35yes
+: > "$CURLREC"
+T35BIN="$MUT35/bin/browser" t35send "$YES35" PWSCOPE="$ROW35"
+t  'T35e (anchor) the UNMUTATED copy verifies the send in the profile' '0 0' "$RC $(wc -l < "$CURLREC")"
+perl -0pi -e 's/body=\$\(_run_verify_in_session "\$f" "\$action" "\$dir" "\$vurl" "\$vexpect"\)/body=\$(curl -fsSL --max-time 30 "\$vurl" 2>\/dev\/null) # MUTANT (DIVE-4984): in_session ignored/' \
+  "$MUT35/bin/browser"
+t  'T35e (anchor) the mutation landed in the copy' 'yes' \
+   "$(grep -q 'MUTANT (DIVE-4984)' "$MUT35/bin/browser" && echo yes || echo no)"
+t35yes
+: > "$CURLREC"
+T35BIN="$MUT35/bin/browser" t35send "$YES35" PWSCOPE="$ROW35"
+t  'T35e MUTANT: re-read with curl, the Sent folder is a sign-in page — NOT VERIFIED' 1 "$RC"
+tc 'T35e MUTANT ...and curl is what fetched it' '#sent' "$(cat "$CURLREC")"
+
+# --- T35f the warm session ------------------------------------------------------------
+DSCOPE35="$TMP/t35/dscope.json"; printf '%s' "$ROW35" > "$DSCOPE35"
+DLABEL35="$TMP/t35/dlabel"; printf '%s' "$SEND35" > "$DLABEL35"
+dserve google.com DPWLABEL="$DLABEL35" DPWSCOPE="$DSCOPE35"
+t  'T35f (precondition) a warm session holds google.com' 0 "$RC"
+L35="$(launches)"; N35=$(wc -l < "$DREC"); : > "$CURLREC"
+d35() { dwarm PATH="$CURLBIN:$SPATH" FIVEDIVE_BROWSER_APPROVAL_DIR="$A35" FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" \
+          "$BROWSER" run google.com send --to="$TO35" --subject="$SUBJ35" --body="$BODY35" "$@"; }
+d35
+t  'T35f the warm session stops the send too (73)' 73 "$RC"
+t  'T35f ...before the click' 0 "$(tail -n +$((N35+1)) "$DREC" | jq -rs '[.[]|select(.call=="click")]|length')"
+t  'T35f ...and the compose URL is encoded there as well' \
+   'https://mail.google.com/mail/u/0/?view=cm&fs=1&to=ops%2Btest%40example.test&su=Q3%20(draft)%20%26%20more%20%231' \
+   "$(tail -n +$((N35+1)) "$DREC" | jq -rs '[.[]|select(.call=="goto" and .kind=="first")|.url]|first')"
+W35="$(aid35)"
+run t35env "$BROWSER" approve "$W35"
+N35=$(wc -l < "$DREC")
+d35 --approved-id="$W35"
+t  'T35f the approved warm send verifies in the profile' 0 "$RC"
+tc 'T35f ...as re-read in this profile' '#sent (re-read in this profile)' "$OUT"
+t  'T35f ...through the daemon: the click, the #sent load, the scoped read — and no curl' '1 1 1 0' \
+   "$(tail -n +$((N35+1)) "$DREC" | jq -rs '[([.[]|select(.call=="click")]|length), ([.[]|select(.call=="goto" and (.url|endswith("#sent")))]|length), ([.[]|select(.call=="scope")]|length)]|join(" ")') $(wc -l < "$CURLREC")"
+t  'T35f ...in the browser already open' "$L35" "$(launches)"
+env PATH="$SPATH" "$BROWSER" serve google.com --stop >/dev/null 2>&1
+
+# --- T35g the page side, and the file as shipped ---------------------------------------
+cat > "$TMP/t35-scope.js" <<'SCOPE'
+const { _scopeIn } = require(process.env.ARIA);
+const ROWS = [{ outerHTML: '<tr>newest</tr>', innerText: 'me  newest\t9:47 AM' }, { outerHTML: '<tr>older</tr>', innerText: 'older' }];
+global.document = { querySelector: (s) => { if (s === '[role=main') throw new SyntaxError('bad');
+  return s === '[role=main] tr' ? ROWS[0] : null; } };
+console.log(JSON.stringify([_scopeIn({ scope: '[role=main] tr' }), _scopeIn({ scope: '#none' }), _scopeIn({ scope: '[role=main' })]));
+SCOPE
+t  'T35g the scope is the FIRST match, null when nothing or a bad selector matches' \
+   '[{"html":"<tr>newest</tr>","text":"me newest 9:47 AM"},null,null]' \
+   "$(ARIA="$ROOT/plugins/browser/lib/aria.cjs" node "$TMP/t35-scope.js" 2>&1)"
+: > "$PWREC"
+run t35env FIVEDIVE_BROWSER_ADAPTER_DIR="$ROOT/plugins/browser/adapters" "$BROWSER" run google.com send --to=a@b.test --subject=s --body=b
+t  'T35g the adapter AS SHIPPED has no probe, so run refuses (75)' 75 "$RC"
+tc 'T35g ...because nobody confirmed the session' 'cannot confirm the google.com session is live' "$ERR"
+t  'T35g ...before a browser opened' 0 "$(jq -rs '[.[]|select(.call=="launch")]|length' "$PWREC")"
+t  'T35g the shipped file: valid, guarded, verified in session, fixed vocabulary' 'true true true ' \
+   "$(jq -r '"\(.actions.send.guard) \(.actions.send.verify.in_session) \(.actions.send.verify.url != null and .actions.send.verify.expect != null) " +
+            (["goto","fill","click","wait_for","select","upload","press"] as $ok | [.actions[].steps[].op|select(. as $o|($ok|index($o))|not)]|join(","))' "$GADAPT")"
+jq '.actions.send.verify.in_session = false' "$FIVEDIVE_BROWSER_ADAPTER_DIR/google.com.json" > "$TMP/t35/bad.json"
+mkdir -p "$TMP/t35/bad"; cp "$TMP/t35/bad.json" "$TMP/t35/bad/google.com.json"
+: > "$PWREC"
+run t35env FIVEDIVE_BROWSER_ADAPTER_DIR="$TMP/t35/bad" "$BROWSER" run google.com send --to=a@b.test --subject=s --body=b
+t  'T35g a scope on a curl verify is refused before a step (64)' '64 0' "$RC $(jq -rs '[.[]|select(.call=="launch")]|length' "$PWREC")"
+run t35env "$BROWSER" run x publish --body=hi --approved-id="$AID35"
+t  'T35g --approved-id on an action with no guard is refused' 64 "$RC"
+
+# --- T35h documented where agents and people read it --------------------------------------
+run bash "$BROWSER" --help
+tc 'T35h --help names --approved-id' '--approved-id' "$OUT$ERR"
+for f in README.md AGENTS.md; do
+  tc "T35h $f documents run google.com send" 'run google.com send' "$(cat "$ROOT/plugins/browser/$f")"
+  tc "T35h $f documents verify.in_session" 'in_session' "$(cat "$ROOT/plugins/browser/$f")"
+done
+tc 'T35h CHANGES.md names the knobs' 'verify.in_session' "$(cat "$ROOT/CHANGES.md")"
+tc 'T35h CHANGES.md names the flag' '--approved-id' "$(cat "$ROOT/CHANGES.md")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

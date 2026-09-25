@@ -126,6 +126,22 @@ the owner or their dashboard runs); then re-run the SAME act with `--approved=<i
 covers exactly those steps, once, for 30 minutes. Do not rephrase the steps to get around the
 stop — a button renamed is still an order placed.
 
+## Sending a Gmail message: `run google.com send`
+
+```bash
+5dive browser run google.com send --to=<addr> --subject='<subject>' --body='<text>'
+```
+
+One command. It opens compose with To and Subject filled, types the body, and stops in front of
+Send with exit **73** and an ask, as `act` does. Relay it: the owner's `approve` shows the `--to`,
+`--subject` and `--body` they are saying yes to. On their yes, re-run the SAME command with the
+SAME arguments plus `--approved-id=<id>` — a different subject is a different ask. It then sends
+and reads the Sent folder back in the same login (`verify.in_session`); only
+`verified: send is live at …#sent` means it went. **NOT VERIFIED means open Sent and look before
+anything else — never send it again blind.** Exit 75 before anything ran means this box has no
+measured google.com login check yet (the adapter ships without one): tell the owner, it is theirs
+to measure with `5dive browser capture google.com`.
+
 ## Working the page: ONE snapshot per decision
 
 ```bash
