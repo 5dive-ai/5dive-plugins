@@ -1,6 +1,6 @@
 {
   "name": "voice",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box, or on OpenRouter if you choose.",
   "author": {
     "name": "5dive",
