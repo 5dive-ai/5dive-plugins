@@ -213,7 +213,13 @@ config_json() {
 }
 
 cmd_config() {
+  # `--json` never reaches this verb through the CLI: `5dive` takes a global
+  # --json out of argv before it dispatches a plugin verb and passes
+  # FIVEDIVE_JSON_MODE=1 instead (DIVE-4893). The dashboard's form reads
+  # `5dive voice config --json`, so the env var is the path it actually takes;
+  # the literal flag stays for a direct run of this file (DIVE-4985).
   local json=0
+  [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && json=1
   if [[ "${1:-}" == --json ]]; then json=1; shift; fi
   local sub="${1:-}"
 

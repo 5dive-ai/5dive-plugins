@@ -30,7 +30,7 @@
     },
     {
       "name": "voice",
-      "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box, or on OpenRouter if you choose. Maintained in 5dive-ai/5dive-voice; this entry is a byte-for-byte mirror of that repository's voice/ (1.3.0 as of DIVE-4880), so an install from here gets the same backend switch, host installer and settings as one from there. The reference implementation of the 5dive plugin contract: a channel-capability plugin, the shape every later channel plugin copies.",
+      "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box, or on OpenRouter if you choose. Maintained in 5dive-ai/5dive-voice; this entry is a byte-for-byte mirror of that repository's voice/ (1.3.1 as of DIVE-4985), so an install from here gets the same backend switch, host installer and settings as one from there. The reference implementation of the 5dive plugin contract: a channel-capability plugin, the shape every later channel plugin copies.",
       "category": "channel",
       "source": "./plugins/voice",
       "homepage": "https://github.com/5dive-ai/5dive-voice"
