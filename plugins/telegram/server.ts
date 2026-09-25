@@ -45,6 +45,7 @@ import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
 import {
@@ -4353,8 +4354,12 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: I
   if (!j.ok || !j.data?.task) return { text: 'Task not found.' }
   const t = j.data.task
   const mine = taskAssignedToMe(t.assignee) ? ' ⭐' : ''
+  // DIVE-4949: the ident AND the /task_<id> number in the header — lodar asked about
+  // both numbers for one row two minutes apart — and the title clamped (they run
+  // to 190 chars and wrap into five phone lines).
+  const title = String(t.title ?? '').length > 120 ? String(t.title).slice(0, 119) + '…' : String(t.title ?? '')
   const lines = [
-    `${t.ident} · ${t.title}`,
+    `${t.ident} (/task_${t.id}) · ${title}`,
     ``,
     `status: ${t.status}${t.priority ? `  ·  priority: ${t.priority}` : ''}`,
     `assignee: ${t.assignee || '(unassigned)'}${mine}`,
@@ -4419,17 +4424,13 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: I
   // and not a comment.
   const gateNeedsHuman = t.needs_human !== undefined ? Number(t.needs_human) === 1 : gateLive
   if (gateLive) {
-    const gIdent = t.ident || `DIVE-${t.id}`
-    // Type-shaped because the verb genuinely differs, and publishing the wrong one is
-    // the same defect one layer down: a secret must never be typed into chat (Telegram
-    // keeps history) and a manual gate records that the step was PERFORMED, so both
-    // take `task answer` with NO --value. Mirrors _gate_answer_route in the CLI.
-    const gHow =
-      t.need_type === 'secret'
-        ? `place the secret out-of-band, then run \`5dive task answer ${gIdent}\` with NO --value (it must never enter chat history)`
-        : t.need_type === 'manual'
-          ? `run \`5dive task answer ${gIdent}\` with NO --value (it records that the step was performed)`
-          : `tap a button on this gate's own alert message in this chat, or run \`5dive task answer ${gIdent} --value=<answer>\``
+    // DIVE-4949 (amendment 2 §5): NO SHELL COMMAND ON THIS CARD. The paired human
+    // reads it on a phone and has no terminal, so "run `5dive task answer …`" was a
+    // route he could not take. The answer control is now ON the card (cardGateAction:
+    // option / Approve-Deny buttons for a tier<2 gate, or a button that has the CLI
+    // re-send the gate's own nonce-buttoned alert), so the route line names that.
+    // The forks keep the DIVE-3340 shell route: they do not carry these buttons.
+    const gAct = cardGateAction(t, gateLive, gateNeedsHuman)
     lines.push(
       '',
       gateNeedsHuman
@@ -4443,40 +4444,91 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: I
       if (!t.need_options && gAsk.length > 300) gAsk = gAsk.slice(0, 299) + '…'
       lines.push(`   asks: ${gAsk}`)
     }
-    if (t.need_options) lines.push(`   options: ${String(t.need_options)}`)
+    if (t.need_options && gAct.kind !== 'buttons') lines.push(`   options: ${String(t.need_options)}`)
     if (t.recommend) lines.push(`   ⭐ rec: ${String(t.recommend)}`)
-    lines.push(`   to answer: ${gHow}`)
-    if (gateNeedsHuman) lines.push(`   lost the alert? /inbox re-sends the pending gates that are YOURS to answer, with their tap buttons.`)
-    lines.push(`   ✅ Done and 🚫 Cancel below WILL BE REFUSED while this gate is pending — answering it is what unblocks the row.`)
+    if (gAct.kind === 'buttons') lines.push('   👇 answer it right here — tap below.')
+    else if (gAct.kind === 'resend') {
+      lines.push('   👇 tap "Send the answer buttons": the gate\'s own tap-to-answer message lands under this card.')
+      if (t.need_type === 'secret') lines.push('   the secret itself is placed out-of-band — it never goes into this chat.')
+    } else lines.push(`   nothing for you to do — ${t.routed_reviewer || 'its reviewer'} answers it.`)
+    lines.push('   ✅ Done and 🚫 Cancel are hidden until the gate is answered — answering it is what unblocks the row.')
   }
-  if (t.body) {
-    let body = String(t.body)
-    if (body.length > 1500) body = body.slice(0, 1500) + '\n…(truncated)'
-    lines.push('', body)
+  const gateAction = cardGateAction(t, gateLive, gateNeedsHuman)
+  // DIVE-4949: why it is blocked, when it wakes, what it delivered, who grades it,
+  // whose it is, how the last gate went, how old it is — every time relative. The
+  // human count (for the "human owner" line) is only fetched when there IS an owner.
+  let humanCount = 0
+  if (t.human_owner) {
+    const hj = await read5diveJson(['human', 'ls', '--json']).catch(() => null)
+    humanCount = Array.isArray(hj?.data?.humans) ? hj.data.humans.length : 0
   }
-  if (t.result) lines.push('', `result: ${t.result}`)
-  lines.push('', 'back to list: /tasks')
+  const stateLines = taskStateLines(t, j.data.blocked_by, gateLive, Date.now(), humanCount)
+  if (stateLines.length) lines.push('', ...stateLines)
+  // DIVE-4949: built to a BUDGET (fitCard), never leaning on the transport's 4096
+  // guard — which cut /task_5114 mid-result and dropped the park note. The result's
+  // SUMMARY sits above the body (it is the field the creator reads), and the body,
+  // markdown markers stripped, gets whatever room is left.
+  const text = fitCard(
+    lines,
+    t.result ? resultSummary(t.result) : '',
+    t.body ? stripMarkdown(t.body) : '',
+    ['', 'back to list: /tasks'],
+  )
   // DIVE-449: an "Escalate" button (semantics A — flag for attention: bumps
   // priority a tier + pings the owning agent & the human). Only for OPEN tasks —
   // a done/cancelled task has nothing to get eyes on. The tap lands in the
   // callback router as `esc:<id>` (mirrors the tna: tap-to-answer flow).
-  let keyboard: InlineKeyboard | undefined
-  if (t.status !== 'done' && t.status !== 'cancelled') {
+  let keyboard = new InlineKeyboard()
+  // DIVE-4949: the gate's own answer controls, first row. Which control (if any)
+  // is decided by cardGateAction from the CLI's verdicts — tier<2 human gates get
+  // option / Approve-Deny buttons answered over the --channel-proof rail (the CLI
+  // re-enforces tier<2 there); every other gate a human owes gets a button that has
+  // the CLI re-send ITS nonce-buttoned alert; agent-routed gets nothing.
+  if (gateAction.kind === 'buttons') {
+    gateAction.buttons.forEach((b, i) => {
+      if (i > 0 && (gateAction.buttons.length > 2 || b.label.length > 20)) keyboard.row()
+      keyboard.text(b.label, b.data)
+    })
+    keyboard.row()
+  } else if (gateAction.kind === 'resend') {
+    keyboard.text('🔐 Send the answer buttons', gateAction.data).row()
+  }
+  // DIVE-4949: a recurring TEMPLATE gets no work controls. `task start` (Do now)
+  // refuses a template (DIVE-2059), and Done/Cancel END it — the heartbeat fires
+  // only templates whose status is `todo` — and a stale template is not an
+  // unwanted one.
+  const open = t.status !== 'done' && t.status !== 'cancelled'
+  if (open && t.kind !== 'recurring') {
     // DIVE-503: "▶️ Do now" (Mark, 2026-06-18) — the ACTIVE counterpart to
     // Escalate. Escalate is passive (bump priority + notify, agent decides when);
     // Do now pings the assigned agent to pick this up immediately and flips the
     // task to in_progress. Only rendered when there's an assignee (nothing to
     // ping otherwise); sits left of 🔺 Escalate. Routes as `donow:<id>`.
-    keyboard = new InlineKeyboard()
-    if (t.assignee) keyboard.text('▶️ Do now', `donow:${t.id}`)
+    // DIVE-4949: on a PARKED row ⏰ Wake now (`task unpark`) takes Do now's place —
+    // offering both was two buttons for one intent.
+    if (isParked(t)) keyboard.text('⏰ Wake now', `twake:${t.id}`)
+    else if (t.assignee) keyboard.text('▶️ Do now', `donow:${t.id}`)
     keyboard.text('🔺 Escalate', `esc:${t.id}`)
     // DIVE-503: second row — close the task out. ✅ Done is one-tap (reversible
     // by reopening); 🚫 Cancel is two-tap (tap once to arm → confirm) so a
     // fat-finger can't kill a task. Only shown while the task is still open.
-    keyboard.row()
-    keyboard.text('✅ Done', `tdone:${t.id}`).text('🚫 Cancel', `tcancel:${t.id}`)
+    // DIVE-4949: and HIDDEN while a gate is live. Both verbs refuse over an open
+    // gate (DIVE-555, DIVE-2773); DIVE-3340 kept them on screen only because the
+    // answer route was not on this card. It is now, so a button that can only be
+    // refused is gone.
+    if (!gateLive) {
+      keyboard.row()
+      keyboard.text('✅ Done', `tdone:${t.id}`).text('🚫 Cancel', `tcancel:${t.id}`)
+    }
   }
-  return { text: lines.join('\n'), keyboard }
+  // DIVE-4949: link buttons, on every row including closed ones (a done row's PR
+  // is exactly what a reader opens it for). URL buttons need no callback handler.
+  // Open PR only with a delivery_ref — most rows have no PR (amendment 1).
+  const prUrl = deliveryUrl(t)
+  keyboard.row()
+  if (prUrl) keyboard.url('🔗 Open PR', prUrl)
+  keyboard.url('🗂 Dashboard', DASHBOARD_TASKS_URL)
+  return { text, keyboard }
 }
 
 for (const def of COMMAND_REGISTRY) {
@@ -4887,6 +4939,80 @@ bot.on('callback_query:data', async ctx => {
       await ctx.editMessageText(detail.text, { reply_markup: detail.keyboard }).catch(() => {})
     } catch {}
     await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
+  // DIVE-4949: a gate answered from its /task_<id> card. `gans:<id>:<token>:<tag>` —
+  // token is the option INDEX (or approved/denied), tag pins the option list the
+  // card was rendered with. resolveCardTap re-reads the LIVE row and refuses a gate
+  // that has since been answered, re-routed, raised to tier 2 or re-optioned, so a
+  // stale card can never answer with a meaning the human did not see. The answer
+  // rides the same --channel-proof rail as /inbox's gclear: tap; the CLI honours it
+  // for tier<2 only, so the tier rule is enforced there, not copied here. No
+  // --channel-msg: that flag attests a message the human TYPED, and a tap is not one.
+  const gansM = GANS_RE.exec(data)
+  if (gansM) {
+    const taskId = gansM[1]!
+    try {
+      const show = await read5diveJson(['--json', 'task', 'show', taskId])
+      const r = resolveCardTap(show?.data?.task, gansM[2]!, gansM[3]!)
+      if (r.kind === 'stale') {
+        await ctx.answerCallbackQuery({ text: r.toast }).catch(() => {})
+      } else {
+        const extraArgs = tapEvidenceArgs(null, {
+          uid: ctx.callbackQuery.from?.id,
+          username: ctx.callbackQuery.from?.username,
+          messageId: ctx.callbackQuery.message?.message_id,
+          osUser: process.env.USER,
+        })
+        extraArgs.push(`--channel-proof=${senderId}`)
+        await write5diveJson(['--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], 8000)
+        await ctx.answerCallbackQuery({ text: `Answered: ${r.ack.length > 150 ? r.ack.slice(0, 149) + '…' : r.ack}` }).catch(() => {})
+      }
+    } catch (e) {
+      await ctx.answerCallbackQuery({ text: tapFailText("Couldn't answer", e) }).catch(() => {})
+    }
+    // Re-render either way: on success the gate block and its buttons are gone; on a
+    // stale tap the card now shows the gate as it really is.
+    try {
+      const detail = await buildTaskDetail(Number(taskId))
+      await ctx.editMessageText(detail.text, { reply_markup: detail.keyboard }).catch(() => {})
+    } catch {}
+    return
+  }
+
+  // DIVE-4949: a tier-2 gate's card button. The plugin mints nothing (DIVE-950):
+  // it asks the CLI to re-send THAT gate's own alert, whose nonce buttons the CLI
+  // mints and seals, so it lands straight under the card with one provenance.
+  const grsM = GRESEND_RE.exec(data)
+  if (grsM) {
+    const taskId = grsM[1]!
+    try {
+      const j = await write5diveJson(
+        ['task', 'inbox', '--send', `--only=${taskId}`, `--channel-proof=${senderId}`, '--json'],
+        15000,
+      )
+      await ctx.answerCallbackQuery({
+        text: j?.data?.sent ? '🔐 Sent — the answer buttons are in the message below.' : 'This gate is no longer waiting on you.',
+      }).catch(() => {})
+    } catch (e) {
+      await ctx.answerCallbackQuery({ text: tapFailText("Couldn't send the gate's buttons — run /inbox", e) }).catch(() => {})
+    }
+    return
+  }
+
+  // DIVE-4949: ⏰ Wake now on a parked row — `task unpark` clears the park early.
+  const twM = TWAKE_RE.exec(data)
+  if (twM) {
+    const taskId = twM[1]!
+    try {
+      await execFileP(SUDO, ['-n', '5dive', 'task', 'unpark', taskId], { timeout: 8000 })
+      await ctx.answerCallbackQuery({ text: '⏰ Woken — the owner picks it up on its next turn.' }).catch(() => {})
+      const detail = await buildTaskDetail(Number(taskId))
+      await ctx.editMessageText(detail.text, { reply_markup: detail.keyboard }).catch(() => {})
+    } catch (e) {
+      await ctx.answerCallbackQuery({ text: tapFailText("Couldn't wake it", e) }).catch(() => {})
+    }
     return
   }
 
