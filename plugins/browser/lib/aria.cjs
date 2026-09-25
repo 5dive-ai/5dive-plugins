@@ -419,6 +419,18 @@ function _textIn() {
   return parts.join('\n').replace(/[ \t]+/g, ' ');
 }
 
+// The ONE element a verify is graded on (DIVE-4984): a Sent list is read at its
+// newest row, so an older message with the same subject further down cannot
+// stand in for the one just sent. The first match in document order, or null —
+// and null is a miss, never "grade the whole page instead".
+function _scopeIn(arg) {
+  var el = null;
+  try { el = document.querySelector(String(arg.scope || '')); } catch (e) { el = null; }
+  if (!el) return null;
+  return { html: String(el.outerHTML || ''),
+           text: String(el.innerText || el.textContent || '').replace(/[ \t]+/g, ' ') };
+}
+
 async function visibleNow(page, target) {
   if (isRef(target)) {
     const want = refBody(target);
@@ -471,14 +483,26 @@ function expectRe(p) {
 // The read that matched is the one returned, so the page.html and page.png that
 // ship are the instant the toast was on screen. `waitFor` is `--wait-for`, and
 // `walk` adds the refs, so an act leaves the same triple a snapshot does.
+// `scope` (DIVE-4984) narrows the read to one element: `run`'s in-session verify.
 async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 30000,
-                                 expect = null, expectWaitMs = 0, pollMs = 250, walk: walkOpts = null } = {}) {
+                                 expect = null, expectWaitMs = 0, pollMs = 250, walk: walkOpts = null,
+                                 scope = null } = {}) {
   const waited = waitFor ? await waitForVisible(page, waitFor, { timeoutMs: waitTimeoutMs, pollMs }) : null;
   if (settleMs > 0) { try { await page.waitForTimeout(settleMs); } catch (e) { /* the read still runs */ } }
   const readNow = async () => {
     const o = { url: '', title: '', html: '', text: '' };
     try { o.url = String(await page.url()); } catch (e) { /* recorded empty */ }
     try { o.title = String(await page.title()); } catch (e) { /* recorded empty */ }
+    if (scope) {
+      // SCOPED (DIVE-4984): the document and the text are that one element's, so
+      // what bin/browser greps cannot reach past it. Not found reads as empty.
+      let hit = null;
+      try { hit = await page.evaluate(_scopeIn, { scope, scopeOf: true }); } catch (e) { hit = null; }
+      o.html = hit ? String(hit.html || '') : '';
+      o.text = hit ? String(hit.text || '') : '';
+      o.scope = { selector: scope, found: !!hit };
+      return o;
+    }
     try { o.html = String(await page.content()); } catch (e) { /* recorded empty */ }
     try { o.text = String(await page.evaluate(_textIn, { textOf: true }) || ''); } catch (e) { /* recorded empty */ }
     return o;
@@ -517,4 +541,4 @@ function render(nodes, { json = false } = {}) {
 module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
   resolveRefWithin, resolveStepSelector, isRef, render, REF_PREFIX,
   classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER,
-  waitForVisible, _visibleIn, _textIn };
+  waitForVisible, _visibleIn, _textIn, _scopeIn };
