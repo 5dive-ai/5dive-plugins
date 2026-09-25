@@ -116,6 +116,10 @@ E_USAGE=64; E_UNAVAILABLE=69; E_PERM=77; E_COLD=75
 # stopped before it. Distinct from every refusal above because the fix is not a
 # login, a box repair or a retry — it is a person saying yes (DIVE-4943).
 E_NEEDS_OWNER=73
+# 76: the capture is of a page that was NOT READY — a known loading screen, or a
+# --wait-for that never appeared (DIVE-4983). Not 75: the session is fine and
+# re-authenticating would change nothing. The fix is to wait for the page.
+E_NOT_READY=76
 
 # THE PUBLIC PROFILE (DIVE-4943 scope 5). The browser used to do nothing at all on a
 # box with zero connected sites: every page verb took a <site>, and a <site> with no
@@ -180,12 +184,19 @@ usage() {
   host's connected login if there is exactly one, the PUBLIC profile (nothing
   logged in) if there is none. Nothing has to be connected to use the browser.
   5dive browser snapshot <url> --interactive   # what is on the page, with refs
+                                      # --wait-for=<css|ref=…|text=…> captures once the
+                                      # page shows it, not at the settle. A known
+                                      # loading screen, or a --wait-for that never came,
+                                      # is NOT the page: exit 76, partial: true.
   5dive browser act <url> --steps='[{"op":"click","selector":"ref=button/Star"}]'
                                       # click / fill / select / press on refs, in one
                                       # tab under one lease; --expect=<regex> grades
-                                      # the page the steps left. Paying, posting,
-                                      # sending and deleting STOP (exit 73) and name
-                                      # the owner's ask; re-run with --approved=<id>.
+                                      # the page the steps left, re-read for up to
+                                      # --expect-wait ms (5000) so a toast counts. It
+                                      # leaves page.md and tree.json like a snapshot.
+                                      # Paying, posting, sending and deleting STOP
+                                      # (exit 73) and name the owner's ask; re-run
+                                      # with --approved=<id>.
   sudo 5dive browser approvals        # the owner: what agents are waiting to be allowed
   sudo 5dive browser approve <id> [--deny]
                                       # the owner's yes: those exact steps, once, 30 min
@@ -265,15 +276,17 @@ usage() {
                                       # at a time: two in one logged-in profile
                                       # overwrite each other and read as flakiness.
                                       # A person at the viewer PREEMPTS an agent.
-  5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json]
+  5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--wait-for=<target>]
                                       # ONE cycle, one page instant: the refs, the
                                       # document and a PNG of the same tab. What `tree`,
                                       # `read` and `shot` give you in three browser
                                       # cycles of three different instants — use this
                                       # when you are about to DECIDE what to do next.
-  5dive browser read <site> <url> [--out=<dir>] [--json]
+  5dive browser read <site> <url> [--out=<dir>] [--json] [--wait-for=<target>]
                                       # one authenticated render -> page.md,
-                                      # page.html and page.meta.json
+                                      # page.html and page.meta.json. Never waits
+                                      # past FIVEDIVE_BROWSER_READ_CAP_MS (30000) of
+                                      # real time: what loaded by then, partial: true
   5dive browser links <site> <url> [--out=<dir>]
                                       # same evidence triple; print article links only
 
@@ -2407,10 +2420,11 @@ _daemon_call() {  # _daemon_call <profile-dir> <request-json>
 # chrome asked for --screenshot and --dump-dom gives whichever that build likes);
 # here the same page object answers both, so the DOM really is the DOM of the
 # image, which the cold path cannot promise.
-_daemon_render() {  # _daemon_render <dir> <url> <w> <h> <full> <wait-ms>
+_daemon_render() {  # _daemon_render <dir> <url> <w> <h> <full> <wait-ms> [<wait-for>]
   _daemon_call "$1" "$(jq -nc --arg u "$2" --argjson w "$3" --argjson h "$4" \
-      --argjson f "$5" --argjson t "$6" --argjson l "$(_daemon_lease_json)" \
-      '{op:"render", url:$u, width:$w, height:$h, full:$f, wait:$t} + $l')"
+      --argjson f "$5" --argjson t "$6" --arg wf "${7:-}" --argjson l "$(_daemon_lease_json)" \
+      '{op:"render", url:$u, width:$w, height:$h, full:$f, wait:$t}
+       + (if $wf == "" then {} else {wait_for:$wf} end) + $l')"
 }
 
 _daemon_lease_json() {
@@ -3356,8 +3370,13 @@ _read_output_dir() { # _read_output_dir <site> <explicit-or-empty> <profile-dir>
 # about the evidence, and "dump-dom" and "snapshot" are genuinely different reads
 # of a live page — the snapshot is the DOM the agent acted against, the dump-dom
 # is a second load of the same URL.
-_derive_capture() { # _derive_capture <stage> <url> <chrome> <capture-kind>
-  local stage="$1" url="$2" chrome="$3" capture="$4"
+#
+# <extra-json> (DIVE-4983) is merged into the metadata: `partial`, `wait_for` and
+# `loading_screen`, and the two a reader must not miss are repeated in page.md's
+# front matter, because page.md is the file an agent actually opens.
+_derive_capture() { # _derive_capture <stage> <url> <chrome> <capture-kind> [<extra-json>]
+  local stage="$1" url="$2" chrome="$3" capture="$4" extra="${5:-}"
+  [[ -n "$extra" ]] || extra='{}'
   if ! node "$READ_EXTRACTOR" --url="$url" <"$stage/page.html" >"$stage/extracted.json"; then
     die "$E_UNAVAILABLE" "the pinned Defuddle extractor rejected the captured DOM; no evidence files were written"
   fi
@@ -3375,29 +3394,115 @@ _derive_capture() { # _derive_capture <stage> <url> <chrome> <capture-kind>
   if [[ -n "$chrome" ]]; then chrome_version="$($chrome --version 2>/dev/null | head -1)"; fi
   [[ -n "$chrome_version" ]] || chrome_version="unknown"
   jq --arg retrieved_at "$retrieved" --arg sha256 "$sha" \
-     --arg chrome_version "$chrome_version" --arg capture "$capture" \
-     '. + {retrieved_at:$retrieved_at, sha256:$sha256, chrome_version:$chrome_version, capture:$capture}' \
+     --arg chrome_version "$chrome_version" --arg capture "$capture" --argjson x "$extra" \
+     '. + {retrieved_at:$retrieved_at, sha256:$sha256, chrome_version:$chrome_version, capture:$capture} + $x' \
      "$stage/extracted.json" >"$stage/full.json" || die "$E_UNAVAILABLE" "could not assemble page metadata"
   jq 'del(.markdown, .site)' "$stage/full.json" >"$stage/page.meta.json"
 
   {
     printf '%s\n' '---'
-    jq -r '"url: " + (.url | @json), "canonical_url: " + (.canonical_url | @json), "title: " + (.title | @json), "description: " + (.description | @json), "author: " + (.author | @json), "published: " + (.published | @json), "retrieved_at: " + (.retrieved_at | @json), "word_count: " + (.word_count | tostring)' "$stage/full.json"
+    jq -r '"url: " + (.url | @json), "canonical_url: " + (.canonical_url | @json), "title: " + (.title | @json), "description: " + (.description | @json), "author: " + (.author | @json), "published: " + (.published | @json), "retrieved_at: " + (.retrieved_at | @json), "word_count: " + (.word_count | tostring), (if .partial == true then "partial: true" else empty end), (if .loading_screen then "loading_screen: " + (.loading_screen | @json) else empty end)' "$stage/full.json"
     printf '%s\n\n' '---'
     jq -r '.markdown' "$stage/full.json"
   } >"$stage/page.md"
 }
 
+# ---- NOT READY IS NOT THE PAGE (DIVE-4983) -----------------------------------
+#
+# KNOWN LOADING SCREENS. A web app answers domcontentloaded with a splash, and a
+# capture taken then is the splash handed back as the page: `snapshot` on the
+# Gmail inbox printed "4 addressable node(s)" with rc 0, and the four were help
+# links and "Try reloading the page". Nothing in that output told an agent it was
+# not the inbox. A splash listed here is NAMED — on stderr, in page.meta.json and
+# in page.md — and the verb exits E_NOT_READY instead of 0.
+#
+# ONE ROW PER SCREEN, so adding a site is one line:
+#     <name>|<host ERE>|<text ERE, grep -iE over page.html>|<max interactive nodes>
+# The node bound is what separates the splash from the loaded app, which may keep
+# the same sentence in a hidden element: the splash offers a handful of links, the
+# inbox hundreds. It counts refs of interactive roles (tree.json) where the verb
+# has them, and interactive tags in page.html where it does not (`read`).
+LOADING_SCREENS=(
+  'gmail|^mail\.google\.com$|having trouble loading|5'
+)
+
+_interactive_roles() {
+  node -e 'process.stdout.write(JSON.stringify(require(process.argv[1]).INTERACTIVE))' \
+    "$_SELF_DIR/../lib/aria.cjs" 2>/dev/null || printf '[]'
+}
+
+_loading_screen() {  # _loading_screen <url> <page.html> [<tree.json>] -> "<name> <nodes>", or rc 1
+  local host="${1#*://}" html="$2" tree="${3:-}" row name hre tre max n
+  host="${host%%/*}"; host="${host%%\?*}"; host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
+  for row in "${LOADING_SCREENS[@]}"; do
+    IFS='|' read -r name hre tre max <<<"$row"
+    [[ "$host" =~ $hre ]] || continue
+    grep -qiE -- "$tre" "$html" 2>/dev/null || continue
+    if [[ -n "$tree" && -s "$tree" ]]; then
+      n=$(jq --argjson r "$(_interactive_roles)" '[.nodes[]? | select(.role as $x | $r | index($x))] | length' "$tree" 2>/dev/null)
+    else
+      n=$(grep -oiE '<(a|button|input|select|textarea)[[:space:]>]' "$html" 2>/dev/null | wc -l)
+    fi
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n <= max )) || continue
+    printf '%s %s\n' "$name" "$n"
+    return 0
+  done
+  return 1
+}
+
+_wait_for_ok() { [[ -n "$1" && ${#1} -le 500 && "$1" != *$'\n'* ]]; }
+
+# _ready_verdict <url> <wait-for> <wait-json|null> <page.html> [<tree.json>] [<partial>]
+# Prints the metadata fragment (partial / wait_for / loading_screen) on stdout and
+# says why on stderr. Returns E_NOT_READY when what was captured is not the page.
+#
+# A --wait-for the capture did not ANSWER is not a met one: a served browser whose
+# daemon started before this release ignores the field and captures at the
+# settle, which is the very defect this exists to end. It is named, not trusted.
+_ready_verdict() {
+  local url="$1" want="$2" got="${3:-null}" html="$4" tree="${5:-}" partial="${6:-false}" screen="" rc=0
+  [[ -n "$got" ]] || got=null
+  if [[ -n "$want" && "$got" == null ]]; then
+    printf '%s: NOT READY — --wait-for was not honoured: the served browser for this profile runs a session daemon from before --wait-for existed, and it captured at the settle instead. Restart it (serve <site> --stop, then serve <site>) and run this again.\n' "$PROG" >&2
+    got=$(jq -nc --arg t "$want" '{target:$t, met:false, honoured:false}')
+    partial=true; rc=$E_NOT_READY
+  elif [[ -n "$want" && "$(jq -r '.met' <<<"$got")" != true ]]; then
+    printf '%s: NOT READY — --wait-for=%s did not appear within %s ms. What was captured is the page as it stood then (partial: true), not the page you waited for.\n' \
+      "$PROG" "$want" "$(jq -r '.waited_ms' <<<"$got")" >&2
+    partial=true; rc=$E_NOT_READY
+  fi
+  if screen=$(_loading_screen "$url" "$html" "$tree"); then
+    printf '%s: LOADING SCREEN — %s is still showing the %s loading page (%s interactive nodes). This capture is NOT the page you asked for. Run it again with --wait-for=<something the loaded page has>, e.g. --wait-for='"'"'[role=main]'"'"'.\n' \
+      "$PROG" "$url" "${screen% *}" "${screen##* }" >&2
+    partial=true; rc=$E_NOT_READY
+  else
+    screen=""
+  fi
+  jq -nc --argjson p "$partial" --argjson w "$got" --arg s "${screen% *}" \
+    '(if $p then {partial:true} else {} end) + (if $w == null then {} else {wait_for:$w} end) + (if $s == "" then {} else {loading_screen:$s} end)'
+  return "$rc"
+}
+
+# THE COLD read's WALL CLOCK (DIVE-4983). --wait is Chrome's VIRTUAL time, and
+# virtual time does not advance while a request is pending — so on a page that
+# long-polls it never runs out: `read` of the Gmail inbox was still running when
+# `timeout 200` killed it, and wrote nothing. Chrome is now told to stop loading
+# and dump what it has at this many real milliseconds (--timeout), and is killed
+# a few seconds after that if it does not; a dump taken at the cap is `partial`.
+READ_CAP_DEFAULT=30000
+
 _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
   local kind="$1"; shift
-  local site="" url="" out="" json=0 wait="$READ_WAIT_DEFAULT"
+  local site="" url="" out="" json=0 wait="$READ_WAIT_DEFAULT" wait_for=""
+  local cap="${FIVEDIVE_BROWSER_READ_CAP_MS:-$READ_CAP_DEFAULT}"
   while (($#)); do
     case "$1" in
       --out=*) out="${1#*=}" ;;
       --json) [[ "$kind" == read ]] || die "$E_USAGE" "--json belongs to browser read; browser links already prints JSON"; json=1 ;;
       --wait=*) wait="${1#*=}" ;;
+      --wait-for=*) wait_for="${1#*=}"; _wait_for_ok "$wait_for" || die "$E_USAGE" "--wait-for takes one CSS selector, ref=<role>/<name> or text=<words>" ;;
       -h|--help)
-        printf '%s %s <site> <url> [--out=<dir>]%s [--wait=<ms>]\n' "$PROG" "$kind" "$([[ "$kind" == read ]] && printf ' [--json]')"
+        printf '%s %s <site> <url> [--out=<dir>]%s [--wait=<ms>] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG" "$kind" "$([[ "$kind" == read ]] && printf ' [--json]')"
         return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
       *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
@@ -3407,12 +3512,16 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
   [[ -n "$site" && -n "$url" ]] || die "$E_USAGE" "usage: 5dive browser $kind <site> <url> [--out=<dir>]"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
   [[ "$wait" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--wait takes milliseconds; got: $wait"
+  [[ "$cap" =~ ^[0-9]{1,7}$ ]] && (( cap > 0 )) || die "$E_USAGE" "FIVEDIVE_BROWSER_READ_CAP_MS takes milliseconds; got: $cap"
   [[ -r "$READ_EXTRACTOR" ]] || die "$E_UNAVAILABLE" "the pinned page extractor is missing from this install ($READ_EXTRACTOR)"
   command -v node >/dev/null 2>&1 || die "$E_UNAVAILABLE" "node is required to run the pinned page extractor"
   command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to assemble the evidence metadata"
 
   # Authenticate BEFORE making the destination. A logged-out call writes
   # nothing — not even an empty output directory that looks like a failed read.
+  # --wait-for renders through a browser that can be ASKED what is on the page
+  # (--dump-dom cannot), so it takes the warm session when one is up.
+  [[ -z "$wait_for" ]] || _PG_WARM=1
   _page_open "$site" "$url"
   local dir="$_PG_DIR" chrome="$_PG_CHROME"
   out="$(_read_output_dir "$site" "$out" "$dir")" || exit $?
@@ -3423,27 +3532,56 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
 
   # One render, one source of truth. page.html is byte-for-byte stdout from this
   # invocation and every derived field below comes from that exact file.
-  local crc=0 capture=dump-dom
-  if (( _SITE_BROKERED )); then
+  local crc=0 capture=dump-dom partial=false waitj=null
+  if (( _SITE_BROKERED )) || { [[ -n "$wait_for" ]] && _daemon_live "$dir"; }; then
     capture=session-daemon
     local rj=""
-    rj=$(_daemon_render "$dir" "$url" 1280 800 false "$wait") || crc=$?
-    if (( crc == 0 )) && [[ -n "$rj" ]]; then jq -r '.html' <<<"$rj" > "$stage/page.html"; fi
+    rj=$(_daemon_render "$dir" "$url" 1280 800 false "$wait" "$wait_for") || crc=$?
+    if (( crc == 0 )) && [[ -n "$rj" ]]; then
+      jq -r '.html' <<<"$rj" > "$stage/page.html"; waitj=$(jq -c '.wait_for // null' <<<"$rj")
+    fi
     if (( crc != 0 )) || [[ ! -s "$stage/page.html" ]]; then
       die "$E_UNAVAILABLE" "the box session did not capture $url (it exited $crc; its own reason is above); no evidence files were written"
     fi
+  elif [[ -n "$wait_for" ]]; then
+    # COLD, AND ASKED TO WAIT: the executor opens the profile the way `snapshot`
+    # does, waits for the element, and hands back the document.
+    capture=playwright
+    local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}" rp=""
+    [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "read --wait-for renders through the executor (a --dump-dom cannot wait for an element), and there is none at $driver"
+    rp=$(FIVEDIVE_BROWSER_PROFILE="$dir" FIVEDIVE_BROWSER_CHROME="$(command -v "$chrome" 2>/dev/null || printf '%s' "$chrome")" \
+         FIVEDIVE_BROWSER_TREE_SETTLE_MS="${FIVEDIVE_BROWSER_TREE_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}" \
+         FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
+         "$driver" <<<"$(jq -nc --arg p "$dir" --arg u "$url" --arg h "$stage/page.html" --arg w "$wait_for" \
+           '{profile:$p, mode:"snapshot", url:$u, html:$h, shot:null, interactive:false, wait_for:$w}')") || crc=$?
+    waitj=$(jq -c '.wait_for // null' <<<"$rp" 2>/dev/null) || waitj=null
+    # The walk it took is what the loading-screen table counts, not tags in page.html.
+    jq -e '.nodes | type == "array"' <<<"$rp" >/dev/null 2>&1 && jq -c '{nodes}' <<<"$rp" > "$stage/tree.json"
+    if (( crc != 0 )) || [[ ! -s "$stage/page.html" ]]; then
+      die "$E_UNAVAILABLE" "the executor did not capture $url (it exited $crc; its own reason is above); no evidence files were written"
+    fi
   else
-    "$chrome" --headless --no-sandbox --disable-gpu \
-        --user-data-dir="$dir" --virtual-time-budget="$wait" \
+    local t0; t0=$(date +%s%N)
+    timeout -k 5 "$(( (cap + 999) / 1000 + 5 ))" "$chrome" --headless --no-sandbox --disable-gpu \
+        --user-data-dir="$dir" --timeout="$cap" --virtual-time-budget="$wait" \
         --dump-dom "$url" >"$stage/page.html" 2>"$stage/chrome.err"
     crc=$?
+    if (( crc == 124 || crc == 137 )); then
+      die "$E_NOT_READY" "$url never finished loading and Chrome did not stop at the ${cap} ms cap, so it was killed and returned nothing; no evidence files were written. A page that never goes quiet is read with --wait-for=<an element it has>, or with snapshot."
+    fi
     if (( crc != 0 )) || [[ ! -s "$stage/page.html" ]]; then
       die "$E_UNAVAILABLE" "the authenticated DOM capture produced no page (chrome exited $crc); no evidence files were written"
+    fi
+    if (( ($(date +%s%N) - t0) / 1000000 >= cap )); then
+      partial=true
+      printf '%s: NOTE — %s was still loading at the %s ms cap; this is what had loaded by then (partial: true in page.meta.json).\n' "$PROG" "$url" "$cap" >&2
     fi
   fi
 
   _signin_guard "$stage/page.html"
-  _derive_capture "$stage" "$url" "$chrome" "$capture"
+  local extra rrc=0
+  extra=$(_ready_verdict "$url" "$wait_for" "$waitj" "$stage/page.html" "$stage/tree.json" "$partial") || rrc=$?
+  _derive_capture "$stage" "$url" "$chrome" "$capture" "$extra"
 
   install -m 00600 "$stage/page.html" "$out/page.html" || die "$E_UNAVAILABLE" "cannot install page.html in $out"
   install -m 00600 "$stage/page.meta.json" "$out/page.meta.json" || die "$E_UNAVAILABLE" "cannot install page.meta.json in $out"
@@ -3463,7 +3601,7 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
   _shot_restore
   _lease_release
   trap - EXIT
-  return 0
+  return "$rrc"
 }
 
 cmd_read()  { _cmd_read_like read "$@"; }
@@ -3515,10 +3653,11 @@ _settle_json() {
 }
 
 cmd_snapshot() {
-  local site="" url="" out="" interactive=0 json=0 shot=1 full=0 wait="no" settle=""
+  local site="" url="" out="" interactive=0 json=0 shot=1 full=0 wait="no" settle="" wait_for=""
   while (($#)); do
     case "$1" in
       --out=*)  out="${1#*=}" ;;
+      --wait-for=*) wait_for="${1#*=}"; _wait_for_ok "$wait_for" || die "$E_USAGE" "--wait-for takes one CSS selector, ref=<role>/<name> or text=<words>" ;;
       --interactive) interactive=1 ;;
       --json)   json=1 ;;
       --no-shot) shot=0 ;;
@@ -3527,7 +3666,7 @@ cmd_snapshot() {
       --wait)   wait="$LEASE_WAIT_DEFAULT" ;;
       --wait=*) wait="${1#*=}" ;;
       -h|--help)
-        printf '%s snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full]\n' "$PROG"
+        printf '%s snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG"
         return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
       *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
@@ -3578,11 +3717,12 @@ cmd_snapshot() {
     local inline=0; (( _SITE_BROKERED )) && inline=1
     plan=$(jq -nc --arg u "$url" --arg h "$stage/page.html" --arg s "$png" \
         --argjson i "$interactive" --argjson f "$full" --argjson l "$(_daemon_lease_json)" \
-        --argjson n "$inline" --argjson st "$(_settle_json "$settle")" \
+        --argjson n "$inline" --argjson st "$(_settle_json "$settle")" --arg wf "$wait_for" \
         '{op:"snapshot", url:$u,
           html:(if $n==1 then null else $h end),
           shot:(if $n==1 then (if $s=="" then null else true end) elif $s=="" then null else $s end),
-          inline:($n==1), interactive:($i==1), full:($f==1)} + $st + $l')
+          inline:($n==1), interactive:($i==1), full:($f==1)}
+         + (if $wf == "" then {} else {wait_for:$wf} end) + $st + $l')
     payload=$(_daemon_call "$_PG_DIR" "$plan") \
       || die "$E_UNAVAILABLE" "the warm session could not capture $url (its own reason is above)."
     if (( inline )); then
@@ -3597,9 +3737,9 @@ cmd_snapshot() {
     [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver — snapshot reads the page through the same executor \`run\` acts through, inside the same profile."
     local chrome; chrome=$(command -v "$_PG_CHROME" 2>/dev/null || printf '%s' "$_PG_CHROME")
     plan=$(jq -nc --arg p "$_PG_DIR" --arg u "$url" --arg h "$stage/page.html" --arg s "$png" \
-        --argjson i "$interactive" --argjson f "$full" \
+        --argjson i "$interactive" --argjson f "$full" --arg wf "$wait_for" \
         '{profile:$p, mode:"snapshot", url:$u, html:$h, shot:(if $s=="" then null else $s end),
-          interactive:($i==1), full:($f==1)}')
+          interactive:($i==1), full:($f==1)} + (if $wf == "" then {} else {wait_for:$wf} end)')
     payload=$(FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
           FIVEDIVE_BROWSER_TREE_SETTLE_MS="${settle:-${FIVEDIVE_BROWSER_TREE_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}" \
           FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
@@ -3611,13 +3751,20 @@ cmd_snapshot() {
   [[ -s "$stage/page.html" ]] || die "$E_UNAVAILABLE" "the capture produced no document; no evidence files were written"
   _signin_guard "$stage/page.html" "$(jq -r '.url // ""' <<<"$payload" 2>/dev/null)"
 
-  # The SAME derivation `read` uses, over the bytes the walk above came from.
-  _derive_capture "$stage" "$url" "$_PG_CHROME" snapshot
-
   # tree.json is the refs, written from the same payload the walk returned — so
   # "what I can click" and "what the page said" are one observation on disk.
   jq '{url, title, nodes}' <<<"$payload" >"$stage/tree.json" \
     || die "$E_UNAVAILABLE" "the capture returned no addressable nodes; no evidence files were written"
+
+  # IS IT THE PAGE (DIVE-4983)? A splash or an unmet --wait-for still ships its
+  # evidence — the PNG is how a person sees what the agent got — but it is named
+  # as not ready, and the verb does not exit 0 on it.
+  local extra rrc=0
+  extra=$(_ready_verdict "$(jq -r '.url // ""' <<<"$payload")" "$wait_for" "$(jq -c '.wait_for // null' <<<"$payload")" \
+            "$stage/page.html" "$stage/tree.json") || rrc=$?
+
+  # The SAME derivation `read` uses, over the bytes the walk above came from.
+  _derive_capture "$stage" "$url" "$_PG_CHROME" snapshot "$extra"
 
   local f
   for f in page.html page.md page.meta.json tree.json; do
@@ -3646,17 +3793,22 @@ cmd_snapshot() {
   trap - EXIT
 
   if (( json )); then
-    jq -nc --argjson p "$payload" --arg o "$out" '$p + {artifacts:$o}'
-    return 0
+    jq -nc --argjson p "$payload" --arg o "$out" --argjson x "$extra" '$p + $x + {artifacts:$o}'
+    return "$rrc"
   fi
   printf '%s\n' "$title"
   printf '  %s\n' "$final"
-  printf '  %s addressable node(s); one page instant, one capture\n' "$nodes"
+  if (( rrc )); then
+    printf '  %s addressable node(s) — NOT the page: see the reason above (partial: true)\n' "$nodes"
+  else
+    printf '  %s addressable node(s); one page instant, one capture\n' "$nodes"
+  fi
   printf '  %s\n' "$out"
   printf '    page.md         what the page says (the pinned extractor, over page.html)\n'
   printf '    tree.json       what you can act on: ref=<role>/<name>[#n]\n'
   printf '    page.html       the document the two above came from\n'
   (( shot )) && [[ -s "$out/page.png" ]] && printf '    page.png        the same tab, the same instant\n'
+  (( rrc )) && return "$rrc"
   printf '%s: one browser cycle for all of it — quote a ref straight into `run`.\n' "$PROG" >&2
   return 0
 }
@@ -3689,6 +3841,9 @@ cmd_snapshot() {
 # from a fresh load.
 ACT_VOCAB='goto fill click wait_for select press'
 ACT_MAX_STEPS=40
+# How long --expect is re-read after the last step before NOT VERIFIED
+# (DIVE-4983): a toast lands a second or two after the click that caused it.
+ACT_EXPECT_WAIT_DEFAULT=5000
 
 _approval_dir() {  # _approval_dir [<seat>] — where a seat's pending asks and grants live
   local seat="${1:-$(_seat)}" home
@@ -3723,8 +3878,12 @@ _act_grant_ok() {  # _act_grant_ok <id> <hash> -> 0 if a live grant for exactly 
 
 cmd_act() {
   local site="" url="" steps="" expect="" approved="" out="" json=0 wait="no" settle="" shot=1
+  local wait_for="" interactive=0 expect_wait="${FIVEDIVE_BROWSER_EXPECT_WAIT_MS:-$ACT_EXPECT_WAIT_DEFAULT}"
   while (($#)); do
     case "$1" in
+      --wait-for=*) wait_for="${1#*=}"; _wait_for_ok "$wait_for" || die "$E_USAGE" "--wait-for takes one CSS selector, ref=<role>/<name> or text=<words>" ;;
+      --expect-wait=*) expect_wait="${1#*=}" ;;
+      --interactive) interactive=1 ;;
       --steps=*)    steps="${1#*=}" ;;
       --steps-file=*) [[ -r "${1#*=}" ]] || die "$E_USAGE" "cannot read ${1#*=}"; steps="$(cat -- "${1#*=}")" ;;
       --expect=*)   expect="${1#*=}" ;;
@@ -3736,8 +3895,9 @@ cmd_act() {
       --wait)       wait="$LEASE_WAIT_DEFAULT" ;;
       --wait=*)     wait="${1#*=}" ;;
       -h|--help)
-        printf '%s act [<site>] <url> --steps=<json> [--expect=<regex>] [--approved=<id>] [--out=<dir>] [--json]\n' "$PROG"
+        printf '%s act [<site>] <url> --steps=<json> [--expect=<regex>] [--expect-wait=<ms>] [--wait-for=<selector|ref=…|text=…>] [--interactive] [--approved=<id>] [--out=<dir>] [--json]\n' "$PROG"
         printf '  <url> may be omitted to continue on the page a served browser is already on.\n'
+        printf '  --expect is re-read for up to --expect-wait ms (default %s) before NOT VERIFIED.\n' "$ACT_EXPECT_WAIT_DEFAULT"
         return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
       *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
@@ -3747,6 +3907,8 @@ cmd_act() {
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
   [[ -z "$settle" || "$settle" =~ ^[0-9]{1,7}$ ]] || die "$E_USAGE" "--settle takes milliseconds; got: $settle"
   [[ -z "$approved" || "$approved" =~ ^[a-z0-9._-]+-[0-9a-f]{12}$ ]] || die "$E_USAGE" "--approved takes the id a refusal printed; got: $approved"
+  [[ "$expect_wait" =~ ^[0-9]{1,6}$ ]] || die "$E_USAGE" "--expect-wait takes milliseconds; got: $expect_wait"
+  [[ -n "$expect" ]] || expect_wait=0
   command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to read the steps"
 
   # THE STEPS, VALIDATED HERE AND AGAIN BY THE EXECUTOR. `upload` is not in the
@@ -3803,16 +3965,23 @@ cmd_act() {
   out="$(_read_output_dir "$site" "$out" "$_PG_DIR")" || exit $?
   local stage; stage="$(mktemp -d /tmp/5dive-browser-read.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the act's re-read"
   _READ_STAGE="$stage"; trap '_read_cleanup' EXIT
-  local errf="$stage/exec.err" drc=0 payload="" plan
+  local errf="$stage/exec.err" drc=0 payload="" plan report
+  # WHAT THE RE-READ AFTER THE LAST STEP WAITS FOR (DIVE-4983), the same for both
+  # executors: --wait-for, then the settle, then --expect polled for its window.
+  report=$(jq -nc --arg wf "$wait_for" --arg e "$expect" --argjson ew "$expect_wait" --argjson i "$interactive" \
+    '{interactive:($i==1), expect_wait_ms:$ew} + (if $wf == "" then {} else {wait_for:$wf} end)
+     + (if $e == "" then {} else {expect:$e} end)')
   if _daemon_live "$_PG_DIR"; then
     plan=$(jq -nc --argjson s "$steps" --argjson a "$is_approved" --argjson sh "$shot" \
-        --argjson l "$(_daemon_lease_json)" --argjson st "$(_settle_json "$settle")" \
-        '{op:"plan", steps:$s, args:{}, literal:true, guard:true, approved:$a, report:{shot:($sh==1)}} + $st + $l')
+        --argjson l "$(_daemon_lease_json)" --argjson st "$(_settle_json "$settle")" --argjson r "$report" \
+        '{op:"plan", steps:$s, args:{}, literal:true, guard:true, approved:$a,
+          report:({shot:($sh==1), tree:true} + $r)} + $st + $l')
     payload=$(_daemon_call "$_PG_DIR" "$plan" 2>"$errf") || drc=$?
     local rep; rep=$(grep -F '"act_report":true' <<<"$payload" | tail -1)
     if [[ -n "$rep" ]]; then
       jq -r '.html_inline // ""' <<<"$rep" > "$stage/page.html"
-      jq -c '{url, title}' <<<"$rep" > "$stage/after.json"
+      jq -c '{url, title, text, wait_for, expect_polled_ms}' <<<"$rep" > "$stage/after.json"
+      jq -e '.nodes | type == "array"' <<<"$rep" >/dev/null 2>&1 && jq -c '{url, title, nodes}' <<<"$rep" > "$stage/tree.json"
       if (( shot )); then jq -r '.png_b64 // ""' <<<"$rep" | base64 -d > "$stage/page.png" 2>/dev/null || :; fi
     fi
   else
@@ -3822,8 +3991,9 @@ cmd_act() {
     local png=""; (( shot )) && png="$stage/page.png"
     plan=$(jq -nc --arg p "$_PG_DIR" --argjson s "$steps" --argjson a "$is_approved" \
         --arg h "$stage/page.html" --arg m "$stage/after.json" --arg sh "$png" \
+        --arg t "$stage/tree.json" --argjson r "$report" \
         '{profile:$p, steps:$s, args:{}, literal:true, guard:true, approved:$a,
-          report:{html:$h, meta:$m, shot:(if $sh=="" then null else $sh end)}}')
+          report:({html:$h, meta:$m, tree:$t, shot:(if $sh=="" then null else $sh end)} + $r)}')
     FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
       FIVEDIVE_BROWSER_RUN_SETTLE_MS="${settle:-${FIVEDIVE_BROWSER_RUN_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}" \
       FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
@@ -3839,7 +4009,7 @@ cmd_act() {
   fi
 
   local f
-  for f in page.html page.png after.json; do
+  for f in page.html page.png after.json tree.json; do
     [[ -s "$stage/$f" ]] && install -m 00600 "$stage/$f" "$out/$f"
   done
   local final title
@@ -3883,16 +4053,43 @@ cmd_act() {
 
   _signin_guard "$stage/page.html" "$final"
 
+  # THE SAME TRIPLE A SNAPSHOT LEAVES (DIVE-4983): page.md and page.meta.json from
+  # the page the steps left, beside the tree.json the executor walked. Never
+  # fatal — the steps already ran, and their verdict below must still be printed.
+  local extra="{}" rrc=0
+  if [[ -s "$stage/page.html" ]]; then
+    extra=$(_ready_verdict "$final" "$wait_for" "$(jq -c '.wait_for // null' "$stage/after.json" 2>/dev/null || echo null)" \
+              "$stage/page.html" "$stage/tree.json") || rrc=$?
+    if [[ -r "$READ_EXTRACTOR" ]] && _have node \
+       && ( _derive_capture "$stage" "${final:-$url}" "$_PG_CHROME" act "$extra" ) 2>"$stage/derive.err"; then
+      for f in page.md page.meta.json; do install -m 00600 "$stage/$f" "$out/$f"; done
+    else
+      printf '%s: NOTE — page.md was not derived from the page after the steps (%s); page.html is.\n' \
+        "$PROG" "$(tail -1 "$stage/derive.err" 2>/dev/null || echo 'no extractor')" >&2
+    fi
+  fi
+
+  # --expect is graded against the document AND the text a person could read,
+  # toasts and live regions included — the executor polled for it for
+  # --expect-wait ms, and the capture it shipped is the read that matched.
   local verdict rc
   if [[ -n "$expect" ]]; then
-    if [[ -s "$out/page.html" ]] && grep -qiE -- "$expect" "$out/page.html"; then verdict=verified; rc=0
+    # No pipe into `grep -q`: under pipefail its early exit SIGPIPEs the writer on
+    # a large page, and a page that matched would read as NOT VERIFIED.
+    if [[ -s "$out/page.html" ]] && { grep -qiE -- "$expect" "$out/page.html" \
+         || grep -qiE -- "$expect" <<<"$(jq -r '.text // ""' "$stage/after.json" 2>/dev/null)"; }; then verdict=verified; rc=0
     else verdict=not_verified; rc=1; fi
   else
     verdict=$([[ "$drc" == 0 ]] && echo executed || echo step_failed); rc=$(( drc == 0 ? 0 : 1 ))
   fi
+  # NOT READY outranks "executed" and "not verified": the steps may be fine and
+  # the page simply never loaded, and re-running the steps is not the fix.
+  if (( rrc )) && [[ "$verdict" == executed || "$verdict" == not_verified ]]; then
+    verdict=not_ready; rc=$E_NOT_READY
+  fi
   if (( json )); then
-    jq -nc --arg v "$verdict" --arg u "$final" --arg t "$title" --arg o "$out" --argjson d "$drc" \
-      '{verdict:$v, url:$u, title:$t, executor_rc:$d, artifacts:$o}'
+    jq -nc --arg v "$verdict" --arg u "$final" --arg t "$title" --arg o "$out" --argjson d "$drc" --argjson x "$extra" \
+      '{verdict:$v, url:$u, title:$t, executor_rc:$d, artifacts:$o} + $x'
     return "$rc"
   fi
   printf '%s\n  %s\n  %s\n' "$title" "$final" "$out"
@@ -3901,6 +4098,7 @@ cmd_act() {
     not_verified) printf '%s: NOT VERIFIED — the executor exited %s, but the page after the steps does not match --expect. Look at %s/page.png before retrying: if it went through and we misread, a retry does it twice.\n' "$PROG" "$drc" "$out" >&2 ;;
     executed)     printf 'done: every step ran. Nothing re-graded it (no --expect) — read %s/page.png or snapshot the page before you report success.\n' "$out" ;;
     step_failed)  printf '%s: a step failed (the executor exited %s). Some steps may have run; look at %s/page.png before retrying.\n' "$PROG" "$drc" "$out" >&2 ;;
+    not_ready)    printf '%s: NOT READY — every step ran, but the page they left is not ready (the reason is above). Look at %s/page.png; wait for the page, do not re-run the steps.\n' "$PROG" "$out" >&2 ;;
   esac
   return "$rc"
 }

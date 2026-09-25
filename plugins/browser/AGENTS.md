@@ -112,8 +112,11 @@ name it: `5dive browser act github.com_work <url> --steps=…`.
 
 Steps are `goto fill click wait_for select press`, run in order, in one tab. Without a URL,
 `act` continues on the page a served browser is holding. `--expect=<regex>` is graded against
-the page as the steps left it; without it the command only says the steps ran — look at the
-`page.png` it writes before you tell anyone it worked.
+the page as the steps left it, re-read for up to 5 s (`--expect-wait=<ms>`) so a toast that lands
+after the click counts, and it matches the text on screen as well as the document. Without it the
+command only says the steps ran — look at the `page.png` it writes before you tell anyone it
+worked. `act` also writes `tree.json` and `page.md` of the page it left, so you do not need a
+second `snapshot` to read the refs there.
 
 **Paying, posting, sending and deleting are the owner's call.** `act` stops in front of any
 such button (read off the live page, whatever selector you used; Ctrl/Cmd+Enter counts as
@@ -151,6 +154,22 @@ at `--settle=6000`. Raise the settle to orient; for an element that is genuinely
 `wait_for` step in the adapter, which now polls for the whole step timeout on a `ref=` selector just
 as it always did on a CSS one. The settle is paid on every run; a `wait_for` costs only what the
 page takes.
+
+**A web app answers with a loading screen first. Wait for the real page.** `snapshot`, `read`
+and `act` take `--wait-for=<target>` — a CSS selector, `ref=<role>/<name>`, or `text=<words>` —
+and capture once the page shows it:
+
+```bash
+5dive browser snapshot https://mail.google.com/mail/u/0/#inbox --interactive --wait-for='[role=main]'
+```
+
+**Exit 76 means the capture is NOT the page:** a known loading screen (Gmail's splash is one;
+the output says `LOADING SCREEN`), or a `--wait-for` that never appeared. `page.meta.json` and
+`page.md` say `partial: true`. Do not read refs or text out of it and do not report it as the
+page; run it again with a `--wait-for` the loaded page has. 76 is not 75: the login is fine,
+so do not ask anyone to log in, and do not re-run an `act`'s steps — they already ran.
+`read` stops at 30 s of real time on a page that never goes quiet and marks what it got
+`partial: true`.
 
 ## What will actually go wrong
 

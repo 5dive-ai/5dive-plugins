@@ -371,18 +371,132 @@ async function stepRisk(page, step, sel) {
   const cls = classifyLabel(label);
   return cls ? { cls, label } : null;
 }
+// ---- READY, NOT SETTLED (DIVE-4983) -----------------------------------------
+//
+// A settle is a guess at how long a page takes, and on a web app it is the wrong
+// guess. Gmail answers domcontentloaded with its loading splash: `snapshot
+// --interactive` on the inbox printed 4 nodes (help-centre links, "Try reloading
+// the page") with rc 0, twice, and the loaded inbox was never captured by any
+// verb. The caller usually knows what the real page has — `[role=main]`, a
+// Compose button — so the capture can wait for the page to SAY it is ready.
+//
+// THE TARGET, in three shapes:
+//   ref=<role>/<name>[#n]  the ref `snapshot` prints; ready when the walk lists it
+//   text=<words>           ready when the visible text contains it (any case)
+//   anything else          a CSS selector with a rendered match — and a bare word
+//                          that matches no element (`Compose`) is also looked for
+//                          as visible text, because that is what the caller meant
+//
+// In the page, so it closes over nothing (page.evaluate serialises it).
+function _visibleIn(arg) {
+  var t = String(arg.target || '');
+  function norm(s) { return String(s || '').replace(/\s+/g, ' ').toLowerCase(); }
+  function shown(el) {
+    var r = el.getClientRects ? el.getClientRects() : null;
+    if (!r || !r.length) return false;
+    var st = el.ownerDocument.defaultView.getComputedStyle(el);
+    return !(st && (st.display === 'none' || st.visibility === 'hidden'));
+  }
+  var body = document.body;
+  var text = norm(body ? (body.innerText || body.textContent) : '');
+  if (arg.mode === 'text') return text.indexOf(norm(t)) >= 0;
+  var els = null;
+  try { els = document.querySelectorAll(t); } catch (e) { els = null; }
+  if (els) for (var i = 0; i < els.length; i++) if (shown(els[i])) return true;
+  return text.indexOf(norm(t)) >= 0;
+}
+
+// The text a person would read on the page right now: the rendered body, plus
+// every live region (toasts, `role=alert`, `aria-live`) whether or not its
+// styling hides it from innerText — a toast is exactly the text `--expect` is
+// usually written against, and it is there for a few seconds only.
+function _textIn() {
+  var parts = [];
+  var b = document.body;
+  if (b) parts.push(b.innerText || b.textContent || '');
+  var live = document.querySelectorAll('[aria-live],[role=alert],[role=status],[role=log]');
+  for (var i = 0; i < live.length; i++) parts.push(live[i].textContent || '');
+  return parts.join('\n').replace(/[ \t]+/g, ' ');
+}
+
+async function visibleNow(page, target) {
+  if (isRef(target)) {
+    const want = refBody(target);
+    const { nodes } = await walk(page, {});
+    return nodes.some((n) => n.ref === want);
+  }
+  const text = target.startsWith('text=');
+  return !!(await page.evaluate(_visibleIn,
+    { target: text ? target.slice(5) : target, mode: text ? 'text' : 'auto', visibleOf: true }));
+}
+
+// Poll until the target is visible, for at most `timeoutMs`. NEVER THROWS on a
+// miss: the page as it stands is still captured, and the caller is told
+// `met:false` and flags the capture partial — "it never came" is information,
+// and an exception here would throw the evidence away with it. Time is counted
+// the way probeRequest counts it, in the waits actually asked for.
+async function waitForVisible(page, target, { timeoutMs = 30000, pollMs = 250 } = {}) {
+  const t = String(target || '');
+  let waited = 0;
+  for (;;) {
+    let ok = false;
+    try { ok = await visibleNow(page, t); } catch (e) { ok = false; }  // mid-navigation: look again
+    if (ok) return { target: t, met: true, waited_ms: waited };
+    if (waited >= timeoutMs) return { target: t, met: false, waited_ms: waited };
+    const step = Math.min(pollMs, Math.max(1, timeoutMs - waited));
+    await page.waitForTimeout(step);
+    waited += step;
+  }
+}
+
+// `--expect` as an EARLY EXIT, never as the verdict. bin/browser still greps
+// what comes back (grep -E, one engine, like the probe's markers), so a pattern
+// JS reads differently only costs the full window, never a wrong answer.
+function expectRe(p) {
+  if (typeof p !== 'string' || !p) return null;
+  try { return new RegExp(p, 'i'); }
+  catch (e) { const l = p.toLowerCase(); return { test: (s) => String(s).toLowerCase().includes(l) }; }
+}
+
 // THE RE-READ AFTER AN ACT (DIVE-4943). The executor's "step ok" says a click
 // was dispatched, not what the page did with it. So after the last step the page
 // is read again — where it ended up, its title, its document — and that, not the
 // step log, is what bin/browser grades `--expect` against. It is read from the
 // page as it now stands, never by navigating: a reload would throw away the very
 // draft or cart the act just built.
-async function pageAfter(page, { settleMs = 0 } = {}) {
+//
+// ...AND READ AGAIN UNTIL --expect MATCHES, for a few seconds (DIVE-4983). A
+// "Message sent" toast arrives after the click; the one read taken at the settle
+// missed it, and `act` printed NOT VERIFIED on a mail that was in the Sent folder.
+// The read that matched is the one returned, so the page.html and page.png that
+// ship are the instant the toast was on screen. `waitFor` is `--wait-for`, and
+// `walk` adds the refs, so an act leaves the same triple a snapshot does.
+async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 30000,
+                                 expect = null, expectWaitMs = 0, pollMs = 250, walk: walkOpts = null } = {}) {
+  const waited = waitFor ? await waitForVisible(page, waitFor, { timeoutMs: waitTimeoutMs, pollMs }) : null;
   if (settleMs > 0) { try { await page.waitForTimeout(settleMs); } catch (e) { /* the read still runs */ } }
-  const out = { url: '', title: '', html: '' };
-  try { out.url = String(await page.url()); } catch (e) { /* recorded empty */ }
-  try { out.title = String(await page.title()); } catch (e) { /* recorded empty */ }
-  try { out.html = String(await page.content()); } catch (e) { /* recorded empty */ }
+  const readNow = async () => {
+    const o = { url: '', title: '', html: '', text: '' };
+    try { o.url = String(await page.url()); } catch (e) { /* recorded empty */ }
+    try { o.title = String(await page.title()); } catch (e) { /* recorded empty */ }
+    try { o.html = String(await page.content()); } catch (e) { /* recorded empty */ }
+    try { o.text = String(await page.evaluate(_textIn, { textOf: true }) || ''); } catch (e) { /* recorded empty */ }
+    return o;
+  };
+  const re = expectRe(expect);
+  let out = await readNow(), polled = 0;
+  while (re && !re.test(out.text) && !re.test(out.html) && polled < expectWaitMs) {
+    const step = Math.min(pollMs, expectWaitMs - polled);
+    try { await page.waitForTimeout(step); } catch (e) { break; }
+    polled += step;
+    out = await readNow();
+  }
+  if (walkOpts) {
+    try { out.nodes = (await walk(page, { interactiveOnly: !!walkOpts.interactiveOnly })).nodes; }
+    catch (e) { out.nodes = null; }
+  }
+  if (waited) out.wait_for = waited;
+  if (re) out.expect_polled_ms = polled;
   return out;
 }
 
@@ -402,4 +516,5 @@ function render(nodes, { json = false } = {}) {
 
 module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
   resolveRefWithin, resolveStepSelector, isRef, render, REF_PREFIX,
-  classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER };
+  classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER,
+  waitForVisible, _visibleIn, _textIn };

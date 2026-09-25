@@ -21,11 +21,15 @@ repo — and that is the `connect-site` skill, not this one.
 ```
 
 1. **Snapshot** the page with `--interactive` and pick refs from what it printed. Never invent a
-   ref; a page you have not snapshotted is a page you are guessing about.
+   ref; a page you have not snapshotted is a page you are guessing about. A web app (Gmail) shows
+   a loading screen first: add `--wait-for='[role=main]'` (or `text=<words>` the loaded page
+   has). **Exit 76 is not the page** — a loading screen or a `--wait-for` that never came; run it
+   again with a `--wait-for`, and do not ask anyone to log in.
 2. **Act** on those refs. Steps are `goto fill click wait_for select press`, run in order, in
    one tab under one lease. Without a URL, `act` continues on the page a served browser holds.
-3. **Verify.** `--expect=<regex>` grades the page as the steps left it. Without it, `act` only
-   says the steps ran — open the `page.png` it wrote before you tell anyone it worked.
+3. **Verify.** `--expect=<regex>` grades the page as the steps left it, re-read for up to 5 s so
+   a toast counts. Without it, `act` only says the steps ran — open the `page.png` it wrote
+   before you tell anyone it worked.
 
 `read`, `links` and `shot` take a URL the same way when you only need the text, the links or a
 picture of a page.

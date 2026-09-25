@@ -351,6 +351,10 @@ async function snapshotMode(plan) {
     page.setDefaultTimeout(STEP_TIMEOUT);
     assertLease('snapshot');
     await page.goto(plan.url, { waitUntil: 'domcontentloaded' });
+    // --wait-for (DIVE-4983): the page says it is ready, bounded by the step
+    // timeout; the settle below then gives the rest of it a moment, as before.
+    const waited = plan.wait_for
+      ? await aria.waitForVisible(page, String(plan.wait_for), { timeoutMs: STEP_TIMEOUT }) : null;
     // NEVER network idle, for the reason written above treeMode: a live web app
     // long-polls and never idles, and waiting for it is what makes a read hang.
     await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
@@ -366,6 +370,7 @@ async function snapshotMode(plan) {
       nodes: snap.nodes || [],
       html_bytes: Buffer.byteLength(snap.html || ''),
       png: plan.shot || null,
+      ...(waited ? { wait_for: waited } : {}),
     };
   } catch (e) {
     die(E_NOTHING_RAN, `could not capture ${plan.url}: ${e.message}`);
@@ -380,11 +385,24 @@ async function snapshotMode(plan) {
 // bin/browser named. Never fatal — a missing re-read is reported by bin/browser
 // as "not verified", which is the honest answer, and must not turn a step that
 // DID run into "nothing ran".
+//
+// DIVE-4983: it waits for --wait-for, polls --expect for its window, and writes
+// the refs too (report.tree), so an act leaves what a snapshot leaves.
 async function writeReport(page, report) {
   try {
-    const after = await aria.pageAfter(page, { settleMs: RUN_SETTLE_MS });
+    const after = await aria.pageAfter(page, {
+      settleMs: RUN_SETTLE_MS, waitFor: report.wait_for || null, waitTimeoutMs: STEP_TIMEOUT,
+      expect: report.expect || null, expectWaitMs: Number(report.expect_wait_ms) || 0,
+      walk: report.tree ? { interactiveOnly: !!report.interactive } : null,
+    });
     if (report.html) fs.writeFileSync(report.html, after.html || '', { mode: 0o600 });
-    if (report.meta) fs.writeFileSync(report.meta, JSON.stringify({ url: after.url, title: after.title }), { mode: 0o600 });
+    if (report.meta) {
+      fs.writeFileSync(report.meta, JSON.stringify({ url: after.url, title: after.title, text: after.text,
+        wait_for: after.wait_for, expect_polled_ms: after.expect_polled_ms }), { mode: 0o600 });
+    }
+    if (report.tree && after.nodes) {
+      fs.writeFileSync(report.tree, JSON.stringify({ url: after.url, title: after.title, nodes: after.nodes }), { mode: 0o600 });
+    }
     if (report.shot) await page.screenshot({ path: report.shot });
   } catch (e) {
     process.stderr.write(`${PROG}: the steps ran but the page could not be re-read afterwards: ${e.message}\n`);
