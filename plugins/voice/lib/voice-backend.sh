@@ -54,9 +54,13 @@ voice_tts_voice() { voice_config_get tts_voice "$VOICE_DEFAULT_TTS_VOICE"; }
 # helper and is still what some boxes hold, so both are read, newest convention
 # first. Parsing mirrors scripts/test-vm.sh: a named var if present, else the
 # first sk- token in the file.
+#
+# DIVE-5043: voice's OWN key first. `5dive config openrouter-key.voice=-` writes
+# openrouter-voice.env, so voice's spend shows under its own key in OpenRouter's
+# per-key usage; without it voice uses the box's shared key (openrouter.env).
 voice_openrouter_key() {
   local f k
-  for f in "$VOICE_CONNECTORS_DIR/openrouter.env" "$VOICE_CONNECTORS_DIR/openrouter"; do
+  for f in "$VOICE_CONNECTORS_DIR/openrouter-voice.env" "$VOICE_CONNECTORS_DIR/openrouter.env" "$VOICE_CONNECTORS_DIR/openrouter"; do
     [[ -r "$f" ]] || continue
     k=$(grep -m1 -E '^(OPENROUTER_API_KEY|OPENROUTER_KEY)=' "$f" 2>/dev/null | cut -d= -f2-)
     k="${k%\"}"; k="${k#\"}"; k="${k%\'}"; k="${k#\'}"
