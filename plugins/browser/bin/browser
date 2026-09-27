@@ -114,12 +114,17 @@ SYSTEMCTL="${FIVEDIVE_BROWSER_SYSTEMCTL:-systemctl}"
 E_USAGE=64; E_UNAVAILABLE=69; E_PERM=77; E_COLD=75
 # 73: an act reached a step the OWNER must allow (pay, publish, send, delete) and
 # stopped before it. Distinct from every refusal above because the fix is not a
-# login, a box repair or a retry — it is a person saying yes (DIVE-4943).
+# login, a box repair or a retry — it is a person saying yes (DIVE-4943). Only a
+# kind the owner's policy sets to "ask" stops; the default is allow (DIVE-5006).
 E_NEEDS_OWNER=73
 # 76: the capture is of a page that was NOT READY — a known loading screen, or a
 # --wait-for that never appeared (DIVE-4983). Not 75: the session is fine and
 # re-authenticating would change nothing. The fix is to wait for the page.
 E_NOT_READY=76
+# 71: never an exit of this command. The cold driver stops with it when a goto
+# landed somewhere else before anything but a goto ran (DIVE-4991), and `act` and
+# `run` then take the whole plan once more through the served browser.
+E_REDIRECTED=71
 
 # THE PUBLIC PROFILE (DIVE-4943 scope 5). The browser used to do nothing at all on a
 # box with zero connected sites: every page verb took a <site>, and a <site> with no
@@ -127,8 +132,9 @@ E_NOT_READY=76
 # has NO connected account runs here: a per-seat profile with nothing logged in and no
 # login probe, because there is nothing to be logged into. A leading underscore can
 # never be a host, so it cannot collide with a real site's profile, and every verb
-# that LISTS sites (ls, served, status, probe-all) skips it — the dashboard's
-# Connected-sites list is logins, and this is not one.
+# that lists LOGINS (ls, status, probe-all) skips it — the dashboard's
+# Connected-sites list is logins, and this is not one. `served` is the exception: it
+# lists running BROWSERS, and a public one is still a Chrome on this box (DIVE-4991).
 PUBLIC_SITE="_public"
 # How long an owner's yes stays good for, and it is short on purpose: the owner
 # approved THIS click on THIS page, and a yes that outlived the page it was about
@@ -189,24 +195,29 @@ usage() {
                                       # loading screen, or a --wait-for that never came,
                                       # is NOT the page: exit 76, partial: true.
   5dive browser act <url> --steps='[{"op":"click","selector":"ref=button/Star"}]'
-                                      # click / fill / select / press on refs, in one
-                                      # tab under one lease; --expect=<regex> grades
-                                      # the page the steps left, re-read for up to
-                                      # --expect-wait ms (5000) so a toast counts. It
-                                      # leaves page.md and tree.json like a snapshot.
-                                      # Paying, posting, sending and deleting STOP
-                                      # (exit 73) and name the owner's ask; re-run
-                                      # with --approved=<id>.
+                                      # click / fill / type / select / press on refs, in
+                                      # one tab under one lease. `type` goes key by key,
+                                      # for a box whose suggestions open on keystrokes.
+                                      # --expect=<regex> grades the page the steps left,
+                                      # re-read for up to --expect-wait ms (5000) so a
+                                      # toast counts. It leaves page.md and tree.json
+                                      # like a snapshot.
+                                      # Paying, posting, sending and deleting run and
+                                      # are logged (the default, yolo). Under the
+                                      # owner's `careful` they STOP (exit 73) and name
+                                      # the owner's ask; re-run with --approved=<id>.
   sudo 5dive browser approvals        # the owner: what agents are waiting to be allowed,
                                       # with what each would send, pay, post or delete
   sudo 5dive browser approve <id> [--deny] [--human-proof=<nonce>]
                                       # the owner's yes: those exact steps, once, 30 min.
                                       # From an agent seat's sudo it needs the proof the
                                       # owner was handed (their Telegram Approve button).
-  5dive browser approvals policy [--json]
+  5dive browser approvals policy [--json]   # the four kinds, and mode: yolo|careful|custom
+  sudo 5dive browser approvals policy set yolo|careful
   sudo 5dive browser approvals policy set <pay|publish|send|delete>=ask|allow
-                                      # the owner's standing answer per kind: ask (73) or
-                                      # allow (the step runs and is logged)
+                                      # the owner's standing answer per kind: allow (the
+                                      # default: the step runs and is logged) or ask
+                                      # (73). yolo = all allow, careful = all ask.
 
   5dive browser setup                 # one-time, as root: create the profile store
   5dive browser auth <site>           # open a browser; log in yourself, once
@@ -225,8 +236,9 @@ usage() {
                                       # caller mid-action. The profile is untouched:
                                       # the next command starts it again, logged in.
   5dive browser served                # which of this seat's browsers are running right now,
-                                      # one site per line. The dashboard reads it to
-                                      # decide whether to offer "Stop browser".
+                                      # one site per line, the public one (_public)
+                                      # included. The dashboard reads it to decide
+                                      # whether to offer "Stop browser".
   sudo 5dive browser forget <site>    # LOG THE BOX OUT: stop the browser, then DELETE the
                                       # profile — the cookies, the session, the stamps.
                                       # Irreversible, and the only way back is to log in
@@ -1319,7 +1331,7 @@ _ls_box_offers() {
 # whole reason the adapter exists rather than a model reading the page. There is
 # deliberately no `eval`, no `script`, and no free-text instruction step: any of
 # those would make the adapter a program the executor merely hosts.
-ADAPTER_STEPS="goto fill click wait_for select upload press"
+ADAPTER_STEPS="goto fill type click wait_for select upload press"
 
 _adapter_validate() {
   local f="$1" action="$2"
@@ -1709,6 +1721,54 @@ of that browser, and a forced release puts one there. Stop the holding process, 
   esac
 }
 
+# ---- A REDIRECTED LANDING, AND THE ONE RETRY (DIVE-4991) -------------------
+#
+# The plan's `landing` field: the site a login wall names, whether reflex may be
+# asked (checked ONCE per command, not per goto), and whether this executor may
+# stop for a retry. Only the cold one may, and only when a served browser can be
+# had: a box with no session daemon or no Xvfb gets the redirect line and the old
+# behaviour. The reflex answer is cached by _landing_reflex, which the verbs call
+# in their own shell: _landing_json runs inside $( ) and could not keep it.
+_LANDING_REFLEX=""
+_landing_reflex() {
+  [[ -n "$_LANDING_REFLEX" ]] && return 0
+  _LANDING_REFLEX=false
+  if _reflex_cli landing && _reflex_configured; then _LANDING_REFLEX=true; fi
+  return 0
+}
+_landing_json() {  # _landing_json <site> <retry 0|1>
+  _landing_reflex
+  local s="$1"; _is_public "$s" && s=""
+  jq -nc --arg s "$s" --argjson r "$_LANDING_REFLEX" --argjson t "$([[ "$2" == 1 ]] && echo true || echo false)" \
+    '{landing:{site:$s, reflex:$r, retry:$t}}'
+}
+_retry_possible() {
+  [[ -x "$(_daemon_bin)" && -z "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]] && _have Xvfb
+}
+# A live served session for the retry, or rc 1 with the reason in _RETRY_WHY. A
+# serve this run starts is stopped again by _retry_unserve; one that was already up
+# (and was cycled out of the way for the cold run) is simply put back. Never call
+# it inside $( ): what it started is remembered in this shell.
+_RETRY_SERVED=""; _RETRY_WHY=""
+_retry_serve() {  # _retry_serve <site> <profile-dir>
+  _daemon_live "$2" && return 0
+  local pre="$_SHOT_RESTORE_SITE" why
+  _SHOT_RESTORE_SITE=""
+  # A SUBSHELL, because cmd_serve reports failure by dying (see _shot_restore).
+  why=$( ( cmd_serve "$1" >/dev/null ) 2>&1 ) || true
+  [[ -n "$pre" ]] || _RETRY_SERVED="$1"
+  _daemon_live "$2" && return 0
+  _retry_unserve
+  [[ -n "$pre" ]] && ! _serve_running "$2" >/dev/null && _SHOT_RESTORE_SITE="$pre"
+  _RETRY_WHY="$(printf '%s\n' "$why" | grep -v '^$' | tail -n1 | sed "s/^$PROG: //" | cut -c1-500)"
+  return 1
+}
+_retry_unserve() {
+  [[ -n "$_RETRY_SERVED" ]] || return 0
+  local s="$_RETRY_SERVED"; _RETRY_SERVED=""
+  ( cmd_serve "$s" --stop >/dev/null 2>&1 ) || true
+}
+
 cmd_run() {
   local site="${1:-}" action="${2:-}"; shift 2 2>/dev/null || true
   [[ -n "$site" && -n "$action" ]] || die "$E_USAGE" "usage: 5dive browser run <site> <action> [--key=value ...]"
@@ -1866,6 +1926,7 @@ cmd_run() {
   _READ_STAGE="$(mktemp -d /tmp/5dive-browser-read.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the run"
   trap '_read_cleanup' EXIT
   local errf="$_READ_STAGE/exec.err"
+  _landing_reflex
   if (( warm )); then
     # THE WARM SESSION EXECUTES IT. Same fixed vocabulary, same refusals, same
     # lease re-read before every step — the daemon re-validates the plan rather
@@ -1874,11 +1935,7 @@ cmd_run() {
     # launches: stop the served browser, start a probe, start the driver's,
     # start the served one again.
     local wplan wrc=0
-    wplan=$(jq -nc --argjson steps "$(jq -c --arg a "$action" '.actions[$a].steps' "$f")" \
-        --argjson args "$args" --argjson l "$(_daemon_lease_json)" \
-        --argjson st "$(_settle_json "$psettle")" --argjson g "$guard" --argjson ap "$is_approved" \
-        --argjson ak "$(_policy_allowed)" \
-        '{op:"plan", steps:$steps, args:$args, guard:$g, approved:$ap, allow_kinds:$ak} + $st + $l')
+    wplan=$(_run_session_plan "$f" "$action" "$args" "$psettle" "$guard" "$is_approved" "$site")
     _daemon_call "$dir" "$wplan" 2>"$errf" || wrc=$?
     cat "$errf" >&2
     _run_finish "$site" "$action" "$f" "$args" "$hash" "$approved" "$wrc" "$errf" "$dir" "the warm session"
@@ -1898,9 +1955,11 @@ cmd_run() {
   local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
   [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver. Set FIVEDIVE_BROWSER_DRIVER to an executable that drives a REAL Chrome profile (the Browser Hand shape: extension + local relay), or reinstall the plugin so its own driver is back. This never falls back to a throwaway browser: an action that did not run inside the profile a person logged into by hand is not the thing that was asked for."
 
+  local may=0; _retry_possible && may=1
   local plan; plan=$(jq -c --arg a "$action" --arg profile "$dir" --argjson args "$args" \
       --argjson g "$guard" --argjson ap "$is_approved" --argjson ak "$(_policy_allowed)" \
-      '{profile: $profile, steps: .actions[$a].steps, args: $args, guard: $g, approved: $ap, allow_kinds: $ak}' "$f")
+      --argjson lj "$(_landing_json "$site" "$may")" \
+      '{profile: $profile, steps: .actions[$a].steps, args: $args, guard: $g, approved: $ap, allow_kinds: $ak} + $lj' "$f")
   # THE LEASE TRAVELS WITH THE PLAN, and it is what the executor re-checks before
   # every single step. Handing it over once and trusting the first check would be
   # a lease that protects keystroke one: the case it has to cover is a PERSON
@@ -1911,10 +1970,34 @@ cmd_run() {
     FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
     FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
     "$driver" <<<"$plan" 2>"$errf"
-  local drc=$?
+  local drc=$? who="the executor"
+  # REDIRECTED BEFORE ANYTHING BUT A GOTO RAN (DIVE-4991): the whole plan, once,
+  # through the served browser, and the verdict is that run's. With no served
+  # browser to be had it is a failed step as before, and the re-read governs.
+  if (( drc == E_REDIRECTED )); then
+    drc=1
+    if _retry_serve "$site" "$dir"; then
+      cat "$errf" >&2
+      drc=0; _daemon_call "$dir" "$(_run_session_plan "$f" "$action" "$args" "$psettle" "$guard" "$is_approved" "$site")" 2>"$errf" || drc=$?
+      _retry_unserve; who="the served browser"
+    else
+      printf '%s: no served browser for the retry (%s), so this stops at the redirect; nothing but the goto ran.\n' \
+        "$PROG" "${_RETRY_WHY:-it gave no reason}" >> "$errf"
+    fi
+  fi
   cat "$errf" >&2
-  _run_finish "$site" "$action" "$f" "$args" "$hash" "$approved" "$drc" "$errf" "$dir" "the executor"
+  _run_finish "$site" "$action" "$f" "$args" "$hash" "$approved" "$drc" "$errf" "$dir" "$who"
   return $?
+}
+
+# The plan `run` hands a warm session, shared by the warm path and the served
+# retry (DIVE-4991), so the two cannot differ.
+_run_session_plan() {  # <adapter> <action> <args> <settle> <guard> <approved> <site>
+  jq -nc --argjson steps "$(jq -c --arg a "$2" '.actions[$a].steps' "$1")" \
+      --argjson args "$3" --argjson l "$(_daemon_lease_json)" \
+      --argjson st "$(_settle_json "$4")" --argjson g "$5" --argjson ap "$6" \
+      --argjson ak "$(_policy_allowed)" --argjson lj "$(_landing_json "$7" 0)" \
+      '{op:"plan", steps:$steps, args:$args, guard:$g, approved:$ap, allow_kinds:$ak} + $st + $l + $lj'
 }
 
 # WHAT FOLLOWS EITHER EXECUTOR, in one place for the reason _run_verify is one
@@ -2263,13 +2346,16 @@ cmd_evict() {
 # yet" on a site that is fine. A separate verb also fails the right way on a box
 # whose plugin predates it: unknown verb, non-zero, and the dashboard offers no
 # Stop button rather than offering one that cannot work.
+#
+# THE PUBLIC PROFILE IS LISTED (DIVE-4991). It is not a login, but `served` is not
+# a list of logins: it is what is running. Skipping `_public` here hid a Chrome
+# that `serve _public --stop` could find and stop, so nothing offered to stop it.
 cmd_served() {
   _require_store
   local d site
   for d in "$(_seat_dir)"/*/; do
     [[ -d "$d" ]] || continue
     site=$(basename "$d")
-    _is_public "$site" && continue   # the public profile is not a login (DIVE-4943)
     _serve_running "$d" >/dev/null || continue
     printf '%s\n' "$site"
   done
@@ -2457,10 +2543,12 @@ _as_seat() {  # <seat> <cmd...>
 
 # How to reach `5dive reflex`. The key is root's (/etc/5dive/reflex-openrouter.key),
 # so a seat with the grant goes through sudo; without it the plain CLI still works
-# for a custom endpoint, and otherwise says why it cannot.
-_reflex_cli() {
+# for a custom endpoint, and otherwise says why it cannot. The grant looked for is
+# the verb's own: login-marker by default, pick-ref for the step loops' retry,
+# landing for the step loops' landing check.
+_reflex_cli() {  # [<reflex verb>]
   if [[ -n "${FIVEDIVE_BROWSER_CLI:-}" ]]; then _RFX=("$FIVEDIVE_BROWSER_CLI" reflex); return 0; fi
-  if [[ $EUID -ne 0 ]] && sudo -n -l /usr/local/bin/5dive reflex login-marker >/dev/null 2>&1; then
+  if [[ $EUID -ne 0 ]] && sudo -n -l /usr/local/bin/5dive reflex "${1:-login-marker}" >/dev/null 2>&1; then
     _RFX=(sudo -n /usr/local/bin/5dive reflex); return 0
   fi
   command -v 5dive >/dev/null 2>&1 || return 1
@@ -2470,6 +2558,31 @@ _reflex_cli() {
 _reflex_configured() {
   local o; o=$(timeout 20 "${_RFX[@]}" status --json 2>/dev/null) || return 1
   [[ "$(jq -r '.configured // false' <<<"$o" 2>/dev/null)" == true ]]
+}
+
+# THE LANDING CHECK'S OPTIONAL TIER (DIVE-4991), asked by the two step loops
+# (lib/aria.cjs checkLanding) with {requested_url, landed_url, landed_title,
+# page_excerpt} on stdin. Page text leaves the box only here, and only when reflex
+# is configured. Always exit 0 and one line of JSON:
+#   {"reflex":"off"}                               no reflex on this box
+#   {"reflex":"error","why":"…"}                   it could not answer
+#   {"reflex":"ok","choice":"…","confidence":N}    answered | generic_page | login_wall | bot_block
+# On anything but "ok" the base verdict (the URLs alone) stands.
+cmd_reflex_landing() {  # _reflex-landing <site>  < state.json
+  local site="${1:-}"
+  [[ "$site" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die "$E_USAGE" "_reflex-landing: '$site' is not a host name"
+  local st rep rc=0 why
+  st="$(mktemp "${TMPDIR:-/tmp}/5dive-browser-landing.XXXXXXXX")" || { jq -nc '{reflex:"error", why:"cannot stage the state"}'; return 0; }
+  head -c 65536 > "$st"
+  if ! _reflex_cli landing || ! _reflex_configured; then
+    rm -f -- "$st"; echo '{"reflex":"off"}'; return 0
+  fi
+  rep=$("${_RFX[@]}" landing "$site" "--state=$st" --json </dev/null 2>"$st.err") || rc=$?
+  why="$(tail -n1 "$st.err" 2>/dev/null)"; rm -f -- "$st" "$st.err"
+  if (( rc )) || ! jq -e '(.choice | type) == "string"' <<<"$rep" >/dev/null 2>&1; then
+    jq -nc --arg w "${why:-reflex landing exited $rc}" '{reflex:"error", why:$w}'; return 0
+  fi
+  jq -c '{reflex:"ok", choice, confidence}' <<<"$rep"
 }
 
 _propose_stamp() {  # <pending-dir> <base> <state> [<why>]
@@ -2565,6 +2678,42 @@ cmd_propose() {
   _propose_stamp "$pd" "$base" proposed
   _audit_row "$dir" propose "$base"
   _proposal_print "$pf"
+}
+
+# WHICH ELEMENT A STEP MEANT, when its ref matches nothing (lib/aria.cjs
+# resolveOrRepick). Not in usage: both executors re-enter here with the page's
+# interactive tree on stdin, so the step loops reach reflex through _reflex_cli
+# like every other reflex call. Always exit 0 and one line of JSON:
+#   {"reflex":"off"}               no reflex on this box (the executor's name match decides)
+#   {"reflex":"error","why":"…"}   reflex could not answer (the name match decides)
+#   {"reflex":"ok", …}             `pick-ref --json`'s report
+# The pick-ref argv is built HERE from five known flags, never passed through: a
+# brokered seat's step reaches this as the profile's owner, and a `--backend=`
+# that rode along would run as whoever holds the reflex grant.
+cmd_reflex_pick() {  # _reflex-pick <site> --op=<op> --intent=<text> [--value=|--key=|--path=]  < tree.json
+  local site="" a tree rc=0 rep why
+  local -a pa=()
+  for a in "$@"; do
+    case "$a" in
+      --op=*|--intent=*|--value=*|--key=*|--path=*) pa+=("$a") ;;
+      -*) die "$E_USAGE" "_reflex-pick: unknown flag: $a" ;;
+      *) [[ -z "$site" ]] || die "$E_USAGE" "_reflex-pick: one site"; site="$a" ;;
+    esac
+  done
+  [[ "$site" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || die "$E_USAGE" "_reflex-pick: '$site' is not a host name"
+  # The tree first: the status call below would otherwise inherit, and eat, stdin.
+  tree="$(mktemp "${TMPDIR:-/tmp}/5dive-browser-pick.XXXXXXXX")" || { jq -nc '{reflex:"error", why:"cannot stage the tree"}'; return 0; }
+  cat > "$tree"
+  if ! _reflex_cli pick-ref || ! _reflex_configured; then
+    rm -f -- "$tree"; echo '{"reflex":"off"}'; return 0
+  fi
+  rep=$("${_RFX[@]}" pick-ref "$site" "--tree=$tree" "${pa[@]}" --json </dev/null 2>"$tree.err") || rc=$?
+  why="$(tail -n1 "$tree.err" 2>/dev/null)"
+  rm -f -- "$tree" "$tree.err"
+  if (( rc )) || ! jq -e 'type == "object"' <<<"$rep" >/dev/null 2>&1; then
+    jq -nc --arg w "${why:-pick-ref exited $rc}" '{reflex:"error", why:$w}'; return 0
+  fi
+  jq -c '. + {reflex:"ok"}' <<<"$rep"
 }
 
 # One proposal, for a person: the pick, then EVERY candidate with its counts.
@@ -4122,17 +4271,29 @@ _loading_screen() {  # _loading_screen <url> <page.html> [<tree.json>] -> "<name
 
 _wait_for_ok() { [[ -n "$1" && ${#1} -le 500 && "$1" != *$'\n'* ]]; }
 
-# _ready_verdict <url> <wait-for> <wait-json|null> <page.html> [<tree.json>] [<partial>]
+# _ready_verdict <url> <wait-for> <wait-json|null> <page.html> [<tree.json>] [<partial>] [<capture>]
 # Prints the metadata fragment (partial / wait_for / loading_screen) on stdout and
 # says why on stderr. Returns E_NOT_READY when what was captured is not the page.
 #
 # A --wait-for the capture did not ANSWER is not a met one: a served browser whose
 # daemon started before this release ignores the field and captures at the
 # settle, which is the very defect this exists to end. It is named, not trusted.
+#
+# ...AND ONLY A DAEMON IS BLAMED FOR IT (DIVE-4991). <capture> is where the page
+# came from (`read`'s page.meta.json field): `session-daemon` by default, which is
+# what every other caller renders through. A cold `read --wait-for` renders
+# through the executor, which no restart changes, and whose payload used to arrive
+# cut at 64 KB — so "restart the served browser" was advice about a browser that
+# was not there, and following it changed nothing. A timeout is a separate branch
+# below: an answer with met:false, never a missing one.
 _ready_verdict() {
-  local url="$1" want="$2" got="${3:-null}" html="$4" tree="${5:-}" partial="${6:-false}" screen="" rc=0
+  local url="$1" want="$2" got="${3:-null}" html="$4" tree="${5:-}" partial="${6:-false}" source="${7:-session-daemon}" screen="" rc=0
   [[ -n "$got" ]] || got=null
-  if [[ -n "$want" && "$got" == null ]]; then
+  if [[ -n "$want" && "$got" == null && "$source" != session-daemon ]]; then
+    printf '%s: NOT READY — --wait-for=%s was not answered: the %s capture came back without a verdict on it (the field was missing, or its reply could not be read), so nothing says this is the page you waited for. No daemon was involved; restarting one will not change it.\n' "$PROG" "$want" "$source" >&2
+    got=$(jq -nc --arg t "$want" '{target:$t, met:false, honoured:false}')
+    partial=true; rc=$E_NOT_READY
+  elif [[ -n "$want" && "$got" == null ]]; then
     printf '%s: NOT READY — --wait-for was not honoured: the served browser for this profile runs a session daemon from before --wait-for existed, and it captured at the settle instead. Restart it (serve <site> --stop, then serve <site>) and run this again.\n' "$PROG" >&2
     got=$(jq -nc --arg t "$want" '{target:$t, met:false, honoured:false}')
     partial=true; rc=$E_NOT_READY
@@ -4250,7 +4411,7 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
 
   _signin_guard "$stage/page.html"
   local extra rrc=0
-  extra=$(_ready_verdict "$url" "$wait_for" "$waitj" "$stage/page.html" "$stage/tree.json" "$partial") || rrc=$?
+  extra=$(_ready_verdict "$url" "$wait_for" "$waitj" "$stage/page.html" "$stage/tree.json" "$partial" "$capture") || rrc=$?
   _derive_capture "$stage" "$url" "$chrome" "$capture" "$extra"
 
   install -m 00600 "$stage/page.html" "$out/page.html" || die "$E_UNAVAILABLE" "cannot install page.html in $out"
@@ -4489,7 +4650,7 @@ cmd_snapshot() {
 # executes an adapter's recipe, and every shipped adapter has `actions: {}` — so
 # no agent on any box could click or type anything. `act` is the generic half:
 # the agent reads refs off `snapshot --interactive`, and hands back a short list
-# of steps in the SAME fixed vocabulary `run` uses (goto fill click wait_for
+# of steps in the SAME fixed vocabulary `run` uses (goto fill type click wait_for
 # select press), executed by the SAME executors, under the same lease.
 #
 # WHAT IS THE SAME AS `run`, on purpose: the lease, the login gate, the step
@@ -4509,7 +4670,7 @@ cmd_snapshot() {
 # a served (warm) browser the tab also survives between calls, so `act` with no
 # URL continues on the page the last call left; without one, the next call starts
 # from a fresh load.
-ACT_VOCAB='goto fill click wait_for select press'
+ACT_VOCAB='goto fill type click wait_for select press'
 ACT_MAX_STEPS=40
 # How long --expect is re-read after the last step before NOT VERIFIED
 # (DIVE-4983): a toast lands a second or two after the click that caused it.
@@ -4540,21 +4701,33 @@ _grant_uid() { printf '%s\n' "${FIVEDIVE_BROWSER_GRANT_UID:-0}"; }
 # grant, which is what seats hold; it is not a sandbox for a seat with a root shell.
 _sudo_is_seat() { [[ "${SUDO_USER:-}" == agent-* ]]; }
 
-# THE OWNER'S POLICY PER KIND (DIVE-4982): "ask" (the default, exit 73) or "allow"
-# (the step runs and is logged). One root-owned 0644 file in the profile store's
-# root-owned 0711 directory: every seat can read it, none can write it. A file that
-# is not owned by the uid that grants is not a policy, and everything reads "ask".
+# THE OWNER'S POLICY PER KIND (DIVE-4982): "allow" (the step runs and is logged)
+# or "ask" (it stops, exit 73, until the owner says yes). THE DEFAULT IS "allow"
+# for all four (DIVE-5006): an owner with no dashboard and no shell could neither
+# approve a step nor relax the policy, so every send stopped dead. Two presets
+# name the four at once: `yolo` (all allow, the default) and `careful` (all ask).
+# One root-owned 0644 file in the profile store's root-owned 0711 directory: every
+# seat can read it, none can write it. A file that is not owned by the uid that
+# grants is not a policy and the default applies, so a seat can neither loosen
+# nor tighten it. A kind the file leaves out, or gives any other value, is the
+# default too.
 APPROVAL_KINDS="pay publish send delete"
+APPROVAL_DEFAULT=allow
 _policy_file() { printf '%s\n' "${FIVEDIVE_BROWSER_APPROVAL_POLICY:-$PROFILE_ROOT/.approval-policy.json}"; }
-_policy_json() {
+_policy_owned() {  # the owner's file as an object, {} when there is no file that counts
   local f cur='{}'; f="$(_policy_file)"
   if [[ -f "$f" && ! -L "$f" && "$(stat -c %u "$f" 2>/dev/null)" == "$(_grant_uid)" ]]; then
     cur=$(jq -c 'if type == "object" then . else {} end' "$f" 2>/dev/null) || cur='{}'
   fi
-  jq -nc --argjson c "$cur" \
-    '{pay:"ask", publish:"ask", send:"ask", delete:"ask"} | with_entries(.value = (if $c[.key] == "allow" then "allow" else "ask" end))'
+  printf '%s\n' "$cur"
+}
+_policy_json() {
+  jq -nc --argjson c "$(_policy_owned)" --arg d "$APPROVAL_DEFAULT" \
+    '{pay:$d, publish:$d, send:$d, delete:$d} | with_entries(.value = (if $c[.key] == "ask" or $c[.key] == "allow" then $c[.key] else $d end))'
 }
 _policy_allowed() { _policy_json | jq -c '[to_entries[] | select(.value == "allow") | .key]'; }
+# yolo (all four allow), careful (all four ask), or custom — computed, never stored.
+_policy_mode() { jq -r '[.[]] | if all(. == "allow") then "yolo" elif all(. == "ask") then "careful" else "custom" end'; }
 
 # One line an owner can read for a request's payload, in a fixed order; empty when
 # the page gave none, and the caller then SAYS so rather than showing the label.
@@ -4645,19 +4818,30 @@ _owner_ask_deliver() {  # <request-file>
   return 0
 }
 
-# A STEP THE OWNER'S POLICY LET THROUGH IS STILL WRITTEN DOWN (DIVE-4982): one JSON
-# line per step in the seat's approvals directory, beside the asks, with the payload
-# and the screenshot the act left — "allow" means "do not ask me", not "do not tell me".
+# A STEP THE POLICY LET THROUGH IS STILL WRITTEN DOWN (DIVE-4982): one JSON line per
+# step in the seat's approvals directory, beside the asks, with the payload and the
+# screenshot the act left — "allow" means "do not ask me", not "do not tell me". The
+# default (yolo, DIVE-5006) is logged exactly like an owner's "allow", and says which.
 _policy_log() {  # <site> <stderr-file> <page> <screenshot>
-  local site="$1" errf="$2" page="$3" shot="$4" line ad
+  local site="$1" errf="$2" page="$3" shot="$4" line ad own cls by
   grep -q '5dive-owner-allowed: {' "$errf" 2>/dev/null || return 0
   ad="$(_approval_dir)" && mkdir -p "$ad" && chmod 700 "$ad" || return 0
+  # "policy" when the owner's file says allow for this kind, "default" when no
+  # file (or one the granting uid does not own) left it at the default (DIVE-5006).
+  own="$(_policy_owned)"
   while IFS= read -r line; do
-    jq -c --arg seat "$(_seat)" --arg site "$site" --arg page "$page" --arg shot "$shot" --argjson at "$(date +%s)" \
-      '{at:$at, seat:$seat, site:$site, class:.cls, label:.label, payload:(.payload // {}), step:.step, page:$page, screenshot:$shot, allowed_by:"policy"}' \
+    cls="$(jq -r .cls <<<"$line")"; by=default
+    [[ "$(jq -r --arg k "$cls" '.[$k] // ""' <<<"$own")" == allow ]] && by=policy
+    jq -c --arg seat "$(_seat)" --arg site "$site" --arg page "$page" --arg shot "$shot" --argjson at "$(date +%s)" --arg by "$by" \
+      '{at:$at, seat:$seat, site:$site, class:.cls, label:.label, payload:(.payload // {}), step:.step, page:$page, screenshot:$shot, allowed_by:$by}' \
       <<<"$line" >> "$ad/allowed.jsonl" 2>/dev/null || continue
-    printf '%s: ALLOWED by the owner'"'"'s policy (%s=allow): step %s, %s — logged in %s/allowed.jsonl\n' "$PROG" \
-      "$(jq -r .cls <<<"$line")" "$(jq -r .step <<<"$line")" "$(_payload_line "$(jq -c '.payload // {}' <<<"$line")")" "$ad" >&2
+    if [[ "$by" == policy ]]; then
+      printf '%s: ALLOWED by the owner'"'"'s policy (%s=allow): step %s, %s — logged in %s/allowed.jsonl\n' "$PROG" \
+        "$cls" "$(jq -r .step <<<"$line")" "$(_payload_line "$(jq -c '.payload // {}' <<<"$line")")" "$ad" >&2
+    else
+      printf '%s: ALLOWED (default yolo): %s, step %s, %s — logged in %s/allowed.jsonl\n' "$PROG" \
+        "$cls" "$(jq -r .step <<<"$line")" "$(_payload_line "$(jq -c '.payload // {}' <<<"$line")")" "$ad" >&2
+    fi
   done < <(grep -o '5dive-owner-allowed: {.*}' "$errf" | sed 's/^5dive-owner-allowed: //')
 }
 
@@ -4750,7 +4934,7 @@ cmd_act() {
   out="$(_read_output_dir "$site" "$out" "$_PG_DIR")" || exit $?
   local stage; stage="$(mktemp -d /tmp/5dive-browser-read.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the act's re-read"
   _READ_STAGE="$stage"; trap '_read_cleanup' EXIT
-  local errf="$stage/exec.err" drc=0 payload="" plan report allow_kinds
+  local errf="$stage/exec.err" drc=0 plan report allow_kinds
   # The kinds the owner lets through without asking, read once, before a step.
   allow_kinds="$(_policy_allowed)"
   # WHAT THE RE-READ AFTER THE LAST STEP WAITS FOR (DIVE-4983), the same for both
@@ -4758,35 +4942,41 @@ cmd_act() {
   report=$(jq -nc --arg wf "$wait_for" --arg e "$expect" --argjson ew "$expect_wait" --argjson i "$interactive" \
     '{interactive:($i==1), expect_wait_ms:$ew} + (if $wf == "" then {} else {wait_for:$wf} end)
      + (if $e == "" then {} else {expect:$e} end)')
+  _landing_reflex
   if _daemon_live "$_PG_DIR"; then
-    plan=$(jq -nc --argjson s "$steps" --argjson a "$is_approved" --argjson sh "$shot" \
-        --argjson l "$(_daemon_lease_json)" --argjson st "$(_settle_json "$settle")" --argjson r "$report" \
-        --argjson ak "$allow_kinds" \
-        '{op:"plan", steps:$s, args:{}, literal:true, guard:true, approved:$a, allow_kinds:$ak,
-          report:({shot:($sh==1), tree:true} + $r)} + $st + $l')
-    payload=$(_daemon_call "$_PG_DIR" "$plan" 2>"$errf") || drc=$?
-    local rep; rep=$(grep -F '"act_report":true' <<<"$payload" | tail -1)
-    if [[ -n "$rep" ]]; then
-      jq -r '.html_inline // ""' <<<"$rep" > "$stage/page.html"
-      jq -c '{url, title, text, wait_for, expect_polled_ms}' <<<"$rep" > "$stage/after.json"
-      jq -e '.nodes | type == "array"' <<<"$rep" >/dev/null 2>&1 && jq -c '{url, title, nodes}' <<<"$rep" > "$stage/tree.json"
-      if (( shot )); then jq -r '.png_b64 // ""' <<<"$rep" | base64 -d > "$stage/page.png" 2>/dev/null || :; fi
-    fi
+    _act_session "$site" "$steps" "$is_approved" "$shot" "$settle" "$report" "$allow_kinds" "$stage" "$errf" || drc=$?
   else
     local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
     [[ -n "$driver" && -x "$driver" ]] || die "$E_UNAVAILABLE" "no executor backend at $driver — act runs through the same executor as run."
     local chrome; chrome=$(command -v "$_PG_CHROME" 2>/dev/null || printf '%s' "$_PG_CHROME")
     local png=""; (( shot )) && png="$stage/page.png"
+    local may=0; _retry_possible && may=1
     plan=$(jq -nc --arg p "$_PG_DIR" --argjson s "$steps" --argjson a "$is_approved" \
         --arg h "$stage/page.html" --arg m "$stage/after.json" --arg sh "$png" \
         --arg t "$stage/tree.json" --argjson r "$report" --argjson ak "$allow_kinds" \
+        --argjson lj "$(_landing_json "$site" "$may")" \
         '{profile:$p, steps:$s, args:{}, literal:true, guard:true, approved:$a, allow_kinds:$ak,
-          report:({html:$h, meta:$m, tree:$t, shot:(if $sh=="" then null else $sh end)} + $r)}')
+          report:({html:$h, meta:$m, tree:$t, shot:(if $sh=="" then null else $sh end)} + $r)} + $lj')
     FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
       FIVEDIVE_BROWSER_RUN_SETTLE_MS="${settle:-${FIVEDIVE_BROWSER_RUN_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}" \
       FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
       FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
       "$driver" <<<"$plan" >/dev/null 2>"$errf" || drc=$?
+    # REDIRECTED BEFORE ANYTHING BUT A GOTO RAN (DIVE-4991): the whole plan, once,
+    # through the served browser. The cold report goes first, so a served run that
+    # reports nothing leaves nothing that looks like its page; with no served
+    # browser to be had, the cold report of the redirected page stands.
+    if (( drc == E_REDIRECTED )); then
+      drc=1
+      if _retry_serve "$site" "$_PG_DIR"; then
+        rm -f -- "$stage/page.html" "$stage/after.json" "$stage/tree.json" "$stage/page.png"
+        drc=0; _act_session "$site" "$steps" "$is_approved" "$shot" "$settle" "$report" "$allow_kinds" "$stage" "$errf" || drc=$?
+        _retry_unserve
+      else
+        printf '%s: no served browser for the retry (%s), so this stops at the redirect; nothing but the goto ran.\n' \
+          "$PROG" "${_RETRY_WHY:-it gave no reason}" >> "$errf"
+      fi
+    fi
   fi
   cat "$errf" >&2
   _shot_restore
@@ -4841,15 +5031,22 @@ cmd_act() {
   # --expect is graded against the document AND the text a person could read,
   # toasts and live regions included — the executor polled for it for
   # --expect-wait ms, and the capture it shipped is the read that matched.
-  local verdict rc
-  if [[ -n "$expect" ]]; then
+  # A FAILED STEP FAILS THE RUN, WHATEVER --expect MATCHED (DIVE-4990). The page
+  # the goto left can already carry the text: a step 2 that matched nothing read
+  # "verified" on booking.com. So the order is step_failed > not_ready >
+  # not_verified > verified, and verified needs the executor's 0 AND the match.
+  local verdict rc fstep
+  fstep=$(grep -o '5dive-step-failed: {.*}' "$errf" 2>/dev/null | tail -1 | sed 's/^5dive-step-failed: //' | jq -c . 2>/dev/null)
+  if (( drc != 0 )); then
+    verdict=step_failed; rc=1
+  elif [[ -n "$expect" ]]; then
     # No pipe into `grep -q`: under pipefail its early exit SIGPIPEs the writer on
     # a large page, and a page that matched would read as NOT VERIFIED.
     if [[ -s "$out/page.html" ]] && { grep -qiE -- "$expect" "$out/page.html" \
          || grep -qiE -- "$expect" <<<"$(jq -r '.text // ""' "$stage/after.json" 2>/dev/null)"; }; then verdict=verified; rc=0
     else verdict=not_verified; rc=1; fi
   else
-    verdict=$([[ "$drc" == 0 ]] && echo executed || echo step_failed); rc=$(( drc == 0 ? 0 : 1 ))
+    verdict=executed; rc=0
   fi
   # NOT READY outranks "executed" and "not verified": the steps may be fine and
   # the page simply never loaded, and re-running the steps is not the fix.
@@ -4858,7 +5055,8 @@ cmd_act() {
   fi
   if (( json )); then
     jq -nc --arg v "$verdict" --arg u "$final" --arg t "$title" --arg o "$out" --argjson d "$drc" --argjson x "$extra" \
-      '{verdict:$v, url:$u, title:$t, executor_rc:$d, artifacts:$o} + $x'
+      --argjson fs "$([[ "$verdict" == step_failed && -n "$fstep" ]] && echo "$fstep" || echo null)" \
+      '{verdict:$v, url:$u, title:$t, executor_rc:$d, failed_step:$fs, artifacts:$o} + $x'
     return "$rc"
   fi
   printf '%s\n  %s\n  %s\n' "$title" "$final" "$out"
@@ -4866,9 +5064,36 @@ cmd_act() {
     verified)     printf 'verified: the page after the steps matches --expect\n' ;;
     not_verified) printf '%s: NOT VERIFIED — the executor exited %s, but the page after the steps does not match --expect. Look at %s/page.png before retrying: if it went through and we misread, a retry does it twice.\n' "$PROG" "$drc" "$out" >&2 ;;
     executed)     printf 'done: every step ran. Nothing re-graded it (no --expect) — read %s/page.png or snapshot the page before you report success.\n' "$out" ;;
-    step_failed)  printf '%s: a step failed (the executor exited %s). Some steps may have run; look at %s/page.png before retrying.\n' "$PROG" "$drc" "$out" >&2 ;;
+    step_failed)
+      local why="a step failed (the executor exited $drc)"
+      # The error's first sentence: the executor printed all of it just above.
+      [[ -n "$fstep" ]] && why=$(jq -r '"step \(.index) (\(.op)\(if .selector then " " + .selector else "" end)) failed: \(.error | split(". ")[0])"' <<<"$fstep")
+      [[ -n "$expect" ]] && why+=" — the run is NOT verified, whatever --expect matched"
+      printf '%s: %s. Some steps may have run; look at %s/page.png before retrying.\n' "$PROG" "$why" "$out" >&2 ;;
     not_ready)    printf '%s: NOT READY — every step ran, but the page they left is not ready (the reason is above). Look at %s/page.png; wait for the page, do not re-run the steps.\n' "$PROG" "$out" >&2 ;;
   esac
+  return "$rc"
+}
+
+# `act` through the warm session: the plan over the socket, the re-read back inline
+# into <stage>. Stderr is APPENDED to <errf>, so a served retry (DIVE-4991) keeps
+# the cold run's goto and redirect lines above its own.
+_act_session() {  # <site> <steps> <approved> <shot> <settle> <report> <allow-kinds> <stage> <errf>
+  local site="$1" steps="$2" is_approved="$3" shot="$4" settle="$5" report="$6" allow_kinds="$7" stage="$8" errf="$9"
+  local plan payload rc=0 rep
+  plan=$(jq -nc --argjson s "$steps" --argjson a "$is_approved" --argjson sh "$shot" \
+      --argjson l "$(_daemon_lease_json)" --argjson st "$(_settle_json "$settle")" --argjson r "$report" \
+      --argjson ak "$allow_kinds" --argjson lj "$(_landing_json "$site" 0)" \
+      '{op:"plan", steps:$s, args:{}, literal:true, guard:true, approved:$a, allow_kinds:$ak,
+        report:({shot:($sh==1), tree:true} + $r)} + $st + $l + $lj')
+  payload=$(_daemon_call "$_PG_DIR" "$plan" 2>>"$errf") || rc=$?
+  rep=$(grep -F '"act_report":true' <<<"$payload" | tail -1)
+  if [[ -n "$rep" ]]; then
+    jq -r '.html_inline // ""' <<<"$rep" > "$stage/page.html"
+    jq -c '{url, title, text, wait_for, expect_polled_ms}' <<<"$rep" > "$stage/after.json"
+    jq -e '.nodes | type == "array"' <<<"$rep" >/dev/null 2>&1 && jq -c '{url, title, nodes}' <<<"$rep" > "$stage/tree.json"
+    if (( shot )); then jq -r '.png_b64 // ""' <<<"$rep" | base64 -d > "$stage/page.png" 2>/dev/null || :; fi
+  fi
   return "$rc"
 }
 
@@ -4897,29 +5122,39 @@ cmd_approvals() {
   (( found )) || printf 'no pending asks\n'
 }
 
-# `approvals policy` (DIVE-4982) — the contract the dashboard toggle is built on:
-#   read:  5dive browser approvals policy [--json]   -> {"pay":"ask","publish":"ask","send":"ask","delete":"ask"}
-#   write: sudo 5dive browser approvals policy set <kind>=ask|allow [...]   (the owner only)
+# `approvals policy` (DIVE-4982, DIVE-5006) — the contract the dashboard toggle is built on:
+#   read:  5dive browser approvals policy [--json]
+#          -> {"pay":"allow","publish":"allow","send":"allow","delete":"allow","mode":"yolo"}
+#          mode is yolo (all four allow), careful (all four ask) or custom, computed from the four
+#   write: sudo 5dive browser approvals policy set yolo|careful [<kind>=ask|allow ...]   (the owner only)
+#          sudo 5dive browser approvals policy set <kind>=ask|allow [...]
 # The 5dive CLI strips --json before a plugin verb runs and sets FIVEDIVE_JSON_MODE=1,
 # so that variable is JSON too, not only the literal flag.
 cmd_approval_policy() {
-  local json=0 set=0 a
+  local json=0 set=0 preset="" a
   [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && json=1
   local -a pairs=()
+  local usage="approvals policy [--json] | approvals policy set yolo|careful | approvals policy set <kind>=ask|allow"
   for a in "$@"; do
     case "$a" in
       --json) json=1 ;;
       set) set=1 ;;
+      yolo|careful) [[ -z "$preset" ]] || die "$E_USAGE" "approvals policy set takes one preset, yolo or careful"; preset="$a" ;;
       *=*) pairs+=("$a") ;;
-      -h|--help) printf 'usage: 5dive browser approvals policy [--json]\n       sudo 5dive browser approvals policy set <%s>=ask|allow ...\n' "${APPROVAL_KINDS// /|}"; return 0 ;;
-      *) die "$E_USAGE" "approvals policy: unexpected '$a' — usage: approvals policy [--json] | approvals policy set <kind>=ask|allow" ;;
+      -h|--help) printf 'usage: 5dive browser approvals policy [--json]\n       sudo 5dive browser approvals policy set yolo|careful\n       sudo 5dive browser approvals policy set <%s>=ask|allow ...\n' "${APPROVAL_KINDS// /|}"; return 0 ;;
+      *) die "$E_USAGE" "approvals policy: unexpected '$a' — usage: $usage" ;;
     esac
   done
+  (( set )) || [[ -z "$preset" && ${#pairs[@]} -eq 0 ]] || die "$E_USAGE" "a preset or <kind>=ask|allow goes after set — usage: $usage"
   if (( set )); then
-    (( ${#pairs[@]} )) || die "$E_USAGE" "approvals policy set <kind>=ask|allow — kinds: $APPROVAL_KINDS"
-    [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner sets the approval policy: sudo 5dive browser approvals policy set ${pairs[0]}"
+    [[ -n "$preset" ]] || (( ${#pairs[@]} )) || die "$E_USAGE" "approvals policy set yolo|careful or <kind>=ask|allow — kinds: $APPROVAL_KINDS"
+    [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner sets the approval policy: sudo 5dive browser approvals policy set ${preset:-${pairs[0]}}"
     _sudo_is_seat && die "$E_PERM" "an agent seat ($SUDO_USER) cannot change what it has to ask about. The owner sets it, from their own shell or the dashboard."
     local cur k v; cur="$(_policy_json)"
+    case "$preset" in
+      yolo)    cur='{"pay":"allow","publish":"allow","send":"allow","delete":"allow"}' ;;
+      careful) cur='{"pay":"ask","publish":"ask","send":"ask","delete":"ask"}' ;;
+    esac
     for a in "${pairs[@]}"; do
       k="${a%%=*}"; v="${a#*=}"
       [[ " $APPROVAL_KINDS " == *" $k "* ]] || die "$E_USAGE" "'$k' is not a kind; the kinds are: $APPROVAL_KINDS"
@@ -4932,8 +5167,10 @@ cmd_approval_policy() {
       rm -f -- "${tmp:?}"; die "$E_UNAVAILABLE" "cannot write the policy at $f"
     fi
   fi
-  if (( json )); then _policy_json; return 0; fi
-  _policy_json | jq -r 'to_entries[] | "\(.key)\t\(.value)"'
+  local pol; pol="$(_policy_json)"
+  if (( json )); then jq -c --arg m "$(_policy_mode <<<"$pol")" '. + {mode:$m}' <<<"$pol"; return 0; fi
+  jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$pol"
+  printf 'mode\t%s\n' "$(_policy_mode <<<"$pol")"
 }
 cmd_approve() {
   local id="" deny=0 proof="" a
@@ -5761,6 +5998,10 @@ case "${1:-}" in
   # Not in usage: the session daemon re-enters here as the profile's owner.
   _broker-lease) shift; cmd_broker_lease "$@" ;;
   _broker-audit) shift; cmd_broker_audit "$@" ;;
+  # Not in usage: both executors re-enter here when a step's ref matches nothing.
+  _reflex-pick) shift; cmd_reflex_pick "$@" ;;
+  # Not in usage: the step loops ask reflex about a landing through here (DIVE-4991).
+  _reflex-landing) shift; cmd_reflex_landing "$@" ;;
   links) shift; cmd_links "$@" ;;
   serve) shift; cmd_serve "$@" ;;
   viewer) shift; cmd_viewer "$@" ;;

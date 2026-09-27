@@ -133,18 +133,47 @@ name it: `5dive browser act github.com_work <url> --steps=…`.
                                   {"op":"click","selector":"ref=button/Save draft"}]' --expect='Draft saved'
 ```
 
-Steps are `goto fill click wait_for select press`, run in order, in one tab. Without a URL,
-`act` continues on the page a served browser is holding. `--expect=<regex>` is graded against
-the page as the steps left it, re-read for up to 5 s (`--expect-wait=<ms>`) so a toast that lands
-after the click counts, and it matches the text on screen as well as the document. Without it the
-command only says the steps ran — look at the `page.png` it writes before you tell anyone it
-worked. `act` also writes `tree.json` and `page.md` of the page it left, so you do not need a
-second `snapshot` to read the refs there.
+Steps are `goto fill type click wait_for select press`, run in order, in one tab. Use `type`
+for search boxes and autocompletes that react to keystrokes, and `fill` for plain inputs: `fill`
+sets the value in one event with no key presses, so a suggestion list that opens on typing never
+opens. `type` clears the field and types the value key by key, `delay_ms` apart (default 50, at
+most 1000). A line break in its value is refused — typed, it is the Enter key; press Enter as its
+own step:
 
-**Paying, posting, sending and deleting are the owner's call.** `act` stops in front of any
-such button (read off the live page, whatever selector you used; Ctrl/Cmd+Enter counts as
-send) and exits **73** with the ask and a screenshot. Relay the ask to the owner with the
-screenshot. Only on their explicit yes is it approved (`sudo 5dive browser approve <id>`, which
+```bash
+5dive browser act <url> --steps='[{"op":"type","selector":"ref=textbox/Where to?","value":"Lisbon"},
+                                  {"op":"wait_for","selector":"text=Lisbon, Portugal"},
+                                  {"op":"click","selector":"text=Lisbon, Portugal"}]'
+```
+
+Without a URL, `act` continues on the page a served browser is holding. `--expect=<regex>` is
+graded against the page as the steps left it, re-read for up to 5 s (`--expect-wait=<ms>`) so a
+toast that lands after the click counts, and it matches the text on screen as well as the
+document. Without it the command only says the steps ran — look at the `page.png` it writes
+before you tell anyone it worked. `act` also writes `tree.json` and `page.md` of the page it
+left, so you do not need a second `snapshot` to read the refs there.
+
+**A step that fails fails the run, whatever --expect matched** — the page before your steps may
+already carry the text. The failure names the step: `act: step 2 (click ref=button/Decline)
+failed: ref=button/Decline matches nothing on this page — the run is NOT verified, whatever
+--expect matched.` and `--json` carries it as `failed_step: {index, op, selector, error}`.
+Steps before it may have run; look at `page.png` before you retry.
+
+**A redirect is said.** After every goto, `act` and `run` compare where the page landed with the
+URL you gave; a changed path, or most of your query dropped, prints
+`redirected: <asked> → <landed> (<why>)`. If nothing but a goto had run, the cold browser stops
+there and your whole step list runs once in the served browser — the line ends
+`; retrying once in the served browser`, and that run's result is the one you get. After a click
+or a fill it is never replayed: read `page.png` and decide. `log in first: 5dive browser auth
+<site>` means reflex read the page as a login wall — ask the owner to connect the site.
+
+**Paying, posting, sending and deleting follow the owner's policy.** The default is yolo
+(DIVE-5006): `act` runs them, says `ALLOWED (default yolo)`, and logs each one, with what it sent
+and a screenshot, for the owner. Under the owner's `careful`
+(`sudo 5dive browser approvals policy set careful`, theirs to set, never yours), `act` stops in
+front of any such button (read off the live page, whatever selector you used; Ctrl/Cmd+Enter
+counts as send, and so does a plain Enter in a composer with no form around it, which is how a chat
+box sends) and exits **73** with the ask and a screenshot. Relay the ask to the owner with the screenshot. Only on their explicit yes is it approved (`sudo 5dive browser approve <id>`, which
 the owner or their dashboard runs); then re-run the SAME act with `--approved=<id>`. A yes
 covers exactly those steps, once, for 30 minutes. Do not rephrase the steps to get around the
 stop — a button renamed is still an order placed.
@@ -155,23 +184,24 @@ stop — a button renamed is still an order placed.
 5dive browser run google.com send --to=<addr> --subject='<subject>' --body='<text>'
 ```
 
-One command. It opens compose with To and Subject filled, types the body, and stops in front of
-Send with exit **73** and an ask, as `act` does. Relay it: the owner's `approve` shows the `--to`,
+One command. It opens compose with To and Subject filled, types the body, and sends (the default,
+yolo, logged). Under `careful` it stops in front of Send with exit **73** and an ask, as `act`
+does. Relay it: the owner's `approve` shows the `--to`,
 `--subject` and `--body` they are saying yes to. On their yes, re-run the SAME command with the
 SAME arguments plus `--approved-id=<id>` — a different subject is a different ask. It then sends
 and reads the Sent folder back in the same login (`verify.in_session`); only
 `verified: send is live at …#sent` means it went. **NOT VERIFIED means open Sent and look before
-anything else — never send it again blind.** Exit 75 before anything ran means this box has no
-measured google.com login check yet (the adapter ships without one): tell the owner, it is theirs
-to measure with `5dive browser capture google.com`.
+anything else — never send it again blind.** Exit 75 before anything ran means the google.com
+login check did not read `authenticated` (logged out, it reads the Google sign-in page): tell the
+owner, and connect the site with them by the shipped flow above.
 
 The ask shows what the step will act on (recipients, subject and first line of a mail; payee and
 amount; the post's text; the item deleted). Relay THAT to the owner, not the button's name. If
 it says the page showed none of it, say so and send the screenshot. **Never approve an ask
 yourself:** `sudo 5dive browser approve` from your seat is refused, and trying to get around that
-is exactly what it exists to stop. The owner may have set a standing answer per kind
-(`5dive browser approvals policy` shows it). A kind set to `allow` runs without stopping, and it
-is still logged for them to read.
+is exactly what it exists to stop. `5dive browser approvals policy` shows the owner's standing
+answer per kind and its `mode` (`yolo`, `careful` or `custom`). A kind set to `allow` (all four
+under `yolo`, the default) runs without stopping, and it is still logged for them to read.
 
 ## Working the page: ONE snapshot per decision
 
@@ -202,6 +232,19 @@ at `--settle=6000`. Raise the settle to orient; for an element that is genuinely
 as it always did on a CSS one. The settle is paid on every run; a `wait_for` costs only what the
 page takes.
 
+**A ref that matches nothing is retried once, on the element reflex picks at confidence 0.9 or
+more.** With reflex configured on the box, `act` and `run` hand the page's interactive refs and
+what the step is for to `5dive reflex pick-ref`, and retry that one step on its pick. Without
+reflex, or when it errors, the retry goes to the ONE element of the same role whose name matches
+yours ignoring case, contains it, or is contained in it; two such elements, and there is no retry.
+Say what a step is for in an optional `"intent"` field
+(`{"op":"click","selector":"ref=button/Decline","intent":"reject the cookie banner"}`); without
+it the intent is the ref's role and name. The output says what happened:
+`step 2: ref=button/Decline matched nothing; reflex picked ref=button/Decline all (conf 0.99); retried: ok`.
+A step that pays, posts, sends or deletes is never retargeted: it fails as before and the failure
+names the suggestion — if it is right, send the step again with that ref, and the owner's policy
+reads it as usual. One retry per step, and only for a `ref=`: a CSS selector still times out.
+
 **A web app answers with a loading screen first. Wait for the real page.** `snapshot`, `read`
 and `act` take `--wait-for=<target>` — a CSS selector, `ref=<role>/<name>`, or `text=<words>` —
 and capture once the page shows it:
@@ -215,6 +258,9 @@ the output says `LOADING SCREEN`), or a `--wait-for` that never appeared. `page.
 `page.md` say `partial: true`. Do not read refs or text out of it and do not report it as the
 page; run it again with a `--wait-for` the loaded page has. 76 is not 75: the login is fine,
 so do not ask anyone to log in, and do not re-run an `act`'s steps — they already ran.
+Only *not honoured* (a served browser running an old daemon) asks for a restart
+(`serve <site> --stop`, then `serve <site>`). `did not appear within <ms>` is a timeout, and *was
+not answered* is a capture with no verdict on `--wait-for`; restarting changes neither.
 `read` stops at 30 s of real time on a page that never goes quiet and marks what it got
 `partial: true`.
 

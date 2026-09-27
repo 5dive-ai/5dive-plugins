@@ -39,6 +39,9 @@
 // the marked element is then addressed with an ordinary CSS attribute selector,
 // which means the rest of the executor needs no ref-awareness at all.
 
+const cp = require('child_process');
+const path = require('path');
+
 // Roles that can be acted on. `--interactive` keeps these and drops the rest;
 // it is the list an agent actually needs, and the full tree is still one flag away.
 const INTERACTIVE = [
@@ -257,6 +260,7 @@ async function resolveRef(page, sel) {
     `from the page every time, so this means the page is not the one \`tree\` described — not that the ` +
     `ref was mistyped.${hint}`);
   err.refMiss = true;
+  err.nodes = nodes;   // the page as it was looked at, for resolveOrRepick
   throw err;
 }
 
@@ -313,6 +317,51 @@ async function resolveStepSelector(page, step, { timeoutMs = 30000, pollMs = 250
   return resolveRef(page, sel);
 }
 
+// ---- TYPE: KEY BY KEY --------------------------------------------------------
+//
+// `fill` sets the value in ONE input event, with no keydown, keypress or keyup,
+// so a search box whose suggestions open on keystrokes never opens. Measured on
+// a hotel search: fill "Lisbon" then Search went to the results for an empty
+// city ("0 properties found"); fill "Lisbo", press "n", wait_for the suggestion
+// timed out at 30s. `type` sends the value one key at a time, as a person types
+// it. It clears the field first, as fill does, so the step means "the field now
+// says this", never "this was appended". Here, not in either step loop, because
+// there are two of them.
+//
+// THE FIRST MATCH, as page.fill takes it: a bare locator is strict and would throw
+// on a selector that matches twice, where the same selector in a `fill` works.
+//
+// THE BOUND GROWS WITH THE TEXT. Playwright's timeout covers the whole typing,
+// delays included, so 600 characters at 50 ms is the whole default 30 s: a flat
+// bound would cut a long message off half-typed.
+//
+// A LINE BREAK IS THE ENTER KEY. pressSequentially sends "\n" and "\r" as Enter,
+// which submits the form the box is in, and Enter is a step the owner's policy
+// reads (stepRisk). Typed inside a value it would never be read, so a `type`
+// value with a line break is refused: press Enter as its own step.
+const TYPE_DELAY_DEFAULT = 50;
+const TYPE_DELAY_MAX = 1000;
+function typeDelay(v) {  // a step's delay_ms -> ms between keys, or null when it is not one
+  if (v === undefined) return TYPE_DELAY_DEFAULT;
+  return Number.isInteger(v) && v >= 0 && v <= TYPE_DELAY_MAX ? v : null;
+}
+function typeRefusal(delayMs, value) {  // why a `type` step cannot run, or null
+  if (typeDelay(delayMs) === null) {
+    return `has delay_ms ${JSON.stringify(delayMs)} — it takes whole milliseconds between keys, ` +
+      `0 to ${TYPE_DELAY_MAX} (default ${TYPE_DELAY_DEFAULT})`;
+  }
+  if (/[\r\n]/.test(value)) {
+    return 'has a line break in its value — typed, that is the Enter key, which sends the form ' +
+      'without the owner\'s policy reading it. Press Enter as its own step, or fill multi-line text';
+  }
+  return null;
+}
+async function typeKeys(page, sel, value, delayMs, { timeoutMs = 30000 } = {}) {
+  const box = page.locator(sel).first();
+  await box.clear({ timeout: timeoutMs });
+  await box.pressSequentially(value, { delay: delayMs, timeout: timeoutMs + [...value].length * delayMs });
+}
+
 // ---- THE OWNER'S FOUR (DIVE-4943) ------------------------------------------
 //
 // An agent may click and type anywhere, but four kinds of act are the owner's to
@@ -324,11 +373,22 @@ async function resolveStepSelector(page, step, { timeoutMs = 30000, pollMs = 250
 //
 // WHAT IS READ. For `click`: the element's accessible label (aria-label, the
 // visible text, a button's value, its title), plus the ref's own name when the
-// step used a ref. For `press`: Enter submits the element's form, so it is the
-// label of that form's submit button; a modifier+Enter is the send/post shortcut
-// on every composer that has one (X, Slack, GitHub comments), so it is refused
-// as `send` without reading anything — a composer rarely carries a label that
-// says so, and guessing "harmless" there is the expensive direction.
+// step used a ref. For `press`: inside a form, Enter submits that form, so it is
+// the label of the form's submit button; a modifier+Enter is the send/post
+// shortcut on every composer that has one (X, Slack, GitHub comments), so it is
+// refused as `send` without reading anything — a composer rarely carries a label
+// that says so, and guessing "harmless" there is the expensive direction.
+//
+// A PLAIN ENTER WITH NO FORM IS NOT "NO FORM, NOTHING SUBMITTED" (DIVE-620). A chat
+// composer is a contenteditable with no <form> around it, and a plain Enter is its
+// send key: on Telegram Web `fill` then `press Enter` delivered a message past
+// send=ask, because there was no form to read a submit button from, the label was
+// '', and '' classifies as nothing. So a plain Enter on a formless composer — the
+// target, or the focused element when the target is not one: `contenteditable`,
+// `textarea` or `[role=textbox]` — is `send`, without reading a label, by the same
+// rule as modifier+Enter. A formless search box (`input[type=search]`, a plain
+// text input) is not a composer and keeps running without an ask. Shift+Enter is
+// a composer's NEW LINE, not its send key, so it is not caught here.
 //
 // IT IS A GUARD, NOT A CLASSIFIER OF INTENT. It catches the literal buttons. An
 // agent that submits an order through a button labelled "Continue" is not caught
@@ -357,12 +417,29 @@ function _labelIn(arg) {
   const sub = form.querySelector('button[type=submit],input[type=submit],button:not([type])');
   return txt(sub) || String(form.getAttribute('action') || '');
 }
+// Is a plain Enter here a formless composer's send key? In the page, like _labelIn.
+function _composerIn(arg) {
+  var el = null;
+  try { el = arg.sel ? document.querySelector(arg.sel) : null; } catch (e) { el = null; }
+  function formless(n) { return !(n.form || (n.closest && n.closest('form'))); }
+  function composer(n) {
+    if (!n) return false;
+    if (n.isContentEditable === true) return true;
+    try { return !!(n.matches && n.matches('[contenteditable=""],[contenteditable=true],[contenteditable=plaintext-only],textarea,[role=textbox]')); }
+    catch (e) { return false; }
+  }
+  if (el && !formless(el)) return false;
+  if (el && composer(el)) return true;
+  var a = document.activeElement;
+  return !!(a && a !== el && composer(a) && formless(a));
+}
 // WHAT THE OWNER IS SAYING YES TO (DIVE-4982). A button label is not an answer to
 // "OK?": measured on a Gmail send, the ask read `"Send (Ctrl-Enter) Send". OK?`,
 // with no recipient, no subject and no text. So before the step, the page is read
 // for what the step will act on — in the form or dialog around the button, the
 // document if there is none:
-//   send     to (every address in a To/Cc/Bcc field or recipient chip), subject,
+//   send     to (every address in a To/Cc/Bcc field or recipient chip; with a
+//            chip on the page, chips and input values only), subject,
 //            first_line of the body
 //   pay      payee (a field that names one, else the site), amount (a price on
 //            the button, else on a "total" line, else the first on the page)
@@ -383,9 +460,14 @@ function _payloadIn(arg) {
   var first = function (q) { var n = all(root, q); for (var i = 0; i < n.length; i++) { var v = text(n[i]); if (v) return v; } return ''; };
   var out = {};
   if (arg.cls === 'send') {
-    var to = [], seen = {};
+    // A chip's `email` attribute is the address. The field around it is not: in
+    // Gmail its text is the chip's glued to the hover card's, `user@x.comLoading...`,
+    // and no pattern can split `com` from `comLoading`. So with any [email] node in
+    // the form, the addresses are those attributes and input values only; a field's
+    // text is read only on a page with no [email] node at all.
+    var to = [], seen = {}, chips = all(root, '[email]').length > 0;
     all(root, '[email],input[name=to],input[name=cc],input[name=bcc],textarea[name=to],[aria-label^="To"],[aria-label^="Cc"],[aria-label^="Bcc"]').forEach(function (n) {
-      var v = (n.getAttribute && n.getAttribute('email')) || n.value || text(n);
+      var v = (n.getAttribute && n.getAttribute('email')) || n.value || (chips ? '' : text(n));
       (String(v || '').match(/[^\s<>,;"'()]+@[^\s<>,;"'()]+/g) || []).forEach(function (a) { if (!seen[a]) { seen[a] = 1; to.push(a); } });
     });
     if (to.length) out.to = to;
@@ -442,6 +524,11 @@ async function stepRisk(page, step, sel) {
     const key = String(step.key || '');
     if (!/(^|\+)Enter$/i.test(key)) return null;
     if (/(Control|Meta|Ctrl|Cmd)\+/i.test(key)) { cls = 'send'; label = key; }
+    else if (/^Enter$/i.test(key)) {
+      let composer = false;
+      try { composer = (await page.evaluate(_composerIn, { sel, op: step.op, composerOf: true })) === true; } catch (e) { composer = false; }
+      if (composer) { cls = 'send'; label = `${key} in a composer with no form`; }
+    }
   }
   if (!cls) {
     const refName = isRef(step.selector) ? refBody(step.selector).replace(/^[^/]*\//, '').replace(/#\d+$/, '') : '';
@@ -455,6 +542,130 @@ async function stepRisk(page, step, sel) {
   try { payload = await page.evaluate(_payloadIn, { sel, op: step.op, cls, payloadOf: true }); } catch (e) { payload = {}; }
   return { cls, label: cleanText(label), payload: cleanPayload(payload) };
 }
+
+// ---- A TARGET THAT IS NOT THERE: ONE RETRY, ON ONE PICKED ELEMENT ------------
+//
+// Measured on a hotel site: `act` step 2, `click ref=button/Decline`, failed
+// "matches nothing on this page". The consent banner's button was there, under
+// another accessible name, and the agent had to snapshot, read and send the whole
+// act again. So a step whose ref matches nothing gets ONE retry, on one element
+// picked for it:
+//   reflex   when the box has it configured: `5dive reflex pick-ref` (DIVE-4929)
+//            on the page's interactive tree, taken at confidence >= 0.9 only,
+//            reached through bin/browser `_reflex-pick` and so through _reflex_cli.
+//   by name  otherwise, and when reflex errors: the ONE element of the ref's own
+//            role whose name equals the ref's (any case, whitespace trimmed),
+//            contains it, or is contained in it. Two, and there is no pick.
+// Reflex answering "none", or under 0.9, IS an answer: the step fails as it did,
+// and the failure says what reflex said.
+//
+// NEVER A STEP THAT PAYS, POSTS, SENDS OR DELETES. The owner's yes, and the
+// policy that let a kind through, cover the step as written; a retargeted Send is
+// another send. stepRisk reads it (the ref's own name, the picked element's live
+// label), and so does pick-ref's review_required; such a step fails as it did,
+// naming the suggestion.
+//
+// WHAT LEAVES THE BOX is what pick-ref sends: the intent, the op, the interactive
+// tree's roles and names. A value goes as `{value}`: pick-ref never shows the
+// model the value, and argv is readable by every seat on the box.
+//
+// A REF MISS ONLY. A CSS selector that matches nothing fails by timing out, and a
+// timeout is not a miss the executor can tell from a slow page.
+const REPICK_MIN_CONFIDENCE = 0.9;
+const REPICK_OP = { click: 'click', fill: 'fill', type: 'fill', select: 'select',
+  press: 'press', wait_for: 'wait_for', upload: 'upload' };
+const SELF_BROWSER = path.join(__dirname, '..', 'bin', 'browser');
+
+function refParts(ref) {  // 'button/Decline#2' -> { role: 'button', name: 'Decline' }
+  const role = ref.split('/')[0];
+  return { role, name: ref.slice(role.length + 1).replace(/#\d+$/, '') };
+}
+
+// The by-name tier: EVERY node that qualifies, so the caller can see there were two.
+function nameMatches(nodes, ref) {
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const { role, name } = refParts(ref);
+  const want = norm(name);
+  if (!want) return [];
+  return (nodes || []).filter((n) => {
+    const have = norm(n.name);
+    return n.role === role && have !== '' && (have === want || have.includes(want) || want.includes(have));
+  });
+}
+
+// bin/browser `_reflex-pick`, the tree on stdin. Never throws: anything that is
+// not its one line of JSON is {reflex:"error"}, and the name match decides.
+function reflexPick(site, args, tree, { timeoutMs = 90000 } = {}) {
+  return new Promise((resolve) => {
+    let out = '', child = null, timer = null;
+    const done = (r) => { clearTimeout(timer); resolve(r); };
+    try { child = cp.spawn(SELF_BROWSER, ['_reflex-pick', site, ...args], { stdio: ['pipe', 'pipe', 'ignore'] }); }
+    catch (e) { return resolve({ reflex: 'error', why: e.message }); }
+    timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) { /* already gone */ } }, timeoutMs);
+    child.on('error', (e) => done({ reflex: 'error', why: e.message }));
+    child.stdout.on('data', (d) => { out += d; });
+    child.on('close', (code) => {
+      let r = null;
+      try { r = JSON.parse(out.trim().split('\n').pop()); } catch (e) { r = null; }
+      done(code === 0 && r && typeof r === 'object' ? r : { reflex: 'error', why: `_reflex-pick exited ${code}` });
+    });
+    child.stdin.on('error', () => { /* it exited before reading the tree; its exit says why */ });
+    child.stdin.end(JSON.stringify(tree));
+  });
+}
+
+// What both step loops call instead of resolveStepSelector: { sel, retry }. `retry`
+// is null, or the start of the line the loop ends with "ok" or "failed". With no
+// retry the miss is thrown as it always was, its message extended by what reflex
+// said, so a miss on step one is still "nothing ran". `n` is the step's number.
+async function resolveOrRepick(page, step, n, opts = {}) {
+  let miss;
+  try { return { sel: await resolveStepSelector(page, step, opts), retry: null }; }
+  catch (e) { if (!e.refMiss || !REPICK_OP[step.op]) throw e; miss = e; }
+  const failAs = (why) => { miss.message += why; return miss; };
+  const from = step.selector;
+  const { role, name } = refParts(refBody(from));
+  const op = REPICK_OP[step.op];
+  const intent = (typeof step.intent === 'string' && step.intent.trim()
+    ? step.intent.trim() : (name ? `${role} named ${name}` : role)).slice(0, 200);
+  const args = [`--op=${op}`, `--intent=${intent}`];
+  if (op === 'fill' || op === 'select') args.push('--value={value}');
+  if (op === 'press') args.push(`--key=${step.key}`);
+  if (op === 'upload') args.push('--path={path}');
+  let url = '', site = '';
+  try { url = String(await page.url()); site = new URL(url).hostname; } catch (e) { site = ''; }
+  const tree = { url, nodes: (miss.nodes || []).filter((x) => INTERACTIVE.includes(x.role)) };
+  const r = site ? await reflexPick(site, args, tree) : { reflex: 'error', why: 'the page has no host name' };
+
+  let pick;
+  if (r.reflex === 'ok' && !(r.error && r.error !== 'no_candidates')) {
+    const conf = typeof r.confidence === 'number' ? r.confidence : null;
+    if (!r.ref) throw failAs(' Reflex proposed no element for it.');
+    if (conf === null || conf < REPICK_MIN_CONFIDENCE) {
+      throw failAs(` Reflex suggested ref=${r.ref} at confidence ${conf}, under ${REPICK_MIN_CONFIDENCE}, so it was not retried.`);
+    }
+    pick = { ref: r.ref, line: `reflex picked ref=${r.ref} (conf ${conf})`,
+             said: `Reflex picked ref=${r.ref} (conf ${conf})`, review: r.review_required === true };
+  } else {
+    // Off: the name match alone, and a miss it cannot settle reads exactly as before.
+    const why = r.reflex === 'off' ? ''
+      : ` Reflex could not pick one (${cleanText(r.why || r.error || 'no answer').slice(0, 160)}).`;
+    const hits = nameMatches(miss.nodes, refBody(from));
+    if (hits.length !== 1) throw failAs(why);
+    pick = { ref: hits[0].ref, line: `name match picked ref=${hits[0].ref}`,
+             said: `${why ? `${why.trim()} ` : ''}A name match picked ref=${hits[0].ref}`, review: false };
+  }
+  let sel;
+  try { sel = await resolveRef(page, REF_PREFIX + pick.ref); }
+  catch (e) { if (!e.refMiss) throw e; throw failAs(` ${pick.said}, and that matches nothing either.`); }
+  const risk = pick.review ? { cls: 'pay, post, send or delete' } : await stepRisk(page, step, sel);
+  if (risk) {
+    throw failAs(` ${pick.said}, and it was not retried: this step would ${risk.cls}, and a step that pays, ` +
+      'posts, sends or deletes is never retargeted — the owner\'s yes covers the step as written.');
+  }
+  return { sel, retry: `step ${n}: ${from} matched nothing; ${pick.line}; retried: ` };
+}
+
 // ---- READY, NOT SETTLED (DIVE-4983) -----------------------------------------
 //
 // A settle is a guess at how long a page takes, and on a web app it is the wrong
@@ -616,6 +827,112 @@ const E_NEEDS_OWNER = 73;
 // the step runs, and bin/browser writes it to the owner's log.
 const OWNER_ALLOWED_PREFIX = '5dive-owner-allowed: ';
 
+// ...and the line for THE STEP THAT FAILED (DIVE-4990), from both loops alike: an
+// `act` whose step 2 failed printed "verified" because --expect matched the page
+// the goto left, and the failure named no step. bin/browser keys on this line to
+// fail the run whatever --expect matched, and to say which step it was.
+const STEP_FAILED_PREFIX = '5dive-step-failed: ';
+function failedStep(index, step, e) {
+  const where = `step ${index} (${step.op})`;
+  let error = String((e && e.message) || e || 'failed').split('\n')[0].trim();
+  if (error.startsWith(`${where}: `)) error = error.slice(where.length + 2);
+  return { index, op: step.op, selector: step.selector || null, error: error.replace(/\.$/, '') };
+}
+
+// ---- WHERE A GOTO LANDED (DIVE-4991) ----------------------------------------
+//
+// A cold `act` of a Booking search URL landed on the undated city page every
+// time, a URL copied from a real browser included, and the next step's failure
+// ("a step failed, the executor exited 1") was all anyone saw. The served
+// browser, same profile and same URL, landed on the results. So after every goto
+// both loops compare the URL asked for with the one the page is on, and say so.
+//
+// THE BASE TEST, no model: redirected when the PATH changed, or when more than
+// half of the requested query keys are gone. Only the fragment changing, or the
+// same path with params ADDED (a tracking id), is the page that was asked for.
+// A trailing slash is not a different page either.
+function redirectWhy(requested, landed) {
+  let a, b;
+  try { a = new URL(requested); b = new URL(landed); } catch (e) { return null; }
+  const trim = (p) => (p.length > 1 ? p.replace(/\/+$/, '') : p);
+  if (trim(a.pathname) !== trim(b.pathname)) return `path ${a.pathname} became ${b.pathname}`;
+  const asked = [...new Set(a.searchParams.keys())];
+  const gone = asked.filter((k) => !b.searchParams.has(k));
+  if (asked.length && gone.length * 2 > asked.length) {
+    return `${gone.length} of ${asked.length} query keys dropped: ${gone.slice(0, 5).join(' ')}`;
+  }
+  return null;
+}
+
+// THE OPTIONAL TIER: `5dive reflex landing`, only where bin/browser found reflex
+// configured, because this is where page text leaves the box. Reached through
+// bin/browser `_reflex-landing` (and so through _reflex_cli, like every reflex
+// call). Never throws: anything that is not its one line of JSON is an error,
+// and on an error the base verdict stands. Its own names, required in place, so
+// no other section's top-level `path` or `cp` can collide with them.
+const LANDING_BROWSER = require('path').join(__dirname, '..', 'bin', 'browser');
+const LANDING_SPAWN = require('child_process').spawn;
+const REFLEX_TIMEOUT_MS = Number(process.env.FIVEDIVE_BROWSER_REFLEX_TIMEOUT_MS || 60000);
+function reflexLanding(site, state) {
+  return new Promise((resolve) => {
+    let child, out = '', over = false;
+    const done = (r) => { if (!over) { over = true; clearTimeout(timer); resolve(r); } };
+    const timer = setTimeout(() => { try { child.kill(); } catch (e) { /* gone */ }
+      done({ reflex: 'error', why: 'reflex did not answer in time' }); }, REFLEX_TIMEOUT_MS);
+    try { child = LANDING_SPAWN(LANDING_BROWSER, ['_reflex-landing', site], { stdio: ['pipe', 'pipe', 'ignore'] }); }
+    catch (e) { return done({ reflex: 'error', why: e.message }); }
+    child.on('error', (e) => done({ reflex: 'error', why: e.message }));
+    child.stdout.on('data', (d) => { out += d; });
+    child.on('close', (code) => {
+      let r = null; try { r = JSON.parse(out.trim().split('\n').pop()); } catch (e) { r = null; }
+      done(code === 0 && r && typeof r === 'object' ? r : { reflex: 'error', why: `_reflex-landing exited ${code}` });
+    });
+    child.stdin.on('error', () => { /* it answers or it does not; close decides */ });
+    child.stdin.end(JSON.stringify(state));
+  });
+}
+
+// One goto's landing, for either loop. `landing` is what bin/browser put in the
+// plan: {site, reflex, retry}. Returns the line to print (or ''), `loginWall`
+// (the message to fail with, or ''), and `retry` — true only when the caller
+// allowed it AND the page was redirected. Never throws: a page that cannot say
+// where it is has not been shown to be somewhere else.
+async function checkLanding(page, requested, landing, { mayRetry = false } = {}) {
+  const out = { line: '', loginWall: '', retry: false };
+  let landed = '';
+  try { landed = String(await page.url()); } catch (e) { return out; }
+  let why = redirectWhy(requested, landed);
+  let host = '';
+  try { host = new URL(landed).hostname; } catch (e) { host = ''; }
+  const site = (landing && landing.site) || host;
+  if (landing && landing.reflex && site) {
+    let title = '', text = '';
+    try { title = String(await page.title()); } catch (e) { title = ''; }
+    try { text = String(await page.evaluate(_textIn, { textOf: true }) || ''); } catch (e) { text = ''; }
+    const r = await reflexLanding(site, { requested_url: requested, landed_url: landed, landed_title: title,
+      page_excerpt: text.replace(/\s+/g, ' ').trim().slice(0, 300) });
+    const conf = Number(r.confidence) || 0;
+    if (r.reflex === 'ok' && r.choice === 'login_wall') {
+      out.loginWall = `the page is a login wall (reflex, ${conf}): log in first: 5dive browser auth ${site}`;
+      return out;
+    }
+    if (r.reflex === 'ok' && (r.choice === 'generic_page' || r.choice === 'bot_block')) {
+      why = `${why ? why + '; ' : ''}reflex: ${r.choice}, ${conf}`;
+    } else if (r.reflex === 'ok' && r.choice === 'answered' && conf >= 0.9 && why) {
+      out.line = `landed on ${landed} (${why}), which reflex read as the page asked for (answered, ${conf}); not a redirect`;
+      return out;
+    }
+  }
+  if (!why) return out;
+  out.retry = !!(mayRetry && landing && landing.retry);
+  out.line = `redirected: ${requested} → ${landed} (${why})` +
+    (out.retry ? '; retrying once in the served browser' : '');
+  return out;
+}
+// The cold driver's exit when it stopped for that retry: only gotos ran, and
+// bin/browser runs the whole plan again through the served browser.
+const E_REDIRECTED = 71;
+
 function render(nodes, { json = false } = {}) {
   if (json) return JSON.stringify({ nodes }, null, 2);
   const w = nodes.reduce((m, n) => Math.max(m, n.role.length), 0);
@@ -626,7 +943,11 @@ function render(nodes, { json = false } = {}) {
 }
 
 module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
-  resolveRefWithin, resolveStepSelector, isRef, render, REF_PREFIX,
+  resolveRefWithin, resolveStepSelector, resolveOrRepick, nameMatches, REPICK_MIN_CONFIDENCE,
+  isRef, render, REF_PREFIX,
+  typeDelay, typeRefusal, typeKeys, TYPE_DELAY_DEFAULT, TYPE_DELAY_MAX,
   classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER, OWNER_ALLOWED_PREFIX,
+  STEP_FAILED_PREFIX, failedStep,
+  redirectWhy, checkLanding, E_REDIRECTED,
   _payloadIn, cleanText, cleanPayload,
   waitForVisible, _visibleIn, _textIn, _scopeIn };

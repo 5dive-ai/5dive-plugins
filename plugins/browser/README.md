@@ -25,6 +25,7 @@ than a detail.
 5dive browser snapshot <url> --wait-for='[role=main]'   # capture when the page shows it;
                                                   # also on read and act (exit 76: not ready)
 sudo 5dive browser approve <id> [--deny]          # the owner's yes to a pay/post/send/delete
+sudo 5dive browser approvals policy set careful   # the owner: all four stop and ask (default: yolo)
 sudo 5dive browser approvals policy set send=allow   # the owner's standing answer per kind
 ```
 
@@ -36,15 +37,20 @@ resolves the profile once, in `_route_site`: the host's one connected login; the
 connected site); a refusal naming the accounts when there are several (`github.com_work`,
 `github.com_personal` — a profile is `<site>_<label>`, and which account acts is the owner's call).
 
-`act` runs agent-written steps in the fixed vocabulary (`goto fill click wait_for select press`)
+`act` runs agent-written steps in the fixed vocabulary (`goto fill type click wait_for select press`)
 through the same executors, lease and login gate as `run`, and grades `--expect` against the page
-as the steps left it. **Paying, publishing, sending and deleting stop before the step** (exit 73):
-the executor reads the live element's label (`lib/aria.cjs` `stepRisk`, shared by both step loops),
-records the ask with a screenshot, and waits for `sudo 5dive browser approve <id>`, a root-owned
-grant bound to the exact steps, good once for 30 minutes. It catches the literal buttons, not
-intent: an order behind a button labelled "Continue" is not caught.
+as the steps left it; a step that fails fails the run, whatever --expect matched, and the failure
+names the step (`--json`: `failed_step`). **Paying, publishing, sending and deleting run and are logged by default
+(yolo, DIVE-5006); under the owner's `careful` they stop before the step** (exit 73): the executor
+reads the live element's label (`lib/aria.cjs` `stepRisk`, shared by both step loops), and a kind
+the owner's policy sets to `ask` records the ask with a screenshot and waits for
+`sudo 5dive browser approve <id>`, a root-owned grant bound to the exact steps, good once for 30
+minutes. It catches the literal buttons, not intent: an order behind a button labelled "Continue"
+is not caught. A key counts too: Ctrl/Cmd+Enter is a send anywhere, and so is a plain Enter in a
+composer with no form around it (a `contenteditable`, a `textarea` or a `[role=textbox]`, the way a
+chat box sends); a plain Enter in a formless search box is not.
 
-`run` stops the same way where the adapter's action says **`"guard": true`** (DIVE-4984): a
+`run` reads the same policy where the adapter's action says **`"guard": true`** (DIVE-4984): a
 recipe is a reviewed file, but when its arguments choose the recipient and the words — a mail —
 sending is still the owner's call. The ask records the `--key=value` arguments and `approve` shows
 them; the yes is bound to that action with those arguments, and is spent with
@@ -52,21 +58,27 @@ them; the yes is bound to that action with those arguments, and is spent with
 action without `guard` keeps the contract it had.
 
 **What the owner says yes to (DIVE-4982).** The ask carries a `payload`, read off the page just
-before the step, in the form or dialog around the button: for a send the recipients, the subject
-and the body's first line; for a pay the payee (or the site) and the amount; for a publish the
+before the step, in the form or dialog around the button: for a send the recipients (a chip's
+address, never the text of the field around it), the subject and the body's first line; for a pay the payee (or the site) and the amount; for a publish the
 first 280 characters of the text; for a delete the row or item it belongs to. Bidi and control
 characters are stripped from it and from the button label. `approvals` and `approve` print it.
 A page that shows none of it gets an ask that says so; the button label is never passed off as
 a payload.
 
 **The owner's policy per kind.** `5dive browser approvals policy [--json]` prints
-`{"pay":"ask","publish":"ask","send":"ask","delete":"ask"}` (also as JSON when
-`FIVEDIVE_JSON_MODE=1`, which is how the 5dive CLI passes `--json` on). The owner changes it
-with `sudo 5dive browser approvals policy set <kind>=ask|allow`. The file lives at
-`/var/lib/5dive/browser-profiles/.approval-policy.json`, root-owned `0644`: every seat reads it,
-none writes it, and one the granting uid does not own is ignored. With `allow`, that kind's step
-runs without asking and is logged, with the payload and the act's screenshot, to
-`allowed.jsonl` in the seat's approvals directory.
+`{"pay":"allow","publish":"allow","send":"allow","delete":"allow","mode":"yolo"}` on a box with no
+policy file (also as JSON when `FIVEDIVE_JSON_MODE=1`, which is how the 5dive CLI passes `--json`
+on). **The default is `allow` for all four (DIVE-5006):** the step runs and is logged, with the
+payload and the act's screenshot, to `allowed.jsonl` in the seat's approvals directory
+(`allowed_by: "default"`, and stderr says `ALLOWED (default yolo)`). The owner changes it with a
+preset, `sudo 5dive browser approvals policy set yolo` (all four allow) or
+`sudo 5dive browser approvals policy set careful` (all four ask: the exit-73 stop), and per kind
+with `set <kind>=ask|allow`, on top of either. `mode` is computed from the four: `yolo`, `careful`,
+or `custom`. The file lives at `/var/lib/5dive/browser-profiles/.approval-policy.json`, root-owned
+`0644`: every seat reads it, none writes it (a seat's `set` is refused, 77), and one the granting
+uid does not own is ignored, so the default applies and a seat can neither loosen nor tighten
+it. A kind the owner set to `allow` is logged as `allowed_by: "policy"`. A file written by an
+earlier version keeps what it says.
 
 **A seat cannot answer an ask.** An agent seat's `sudo 5dive …` grant is root, and measured, a
 seat approved its own ask that way. `approve` and `approve --deny` from `sudo` by an `agent-*`
@@ -487,6 +499,22 @@ not make a slow element arrive. An element that is genuinely late is `wait_for`'
 `wait_for` on a CSS selector always did. Raising the settle to cover a late element buys the delay
 on **every** run of that adapter; a `wait_for` costs only as long as the page actually takes.
 
+**A ref that matches nothing is retried once, on the element reflex picks at confidence 0.9 or
+more.** Both executors do it, for a `click`, `fill`, `type`, `select`, `press`, `wait_for` or
+`upload` step: `5dive reflex pick-ref` gets the page's interactive refs, the op, and what the step
+is for — the step's optional `"intent"` field, or else the ref's role and name (`button named
+Decline`) — and the step is retried on the ref it picks, reported as `step 2: ref=button/Decline
+matched nothing; reflex picked ref=button/Decline all (conf 0.99); retried: ok`. A value goes to
+pick-ref as `{value}`, never the text itself. Reflex answering `none`, or under 0.9, is an answer:
+no retry, and the failure names it. On a box without reflex, or when reflex errors, the retry goes
+to the one element of the same role whose name equals the ref's ignoring case, contains it, or is
+contained in it; with two such elements, or none, the step fails exactly as before. A step that
+pays, posts, sends or deletes (the ref's own name, the picked element's label, or pick-ref's
+`review_required`) is never retargeted, because the owner's yes covers the step as written: it
+fails and names the suggestion. Reflex is reached as `propose` reaches it: `sudo -n 5dive reflex
+pick-ref` when the seat holds that grant, the plain CLI otherwise, where the root-only key is not
+readable and the name match decides.
+
 ### Ready, not settled: `--wait-for`, loading screens, `read`'s cap, `--expect`'s window (DIVE-4983)
 
 ```
@@ -531,9 +559,12 @@ because its one re-read came before the toast.
 
 **76 is not 75.** 75 means the session is cold and a person has to log in again. 76 means the
 session is fine and the page was not ready: wait for it. Do not re-authenticate, and do not re-run
-an `act`'s steps. A browser served before this release runs the old daemon, which ignores
-`--wait-for`; that is reported as *not honoured* (76), never as met. `serve <site> --stop` and
-`serve <site>` again picks up the new one.
+an `act`'s steps. A `--wait-for` that times out says `did not appear within <ms>` (76). A browser
+served before this release runs the old daemon, which ignores `--wait-for`; that is reported as
+*not honoured* (76), never as met, and `serve <site> --stop` and `serve <site>` again picks up the
+new one. A cold `read` (nothing served) whose capture comes back with no verdict on `--wait-for`
+says it *was not answered* (76) and names the capture; it blames no daemon, because there is none
+to restart.
 
 ## Adapters are data, and the vocabulary is fixed
 
@@ -558,22 +589,24 @@ when.
 | `reddit.com` | `/login/` | `name="username"` | logged-out form in a real browser |
 | `x.com` | `/i/flow/login` | `name="username_or_email"` | logged-out form, three renders (8s, 25s, Playwright 15s); the logged-in half is unmeasured because no x.com profile exists — that gap fails SAFE (a false "expired" asks a person; never a false "authenticated") |
 | `github.com` | `/settings/profile` | `action="/session"` | BOTH halves: 3 matches on the sign-in page logged out, 0 on "Your profile" logged in |
-| `google.com` | none | none | **the login check is not measured**, so there is no probe: `status google.com` reads UNKNOWN and `run google.com send` refuses (75) before a step, which is the fail-closed half. Measure it with `capture google.com` and reflex (below), and put the probe in the seat's `.adapters/google.com.json`. The `send` action's steps and its Sent-folder verify were measured on a live Gmail on 2026-09-25 (see the file's `_comment`) |
-| `web.telegram.org` | `/k/` | out: `(page-signQR\|auth-qr-form\|…)`, **in:** `class="[^"]*chatlist` | the POSITIVE marker on both halves (9 matches on the settled live session, 0 on the shell and on a logged-out render); the logged-out marker matched 0 on the live session but its logged-out render was never observed — the K app does not paint sign-in inside the probe's window on a fresh profile. That gap fails SAFE only because of the positive marker: neither matching is `UNKNOWN`, not a login |
+| `google.com` | `accounts.google.com/signin/v2/identifier` | `<title>Sign in - Google Accounts</title>` | BOTH halves: the sign-in page's title, exactly, 1 match logged out (an 857 KB render, throwaway profile); 0 logged in, where `status` read authenticated. It probes the sign-in page because a logged-out `myaccount.google.com` renders a marketing page with 0 matches, and it matches the title, not the words "Sign in". The `send` action's steps and its Sent-folder verify were measured on a live Gmail on 2026-09-25 (see the file's `_comment`) |
+| `booking.com` | `/` | `data-testid="auth-link-in-view"` | BOTH halves: 1 match in each of two logged-out renders, 0 in the logged-in one (header "Your account", Genius level), where `status` read authenticated. The first draft's marker was the Sign in link's href, `account.booking.com/auth/oauth2?client_id=`, as counted; the marker is a regex, `2?` is an optional 2, and it matched 0 logged-out renders. It ships two actions, `search` and `hotels` (`--city --checkin --checkout --adults --rooms --max_eur`, dates YYYY-MM-DD, cheapest first): a cold `run` of a results URL is redirected to an undated city page and retried once in the served browser (DIVE-4991), so `serve booking.com` first saves that round trip — and expect NOT VERIFIED, because the verify is a public fetch and Booking answers that with a different page |
+| `web.telegram.org` | `/k/` | out: `(page-signQR\|auth-qr-form\|…)`, **in:** `class="([^"]* )?chatlist[ "]` | the POSITIVE marker on both halves: `chatlist` as a whole class name, 1 match on the live signed-in render (`class="chatlist virtual-chatlist"`), 0 on the shell and on both 2026-09-25 signed-out renders. The first marker, `class="[^"]*chatlist`, also matched the signed-out render's `chatlist-container` class and read a signed-out profile as `authenticated`; the logged-out marker matched 0 on the live session but its logged-out render was never observed — the K app does not paint sign-in inside the probe's window on a fresh profile. That gap fails SAFE only because of the positive marker: neither matching is `UNKNOWN`, not a login |
 
-Every shipped adapter but one has `"actions": {}`: they classify a session, and the actions a
-site's owner wants are theirs to write in their seat's `.adapters/`. The one is google.com's
-`send` (DIVE-4984):
+Every shipped adapter but two has `"actions": {}`: they classify a session, and the actions a
+site's owner wants are theirs to write in their seat's `.adapters/`. booking.com's `search` and
+`hotels` are in its row above. The other is google.com's `send` (DIVE-4984):
 
 ```bash
 5dive browser run google.com send --to=<addr> --subject='<subject>' --body='<text>'
-# -> exit 73 and an approval id; the owner: sudo 5dive browser approve <id>
+# -> by default (yolo): ALLOWED (default yolo): send …, then verified: send is live at …#sent
+# -> under careful: exit 73 and an approval id; the owner: sudo 5dive browser approve <id>, then
 5dive browser run google.com send --to=<addr> --subject='<subject>' --body='<text>' --approved-id=<id>
 # -> verified: send is live at https://mail.google.com/mail/u/0/#sent (re-read in this profile)
 ```
 
 It opens full-screen compose with To and Subject in the URL (Gmail drops a `body=` parameter, so
-the body is typed), stops in front of Send until the owner's yes (`guard: true`), waits for
+the body is typed), under `careful` stops in front of Send until the owner's yes (`guard: true`), waits for
 Gmail's "Message sent" before letting the browser go, and is verified by the Sent folder, read in
 the same profile, on its newest row — never by the toast.
 
@@ -637,7 +670,7 @@ sudo 5dive browser adapters reject linkedin.com
   the signed-out shell for days before anyone looked.
 
 Its steps come from a closed vocabulary —
-`goto fill click wait_for select upload press` — and a step outside it is a **load-time refusal**.
+`goto fill type click wait_for select upload press` — and a step outside it is a **load-time refusal**.
 There is no `eval`, no `script` and no free-text instruction step, because any of those would make
 the adapter a program the executor merely hosts. The LLM decides *what* to distribute, where, and
 whether it is worth doing; the **adapter** decides where to click, what to fill, how to publish.
@@ -669,6 +702,21 @@ adapter loads. Arguments go in as what they are: into any `url` (a step's or the
 URL-encoded, so a subject with `&`, `#` or a space stays one parameter, and into `verify.expect`
 regex-escaped, so "Q3 (draft)" matches itself. A `fill` value is typed exactly as given.
 
+**`fill` or `type`.** Use `type` for search boxes and autocompletes that react to keystrokes, and
+`fill` for plain inputs. `fill` is `page.fill`: the value lands in one input event, with no
+keydown, keypress or keyup, so a suggestion list that opens on keystrokes never opens — a hotel
+search filled with "Lisbon" searched an empty city. `type` clears the field as `fill` does, then
+types the value key by key (`locator.pressSequentially`), `delay_ms` apart: optional, whole
+milliseconds, default 50, at most 1000; anything else is refused before the browser opens. Its
+value takes the same `{key}` arguments as `fill`, and like `fill` it is not one of the owner's
+four. A value with a line break is refused, arguments included: typed, a line break is the Enter
+key, which sends the form without the owner's policy reading it — press Enter as its own step.
+The step's bound grows with the text, so a long value is never cut off half-typed.
+
+```json
+{"op":"type","selector":"ref=textbox/Where to?","value":"{city}","delay_ms":80}
+```
+
 ## The executor
 
 `5dive browser run <site> <action> [--key=value ...]` ships with one, `bin/driver-playwright`, and
@@ -696,6 +744,34 @@ allows one instance per profile directory and a second one hands its work to the
 and exits with an empty document. The login lives in the directory, not in the process. A **live
 viewer** is the exception: that is a person at a keyboard part-way through the login the viewer
 exists for, so it is a refusal rather than a cycle.
+
+**A redirected landing is said, and a cold run is retried once in the served browser (DIVE-4991).**
+Some sites answer the headless cold browser with a different page: a cold `act` of a Booking search
+URL, even one copied from a real browser, landed on the undated city page, and all anyone saw was
+the next step failing. After every `goto` (the `act` URL included) both executors compare the URL
+asked for with the one the page is on. It is a redirect when the path changed, or when more than
+half of the requested query keys are gone; a fragment that moved, a trailing slash, or the same path
+with params only added is the page that was asked for. A redirect prints, every time:
+
+```
+redirected: <asked> → <landed> (<why>); retrying once in the served browser
+```
+
+The retry clause appears only on the cold executor, and only while nothing but a `goto` has run: the
+cold run stops there and `act` or `run` takes the whole step list, once, through the served browser —
+serving the site if nothing was, and stopping it afterwards only if this run started it. Its result is
+the verdict. After a click, a fill or any other step, the line is printed on its own and nothing is
+replayed. A box with no session daemon or no Xvfb (or `FIVEDIVE_BROWSER_NO_DAEMON=1`) gets the line
+and the old behaviour; if the served browser will not start, the run stops at the redirect and says
+why. The served run is never retried again.
+
+Where reflex is configured, it is also asked whether the landing answered the request (requested
+and landed URL, the title, at most 300 characters of visible text; page text leaves the box only
+under that opt-in). `generic_page` or `bot_block` is a redirect; `login_wall` fails the run with
+`log in first: 5dive browser auth <site>`; `answered` at 0.9 or more overrides a base redirect. If
+reflex errors or is not configured, the URLs alone decide. It is reached as `5dive reflex landing
+<site> --state=<file> --json`, bounded by `FIVEDIVE_BROWSER_REFLEX_TIMEOUT_MS` (default 60000).
+The 5dive CLI has no `reflex landing` verb yet; until it ships, that call errors and the URLs decide.
 
 **Exit 70 means nothing ran.** `run`'s verdict is an out-of-band re-read of the artifact, which is
 the right grade for an action that executed and the wrong one for an action that never started —

@@ -236,7 +236,7 @@ t 'T1f the registry marketplace lists it' 'browser' \
 # So the way a file goes missing on a real box is now exactly one thing: it is
 # not COMMITTED here. Grade that, against git, not against a list.
 for f in plugins/browser/.claude-plugin/plugin.json plugins/browser/README.md plugins/browser/bin/browser plugins/browser/adapters/example.json plugins/browser/adapters/google.com.json \
-         plugins/browser/lib/extract.bundle.cjs plugins/browser/lib/extract.src.mjs plugins/browser/lib/pins.json; do
+         plugins/browser/adapters/booking.com.json plugins/browser/lib/extract.bundle.cjs plugins/browser/lib/extract.src.mjs plugins/browser/lib/pins.json; do
   t "T1g $f is committed, so a clone of this repo carries it" "yes" \
     "$(git -C "$ROOT" ls-files --error-unmatch "$f" >/dev/null 2>&1 && echo yes || echo no)"
 done
@@ -2301,9 +2301,21 @@ let markWalks = 0;   // DIVE-4674: how many times the ref layer has asked THIS p
 // Unset, every answer is the one it always was.
 let clock = 0;
 const late = () => !!process.env.PWLATE_MS && clock >= Number(process.env.PWLATE_MS);
+// A SEARCH BOX WHOSE SUGGESTIONS OPEN ON KEYSTROKES (the `type` step). PWSUGGEST
+// names the suggestion; it is on the page only once a key has gone down in the
+// box since the last goto. page.fill puts a value in with no keydown, which is
+// the measured defect; pressSequentially sends one key per character. Unset,
+// waitForSelector answers as it always did.
+let keydowns = 0;
+// DIVE-4991: A PAGE LANDS WHERE IT WAS ASKED, unless PWLAND names where it
+// lands instead (a redirect) — every goto, or only the one to PWLAND_FROM. PWURL,
+// older, pins url() whatever the goto was.
+let lastGoto = '';
+const landed = () => (process.env.PWLAND && (!process.env.PWLAND_FROM || lastGoto === process.env.PWLAND_FROM)
+  ? process.env.PWLAND : lastGoto);
 const page = {
   setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t }),
-  goto: async (url, o) => { clock = 0; rec({ call: 'goto', url }); },
+  goto: async (url, o) => { clock = 0; keydowns = 0; lastGoto = url; rec({ call: 'goto', url }); },
   fill: async (sel, val) => {
     rec({ call: 'fill', sel, val });
     // PWPREEMPT_FILE: a PERSON arrives mid-run. Writing the lease file from
@@ -2320,7 +2332,20 @@ const page = {
     rec({ call: 'click', sel });
     if (process.env.PWFAIL) throw new Error('stub: the step failed');
   },
-  waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel }),
+  waitForSelector: async (sel) => {
+    rec({ call: 'waitForSelector', sel });
+    if (process.env.PWSUGGEST && sel === `text=${process.env.PWSUGGEST}` && !keydowns) {
+      throw new Error('page.waitForSelector: Timeout 30000ms exceeded.');
+    }
+  },
+  locator: (sel) => { const box = {
+    first: () => { rec({ call: 'first', sel }); return box; },
+    clear: async (o) => rec({ call: 'clear', sel, timeout: o && o.timeout }),
+    pressSequentially: async (val, o) => {
+      rec({ call: 'type', sel, val, delay: o && o.delay, timeout: o && o.timeout });
+      keydowns += [...val].length;
+    },
+  }; return box; },
   waitForTimeout: async (ms) => { clock += Number(ms) || 0; rec({ call: 'waitForTimeout', ms }); },
   // DIVE-4588. The ref layer runs its walk with page.evaluate, so the tape has
   // to carry it. PWWALK parks the answer the walk would have produced in a real
@@ -2331,6 +2356,9 @@ const page = {
     // DIVE-4943: the owner-approval guard reads the live element's label through
     // evaluate. PWLABEL parks what the page would have said.
     if (arg && arg.riskOf) { rec({ call: 'label', sel: arg.sel, op: arg.op }); return process.env.PWLABEL || ''; }
+    // DIVE-620: is a plain Enter's target a composer with no form (a chat box)?
+    // PWCOMPOSER=1 says it is. The page-side test itself is graded in T46a.
+    if (arg && arg.composerOf) { rec({ call: 'composer', sel: arg.sel }); return process.env.PWCOMPOSER === '1'; }
     // DIVE-4982: what the risky step will act on. PWPAYLOAD parks what the page
     // shows (recipients, subject...); unset, the page shows nothing readable.
     if (arg && arg.payloadOf) { rec({ call: 'payload', sel: arg.sel, cls: arg.cls });
@@ -2349,6 +2377,15 @@ const page = {
     if (mark) markWalks++;
     rec({ call: 'evaluate', fnlen: String(fn).length, mark, walkN: mark ? markWalks : null,
           interactiveOnly: !!(arg && arg.interactiveOnly), snapshot: !!(arg && arg.snapshot) });
+    // PWREFS: A PAGE THAT KNOWS ITS OWN REFS (T40). A file of {nodes}; a mark walk
+    // stamps the one node whose ref it names, and finds nothing for any other, so
+    // a missed ref and the one picked for the retry answer differently on the same
+    // page. Inert unless the variable is set.
+    if (process.env.PWREFS) {
+      const nodes = JSON.parse(fs.readFileSync(process.env.PWREFS, 'utf8')).nodes;
+      const at = mark ? nodes.findIndex((x) => x.ref === mark) : -1;
+      return { nodes, marker: at >= 0 ? `r${at}` : null };
+    }
     // PWWALK_MISS=<n> (DIVE-4674) — A REF THAT IS NOT THERE YET, which is a shape
     // no other fixture here can produce: the first <n> mark-walks find nothing
     // and the (n+1)th finds it. Every existing arm sees a page whose answer never
@@ -2375,7 +2412,7 @@ const page = {
   },
   selectOption: async (sel, val) => rec({ call: 'selectOption', sel, val }),
   // DIVE-4943: `act` re-reads the page as the steps left it.
-  url: () => process.env.PWURL || 'https://stub.test/after',
+  url: () => process.env.PWURL || (lastGoto && landed()) || 'https://stub.test/after',
   title: async () => process.env.PWTITLE || 'stub after',
   content: async () => (late() && process.env.PWHTML_LATE) || process.env.PWHTML || '<html><body>stub after</body></html>',
   setInputFiles: async (sel, p) => rec({ call: 'setInputFiles', sel, path: p }),
@@ -3458,13 +3495,16 @@ const rec = (o) => fs.appendFileSync(process.env.PWREC, JSON.stringify(o) + '\n'
 let markWalks = 0;   // DIVE-4674, see the driver stub
 // DIVE-4983: the driver stub's page clock, per tab, with the late state named by
 // FILES (DPWSNAP_LATE, DPWDOM_LATE) and DPWTEXT/DPWTEXT_LATE, fixed at `serve`.
-const mkpage = (kind) => { let clock = 0;
+// DPWSUGGEST: the driver stub's keystroke-driven search box (PWSUGGEST), per tab.
+// DIVE-4991: a tab lands where its goto asked, unless the FILE DPWLAND names
+// where it lands instead (a redirect in the served browser).
+const mkpage = (kind) => { let clock = 0, keydowns = 0, lastGoto = '';
   const late = () => !!process.env.DPWLATE_MS && clock >= Number(process.env.DPWLATE_MS);
   return {
   setDefaultTimeout: (t) => rec({ call: 'setDefaultTimeout', t, kind }),
   // DPWGOTO_MS: a page that takes real time to load, so two requests can
   // overlap in the daemon (DIVE-4927, T27m). Unset, a goto is instant as before.
-  goto: async (url) => { clock = 0; rec({ call: 'goto', url, kind });
+  goto: async (url) => { clock = 0; keydowns = 0; lastGoto = url; rec({ call: 'goto', url, kind });
     if (process.env.DPWGOTO_MS) await new Promise((r) => setTimeout(r, Number(process.env.DPWGOTO_MS))); },
   content: async () => { rec({ call: 'content', kind });
     return fs.readFileSync((late() && process.env.DPWDOM_LATE) || process.env.DPWDOM, 'utf8'); },
@@ -3476,12 +3516,26 @@ const mkpage = (kind) => { let clock = 0;
     }
   },
   click: async (sel) => { clock = 0; rec({ call: 'click', sel, kind }); if (process.env.PWFAIL) throw new Error('stub: the step failed'); },
-  waitForSelector: async (sel) => rec({ call: 'waitForSelector', sel, kind }),
+  waitForSelector: async (sel) => {
+    rec({ call: 'waitForSelector', sel, kind });
+    if (process.env.DPWSUGGEST && sel === `text=${process.env.DPWSUGGEST}` && !keydowns) {
+      throw new Error('page.waitForSelector: Timeout 30000ms exceeded.');
+    }
+  },
+  locator: (sel) => { const box = {
+    first: () => { rec({ call: 'first', sel, kind }); return box; },
+    clear: async (o) => rec({ call: 'clear', sel, timeout: o && o.timeout, kind }),
+    pressSequentially: async (val, o) => {
+      rec({ call: 'type', sel, val, delay: o && o.delay, timeout: o && o.timeout, kind });
+      keydowns += [...val].length;
+    },
+  }; return box; },
   waitForTimeout: async (ms) => { clock += Number(ms) || 0; rec({ call: 'waitForTimeout', ms, kind }); },
   // DIVE-4943: `act` re-reads the page the steps left, and the owner-approval
   // guard reads the live label. The daemon's env is fixed at `serve` time, so the
   // label an arm wants is read from a FILE per call (DPWLABEL), not from env.
-  url: () => 'https://warm.test/after',
+  url: () => { try { return fs.readFileSync(process.env.DPWLAND, 'utf8').trim(); }
+               catch (e) { return lastGoto || 'https://warm.test/after'; } },
   title: async () => 'warm after',
   evaluate: async (fn, arg) => {
     if (arg && arg.riskOf) {
@@ -3500,6 +3554,13 @@ const mkpage = (kind) => { let clock = 0;
     const mark = (arg && arg.mark) || null;
     if (mark) markWalks++;
     rec({ call: 'evaluate', kind, mark, walkN: mark ? markWalks : null, snapshot: !!(arg && arg.snapshot) });
+    // DPWREFS: the driver stub's page that knows its refs (PWREFS), from a FILE read
+    // per call — the env is fixed at `serve`, the page is the arm's.
+    if (process.env.DPWREFS && !(arg && arg.snapshot)) {
+      const nodes = JSON.parse(fs.readFileSync(process.env.DPWREFS, 'utf8')).nodes;
+      const at = mark ? nodes.findIndex((x) => x.ref === mark) : -1;
+      return { nodes, marker: at >= 0 ? `r${at}` : null };
+    }
     // PWWALK_MISS: the same not-there-yet page the driver stub can produce
     // (DIVE-4674). The warm loop is a SECOND copy of the step loop, so it needs
     // the same fixture or half the product stays ungraded.
@@ -5053,11 +5114,16 @@ tc 'T29h ...and that it is the box logging out' 'LOG THE BOX OUT' "$OUT$ERR"
 unset FIVEDIVE_BROWSER_DRIVER
 P31="$TMP/p31/profiles"; mkdir -p "$P31/$SEAT"; chmod 711 "$P31"; chmod 700 "$P31/$SEAT"
 A31="$TMP/p31/approvals"
+# THE DEFAULT IS YOLO (DIVE-5006): with no policy file the owner's four run and are
+# logged (T37). The arms below grade the STOP, so they run under the owner's
+# `careful` — a policy file the granting uid owns, set in T32e by the verb itself.
+POL31="$TMP/p31/policy.json"
 # Every ref in these arms resolves: the walk finds its element. What the arms grade
 # is what act does AFTER the page answered, not the walk (T23 grades that).
 W31="$TMP/p31/walk.json"; printf '{"nodes":[],"marker":"m-31"}' > "$W31"
 actenv() { env FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" FIVEDIVE_BROWSER_SESSION_ROOT="$TMP/p31/sessions" \
                FIVEDIVE_BROWSER_APPROVAL_DIR="$A31" FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 \
+               FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL31" FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" \
                NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$W31" "$@"; }
 STAR='[{"op":"click","selector":"ref=button/Star"}]'
 
@@ -5105,7 +5171,9 @@ run actenv "$MUT32G" act "https://noadapter.test/x" --steps="$STAR"
 t  'T32c MUTANT (no generic check): the LIVE no-adapter login is refused again' 75 "$RC"
 # the render itself is re-checked: the site's front page was fine, the page asked for is a sign-in
 : > "$PWREC"
-run actenv env PWURL="https://noadapter.test/login?next=/x" "$BROWSER" act "https://noadapter.test/x" --steps="$STAR"
+# Cold, and only cold: this grades the guard after the fact, not the served retry a
+# redirect gets where a served browser can be had (DIVE-4991, T41).
+run actenv env PWURL="https://noadapter.test/login?next=/x" FIVEDIVE_BROWSER_NO_DAEMON=1 "$BROWSER" act "https://noadapter.test/x" --steps="$STAR"
 t  'T32c a page that ENDS on a sign-in URL is refused after the fact' 75 "$RC"
 tc 'T32c ...naming the redirect' 'redirected to a sign-in' "$ERR"
 
@@ -5124,6 +5192,8 @@ run actenv "$BROWSER" act gh.test_work "https://other.test/repo" --steps="$STAR"
 t  'T32d an account is still scoped to its site' 64 "$RC"
 
 # --- T32e the owner's four -----------------------------------------------------
+run actenv env -u SUDO_USER "$BROWSER" approvals policy set careful
+t  'T32e (setup) the owner sets careful, so the four stop' '0 careful' "$RC $(jq -r 'if [.[]] == ["ask","ask","ask","ask"] then "careful" else . end' "$POL31" 2>/dev/null)"
 ORDER='[{"op":"click","selector":"ref=button/Place your order"}]'
 : > "$PWREC"
 run actenv env PWLABEL="Place your order" "$BROWSER" act "https://shop.test/cart" --steps="$ORDER" --out="$TMP/act31e"
@@ -5136,7 +5206,7 @@ AID=$(sed -n 's/.*browser approve \([^ ]*\) .*/\1/p' <<<"$ERR" | head -1)
 t  'T32e ...and a recorded ask' yes "$([[ -n "$AID" && -f "$A31/$AID.json" ]] && echo yes || echo no)"
 run actenv env PWLABEL="Place your order" "$BROWSER" act "https://shop.test/cart" --steps="$ORDER" --approved="$AID"
 t  'T32e an ask nobody answered is still refused' 73 "$RC"
-run actenv "$BROWSER" approve "$AID"
+run actenv env FIVEDIVE_BROWSER_GRANT_UID=0 "$BROWSER" approve "$AID"
 t  'T32e a non-owner cannot approve' 77 "$RC"
 run actenv env FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" "$BROWSER" approve "$AID"
 t  'T32e the owner approves' 0 "$RC"
@@ -5199,7 +5269,8 @@ DPWLABEL="$TMP/dpw.label"; printf 'Send' > "$DPWLABEL"
 dserve warmact.test DPWLABEL="$DPWLABEL"
 t  'T32h a warm session is up for the act arms' 0 "$RC"
 LB31="$(launches)"; : > "$TMP/.drec-mark"; DREC_LINES=$(wc -l < "$DREC")
-dwarm "$BROWSER" act warmact.test "https://warmact.test/inbox" --steps='[{"op":"click","selector":"#send"}]' --out="$TMP/act31h"
+dwarm FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL31" FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" \
+  "$BROWSER" act warmact.test "https://warmact.test/inbox" --steps='[{"op":"click","selector":"#send"}]' --out="$TMP/act31h"
 t  'T32h the warm session stops a send (73)' 73 "$RC"
 t  'T32h ...before the click' 0 "$(tail -n +$((DREC_LINES+1)) "$DREC" | jq -rs '[.[]|select(.call=="click")]|length')"
 t  'T32h ...in the browser that was already up (no launch)' "$LB31" "$(launches)"
@@ -5849,9 +5920,9 @@ tc 'T34h CHANGES.md names the read cap' 'FIVEDIVE_BROWSER_READ_CAP_MS' "$(cat "$
 #   T35h  documented where agents and people read it
 unset FIVEDIVE_BROWSER_DRIVER
 GADAPT="$ROOT/plugins/browser/adapters/google.com.json"
-# THE SHIPPED FILE, plus a probe this suite can answer. It ships with none —
-# nothing measured google.com's signed-out page — so `run` on the file as shipped
-# refuses (T35g); every other arm needs a session that probes `authenticated`.
+# THE SHIPPED FILE, with its probe swapped for one this suite's DOMs answer, so
+# every arm below runs on a session that probes `authenticated`. The shipped probe
+# (the sign-in page's title, measured) is graded as shipped in T35g and T39e.
 jq '.probe = {url:"https://google.com/", logged_out_when_dom_matches:"action=\"/login\""}' "$GADAPT" \
   > "$FIVEDIVE_BROWSER_ADAPTER_DIR/google.com.json"
 mkprofile google.com "$LIVE_DOM" >/dev/null
@@ -5874,7 +5945,8 @@ SEND35=$'Send ‪(Ctrl-Enter)‬ Send'
 # The newest Sent row, as the page's first [role=main] tr would give it.
 ROW35='{"html":"<tr><td>me</td><td>Q3 (draft) &amp; more #1 - hello &amp; welcome</td></tr>","text":"me Q3 (draft) & more #1 - hello & welcome #2 9:46 AM"}'
 t35env() { env PATH="$CURLBIN:$PATH" FIVEDIVE_BROWSER_APPROVAL_DIR="$A35" FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 \
-             FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" \
+             FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL31" \
+             NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" \
              PWLABEL="$SEND35" "$@"; }
 t35send() {  # t35send <approval-id|-> [env assignments...] — the send, with the fixed arguments
   local id="$1"; shift
@@ -5993,6 +6065,7 @@ dserve google.com DPWLABEL="$DLABEL35" DPWSCOPE="$DSCOPE35"
 t  'T35f (precondition) a warm session holds google.com' 0 "$RC"
 L35="$(launches)"; N35=$(wc -l < "$DREC"); : > "$CURLREC"
 d35() { dwarm PATH="$CURLBIN:$SPATH" FIVEDIVE_BROWSER_APPROVAL_DIR="$A35" FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" \
+          FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL31" \
           "$BROWSER" run google.com send --to="$TO35" --subject="$SUBJ35" --body="$BODY35" "$@"; }
 d35
 t  'T35f the warm session stops the send too (73)' 73 "$RC"
@@ -6022,11 +6095,15 @@ SCOPE
 t  'T35g the scope is the FIRST match, null when nothing or a bad selector matches' \
    '[{"html":"<tr>newest</tr>","text":"me newest 9:47 AM"},null,null]' \
    "$(ARIA="$ROOT/plugins/browser/lib/aria.cjs" node "$TMP/t35-scope.js" 2>&1)"
+# The adapter AS SHIPPED probes the Google sign-in page for its title: on a
+# logged-out profile, run refuses before a step.
+mkprofile google.com '<html><head><title>Sign in - Google Accounts</title></head><body></body></html>' >/dev/null
 : > "$PWREC"
 run t35env FIVEDIVE_BROWSER_ADAPTER_DIR="$ROOT/plugins/browser/adapters" "$BROWSER" run google.com send --to=a@b.test --subject=s --body=b
-t  'T35g the adapter AS SHIPPED has no probe, so run refuses (75)' 75 "$RC"
-tc 'T35g ...because nobody confirmed the session' 'cannot confirm the google.com session is live' "$ERR"
+t  'T35g the adapter AS SHIPPED, on a logged-out profile: run refuses (75)' 75 "$RC"
+tc 'T35g ...because its own probe read the sign-in page' 'google.com is logged out' "$ERR"
 t  'T35g ...before a browser opened' 0 "$(jq -rs '[.[]|select(.call=="launch")]|length' "$PWREC")"
+mkprofile google.com "$LIVE_DOM" >/dev/null
 t  'T35g the shipped file: valid, guarded, verified in session, fixed vocabulary' 'true true true ' \
    "$(jq -r '"\(.actions.send.guard) \(.actions.send.verify.in_session) \(.actions.send.verify.url != null and .actions.send.verify.expect != null) " +
             (["goto","fill","click","wait_for","select","upload","press"] as $ok | [.actions[].steps[].op|select(. as $o|($ok|index($o))|not)]|join(","))' "$GADAPT")"
@@ -6056,8 +6133,10 @@ tc 'T35h CHANGES.md names the flag' '--approved-id' "$(cat "$ROOT/CHANGES.md")"
 #   T36a  the ask carries recipients, subject and first line; bidi is stripped
 #   T36b  `approvals policy` answers JSON on --json AND on FIVEDIVE_JSON_MODE=1
 #   T36c  `policy set` is the owner's: a seat uid and a seat's sudo are refused
-#   T36d  send=allow runs the send and logs it; pay still stops; a policy file
-#         the granting uid does not own is not a policy; the warm loop agrees
+#   T36d  careful + send=allow runs the send and logs it; pay still stops; a
+#         policy file the granting uid does not own is not a policy (the default,
+#         yolo, applies: DIVE-5006); the warm loop agrees
+# T36a and T36e-g grade the ask, so they run under the owner's `careful`.
 #   T36e  a seat's approve needs the owner's proof: none / wrong refused, right granted
 #   T36f  MUTANT: the SUDO_USER check removed, a seat approves its own ask
 #   T36g  the ask is handed to `5dive owner-ask` when the CLI has it, fail-soft
@@ -6074,6 +6153,8 @@ CLICK36='[{"op":"click","selector":"#send"}]'
 aid36() { sed -n 's/.*browser approve \([^ ]*\) .*/\1/p' <<<"$ERR" | head -1; }
 
 # --- T36a the ask shows what is being sent ------------------------------------------
+run t36env "$BROWSER" approvals policy set careful
+t  'T36a (setup) the owner sets careful' 0 "$RC"
 : > "$PWREC"
 run t36env PWLABEL="$SEND36" PWPAYLOAD="$PAY36" "$BROWSER" act "https://mail36.test/compose" --steps="$CLICK36" --out="$TMP/t36a"
 t  'T36a a send still stops with 73' 73 "$RC"
@@ -6094,9 +6175,10 @@ run t36env "$BROWSER" approve "$AID36" --deny
 t  'T36a (cleanup) the owner declines it' 0 "$RC"
 
 # --- T36b the policy, read ---------------------------------------------------------
-DEF36='{"pay":"ask","publish":"ask","send":"ask","delete":"ask"}'
+rm -f "$POL36"
+DEF36='{"pay":"allow","publish":"allow","send":"allow","delete":"allow","mode":"yolo"}'
 run t36env "$BROWSER" approvals policy --json
-t  'T36b approvals policy --json: every kind, default ask' "$DEF36" "$OUT"
+t  'T36b approvals policy --json with no file: every kind, default allow (yolo)' "$DEF36" "$OUT"
 run t36env FIVEDIVE_JSON_MODE=1 "$BROWSER" approvals policy
 t  'T36b ...and the same with FIVEDIVE_JSON_MODE=1 (the CLI strips --json)' "$DEF36" "$OUT"
 run t36env FIVEDIVE_BROWSER_GRANT_UID=0 "$BROWSER" approvals policy --json
@@ -6110,10 +6192,10 @@ t  'T36c ...nor a seat through sudo' 77 "$RC"
 t  'T36c ...and nothing was written' 'no' "$([[ -e "$POL36" ]] && echo yes || echo no)"
 run t36env "$BROWSER" approvals policy set send=bogus
 t  'T36c a value is ask or allow' 64 "$RC"
-run t36env "$BROWSER" approvals policy set send=allow
+run t36env "$BROWSER" approvals policy set careful send=allow
 t  'T36c the owner sets it' 0 "$RC"
 run t36env "$BROWSER" approvals policy --json
-t  'T36c ...and it takes effect' '{"pay":"ask","publish":"ask","send":"allow","delete":"ask"}' "$OUT"
+t  'T36c ...and it takes effect' '{"pay":"ask","publish":"ask","send":"allow","delete":"ask","mode":"custom"}' "$OUT"
 t  'T36c ...in a file every seat can read and none can write' '644' "$(stat -c %a "$POL36")"
 
 # --- T36d send=allow: the send runs, and is written down ------------------------------
@@ -6128,8 +6210,11 @@ t  'T36d ...logged with the payload and the screenshot' "send|ann@example.test|$
 run t36env PWLABEL="Place your order" "$BROWSER" act "https://shop36.test/cart" --steps='[{"op":"click","selector":"#buy"}]'
 t  'T36d ...while pay, still "ask", stops (73) before the click' '73 0' \
    "$RC $(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
-run t36env FIVEDIVE_BROWSER_GRANT_UID=0 PWLABEL="$SEND36" PWPAYLOAD="$PAY36" "$BROWSER" act "https://mail36.test/compose" --steps="$CLICK36"
-t  'T36d a policy file the granting uid does not own is not a policy: the send stops' 73 "$RC"
+: > "$PWREC"
+run t36env FIVEDIVE_BROWSER_GRANT_UID=0 PWLABEL="Place your order" "$BROWSER" act "https://shop36.test/cart" --steps='[{"op":"click","selector":"#buy"}]'
+t  'T36d a policy file the granting uid does not own is not a policy: the default applies, and the pay it says "ask" to runs' \
+   '0 1' "$RC $(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
+tc 'T36d ...logged as the default, not as the file' 'ALLOWED (default yolo): pay' "$ERR"
 # the warm loop reads the same policy
 mkprofile warm36.test "$LIVE_DOM" >/dev/null
 DL36="$TMP/t36/dlabel"; printf '%s' "$SEND36" > "$DL36"; DP36="$TMP/t36/dpayload"; printf '%s' "$PAY36" > "$DP36"
@@ -6231,6 +6316,1298 @@ done
 tc 'T36h README.md documents the proof' '--human-proof' "$(cat "$ROOT/plugins/browser/README.md")"
 tc 'T36h CHANGES.md names the JSON contract' 'FIVEDIVE_JSON_MODE' "$(cat "$ROOT/CHANGES.md")"
 tc 'T36h CHANGES.md names the proof' '--human-proof' "$(cat "$ROOT/CHANGES.md")"
+
+# ============ T37 DIVE-5006: the default is yolo — the owner's four run, and are written down
+#
+# Measured on a box at browser 1.17.0: the default was "ask", so an owner with no
+# dashboard and no shell could not approve a step, could not relax the policy, and
+# every send stopped dead with 73. Each arm is the mutant:
+#   T37a  no policy file: pay, publish, send and delete each run and none exits 73;
+#         each is in allowed.jsonl as allowed_by "default", with its screenshot; the
+#         warm loop and a guarded `run google.com send` agree
+#   T37b  `set careful` stops all four again (73, before the click), warm too
+#   T37c  mode: careful + pay=allow is custom, and pay then runs as the owner's
+#         policy; yolo; the text form; a preset only after `set`, one at a time
+#   T37d  a seat's `set yolo` / `set careful` is refused (77) and writes nothing; a
+#         careful file the granting uid does not own is not a policy
+#   T37e  MUTANT: the old "ask" default restored — with no file the send stops again
+#   T37f  documented where agents and people read it
+unset FIVEDIVE_BROWSER_DRIVER
+A37="$TMP/t37/approvals"; POL37="$TMP/t37/policy.json"; mkdir -p "$TMP/t37"
+t37env() { env -u SUDO_USER FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" FIVEDIVE_BROWSER_SESSION_ROOT="$TMP/p31/sessions" \
+               FIVEDIVE_BROWSER_APPROVAL_DIR="$A37" FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL37" \
+               FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 \
+               NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$W31" "$@"; }
+# One live label per kind, as the label table classifies them (T32g).
+declare -A LBL37=([pay]="Place your order" [publish]="Post" [send]="Send" [delete]="Delete repository")
+clicks37() { jq -rs '[.[]|select(.call=="click")]|length' "$PWREC"; }
+act37() {  # act37 <kind> [env assignments...] — one click on a button whose live label is that kind
+  local k="$1"; shift
+  : > "$PWREC"
+  run t37env PWLABEL="${LBL37[$k]}" "$@" "${T37BIN:-$BROWSER}" act "https://$k.t37.test/x" --steps="$CLICK36" --out="$TMP/t37/$k"
+}
+
+# --- T37a no policy file: all four run, and each is written down --------------------
+t  'T37a (precondition) there is no policy file' 'no' "$([[ -e "$POL37" ]] && echo yes || echo no)"
+for k in pay publish send delete; do
+  act37 "$k"
+  t  "T37a $k runs with no policy file: exit 0, and the click happened" '0 1' "$RC $(clicks37)"
+  tc "T37a ...it says the default let it through" "ALLOWED (default yolo): $k" "$ERR"
+done
+LOG37=""
+while IFS=' ' read -r c by shot; do
+  LOG37+="$c:$by:$([[ -s "$shot" ]] && echo shot || echo noshot) "
+done < <(jq -r '"\(.class) \(.allowed_by) \(.screenshot)"' "$A37/allowed.jsonl" 2>/dev/null)
+t  'T37a allowed.jsonl holds all four, each by the default, each with its screenshot' \
+   'pay:default:shot publish:default:shot send:default:shot delete:default:shot ' "$LOG37"
+# the warm loop reads the same default
+mkprofile warm37.test "$LIVE_DOM" >/dev/null
+DL37="$TMP/t37/dlabel"; printf 'Send' > "$DL37"
+dserve warm37.test DPWLABEL="$DL37"
+t  'T37a (precondition) a warm session is up' 0 "$RC"
+w37() { dwarm FIVEDIVE_BROWSER_APPROVAL_DIR="$A37" FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL37" FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" \
+          "$BROWSER" act warm37.test "https://warm37.test/compose" --steps="$CLICK36" "$@"; }
+N37=$(wc -l < "$DREC")
+w37 --out="$TMP/t37/warm"
+t  'T37a the warm session sends with no policy file too' '0 1' \
+   "$RC $(tail -n +$((N37+1)) "$DREC" | jq -rs '[.[]|select(.call=="click")]|length')"
+tc 'T37a ...and logs it as the default' 'ALLOWED (default yolo): send' "$ERR"
+# a guarded adapter action, the owner's live arm: run google.com send, no policy file
+: > "$PWREC"
+run t35env FIVEDIVE_BROWSER_APPROVAL_DIR="$A37" FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL37" PWSCOPE="$ROW35" \
+    "$BROWSER" run google.com send --to="$TO35" --subject="$SUBJ35" --body="$BODY35"
+t  'T37a run google.com send with no policy file: sent (no 73) and verified in Sent' '0 1' "$RC $(clicks37)"
+tc 'T37a ...logged as the default' 'ALLOWED (default yolo): send' "$ERR"
+t  'T37a ...and it is in allowed.jsonl' 'google.com send default' \
+   "$(jq -r 'select(.site == "google.com") | "\(.site) \(.class) \(.allowed_by)"' "$A37/allowed.jsonl" 2>/dev/null | tail -1)"
+
+# --- T37b careful: all four stop again ------------------------------------------------
+run t37env "$BROWSER" approvals policy set careful
+t  'T37b the owner sets careful' '0 {"pay":"ask","publish":"ask","send":"ask","delete":"ask","mode":"careful"}' \
+   "$RC $(t37env "$BROWSER" approvals policy --json)"
+for k in pay publish send delete; do
+  act37 "$k"
+  t  "T37b under careful, $k stops with 73 before the click" '73 0' "$RC $(clicks37)"
+done
+N37=$(wc -l < "$DREC")
+w37
+t  'T37b ...and the warm session stops the send too' '73 0' \
+   "$RC $(tail -n +$((N37+1)) "$DREC" | jq -rs '[.[]|select(.call=="click")]|length')"
+env PATH="$SPATH" "$BROWSER" serve warm37.test --stop >/dev/null 2>&1
+
+# --- T37c the mode --------------------------------------------------------------------
+run t37env "$BROWSER" approvals policy set pay=allow
+run t37env "$BROWSER" approvals policy --json
+t  'T37c careful, then pay=allow: mode custom' '{"pay":"allow","publish":"ask","send":"ask","delete":"ask","mode":"custom"}' "$OUT"
+act37 pay
+t  'T37c ...pay runs on top of careful' '0 1' "$RC $(clicks37)"
+tc 'T37c ...as the owner'"'"'s policy, not the default' "ALLOWED by the owner's policy (pay=allow)" "$ERR"
+t  'T37c ...and allowed.jsonl says so' 'pay policy' "$(jq -r '"\(.class) \(.allowed_by)"' "$A37/allowed.jsonl" 2>/dev/null | tail -1)"
+act37 send
+t  'T37c ...while send, still ask, stops' '73 0' "$RC $(clicks37)"
+run t37env "$BROWSER" approvals policy set yolo
+run t37env FIVEDIVE_JSON_MODE=1 "$BROWSER" approvals policy
+t  'T37c set yolo: all four allow, mode yolo (FIVEDIVE_JSON_MODE=1 too)' \
+   '{"pay":"allow","publish":"allow","send":"allow","delete":"allow","mode":"yolo"}' "$OUT"
+run t37env "$BROWSER" approvals policy set yolo send=ask
+tc 'T37c a per-kind value on top of a preset; the text form names the mode' $'send\task\ndelete\tallow\nmode\tcustom' "$OUT"
+cp "$POL37" "$TMP/t37/before.json"
+run t37env "$BROWSER" approvals policy careful
+t  'T37c a preset without set is refused, and nothing is written' '64 same' \
+   "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
+run t37env "$BROWSER" approvals policy set yolo careful
+t  'T37c one preset at a time' '64 same' "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
+
+# --- T37d the owner's only; a seat can neither loosen nor tighten it -------------------
+run t37env "$BROWSER" approvals policy set careful; cp "$POL37" "$TMP/t37/before.json"
+run t37env SUDO_USER=agent-x "$BROWSER" approvals policy set yolo
+t  'T37d a seat'"'"'s sudo cannot set yolo (77), and the careful file is unchanged' '77 same' \
+   "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
+run t37env FIVEDIVE_BROWSER_GRANT_UID=0 "$BROWSER" approvals policy set yolo
+t  'T37d ...nor a seat uid' '77 same' "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
+run t37env "$BROWSER" approvals policy set yolo; cp "$POL37" "$TMP/t37/before.json"
+run t37env SUDO_USER=agent-x "$BROWSER" approvals policy set careful
+t  'T37d a seat'"'"'s sudo cannot set careful (77), and the yolo file is unchanged' '77 same' \
+   "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
+run t37env FIVEDIVE_BROWSER_GRANT_UID=0 "$BROWSER" approvals policy set careful
+t  'T37d ...nor a seat uid' '77 same' "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
+rm -f "$POL37"
+run t37env SUDO_USER=agent-x "$BROWSER" approvals policy set careful
+t  'T37d with no file, a seat'"'"'s careful is refused and creates none' '77 no' "$RC $([[ -e "$POL37" ]] && echo yes || echo no)"
+run t37env "$BROWSER" approvals policy set careful
+act37 send FIVEDIVE_BROWSER_GRANT_UID=0
+t  'T37d a careful file the granting uid does not own is not a policy: the send runs' '0 1' "$RC $(clicks37)"
+tc 'T37d ...as the default' 'ALLOWED (default yolo): send' "$ERR"
+
+# --- T37e MUTANT: the old "ask" default restored ----------------------------------------
+MUT37="$TMP/t37/mut"; rm -rf "$MUT37"; cp -r "$ROOT/plugins/browser" "$MUT37"
+sed -i 's|^APPROVAL_DEFAULT=allow$|APPROVAL_DEFAULT=ask  # MUTANT (DIVE-5006)|' "$MUT37/bin/browser"
+t  'T37e (anchor) the mutation landed in the copy' 'yes' "$(grep -q 'MUTANT (DIVE-5006)' "$MUT37/bin/browser" && echo yes || echo no)"
+rm -f "$POL37"
+T37BIN="$MUT37/bin/browser" act37 send
+t  'T37e MUTANT ("ask" default): with no policy file the send stops again, 73 before the click' '73 0' "$RC $(clicks37)"
+
+# --- T37f the words ---------------------------------------------------------------------
+run bash "$BROWSER" --help
+tc 'T37f --help names the presets' 'approvals policy set yolo|careful' "$OUT$ERR"
+for f in plugins/browser/README.md plugins/browser/AGENTS.md plugins/browser/skills/use-browser/SKILL.md CHANGES.md; do
+  tc "T37f $f names careful, the way back to the stop" 'approvals policy set careful' "$(cat "$ROOT/$f")"
+done
+
+# ============ T38 `type`: key by key, for a search box whose suggestions open on keystrokes
+#
+# Measured on a live hotel search with nothing connected, at 1.18.0: `fill` put
+# "Lisbon" in the box and Search went to the results for an empty city ("0
+# properties found"), because the suggestion list opens only on typed keys and
+# page.fill sends none; fill "Lisbo", press "n", wait_for the suggestion timed out
+# at 30 s. The stubs model that box (PWSUGGEST, DPWSUGGEST): the suggestion is on
+# the page only once a key has gone down. Each arm is the mutant:
+#   T38a  the box: `type` opens the suggestion and `fill` does not, cold and warm
+#   T38b  `type` is accepted by act (cold, on a ref too) and by an adapter step
+#   T38c  {key} in a `type` value: the argument is typed, a missing one refused
+#   T38d  delay_ms: 50 by default, the caller's, anything else refused before the
+#         browser opens; the bound grows with the text; not one of the owner's four;
+#         a line break (typed, the Enter key) refused, cold and warm
+#   T38e  MUTANT: `type` mapped to page.fill in both executors — the suggestion
+#         never opens, cold and warm
+#   T38f  documented where agents and people read it
+unset FIVEDIVE_BROWSER_DRIVER
+mkdir -p "$TMP/t38"
+SUG38='Lisbon, Portugal'
+TYPE38='[{"op":"type","selector":"#where","value":"Lisbon"},{"op":"wait_for","selector":"text=Lisbon, Portugal"}]'
+FILL38='[{"op":"fill","selector":"#where","value":"Lisbon"},{"op":"wait_for","selector":"text=Lisbon, Portugal"}]'
+POL38="$TMP/t38/policy.json"
+t38env() { env -u SUDO_USER FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" FIVEDIVE_BROWSER_SESSION_ROOT="$TMP/p31/sessions" \
+               FIVEDIVE_BROWSER_APPROVAL_DIR="$TMP/t38/approvals" FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL38" \
+               FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 \
+               NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWWALK="$W31" PWSUGGEST="$SUG38" "$@"; }
+act38() {  # act38 <steps> [env assignments...] — cold, on the hotel search page
+  local st="$1"; shift
+  : > "$PWREC"
+  run t38env "$@" "${T38BIN:-$BROWSER}" act "https://hotels.t38.test/" --steps="$st" --out="$TMP/t38/cold"
+}
+tape38() { jq -rs "$1" "$PWREC"; }
+KEYS38='[.[]|select(.call|IN("clear","type","fill"))|if .call=="type" then "type:"+.val elif .call=="fill" then "fill:"+.val else .call end]|join(" ")'
+
+# --- T38a the box that opens on keystrokes ------------------------------------------------
+act38 "$TYPE38"
+t  'T38a `type` opens a suggestion list that opens on keystrokes: act exits 0' 0 "$RC"
+t  'T38a ...the box was cleared, then typed key by key, and nothing was filled' 'clear type:Lisbon' "$(tape38 "$KEYS38")"
+t  'T38a ...into the FIRST match, as page.fill takes it, not a strict locator that throws on two' '1' \
+   "$(tape38 '[.[]|select(.call=="first")]|length')"
+act38 "$FILL38"
+t  'T38a `fill` does not open it: the wait_for the suggestion fails (1)' 1 "$RC"
+tc 'T38a ...timed out, as it did on the live page' 'Timeout 30000ms exceeded' "$ERR"
+act38 "$FILL38" PWSUGGEST=
+t  'T38a (anchor) with no such box, the same fill + wait_for passes: the red above is the box' 0 "$RC"
+# the warm loop is the second copy of the step loop
+mkprofile warm38.test "$LIVE_DOM" >/dev/null
+dserve warm38.test DPWSUGGEST="$SUG38"
+t  'T38a (precondition) a warm session is up' 0 "$RC"
+w38() {  # w38 <site> <steps> — act on the served browser; N38 marks where its tape starts
+  N38=$(wc -l < "$DREC")
+  dwarm "$BROWSER" act "$1" "https://$1/hotels" --steps="$2" --out="$TMP/t38/warm"
+}
+wtape38() { tail -n +$((N38+1)) "$DREC" | jq -rs "$1"; }
+w38 warm38.test "$TYPE38"
+t  'T38a warm: `type` opens it too' 0 "$RC"
+t  'T38a warm: ...cleared, then typed key by key' 'clear type:Lisbon' "$(wtape38 "$KEYS38")"
+w38 warm38.test "$FILL38"
+t  'T38a warm: `fill` does not (1)' 1 "$RC"
+# T38d's warm arm, on this session: the daemon checks a `type` value as the driver does
+w38 warm38.test '[{"op":"type","selector":"#where","value":"Lisbon\nx"}]'
+t  'T38d warm: a line break in a `type` value is refused before a key goes down (69: nothing ran)' '69 0' \
+   "$RC $(wtape38 '[.[]|select(.call=="clear" or .call=="type")]|length')"
+env PATH="$SPATH" "$BROWSER" serve warm38.test --stop >/dev/null 2>&1
+
+# --- T38b accepted by act and by an adapter step ------------------------------------------
+act38 '[{"op":"type","selector":"ref=textbox/Where to?","value":"Lisbon"}]'
+t  'T38b act takes `type` on a ref, as the agent reads it off snapshot' 0 "$RC"
+t  'T38b ...typed into the element the ref resolved to, not the literal ref' 'resolved' \
+   "$(tape38 '[.[]|select(.call=="type")|.sel]|first|if . == null then "none" elif startswith("ref=") then "literal" else "resolved" end')"
+AD38="$TMP/t38/adapters"; mkdir -p "$AD38"; printf 'PUBLISHED' > "$TMP/t38/artifact.html"
+mkprofile hotels38 "$LIVE_DOM" >/dev/null
+cat > "$AD38/hotels38.json" <<JSON
+{ "site": "hotels38",
+  "probe": { "url": "https://hotels38.test/", "logged_out_when_dom_matches": "action=\"/login\"" },
+  "actions": { "search": {
+      "steps": [ {"op":"goto","url":"https://hotels38.test/"},
+                 {"op":"type","selector":"#where","value":"{city}","delay_ms":80},
+                 {"op":"wait_for","selector":"text=$SUG38"},
+                 {"op":"click","selector":"text=$SUG38"} ],
+      "verify": { "url": "file://$TMP/t38/artifact.html", "expect": "PUBLISHED" } } } }
+JSON
+run38() { : > "$PWREC"; run env FIVEDIVE_BROWSER_ADAPTER_DIR="$AD38" FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 \
+            NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWSUGGEST="$SUG38" "$BROWSER" run hotels38 search "$@"; }
+run38 --city=Lisbon
+t  'T38b an adapter with a `type` step loads and runs: the suggestion opened and was clicked' '0 1' \
+   "$RC $(tape38 '[.[]|select(.call=="click" and .sel=="text=Lisbon, Portugal")]|length')"
+
+# --- T38c {key} in a `type` value ---------------------------------------------------------
+t  'T38c the argument is typed as a VALUE, not the placeholder' 'Lisbon' "$(tape38 '[.[]|select(.call=="type")|.val]|first')"
+run38
+t  'T38c a missing --city is refused before the browser opens (69: nothing to re-read), nothing typed' '69 0' \
+   "$RC $(tape38 '[.[]|select(.call=="launch" or .call=="type")]|length')"
+tc 'T38c ...rather than typing the literal placeholder' 'publishes literal' "$ERR"
+
+# --- T38d delay_ms, the bound, and the owner's four ---------------------------------------
+drv38() {  # drv38 <steps-json> — the plan straight to the driver, as T16d does
+  : > "$PWREC"
+  printf '{"profile":"%s","steps":%s,"args":{}}' "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/hotels38" "$1" | \
+    env NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" FIVEDIVE_BROWSER_CHROME=/bin/true "$DRV" \
+      >/dev/null 2>"$TMP/t38/drv.err"; RC=$?; ERR=$(cat "$TMP/t38/drv.err")
+}
+DELAY38='[.[]|select(.call=="type")|"\(.delay) \(.timeout)"]|first'
+drv38 '[{"op":"type","selector":"#where","value":"Lisbon"}]'
+t  'T38d delay_ms defaults to 50; the bound is the step timeout plus 6 keys x 50' '0 50 30300' "$RC $(tape38 "$DELAY38")"
+drv38 '[{"op":"type","selector":"#where","value":"Lisbon","delay_ms":0}]'
+t  'T38d delay_ms 0 is a delay too' '0 0 30000' "$RC $(tape38 "$DELAY38")"
+t  'T38d the adapter'"'"'s delay_ms 80 reached the page' '80 30480' "$(run38 --city=Lisbon; tape38 "$DELAY38")"
+for bad in '"fast"' -1 1001 2.5 null; do
+  drv38 '[{"op":"goto","url":"https://x.test/"},{"op":"type","selector":"#where","value":"Lisbon","delay_ms":'"$bad"'}]'
+  t  "T38d delay_ms $bad is refused before the browser opens (70, no launch)" '70 0' \
+     "$RC $(tape38 '[.[]|select(.call=="launch")]|length')"
+done
+tc 'T38d ...saying what it takes' 'whole milliseconds between keys, 0 to 1000' "$ERR"
+# pressSequentially sends a line break as Enter, which submits the form; a `press
+# Enter` step is read by the owner's policy, a newline inside a value never would be
+drv38 '[{"op":"goto","url":"https://x.test/"},{"op":"type","selector":"#where","value":"Lisbon\n"}]'
+t  'T38d a line break in a `type` value (the Enter key) is refused before the browser opens (70, no launch)' '70 0' \
+   "$RC $(tape38 '[.[]|select(.call=="launch")]|length')"
+tc 'T38d ...saying to press Enter as its own step' 'Press Enter as its own step' "$ERR"
+run38 --city=$'Lisbon\r'
+t  'T38d ...and one that arrives in a {key} argument, nothing typed (69: nothing ran)' '69 0' \
+   "$RC $(tape38 '[.[]|select(.call=="type")]|length')"
+run t38env "$BROWSER" approvals policy set careful
+act38 "$TYPE38" PWLABEL=Send
+t  'T38d `type` is not one of the owner'"'"'s four: under careful, by a Send label, it runs unasked' '0 0' \
+   "$RC $(tape38 '[.[]|select(.call=="label")]|length')"
+
+# --- T38e MUTANT: `type` mapped to page.fill in both executors ----------------------------
+MUT38="$TMP/t38/mut"; rm -rf "$MUT38"; cp -r "$ROOT/plugins/browser" "$MUT38"
+sed -i "s|^\( *case 'type': *\)await aria\.typeKeys(.*\$|\1await page.fill(sel, s.value); break;  // MUTANT (type as fill)|" \
+  "$MUT38/bin/driver-playwright" "$MUT38/bin/session-daemon"
+t  'T38e (anchor) the mutation landed in both executors' '1 1' \
+   "$(grep -c 'MUTANT (type as fill)' "$MUT38/bin/driver-playwright") $(grep -c 'MUTANT (type as fill)' "$MUT38/bin/session-daemon")"
+T38BIN="$MUT38/bin/browser" act38 "$TYPE38"
+t  'T38e MUTANT (type as fill), cold: the suggestion never opens (1), and the box was filled' '1 fill:Lisbon' "$RC $(tape38 "$KEYS38")"
+mkprofile mut38.test "$LIVE_DOM" >/dev/null
+dserve mut38.test DPWSUGGEST="$SUG38" FIVEDIVE_BROWSER_SESSION_DAEMON="$MUT38/bin/session-daemon"
+t  'T38e (precondition) the mutant warm session is up' 0 "$RC"
+w38 mut38.test "$TYPE38"
+t  'T38e MUTANT (type as fill), warm: the suggestion never opens (1)' '1 fill:Lisbon' "$RC $(wtape38 "$KEYS38")"
+env PATH="$SPATH" "$BROWSER" serve mut38.test --stop >/dev/null 2>&1
+
+# --- T38f the words -----------------------------------------------------------------------
+run bash "$BROWSER" --help
+tc 'T38f --help names type' 'click / fill / type / select / press' "$OUT$ERR"
+for f in plugins/browser/README.md plugins/browser/AGENTS.md plugins/browser/skills/use-browser/SKILL.md CHANGES.md; do
+  tc "T38f $f says when to type and when to fill" \
+     'Use `type` for search boxes and autocompletes that react to keystrokes, and `fill` for plain inputs' \
+     "$(tr -s ' \n' '  ' < "$ROOT/$f")"
+done
+
+# ============ T39 the shipped booking.com adapter, and google.com's login probe
+#
+# Measured on BOTH halves (each file's `_comment` has the numbers). booking.com,
+# 2026-09-26, browser 1.18.0, on a box with a booking.com login: `5dive browser
+# capture booking.com` matched data-testid="auth-link-in-view" once in each of two
+# logged-out renders and 0 times in the logged-in one, whose header reads "Your
+# account" with a Genius level, and `status booking.com` read authenticated with
+# the file installed; the logged-out render also carries the header Sign in link
+# to account.booking.com/auth/oauth2?client_id= . google.com: logged out, the
+# sign-in page's title is exactly "Sign in - Google Accounts" (1 match); logged
+# in, `status google.com` read authenticated with that probe (0 matches).
+# The fixtures are those strings cut to the element: the attribute, the href
+# prefix, the title and the header's words were measured, the rest of each element
+# was not, and GLIN39 is the suite's own logged-in page. A plain fetch of the
+# booking.com home page is a 202 with an empty body, so there is no render to
+# capture without a browser.
+# THE MARKER IS A REGEX: `grep -iE` cold, `new RegExp(m, 'i')` in the served
+# browser, so T39b and T39e apply it both ways. The first booking.com draft carried
+# the href as it was counted; as a regex `2?` is an optional 2 with no literal `?`
+# after it, so it missed the link it was counted in and `status` read authenticated
+# on a logged-out render (T39b-control).
+#   T39a  booking.com: the file parses and names its site and the page it probes,
+#         and the version moved, or no box that already has the plugin fetches it
+#   T39b  its marker matches the logged-out header and not the logged-in one
+#   T39c  `status booking.com` through the real probe and the real adapter search
+#         path — no override, so the package's adapters/ is the fallback it resolves
+#   T39d  both actions use only the fixed step vocabulary, read out of bin/browser,
+#         and each declares the out-of-band verify the executor demands
+#   T39e  google.com: the probe is the sign-in page, its title matches the
+#         logged-out page and not a logged-in one, and `status google.com` says so
+#   T39f  MUTANT: the package before this change (no booking.com file, google.com
+#         with no probe) — status cannot tell the two renders apart
+#   T39g  documented where people read it
+BKA="$ROOT/plugins/browser/adapters/booking.com.json"
+GA39="$ROOT/plugins/browser/adapters/google.com.json"
+BKOUT39='<header><a data-testid="auth-link-in-view" href="https://account.booking.com/auth/oauth2?client_id=ID"><span>Sign in</span></a></header>'
+BKIN39='<header><button><span>Your account</span><span>Genius level</span></button></header>'
+GLOUT39='<html><head><title>Sign in - Google Accounts</title></head><body></body></html>'
+GLIN39="$LIVE_DOM"
+# Both ways the probe reads a marker: bin/browser's grep, the daemon's RegExp.
+mark39() {  # mark39 <marker> <dom> -> "<grep> <RegExp>", each match|miss
+  printf '%s %s' "$(grep -qiE "$1" <<<"$2" && echo match || echo miss)" \
+    "$(node -e 'process.stdout.write(new RegExp(process.argv[1], "i").test(process.argv[2]) ? "match" : "miss")' "$1" "$2" 2>/dev/null || echo error)"
+}
+mkdir -p "$TMP/t39"
+rm -f "${FIVEDIVE_BROWSER_PROFILE_ROOT:?}/${SEAT:?}/.adapters/booking.com.json" "${FIVEDIVE_BROWSER_PROFILE_ROOT:?}/${SEAT:?}/.adapters/google.com.json"
+
+# --- T39a the file ------------------------------------------------------------------------
+run jq -e . "$BKA";                                  t 'T39a the shipped booking.com adapter is valid JSON' 0 "$RC"
+t  'T39a it names its site' 'booking.com' "$(jq -r '.site' "$BKA")"
+t  'T39a it probes the home page, whose header carries the Sign in link' 'https://www.booking.com/' "$(jq -r '.probe.url' "$BKA")"
+# Same reason as T1i: `plugin upgrade` resolves a version-pinned path, so a box
+# holding 1.19.0 never fetches this file unless the number moves past it.
+BKV="$(jq -r .version "$ROOT/plugins/browser/.claude-plugin/plugin.json")"
+t  'T39a the manifest is past 1.19.0, the release that shipped without it' 'yes' \
+   "$([[ "$BKV" != 1.19.0 && "$(printf '%s\n' 1.19.0 "$BKV" | sort -V | tail -1)" == "$BKV" ]] && echo yes || echo no)"
+
+# --- T39b the marker against both headers -------------------------------------------------
+BKMARK="$(jq -r '.probe.logged_out_when_dom_matches // empty' "$BKA")"
+t  'T39b (anchor) it declares a logged-out marker' 'yes' "$([[ -n "$BKMARK" ]] && echo yes || echo no)"
+t  'T39b the marker MATCHES the logged-out header (grep -iE, RegExp)' 'match match' "$(mark39 "$BKMARK" "$BKOUT39")"
+t  'T39b it does NOT match the logged-in "Your account" header' 'miss miss' "$(mark39 "$BKMARK" "$BKIN39")"
+t  'T39b-control the first draft, the href as counted, MISSES the same header: `2?` is an optional 2' 'miss miss' \
+   "$(mark39 'account.booking.com/auth/oauth2?client_id=' "$BKOUT39")"
+
+# --- T39c status, through the probe, with the adapter found where every box finds it -----
+mkprofile booking.com "$BKOUT39" >/dev/null
+run env -u FIVEDIVE_BROWSER_ADAPTER_DIR "$BROWSER" status booking.com
+t  'T39c logged out, `status booking.com` reports the session cold' 75 "$RC"
+tc 'T39c ...as expired, which names a person' 'session expired — human action required' "$OUT"
+mkprofile booking.com "$BKIN39" >/dev/null
+run env -u FIVEDIVE_BROWSER_ADAPTER_DIR "$BROWSER" status booking.com
+t  'T39c logged in, it exits 0' 0 "$RC"
+tc 'T39c ...and reads authenticated' 'authenticated (checked' "$OUT"
+
+# --- T39d the two actions -----------------------------------------------------------------
+BKSTEPS="$(sed -n 's/^ADAPTER_STEPS="\(.*\)"$/\1/p' "$BROWSER")"
+t  'T39d (anchor) the step vocabulary was read out of bin/browser' 'yes' "$([[ "$BKSTEPS" == *goto*wait_for* ]] && echo yes || echo no)"
+BKOPS='($v|split(" ")) as $ok | [.actions[].steps[].op | select(. as $o | $ok | index($o) | not)] | unique
+       | if length == 0 then "none" else join(", ") end'
+t  'T39d it ships the two dated searches, each with steps' 'hotels:2 search:2' \
+   "$(jq -r '[.actions | to_entries[] | "\(.key):\(.value.steps|length)"] | sort | join(" ")' "$BKA")"
+t  'T39d both actions use only ops in ADAPTER_STEPS' 'none' "$(jq -r --arg v "$BKSTEPS" "$BKOPS" "$BKA")"
+t  'T39d-control an op outside the vocabulary is named, so the arm can say no' 'eval' \
+   "$(jq '.actions.hotels.steps[1].op = "eval"' "$BKA" | jq -r --arg v "$BKSTEPS" "$BKOPS")"
+t  'T39d each declares the out-of-band verify (url and expect) the executor demands' 'yes' \
+   "$(jq -e '[.actions[].verify | (.url and .expect)] | all' "$BKA" >/dev/null 2>&1 && echo yes || echo no)"
+
+# --- T39e google.com's login probe --------------------------------------------------------
+t  'T39e google.com probes the sign-in page' 'https://accounts.google.com/signin/v2/identifier' "$(jq -r '.probe.url' "$GA39")"
+GMARK39="$(jq -r '.probe.logged_out_when_dom_matches // empty' "$GA39")"
+t  'T39e (anchor) it declares a logged-out marker' 'yes' "$([[ -n "$GMARK39" ]] && echo yes || echo no)"
+t  'T39e the marker MATCHES the sign-in page title (grep -iE, RegExp)' 'match match' "$(mark39 "$GMARK39" "$GLOUT39")"
+t  'T39e it does NOT match a logged-in page' 'miss miss' "$(mark39 "$GMARK39" "$GLIN39")"
+t  'T39e-control the words outside the title do not match: the marker is the title' 'miss miss' \
+   "$(mark39 "$GMARK39" '<html><body><a href="#">Sign in</a> - Google Accounts</body></html>')"
+mkprofile google.com "$GLOUT39" >/dev/null
+run env -u FIVEDIVE_BROWSER_ADAPTER_DIR "$BROWSER" status google.com
+t  'T39e logged out, `status google.com` reports the session cold' 75 "$RC"
+tc 'T39e ...as expired, which names a person' 'session expired — human action required' "$OUT"
+mkprofile google.com "$GLIN39" >/dev/null
+run env -u FIVEDIVE_BROWSER_ADAPTER_DIR "$BROWSER" status google.com
+t  'T39e logged in, it exits 0' 0 "$RC"
+tc 'T39e ...and reads authenticated' 'authenticated (checked' "$OUT"
+
+# --- T39f MUTANT: the package before this change ------------------------------------------
+MUT39="$TMP/t39/mut"; rm -rf "${MUT39:?}"; cp -r "$ROOT/plugins/browser" "$MUT39"; rm -f "${MUT39:?}/adapters/booking.com.json"
+jq 'del(.probe)' "$GA39" > "$MUT39/adapters/google.com.json"
+t  'T39f (anchor) the mutant package has no booking.com adapter, and google.com has no probe' 'no null' \
+   "$([[ -e "$MUT39/adapters/booking.com.json" ]] && echo yes || echo no) $(jq -c .probe "$MUT39/adapters/google.com.json")"
+mkprofile booking.com "$BKOUT39" >/dev/null
+run env -u FIVEDIVE_BROWSER_ADAPTER_DIR "$MUT39/bin/browser" status booking.com
+tc 'T39f MUTANT (no shipped adapter), booking.com logged out: status can only say UNKNOWN' 'UNKNOWN (no adapter for booking.com' "$OUT"
+tn 'T39f ...so the expired session is never reported' 'session expired' "$OUT"
+mkprofile google.com "$GLOUT39" >/dev/null
+run env -u FIVEDIVE_BROWSER_ADAPTER_DIR "$MUT39/bin/browser" status google.com
+tc 'T39f MUTANT (no probe), google.com logged out: status can only say UNKNOWN' 'UNKNOWN (' "$OUT"
+tn 'T39f ...so the expired session is never reported' 'session expired' "$OUT"
+mkprofile google.com "$LIVE_DOM" >/dev/null
+
+# --- T39g the words -----------------------------------------------------------------------
+tc 'T39g the README lists booking.com with its marker' '| `booking.com` | `/` | `data-testid="auth-link-in-view"` |' \
+   "$(cat "$ROOT/plugins/browser/README.md")"
+tc "T39g the README lists google.com's probe" '| `google.com` | `accounts.google.com/signin/v2/identifier` | `<title>Sign in - Google Accounts</title>` |' \
+   "$(cat "$ROOT/plugins/browser/README.md")"
+tc 'T39g CHANGES.md says search needs the served browser' '5dive browser serve booking.com' "$(cat "$ROOT/CHANGES.md")"
+tc 'T39g CHANGES.md names the google.com probe' 'google.com probes `https://accounts.google.com/signin/v2/identifier`' "$(cat "$ROOT/CHANGES.md")"
+
+# ============ T40 a step whose ref matches nothing: one retry, on one picked element
+#
+# Measured on a hotel site at 1.13.0: `act` step 2, `click ref=button/Decline`,
+# failed "matches nothing on this page" — the consent banner's button was there,
+# under another accessible name. `5dive reflex pick-ref` picks a step's element
+# off a page tree (8 intents measured: 7 right, 1 right abstention), and nothing
+# called it. The stubs model a page that knows its refs (PWREFS / DPWREFS) and a
+# reflex whose answer each arm sets (RFX40). Each arm is the mutant:
+#   T40a  a miss, reflex picks at >= 0.9: retried on the pick and said so, cold and
+#         warm; the intent field, the op and {value} (never the value) reach pick-ref
+#   T40b  a step that would send, pay, post or delete is never retargeted: by its
+#         own ref name, by pick-ref's review_required, by the picked element's live
+#         label, and by the name match — cold, and warm
+#   T40c  reflex under 0.9, or no pick: fails as before and names the answer, even
+#         with a name match on the page; cold and warm
+#   T40d  reflex not configured: no pick-ref call at all; the name match retries
+#   T40e  one retry: a pick that matches nothing, or a retried step that fails, is
+#         not retried again
+#   T40f  the name match: reflex erroring falls back to it; two candidates, or
+#         none, fail exactly as before; cold and warm
+#   T40g  MUTANT: the retry removed from lib/aria.cjs — the miss fails, cold and warm
+#   T40h  documented where agents and people read it
+unset FIVEDIVE_BROWSER_DRIVER
+T40="$TMP/t40"; mkdir -p "$T40"
+RFX40="$T40/5dive"; RFXREC40="$T40/rfx.rec"; : > "$RFXREC40"
+cat > "$RFX40" <<CLI
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$RFXREC40"
+[[ "\$1" == reflex ]] || { echo "unknown command: \$1" >&2; exit 64; }
+case "\$2" in
+  status) if [[ -e "$T40/rfx-off" ]]; then echo '{"configured":false}'; else echo '{"configured":true}'; fi ;;
+  pick-ref)
+    for a in "\$@"; do [[ "\$a" == --tree=* ]] && cp "\${a#--tree=}" "$T40/tree-seen.json"; done
+    if [[ -e "$T40/rfx-fail" ]]; then echo "reflex: the model did not answer" >&2; exit 69; fi
+    # a PERSON takes the browser while reflex is thinking (the driver's lease file)
+    if [[ -e "$T40/preempt" && -n "\${FIVEDIVE_BROWSER_LEASE:-}" ]]; then
+      printf 'token=belongs-to-the-person-at-the-viewer\nholder=someone\nholder_pid=1\nkind=human\n' > "\$FIVEDIVE_BROWSER_LEASE"
+    fi
+    cat "$T40/pick.json" ;;
+  *) echo "unknown reflex verb: \$2" >&2; exit 64 ;;
+esac
+CLI
+chmod +x "$RFX40"
+pick40() {  # pick40 <ref|""> <confidence|null> [review_required] — what pick-ref answers
+  rm -f "$T40/rfx-off" "$T40/rfx-fail"
+  jq -nc --arg r "$1" --argjson c "$2" --argjson rv "${3:-false}" \
+    '{site:"stub.test", op:"click", mode:"shadow", written:false, candidates:[],
+      choice:(if $r == "" then "none" else "r1" end), confidence:$c, error:null,
+      ref:(if $r == "" then null else $r end), review_required:$rv}' > "$T40/pick.json"
+}
+# The page: a consent banner whose Decline button is named "Decline all".
+cat > "$T40/refs.json" <<'RJ'
+{ "nodes": [ {"ref":"button/Decline all","role":"button","name":"Decline all","tag":"button"},
+             {"ref":"button/Accept all","role":"button","name":"Accept all","tag":"button"},
+             {"ref":"button/Send","role":"button","name":"Send","tag":"button"},
+             {"ref":"textbox/Search in your own words","role":"textbox","name":"Search in your own words","tag":"input"},
+             {"ref":"heading/Stays","role":"heading","name":"Stays","tag":"h1"} ] }
+RJ
+# ...and one with TWO buttons a name match could mean.
+cat > "$T40/refs2.json" <<'RJ'
+{ "nodes": [ {"ref":"button/Decline all","role":"button","name":"Decline all","tag":"button"},
+             {"ref":"button/Decline optional","role":"button","name":"Decline optional","tag":"button"} ] }
+RJ
+t40env() { env -u SUDO_USER FIVEDIVE_BROWSER_PROFILE_ROOT="$P31" FIVEDIVE_BROWSER_SESSION_ROOT="$TMP/p31/sessions" \
+               FIVEDIVE_BROWSER_APPROVAL_DIR="$T40/approvals" FIVEDIVE_BROWSER_APPROVAL_POLICY="$T40/policy.json" \
+               FIVEDIVE_BROWSER_GRANT_UID="$(id -u)" FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 \
+               NODE_PATH="$PWROOT/node_modules" PWREC="$PWREC" PWREFS="$T40/refs.json" \
+               FIVEDIVE_BROWSER_CLI="$RFX40" "$@"; }
+act40() {  # act40 <steps> [env assignments...] — cold, on the consent banner
+  local st="$1"; shift
+  : > "$PWREC"; : > "$RFXREC40"; rm -f "$T40/tree-seen.json"
+  run t40env "$@" "${T40BIN:-$BROWSER}" act "https://shop40.test/" --steps="$st" --out="$T40/cold"
+}
+tape40() { jq -rs "[.[]|select(.call==\"$1\")|.sel]|join(\" \")" "$PWREC"; }
+picks40() { grep -c '^reflex pick-ref ' "$RFXREC40"; }
+CLICK40='[{"op":"click","selector":"ref=button/Decline"}]'
+
+# --- T40a reflex picks, and the step is retried on the pick -------------------------------
+pick40 'button/Decline all' 0.99
+act40 "$CLICK40"
+t  'T40a a ref that matches nothing, reflex picks at 0.99: act exits 0' 0 "$RC"
+t  'T40a ...the click went to the picked element (r0, "Decline all")' '[data-5dive-ref="r0"]' "$(tape40 click)"
+tc 'T40a ...and it says so, plainly' \
+   'step 2: ref=button/Decline matched nothing; reflex picked ref=button/Decline all (conf 0.99); retried: ok' "$ERR"
+t  'T40a ...pick-ref was asked once' 1 "$(picks40)"
+tc 'T40a ...with the op, and (no intent field) the ref in words' '--op=click --intent=button named Decline --json' \
+   "$(cat "$RFXREC40")"
+# The stub page is on the URL its goto asked for (DIVE-4991), so that is the site.
+tc 'T40a ...about the page it was on' 'reflex pick-ref shop40.test --tree=' "$(cat "$RFXREC40")"
+t  'T40a ...and the tree it read is the interactive nodes of that page' \
+   'button/Decline all,button/Accept all,button/Send,textbox/Search in your own words' \
+   "$(jq -r '[.nodes[].ref]|join(",")' "$T40/tree-seen.json" 2>/dev/null)"
+pick40 'textbox/Search in your own words' 0.95
+act40 '[{"op":"fill","selector":"ref=textbox/Where","value":"s3cret Lisbon","intent":"the destination box"}]'
+t  'T40a a fill: retried on the pick, with the value' '0 [data-5dive-ref="r3"] s3cret Lisbon' \
+   "$RC $(tape40 fill) $(jq -rs '[.[]|select(.call=="fill")|.val]|first' "$PWREC")"
+tc 'T40a ...the step'"'"'s intent field is the intent, and the value goes as {value}' \
+   '--op=fill --intent=the destination box --value={value} --json' "$(cat "$RFXREC40")"
+tn 'T40a ...the value itself never reaches argv' 's3cret' "$(cat "$RFXREC40")"
+pick40 'textbox/Search in your own words' 0.95
+act40 '[{"op":"type","selector":"ref=textbox/Where","value":"Lisbon"}]'
+t  'T40a a type step: asked as a fill, typed into the pick' '0 --op=fill [data-5dive-ref="r3"]' \
+   "$RC $(grep -o -- '--op=fill' "$RFXREC40" | head -1) $(jq -rs '[.[]|select(.call=="type")|.sel]|first' "$PWREC")"
+
+# --- T40b the owner's four are never retargeted -------------------------------------------
+pick40 'button/Send' 0.99
+act40 '[{"op":"click","selector":"ref=button/Send now"}]'
+t  'T40b a Send whose ref missed: reflex picks Send at 0.99, and nothing is clicked (1)' '1 ' "$RC $(tape40 click)"
+tc 'T40b ...the failure names the pick and why it was not retried' \
+   'Reflex picked ref=button/Send (conf 0.99), and it was not retried: this step would send' "$ERR"
+pick40 'button/Accept all' 0.99 true
+act40 '[{"op":"click","selector":"ref=button/Continue"}]'
+t  'T40b pick-ref flags review_required: nothing is clicked (1)' '1 ' "$RC $(tape40 click)"
+tc 'T40b ...and says so' 'it was not retried: this step would pay, post, send or delete' "$ERR"
+pick40 'button/Accept all' 0.99
+act40 '[{"op":"click","selector":"ref=button/Next"}]' PWLABEL='Place your order'
+t  'T40b the picked element reads "Place your order": nothing is clicked (1)' '1 ' "$RC $(tape40 click)"
+tc 'T40b ...it would pay' 'this step would pay' "$ERR"
+touch "$T40/rfx-off"
+act40 '[{"op":"click","selector":"ref=button/Send now"}]'
+t  'T40b no reflex, the one name match is Send: nothing is clicked (1)' '1 ' "$RC $(tape40 click)"
+tc 'T40b ...the failure names the name match' 'A name match picked ref=button/Send, and it was not retried' "$ERR"
+
+# --- T40c under 0.9, or no pick, is an answer ----------------------------------------------
+pick40 'button/Decline all' 0.62
+act40 "$CLICK40"
+t  'T40c reflex at 0.62: nothing is clicked (1), though a name match is on the page' '1 ' "$RC $(tape40 click)"
+tc 'T40c ...the failure names reflex'"'"'s answer' \
+   'Reflex suggested ref=button/Decline all at confidence 0.62, under 0.9, so it was not retried' "$ERR"
+tc 'T40c ...after the miss, as before' 'ref=button/Decline matches nothing on this page' "$ERR"
+pick40 '' null
+act40 "$CLICK40"
+t  'T40c reflex picks none: nothing is clicked (1)' '1 ' "$RC $(tape40 click)"
+tc 'T40c ...and it says so' 'Reflex proposed no element for it.' "$ERR"
+
+# --- T40d reflex not configured: never asked ----------------------------------------------
+touch "$T40/rfx-off"
+act40 "$CLICK40"
+t  'T40d not configured: pick-ref is never called' 0 "$(picks40)"
+t  'T40d ...(anchor) the CLI was reached, and asked only whether reflex is on' 'reflex status --json' \
+   "$(sort -u "$RFXREC40" | paste -sd '|')"
+t  'T40d ...the one near name is retried (0), on Decline all' '0 [data-5dive-ref="r0"]' "$RC $(tape40 click)"
+tc 'T40d ...and it says a name match picked it' \
+   'step 2: ref=button/Decline matched nothing; name match picked ref=button/Decline all; retried: ok' "$ERR"
+
+# --- T40e one retry ------------------------------------------------------------------------
+pick40 'button/Gone' 0.99
+act40 "$CLICK40"
+t  'T40e a pick that matches nothing either: nothing clicked, pick-ref asked once (1)' '1  1' \
+   "$RC $(tape40 click) $(picks40)"
+tc 'T40e ...and it is not retried again' 'Reflex picked ref=button/Gone (conf 0.99), and that matches nothing either.' "$ERR"
+pick40 'button/Decline all' 0.99
+act40 "$CLICK40" PWFAIL=1
+t  'T40e a retried click that fails: one click, one pick-ref call (1)' '1 1 1' \
+   "$RC $(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC") $(picks40)"
+tc 'T40e ...said as a failed retry' 'reflex picked ref=button/Decline all (conf 0.99); retried: failed' "$ERR"
+pick40 'button/Decline all' 0.99; touch "$T40/preempt"
+act40 "$CLICK40"
+rm -f "$T40/preempt"
+t  'T40e the lease is taken while reflex picks: the retry clicks nothing' '' "$(tape40 click)"
+tc 'T40e ...the lease is read again before the retry' 'TAKEN by someone else' "$ERR"
+rm -rf "$P31/$SEAT/_public/.5dive-lease"   # the person's lease, which the arms after this are not about
+
+# --- T40f the name match ------------------------------------------------------------------
+pick40 'button/Decline all' 0.99; touch "$T40/rfx-fail"
+act40 "$CLICK40"
+t  'T40f reflex errors: the name match retries it (0)' '0 [data-5dive-ref="r0"]' "$RC $(tape40 click)"
+tc 'T40f ...and says it was the name match' 'name match picked ref=button/Decline all; retried: ok' "$ERR"
+touch "$T40/rfx-off"
+act40 "$CLICK40" PWREFS="$T40/refs2.json"
+t  'T40f two buttons a name match could mean: nothing is clicked (1)' '1 ' "$RC $(tape40 click)"
+tn 'T40f ...and the failure reads as before' 'picked' "$ERR"
+tc 'T40f ...(anchor) the miss itself' 'ref=button/Decline matches nothing on this page' "$ERR"
+act40 '[{"op":"click","selector":"ref=button/Checkout"}]'
+t  'T40f no near name at all: nothing is clicked (1)' '1 ' "$RC $(tape40 click)"
+act40 '[{"op":"click","selector":"ref=link/Decline"}]'
+t  'T40f a near name of ANOTHER role is not a match (1)' '1 ' "$RC $(tape40 click)"
+
+# --- warm: the second copy of the step loop -----------------------------------------------
+cp "$T40/refs.json" "$T40/wrefs.json"
+mkprofile warm40.test "$LIVE_DOM" >/dev/null
+dserve warm40.test FIVEDIVE_BROWSER_CLI="$RFX40" DPWREFS="$T40/wrefs.json"
+t  'T40 (precondition) a warm session is up' 0 "$RC"
+w40() {  # w40 <steps> [site] — act on the served browser; N40 marks where its tape starts
+  N40=$(wc -l < "$DREC"); : > "$RFXREC40"
+  dwarm "$BROWSER" act "${2:-warm40.test}" "https://${2:-warm40.test}/" --steps="$1" --out="$T40/warm"
+}
+wtape40() { tail -n +$((N40+1)) "$DREC" | jq -rs "[.[]|select(.call==\"$1\")|.sel]|join(\" \")"; }
+pick40 'button/Decline all' 0.99
+w40 "$CLICK40"
+t  'T40a warm: reflex picks at 0.99, retried on the pick (0)' '0 [data-5dive-ref="r0"]' "$RC $(wtape40 click)"
+tc 'T40a warm: ...and says so' \
+   'step 2: ref=button/Decline matched nothing; reflex picked ref=button/Decline all (conf 0.99); retried: ok' "$ERR"
+tc 'T40a warm: ...about the page it was on' 'reflex pick-ref warm40.test --tree=' "$(cat "$RFXREC40")"
+pick40 'button/Send' 0.99
+w40 '[{"op":"click","selector":"ref=button/Send now"}]'
+t  'T40b warm: a Send is never retargeted (1)' '1 ' "$RC $(wtape40 click)"
+tc 'T40b warm: ...and says why' 'it was not retried: this step would send' "$ERR"
+pick40 'button/Decline all' 0.62
+w40 "$CLICK40"
+t  'T40c warm: reflex at 0.62, nothing clicked (1)' '1 ' "$RC $(wtape40 click)"
+tc 'T40c warm: ...naming the answer' 'at confidence 0.62, under 0.9' "$ERR"
+touch "$T40/rfx-off"
+w40 "$CLICK40"
+t  'T40d warm: not configured, pick-ref never called; the name match retries (0)' '0 0 [data-5dive-ref="r0"]' \
+   "$(picks40) $RC $(wtape40 click)"
+pick40 'button/Gone' 0.99
+w40 "$CLICK40"
+t  'T40e warm: a pick that matches nothing either: nothing clicked, one pick-ref call (1)' '1  1' \
+   "$RC $(wtape40 click) $(picks40)"
+touch "$T40/rfx-off"; cp "$T40/refs2.json" "$T40/wrefs.json"
+w40 "$CLICK40"
+t  'T40f warm: two near names, nothing clicked (1)' '1 ' "$RC $(wtape40 click)"
+tn 'T40f warm: ...the failure reads as before' 'picked' "$ERR"
+env PATH="$SPATH" "$BROWSER" serve warm40.test --stop >/dev/null 2>&1
+
+# --- T40g MUTANT: the retry removed ---------------------------------------------------------
+MUT40="$T40/mut"; rm -rf "${MUT40:?}"; cp -r "$ROOT/plugins/browser" "$MUT40"
+sed -i 's#^\(  catch (e) { \)if (!e.refMiss || !REPICK_OP.*$#\1throw e; }  // MUTANT (no retry)#' "$MUT40/lib/aria.cjs"
+t  'T40g (anchor) the mutation landed in the shared step resolve' 1 "$(grep -c 'MUTANT (no retry)' "$MUT40/lib/aria.cjs")"
+pick40 'button/Decline all' 0.99
+T40BIN="$MUT40/bin/browser" act40 "$CLICK40"
+t  'T40g MUTANT (no retry), cold: the miss fails (1), nothing clicked, reflex never asked' '1  0' \
+   "$RC $(tape40 click) $(picks40)"
+cp "$T40/refs.json" "$T40/wrefs.json"
+mkprofile mut40.test "$LIVE_DOM" >/dev/null
+dserve mut40.test FIVEDIVE_BROWSER_CLI="$RFX40" DPWREFS="$T40/wrefs.json" FIVEDIVE_BROWSER_SESSION_DAEMON="$MUT40/bin/session-daemon"
+t  'T40g (precondition) the mutant warm session is up' 0 "$RC"
+w40 "$CLICK40" mut40.test
+t  'T40g MUTANT (no retry), warm: the miss fails (1), nothing clicked' '1 ' "$RC $(wtape40 click)"
+env PATH="$SPATH" "$BROWSER" serve mut40.test --stop >/dev/null 2>&1
+
+# --- T40h the words ---------------------------------------------------------------------------
+for f in plugins/browser/README.md plugins/browser/AGENTS.md CHANGES.md; do
+  tc "T40h $f says a missed ref is retried once, and never for the owner's four" \
+     'is retried once, on the element reflex picks at confidence 0.9 or more' "$(tr -s ' \n' '  ' < "$ROOT/$f")"
+done
+tc 'T40h CHANGES.md names the intent field' '"intent"' "$(cat "$ROOT/CHANGES.md")"
+
+# ============================================================== T41 DIVE-4991
+# A REDIRECTED LANDING IS SAID, AND A COLD RUN IS RETRIED ONCE IN THE SERVED
+# BROWSER. Measured 2026-09-26 on booking.com: a cold `act` of three different
+# search URLs landed on the undated city page, and the next step's failure was
+# all anyone saw; the same URLs through `serve` landed on the results. The stubs
+# land a goto where it asked unless PWLAND (cold) or the file DPWLAND (served)
+# says otherwise. Each arm is the mutant of one rule:
+#   T41a  a changed path: the cold run stops at the goto and the whole plan runs
+#         once in a served browser, which the run started and stops again
+#   T41b  more than half the query keys dropped, on `run` (an adapter search)
+#   T41c  params only ADDED, the fragment alone moved, a trailing slash: no redirect
+#   T41d  a click already ran: the line, and no replay
+#   T41e  reflex, through a stub CLI: login_wall fails with the auth line, cold and
+#         warm; answered >= 0.9 overrides the base; generic_page is a redirect; an
+#         error leaves the base verdict
+#   T41f  reflex not configured: never asked, and the base alone retries; no served
+#         browser to be had, or one that will not start: the line, and no retry
+#   T41g  the served run redirected too: one retry, never two
+#   T41h  MUTANT: the landing check removed from both loops
+#   T41i  the words
+unset FIVEDIVE_BROWSER_DRIVER
+T41="$TMP/t41"; mkdir -p "$T41/pw/node_modules/playwright-core"
+# ONE NODE_PATH FOR BOTH EXECUTORS. The retry starts the served browser from
+# inside the command, so the daemon inherits the arm's NODE_PATH; which stub a
+# process gets is decided by which program it is.
+printf '{ "name": "playwright-core", "version": "0.0.0-t41", "main": "index.js" }\n' \
+  > "$T41/pw/node_modules/playwright-core/package.json"
+cat > "$T41/pw/node_modules/playwright-core/index.js" <<'T41JS'
+const path = require('path');
+module.exports = require(path.basename(process.argv[1] || '') === 'session-daemon'
+  ? process.env.T41_DAEMON_STUB : process.env.T41_DRIVER_STUB);
+T41JS
+R41="$(mkprofile redir.test "$LIVE_DOM")"
+Q41='https://redir.test/searchresults.html?ss=Lisbon&checkin=2026-10-14&checkout=2026-10-15&group_adults=2'
+CITY41='https://redir.test/city/pt/lisbon.html'
+WAIT41='[{"op":"wait_for","selector":"[data-testid=property-card]"}]'
+printf '<html><body>477 properties found</body></html>' > "$T41/results.html"
+cat > "$FIVEDIVE_BROWSER_ADAPTER_DIR/redir.test.json" <<JSON
+{ "site": "redir.test",
+  "probe": { "url": "https://redir.test/feed", "logged_out_when_dom_matches": "action=\"/login\"" },
+  "actions": { "search": {
+      "steps": [ {"op":"goto","url":"https://redir.test/searchresults.html?ss={city}&checkin={checkin}&checkout={checkout}&nflt=ht_id%3D204"},
+                 {"op":"wait_for","selector":"[data-testid=property-card]"} ],
+      "verify": { "url": "file://$T41/results.html", "expect": "properties found" } } } }
+JSON
+# `5dive reflex …` as bin/browser reaches it (FIVEDIVE_BROWSER_CLI). T41_RFX is the
+# answer to `landing`, T41_RFX_RC its exit, T41_RFX_CONF what `status` says.
+RFX41="$T41/5dive"; RFXLOG41="$T41/rfx.log"
+cat > "$RFX41" <<'RFX'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$T41_RFXLOG"
+[[ "${1:-}" == reflex ]] || exit 64
+case "${2:-}" in
+  status)  printf '{"configured":%s}\n' "${T41_RFX_CONF:-true}" ;;
+  landing) for a in "$@"; do [[ "$a" == --state=* ]] && cp "${a#*=}" "$T41_RFXLOG.state"; done
+           printf '%s\n' "${T41_RFX:-}"; exit "${T41_RFX_RC:-0}" ;;
+  *) exit 64 ;;
+esac
+RFX
+chmod +x "$RFX41"
+# Xvfb is the fake from SBIN, so a served browser can be had (T41f takes it
+# away); google-chrome stays the DOM-serving fake, so the cold probe reads the
+# profile and the fallback serve stays up.
+t41env() { env PATH="$SBIN:$PATH" DISPLAY= NODE_PATH="$T41/pw/node_modules" \
+               T41_DRIVER_STUB="$PWROOT/node_modules/playwright-core" T41_DAEMON_STUB="$DSTUB/node_modules/playwright-core" \
+               PWREC="$PWREC" DPWDOM="$DPWDOM" DPWLAND="$T41/dland" T41_RFXLOG="$RFXLOG41" \
+               FIVEDIVE_BROWSER_RUN_SETTLE_MS=0 "$@"; }
+act41() {  # act41 <url> <steps> [env assignments...]
+  local u="$1" st="$2"; shift 2
+  : > "$PWREC"; : > "$RFXLOG41"; rm -f "$RFXLOG41.state"
+  run t41env "$@" "${T41BIN:-$BROWSER}" act redir.test "$u" --steps="$st" --out="$T41/out"
+}
+reflex41() { echo FIVEDIVE_BROWSER_CLI="$RFX41" T41_RFX="$1"; }
+# The cold executor's records carry no `kind`; the served one's are kind=first.
+cold41() { jq -rs '[.[]|select(.kind==null)|select(.call|IN("goto","click","waitForSelector"))|.call]|join(" ")' "$PWREC"; }
+warm41() { jq -rs '[.[]|select(.kind=="first")|select(.call|IN("goto","click","waitForSelector"))|if .call=="goto" then "goto:"+.url else .call end]|join(" ")' "$PWREC"; }
+lines41() { grep -cF -- "$1" <<<"$ERR"; }
+served41() { [[ -e "$R41/.5dive-serve" ]] && echo up || echo down; }
+rm -f "$T41/dland"
+
+# --- T41a a changed path: one retry, in a served browser the run starts and stops ---------
+act41 "$Q41" "$WAIT41" PWLAND="$CITY41"
+t  'T41a a cold act that landed on another path is retried, and exits 0' 0 "$RC"
+tc 'T41a ...the redirect is said: asked, landed, why, and the retry' \
+   "redirected: $Q41 → $CITY41 (path /searchresults.html became /city/pt/lisbon.html); retrying once in the served browser" "$ERR"
+t  'T41a ...the cold run stopped at the goto: the wait_for never ran cold' 'goto' "$(cold41)"
+tc 'T41a ...and the whole plan ran in the served browser' "goto:$Q41 waitForSelector" "$(warm41)"
+tc 'T41a ...which landed where it was asked, so that is the page the act reports' "$Q41" "$OUT"
+t  'T41a ...and the served browser this run started is stopped again' down "$(served41)"
+
+# --- T41b more than half the query keys dropped, on `run` --------------------------------
+REQ41B='https://redir.test/searchresults.html?ss=Lisbon&checkin=2026-10-14&checkout=2026-10-15&nflt=ht_id%3D204'
+: > "$PWREC"
+run t41env PWLAND='https://redir.test/searchresults.html?nflt=ht_id%3D204' \
+    "$BROWSER" run redir.test search --city=Lisbon --checkin=2026-10-14 --checkout=2026-10-15
+t  'T41b a `run` whose landing dropped 3 of 4 query keys is retried, and verifies' 0 "$RC"
+tc 'T41b ...naming the keys' '(3 of 4 query keys dropped: ss checkin checkout); retrying once in the served browser' "$ERR"
+t  'T41b ...cold, only the goto ran' 'goto' "$(cold41)"
+tc 'T41b ...the adapter steps ran in the served browser' "goto:$REQ41B waitForSelector" "$(warm41)"
+tc 'T41b ...the verdict is still the out-of-band re-read' 'verified: search is live' "$OUT"
+t  'T41b ...and the served browser is stopped again' down "$(served41)"
+
+# --- T41c added params, a moved fragment, a trailing slash: the page asked for -----------
+act41 "$Q41" "$WAIT41" PWLAND="$Q41&label=gen173nr&aid=304142"
+t  'T41c a landing that only ADDED params: no line, no retry, the act runs on cold' '0 0 goto waitForSelector' \
+   "$RC $(lines41 'redirected:') $(cold41)"
+t  'T41c ...and no served browser was started' '' "$(warm41)"
+act41 "$Q41" "$WAIT41" PWLAND="$Q41#map_opened"
+t  'T41c ...nor one where only the fragment moved' '0 0 goto waitForSelector' "$RC $(lines41 'redirected:') $(cold41)"
+act41 'https://redir.test/deals' "$WAIT41" PWLAND='https://redir.test/deals/'
+t  'T41c ...nor a trailing slash' '0 0 goto waitForSelector' "$RC $(lines41 'redirected:') $(cold41)"
+act41 "$Q41" "$WAIT41" PWLAND='https://redir.test/searchresults.html?ss=Lisbon&checkin=2026-10-14'
+t  'T41c-control half the keys dropped is not MORE than half' '0 0' "$RC $(lines41 'redirected:')"
+
+# --- T41d a click already ran: said, never replayed --------------------------------------
+D41='[{"op":"click","selector":"#accept"},{"op":"goto","url":"'"$Q41"'"},{"op":"wait_for","selector":"[data-testid=property-card]"}]'
+act41 'https://redir.test/' "$D41" PWLAND="$CITY41" PWLAND_FROM="$Q41"
+t  'T41d a redirect after a click is still said' 1 "$(lines41 "redirected: $Q41 → $CITY41 (path")"
+t  'T41d ...and never replayed' 0 "$(lines41 'retrying')"
+t  'T41d ...the plan ran once, cold, to the end, as it did before' '0 goto click goto waitForSelector' "$RC $(cold41)"
+t  'T41d ...with no served browser' '' "$(warm41)"
+
+# --- T41e the optional reflex tier --------------------------------------------------------
+LONG41="$(printf 'Lisbon hotels %.0s' {1..40})"
+act41 "$Q41" "$WAIT41" $(reflex41 '{"choice":"login_wall","confidence":1}') PWTEXT="$LONG41"
+t  'T41e reflex login_wall: the act fails' 1 "$RC"
+tc 'T41e ...with the line to log in' 'log in first: 5dive browser auth redir.test' "$ERR"
+t  'T41e ...before the next step, with no retry' 'goto|' "$(cold41)|$(warm41)"
+t  'T41e ...reflex saw the landing: asked, landed, title, and at most 300 chars of text' "$Q41 $Q41 stub after 300" \
+   "$(jq -r '"\(.requested_url) \(.landed_url) \(.landed_title) \(.page_excerpt|length)"' "$RFXLOG41.state" 2>/dev/null)"
+t  'T41e ...once, as `reflex landing <site> --state=<file> --json`' 1 "$(grep -cE '^reflex landing redir\.test --state=[^ ]+ --json$' "$RFXLOG41")"
+run t41env $(reflex41 '{"choice":"login_wall","confidence":1}') "$BROWSER" serve redir.test
+t  'T41e (precondition) a served browser is up, and it can reach reflex' '0 up' "$RC $(served41)"
+act41 "$Q41" "$WAIT41" $(reflex41 '{"choice":"login_wall","confidence":1}')
+t  'T41e warm: login_wall fails the act the same way' 1 "$RC"
+tc 'T41e warm: ...with the line to log in' 'log in first: 5dive browser auth redir.test' "$ERR"
+t  'T41e warm: ...and the wait_for never ran' "goto:$Q41|" "$(warm41)|$(cold41)"
+env PATH="$SBIN:$PATH" "$BROWSER" serve redir.test --stop >/dev/null 2>&1
+act41 "$Q41" "$WAIT41" PWLAND="$CITY41" $(reflex41 '{"choice":"answered","confidence":0.97}')
+t  'T41e reflex answered 0.97 overrides a base redirect: no retry, the act runs on cold' '0 0 goto waitForSelector' \
+   "$RC $(lines41 'retrying') $(cold41)"
+tc 'T41e ...and says why' "landed on $CITY41 (path /searchresults.html became /city/pt/lisbon.html), which reflex read as the page asked for (answered, 0.97); not a redirect" "$ERR"
+act41 "$Q41" "$WAIT41" PWLAND="$CITY41" $(reflex41 '{"choice":"answered","confidence":0.8}')
+t  'T41e-control answered under 0.9 does not: retried' '0 1' "$RC $(lines41 'retrying once in the served browser')"
+act41 "$Q41" "$WAIT41" $(reflex41 '{"choice":"generic_page","confidence":0.95}')
+t  'T41e reflex generic_page on a URL the base passed: a redirect, retried' '0 1' "$RC $(lines41 'retrying once in the served browser')"
+tc 'T41e ...with reflex named as the reason' "redirected: $Q41 → $Q41 (reflex: generic_page, 0.95); retrying once" "$ERR"
+act41 "$Q41" "$WAIT41" PWLAND="$CITY41" $(reflex41 '') T41_RFX_RC=3
+t  'T41e reflex erroring leaves the base verdict: retried' '0 1' "$RC $(lines41 'retrying once in the served browser')"
+t  'T41e ...and it WAS asked (the error is reflex'"'"'s, not a skip)' yes "$(grep -q '^reflex landing' "$RFXLOG41" && echo yes || echo no)"
+
+# --- T41f no reflex; no served browser; one that will not start ---------------------------
+act41 "$Q41" "$WAIT41" PWLAND="$CITY41" $(reflex41 '{"choice":"login_wall","confidence":1}') T41_RFX_CONF=false
+t  'T41f reflex not configured: the base alone retries' '0 1' "$RC $(lines41 'retrying once in the served browser')"
+t  'T41f ...and reflex is never asked about a landing (the stub was reached: status was read)' '0 yes' \
+   "$(grep -c '^reflex landing' "$RFXLOG41") $(grep -q '^reflex status' "$RFXLOG41" && echo yes || echo no)"
+act41 "$Q41" "$WAIT41" PWLAND="$CITY41" FIVEDIVE_BROWSER_NO_DAEMON=1
+t  'T41f no served browser to be had: the line alone, and the act runs on cold as before' \
+   "0 1 0 goto waitForSelector" "$RC $(lines41 "redirected: $Q41 → $CITY41") $(lines41 'retrying') $(cold41)"
+act41 "$Q41" "$WAIT41" PWLAND="$CITY41" DPWNOLAUNCH=1
+t  'T41f a served browser that will not start: the act fails, and says why' '1 1' "$RC $(lines41 'no served browser for the retry')"
+t  'T41f ...the browser it tried to start is not left running' down "$(served41)"
+tc 'T41f ...and the page it shows is where the cold run landed' "$CITY41" "$OUT"
+
+# --- T41g the served run redirected too: one retry, never two ----------------------------
+printf '%s' "$CITY41" > "$T41/dland"
+act41 "$Q41" "$WAIT41" PWLAND="$CITY41"
+rm -f "$T41/dland"
+t  'T41g the served run landed on the city page too: one retry, two lines' '1 2' \
+   "$(lines41 'retrying once') $(lines41 'redirected:')"
+t  'T41g ...the page was asked for once cold and once served' '1 1' \
+   "$(jq -rs --arg q "$Q41" '[.[]|select(.kind==null and .call=="goto" and .url==$q)]|length' "$PWREC") $(jq -rs --arg q "$Q41" '[.[]|select(.kind=="first" and .call=="goto" and .url==$q)]|length' "$PWREC")"
+t  'T41g ...and the served browser is stopped again' down "$(served41)"
+
+# --- T41h MUTANT: the landing check removed from both loops -------------------------------
+MUT41="$T41/mut"; rm -rf "${MUT41:?}"; cp -r "$ROOT/plugins/browser" "$MUT41"
+sed -i "s|^async function checkLanding(.*{\$|&\n  return { line: '', loginWall: '', retry: false };  // MUTANT (no landing check)|" "$MUT41/lib/aria.cjs"
+t  'T41h (anchor) the mutation landed' 1 "$(grep -c 'MUTANT (no landing check)' "$MUT41/lib/aria.cjs")"
+T41BIN="$MUT41/bin/browser" act41 "$Q41" "$WAIT41" PWLAND="$CITY41"
+t  'T41h MUTANT (no landing check): nothing said, nothing retried, the cold run goes on as before' \
+   '0 0 goto waitForSelector' "$(lines41 'redirected:') $(lines41 'retrying') $(cold41)"
+
+# --- T41i the words -----------------------------------------------------------------------
+for f41 in README.md AGENTS.md; do
+  tc "T41i browser/$f41 shows the redirect line" 'retrying once in the served browser' "$(cat "$ROOT/plugins/browser/$f41")"
+done
+tc 'T41i CHANGES.md carries the entry' 'DIVE-4991' "$(cat "$ROOT/CHANGES.md")"
+
+# ============================================================== T42 DIVE-4990
+# A FAILED STEP FAILS `act`, WHATEVER --expect MATCHED, AND THE FAILURE NAMES THE
+# STEP. Measured at 1.13.0 on a hotel site: step 2, `click ref=button/Decline`,
+# failed "matches nothing on this page", and the run printed "verified: the page
+# after the steps matches --expect" and exited 0 — the expected text was on the
+# page before any step ran. The T40 stubs (a page that knows its refs, reflex
+# off): a ref with no near name fails step 2 on the page the goto left, and that
+# page carries the text --expect asks for. Cold and warm:
+#   T42a  a failed step 2 + an --expect that matches the unchanged page: rc 1, no
+#         `verified`, stderr names step 2 and its error; --json is step_failed
+#         with failed_step.index 2
+#   T42b  CONTROL: every step ok + a matching --expect: verified, rc 0
+#   T42c  every step ok + no match: NOT VERIFIED, as before
+#   T42d  a failed step and no --expect: step_failed, naming the step
+#   T42e  MUTANT: the old verdict (--expect alone decides, no step named) — a and d red
+#   T42f  documented where agents and people read it
+T42="$TMP/t42"; mkdir -p "$T42"
+FAIL42='[{"op":"click","selector":"ref=button/Checkout"}]'
+OK42='[{"op":"click","selector":"ref=button/Decline all"}]'
+NAMED42='step 2 (click ref=button/Checkout) failed: ref=button/Checkout matches nothing on this page'
+act42() {  # act42 <steps> [act flags...] — cold, on the T40 page, reflex off
+  local st="$1"; shift
+  : > "$PWREC"; touch "$T40/rfx-off"
+  run t40env "${T42BIN:-$BROWSER}" act "https://shop40.test/" --steps="$st" --out="$T42/cold" "$@"
+}
+
+# --- cold ------------------------------------------------------------------------------------
+act42 "$FAIL42" --expect='stub after'
+t  'T42a cold: step 2 failed, --expect matches the unchanged page: act fails (1)' 1 "$RC"
+tn 'T42a cold: ...and says nothing is verified on stdout' 'verified' "$OUT"
+tc 'T42a cold: ...the failure names step 2 and its error' "$NAMED42" "$ERR"
+tc 'T42a cold: ...and says --expect did not save it' 'the run is NOT verified, whatever --expect matched' "$ERR"
+t  'T42a cold: (anchor) the page did carry the expected text' 1 "$(grep -c 'stub after' "$T42/cold/page.html")"
+act42 "$FAIL42" --expect='stub after' --json
+t  'T42a cold --json: step_failed, failed_step index 2, op click, the selector, the error' \
+   'step_failed 2 click ref=button/Checkout true 1' \
+   "$(jq -r '"\(.verdict) \(.failed_step.index) \(.failed_step.op) \(.failed_step.selector) \(.failed_step.error|startswith("ref=button/Checkout matches nothing on this page")) \(.executor_rc)"' <<<"$OUT")"
+act42 "$OK42" --expect='stub after'
+t  'T42b cold CONTROL: every step ok, --expect matches: verified (0)' '0 verified: the page after the steps matches --expect' \
+   "$RC $(grep '^verified' <<<"$OUT")"
+act42 "$OK42" --expect='stub after' --json
+t  'T42b cold CONTROL --json: verified, no failed_step' 'verified null' "$(jq -r '"\(.verdict) \(.failed_step)"' <<<"$OUT")"
+act42 "$OK42" --expect='Booking confirmed' --expect-wait=0
+t  'T42c cold: every step ok, no match: NOT VERIFIED (1), as before' 1 "$RC"
+tc 'T42c cold: ...said as NOT VERIFIED' 'NOT VERIFIED — the executor exited 0' "$ERR"
+act42 "$FAIL42"
+t  'T42d cold: a failed step, no --expect: step_failed (1)' 1 "$RC"
+tc 'T42d cold: ...naming the step' "$NAMED42" "$ERR"
+tn 'T42d cold: ...and no word about --expect it was not given' 'whatever --expect' "$ERR"
+
+# --- warm: the second copy of the step loop ----------------------------------------------------
+cp "$T40/refs.json" "$T42/wrefs.json"; touch "$T40/rfx-off"
+mkprofile warm42.test "$LIVE_DOM" >/dev/null
+dserve warm42.test FIVEDIVE_BROWSER_CLI="$RFX40" DPWREFS="$T42/wrefs.json"
+t  'T42 (precondition) a warm session is up' 0 "$RC"
+w42() {  # w42 <steps> [act flags...] — act on the served browser, whose page says "posts"
+  local st="$1"; shift
+  dwarm "${T42BIN:-$BROWSER}" act warm42.test "https://warm42.test/" --steps="$st" --out="$T42/warm" "$@"
+}
+w42 "$FAIL42" --expect='posts'
+t  'T42a warm: step 2 failed, --expect matches the unchanged page: act fails (1)' 1 "$RC"
+tn 'T42a warm: ...and says nothing is verified on stdout' 'verified' "$OUT"
+tc 'T42a warm: ...the failure names step 2 and its error' "$NAMED42" "$ERR"
+w42 "$FAIL42" --expect='posts' --json
+t  'T42a warm --json: step_failed, failed_step index 2' 'step_failed 2 click' \
+   "$(jq -r '"\(.verdict) \(.failed_step.index) \(.failed_step.op)"' <<<"$OUT")"
+w42 "$OK42" --expect='posts'
+t  'T42b warm CONTROL: every step ok, --expect matches: verified (0)' '0 verified: the page after the steps matches --expect' \
+   "$RC $(grep '^verified' <<<"$OUT")"
+w42 "$OK42" --expect='Booking confirmed' --expect-wait=0
+t  'T42c warm: every step ok, no match: NOT VERIFIED (1)' 1 "$RC"
+tc 'T42c warm: ...said as NOT VERIFIED' 'NOT VERIFIED' "$ERR"
+w42 "$FAIL42"
+t  'T42d warm: a failed step, no --expect: step_failed (1)' 1 "$RC"
+tc 'T42d warm: ...naming the step' "$NAMED42" "$ERR"
+
+# --- T42e MUTANT: the old verdict -------------------------------------------------------------
+MUT42="$T42/mut"; rm -rf "${MUT42:?}"; cp -r "$ROOT/plugins/browser" "$MUT42"
+sed -i -e 's/^  if (( drc != 0 )); then$/  if false; then  # MUTANT (old verdict)/' \
+       -e 's/^    verdict=executed; rc=0$/    verdict=$([[ "$drc" == 0 ]] \&\& echo executed || echo step_failed); rc=$(( drc == 0 ? 0 : 1 ))  # MUTANT (old verdict)/' \
+       -e 's/^  fstep=\$(grep .*$/  fstep=""  # MUTANT (old verdict)/' "$MUT42/bin/browser"
+t  'T42e (anchor) the three mutations landed in act'"'"'s verdict' 3 "$(grep -c 'MUTANT (old verdict)' "$MUT42/bin/browser")"
+T42BIN="$MUT42/bin/browser" act42 "$FAIL42" --expect='stub after'
+t  'T42e MUTANT (old verdict), cold: the failed step 2 reads verified (0) — T42a is red' '0 verified: the page after the steps matches --expect' \
+   "$RC $(grep '^verified' <<<"$OUT")"
+T42BIN="$MUT42/bin/browser" act42 "$FAIL42"
+tn 'T42e MUTANT (old verdict), cold: no step named — T42d is red' 'step 2 (click' "$ERR"
+tc 'T42e ...(anchor) it did fail, the old way' 'a step failed (the executor exited 1)' "$ERR"
+T42BIN="$MUT42/bin/browser" w42 "$FAIL42" --expect='posts'
+t  'T42e MUTANT (old verdict), warm: the failed step 2 reads verified (0)' '0 verified: the page after the steps matches --expect' \
+   "$RC $(grep '^verified' <<<"$OUT")"
+env PATH="$SPATH" "$BROWSER" serve warm42.test --stop >/dev/null 2>&1
+
+# --- T42f the words -----------------------------------------------------------------------------
+for f in plugins/browser/README.md plugins/browser/AGENTS.md CHANGES.md; do
+  tc "T42f $f says a failed step fails act whatever --expect matched" \
+     'step that fails fails the run, whatever --expect matched' "$(tr -s ' \n' '  ' < "$ROOT/$f")"
+done
+tc 'T42f CHANGES.md names the --json field' 'failed_step' "$(cat "$ROOT/CHANGES.md")"
+
+# ============ T43 a send's recipients: a chip's address, never the text of the field around it
+#
+# Measured on Gmail at 1.18.0: a one-recipient send asked the owner to approve
+# `to user@example.comLoading..., user@example.com`. The To field has no `email`
+# attribute, so its text was read, and that text is the chip's glued to the hover
+# card's; the chip's clean copy came through as well. Each arm is the mutant:
+#   T43a  a chip and the field around it: one address, the chip's
+#   T43b  ...and an address still being typed in the field's input is kept
+#   T43c  no [email] node on the page: a textarea's value, and a field's text, still read
+#   T43d  MUTANT: the field's text read beside the chip — the glued address is back
+#   T43e  the words
+T43="$TMP/t43"; mkdir -p "$T43"
+cat > "$T43/to.js" <<'TOJS'
+const { _payloadIn } = require(process.env.ARIA);
+// A node lists the simple selectors it matches; querySelectorAll keeps document
+// order, as the DOM does: the To field, an ancestor, before the chip inside it.
+const node = (m, p) => Object.assign({ m, getAttribute: (a) => ((p.attrs || {})[a] ?? null) }, p);
+const to = (nodes) => {
+  const form = { querySelectorAll: (q) => { const qs = q.split(',').map((x) => x.trim());
+    return nodes.filter((n) => n.m.some((x) => qs.includes(x))); } };
+  global.document = { querySelector: (s) => (s === '#send' ? { closest: () => form } : null), querySelectorAll: () => [] };
+  return _payloadIn({ sel: '#send', cls: 'send', op: 'click' }).to || [];
+};
+const field = node(['[aria-label^="To"]'], { attrs: { 'aria-label': 'To recipients' }, innerText: 'user@example.comLoading...' });
+const chip = node(['[email]'], { attrs: { email: 'user@example.com' }, innerText: 'user' });
+const typing = node(['[aria-label^="To"]'], { attrs: { 'aria-label': 'To recipients' }, value: 'late@example.test' });
+const textarea = node(['textarea[name=to]'], { value: 'ann@example.test' });
+const plain = node(['[aria-label^="To"]'], { attrs: { 'aria-label': 'To' }, innerText: 'bob@example.test' });
+console.log(JSON.stringify([to([field, chip]), to([field, chip, typing]), to([textarea, plain])]));
+TOJS
+OUT43="$(ARIA="$ROOT/plugins/browser/lib/aria.cjs" node "$T43/to.js" 2>&1)"
+t  'T43a a chip and the To field around it: to is the chip'"'"'s address, once' '["user@example.com"]' "$(jq -c '.[0]' <<<"$OUT43" 2>&1)"
+t  'T43b ...an address still in the field'"'"'s input is kept' '["user@example.com","late@example.test"]' "$(jq -c '.[1]' <<<"$OUT43" 2>&1)"
+t  'T43c no [email] node: the textarea'"'"'s value and the field'"'"'s text are read' '["ann@example.test","bob@example.test"]' "$(jq -c '.[2]' <<<"$OUT43" 2>&1)"
+
+# --- T43d MUTANT: the field's text read beside the chip ---------------------------------------
+sed "s/ || (chips ? '' : text(n));\$/ || text(n);  \/\/ MUTANT (field text)/" "$ROOT/plugins/browser/lib/aria.cjs" > "$T43/aria-mut.cjs"
+t  'T43d (anchor) the mutation landed in _payloadIn' 1 "$(grep -c 'MUTANT (field text)' "$T43/aria-mut.cjs")"
+t  'T43d MUTANT (field text): the glued address is back, and the chip'"'"'s copy beside it — T43a is red' \
+   '["user@example.comLoading...","user@example.com"]' "$(ARIA="$T43/aria-mut.cjs" node "$T43/to.js" 2>&1 | jq -c '.[0]' 2>&1)"
+
+# --- T43e the words ---------------------------------------------------------------------------
+tc 'T43e CHANGES.md names the glued address' 'user@example.comLoading...' "$(cat "$ROOT/CHANGES.md")"
+tc 'T43e README.md says a chip'"'"'s address wins over the field'"'"'s text' 'never the text of the field around it' \
+   "$(tr -s ' \n' '  ' < "$ROOT/plugins/browser/README.md")"
+
+# ============ T44 the shipped Telegram marker: a signed-out profile is not a login
+#
+# Measured on the K app's 2026-09-25 renders: the signed-out page carries
+# `class="tabs-tab chatlist-container sidebar …"`, and the shipped logged-in marker
+# `class="[^"]*chatlist` matched the `chatlist` inside `chatlist-container`. So a
+# SIGNED-OUT profile probed `authenticated` on the first poll, and every acting verb
+# ran on a dead session. T29g grades the marker with grep against hand-built
+# documents; these arms run it through the real probe, on the class lists the
+# renders actually had. Each arm is the mutant:
+#   T44a  a signed-out render carrying `chatlist-container` probes NOT authenticated
+#   T44b  the live render's `chatlist virtual-chatlist` still probes authenticated
+#   T44c  MUTANT: the old marker, same probe, same signed-out render — authenticated
+#   T44d  the marker keys on the class NAME, wherever it sits in the list
+#   T44e  the words
+TGOUT_DOM='<html><body class="animation-level-2 has-auth-pages"><div id="auth-pages"></div><div class="tabs-tab chatlist-container sidebar sidebar-left-section"><div class="sidebar-content"></div></div></body></html>'
+TGIN_DOM='<html><body class="animation-level-2"><div class="tabs-tab chatlist-container sidebar"><ul class="chatlist virtual-chatlist"><li class="chatlist-chat">a chat</li></ul></div></body></html>'
+TGA="$ROOT/plugins/browser/adapters/web.telegram.org.json"
+TGAD="$FIVEDIVE_BROWSER_ADAPTER_DIR/web.telegram.org.json"
+cp "$TGA" "$TGAD"
+TGOUTD="$(mkprofile web.telegram.org_signedout "$TGOUT_DOM")"
+mkprofile web.telegram.org_signedin "$TGIN_DOM" >/dev/null
+
+# --- T44a a signed-out render carrying chatlist-container is NOT a login ---------------------
+t  'T44a (anchor) the signed-out fixture carries the class that lied' 'yes' \
+   "$(grep -q 'chatlist-container' <<<"$TGOUT_DOM" && echo yes || echo no)"
+spaprobe web.telegram.org_signedout
+tn 'T44a the signed-out render does NOT probe authenticated' 'authenticated' "$OUT"
+tc 'T44a ...it reads UNKNOWN: neither marker is on the page' 'UNKNOWN' "$OUT"
+tn 'T44a ...and the tile does not remember a login either' 'authenticated' \
+   "$(awk '{print $2}' "$TGOUTD/.5dive-liveness" 2>/dev/null | tail -1)"
+
+# --- T44b the live render still probes authenticated -----------------------------------------
+spaprobe web.telegram.org_signedin
+tc 'T44b the signed-in render (chatlist virtual-chatlist) probes authenticated' 'authenticated' "$OUT"
+t  'T44b ...quietly' 0 "$RC"
+
+# --- T44c MUTANT: the old marker reads the same signed-out render as a login ------------------
+jq '.probe.logged_in_when_dom_matches = "class=\"[^\"]*chatlist"' "$TGA" > "$TGAD"
+spaprobe web.telegram.org_signedout
+tc 'T44c MUTANT (old marker): the signed-out render probes authenticated — T44a is red' 'authenticated' "$OUT"
+cp "$TGA" "$TGAD"
+
+# --- T44d the class name, wherever it sits in the list ---------------------------------------
+TGIN="$(jq -r '.probe.logged_in_when_dom_matches' "$TGA")"
+t  'T44d the marker counts 0 on the signed-out render and 1 on the signed-in one' '0 1' \
+   "$(grep -oiE -- "$TGIN" <<<"$TGOUT_DOM" | wc -l | tr -d ' ') $(grep -oiE -- "$TGIN" <<<"$TGIN_DOM" | wc -l | tr -d ' ')"
+t  'T44d ...matches chatlist first, middle or last in a class list' 'match match match' \
+   "$(for c in 'chatlist a' 'a chatlist b' 'a chatlist'; do grep -qiE -- "$TGIN" <<<"<ul class=\"$c\">" && printf 'match ' || printf 'miss '; done | sed 's/ $//')"
+t  'T44d ...and not a class that only contains the word' 'miss miss' \
+   "$(for c in 'virtual-chatlist' 'chatlist-container'; do grep -qiE -- "$TGIN" <<<"<ul class=\"$c\">" && printf 'match ' || printf 'miss '; done | sed 's/ $//')"
+
+# --- T44e the words ----------------------------------------------------------------------------
+tc 'T44e CHANGES.md carries the entry' 'DIVE-4998' "$(cat "$ROOT/CHANGES.md")"
+tc 'T44e the README row names the marker that ships' "$TGIN" "$(cat "$ROOT/plugins/browser/README.md")"
+tn 'T44e ...and the adapter no longer claims 0 on a logged-out render' "on a logged-out cold profile's own render, it matched 0" \
+   "$(jq -r '._comment' "$TGA")"
+
+# ============ T45 a --wait-for timeout is a timeout, and `served` names the public browser
+#
+# Two leftovers of a live Booking test at 1.22.2 (DIVE-4991 items 3 and 4):
+#   item 3: `read --wait-for` on an element that never appeared said "--wait-for was not
+#           honoured … a session daemon from before --wait-for existed … Restart it" with
+#           no daemon in the path. The cold executor printed its payload and called
+#           process.exit, and bin/browser reads it through a PIPE: the first 64 KB arrived
+#           and the rest did not. A real page's node list is past that, so jq found no
+#           wait_for in the cut JSON, and the only branch for "no wait_for" was the
+#           old-daemon one. Restarting changed nothing, because nothing was served.
+#   item 4: `served` printed nothing while a `_public` browser ran; `serve _public --stop`
+#           found it and stopped it.
+# Each arm is the mutant:
+#   T45a  cold read, a page past 64 KB, the element never comes: the TIMEOUT message
+#   T45b  ...and the same page when the element does come: met, rc 0
+#   T45c  MUTANT: the executor exits without flushing — T45a's page loses its verdict,
+#         and the message names the executor, never a daemon
+#   T45d  warm read on the current daemon: the timeout message; on a daemon with no
+#         wait_for field (the old one): the old-daemon message, still 76
+#   T45e  `served` lists `_public` while it runs, and not once it stops
+#   T45f  MUTANT: the old skip restored in a copy — `_public` is missing again
+#   T45g  the words
+T45="$TMP/t45"; mkdir -p "$T45"
+mkprofile big45.test "$LIVE_DOM" >/dev/null
+# A PAGE PAST THE PIPE. 1500 refs is ~110 KB of payload, and Booking's results page
+# walks to more than that.
+jq -n '{nodes: ([range(0;1500)] | map({ref:("link/Hotel number \(.) in Lisbon"), role:"link",
+         name:("Hotel number \(.) in Lisbon"), tag:"a"})),
+        marker: null, title: "Hotels in Lisbon", url: "https://big45.test/searchresults",
+        html: "<html><body><main><h1>Hotels in Lisbon</h1><p>Every property the search found, with its price and its rating, one card after another down the page.</p></main></body></html>"}' \
+  > "$T45/big.json"
+jq '.nodes += [{ref:"main/", role:"main", name:"", tag:"div"}]' "$T45/big.json" > "$T45/big-late.json"
+t  'T45a (anchor) the fixture is past a pipe'"'"'s 64 KB' 'yes' \
+   "$([[ $(jq -c '{url, nodes}' "$T45/big.json" | wc -c) -gt 65536 ]] && echo yes || echo no)"
+
+# --- T45a the element never comes: the timeout message, not the old-daemon one ---------------
+rm -rf "$T45/a"
+run t34env PWWALK="$T45/big.json" PWLATE_MS=99999999 FIVEDIVE_BROWSER_STEP_TIMEOUT=1000 \
+    "$BROWSER" read big45.test "https://big45.test/searchresults" --wait-for='[data-testid=property-card]' --out="$T45/a"
+t  'T45a a --wait-for that never appears on a page past 64 KB is NOT READY (76)' 76 "$RC"
+tc 'T45a ...and says it timed out, with the bound' 'did not appear within 1000 ms' "$ERR"
+tn 'T45a ...not that it was not honoured' 'not honoured' "$ERR"
+tn 'T45a ...and blames no daemon: none was in the path' 'session daemon' "$ERR"
+t  'T45a page.meta.json: rendered by the executor, the wait answered and unmet' 'playwright false 1000' \
+   "$(jq -r '"\(.capture) \(.wait_for.met) \(.wait_for.waited_ms)"' "$T45/a/page.meta.json" 2>/dev/null)"
+
+# --- T45b ...and when it comes, on the same page, it is met ----------------------------------
+rm -rf "$T45/b"
+run t34env PWWALK="$T45/big.json" PWWALK_LATE="$T45/big-late.json" PWLATE_MS=1500 \
+    "$BROWSER" read big45.test "https://big45.test/searchresults" --wait-for='[role=main]' --out="$T45/b"
+t  'T45b the element that arrives on a page past 64 KB is met, and read exits 0' '0 true 1500' \
+   "$RC $(jq -r '"\(.wait_for.met) \(.wait_for.waited_ms)"' "$T45/b/page.meta.json" 2>/dev/null)"
+
+# --- T45c MUTANT: the executor exits the moment it has written ----------------------------------
+MUT45="$T45/mutant"; rm -rf "$MUT45"; cp -r "$ROOT/plugins/browser" "$MUT45"
+perl -0pi -e 's/(async function printAndExit\(obj, code = 0\) \{\n)/$1  process.stdout.write(JSON.stringify(obj) + "\\n"); process.exit(code); \/\* MUTANT (DIVE-4991): exit before the pipe drains \*\/\n/' \
+  "$MUT45/bin/driver-playwright"
+t  'T45c (anchor) the mutation landed in the copy' 'yes' \
+   "$(grep -q 'MUTANT (DIVE-4991)' "$MUT45/bin/driver-playwright" && echo yes || echo no)"
+rm -rf "$T45/c"
+run t34env PWWALK="$T45/big.json" PWLATE_MS=99999999 FIVEDIVE_BROWSER_STEP_TIMEOUT=1000 \
+    "$MUT45/bin/browser" read big45.test "https://big45.test/searchresults" --wait-for='[data-testid=property-card]' --out="$T45/c"
+tn 'T45c MUTANT (no flush): the timeout is lost — T45a is red' 'did not appear within' "$ERR"
+tc 'T45c MUTANT ...and the reply is said to carry no verdict' 'was not answered' "$ERR"
+tn 'T45c MUTANT ...still without blaming a daemon that was not there' 'session daemon from before' "$ERR"
+t  'T45c MUTANT ...and it is still NOT READY, never met' 76 "$RC"
+rm -rf "$T45/c2"
+run t34env PWWALK="$T45/big.json" PWWALK_LATE="$T45/big-late.json" PWLATE_MS=1500 \
+    "$MUT45/bin/browser" read big45.test "https://big45.test/searchresults" --wait-for='[role=main]' --out="$T45/c2"
+t  'T45c MUTANT ...even an element that DID arrive reads as unanswered — T45b is red' 76 "$RC"
+
+# --- T45d the warm read: a timeout, and a daemon that does not answer ------------------------
+mkprofile warm45.test "$LIVE_DOM" >/dev/null
+jq '.url = "https://warm45.test/inbox"' "$T34INBOX" > "$T45/w.json"
+dserve warm45.test DPWLATE_MS=99999999 DPWSNAP="$T45/w.json" FIVEDIVE_BROWSER_STEP_TIMEOUT=1000
+t  'T45d (precondition) the warm session is up' 0 "$RC"
+rm -rf "$T45/d"
+dwarm "$BROWSER" read warm45.test "https://warm45.test/inbox" --wait-for='text=Compose' --out="$T45/d"
+t  'T45d a warm read whose element never comes is NOT READY (76)' 76 "$RC"
+tc 'T45d ...with the timeout message' 'did not appear within 1000 ms' "$ERR"
+tn 'T45d ...and not the old-daemon one: this daemon answered' 'not honoured' "$ERR"
+t  'T45d ...rendered in the session' 'session-daemon false' \
+   "$(jq -r '"\(.capture) \(.wait_for.met)"' "$T45/d/page.meta.json" 2>/dev/null)"
+env PATH="$SPATH" "$BROWSER" serve warm45.test --stop >/dev/null 2>&1
+# AN OLD DAEMON: this release's daemon with the wait_for field cut out of its replies,
+# which is what one from before --wait-for sends back.
+OLD45="$T45/old"; rm -rf "$OLD45"; cp -r "$ROOT/plugins/browser" "$OLD45"
+perl -ni -e 'print unless /^\s*\.\.\.\(waited \? \{ wait_for: waited \} : \{\}\),\s*$/' "$OLD45/bin/session-daemon"
+t  'T45d (anchor) the old daemon sends no wait_for' 0 "$(grep -c 'wait_for: waited' "$OLD45/bin/session-daemon")"
+dserve warm45.test FIVEDIVE_BROWSER_SESSION_DAEMON="$OLD45/bin/session-daemon" DPWLATE_MS=99999999 DPWSNAP="$T45/w.json" FIVEDIVE_BROWSER_STEP_TIMEOUT=1000
+t  'T45d (precondition) the old daemon is up' 0 "$RC"
+rm -rf "$T45/d2"
+dwarm env FIVEDIVE_BROWSER_SESSION_DAEMON="$OLD45/bin/session-daemon" \
+    "$BROWSER" read warm45.test "https://warm45.test/inbox" --wait-for='text=Compose' --out="$T45/d2"
+t  'T45d a daemon that sends no wait_for is NOT READY (76)' 76 "$RC"
+tc 'T45d ...and is named as the old daemon, with the restart' 'session daemon from before --wait-for existed' "$ERR"
+tn 'T45d ...not as a timeout it never reported' 'did not appear within' "$ERR"
+env PATH="$SPATH" FIVEDIVE_BROWSER_SESSION_DAEMON="$OLD45/bin/session-daemon" "$BROWSER" serve warm45.test --stop >/dev/null 2>&1
+
+# --- T45e `served` names the public browser while it runs ------------------------------------
+PUBD="$(mkprofile _public "$LIVE_DOM")"
+run "$BROWSER" served
+tn 'T45e (control) a public profile that is not running is not in `served`' '_public' "$OUT"
+PUBPIDS="$(mkserve "$PUBD" "$(date -u +%s)")"
+run "$BROWSER" served
+t  'T45e a running public browser is in `served`, as its bare name' 'yes' \
+   "$(printf '%s\n' "$OUT" | grep -qx '_public' && echo yes || echo no)"
+t  'T45e ...and asking is not an error' 0 "$RC"
+
+# --- T45f MUTANT: the old skip, restored in a copy ---------------------------------------------
+MUTS45="$T45/served-mutant"; rm -rf "$MUTS45"; cp -r "$ROOT/plugins/browser" "$MUTS45"
+perl -0pi -e 's/(    site=\$\(basename "\$d"\)\n)(    _serve_running "\$d" >\/dev\/null \|\| continue\n    printf)/$1    _is_public "\$site" && continue   # MUTANT (DIVE-4991)\n$2/' "$MUTS45/bin/browser"
+t  'T45f (anchor) the mutation landed in the copy' 1 "$(grep -c 'MUTANT (DIVE-4991)' "$MUTS45/bin/browser")"
+run "$MUTS45/bin/browser" served
+t  'T45f MUTANT (skip _public): the running public browser is missing — T45e is red' 'no' \
+   "$(printf '%s\n' "$OUT" | grep -qx '_public' && echo yes || echo no)"
+kill $PUBPIDS 2>/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 $PUBPIDS 2>/dev/null || break; sleep 0.1; done
+run "$BROWSER" served
+tn 'T45e once it stops, it is gone from `served`' '_public' "$OUT"
+
+# --- T45g the words ----------------------------------------------------------------------------
+tc 'T45g CHANGES.md names the pipe' '64 KB' "$(cat "$ROOT/CHANGES.md")"
+tc 'T45g CHANGES.md says served lists _public' '`served`' "$(cat "$ROOT/CHANGES.md")"
+tc 'T45g the README tells a timeout from an old daemon' 'was not answered' \
+   "$(tr -s ' \n' '  ' < "$ROOT/plugins/browser/README.md")"
+
+# ============ T46 a plain Enter in a composer with no form is a send
+#
+# Measured on Telegram Web, under send=ask: `fill` on the message composer, then
+# `press Enter`, delivered the message with no ask and exit 0. The composer is a
+# contenteditable with no <form> around it; a plain Enter asked _labelIn for the
+# form's submit button, got '' because there is no form, and '' classifies as
+# nothing. Ctrl/Cmd+Enter was already a send without a label; a formless plain
+# Enter on a composer now is too. Each arm is the mutant:
+#   T46a  the real stepRisk, on a DOM shim: a formless contenteditable, textarea,
+#         [role=textbox], a node inside a contenteditable, and a focused composer
+#         are all `send`, and the ask carries the message's first line
+#   T46b  ...a formless search box is not; Shift+Enter (a new line) is not; a
+#         composer INSIDE a form still follows that form's submit button
+#   T46c  MUTANT: the formless-composer branch removed — the composer runs, T46a red
+#   T46d  act, under careful: fill + press Enter on a formless composer exits 73 with
+#         a send ask, before the Enter reaches the page; the search box still runs
+#   T46e  the words
+T46="$TMP/t46"; mkdir -p "$T46"
+cat > "$T46/risk.js" <<'RISKJS'
+const aria = require(process.env.ARIA);
+// A node lists the simple selectors it matches, as in T43. `form` is the form it
+// sits in, or null; `ce` is isContentEditable (true inside a contenteditable).
+const sub = (label) => ({ getAttribute: (a) => (a === 'aria-label' ? label : null), innerText: label });
+const mkform = (label) => ({ querySelector: () => sub(label), querySelectorAll: () => [], getAttribute: () => null });
+const node = (m, p = {}) => ({ m, form: p.form || null, isContentEditable: !!p.ce, innerText: p.text || '', value: p.value,
+  getAttribute: () => null, closest: (q) => (p.form && /form/.test(q) ? p.form : null),
+  matches: (q) => q.split(',').map((x) => x.trim()).some((x) => m.includes(x)) });
+const composer = node(['div.input-message-input[contenteditable=true]', '[contenteditable=true]'], { ce: true, text: 'test' });
+const nodes = {
+  '#composer': composer,
+  '#search': node(['input[type=search]']),
+  '#textarea': node(['textarea'], { value: 'a note' }),
+  '#textbox': node(['[role=textbox]'], { text: 'hello' }),
+  '#inner': node(['p'], { ce: true, text: 'inside' }),
+  '#app': node(['div']),
+  '#formsearch': node(['[contenteditable=true]'], { ce: true, form: mkform('Search') }),
+  '#formsend': node(['textarea'], { form: mkform('Send') }),
+};
+const page = (active) => ({ evaluate: async (fn, arg) => {
+  global.document = { activeElement: active || null,
+    querySelector: (s) => nodes[s] || null,
+    querySelectorAll: (q) => { const qs = q.split(',').map((x) => x.trim());
+      return Object.values(nodes).filter((n) => !n.form && n.m.some((x) => qs.includes(x))); } };
+  return fn(arg);
+} });
+const cases = [
+  ['composer', 'Enter', '#composer', null], ['textarea', 'Enter', '#textarea', null],
+  ['textbox', 'Enter', '#textbox', null], ['inner', 'Enter', '#inner', null],
+  ['focused', 'Enter', null, composer], ['focused-app', 'Enter', '#app', composer],
+  ['search', 'Enter', '#search', null], ['shift', 'Shift+Enter', '#composer', null],
+  ['form-search', 'Enter', '#formsearch', null], ['form-send', 'Enter', '#formsend', null],
+  ['ctrl-search', 'Control+Enter', '#search', null],
+];
+(async () => {
+  const out = {};
+  for (const [name, key, sel, active] of cases) {
+    const r = await aria.stepRisk(page(active), { op: 'press', selector: sel || undefined, key }, sel);
+    out[name] = r ? { cls: r.cls, first_line: r.payload.first_line || null } : null;
+  }
+  console.log(JSON.stringify(out));
+})().catch((e) => { console.log(JSON.stringify({ error: String(e && e.message) })); });
+RISKJS
+OUT46="$(ARIA="$ROOT/plugins/browser/lib/aria.cjs" node "$T46/risk.js" 2>&1)"
+c46() { jq -r --arg k "$1" '.[$k] | if . == null then "runs" else .cls end' <<<"$OUT46" 2>&1; }
+
+# --- T46a a formless composer's Enter is a send ------------------------------------------------
+t  'T46a a plain Enter on a formless contenteditable composer is a send' 'send' "$(c46 composer)"
+t  'T46a ...and the ask carries the message the owner is asked about' 'test' \
+   "$(jq -r '.composer.first_line' <<<"$OUT46" 2>&1)"
+t  'T46a ...on a formless textarea too' 'send' "$(c46 textarea)"
+t  'T46a ...on a formless [role=textbox]' 'send' "$(c46 textbox)"
+t  'T46a ...on a node inside a contenteditable' 'send' "$(c46 inner)"
+t  'T46a ...with no selector, on the focused composer' 'send' "$(c46 focused)"
+t  'T46a ...and on a formless non-composer while a composer has focus' 'send' "$(c46 focused-app)"
+
+# --- T46b what keeps running ---------------------------------------------------------------------
+t  'T46b a plain Enter in a formless search box still runs without an ask' 'runs' "$(c46 search)"
+t  'T46b Shift+Enter in the composer is a new line, not a send' 'runs' "$(c46 shift)"
+t  'T46b a composer inside a form follows that form: Search runs' 'runs' "$(c46 form-search)"
+t  'T46b ...and Send is a send, as before' 'send' "$(c46 form-send)"
+t  'T46b (control) Ctrl+Enter is still a send anywhere' 'send' "$(c46 ctrl-search)"
+
+# --- T46c MUTANT: the formless-composer branch removed ----------------------------------------
+sed 's|    else if (/^Enter$/i.test(key)) {|    else if (false) {  // MUTANT (formless Enter)|' "$ROOT/plugins/browser/lib/aria.cjs" > "$T46/aria-mut.cjs"
+t  'T46c (anchor) the mutation landed in stepRisk' 1 "$(grep -c 'MUTANT (formless Enter)' "$T46/aria-mut.cjs")"
+OUT46M="$(ARIA="$T46/aria-mut.cjs" node "$T46/risk.js" 2>&1)"
+t  'T46c MUTANT (no formless branch): the composer'"'"'s Enter runs with no ask — T46a is red' 'null' \
+   "$(jq -c '.composer' <<<"$OUT46M" 2>&1)"
+
+# --- T46d act, end to end, under careful ------------------------------------------------------
+cp "$POL31" "$T46/policy.before" 2>/dev/null
+run actenv env -u SUDO_USER "$BROWSER" approvals policy set careful
+t  'T46d (setup) the owner sets careful' 0 "$RC"
+TGSTEPS='[{"op":"fill","selector":"div.input-message-input[contenteditable=true]","value":"test"},
+          {"op":"press","selector":"div.input-message-input[contenteditable=true]","key":"Enter"}]'
+: > "$PWREC"
+run actenv env PWCOMPOSER=1 "$BROWSER" act "https://chat-web.test/k/" --steps="$TGSTEPS" --out="$T46/d"
+t  'T46d fill + Enter in a formless composer stops with 73' 73 "$RC"
+tc 'T46d ...as a send' 'send a message' "$ERR"
+tc 'T46d ...with the ask to approve' 'sudo 5dive browser approve' "$ERR"
+t  'T46d ...BEFORE the Enter reached the page' 0 "$(jq -rs '[.[]|select(.call=="press")]|length' "$PWREC")"
+t  'T46d ...having asked the page whether it is a composer' 'yes' \
+   "$([[ "$(jq -rs '[.[]|select(.call=="composer")]|length' "$PWREC")" -ge 1 ]] && echo yes || echo no)"
+: > "$PWREC"
+run actenv "$BROWSER" act "https://chat-web.test/search" \
+    --steps='[{"op":"fill","selector":"input[type=search]","value":"hotels"},{"op":"press","selector":"input[type=search]","key":"Enter"}]'
+t  'T46d (control) Enter in a formless search box runs, with no ask' '0 1' \
+   "$RC $(jq -rs '[.[]|select(.call=="press")]|length' "$PWREC")"
+if [[ -s "$T46/policy.before" ]]; then cp "$T46/policy.before" "$POL31"; fi
+
+# --- T46e the words ----------------------------------------------------------------------------
+for f in plugins/browser/README.md plugins/browser/AGENTS.md plugins/browser/skills/use-browser/SKILL.md; do
+  tc "T46e $f says a plain Enter in a formless composer is a send" 'a plain Enter in a composer with no form around it' \
+     "$(tr -s ' \n' '  ' < "$ROOT/$f")"
+done
+tc 'T46e CHANGES.md carries the entry' 'DIVE-620' "$(cat "$ROOT/CHANGES.md")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
