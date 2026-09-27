@@ -112,6 +112,7 @@ const stepFailure = () => (stepsRun ? E_FAILED : E_NOTHING_RAN);
 const STEPS = {
   goto:     ['url'],
   fill:     ['selector', 'value'],
+  type:     ['selector', 'value'],
   click:    ['selector'],
   wait_for: ['selector'],
   select:   ['selector', 'value'],
@@ -183,6 +184,19 @@ function assertLease(where) {
 }
 
 function die(code, msg) { process.stderr.write(`${PROG}: ${msg}\n`); process.exit(code); }
+
+// A PIPE IS NOT A FILE (DIVE-4991). bin/browser reads what `tree` and `snapshot`
+// print through `$( … )`, and `process.exit` drops whatever that pipe has not taken
+// yet: the first 64 KB arrive and the rest never does (measured: 2 MB written,
+// 65536 bytes read). A real page's node list is past that, so a cold `read
+// --wait-for` got a cut payload, found no `wait_for` in it, and blamed "a session
+// daemon from before --wait-for existed" that was not in the path at all. The exit
+// waits for the write to be flushed — the rule the session daemon's client half
+// has followed since DIVE-4794.
+async function printAndExit(obj, code = 0) {
+  await new Promise((resolve) => process.stdout.write(JSON.stringify(obj) + '\n', resolve));
+  process.exit(code);
+}
 
 // {key} -> args.key, as a VALUE. A placeholder with no argument is a REFUSAL and
 // not a passthrough: the dual of this bug is already known on the verify side —
@@ -300,6 +314,7 @@ async function treeMode(plan) {
     die(E_NOTHING_RAN, 'tree needs an http(s) url to enumerate');
   }
   const ctx = await openProfile(profile);
+  let payload;
   try {
     const page = ctx.pages()[0] || await ctx.newPage();
     page.setDefaultTimeout(STEP_TIMEOUT);
@@ -311,13 +326,13 @@ async function treeMode(plan) {
     // domcontentloaded is what a tree needs and is bounded by construction.
     await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
     const { nodes } = await aria.walk(page, { interactiveOnly: !!plan.interactive });
-    process.stdout.write(JSON.stringify({ url: plan.url, nodes }) + '\n');
+    payload = { url: plan.url, nodes };
   } catch (e) {
     die(E_NOTHING_RAN, `could not enumerate ${plan.url}: ${e.message}`);
   } finally {
-    try { await ctx.close(); } catch (e) { /* the tree is already printed */ }
+    try { await ctx.close(); } catch (e) { /* the tree is already walked */ }
   }
-  process.exit(0);
+  await printAndExit(payload);
 }
 
 // `snapshot` — ONE browser, ONE navigation, ONE page-side read (DIVE-4653).
@@ -381,8 +396,7 @@ async function snapshotMode(plan) {
   } finally {
     try { await ctx.close(); } catch (e) { /* the capture is already on disk */ }
   }
-  process.stdout.write(JSON.stringify(payload) + '\n');
-  process.exit(0);
+  await printAndExit(payload);
 }
 
 // `act`'s re-read (DIVE-4943): the page as the steps left it, to the files
@@ -471,6 +485,18 @@ async function main() {
       out[field] = field === 'selector' || plan.literal ? s[field]
         : interp(s[field], args, `step ${i + 1} (${s.op})`, field === 'url' ? encodeURIComponent : null);
     }
+    // `type`'s one optional knob, a number and never an argument, and its value with
+    // the arguments in: checked here with the rest, so a bad one refuses before the
+    // browser opens (lib/aria.cjs).
+    if (s.op === 'type') {
+      const why = aria.typeRefusal(s.delay_ms, out.value);
+      if (why) die(E_NOTHING_RAN, `step ${i + 1} (type) ${why}`);
+      out.delay_ms = aria.typeDelay(s.delay_ms);
+    }
+    // `intent`: what a step is for, in words, read only when its ref matches
+    // nothing (lib/aria.cjs resolveOrRepick). Never interpolated, for the reason a
+    // selector is not: it steers which element gets picked.
+    if (typeof s.intent === 'string' && s.intent) out.intent = s.intent;
     return out;
   });
 
@@ -487,13 +513,14 @@ async function main() {
   // where a second caller cannot get a laxer one.
   const ctx = await openProfile(profile);
 
-  let rc = 0, needsOwner = null, page = null;
+  let rc = 0, needsOwner = null, page = null, retry = null, acted = false, redirected = false, at = -1;
   try {
     page = ctx.pages()[0] || await ctx.newPage();
     page.setDefaultTimeout(STEP_TIMEOUT);
     for (let i = 0; i < resolved.length; i++) {
       const s = resolved[i];
       const where = `step ${i + 1} (${s.op})`;
+      at = i;
       // RESOLVE BEFORE THE COUNTER, deliberately. Turning `ref=button/Send` into
       // a selector is a page.evaluate that reads the document and changes
       // nothing, so a ref that matches nothing performed no part of the action —
@@ -506,7 +533,12 @@ async function main() {
       // A ref `wait_for` WAITS, like its CSS twin always did (DIVE-4674). The
       // choice of which ops wait lives in lib/aria.cjs, shared by this loop and
       // the other one, because the defect was that there are two of them.
-      const sel = await aria.resolveStepSelector(page, s, { timeoutMs: STEP_TIMEOUT });
+      // A ref that matches nothing gets ONE retry on a picked element, never for a
+      // step that pays, posts, sends or deletes (lib/aria.cjs resolveOrRepick).
+      // The pick can take reflex seconds, so the lease is read again before a retry.
+      const { sel, retry: r } = await aria.resolveOrRepick(page, s, i + 1, { timeoutMs: STEP_TIMEOUT });
+      if (r) assertLease(where);
+      retry = r;
       // THE OWNER'S FOUR (DIVE-4943), checked on the live element BEFORE the
       // counter: a refused step was not entered, so a refusal on step one is
       // still "nothing ran". Only `act` sets guard; an adapter recipe is a
@@ -523,20 +555,35 @@ async function main() {
         }
       }
       stepsRun++;  // entered, not completed — see stepsRun above
+      if (s.op !== 'goto') acted = true;
       switch (s.op) {
         case 'goto':
           await page.goto(s.url, { waitUntil: 'domcontentloaded' });
           if (RUN_SETTLE_MS > 0) await page.waitForTimeout(RUN_SETTLE_MS);
           break;
         case 'fill':     await page.fill(sel, s.value); break;
+        case 'type':     await aria.typeKeys(page, sel, s.value, s.delay_ms, { timeoutMs: STEP_TIMEOUT }); break;
         case 'click':    await page.click(sel); break;
         case 'wait_for': await page.waitForSelector(sel); break;
         case 'select':   await page.selectOption(sel, s.value); break;
         case 'upload':   await page.setInputFiles(sel, s.path); break;
         case 'press':    await page.press(sel, s.key); break;
       }
+      if (retry) process.stderr.write(`  ${retry}ok\n`);
+      retry = null;
       process.stderr.write(`  ${where} ok\n`);
+      // WHERE THE GOTO LANDED (DIVE-4991), said every time. While nothing but a
+      // goto has run, a redirect stops this cold run here and bin/browser runs the
+      // whole plan once more in the served browser; after a click, never.
+      if (s.op === 'goto' && plan.landing) {
+        const land = await aria.checkLanding(page, s.url, plan.landing, { mayRetry: !acted });
+        if (land.line) process.stderr.write(land.line + '\n');
+        if (land.loginWall) throw new Error(`${where}: ${land.loginWall}`);
+        if (land.retry) { redirected = true; break; }
+      }
     }
+    at = -1;   // every step returned: whatever throws now is not a step's failure
+    if (redirected) rc = aria.E_REDIRECTED;
     if (needsOwner) {
       process.stderr.write(aria.NEEDS_OWNER_PREFIX + JSON.stringify(needsOwner) + '\n');
       rc = aria.E_NEEDS_OWNER;
@@ -547,7 +594,11 @@ async function main() {
     // re-reads the artifact by a different path whatever this exits, because
     // "failed" here and "published" are not mutually exclusive — that is the
     // case that double-posts on a blind retry.
+    if (retry) process.stderr.write(`  ${retry}failed\n`);
     process.stderr.write(`${PROG}: ${e.message}\n`);
+    // WHICH STEP (DIVE-4990), as a line bin/browser reads: a failed step fails
+    // `act` whatever its --expect matched, and the failure names the step.
+    if (at >= 0) process.stderr.write(aria.STEP_FAILED_PREFIX + JSON.stringify(aria.failedStep(at + 1, resolved[at], e)) + '\n');
     rc = stepFailure();
     if (rc === E_NOTHING_RAN) {
       process.stderr.write(`${PROG}: the browser opened but not one step ran, so nothing was ` +

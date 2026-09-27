@@ -25,8 +25,12 @@ repo — and that is the `connect-site` skill, not this one.
    a loading screen first: add `--wait-for='[role=main]'` (or `text=<words>` the loaded page
    has). **Exit 76 is not the page** — a loading screen or a `--wait-for` that never came; run it
    again with a `--wait-for`, and do not ask anyone to log in.
-2. **Act** on those refs. Steps are `goto fill click wait_for select press`, run in order, in
-   one tab under one lease. Without a URL, `act` continues on the page a served browser holds.
+2. **Act** on those refs. Steps are `goto fill type click wait_for select press`, run in order,
+   in one tab under one lease. Without a URL, `act` continues on the page a served browser holds.
+   Use `type` for search boxes and autocompletes that react to keystrokes, and `fill` for plain
+   inputs: `fill` sets the value with no key presses, so a suggestion list never opens. `type`
+   goes key by key (`"delay_ms"`, default 50); pick the suggestion with a `wait_for` and a
+   `click`.
 3. **Verify.** `--expect=<regex>` grades the page as the steps left it, re-read for up to 5 s so
    a toast counts. Without it, `act` only says the steps ran — open the `page.png` it wrote
    before you tell anyone it worked.
@@ -53,8 +57,17 @@ and the refusal names both. **Ask the owner which one, never guess**, then name 
 
 ## Paying, posting, sending and deleting are the owner's call
 
-`act` stops in front of any such button (read off the live page, whatever selector you used;
-Ctrl/Cmd+Enter counts as send) and exits **73** with the ask, a screenshot and an approval id.
+**The owner's default is yolo** (DIVE-5006): `act` runs pay, post, send and delete steps without
+stopping, says `ALLOWED (default yolo)`, and logs each one for the owner with what it sent and a
+screenshot. `5dive browser approvals policy` shows the policy and its `mode` (`yolo`, `careful`
+or `custom`). Changing it is the owner's, not yours:
+`sudo 5dive browser approvals policy set careful` restores the stop for all four,
+`set <kind>=ask|allow` changes one kind, and from your seat both are refused.
+
+Where a kind is `ask` (the owner chose `careful`, or that kind), `act` stops in front of any such
+button (read off the live page, whatever selector you used; Ctrl/Cmd+Enter counts as send, and so
+does a plain Enter in a composer with no form around it, which is how a chat box sends) and
+exits **73** with the ask, a screenshot and an approval id.
 
 - Relay the ask to the owner **with the screenshot**, in plain words: what will be bought,
   posted, sent or deleted, and where.
@@ -64,9 +77,7 @@ Ctrl/Cmd+Enter counts as send) and exits **73** with the ask, a screenshot and a
   or their dashboard runs, or their Approve button on Telegram — not you (from a seat it is
   refused). Then re-run the SAME act with `--approved=<id>`. A yes covers exactly those steps,
   once, for 30 minutes.
-- `5dive browser approvals policy` shows the owner's standing answer per kind. `allow` means that
-  kind runs without stopping; it is still logged for the owner.
 - **Do not rephrase the steps to get around the stop.** A button renamed is still an order
   placed. The check reads literal button labels, so a purchase behind a button labelled
-  "Continue" is not caught by it — that one is on you: if a step will pay, post, send or delete,
-  ask first even when `act` does not stop you.
+  "Continue" is not caught by it — under `careful` that one is on you: if a step will pay, post,
+  send or delete, ask first even when `act` does not stop you.

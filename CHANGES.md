@@ -1,5 +1,295 @@
 ## Unreleased
 
+### Changed — the registry copy catches up ten releases, to browser 1.22.5: a signed-out Telegram Web profile stops reading `authenticated` (DIVE-4998), approvals default to yolo (DIVE-5006), and a formless Enter is a send (DIVE-620)
+
+`plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.22.5 (6b1f1d5), byte for byte. The last mirror
+was 1.17.0 (DIVE-4997), so every box keyed `browser@5dive-plugins` was missing 1.18.0 through 1.22.5.
+The one that matters most is 1.22.3: the `web.telegram.org` login marker matched inside
+`chatlist-container` on the signed-out page, so `status` read a signed-out profile as authenticated.
+`tests/browser_plugin_unit.sh` carries upstream's arms from 1.17.0 to 1.22.5, with `browser/` read as
+`plugins/browser/`. Upstream's entries for the ten releases follow, unedited apart from the heading level.
+
+#### Fixed — a plain Enter in a chat composer with no form is a send, and asks under `careful` (DIVE-620), browser 1.22.5
+
+**Before:** under `send=ask`, on Telegram Web, `act` with `fill` on the message composer
+(`div.input-message-input[contenteditable=true]`) and then `press Enter` delivered the message:
+`step 2 (press) ok`, `verified`, exit 0, and no ask. `stepRisk` read a plain Enter as "submit the
+element's form" and looked for that form's submit button. A chat composer is a `contenteditable`
+with no `<form>` around it, so the label was `''`, `''` classifies as nothing, and the step ran.
+Ctrl/Cmd+Enter was already a send without a label; a plain Enter was not.
+
+**Now:** a plain Enter whose target has no form is `send`, without reading a label, when the
+target is a composer: `contenteditable`, `textarea` or `[role=textbox]`. When the target is not a
+composer, the focused element is checked the same way. Under `careful` the step stops with exit 73
+and a send ask that carries the message's first line. What keeps running with no ask: a plain Enter
+in a formless search box (`input[type=search]`, a plain text input), Shift+Enter (a composer's new
+line), and a composer inside a form, which still follows that form's submit button.
+
+#### Fixed — a `--wait-for` timeout reads as a timeout, and `served` lists the public browser (DIVE-4991), browser 1.22.4
+
+**Before:** a cold `read --wait-for` (nothing served) on a real page said `--wait-for was not
+honoured: the served browser for this profile runs a session daemon from before --wait-for
+existed … Restart it`, whether the element timed out or arrived. No daemon was in the path. The
+executor printed its reply and called `process.exit`, and `read` takes that reply through a pipe,
+which carries the first 64 KB and drops the rest. A real page's node list is past 64 KB, so the
+JSON arrived cut, no `wait_for` could be read from it, and the only branch for a missing
+`wait_for` was the old-daemon one. Restarting changed nothing. Separately, `5dive browser served`
+printed nothing while a `_public` browser ran, although `serve _public --stop` found it and
+stopped it.
+
+**Now:** the executor waits until its reply has been flushed before it exits, for `tree` and
+`snapshot` alike, so the reply arrives whole at any size. A timeout says
+`--wait-for=<target> did not appear within <ms> ms` (76). A daemon with no `wait_for` in its reply
+is still named as the old daemon, with the restart (76). A cold capture with no verdict says the
+`--wait-for` *was not answered*, names the capture, and blames no daemon (76). `served` lists
+`_public` while it runs; `ls`, `status` and `probe-all` still skip it, because it is not a login.
+
+#### Fixed — a signed-out Telegram Web profile no longer probes `authenticated` (DIVE-4998), browser 1.22.3
+
+**Before:** the `web.telegram.org` adapter's logged-in marker was `class="[^"]*chatlist`. The K
+app's signed-out render now carries `class="tabs-tab chatlist-container sidebar …"`, and
+`[^"]*chatlist` matches the `chatlist` inside `chatlist-container`. So `status web.telegram.org`
+read a signed-out profile as `authenticated` on the first poll, and every acting verb then ran on a
+dead session.
+
+**Now:** the marker is `class="([^"]* )?chatlist[ "]`: `chatlist` as a whole class name, at the
+start of the attribute or after a space, and followed by a space or the closing quote. On the
+2026-09-25 renders it matched 0 on both signed-out renders, the cold render and the curl'd shell, and
+1 on the live signed-in render (`class="chatlist virtual-chatlist"`). A signed-out profile whose
+page shows neither marker now reads `UNKNOWN`, and the acting verbs refuse it. The README's
+shipped-adapter row carries the new marker. The adapter's `_comment` drops its 2026-09-21 "0 on a
+logged-out render" note, which no longer holds, and names three fallback markers that measured the
+same way: `id=folders-sidebar`, `id=new-menu` and `id=folders-tabs`.
+
+#### Fixed — a send's ask lists each recipient once, as the chip's address, browser 1.22.2
+
+**Before:** the ask for a one-recipient Gmail send read `to user@example.comLoading...,
+user@example.com`. Recipients were read from every chip and every To/Cc/Bcc field, and a field
+with no `email` attribute was read by its text. Gmail's To field is such a field, and its text is
+the chip's glued to the hover card's. No address pattern can split `com` from `comLoading`, and the
+chip's clean copy was kept beside it, so the owner was asked to approve a send to an address that
+does not exist.
+
+**Now:** when the form holds any `[email]` node (a recipient chip), the recipients are those
+attributes and the fields' input values only; a field's text is read only on a page with no
+`[email]` node at all. The same send asks for `to user@example.com`.
+
+#### Fixed — a step that fails fails `act`, whatever `--expect` matched, and the failure names the step (DIVE-4990), browser 1.22.1
+
+**Before:** `act --expect` was graded on the page alone. Measured at 1.13.0 on booking.com: step 2,
+`click ref=button/Decline`, failed with "matches nothing on this page", and the run printed
+`verified: the page after the steps matches --expect` and exited 0, because the expected text was
+on the page before any step ran. `--json` said `"verdict":"verified"` next to a non-zero
+`executor_rc`. Without `--expect`, the failure read "a step failed (the executor exited 1)" and did
+not say which step.
+
+**Now:** a step that fails fails the run, whatever --expect matched. The order is `step_failed` >
+`not_ready` > `not_verified` > `verified`; `verified` needs the executor's exit 0 and the match.
+The failure names the step:
+
+```
+act: step 2 (click ref=button/Decline) failed: ref=button/Decline matches nothing on this page — the run is NOT verified, whatever --expect matched. Some steps may have run; look at …/page.png before retrying.
+```
+
+- `--json` adds `failed_step: {index, op, selector, error}` (null unless the verdict is
+  `step_failed`); `selector` is null for a `goto`.
+- Both step loops (the cold `driver-playwright` and the warm `session-daemon`) print the failed
+  step as one `5dive-step-failed: {…}` line on stderr, from `lib/aria.cjs`.
+- `run` is unchanged: its verify is an out-of-band re-read of a different URL, and a red executor
+  with a live artifact reads verified there by design — a failure there is what double-posts on a
+  retry.
+
+#### Added — a redirected landing is said, and a cold run is retried once in the served browser (DIVE-4991), browser 1.22.0
+
+**Before:** a cold `act` or `run` that the site redirected said nothing about it. Measured
+2026-09-26 on booking.com: three different search URLs, one copied from a real browser with
+`dest_id`, `label` and `ac_meta`, landed on `https://www.booking.com/city/pt/lisbon.html`; the
+next `wait_for [data-testid=property-card]` failed with "a step failed (the executor exited 1)",
+and nothing said a redirect had happened. A fourth landed on `searchresults.html?nflt=…` with the
+dates and `ss` dropped. The same URLs after `serve booking.com` landed on the results (477
+properties found).
+
+**Now:** after every `goto` (the `act` URL included) both executors compare the URL asked for with
+the one the page is on, and a redirect prints:
+
+```
+redirected: https://www.booking.com/searchresults.html?ss=Lisbon&… → https://www.booking.com/city/pt/lisbon.html (path /searchresults.html became /city/pt/lisbon.html); retrying once in the served browser
+```
+
+- A redirect is a changed path, or more than half of the requested query keys missing. A moved
+  fragment, a trailing slash, or the same path with params only added is not one.
+- On the cold executor, while nothing but a `goto` has run, the run stops there and `act` or `run`
+  takes the whole step list once through the served browser: served if nothing was, and stopped
+  afterwards only if this run started it. That run's result is the verdict. Never twice.
+- After a click, fill or any other step, the line alone, and nothing is replayed. The served
+  executor prints the line and has nothing to retry in. No session daemon or no Xvfb on the box
+  (or `FIVEDIVE_BROWSER_NO_DAEMON=1`): the line alone. A served browser that will not start: the
+  run stops at the redirect and says why.
+- Optional, where reflex is configured: `5dive reflex landing <site> --state=<file> --json` is
+  asked whether the landing answered the request (requested and landed URL, title, at most 300
+  characters of visible text — page text leaves the box only under that opt-in). `generic_page`
+  or `bot_block` is a redirect, `login_wall` fails with `log in first: 5dive browser auth <site>`,
+  `answered` at 0.9 or more overrides a base redirect, and an error leaves the base verdict.
+  `FIVEDIVE_BROWSER_REFLEX_TIMEOUT_MS` bounds it (default 60000). With no reflex nothing is asked.
+  The 5dive CLI has no `reflex landing` verb yet; until it ships, the call errors and the URLs
+  decide, so this tier changes nothing today.
+- Harness T41: a changed path retried once in a served browser the run starts and stops (`act`);
+  dropped keys retried (`run`); added params, a moved fragment, a trailing slash and exactly half
+  the keys not; no replay after a click; reflex's login_wall (cold and warm), answered over and under 0.9,
+  generic_page, and an error; no reflex, no served browser, a served browser that will not start; one retry when the served run
+  is redirected too; the landing check removed from both loops as the mutant.
+
+#### Added — a step whose ref matches nothing is retried once, on the element reflex or a name match picks, browser 1.21.0
+
+**Before:** a step whose `ref=` matched nothing failed with `ref=… matches nothing on this page`,
+and the agent had to snapshot, read the refs and send the whole `act` again. Measured on a hotel
+site: step 2, `click ref=button/Decline`, failed while the consent banner's button was on the page
+under another accessible name. `5dive reflex pick-ref` could already pick a step's element off a
+page tree, and nothing in the browser called it.
+
+**Now:** a step whose ref matches nothing is retried once, on the element reflex picks at
+confidence 0.9 or more, and the output says so:
+
+```
+  step 2: ref=button/Decline matched nothing; reflex picked ref=button/Decline all (conf 0.99); retried: ok
+```
+
+- `click`, `fill`, `type`, `select`, `press`, `wait_for` and `upload`, in both executors (a cold
+  `act`/`run` and a served browser). pick-ref gets the page's interactive refs, the op (`fill` for
+  a `type`), and what the step is for: a new optional step field, `"intent"`, or else the ref's
+  role and name (`button named Decline`). A value goes as `{value}`: pick-ref never shows the model
+  the value, and a command line is readable by every seat on the box.
+- Reflex answering `none`, or under 0.9, is an answer: no retry, and the failure names it
+  (`Reflex suggested ref=… at confidence 0.62, under 0.9, so it was not retried.`).
+- Without reflex, or when reflex errors: the ONE element of the same role whose accessible name
+  equals the ref's ignoring case and outer whitespace, contains it, or is contained in it
+  (`name match picked ref=…`). Two such elements, or none, and the step fails exactly as before.
+- A step that pays, posts, sends or deletes is never retargeted: read from the ref's own name, the
+  picked element's live label and pick-ref's `review_required`. The owner's yes, and the policy
+  that lets a kind through, cover the step as written. It fails as before and names the suggestion.
+- One retry per step, and only for a `ref=` miss: a CSS selector that matches nothing still times
+  out. A first-step miss that is not retried is still "nothing ran" (70).
+- Reflex is reached as `propose` reaches it: `_reflex_cli` now looks for the verb's own grant,
+  `sudo -n /usr/local/bin/5dive reflex pick-ref`, and uses the plain CLI without it. The standard
+  seat sudoers of 5dive 0.54.0 grants no `5dive reflex` verb (not `login-marker` either), so on
+  such a seat the root-only key is unreadable and the name match decides; the grant is 5dive's.
+- Harness: T40 (reflex's pick retried, cold and warm; the four never retargeted by name, label,
+  `review_required` and name match; under 0.9 and `none`; no pick-ref call without reflex; one
+  retry; the name match with one, two and no candidates; the retry removed as the mutant).
+
+#### Added — a booking.com adapter (a login probe and two dated searches) and google.com's login probe, browser 1.20.0
+
+**Before:** no booking.com adapter shipped, and the shipped google.com adapter had no `probe`.
+`status booking.com` and `status google.com` read `UNKNOWN` whether the profile was logged in or
+not, so `run` refused on both — `run google.com send` included, until someone wrote a probe into
+the seat's `.adapters/` — and a dated hotel search meant writing an adapter by hand.
+
+**Now:** `status booking.com` and `status google.com` read `session expired — human action
+required` (exit 75) on a logged-out profile and `authenticated` on a logged-in one, so `run
+google.com send` works on a logged-in box with nothing written by hand. booking.com also ships two
+actions that search by date:
+
+```bash
+5dive browser serve booking.com
+5dive browser run booking.com hotels --city=Lisbon --checkin=2026-10-14 --checkout=2026-10-15 \
+                                     --adults=2 --rooms=1 --max_eur=120
+# -> step 1 (goto) ok / step 2 (wait_for) ok, then NOT VERIFIED (exit 1, see below);
+#    the result page lists the hotels, cheapest first
+```
+
+- `search`: every property type under `--max_eur` per stay, cheapest first. `hotels`: the same,
+  hotels only (`ht_id=204`) rated 8+ (`review_score=80`). Both take `--city --checkin --checkout
+  --adults --rooms --max_eur`, dates YYYY-MM-DD; `--city` is the name as a person types it, no
+  dest_id needed.
+- Run `5dive browser serve booking.com` first. A cold `act` or `run` of any results URL, even one
+  copied from a real browser, is redirected to an undated city page; the same URL through the
+  served browser returns the dated results. Measured 2026-09-26: `ss=Lisbon` alone, 477 properties
+  found; `hotels` for Lisbon 14–15 Oct, 2 adults, at most 120: 25 hotels, the cheapest EUR 95.
+- Expect NOT VERIFIED. The verify is a public fetch of the results URL, and Booking answers a
+  public fetch with a different page, so it cannot re-read the results. Read the result page.
+- Both probes were measured on both halves, and both markers are regexes (`grep -iE` cold,
+  `RegExp` in the served browser):
+  - booking.com probes `/` for `data-testid=["']?auth-link-in-view`: 1 match in each of two
+    logged-out renders, 0 logged in. Not the Sign in link's href,
+    `account.booking.com/auth/oauth2?client_id=`: as a regex `2?` is an optional 2, it matched 0
+    logged-out renders, and every logged-out profile would have read `authenticated`.
+  - google.com probes `https://accounts.google.com/signin/v2/identifier` for its title,
+    `<title>Sign in - Google Accounts</title>`: 1 match logged out, 0 logged in. Not
+    `myaccount.google.com`: logged out, that is a marketing page with 0 matches.
+- A seat file of the same name in `.adapters/` still wins over the shipped one.
+- Harness: T39 (both files, both markers as regexes against both halves, `status` through the real
+  probe, the tree before this change as the mutant); T35g now runs the shipped google.com file on a
+  logged-out profile.
+
+#### Added — a `type` step: key by key, for search boxes and autocompletes that open on keystrokes, browser 1.19.0
+
+**Before:** `act` and `run` could only `fill` a text box, and `fill` puts the value in with one
+input event and no key presses. A search box whose suggestion list opens on typed keys never
+opened. Measured on a live hotel search with nothing connected, at 1.18.0: `fill` "Lisbon" and
+then Search went to the results for an empty city ("0 properties found"); `fill` "Lisbo",
+`press` "n" and a `wait_for` the suggestion timed out after 30 s.
+
+**Now:** a `type` step clears the field, as `fill` does, and types the value one key at a time,
+so the suggestion list opens and a `wait_for` and a `click` pick from it:
+
+```bash
+5dive browser act <url> --steps='[{"op":"type","selector":"ref=textbox/Where to?","value":"Lisbon"},
+                                  {"op":"wait_for","selector":"text=Lisbon, Portugal"}]'
+```
+
+- Use `type` for search boxes and autocompletes that react to keystrokes, and `fill` for plain
+  inputs.
+- `{"op":"type","selector":…,"value":…}` takes an optional **`delay_ms`** between keys: whole
+  milliseconds, default 50, at most 1000. Anything else is refused before the browser opens
+  (69: nothing ran).
+- `act` and adapter steps both take it: the vocabularies are now
+  `goto fill type click wait_for select press` and, for an adapter,
+  `goto fill type click wait_for select upload press`. Its value takes `{key}` arguments exactly
+  as `fill` does, and a missing one is refused the same way.
+- It is not one of the owner's four: typing runs without asking, under `careful` too. The click
+  that sends is still the step that asks.
+- A line break in a `type` value is refused before the browser opens (69: nothing ran), from a
+  `{key}` argument too: typed, it is the Enter key, which sends the form without the owner's
+  policy reading it. Press Enter as its own step.
+- The step's bound is the step timeout plus the typing time, so a long value is not cut off
+  half-typed.
+- Both step loops (`driver-playwright`, `session-daemon`) run it through one function in
+  `lib/aria.cjs` (`typeKeys`, `locator.pressSequentially`).
+- Harness: T38 (a stub search box whose suggestions open only on keydown: `type` opens it and
+  `fill` does not, cold and warm; `type` in `act`, on a ref, and in an adapter step; `{key}`;
+  `delay_ms`; not one of the owner's four; a line break refused, cold and warm; a mutant that
+  maps `type` to `page.fill` in both executors and goes red).
+
+#### Changed — approvals default to yolo: pay, publish, send and delete run and are logged; presets `yolo`/`careful`, a `mode` field (DIVE-5006), browser 1.18.0
+
+**Before:** every pay, publish, send and delete step stopped in front of the button with exit 73
+until the owner said yes. Measured on a box at 1.17.0: an owner with no dashboard and no shell
+could not approve, could not relax the policy, and every send stopped dead.
+
+**Now:** on a box with no policy file, all four run. Each step is still written down in the seat's
+`allowed.jsonl` with its payload and the act's screenshot, as `allowed_by: "default"`, and the
+agent's stderr says `ALLOWED (default yolo): <kind>, step N, …`. `run google.com send` sends and is
+verified in Sent without an approval id.
+
+- **`sudo 5dive browser approvals policy set careful`** puts the stop back for all four (exit 73,
+  the ask, the owner's `approve`, exactly as before). **`set yolo`** makes all four allow again.
+  **`set <kind>=ask|allow`** still changes one kind, on top of either preset.
+- **`5dive browser approvals policy --json`** (and `FIVEDIVE_JSON_MODE=1`) adds `"mode"`: `yolo`
+  (all four allow), `careful` (all four ask) or `custom`, computed from the four, never stored. The
+  text form prints a `mode` line.
+- Only the owner changes it: a seat's `set yolo`, `set careful` or `set <kind>=…` is refused (77)
+  and writes nothing. A policy file the granting uid does not own is ignored and the default
+  applies, so a seat can neither loosen nor tighten it. A kind the file leaves out, or gives any
+  value other than `ask` or `allow`, is the default too.
+- A policy file written by 1.17.0 keeps what it says: an owner who ran `set send=allow` there has a
+  file with the other three at `ask`, and keeps them until they `set yolo`.
+- A preset or `<kind>=…` without `set` is now a usage error (64) rather than a silent read.
+- The step loops (`driver-playwright`, `session-daemon`) are unchanged: both already run whatever
+  `allow_kinds` the front door sends, and the front door now sends all four by default.
+- Harness: T37 (no-file default for `act` cold and warm and for `run google.com send`, `careful`,
+  `mode`, the seat refusals, and a mutant that restores the `ask` default); the arms that grade
+  the stop (T32e, T32h, T35, T36) now run under `careful`.
+
 ### Added — the registry copy carries reflex-drafted login checks the owner approves, and adapter drift, at browser 1.17.0 (DIVE-4997)
 
 `plugins/browser` mirrors 5dive-ai/5dive-browser at 1.17.0 byte for byte. A login with no adapter gets

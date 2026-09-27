@@ -113,6 +113,7 @@ function seatOfUid(uid) {
 const STEPS = {
   goto:     ['url'],
   fill:     ['selector', 'value'],
+  type:     ['selector', 'value'],
   click:    ['selector'],
   wait_for: ['selector'],
   select:   ['selector', 'value'],
@@ -746,6 +747,14 @@ async function planRequest(ctx, req, send, end) {
         out[field] = field === 'selector' || req.literal ? s[field]
           : interpOrThrow(s[field], args, `step ${i + 1} (${s.op})`, field === 'url' ? encodeURIComponent : null);
       }
+      // `type`'s delay_ms and value, checked with the rest, as the one-shot driver does.
+      if (s.op === 'type') {
+        const why = aria.typeRefusal(s.delay_ms, out.value);
+        if (why) { const e = new Error(`step ${i + 1} (type) ${why}`); e.nothingRan = true; throw e; }
+        out.delay_ms = aria.typeDelay(s.delay_ms);
+      }
+      // `intent`, as the one-shot driver keeps it: never interpolated.
+      if (typeof s.intent === 'string' && s.intent) out.intent = s.intent;
       return out;
     });
   } catch (e) {
@@ -756,7 +765,7 @@ async function planRequest(ctx, req, send, end) {
   // that throws may already have navigated, a click may already have posted. The
   // expensive direction is claiming nothing ran when something did — that is the
   // blind retry that double-posts.
-  let stepsRun = 0, needsOwner = null;
+  let stepsRun = 0, needsOwner = null, retry = null, at = -1;
   let page;
   try { page = await pageOf(ctx); }
   catch (e) {
@@ -768,13 +777,18 @@ async function planRequest(ctx, req, send, end) {
     for (let i = 0; i < resolved.length; i++) {
       const s = resolved[i];
       const where = `step ${i + 1} (${s.op})`;
+      at = i;
       // BEFORE THE RESOLVE AND BEFORE THE COUNTER. Both touch the page, and the
       // point is to touch nothing once the browser is someone else's.
       assertLease(req, where);
       // A ref `wait_for` WAITS, like its CSS twin always did (DIVE-4674). The
       // choice of which ops wait lives in lib/aria.cjs, shared by this loop and
       // the other one, because the defect was that there are two of them.
-      const sel = await aria.resolveStepSelector(page, s, { timeoutMs: STEP_TIMEOUT });
+      // One retry on a picked element when a ref matches nothing — the same call
+      // as the one-shot driver's loop (lib/aria.cjs resolveOrRepick).
+      const { sel, retry: r } = await aria.resolveOrRepick(page, s, i + 1, { timeoutMs: STEP_TIMEOUT });
+      if (r) assertLease(req, where);
+      retry = r;
       // THE OWNER'S FOUR (DIVE-4943) — the same check, in the same place, as the
       // one-shot driver's loop; lib/aria.cjs holds it so the two cannot differ.
       if (req.guard && !req.approved) {
@@ -793,16 +807,30 @@ async function planRequest(ctx, req, send, end) {
           break;
         }
         case 'fill':     await page.fill(sel, s.value); break;
+        case 'type':     await aria.typeKeys(page, sel, s.value, s.delay_ms, { timeoutMs: STEP_TIMEOUT }); break;
         case 'click':    await page.click(sel); break;
         case 'wait_for': await page.waitForSelector(sel); break;
         case 'select':   await page.selectOption(sel, s.value); break;
         case 'upload':   await page.setInputFiles(sel, s.path); break;
         case 'press':    await page.press(sel, s.key); break;
       }
+      if (retry) send({ t: 'log', line: `  ${retry}ok` });
+      retry = null;
       send({ t: 'log', line: `  ${where} ok` });
+      // WHERE THE GOTO LANDED (DIVE-4991), said every time, exactly as the cold
+      // driver says it. This IS the served browser, so there is nothing to retry in.
+      if (s.op === 'goto' && req.landing) {
+        const land = await aria.checkLanding(page, s.url, req.landing);
+        if (land.line) send({ t: 'log', line: land.line });
+        if (land.loginWall) throw new Error(`${where}: ${land.loginWall}`);
+      }
     }
+    at = -1;
   } catch (e) {
+    if (retry) send({ t: 'log', line: `  ${retry}failed` });
     send({ t: 'err', msg: e.message });
+    // Which step (DIVE-4990), exactly as the one-shot driver says it.
+    if (at >= 0) send({ t: 'err', msg: aria.STEP_FAILED_PREFIX.trim() + ' ' + JSON.stringify(aria.failedStep(at + 1, resolved[at], e)) });
     if (!stepsRun) {
       send({ t: 'err', msg: 'the session was open but not one step ran, so nothing was published and ' +
         'there is nothing to re-read.' });

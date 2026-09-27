@@ -1,0 +1,44 @@
+{
+  "_comment": "MEASURED, NOT GUESSED, on BOTH halves — 2026-09-26, browser 1.18.0, on a box with a booking.com login. The marker is data-testid=\"auth-link-in-view\", `5dive reflex login-marker`'s top pick: `5dive browser capture booking.com` matched it once in each of two logged-out renders and 0 times in the logged-in render, where the header shows 'Your account' + Genius level instead, and `status booking.com` read authenticated with this file installed. THE MARKER IS A REGEX (grep -iE here, RegExp in the served browser). The first draft used the link's href as it was counted, account.booking.com/auth/oauth2?client_id= : as a regex `2?` is an optional 2, so it matched 0 of the 2 logged-out captures and would have stamped every logged-out profile authenticated. A plain fetch of the home page is a 202 with an empty body, so the marker cannot be read off curl. SEARCH NEEDS THE SERVED BROWSER: a cold act/run of any searchresults URL (even one copied from a real browser) is redirected to the undated /city/pt/lisbon.html SEO page; the same URL through `serve booking.com` returns the dated results. ss=<city name> is enough, no dest_id needed (477 results for Lisbon 14-15 Oct).",
+  "site": "booking.com",
+  "probe": {
+    "url": "https://www.booking.com/",
+    "logged_out_when_dom_matches": "data-testid=[\"']?auth-link-in-view"
+  },
+  "actions": {
+    "search": {
+      "_comment": "Dated search, every property type, under {max_eur} per stay, cheapest first. Run `serve booking.com` first (see the top comment). Dates are YYYY-MM-DD. The verify block cannot re-read the results (Booking serves a public curl a different page), so expect NOT VERIFIED and read the result page instead.",
+      "steps": [
+        {
+          "op": "goto",
+          "url": "https://www.booking.com/searchresults.html?ss={city}&checkin={checkin}&checkout={checkout}&group_adults={adults}&no_rooms={rooms}&group_children=0&lang=en-us&selected_currency=EUR&nflt=price%3DEUR-min-{max_eur}-1&order=price"
+        },
+        {
+          "op": "wait_for",
+          "selector": "[data-testid=property-card]"
+        }
+      ],
+      "verify": {
+        "url": "https://www.booking.com/searchresults.html?ss={city}&checkin={checkin}&checkout={checkout}",
+        "expect": "properties found"
+      }
+    },
+    "hotels": {
+      "_comment": "Same as search, restricted to hotels (ht_id=204) rated 8+ (review_score=80). Lisbon 14-15 Oct, 2 adults, max 120: 25 found, cheapest Dom Joao Glamour EUR 95, Avenida Park EUR 98, ibis Alfragide EUR 107.",
+      "steps": [
+        {
+          "op": "goto",
+          "url": "https://www.booking.com/searchresults.html?ss={city}&checkin={checkin}&checkout={checkout}&group_adults={adults}&no_rooms={rooms}&group_children=0&lang=en-us&selected_currency=EUR&nflt=price%3DEUR-min-{max_eur}-1%3Bht_id%3D204%3Breview_score%3D80&order=price"
+        },
+        {
+          "op": "wait_for",
+          "selector": "[data-testid=property-card]"
+        }
+      ],
+      "verify": {
+        "url": "https://www.booking.com/searchresults.html?ss={city}&checkin={checkin}&checkout={checkout}",
+        "expect": "properties found"
+      }
+    }
+  }
+}
