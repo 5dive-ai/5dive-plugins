@@ -38,6 +38,7 @@ import { captureBaseline, resolveLiveTranscript, resumedSinceBaseline, rotatedSi
 import { retryResume, type RetryLimits } from './lib/resume-retry'
 import { parseResetEpoch } from './lib/time'
 import { resumePrompt } from './lib/resume-prompt'
+import { isLite, recordOpsDetail } from './lib/lite'
 
 const resetEpoch = parseInt(process.argv[2] ?? '0', 10) || 0
 const socket = process.argv[3] ?? ''
@@ -271,7 +272,11 @@ try {
   }
 
   // Phase 4 — Telegram ping (success, or a heads-up that we gave up).
-  if (process.env.TELEGRAM_BOT_TOKEN && chatIdsCsv) {
+  // DIVE-5121: on a lite (partner-client) box continuity is invisible — the
+  // client already got the neutral line, so the outcome goes to ops only.
+  if (isLite()) {
+    recordOpsDetail('resume-after-reset', `resumed=${resumed} attempts=${attempts} gaveUp=${giveUp || 'no'}`)
+  } else if (process.env.TELEGRAM_BOT_TOKEN && chatIdsCsv) {
     // Each entry is "chatId" or "chatId:threadId" (forum topic) — see the
     // encoding in stopfailure-notify.ts. Split on the first ':' so the resume
     // ping lands back in the same topic the limit notice went to.

@@ -42,6 +42,12 @@ import { setTimeout as sleep } from 'timers/promises'
 import { readPayload } from './lib/payload'
 import { readEntries, analyzeTurn, hadTelegramToolCallAfter } from './lib/transcript'
 import { sendMessage, getToken } from './lib/telegram'
+import { isLite, readLiteLang, readAllowance, liteLimitText, recordOpsDetail, LITE_STRINGS } from './lib/lite'
+
+// DIVE-5121: on a lite (partner-client) box every line this hook sends is the
+// neutral, localized one, and the technical text goes to ops instead. Default
+// profile: false, and each send below is what it was.
+const LITE = isLite()
 import { emitBlock } from './lib/output'
 import { TG_TOOL_PREFIX, signalTurnEnded } from './lib/paths'
 import { getAllowedChatIds, getCallerChat, getGroupTopics, type CallerChat } from './lib/access'
@@ -169,7 +175,12 @@ if (sessionLimitHit && getToken()) {
       } catch {
         // ignore — at worst we send the DM twice on next Stop
       }
-      await Promise.all(targets.map(t => sendMessage(t.chatId, dm, t.threadId)))
+      let out = dm
+      if (LITE) {
+        recordOpsDetail('stop-reply-check', dm)
+        out = liteLimitText(readLiteLang(), await readAllowance())
+      }
+      await Promise.all(targets.map(t => sendMessage(t.chatId, out, t.threadId)))
     }
   }
 }
@@ -200,7 +211,8 @@ if (payload.stop_hook_active === true) {
       let diag = '[5dive] Agent stopped without a Telegram reply and produced no transcript text'
       if (cachedMsg) diag += ` (unanswered message_id=${cachedMsg})`
       diag += '. Retry-after-block already attempted; check journalctl on the host.'
-      await sendMessage(cachedChat, diag, cachedThread || undefined)
+      if (LITE) recordOpsDetail('stop-reply-check', diag)
+      await sendMessage(cachedChat, LITE ? LITE_STRINGS[readLiteLang()].failed : diag, cachedThread || undefined)
     }
   }
   process.exit(0)
@@ -255,7 +267,8 @@ if (a.reactedNewest) process.exit(0)
 if (a.texts.length > 0) {
   const joined = a.texts.join('\n\n').trim()
   if (joined) {
-    await sendMessage(chatId, `(auto-relay) ${joined}`, threadId)
+    // A lite client gets the agent's words as a normal message, no tag.
+    await sendMessage(chatId, LITE ? joined : `(auto-relay) ${joined}`, threadId)
     process.exit(0)
   }
 }
@@ -285,7 +298,8 @@ if (existsSync(lockFile)) {
   let diag = '(auto-relay) Agent stopped without a Telegram reply and produced no transcript text'
   if (diagMsg) diag += ` (unanswered message_id=${diagMsg})`
   diag += '. Retry-after-block already attempted; check journalctl on the host.'
-  await sendMessage(diagChat, diag, diagThread)
+  if (LITE) recordOpsDetail('stop-reply-check', diag)
+  await sendMessage(diagChat, LITE ? LITE_STRINGS[readLiteLang()].failed : diag, diagThread)
   process.exit(0)
 }
 

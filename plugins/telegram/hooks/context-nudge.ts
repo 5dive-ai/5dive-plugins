@@ -34,6 +34,7 @@ import { getToken } from './lib/telegram'
 import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { nudgeFile } from './lib/paths'
 import type { HookPayload } from './lib/types'
+import { isLite } from './lib/lite'
 
 // Opt-in gate: the carry-over nudge is OFF by default and only fires once the
 // user has turned it on for this agent with `/context on` (writes
@@ -58,6 +59,9 @@ const TIERS: { at: number; text: string }[] = [
 ]
 
 const payload = await readPayload<HookPayload>()
+
+// DIVE-5121: an operator nudge (/new is a lite client's lever). A lite box never runs it.
+if (isLite()) process.exit(0)
 
 // Re-entry from a blocked Stop (stop-reply-check) isn't a fresh natural break —
 // skip so the nudge only ever rides a clean turn end.

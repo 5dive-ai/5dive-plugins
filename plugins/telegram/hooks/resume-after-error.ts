@@ -24,6 +24,7 @@ import { capturePaneFor, sendKeys, type TmuxCtx } from './lib/tmux'
 import { sendMessage } from './lib/telegram'
 import { captureBaseline, resumedSinceBaseline, rotatedSince, type ResumeBaseline } from './lib/live-transcript'
 import { resumePrompt } from './lib/resume-prompt'
+import { isLite, recordOpsDetail } from './lib/lite'
 
 const socket = process.argv[2] ?? ''
 const target = process.argv[3] ?? ''
@@ -125,7 +126,11 @@ try {
 
   // Telegram ping — success quietly confirms recovery; failure asks for a hand.
   // Stay silent on success when we never had a chat to ping.
-  if (process.env.TELEGRAM_BOT_TOKEN && chatIdsCsv) {
+  // DIVE-5121: on a lite (partner-client) box continuity is invisible — the
+  // client already got the neutral line, so the outcome goes to ops only.
+  if (isLite()) {
+    recordOpsDetail('resume-after-error', `resumed=${resumed}`)
+  } else if (process.env.TELEGRAM_BOT_TOKEN && chatIdsCsv) {
     // Each entry is "chatId" or "chatId:threadId" (forum topic) — see the
     // encoding in stopfailure-notify.ts. Split on the first ':' so the ping
     // threads back into the same topic the error notice went to.

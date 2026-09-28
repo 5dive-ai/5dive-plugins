@@ -28,10 +28,14 @@ import { decideNag } from './lib/silence-decision'
 import { emitPostToolContext } from './lib/output'
 import { readEntries, analyzeTurn } from './lib/transcript'
 import { TG_TOOL_PREFIX } from './lib/paths'
+import { isLite } from './lib/lite'
 
 // Drain stdin. We only need transcript_path (for the DIVE-1323 a2a-turn
 // check below); the rest is unused.
 const payload = await readPayload<{ transcript_path?: string }>()
+
+// DIVE-5121: an operator alarm. A lite (partner-client) box never runs it.
+if (isLite()) process.exit(0)
 
 // First-fire silence threshold (seconds since last reply). Lower = the agent
 // is forced to ack sooner; higher = quieter but more perceived silence. The

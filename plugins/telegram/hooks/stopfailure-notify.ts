@@ -25,6 +25,7 @@ import { resumePrompt } from './lib/resume-prompt'
 import { parseResetEpoch } from './lib/time'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
+import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
 
 const payload = await readPayload<HookPayload>()
 const msg = [payload.message, payload.reason, typeof payload.error === 'string' ? payload.error : undefined, payload.stopReason]
@@ -208,6 +209,23 @@ if (isRateLimit) {
   }
 }
 
+// DIVE-5121: the split on a lite (partner-client) box. The client gets one
+// neutral line in their language: the allowance line for a limit, else "try
+// again in a minute", with the account button when the box has an account URL.
+// The technical text built above goes to ops (stderr + the channel's
+// ops-failures.jsonl) and never to the client. Default profile: markup stays
+// undefined and text is untouched, so the sends below are what they were.
+const LITE = isLite()
+let markup: unknown = undefined
+if (LITE) {
+  recordOpsDetail('stopfailure', text)
+  const lang = readLiteLang()
+  const limitHit = isRateLimit || /key limit exceeded|insufficient credits|more credits/i.test(raw)
+  text = limitHit ? liteLimitText(lang, await readAllowance()) : LITE_STRINGS[lang].failed
+  const accountUrl = liteAccountUrl(readChannelEnv('TELEGRAM_ACCOUNT_URL'))
+  if (limitHit && accountUrl) markup = { inline_keyboard: [[{ text: LITE_STRINGS[lang].accountButton, url: accountUrl }]] }
+}
+
 // Caller-only narrowing: prefer the inbound chat (and its forum topic) the
 // user actually wrote from. On an autonomous turn (no telegram inbound in the
 // transcript — cron-triggered, long-running background agent, etc) fall back
@@ -275,7 +293,10 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
   if (rot) {
     const rotText =
       `Usage limit hit on '${rot.from}' — rotating to '${rot.to}' and resuming this session on the new account.`
-    await Promise.all(targets.map(t => sendMessage(t.chatId, rotText, t.threadId)))
+    // DIVE-5121: a lite client does not hear about accounts; the rotation is
+    // invisible continuity, recorded for ops.
+    if (LITE) recordOpsDetail('stopfailure', rotText)
+    else await Promise.all(targets.map(t => sendMessage(t.chatId, rotText, t.threadId)))
     // The notice is out and nothing more will be typed from this turn — clear the
     // indicator before the exit below tears the process down.
     signalTurnEnded()
@@ -345,7 +366,7 @@ if (shouldSend) {
   if (targets.length === 0) {
     console.error('[stopfailure-notify] no paired chat configured — usage-limit notice NOT sent (lost)')
   }
-  const results = await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId)))
+  const results = await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId, markup)))
   targets.forEach((t, i) => {
     console.error(`[stopfailure-notify] send ${fmtTarget(t)}: ${results[i] ? 'ok' : 'FAILED'}`)
   })
@@ -366,7 +387,7 @@ if (shouldSend) {
     const fallback = getAllowedChatIds().filter(id => !tried.has(id))
     if (fallback.length > 0) {
       console.error(`[stopfailure-notify] all ${results.length} routed send(s) failed — falling back to ${fallback.join(',')}`)
-      const fbResults = await Promise.all(fallback.map(id => sendMessage(id, text)))
+      const fbResults = await Promise.all(fallback.map(id => sendMessage(id, text, undefined, markup)))
       fallback.forEach((id, i) => {
         console.error(`[stopfailure-notify] fallback send ${id}: ${fbResults[i] ? 'ok' : 'FAILED'}`)
       })

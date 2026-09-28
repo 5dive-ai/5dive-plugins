@@ -71,7 +71,9 @@ export function apiBase(): string {
 // not be attributed after the fact: the hook's own artifacts proved it DECIDED
 // to send on both seats, and nothing anywhere recorded what happened next.
 // Callers that do not care may still ignore the boolean.
-export async function sendMessage(chatId: string, text: string, threadId?: string): Promise<boolean> {
+// DIVE-5121: replyMarkup is optional and is sent ONLY when passed, so every
+// existing three-argument caller posts exactly the body it posted before.
+export async function sendMessage(chatId: string, text: string, threadId?: string, replyMarkup?: unknown): Promise<boolean> {
   const token = getToken()
   if (!token) {
     process.stderr.write(
@@ -110,6 +112,7 @@ export async function sendMessage(chatId: string, text: string, threadId?: strin
   try {
     const params = new URLSearchParams({ chat_id: chatId, text: trimmed })
     if (threadId) params.set('message_thread_id', threadId)
+    if (replyMarkup !== undefined) params.set('reply_markup', JSON.stringify(replyMarkup))
     const res = await fetch(`${apiBase()}/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },

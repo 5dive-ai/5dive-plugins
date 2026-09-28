@@ -89,6 +89,15 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](https://t.me/userinfobot)). Default policy is `pairing`. `ackReaction` only accepts Telegram's fixed emoji whitelist.
 
+## Profiles
+
+`TELEGRAM_PROFILE=lite` in `~/.claude/channels/telegram/.env` gives a partner's client a light bot: the
+commands `/start /new /stop /usage /account /help` (English, and Russian for ru clients), consumer
+instructions with no operator rules, neutral emoji-free bot text, and none of a 5dive org's machinery
+(tasks, gates, council, banners, silence and context alarms). Only the allowlisted owner is answered.
+`TELEGRAM_ACCOUNT_URL=https://…` adds the `/account` button. Anything else, including unset, is the
+default profile, which is unchanged. See `hooks/lib/lite.ts`.
+
 ## Tools exposed to the assistant
 
 | Tool | Purpose |
