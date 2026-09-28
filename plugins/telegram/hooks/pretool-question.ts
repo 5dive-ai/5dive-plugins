@@ -31,6 +31,7 @@ import { getToken } from './lib/telegram'
 import { readEntries, analyzeTurn } from './lib/transcript'
 import { buildBridge, buttonText } from './lib/question-bridge'
 import type { HookPayload } from './lib/types'
+import { isLite, liteQuestionPrompt } from './lib/lite'
 
 const payload = await readPayload<HookPayload>()
 const tool = payload.tool_name
@@ -108,9 +109,11 @@ const inline_keyboard = spec!.buttons.map((b, i) => [
 
 async function post(): Promise<boolean> {
   try {
+    // DIVE-5121: a lite client gets the question without the ❓ lead.
+    const prompt = isLite() ? liteQuestionPrompt(spec!.prompt) : spec!.prompt
     const body: Record<string, unknown> = {
       chat_id: chatId,
-      text: spec!.prompt.length > 3800 ? spec!.prompt.slice(0, 3800) + '…' : spec!.prompt,
+      text: prompt.length > 3800 ? prompt.slice(0, 3800) + '…' : prompt,
       reply_markup: { inline_keyboard },
     }
     if (threadId) body.message_thread_id = Number(threadId)

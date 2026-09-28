@@ -1,5 +1,37 @@
 ## Unreleased
 
+### Added — a `lite` profile for a partner's clients: six commands, a consumer voice, no org machinery (DIVE-5121), telegram 0.5.65
+
+A partner's client (OINOA's end users) chats with one agent through its own bot and operates nothing.
+`TELEGRAM_PROFILE=lite` in the channel's `.env` (or the process env) selects a profile of the same
+bridge, not a fork, so every bridge fix still reaches it. **With nothing set, nothing changes:** any
+value but `lite` is the default profile, and every lite branch is a guard on that one flag.
+
+Under `lite`:
+- **Commands:** `/start` `/new` `/stop` `/usage` `/account` `/help`, pushed with `setMyCommands` in
+  English and, for `language_code=ru`, Russian. `/clear` is a hidden alias of `/new`. Every other
+  command, org ones included, gets the `/help` reply. `/start` goes to the agent, which greets in its
+  own voice. `/usage` reads the allowance from the agent's own OpenRouter key (`GET /api/v1/key`), or
+  says the client runs on their own subscription. `/account` is a URL button (not `web_app`) to
+  `TELEGRAM_ACCOUNT_URL`, and is left out of the menu when that is unset.
+- **Access:** only the allowlisted owner, only in a private chat. Anyone else gets silence, never a
+  pairing code. Groups are ignored.
+- **Instructions:** a consumer block replaces the operator rules (no word cap, no
+  finished/blocked/mistake triage). The persona sets the voice.
+- **Strings:** every bot-authored line is neutral, localized and emoji-free. Failures and limits get one
+  line ("Не получилось, попробуйте ещё раз через минуту", the weekly-limit line with the account button).
+  The technical text goes to `ops-failures.jsonl` in the channel state dir and to stderr.
+- **Off:** the ack reaction (typing is the ack), the auto Yes/No buttons, the auto-attach footer, the
+  needs-you banner, gate replies, and the silence-watchdog and context-nudge hooks. stop-reply-check,
+  pretool-question and resume-after-* stay, with neutral text. resume-after-* no longer pings the client.
+
+Shared files and why the default profile is unaffected: `server.ts` (every change is a `LITE` guard;
+the default instructions block is byte-identical), `hooks/lib/telegram.ts` (`sendMessage` takes an
+optional `replyMarkup` and sends it only when passed), `hooks/lib/lite.ts` (new), and seven hooks (a `LITE`/`isLite()` guard
+each). `test/dive5121-lite-profile.test.ts` pins the default menu, `/help`, instructions and
+`hooks.json` to the 0.5.64 release's bytes, and checks the shape of every guard. Eight mutant arms were
+confirmed red.
+
 ### Changed — the registry copy catches up ten releases, to browser 1.22.5: a signed-out Telegram Web profile stops reading `authenticated` (DIVE-4998), approvals default to yolo (DIVE-5006), and a formless Enter is a send (DIVE-620)
 
 `plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.22.5 (6b1f1d5), byte for byte. The last mirror
