@@ -25,7 +25,8 @@ than a detail.
 5dive browser snapshot <url> --wait-for='[role=main]'   # capture when the page shows it;
                                                   # also on read and act (exit 76: not ready)
 sudo 5dive browser approve <id> [--deny]          # the owner's yes to a pay/post/send/delete
-sudo 5dive browser approvals policy set careful   # the owner: all four stop and ask (default: yolo)
+sudo 5dive browser approvals policy set careful   # the owner: all four stop and ask
+sudo 5dive browser approvals policy set standard  # the default: only paying stops and asks
 sudo 5dive browser approvals policy set send=allow   # the owner's standing answer per kind
 ```
 
@@ -40,8 +41,9 @@ connected site); a refusal naming the accounts when there are several (`github.c
 `act` runs agent-written steps in the fixed vocabulary (`goto fill type click wait_for select press`)
 through the same executors, lease and login gate as `run`, and grades `--expect` against the page
 as the steps left it; a step that fails fails the run, whatever --expect matched, and the failure
-names the step (`--json`: `failed_step`). **Paying, publishing, sending and deleting run and are logged by default
-(yolo, DIVE-5006); under the owner's `careful` they stop before the step** (exit 73): the executor
+names the step (`--json`: `failed_step`). **Publishing, sending and deleting run and are logged by default, while paying stops
+for the owner's approval (standard, DIVE-5148); under the owner's `careful` all four stop
+before the step** (exit 73): the executor
 reads the live element's label (`lib/aria.cjs` `stepRisk`, shared by both step loops), and a kind
 the owner's policy sets to `ask` records the ask with a screenshot and waits for
 `sudo 5dive browser approve <id>`, a root-owned grant bound to the exact steps, good once for 30
@@ -66,15 +68,18 @@ A page that shows none of it gets an ask that says so; the button label is never
 a payload.
 
 **The owner's policy per kind.** `5dive browser approvals policy [--json]` prints
-`{"pay":"allow","publish":"allow","send":"allow","delete":"allow","mode":"yolo"}` on a box with no
+`{"pay":"ask","publish":"allow","send":"allow","delete":"allow","mode":"standard"}` on a box with no
 policy file (also as JSON when `FIVEDIVE_JSON_MODE=1`, which is how the 5dive CLI passes `--json`
-on). **The default is `allow` for all four (DIVE-5006):** the step runs and is logged, with the
-payload and the act's screenshot, to `allowed.jsonl` in the seat's approvals directory
-(`allowed_by: "default"`, and stderr says `ALLOWED (default yolo)`). The owner changes it with a
-preset, `sudo 5dive browser approvals policy set yolo` (all four allow) or
-`sudo 5dive browser approvals policy set careful` (all four ask: the exit-73 stop), and per kind
-with `set <kind>=ask|allow`, on top of either. `mode` is computed from the four: `yolo`, `careful`,
-or `custom`. The file lives at `/var/lib/5dive/browser-profiles/.approval-policy.json`, root-owned
+on). **The default is per kind (DIVE-5148): paying stops for your approval; posting, sending and
+deleting go ahead and are logged.** An allowed step runs and is logged, with the payload and the
+act's screenshot, to `allowed.jsonl` in the seat's approvals directory (`allowed_by: "default"`,
+and stderr says `ALLOWED (default standard)`); `pay` stops with exit 73 and an ask, one tap in
+Telegram for the owner. Why the odd one out: a page the agent reads can carry hidden instructions,
+and a post or a delete can be undone or apologised for — money charged to your card cannot. The
+owner changes it with a preset, `sudo 5dive browser approvals policy set standard` (this default),
+`set yolo` (all four allow) or `set careful` (all four ask: the exit-73 stop), and per kind with
+`set <kind>=ask|allow`, on top of any of them. `mode` is computed from the four: `standard`,
+`yolo`, `careful`, or `custom`. The file lives at `/var/lib/5dive/browser-profiles/.approval-policy.json`, root-owned
 `0644`: every seat reads it, none writes it (a seat's `set` is refused, 77), and one the granting
 uid does not own is ignored, so the default applies and a seat can neither loosen nor tighten
 it. A kind the owner set to `allow` is logged as `allowed_by: "policy"`. A file written by an
@@ -599,7 +604,7 @@ site's owner wants are theirs to write in their seat's `.adapters/`. booking.com
 
 ```bash
 5dive browser run google.com send --to=<addr> --subject='<subject>' --body='<text>'
-# -> by default (yolo): ALLOWED (default yolo): send …, then verified: send is live at …#sent
+# -> by default (standard, send=allow): ALLOWED (default standard): send …, then verified at …#sent
 # -> under careful: exit 73 and an approval id; the owner: sudo 5dive browser approve <id>, then
 5dive browser run google.com send --to=<addr> --subject='<subject>' --body='<text>' --approved-id=<id>
 # -> verified: send is live at https://mail.google.com/mail/u/0/#sent (re-read in this profile)

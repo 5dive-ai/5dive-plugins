@@ -1,5 +1,40 @@
 ## Unreleased
 
+### Changed — the registry copy catches up to browser 1.23.0: paying asks by default on a customer box, and a third preset, `standard` (DIVE-5148)
+
+`plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.23.0 (9b66ecc), byte for byte. The last mirror
+was 1.22.5 (DIVE-5076), and that copy equalled upstream's 6b1f1d5 exactly, so this is one release.
+Every box keyed `browser@5dive-plugins` with no policy file of its own now stops on pay and asks;
+publish, send and delete still run and are logged. `tests/browser_plugin_unit.sh` carries upstream's
+arms from 1.22.5 to 1.23.0, with `browser/` read as `plugins/browser/`. Upstream's entry follows,
+unedited apart from the heading level.
+
+#### Changed — paying asks by default on a customer box; a third preset, `standard` (DIVE-5148), browser 1.23.0
+
+**Before:** the default was `yolo` — pay, publish, send and delete all ran and were logged
+(DIVE-5006, which fixed an owner with no dashboard and no shell being unable to approve anything).
+Since then the owner-ask relay turned an ask into one tap in Telegram, so the stop is cheap again.
+A page the agent reads can carry hidden instructions; a post or a delete can be undone or
+apologised for, and money charged to a customer's card cannot.
+
+**Now:** the default is per kind — `{"pay":"ask","publish":"allow","send":"allow","delete":"allow"}`.
+On a box with no policy file, a pay step stops with exit **73** and an ask carrying the payee, the
+amount and a screenshot; publish, send and delete run and are logged to `allowed.jsonl` as
+`allowed_by: "default"`, and stderr says `ALLOWED (default standard)` (it said `default yolo`).
+
+- **`sudo 5dive browser approvals policy set standard`** is a third preset, this default, beside
+  `yolo` (all four allow) and `careful` (all four ask). `set standard` followed by
+  `set pay=allow` is `yolo` again.
+- **`approvals policy --json`** reports `"mode":"standard"` for exactly this map, then `yolo`,
+  `careful` or `custom` as before, so the dashboard switch can show it.
+- **Unchanged:** an explicit owner setting still wins over the default; only the owner changes the
+  policy (a seat's `set` is still refused, 77); a policy file the granting uid does not own is
+  still ignored and the default applies; every allowed step is still logged with its payload and
+  its screenshot.
+- Our own boxes stay `yolo`: `sudo 5dive browser approvals policy set yolo`.
+- Harness: T36b/T36c/T36d and T37 grade the new default, one arm per preset (`standard`, `yolo`,
+  `careful`), and T37e's mutant is now the old all-`allow` default — with it, a pay runs.
+
 ### Added — a `lite` profile for a partner's clients: six commands, a consumer voice, no org machinery (DIVE-5121), telegram 0.5.65
 
 A partner's client (OINOA's end users) chats with one agent through its own bot and operates nothing.

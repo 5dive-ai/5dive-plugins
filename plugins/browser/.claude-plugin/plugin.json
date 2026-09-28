@@ -1,7 +1,7 @@
 {
   "name": "browser",
-  "version": "1.22.5",
-  "description": "Browse and act on any website with nothing connected; where it must be you, persistent human-authenticated sessions you log into once by hand (several accounts per site). Paying, posting, sending and deleting run and are logged for you by default; set careful and they wait for your yes. Never solves a security challenge; it stops and asks you.",
+  "version": "1.23.0",
+  "description": "Browse and act on any website with nothing connected; where it must be you, persistent human-authenticated sessions you log into once by hand (several accounts per site). Paying stops for your approval by default; posting, sending and deleting go ahead and are logged for you; set careful and all four wait for your yes. Never solves a security challenge; it stops and asks you.",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com",

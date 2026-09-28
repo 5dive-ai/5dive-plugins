@@ -6135,7 +6135,7 @@ tc 'T35h CHANGES.md names the flag' '--approved-id' "$(cat "$ROOT/CHANGES.md")"
 #   T36c  `policy set` is the owner's: a seat uid and a seat's sudo are refused
 #   T36d  careful + send=allow runs the send and logs it; pay still stops; a
 #         policy file the granting uid does not own is not a policy (the default,
-#         yolo, applies: DIVE-5006); the warm loop agrees
+#         standard, applies: DIVE-5006, DIVE-5148); the warm loop agrees
 # T36a and T36e-g grade the ask, so they run under the owner's `careful`.
 #   T36e  a seat's approve needs the owner's proof: none / wrong refused, right granted
 #   T36f  MUTANT: the SUDO_USER check removed, a seat approves its own ask
@@ -6176,9 +6176,9 @@ t  'T36a (cleanup) the owner declines it' 0 "$RC"
 
 # --- T36b the policy, read ---------------------------------------------------------
 rm -f "$POL36"
-DEF36='{"pay":"allow","publish":"allow","send":"allow","delete":"allow","mode":"yolo"}'
+DEF36='{"pay":"ask","publish":"allow","send":"allow","delete":"allow","mode":"standard"}'
 run t36env "$BROWSER" approvals policy --json
-t  'T36b approvals policy --json with no file: every kind, default allow (yolo)' "$DEF36" "$OUT"
+t  'T36b approvals policy --json with no file: pay asks, the other three allow (standard)' "$DEF36" "$OUT"
 run t36env FIVEDIVE_JSON_MODE=1 "$BROWSER" approvals policy
 t  'T36b ...and the same with FIVEDIVE_JSON_MODE=1 (the CLI strips --json)' "$DEF36" "$OUT"
 run t36env FIVEDIVE_BROWSER_GRANT_UID=0 "$BROWSER" approvals policy --json
@@ -6211,10 +6211,15 @@ run t36env PWLABEL="Place your order" "$BROWSER" act "https://shop36.test/cart" 
 t  'T36d ...while pay, still "ask", stops (73) before the click' '73 0' \
    "$RC $(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
 : > "$PWREC"
-run t36env FIVEDIVE_BROWSER_GRANT_UID=0 PWLABEL="Place your order" "$BROWSER" act "https://shop36.test/cart" --steps='[{"op":"click","selector":"#buy"}]'
-t  'T36d a policy file the granting uid does not own is not a policy: the default applies, and the pay it says "ask" to runs' \
+run t36env FIVEDIVE_BROWSER_GRANT_UID=0 PWLABEL="Post" "$BROWSER" act "https://social36.test/new" --steps='[{"op":"click","selector":"#post"}]'
+t  'T36d a policy file the granting uid does not own is not a policy: the default applies, and the publish it says "ask" to runs' \
    '0 1' "$RC $(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
-tc 'T36d ...logged as the default, not as the file' 'ALLOWED (default yolo): pay' "$ERR"
+tc 'T36d ...logged as the default, not as the file' 'ALLOWED (default standard): publish' "$ERR"
+# ...and the default is not "everything runs": the unowned file's pay is still the default's ask.
+: > "$PWREC"
+run t36env FIVEDIVE_BROWSER_GRANT_UID=0 PWLABEL="Place your order" "$BROWSER" act "https://shop36.test/cart" --steps='[{"op":"click","selector":"#buy"}]'
+t  'T36d ...while a pay stops on the default too, before the click' '73 0' \
+   "$RC $(jq -rs '[.[]|select(.call=="click")]|length' "$PWREC")"
 # the warm loop reads the same policy
 mkprofile warm36.test "$LIVE_DOM" >/dev/null
 DL36="$TMP/t36/dlabel"; printf '%s' "$SEND36" > "$DL36"; DP36="$TMP/t36/dpayload"; printf '%s' "$PAY36" > "$DP36"
@@ -6317,20 +6322,26 @@ tc 'T36h README.md documents the proof' '--human-proof' "$(cat "$ROOT/plugins/br
 tc 'T36h CHANGES.md names the JSON contract' 'FIVEDIVE_JSON_MODE' "$(cat "$ROOT/CHANGES.md")"
 tc 'T36h CHANGES.md names the proof' '--human-proof' "$(cat "$ROOT/CHANGES.md")"
 
-# ============ T37 DIVE-5006: the default is yolo — the owner's four run, and are written down
+# ============ T37 DIVE-5006 + DIVE-5148: the default is standard — paying asks, the
+# other three run and are written down
 #
-# Measured on a box at browser 1.17.0: the default was "ask", so an owner with no
-# dashboard and no shell could not approve a step, could not relax the policy, and
-# every send stopped dead with 73. Each arm is the mutant:
-#   T37a  no policy file: pay, publish, send and delete each run and none exits 73;
-#         each is in allowed.jsonl as allowed_by "default", with its screenshot; the
-#         warm loop and a guarded `run google.com send` agree
-#   T37b  `set careful` stops all four again (73, before the click), warm too
+# Measured on a box at browser 1.17.0: the default was "ask" for all four, so an owner
+# with no dashboard and no shell could not approve a step, could not relax the policy,
+# and every send stopped dead with 73. DIVE-5006 made all four "allow"; the owner-ask
+# relay then made an ask one tap, and DIVE-5148 put the stop back on `pay` ONLY — a
+# post or a delete can be undone, money charged to a card cannot. Each arm is the mutant:
+#   T37a  no policy file: publish, send and delete each run and none exits 73, while
+#         pay stops with 73 before the click; each allowed one is in allowed.jsonl as
+#         allowed_by "default", with its screenshot; the warm loop and a guarded
+#         `run google.com send` agree
+#   T37b  `set careful` stops all four (73, before the click), warm too
 #   T37c  mode: careful + pay=allow is custom, and pay then runs as the owner's
-#         policy; yolo; the text form; a preset only after `set`, one at a time
-#   T37d  a seat's `set yolo` / `set careful` is refused (77) and writes nothing; a
-#         careful file the granting uid does not own is not a policy
-#   T37e  MUTANT: the old "ask" default restored — with no file the send stops again
+#         policy; one arm per preset — standard, yolo, careful — and `set standard`
+#         then `set pay=allow` is yolo; the text form; a preset only after `set`,
+#         one at a time
+#   T37d  a seat's `set standard` / `set yolo` / `set careful` is refused (77) and
+#         writes nothing; a careful file the granting uid does not own is not a policy
+#   T37e  MUTANT: DIVE-5006's all-"allow" default restored — with no file a pay runs
 #   T37f  documented where agents and people read it
 unset FIVEDIVE_BROWSER_DRIVER
 A37="$TMP/t37/approvals"; POL37="$TMP/t37/policy.json"; mkdir -p "$TMP/t37"
@@ -6347,19 +6358,22 @@ act37() {  # act37 <kind> [env assignments...] — one click on a button whose l
   run t37env PWLABEL="${LBL37[$k]}" "$@" "${T37BIN:-$BROWSER}" act "https://$k.t37.test/x" --steps="$CLICK36" --out="$TMP/t37/$k"
 }
 
-# --- T37a no policy file: all four run, and each is written down --------------------
+# --- T37a no policy file: three run, pay asks, and each allowed one is written down ----
 t  'T37a (precondition) there is no policy file' 'no' "$([[ -e "$POL37" ]] && echo yes || echo no)"
-for k in pay publish send delete; do
+act37 pay
+t  'T37a pay stops with no policy file: 73, and the click did NOT happen' '73 0' "$RC $(clicks37)"
+tc 'T37a ...with the owner'"'"'s ask' 'browser approve' "$ERR"
+for k in publish send delete; do
   act37 "$k"
   t  "T37a $k runs with no policy file: exit 0, and the click happened" '0 1' "$RC $(clicks37)"
-  tc "T37a ...it says the default let it through" "ALLOWED (default yolo): $k" "$ERR"
+  tc "T37a ...it says the default let it through" "ALLOWED (default standard): $k" "$ERR"
 done
 LOG37=""
 while IFS=' ' read -r c by shot; do
   LOG37+="$c:$by:$([[ -s "$shot" ]] && echo shot || echo noshot) "
 done < <(jq -r '"\(.class) \(.allowed_by) \(.screenshot)"' "$A37/allowed.jsonl" 2>/dev/null)
-t  'T37a allowed.jsonl holds all four, each by the default, each with its screenshot' \
-   'pay:default:shot publish:default:shot send:default:shot delete:default:shot ' "$LOG37"
+t  'T37a allowed.jsonl holds the three allowed kinds, each by the default, each with its screenshot — and no pay' \
+   'publish:default:shot send:default:shot delete:default:shot ' "$LOG37"
 # the warm loop reads the same default
 mkprofile warm37.test "$LIVE_DOM" >/dev/null
 DL37="$TMP/t37/dlabel"; printf 'Send' > "$DL37"
@@ -6371,13 +6385,13 @@ N37=$(wc -l < "$DREC")
 w37 --out="$TMP/t37/warm"
 t  'T37a the warm session sends with no policy file too' '0 1' \
    "$RC $(tail -n +$((N37+1)) "$DREC" | jq -rs '[.[]|select(.call=="click")]|length')"
-tc 'T37a ...and logs it as the default' 'ALLOWED (default yolo): send' "$ERR"
+tc 'T37a ...and logs it as the default' 'ALLOWED (default standard): send' "$ERR"
 # a guarded adapter action, the owner's live arm: run google.com send, no policy file
 : > "$PWREC"
 run t35env FIVEDIVE_BROWSER_APPROVAL_DIR="$A37" FIVEDIVE_BROWSER_APPROVAL_POLICY="$POL37" PWSCOPE="$ROW35" \
     "$BROWSER" run google.com send --to="$TO35" --subject="$SUBJ35" --body="$BODY35"
 t  'T37a run google.com send with no policy file: sent (no 73) and verified in Sent' '0 1' "$RC $(clicks37)"
-tc 'T37a ...logged as the default' 'ALLOWED (default yolo): send' "$ERR"
+tc 'T37a ...logged as the default' 'ALLOWED (default standard): send' "$ERR"
 t  'T37a ...and it is in allowed.jsonl' 'google.com send default' \
    "$(jq -r 'select(.site == "google.com") | "\(.site) \(.class) \(.allowed_by)"' "$A37/allowed.jsonl" 2>/dev/null | tail -1)"
 
@@ -6409,6 +6423,23 @@ run t37env "$BROWSER" approvals policy set yolo
 run t37env FIVEDIVE_JSON_MODE=1 "$BROWSER" approvals policy
 t  'T37c set yolo: all four allow, mode yolo (FIVEDIVE_JSON_MODE=1 too)' \
    '{"pay":"allow","publish":"allow","send":"allow","delete":"allow","mode":"yolo"}' "$OUT"
+# one arm per preset (DIVE-5148), each read back through --json
+run t37env "$BROWSER" approvals policy set careful --json
+t  'T37c set careful: all four ask, mode careful' \
+   '{"pay":"ask","publish":"ask","send":"ask","delete":"ask","mode":"careful"}' "$OUT"
+run t37env "$BROWSER" approvals policy set standard --json
+t  'T37c set standard: pay asks, the other three allow, mode standard' \
+   '{"pay":"ask","publish":"allow","send":"allow","delete":"allow","mode":"standard"}' "$OUT"
+t  'T37c ...and standard is written down, not left implicit' \
+   '{"pay":"ask","publish":"allow","send":"allow","delete":"allow"}' "$(jq -c . "$POL37")"
+run t37env "$BROWSER" approvals policy set pay=allow --json
+t  'T37c set standard then pay=allow is yolo again' \
+   '{"pay":"allow","publish":"allow","send":"allow","delete":"allow","mode":"yolo"}' "$OUT"
+run t37env "$BROWSER" approvals policy set standard
+act37 pay
+t  'T37c under standard a pay stops, 73 before the click' '73 0' "$RC $(clicks37)"
+act37 publish
+t  'T37c ...and a publish runs' '0 1' "$RC $(clicks37)"
 run t37env "$BROWSER" approvals policy set yolo send=ask
 tc 'T37c a per-kind value on top of a preset; the text form names the mode' $'send\task\ndelete\tallow\nmode\tcustom' "$OUT"
 cp "$POL37" "$TMP/t37/before.json"
@@ -6431,28 +6462,52 @@ t  'T37d a seat'"'"'s sudo cannot set careful (77), and the yolo file is unchang
    "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
 run t37env FIVEDIVE_BROWSER_GRANT_UID=0 "$BROWSER" approvals policy set careful
 t  'T37d ...nor a seat uid' '77 same' "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
+run t37env "$BROWSER" approvals policy set careful; cp "$POL37" "$TMP/t37/before.json"
+run t37env SUDO_USER=agent-x "$BROWSER" approvals policy set standard
+t  'T37d a seat'"'"'s sudo cannot set standard (77), and the careful file is unchanged' '77 same' \
+   "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
+run t37env FIVEDIVE_BROWSER_GRANT_UID=0 "$BROWSER" approvals policy set standard
+t  'T37d ...nor a seat uid' '77 same' "$RC $(cmp -s "$POL37" "$TMP/t37/before.json" && echo same || echo changed)"
 rm -f "$POL37"
 run t37env SUDO_USER=agent-x "$BROWSER" approvals policy set careful
 t  'T37d with no file, a seat'"'"'s careful is refused and creates none' '77 no' "$RC $([[ -e "$POL37" ]] && echo yes || echo no)"
+run t37env FIVEDIVE_BROWSER_GRANT_UID=0 "$BROWSER" approvals policy set standard
+t  'T37d ...and a seat'"'"'s standard creates none either' '77 no' "$RC $([[ -e "$POL37" ]] && echo yes || echo no)"
 run t37env "$BROWSER" approvals policy set careful
 act37 send FIVEDIVE_BROWSER_GRANT_UID=0
 t  'T37d a careful file the granting uid does not own is not a policy: the send runs' '0 1' "$RC $(clicks37)"
-tc 'T37d ...as the default' 'ALLOWED (default yolo): send' "$ERR"
+tc 'T37d ...as the default' 'ALLOWED (default standard): send' "$ERR"
 
-# --- T37e MUTANT: the old "ask" default restored ----------------------------------------
+# --- T37e MUTANTS: the two defaults this one replaced ------------------------------------
+# DIVE-5006's all-"allow" default — the one DIVE-5148 narrowed. With it, a pay runs.
 MUT37="$TMP/t37/mut"; rm -rf "$MUT37"; cp -r "$ROOT/plugins/browser" "$MUT37"
-sed -i 's|^APPROVAL_DEFAULT=allow$|APPROVAL_DEFAULT=ask  # MUTANT (DIVE-5006)|' "$MUT37/bin/browser"
-t  'T37e (anchor) the mutation landed in the copy' 'yes' "$(grep -q 'MUTANT (DIVE-5006)' "$MUT37/bin/browser" && echo yes || echo no)"
+sed -i 's|^APPROVAL_DEFAULTS=.*$|APPROVAL_DEFAULTS='"'"'{"pay":"allow","publish":"allow","send":"allow","delete":"allow"}'"'"'  # MUTANT (DIVE-5148)|' "$MUT37/bin/browser"
+t  'T37e (anchor) the mutation landed in the copy' 'yes' "$(grep -q 'MUTANT (DIVE-5148)' "$MUT37/bin/browser" && echo yes || echo no)"
+t  'T37e (anchor) ...and the mutant is still valid bash' 0 "$(bash -n "$MUT37/bin/browser" 2>&1 >/dev/null; echo $?)"
 rm -f "$POL37"
-T37BIN="$MUT37/bin/browser" act37 send
+T37BIN="$MUT37/bin/browser" act37 pay
+t  'T37e MUTANT (all-allow default): with no policy file the pay runs again, no 73' '0 1' "$RC $(clicks37)"
+# ...and the pre-DIVE-5006 all-"ask" default: with it, a send stops.
+MUT37b="$TMP/t37/mut2"; rm -rf "$MUT37b"; cp -r "$ROOT/plugins/browser" "$MUT37b"
+sed -i 's|^APPROVAL_DEFAULTS=.*$|APPROVAL_DEFAULTS='"'"'{"pay":"ask","publish":"ask","send":"ask","delete":"ask"}'"'"'  # MUTANT (DIVE-5006)|' "$MUT37b/bin/browser"
+t  'T37e (anchor) the second mutation landed in the copy' 'yes' "$(grep -q 'MUTANT (DIVE-5006)' "$MUT37b/bin/browser" && echo yes || echo no)"
+rm -f "$POL37"
+T37BIN="$MUT37b/bin/browser" act37 send
 t  'T37e MUTANT ("ask" default): with no policy file the send stops again, 73 before the click' '73 0' "$RC $(clicks37)"
 
 # --- T37f the words ---------------------------------------------------------------------
 run bash "$BROWSER" --help
-tc 'T37f --help names the presets' 'approvals policy set yolo|careful' "$OUT$ERR"
+tc 'T37f --help names the presets' 'approvals policy set standard|yolo|careful' "$OUT$ERR"
+run t37env "$BROWSER" approvals policy --help
+tc 'T37f ...and the verb'"'"'s own help says what standard means, in plain words' \
+   'paying stops for your approval' "$OUT$ERR"
 for f in plugins/browser/README.md plugins/browser/AGENTS.md plugins/browser/skills/use-browser/SKILL.md CHANGES.md; do
   tc "T37f $f names careful, the way back to the stop" 'approvals policy set careful' "$(cat "$ROOT/$f")"
+  tc "T37f $f names the standard default" 'standard' "$(cat "$ROOT/$f")"
 done
+tc 'T37f the plugin manifest tells the owner paying asks' 'Paying stops for your approval' \
+   "$(jq -r .description "$ROOT/plugins/browser/.claude-plugin/plugin.json")"
+tc 'T37f CHANGES.md names the row' 'DIVE-5148' "$(cat "$ROOT/CHANGES.md")"
 
 # ============ T38 `type`: key by key, for a search box whose suggestions open on keystrokes
 #
