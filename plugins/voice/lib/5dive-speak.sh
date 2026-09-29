@@ -59,7 +59,8 @@ voice_require_cmd ffmpeg || exit 1
 # header, so its shape comes in as ffmpeg input options (DIVE-5162).
 to_ogg() {  # to_ogg <src> [<ffmpeg input options>...]
   local src="$1"; shift
-  ffmpeg -hide_banner -loglevel error -y "$@" -i "$src" -c:a libopus -b:a 32k -ar 48000 -ac 1 "$OUT" </dev/null
+  ffmpeg -hide_banner -loglevel error -y "$@" -i "$src" -c:a libopus -b:a 32k -ar 48000 -ac 1 "$OUT" </dev/null || return 1
+  [[ -s "$OUT" ]] || { echo "5dive voice: the audio could not be converted to a voice note" >&2; return 1; }
 }
 
 speak_local() {
@@ -89,6 +90,10 @@ tts_call() {
         --output "$raw" >/dev/null; then
     rm -f "$raw"; return 1
   fi
+  # An empty 200 is a failure, not silence to send: headerless PCM gives ffmpeg
+  # nothing to refuse, so it would "convert" zero bytes into an OGG with no audio
+  # and skip the fallback below (DIVE-5162, quinn iteration 1).
+  [[ -s "$raw" ]] || { echo "5dive voice: OpenRouter returned no audio" >&2; rm -f "$raw"; return 1; }
   if [[ "$fmt" == pcm ]]; then to_ogg "$raw" -f s16le -ar 24000 -ac 1
   else to_ogg "$raw"; fi
   local rc=$?; rm -f "$raw"; return $rc
