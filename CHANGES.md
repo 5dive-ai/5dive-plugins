@@ -1,5 +1,35 @@
 ## Unreleased
 
+### Fixed — a lite client bot shows it is working again: the default ack reaction and hooks are back (DIVE-5194), telegram 0.5.74
+
+A partner client on a DeepSeek agent asked for a site and saw nothing for over a minute: the agent
+made one tool call and then thought. DIVE-5166's "on it" rule is an instruction the model did not
+follow, and its lite watchdog arm can only speak after a tool call. lodar's direction on the row:
+"we shouldn't customize our perfectly working hooks too much". Lite now runs the default behaviour
+and changes only what the client reads:
+
+- **Ack reaction restored.** Every inbound gets the reaction the default profile uses. A lite box
+  that names none gets 👀 (no lite box writes one); the box's own `ackReaction` still wins, and
+  `""` still turns it off. DIVE-5121 had dropped it on a no-emoji rule that, per lodar, covers the
+  partner's dashboard, not the bots.
+- **Silence watchdog: the default one.** It reminds the AGENT, never the client, so lite no longer
+  touches it. DIVE-5166's narrow lite arm (`decideLiteNudge`) is removed.
+- **Context nudge runs on lite.** Still opt-in. Its message and buttons reach the client, so under
+  lite they are the localized, neutral lines (no word about context), and the `ho:` button answers
+  are too. Lite offers only "Remember and start fresh" and "Not yet": the clear-without-saving
+  button stays off a client's keyboard, in line with DIVE-5173, and a stray `ho:clear` tap from a
+  client is answered as "Not yet" and wipes nothing.
+- The typing indicator already repeats every 4s for the whole turn under both profiles; it is now
+  pinned by a test. No canned "on it" line and no lite-only typing loop were added.
+
+**Reversed graded assertions (on the owner's word, 2026-09-29 06:42Z and 06:43Z):** DIVE-5121's
+arms "silence-watchdog is dropped" and "context-nudge is dropped" and its ratchet shape
+`!LITE && access.ackReaction`, and DIVE-5166's lite watchdog arms, now pin the restore
+(`test/dive5194-lite-default-hooks.test.ts`).
+
+**Unchanged:** the default profile. No reaction unless configured, the same watchdog, the same
+context-nudge text and buttons.
+
 ### Changed — a lite client bot has four commands and greets from its pack (DIVE-5173), telegram 0.5.73
 
 Three owner asks for partner client bots (`TELEGRAM_PROFILE=lite`), one release. The default
