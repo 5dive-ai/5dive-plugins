@@ -27,6 +27,10 @@ export interface LoggedMessage {
   text: string
   message_id?: string
   thread_id?: string
+  // DIVE-5171: set on an inbound that was a tap on one of our reply buttons, not
+  // a typed message; answers_message_id is the bot message the button sat under.
+  via?: 'button'
+  answers_message_id?: string
 }
 
 // chat_id → log filename. chat_ids are numeric (DMs) or '-100…' (supergroups);
@@ -102,11 +106,11 @@ export function mostRecentChatId(dir: string): string | undefined {
 
 // Render the last `limit` messages for a chat as a compact transcript for the
 // tool result. Outbound lines are marked with → so the agent can tell its own
-// replies apart from inbound.
+// replies apart from inbound; a button tap says so (DIVE-5171).
 export function formatRecent(rows: LoggedMessage[], limit: number): string {
   const slice = rows.slice(-Math.max(1, limit))
   if (!slice.length) return '(no recorded messages for this chat yet)'
   return slice
-    .map(r => `[${r.ts}] ${r.dir === 'out' ? '→ ' : ''}${r.user}: ${r.text}`)
+    .map(r => `[${r.ts}] ${r.dir === 'out' ? '→ ' : ''}${r.user}${r.via === 'button' ? ' (button tap)' : ''}: ${r.text}`)
     .join('\n')
 }
