@@ -70,8 +70,8 @@ person, wait, and finish the job yourself.
 A page verb that hits a check prints this exact command for you. Your paired owner gets
 "I'm stuck on a captcha on <site>" with an **Open <site>** button; their tap opens the box
 browser on that page and sends them a one-time link as code, from root, never through you.
-They clear the check and tap **Done**. Done closes their view and **leaves the browser
-running**, so the check stays cleared for you.
+They clear the check and tap **Done**. Done closes their view and **hands the same browser
+back to you, on that page**, so the check stays cleared for you.
 
 After the `[browser challenge] … tapped Done` message, carry on **without asking again**:
 
@@ -79,7 +79,7 @@ After the `[browser challenge] … tapped Done` message, carry on **without aski
    read the result (the listing, the sent folder, the confirmation page) before you redo it.
    Nothing is sent twice.
 2. Re-read the page you were stopped on (`5dive browser snapshot <url>`). It goes through
-   the browser the owner just used.
+   the browser profile the owner just used.
 3. Clear: continue from that step. Still a check: say so once and stop.
 
 Do not poll while you wait. Do not open the link. A flat block with nothing to click

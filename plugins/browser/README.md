@@ -108,6 +108,7 @@ reaches it through a viewer that is handed out as a **one-time, expiring, sessio
 
 ```
 5dive browser serve <site>                                   # persistent Chrome on its own Xvfb
+5dive browser serve <site> --login                           # the same, as plain Chrome for a person
 5dive browser serve <site> --stop                            # stop the browser; the profile survives
 5dive browser viewer <site> --bind=<session> [--ttl=600]     # mint a one-time link
 5dive browser viewer-redeem <site> --nonce=- --session=<id>  # the relay's gate; consumes the link
@@ -144,6 +145,24 @@ The ticket may advertise no more life than the server was given, never more.
 
 `auth` on a display-less box starts server mode instead of dead-ending. A box that does not have
 the server-mode packages still refuses — and names which ones it lacks, rather than half-starting.
+
+**The browser a person signs in through is plain Chrome, with no automation control** (DIVE-5203).
+Google refuses a sign-in typed into a browser under automation control, and the warm serve is one:
+the session daemon's Playwright launch, on `--remote-debugging-pipe`. Measured on two boxes on two
+IPs, the daemon serve was refused and plain Chrome on the same profile signed in first try. Every
+other site's "Sign in with Google" button is the same Google page, so this is not a google.com rule.
+`viewer` is the one verb every person's view goes through (the dashboard's Connect, the Telegram
+Connect tap, a hand-minted link), so it re-serves a warm browser as plain Chrome before it mints;
+`auth` and the Connect tap serve with `--login` from the start. The agents lose nothing, because
+Google gates the sign-in and not the session: once the view has ended, the next `serve` (the
+Connect "Done", an agent's command, `sudo 5dive browser serve <site>` from a brokered seat) brings
+the warm session back on the profile the person just logged in to. While the person is still in
+the view, nothing swaps the browser under them.
+
+A seat with a proxy set keeps the automated browser for the login, because plain Chrome cannot
+carry the proxy's username and password (DIVE-4951) and would sign the person in from this box's
+own IP. `viewer` and `serve --login` say so on stderr: sign-ins that check for automation will be
+refused through that seat.
 
 ### What protects the session while the viewer is open
 

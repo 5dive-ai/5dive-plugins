@@ -232,6 +232,11 @@ usage() {
   5dive browser serve <site>          # hold the session: one browser on its own Xvfb,
                                       #   held by a daemon, so commands attach to it
                                       #   instead of stopping and restarting it
+  5dive browser serve <site> --login  # the same, as plain Chrome with no automation
+                                      #   control, for a PERSON to sign in through: Google
+                                      #   (and every "Sign in with Google") refuses a
+                                      #   sign-in typed into an automated browser. `viewer`
+                                      #   does this for you.
   5dive browser serve <site> --stop   # stop the browser; the profile survives
   5dive browser evict [--idle=1800] [--dry-run]
                                       # stop served browsers nobody has used, on a
@@ -282,8 +287,8 @@ usage() {
   5dive browser connect-request <site> --challenge [--url=<page>] [--reason=<what you were doing>]
                                       # stuck on a captcha: the owner gets an "Open <site>"
                                       # button, clears the check in the box browser on that
-                                      # page, taps Done — and the browser STAYS OPEN so your
-                                      # next read of the page goes through it. You never
+                                      # page, taps Done — and that browser comes BACK TO YOU
+                                      # on the page, so your next read goes through it. You never
                                       # solve the check; you carry on after their Done.
 
   5dive browser adblock status              # is ad filtering on, and which sites is it off for
@@ -847,7 +852,7 @@ cmd_auth() {
   # without the server-mode packages gets — where it is true.
   if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
     printf 'No display here, so the browser runs on this box and you reach it through a\none-time link. Starting it:\n\n' >&2
-    cmd_serve "$site" >&2
+    cmd_serve "$site" --login >&2
     printf '\nNow ask for a viewer link (the dashboard does this for you):\n  5dive browser viewer %s --bind=<your dashboard session>\n' "$site" >&2
     return 0
   fi
@@ -3389,10 +3394,11 @@ _serve_running() {  # _serve_running <dir> -> echoes display, 0 if live
 _kv() { [[ -f "$1" ]] && sed -n "s/^$2=//p" "$1" | head -1; }
 
 cmd_serve() {
-  local site="" stop=0 start_url=""
+  local site="" stop=0 login=0 start_url=""
   while (($#)); do
     case "$1" in
       --stop) stop=1 ;;
+      --login) login=1 ;;
       --url=*) start_url="${1#*=}" ;;
       -h|--help) usage; return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
@@ -3447,9 +3453,57 @@ cmd_serve() {
     return 0
   fi
 
+  # A LOGIN VIEW IS PLAIN CHROME (DIVE-5203). Google refuses a sign-in typed
+  # into a browser under automation control, and the warm serve below IS one:
+  # the daemon's Playwright launch, --remote-debugging-pipe and all. Measured on
+  # two boxes on two IPs: refused through the daemon serve, signed in first try
+  # through plain Chrome on the same profile — and every other site's "Sign in
+  # with Google" button is the same Google page in its own profile, so this is
+  # not a google.com special case. Agents lose nothing: Google gates the
+  # SIGN-IN, not the session, and the next command after the view ends starts
+  # the warm session again on the profile the person just logged in.
+  #
+  # A PROXIED SEAT KEEPS THE DAEMON (DIVE-4951). Plain Chrome cannot carry the
+  # proxy's login, so a plain login view would sign the person in from this
+  # box's own IP — the route the proxy is there to avoid, and a new IP under a
+  # fresh login. That seat gets the automated browser WITH its proxy, and is
+  # told that Google-style sign-ins will be refused in it rather than finding
+  # out from a refusal page.
+  local plain=0 _lnote=""
+  if (( login )); then
+    if [[ -f "$(_proxy_file)" ]]; then
+      _lnote="$PROG: NOTE — $site is served for a login through this seat's proxy, which only the automated browser can carry. Sites that refuse sign-in in an automated browser (Google, and any \"Sign in with Google\") will refuse it here; this seat keeps the proxy rather than logging in from the box's own IP."
+    else
+      plain=1
+    fi
+  fi
+
   local disp
   if disp=$(_serve_running "$dir"); then
-    printf 'already serving %s on :%s\n' "$site" "$disp"; return 0
+    if (( plain )) && _daemon_live "$dir"; then
+      # The daemon is holding the profile, and Chrome allows one instance per
+      # --user-data-dir: stop it (gracefully — that is how the profile is
+      # written out) and serve again below, plain.
+      ( cmd_serve "$site" --stop >/dev/null 2>&1 ) || true
+      ! _serve_running "$dir" >/dev/null \
+        || die "$E_UNAVAILABLE" "$site is served by the session daemon and it did not stop, so it cannot be re-served as plain Chrome for a login. Nothing was changed; try again, or: 5dive browser serve $site --stop"
+      printf '%s: %s was held by the automated session; re-serving it as plain Chrome for a person to sign in.\n' "$PROG" "$site" >&2
+    elif (( ! login )) && [[ "$(_kv "$(_serve_pidfile "$dir")" login)" == 1 ]] \
+         && ! _viewer_live "$dir" && _retry_possible; then
+      # AND BACK AGAIN WHEN THE PERSON HAS GONE. A plain serve left up after
+      # its view ended (nobody tapped Done) would otherwise hold the profile
+      # with no daemon, and a brokered seat can only act THROUGH a daemon — so
+      # it would be refused until somebody stopped a browser nobody is using.
+      # Only a LOGIN serve is swapped, only with no live viewer, and only where
+      # a warm session can actually start (else this is a restart for nothing).
+      ( cmd_serve "$site" --stop >/dev/null 2>&1 ) || true
+      ! _serve_running "$dir" >/dev/null \
+        || die "$E_UNAVAILABLE" "$site is served as plain Chrome for a login and it did not stop, so the warm session cannot start. Try again, or: 5dive browser serve $site --stop"
+      printf '%s: the login view of %s has ended; re-serving it as the warm session.\n' "$PROG" "$site" >&2
+    else
+      [[ -n "$_lnote" ]] && _daemon_live "$dir" && printf '%s\n' "$_lnote" >&2
+      printf 'already serving %s on :%s\n' "$site" "$disp"; return 0
+    fi
   fi
   # (An already-running browser keeps the tab it has; --url only picks where a
   # NEW one opens. The person at the viewer can still move it themselves.)
@@ -3486,7 +3540,7 @@ cmd_serve() {
   local chrome_path; chrome_path=$(command -v "$chrome" 2>/dev/null || printf '%s' "$chrome")
   local daemon; daemon="$(_daemon_bin)"
   local dpid="" derr; derr="$(_daemon_errlog "$dir")"
-  if [[ -x "$daemon" && -z "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then
+  if (( ! plain )) && [[ -x "$daemon" && -z "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then
     local rdy="$dir/.5dive-session.ready"
     ( umask 077; : > "$rdy"; : > "$derr" ) 2>/dev/null || true
     # THE SOCKET IS THE BROKER (DIVE-4664). When it lands in the rendezvous the
@@ -3532,6 +3586,7 @@ cmd_serve() {
     _rv_offer_write "$(_seat)" "$site"
     printf 'serving %s on :%s (warm session — the profile outlives every viewer, and the browser outlives every command)\n' "$site" "$disp"
     [[ -n "$dbroker" ]] && printf '  brokered at %s — other seats on this box use THIS login, with no second login of their own\n' "$dsock"
+    [[ -n "$_lnote" ]] && printf '%s\n' "$_lnote" >&2
     return 0
   fi
 
@@ -3581,8 +3636,13 @@ cmd_serve() {
   fi
 
   ( umask 077; printf 'display=%s\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
-      "$disp" "$xpid" "$cpid" "$(date -u +%s)" > "$(_serve_pidfile "$dir")" )
-  printf 'serving %s on :%s (persistent — the profile outlives every viewer)\n' "$site" "$disp"
+      "$disp" "$xpid" "$cpid" "$(date -u +%s)" > "$(_serve_pidfile "$dir")"
+    (( plain )) && printf 'login=1\n' >> "$(_serve_pidfile "$dir")" )
+  if (( plain )); then
+    printf 'serving %s on :%s (plain Chrome for a person to sign in — no automation control; the next agent command after the view ends starts the warm session again)\n' "$site" "$disp"
+  else
+    printf 'serving %s on :%s (persistent — the profile outlives every viewer)\n' "$site" "$disp"
+  fi
 }
 
 # ------------------------------------------------------------------ the viewer
@@ -3628,6 +3688,18 @@ cmd_viewer() {
   local disp
   disp=$(_serve_running "$dir") || die "$E_UNAVAILABLE" "no browser is serving $site — start it first: 5dive browser serve $site"
   _viewer_requires
+  # A VIEW IS FOR A PERSON, SO THE BROWSER UNDER IT IS PLAIN (DIVE-5203). This
+  # is the one verb every human view goes through — the dashboard's Connect
+  # (which serves first, then mints), the owner's Telegram Connect tap, and a
+  # hand-minted link — so it is the one place the rule cannot be skipped by a
+  # caller that did not know it. A warm serve is re-served plain here; see
+  # cmd_serve --login for why, and for the proxied seat that keeps the daemon.
+  # The subshell: cmd_serve reports failure by dying (see _shot_restore).
+  if _daemon_live "$dir"; then
+    ( cmd_serve "$site" --login >/dev/null ) \
+      || die "$E_UNAVAILABLE" "$site could not be re-served as plain Chrome for a person to sign in (above), so no link was issued. The profile is untouched."
+    disp=$(_serve_running "$dir") || die "$E_UNAVAILABLE" "no browser is serving $site after re-serving it for a login — start it again: 5dive browser serve $site --login"
+  fi
 
   # Replacing a ticket revokes the previous one. Two live tickets on one profile
   # is two answers to "who is allowed in right now" — and the revoke happens
@@ -5913,10 +5985,16 @@ _connect_tap() {  # <caller> <code> <sender>
   err=$(mktemp); trap 'rm -f "$err"' EXIT
   # serve first, so an existing profile resolves the way it always has; auth
   # only when serve says there is no profile, then serve once more (DIVE-4895).
-  rc=0; _connect_as_box serve "$site" "${at[@]}" >/dev/null 2>"$err" || rc=$?
+  # --login (DIVE-5203): a person is about to use this browser, so it is plain
+  # Chrome — for a captcha as much as for a sign-in, since the checks that refuse
+  # an automated browser's login are the same ones that keep re-asking it.
+  rc=0; _connect_as_box serve "$site" --login "${at[@]}" >/dev/null 2>"$err" || rc=$?
   if (( rc != 0 )) && grep -q '\bno profile for\b' "$err"; then
     rc=0; _connect_as_box auth "$site" >/dev/null 2>"$err" || rc=$?
-    (( rc == 0 )) && { rc=0; _connect_as_box serve "$site" "${at[@]}" >/dev/null 2>"$err" || rc=$?; }
+    # auth on a display-less box serves the site's FRONT page itself, and a
+    # running browser keeps its tab; a captcha view must open on the stopped page.
+    (( rc == 0 && ${#at[@]} )) && { _connect_as_box serve "$site" --stop >/dev/null 2>&1 || true; }
+    (( rc == 0 )) && { rc=0; _connect_as_box serve "$site" --login "${at[@]}" >/dev/null 2>"$err" || rc=$?; }
   fi
   (( rc == 0 )) || die "$E_UNAVAILABLE" "the browser for $site did not start: $(tail -1 "$err")"
 
@@ -5950,8 +6028,8 @@ _connect_tap() {  # <caller> <code> <sender>
 
   done_code=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
   f=$(_connect_file "$done_code")
-  ( umask 077; printf 'op=done\nseat=%s\nsite=%s\nexpires_at=%s\nkind=%s\n' \
-      "$caller" "$site" "$(( $(date -u +%s) + CONNECT_DONE_TTL ))" "$kind" > "$f" )
+  ( umask 077; printf 'op=done\nseat=%s\nsite=%s\nexpires_at=%s\nkind=%s\nurl=%s\n' \
+      "$caller" "$site" "$(( $(date -u +%s) + CONNECT_DONE_TTL ))" "$kind" "$CONNECT_URL" > "$f" )
   printf 'site=%s\nurl=https://%s%s\nexpires=%s\ndone=%s\nkind=%s\n' \
     "$site" "$host" "$path" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)" "$done_code" "$kind"
 }
@@ -5962,14 +6040,21 @@ _connect_done() {  # <caller> <code> <sender>
   site="$CONNECT_SITE"
   _valid_site "$site" || die "$E_PERM" "the request names no usable site"
   if [[ "$CONNECT_KIND" == challenge ]]; then
-    # DIVE-5200: a cleared check lives in THAT browser (the clearance cookie, and
-    # for a check inside a form, the page itself), so Done closes the person's
-    # view and leaves the browser running for the agent to carry on in. No
-    # probe: a served profile cannot be probed, and whether the page is clear is
-    # the agent's own next read of it, not a login verdict.
+    # DIVE-5200: a cleared check lives in THIS profile (the clearance cookie), so
+    # Done closes the person's view and hands the same profile back to the agent
+    # — no probe: whether the page is clear is the agent's own next read of it,
+    # not a login verdict. The person used plain Chrome (DIVE-5203), which an
+    # agent cannot drive, so a plain serve now swaps it back for the warm session
+    # (cmd_serve: a login serve with no live view), opened on the stopped page.
+    # Doing it here rather than on the agent's next command is what lets a
+    # brokered seat, which cannot serve, carry on at all.
+    local st="the view is closed and the browser is back in the agent's hands, on the page it stopped at"
     _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
-    printf 'site=%s\nkind=challenge\nstatus_rc=0\nstatus=%s\n' "$site" \
-      "the view is closed and the browser is still open, so the agent carries on in it"
+    local -a at=()
+    _connect_page_ok "$site" "$CONNECT_URL" && at=("--url=$CONNECT_URL")
+    _connect_as_box serve "$site" "${at[@]}" >/dev/null 2>&1 \
+      || st="the view is closed; the browser did not restart for the agent, so its next command starts it (the cleared check is kept in the profile)"
+    printf 'site=%s\nkind=challenge\nstatus_rc=0\nstatus=%s\n' "$site" "$st"
     return 0
   fi
   # revoke -> stop -> probe, in that order: a served profile cannot be probed

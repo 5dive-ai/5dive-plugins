@@ -65,7 +65,8 @@ case "$1" in
   serve)
     if [[ -f "$FAKE_CTL.noprofile" && ! -f "$FAKE_CTL.authed" ]]; then
       echo "browser: no profile for $2 — 5dive browser auth $2" >&2; exit 69
-    fi ;;
+    fi
+    [[ -f "$FAKE_CTL.servefail" && "$*" != *--login* && "$*" != *--stop* ]] && { echo "browser: the warm session did not start" >&2; exit 69; } ;;
   auth) : >"$FAKE_CTL.authed" ;;
   viewer)
     [[ -f "$FAKE_CTL.badpath" ]] && { echo "not-a-path"; echo "one-time, expires 2099-01-01T00:00:00Z, bound to session x." >&2; exit 0; }
@@ -97,7 +98,7 @@ export FIVEDIVE_BROWSER_CONNECT_PRIV="$BROWSER"
 export FAKE_LOG="$TMP/fake.log" FAKE_CTL="$TMP/ctl"
 
 priv() { printf '%s\0' "$@" | "$BROWSER" _connect; }
-reset() { : >"$TMP/stub.log"; : >"$FAKE_LOG"; rm -f "$TMP"/ctl.{noprofile,authed,bind500,tgfail,badpath}; }
+reset() { : >"$TMP/stub.log"; : >"$FAKE_LOG"; rm -f "$TMP"/ctl.{noprofile,authed,bind500,tgfail,badpath,servefail}; }
 binds() { grep -c '"/shell/browser-viewer-bind"' "$TMP/stub.log" 2>/dev/null || true; }
 last_code() { jq -r 'select(.path|test("sendMessage")) | .form.reply_markup' "$TMP/stub.log" | tail -1 | jq -r '.inline_keyboard[0][0].callback_data' | sed 's/^bconn://'; }
 
@@ -147,6 +148,9 @@ reset
 out=$(priv tap "$CODE" "$OWNER" 2>&1); rc=$?
 t  "T1 the owner's tap succeeds (refused taps did not burn it)" 0 "$rc"
 t  "T2 serve then viewer, as the relay would" "serve booking.com|viewer" "$(head -2 "$FAKE_LOG" | cut -d' ' -f1,2 | tr '\n' '|' | sed 's/|$//' | sed 's/^serve booking.com|viewer.*/serve booking.com|viewer/')"
+# DIVE-5203: the browser a person signs in through is plain Chrome, so the tap
+# serves it that way from the start instead of starting a daemon to stop it.
+t  "T2 ... and the serve is for a login" "serve booking.com --login" "$(head -1 "$FAKE_LOG")"
 bindrec=$(jq -c 'select(.path=="/shell/browser-viewer-bind")' "$TMP/stub.log")
 t  "T3 exactly one bind registered" 1 "$(binds)"
 t  "T3 ... with the connectord token" "Bearer connectord-secret-token-0123456789" "$(jq -r '.auth' <<<"$bindrec")"
@@ -231,8 +235,9 @@ t  "Q5 the reason is capped" 1 "$(( $(sed -n 's/^Why: //p' <<<"$txt" | wc -c) <=
 # The same rails as Connect — the owner's tap is the authorisation, the link goes
 # out from root as code — with three differences: the message says what is
 # blocking and where, the browser opens on the page the agent was stopped on,
-# and Done closes the view but LEAVES THE BROWSER RUNNING so the agent's next
-# read of the page goes through the browser the check was cleared in.
+# and Done closes the view and HANDS THE BROWSER BACK (the person's plain Chrome
+# swapped for the warm session, DIVE-5203, on the same page) so the agent's next
+# read of the page goes through the profile the check was cleared in.
 reset; rm -rf "$TMP/req"/*
 PAGE="https://futuretools.io/submit-a-tool?ref=x"
 out=$("$BROWSER" connect-request futuretools.io --challenge --url="$PAGE" --reason="submitting 5dive to the directory" 2>&1); rc=$?
@@ -253,7 +258,7 @@ t  "C4 only the paired owner can open it" 77 "$rc"
 reset
 out=$(priv tap "$CCODE" "$OWNER" 2>&1); rc=$?
 t  "C5 the owner's tap succeeds" 0 "$rc"
-t  "C5 the browser opens ON THE PAGE the agent was stopped on" "serve futuretools.io --url=$PAGE" "$(head -1 "$FAKE_LOG")"
+t  "C5 the browser opens ON THE PAGE the agent was stopped on, as plain Chrome for a person" "serve futuretools.io --login --url=$PAGE" "$(head -1 "$FAKE_LOG")"
 t  "C5 exactly one bind" 1 "$(binds)"
 tc "C5 the link and a kind come back to the plugin" "kind=challenge" "$out"
 tc "C5 ... the one-time link" "url=https://box.example.5dive.ai/browser/viewer/futuretools.io/" "$out"
@@ -263,15 +268,15 @@ out=$(priv done "$CDONE" 999999 2>&1); rc=$?
 t  "C6 another person cannot press Done" 77 "$rc"
 out=$(priv done "$CDONE" "$OWNER" 2>&1); rc=$?
 t  "C7 the owner's Done succeeds" 0 "$rc"
-t  "C7 Done REVOKES the view and nothing else: no stop, no probe" "viewer-revoke futuretools.io" "$(tr '\n' '|' <"$FAKE_LOG" | sed 's/|$//')"
-tc "C7 the verdict says the browser is still open for the agent" "status=the view is closed and the browser is still open" "$out"
+t  "C7 Done REVOKES the view, then serves the page back for the agent: no stop, no probe" "viewer-revoke futuretools.io|serve futuretools.io --url=$PAGE" "$(tr '\n' '|' <"$FAKE_LOG" | sed 's/|$//')"
+tc "C7 the verdict says the browser is back with the agent" "status=the view is closed and the browser is back in the agent's hands" "$out"
 tc "C7 ... and is a challenge verdict" "kind=challenge" "$out"
 out=$(priv done "$CDONE" "$OWNER" 2>&1); rc=$?
 t  "C8 Done is one-shot" 77 "$rc"
 # no --url: the site's own page
 reset; "$BROWSER" connect-request futuretools.io --challenge >/dev/null 2>&1; CCODE=$(last_code); : >"$FAKE_LOG"
 out=$(priv tap "$CCODE" "$OWNER" 2>&1); rc=$?
-t  "C9 no --url opens the site's own front page" "serve futuretools.io --url=https://futuretools.io/" "$(head -1 "$FAKE_LOG")"
+t  "C9 no --url opens the site's own front page" "serve futuretools.io --login --url=https://futuretools.io/" "$(head -1 "$FAKE_LOG")"
 # the page must be ON the site
 reset
 for bad in "https://evil.example/futuretools.io" "javascript:alert(1)" "https://futuretools.io.evil.example/" "file:///etc/passwd" "https://futuretools.io/a b"; do
@@ -296,6 +301,26 @@ t  "C13 ... or any bind" 0 "$(binds)"
 # serve --url itself only opens pages of the site
 out=$("$BROWSER" serve futuretools.io --url=https://evil.example/ 2>&1); rc=$?
 t  "C14 serve --url refuses a page of another site" 64 "$rc"
+# a site with no profile yet: auth serves the FRONT page itself, so the tap stops
+# that browser and serves again ON the stopped page (DIVE-5203 merge)
+reset; "$BROWSER" connect-request futuretools.io --challenge --url="$PAGE" >/dev/null 2>&1; CCODE=$(last_code); : >"$TMP/ctl.noprofile"; : >"$FAKE_LOG"
+out=$(priv tap "$CCODE" "$OWNER" 2>&1); rc=$?
+t  "C15 no profile: the tap succeeds" 0 "$rc"
+t  "C15 ... auth, stop its front-page browser, serve plain on the stopped page, then the view" \
+   "serve futuretools.io --login --url=$PAGE|auth futuretools.io|serve futuretools.io --stop|serve futuretools.io --login --url=$PAGE|viewer futuretools.io" \
+   "$(cut -d' ' -f1-4 <"$FAKE_LOG" | sed 's/ --bind=.*//' | tr '\n' '|' | sed 's/|$//')"
+CDONE=$(sed -n 's/^done=//p' <<<"$out")
+# a Done whose stored page was tampered off the site hands back the front page, not that page
+f="$TMP/req/$(printf '%s' "$CDONE" | sha256sum | cut -d' ' -f1)"; sed -i 's|^url=.*|url=https://evil.example/|' "$f"; : >"$FAKE_LOG"
+out=$(priv done "$CDONE" "$OWNER" 2>&1); rc=$?
+t  "C16 a Done with a tampered page still closes the view" 0 "$rc"
+t  "C16 ... and serves the site back with NO foreign page" "viewer-revoke futuretools.io|serve futuretools.io" "$(tr '\n' '|' <"$FAKE_LOG" | sed 's/|$//')"
+# the hand-back fails: Done still succeeds (the view is closed) and says what happens next
+reset; "$BROWSER" connect-request futuretools.io --challenge --url="$PAGE" >/dev/null 2>&1; CCODE=$(last_code)
+out=$(priv tap "$CCODE" "$OWNER" 2>&1); CDONE=$(sed -n 's/^done=//p' <<<"$out"); : >"$TMP/ctl.servefail"; : >"$FAKE_LOG"
+out=$(priv done "$CDONE" "$OWNER" 2>&1); rc=$?
+t  "C17 a failed hand-back is still a closed view" 0 "$rc"
+tc "C17 ... and the verdict says the agent's next command starts it, with the check kept" "its next command starts it (the cleared check is kept in the profile)" "$out"
 
 # ---- H: the page hint (DIVE-5200) — the public profile is never probed, so a
 # captcha interstitial there is named on the way out, keyed on the TITLE only.

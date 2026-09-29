@@ -15,7 +15,7 @@ type Entity = { type: 'code'; offset: number; length: number }
 export type ConnectTap = { op: 'tap' | 'done'; code: string }
 
 // DIVE-5200: 'challenge' is the agent stuck on a captcha. Same rails, different
-// words, and Done leaves the browser running for the agent instead of probing.
+// words, and Done hands the browser back to the agent instead of probing.
 export type ConnectKind = 'login' | 'challenge'
 
 export type ConnectLink = { site: string; url: string; expires: string; done: string; kind: ConnectKind }
@@ -114,7 +114,7 @@ export function connectAgentNote(kind: 'opened' | 'verdict', site: string, detai
   if (what === 'challenge') {
     return kind === 'opened'
       ? `[browser challenge] The owner tapped Open for ${site}. The one-time link was sent to them. Wait for their Done; do not open the link, and do not touch ${site} until then.`
-      : `[browser challenge] The owner cleared the check on ${site} and tapped Done. The box browser for ${site} is still open with it cleared. ` +
+      : `[browser challenge] The owner cleared the check on ${site} and tapped Done. The box browser for ${site} is back in your hands, on that page, with the check cleared. ` +
           `Carry on with the task now, without asking them again: first check what already happened (did the step you were on go through?) so nothing is sent twice, ` +
           `then re-read the page you were stopped on (5dive browser snapshot <that url>) and continue from that step. ` +
           `If the check is still there, say so once and stop; never try to solve it.`

@@ -9,7 +9,7 @@
 //      hook registrations are pinned to the 0.5.64 release's bytes; every place the code
 //      reads the profile is a guard of a known shape; and the one shared send
 //      helper that grew a parameter posts the same body when it is not passed.
-//   2. LITE = THE AGREED SURFACE (oinoa's list on the row): six localized
+//   2. LITE = THE AGREED SURFACE (oinoa's list on the row): four localized
 //      commands, org commands unreachable, consumer instructions, and no
 //      client-visible string that names the platform or carries an emoji.
 //
@@ -184,7 +184,7 @@ const SAMPLE_ALLOWANCES: Allowance[] = [
 function clientVisible(lang: Lang): string[] {
   const s = LITE_STRINGS[lang]
   const out: string[] = [
-    s.newDone, s.stopDone, s.failed, s.accountPrompt, s.accountButton, s.helpQuestions,
+    s.failed, s.accountPrompt, s.accountButton, s.helpQuestions,
     ...Object.values(s.menu),
     liteHelpBody(lang, { account: true }),
     liteHelpBody(lang, { account: false }),
@@ -197,29 +197,31 @@ const EMOJI = /\p{Extended_Pictographic}/u
 const leaks = (strings: string[]) => strings.filter(t => LEAK.test(t) || EMOJI.test(t))
 
 describe('lite = the surface oinoa agreed', () => {
-  test('the / menu is exactly the six commands, in both languages', () => {
+  test('the / menu is exactly the four commands, in both languages (DIVE-5173 dropped /new and /stop)', () => {
     for (const lang of ['ru', 'en'] as const) {
-      expect(liteMenu(lang, { account: true }).map(c => c.command)).toEqual(['start', 'new', 'stop', 'usage', 'account', 'help'])
+      expect(liteMenu(lang, { account: true }).map(c => c.command)).toEqual(['start', 'usage', 'account', 'help'])
       // no cabinet URL on the box → no button that goes nowhere
-      expect(liteMenu(lang, { account: false }).map(c => c.command)).toEqual(['start', 'new', 'stop', 'usage', 'help'])
+      expect(liteMenu(lang, { account: false }).map(c => c.command)).toEqual(['start', 'usage', 'help'])
     }
-    expect(liteMenu('ru', { account: true }).map(c => c.description)).toEqual(['Начать', 'Новый разговор', 'Остановить', 'Лимит', 'Мой кабинет', 'Помощь'])
-    expect(liteMenu('en', { account: true }).map(c => c.description)).toEqual(['Start', 'New conversation', 'Stop', 'Allowance', 'My account', 'Help'])
+    expect(liteMenu('ru', { account: true }).map(c => c.description)).toEqual(['Начать', 'Лимит', 'Мой кабинет', 'Помощь'])
+    expect(liteMenu('en', { account: true }).map(c => c.description)).toEqual(['Start', 'Allowance', 'My account', 'Help'])
   })
 
   test('every org command is unreachable: it routes to the /help reply', () => {
-    const orgOnly = COMMAND_REGISTRY.map(c => c.name).filter(n => !(LITE_COMMANDS as readonly string[]).includes(n) && n !== 'clear')
-    expect(orgOnly.length).toBe(18) // 19 until DIVE-5164 removed /council from the registry
+    const orgOnly = COMMAND_REGISTRY.map(c => c.name).filter(n => !(LITE_COMMANDS as readonly string[]).includes(n))
+    // 18 plus /stop and /clear, which DIVE-5173 took out of lite (19 → 18 was DIVE-5164's /council)
+    expect(orgOnly.length).toBe(20)
+    expect(orgOnly).toContain('stop')
+    expect(orgOnly).toContain('clear')
     for (const n of orgOnly) expect(liteRoute(`/${n}`)).toBe('help')
     for (const n of ['task_12', 'nudges', 'whatever', 'login', 'status', 'council']) expect(liteRoute(`/${n}`)).toBe('help')
   })
 
-  test('the six route to themselves; /clear is a hidden alias of /new; chat is not a command', () => {
+  test('the four route to themselves; /new, /clear and /stop get /help (DIVE-5173); chat is not a command', () => {
     for (const c of LITE_COMMANDS) expect(liteRoute(`/${c}`)).toBe(c)
     expect(liteRoute('/start ref_abc123')).toBe('start')
-    expect(liteRoute('/NEW@MayaBot')).toBe('new')
-    expect(liteRoute('/clear')).toBe('new')
-    expect(liteMenu('en', { account: true }).some(c => c.command === 'clear')).toBe(false)
+    for (const t of ['/new', '/NEW@MayaBot', '/clear', '/stop', '/stop@MayaBot now']) expect(liteRoute(t)).toBe('help')
+    for (const c of ['new', 'clear', 'stop']) expect(liteMenu('en', { account: true }).some(m => m.command === c)).toBe(false)
     for (const t of ['hello', '', ' /new', 'what does /usage say?', undefined]) expect(liteRoute(t)).toBeNull()
   })
 
@@ -267,7 +269,21 @@ describe('lite = the surface oinoa agreed', () => {
       expect(LITE_INSTRUCTIONS).not.toContain(operator)
     for (const needed of ['reply tool', 'download_attachment', 'recent_messages', 'image_path', 'chat_id', '/start', 'Never use emoji'])
       expect(LITE_INSTRUCTIONS).toContain(needed)
-    expect(LITE_INSTRUCTIONS).not.toMatch(/5dive/i)
+    // the one command the agent runs is the only place the brand may appear (DIVE-5168)
+    expect(LITE_INSTRUCTIONS.replaceAll('`5dive partner hire <slug>`', '')).not.toMatch(/5dive/i)
+  })
+
+  test('DIVE-5168: lite instructions carry the hire-a-colleague rule; the default block does not', () => {
+    expect(LITE_INSTRUCTIONS).toContain('run `5dive partner hire <slug>`')
+    expect(LITE_INSTRUCTIONS).toContain('ask them to confirm. Only after a clear yes')
+    expect(LITE_INSTRUCTIONS).toContain('Never hire without that yes, and never hire more than the one they confirmed.')
+    expect(LITE_INSTRUCTIONS).toContain('is not available')
+    const lines = SERVER.split('\n')
+    const start = lines.indexOf('    instructions: [')
+    const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
+    const block = lines.slice(start + 1, end).join('\n')
+    expect(block).not.toContain('partner hire')
+    expect(block).not.toContain('colleague')
   })
 
   test('the question bridge drops its emoji lead in lite', () => {

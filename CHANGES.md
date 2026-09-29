@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Added — stuck on a captcha, the agent asks the owner and then carries on (DIVE-5200), browser 1.24.0, telegram 0.5.70
+### Added — stuck on a captcha, the agent asks the owner and then carries on (DIVE-5200), browser 1.24.0, telegram 0.5.75
 
 An agent's browser task used to end at the first captcha, and a person had to restart the job.
 Now `5dive browser connect-request <site> --challenge --url=<page>` sends the paired owner
@@ -9,10 +9,14 @@ Now `5dive browser connect-request <site> --challenge --url=<page>` sends the pa
 code, and only the paired owner's tap through the same seat counts.
 
 - The box browser opens on the page the agent was stopped on (`serve --url=`, a page of that
-  site only; checked by the agent verb, again by root, and again by `serve`).
-- The owner clears the check and taps **Done — carry on**. Done closes the view and leaves the
-  browser running (no stop, no probe), so the cleared check is still there when the agent
-  re-reads the page through it.
+  site only; checked by the agent verb, again by root, and again by `serve`). It opens as plain
+  Chrome, like every view a person uses (DIVE-5203): the checks that refuse an automated
+  browser's sign-in are the same ones that keep re-asking it.
+- The owner clears the check and taps **Done — carry on**. Done closes the view, with no probe,
+  and hands the same profile back to the agent: the plain browser is swapped back for the warm
+  session, opened on the stopped page, so the cleared check (its cookie) is there when the agent
+  re-reads the page. Done does it rather than the agent's next command, because a seat that uses
+  the box's browser through the broker cannot start one itself.
 - The agent's session is told to carry on without asking again, to check first that the step
   it was on did not already go through, and never to try to solve a check.
 - A page verb whose render is titled like a check ("Just a moment…", "Verify you are human")
@@ -21,6 +25,66 @@ code, and only the paired owner's tap through the same seat counts.
 - 5dive still never solves or bypasses a challenge. A person does it.
 
 `tests/browser_connect_request_unit.sh` (C and H arms) and `test/dive5200-captcha-handoff.test.ts`.
+
+### Changed — a lite client bot has four commands and greets from its pack (DIVE-5173), telegram 0.5.73
+
+Three owner asks for partner client bots (`TELEGRAM_PROFILE=lite`), one release. The default
+profile is unchanged: its menu, instructions and hook pins, and the guard ratchet on every read of
+the profile, all pass as before.
+
+- `/new`, its hidden alias `/clear`, and `/stop` are gone. The menu is `start`, `usage`, `account`
+  (when the box has an account URL) and `help`. Those three now get the `/help` reply, like any
+  other command not on the list, and nothing sends `/clear` or Ctrl-C to the agent's session any
+  more. A client can no longer wipe the conversation or interrupt a turn from the chat; the
+  context still compacts on its own.
+- A bare `/start` is answered at once with the pack's welcome, with no model turn, in the client's
+  language. The text is `ext.5dive.welcome.en` / `.ru` in the agent's `persona.yaml` (the one pack
+  file `agent import` keeps on the box, at `~/.claude/persona.yaml`; the OpenAgent schema is closed
+  everywhere but `ext`). It is logged like a reply, so `recent_messages` shows the greeting. A
+  `/start` with a deep-link payload still goes to the model after the welcome. With no welcome for
+  that language, or no readable persona, the model greets as before.
+
+`test/dive5173-lite-welcome.test.ts` covers the welcome reader against real YAML, the `/start`
+order and the removed arm, with mutants that turn each check red.
+
+### Added — a lite client asks its agent to hire a colleague (DIVE-5168), telegram 0.5.72
+
+A partner client can now say "hire me a designer" in the chat. `LITE_INSTRUCTIONS` gets one
+paragraph: the agent names the colleague back in one short line, hires only after a clear yes by
+running `5dive partner hire <slug>` (its own command, never shown to the client), tells the client the
+colleague will appear in a minute, says "not available" if the catalogue has no such colleague, and
+never hires more than the one confirmed.
+
+**Unchanged:** the default profile's instructions, byte for byte. The lite "no 5dive in the
+instructions" checks now allow that one command and nothing else.
+
+### Fixed — a person signs in through plain Chrome, so Google stops refusing the login (DIVE-5203), browser 1.23.2
+
+Connect google.com, and every site's "Sign in with Google", was refused whatever the person did:
+the view showed the warm serve, which is the session daemon's Playwright launch
+(`--remote-debugging-pipe`), and Google refuses a sign-in typed into a browser under automation
+control. It was not the box IP: the same refusal on two boxes, and plain Chrome on the same profile
+signed in first try.
+
+- `viewer` re-serves a warm browser as plain Chrome (no `--remote-debugging-*`) before it mints.
+  Every person's view goes through it: the dashboard's Connect, the Telegram Connect tap and a
+  hand-minted link, so no caller has to know the rule.
+- New `serve <site> --login` does the same on purpose. `auth` on a display-less box and the Connect
+  tap use it, so they do not start a daemon only to stop it again.
+- Once nobody is in the view, the next plain `serve` swaps the login browser back for the warm
+  session, so a brokered seat is not left behind a browser nobody is using. A box that cannot start
+  a daemon keeps the plain one rather than restarting it for nothing.
+- A seat with a proxy set keeps the daemon for the login, because plain Chrome cannot carry the
+  proxy's login and would sign in from the box's own IP (DIVE-4951). It says so on stderr.
+
+### Fixed — a lite client bot never asks the client for a key when a voice reply fails (DIVE-5162), telegram 0.5.70
+
+On a partner client box, a voice reply failed and the client's agent then changed the box's voice
+settings itself and asked the client to type in a key and to agree to their text leaving the
+machine. `LITE_INSTRUCTIONS` now carries one consumer-worded line: answer voice messages; if a
+voice reply does not work, answer in text and say only that; never ask the client to pick a
+setting, give a key or password, or agree to send anything elsewhere; never change voice settings
+yourself. Default profile unchanged — the line is in the lite block only.
 
 ### Fixed — Chrome's temp files no longer pile up in /tmp (DIVE-5190), browser 1.23.1
 

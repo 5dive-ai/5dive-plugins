@@ -27,6 +27,21 @@ VOICE_DEFAULT_TTS_MODEL="${VOICE_DEFAULT_TTS_MODEL:-microsoft/mai-voice-2-flash}
 VOICE_DEFAULT_TTS_VOICE="${VOICE_DEFAULT_TTS_VOICE:-alloy}"
 VOICE_DEFAULT_EDGE_VOICE="${VOICE_DEFAULT_EDGE_VOICE:-en-US-AriaNeural}"
 
+# DIVE-5162: an agent speaks in its OWN character's voice. OpenAgent packs carry
+# voice.audio {base, style}, and the base names are Gemini TTS's prebuilt voices
+# (Charon, Kore, Puck, Sulafat, Achird, ...), which only a Gemini TTS model
+# knows — so a persona voice is spoken on this model whatever tts_model says.
+# tts_model/tts_voice stay the box default for an agent that carries no voice.
+VOICE_DEFAULT_PERSONA_TTS_MODEL="${VOICE_DEFAULT_PERSONA_TTS_MODEL:-google/gemini-3.8-flash-tts}"
+# The installed persona of the agent that is CALLING: `agent import` puts it at
+# ~/.claude/persona.yaml of the agent's own unix user, and a seat runs its tools
+# as that user, so the caller's home is the only lookup there is.
+VOICE_PERSONA_FILE="${VOICE_PERSONA_FILE:-${CLAUDE_CONFIG_DIR:-${HOME:-/nonexistent}/.claude}/persona.yaml}"
+# The account a partner build seeds its per-box key into (5dive-api
+# partner-box.ts SEEDED_ACCOUNT = "openrouter"). Read last, after every
+# connector file, so a box that holds a connector key behaves exactly as before.
+VOICE_SEEDED_ACCOUNT_ENV="${VOICE_SEEDED_ACCOUNT_ENV:-${STATE_DIR:-/var/lib/5dive}/auth-profiles/openrouter/combined.env}"
+
 # voice_config_get <key> [<default>] — reads one key=value line. Never sourced:
 # this file is root-written but a `.` of a config file is still an eval, and the
 # format has no need for one.
@@ -47,6 +62,41 @@ voice_backend_configured() {
 voice_stt_model() { voice_config_get stt_model "$VOICE_DEFAULT_STT_MODEL"; }
 voice_tts_model() { voice_config_get tts_model "$VOICE_DEFAULT_TTS_MODEL"; }
 voice_tts_voice() { voice_config_get tts_voice "$VOICE_DEFAULT_TTS_VOICE"; }
+voice_persona_tts_model() { voice_config_get persona_tts_model "$VOICE_DEFAULT_PERSONA_TTS_MODEL"; }
+
+# voice_tts_format <model> — the response_format a speaking model accepts.
+# Gemini TTS answers ONLY raw PCM (16-bit little-endian, 24 kHz, mono) and
+# rejects "mp3" with a 400, measured on OpenRouter 2026-09-29. Every other
+# model keeps the mp3 it has always been asked for.
+voice_tts_format() {
+  case "$1" in google/gemini*) printf 'pcm\n' ;; *) printf 'mp3\n' ;; esac
+}
+
+# voice_persona_audio — the calling agent's voice.audio, as two lines: the base
+# voice name, then the style (one line, may be empty). Returns 1 — and the
+# caller uses the box default — when there is no persona, it does not parse, or
+# its base is not a plain voice name. Never an error: a pack without a voice is
+# the ordinary case, not a fault.
+voice_persona_audio() {
+  [[ -r "$VOICE_PERSONA_FILE" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  VOICE_PERSONA_FILE="$VOICE_PERSONA_FILE" python3 - 2>/dev/null <<'PY'
+import os, re, sys
+try:
+    import yaml
+    with open(os.environ["VOICE_PERSONA_FILE"]) as f:
+        d = yaml.safe_load(f) or {}
+    a = (d.get("voice") or {}).get("audio") or {}
+    base = a.get("base")
+    style = a.get("style")
+except Exception:
+    sys.exit(1)
+if not isinstance(base, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", base.strip()):
+    sys.exit(1)
+print(base.strip())
+print(" ".join(style.split())[:500] if isinstance(style, str) else "")
+PY
+}
 
 # voice_openrouter_key — the box's existing OpenRouter credential. No new secret
 # store (DIVE-4439 scope line). Canonical name is openrouter.env (the shape
@@ -67,6 +117,16 @@ voice_openrouter_key() {
     [[ -z "$k" ]] && k=$(grep -oE 'sk-[A-Za-z0-9_-]{20,}' "$f" 2>/dev/null | head -1)
     if [[ -n "$k" ]]; then printf '%s\n' "$k"; return 0; fi
   done
+  # DIVE-5162: a partner box has no connector key — its build seeds the box's
+  # capped key into the `openrouter` account its agents answer on, and nowhere
+  # else, so voice there had no key at all. Read that account's token, and only
+  # when the account really points at OpenRouter.
+  f="$VOICE_SEEDED_ACCOUNT_ENV"
+  if [[ -r "$f" ]] && grep -qE '^ANTHROPIC_BASE_URL=.?https://openrouter\.ai/' "$f" 2>/dev/null; then
+    k=$(grep -m1 '^ANTHROPIC_AUTH_TOKEN=' "$f" 2>/dev/null | cut -d= -f2-)
+    k="${k%\"}"; k="${k#\"}"; k="${k%\'}"; k="${k#\'}"
+    if [[ "$k" =~ ^sk-or-[A-Za-z0-9_-]{8,200}$ ]]; then printf '%s\n' "$k"; return 0; fi
+  fi
   return 1
 }
 

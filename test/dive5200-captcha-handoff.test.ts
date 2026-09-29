@@ -17,7 +17,7 @@ import {
 const DONE = 'd'.repeat(48)
 const URL = `https://box.example.5dive.ai/browser/viewer/futuretools.io/${'a'.repeat(64)}`
 const TAP_OK = `site=futuretools.io\nurl=${URL}\nexpires=2026-09-29T15:00:00Z\ndone=${DONE}\nkind=challenge\n`
-const DONE_OK = `site=futuretools.io\nkind=challenge\nstatus_rc=0\nstatus=the view is closed and the browser is still open, so the agent carries on in it\n`
+const DONE_OK = `site=futuretools.io\nkind=challenge\nstatus_rc=0\nstatus=the view is closed and the browser is back in the agent's hands, on the page it stopped at\n`
 
 describe('the kind rides root\'s answer', () => {
   test('a challenge link parses as a challenge', () => {
@@ -64,7 +64,7 @@ describe('what the agent is told', () => {
     expect(n).toContain('without asking them again')
     expect(n).toContain('nothing is sent twice')
     expect(n).toContain('never try to solve it')
-    expect(n).toContain('still open')
+    expect(n).toContain('back in your hands')
   })
   test('a login note is unchanged', () => {
     expect(connectAgentNote('opened', 'booking.com')).toContain('[browser connect] The owner tapped Connect for booking.com')

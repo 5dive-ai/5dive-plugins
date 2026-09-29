@@ -26,7 +26,8 @@ describe('the lite instructions carry the ack-first rule', () => {
     expect(LITE_INSTRUCTIONS).toContain('A quick question gets one reply')
     expect(LITE_INSTRUCTIONS).toContain('Never go quiet on a request.')
     // consumer wording: none of the operator ack machinery leaks in
-    for (const operator of ['edit_message', '30s', 'progress', '5dive']) expect(LITE_INSTRUCTIONS).not.toContain(operator)
+    for (const operator of ['edit_message', '30s', 'progress']) expect(LITE_INSTRUCTIONS).not.toContain(operator)
+    expect(LITE_INSTRUCTIONS.replaceAll('`5dive partner hire <slug>`', '')).not.toContain('5dive')
   })
 })
 
