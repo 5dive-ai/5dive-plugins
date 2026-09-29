@@ -3428,7 +3428,8 @@ cmd_serve() {
 
   # -nolisten tcp: the display is a unix socket and nothing else. An X server on
   # a TCP port is an unauthenticated remote keyboard for every seat on the box.
-  Xvfb ":$disp" -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
+  # DIVE-5190: every child below that outlives this command owns its own TMPDIR.
+  _tmp_exec Xvfb ":$disp" -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
   local xpid=$!
   local waited=0
   while ! _display_socket "$disp" && (( waited < 300 )); do waited=$(( waited + 1 )); sleep 0.05; done
@@ -3465,7 +3466,7 @@ cmd_serve() {
     # so a warm serve opens the SITE and not about:blank (DIVE-4944).
     DISPLAY=":$disp" FIVEDIVE_BROWSER_CHROME="$chrome_path" \
       FIVEDIVE_BROWSER_START_URL="$(_site_url "$site")" \
-      "$daemon" serve "$dir" "$dsock" $dbroker >"$rdy" 2>"$derr" &
+      _tmp_exec "$daemon" serve "$dir" "$dsock" $dbroker >"$rdy" 2>"$derr" &
     dpid=$!
     # READY IS A LINE THE DAEMON PRINTS WHEN THE CONTEXT IS OPEN AND THE SOCKET
     # IS ACCEPTING — not when bash got a pid back. 30s is a ceiling and not a
@@ -3513,7 +3514,7 @@ cmd_serve() {
   # profile, like everything else here.
   local errlog; errlog="$dir/.5dive-serve.err"
   ( umask 077; : > "$errlog" ) 2>/dev/null || true
-  DISPLAY=":$disp" "$chrome" --user-data-dir="$dir" --no-first-run \
+  DISPLAY=":$disp" _tmp_exec "$chrome" --user-data-dir="$dir" --no-first-run \
       --no-default-browser-check --window-size=1280,800 \
       --disable-features=TranslateUI "$(_site_url "$site")" >/dev/null 2>"$errlog" &
   local cpid=$!
@@ -3630,10 +3631,10 @@ cmd_viewer() {
   # life than the VNC server was actually given. Lengthening -timeout instead would
   # have kept a viewer accepting a client after its own ticket had expired.
   local clock0; clock0=$(date -u +%s)
-  x11vnc -display ":$disp" -localhost -once -rfbport "$vncport" \
+  _tmp_exec x11vnc -display ":$disp" -localhost -once -rfbport "$vncport" \
          -timeout "$ttl" -passwdfile "$pwfile" >/dev/null 2>&1 &
   local vncpid=$!
-  websockify "127.0.0.1:$port" "127.0.0.1:$vncport" >/dev/null 2>&1 &
+  _tmp_exec websockify "127.0.0.1:$port" "127.0.0.1:$vncport" >/dev/null 2>&1 &
   local wspid=$!
 
   ( umask 077; printf 'vnc_pid=%s\nws_pid=%s\nport=%s\nvnc_port=%s\n' "$vncpid" "$wspid" "$port" "$vncport" > "$(_viewer_pidfile "$dir")" )
@@ -5965,6 +5966,105 @@ if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   esac
 fi
 # <<< DIVE-4348
+
+# >>> DIVE-5190 Chrome's temp files die with the process that made them
+# A customer box (2026-09-29) had 3.0G in /tmp that was nothing but Chrome: 256
+# `.com.google.Chrome.*` files (~9.7M each) and `scoped_dir*` directories (~52M
+# each). Chrome writes both into $TMPDIR and deletes them on a CLEAN close only;
+# every browser this plugin ends with a kill — a `timeout -k`, an evict, a lease
+# reaper, a serve stopped under a viewer — leaves its set behind, and nothing on
+# the box ever sweeps /tmp. So the fix is not "close Chrome nicely", which no
+# killed process can do; it is that Chrome never writes into a directory that
+# outlives its owner.
+#
+# THE SHAPE. Every launch gets its own TMPDIR, $_TMP_ROOT/<pid>.<starttime>,
+# exported so every Chrome below it (the headless probes, driver-playwright, the
+# session daemon, `auth`'s headed window) inherits it — Playwright passes
+# process.env to the browser unless an `env` option overrides it, and neither
+# node launcher sets one. It is removed on exit by the EXIT trap, and a launch
+# that was KILLED (no trap runs on SIGKILL) is swept by the next launch's reap.
+#
+# WHY <pid>.<starttime> AND NOT A PID FILE. The name is the whole ownership
+# claim, so the reap needs no second file that a kill could leave half-written.
+# The starttime (field 22 of /proc/<pid>/stat) is what makes a recycled pid read
+# as DEAD: a live process with that pid and a different start is a stranger, and
+# its predecessor's directory is garbage. A live owner — including a session
+# daemon that has held a browser for a week — is never reaped. A zombie owner
+# reads as alive; that errs toward keeping, which is the only safe direction.
+#
+# A DETACHED CHILD OWNS ITS OWN DIRECTORY. `serve` starts a session daemon (or a
+# plain Chrome) that outlives this invocation by hours; handed our TMPDIR it
+# would lose it the moment we exit. `_tmp_exec` claims a directory for the
+# background subshell's own pid and then execs, so the pid on the directory IS
+# the daemon's pid (exec keeps both pid and starttime) and the reap keys on the
+# right process. It is removed by the first launch after that process dies.
+#
+# WHERE, AND WHY NOT $XDG_CACHE_HOME. Under the seat's own $HOME, only when this
+# uid owns $HOME: a root caller with a seat's HOME would otherwise plant
+# root-owned 0700 directories the seat can never clean. Not $XDG_CACHE_HOME
+# because boxes export SHARED XDG_* dirs across seats (the DIVE-4587 comment at
+# the top of this file), and a shared parent is the first-seat-owns-it failure
+# all over again. Never /tmp itself. When no private root can be had, TMPDIR is
+# left as the caller set it — the old behaviour, never a refused launch.
+# FIVEDIVE_BROWSER_TMP_ROOT overrides the root (the harness points it at scratch).
+#
+# EXIT TRAPS COMPOSE THROUGH A SHIM. The verbs below set their own EXIT traps
+# (lease release, read cleanup) and clear them with `trap - EXIT`; the builtin
+# would drop our cleanup at the first one. `trap` is therefore a function that
+# appends `_tmp_release` to any EXIT trap and turns `trap - EXIT` back into ours.
+# _tmp_release acts only in the process that claimed the directory, so a
+# subshell's own EXIT trap can never delete its parent's TMPDIR mid-run.
+if [[ -n "${FIVEDIVE_BROWSER_TMP_ROOT:-}" ]]; then _TMP_ROOT="$FIVEDIVE_BROWSER_TMP_ROOT"
+elif [[ -n "${HOME:-}" && -O "$HOME" ]]; then _TMP_ROOT="$HOME/.cache/5dive-browser/tmp"
+else _TMP_ROOT=""; fi
+# What this process was started with — minus a per-launch dir inherited from a
+# parent invocation (a `setsid "$0" propose`), which that parent deletes.
+_TMP_INHERITED="${TMPDIR-}"; _TMP_INHERITED_SET="${TMPDIR+1}"
+if [[ -n "$_TMP_ROOT" && "$_TMP_INHERITED" == "$_TMP_ROOT"/* ]]; then _TMP_INHERITED=""; _TMP_INHERITED_SET=""; fi
+_TMP_OWN=""; _TMP_OWN_PID=""
+_tmp_starttime() {  # <pid> -> starttime; read after the LAST ')' (comm may hold both)
+  local s; { read -r s < "/proc/$1/stat"; } 2>/dev/null || return 1
+  s="${s##*) }"; local -a f; read -ra f <<<"$s"
+  [[ -n "${f[19]:-}" ]] && printf '%s\n' "${f[19]}"
+}
+_tmp_reap() {
+  [[ -n "$_TMP_ROOT" && -d "$_TMP_ROOT" && -O "$_TMP_ROOT" ]] || return 0
+  local d n p
+  for d in "$_TMP_ROOT"/*.*; do
+    [[ -d "$d" && ! -L "$d" ]] || continue
+    n="${d##*/}"; p="${n%%.*}"
+    [[ "$p" =~ ^[0-9]+$ && "${n#*.}" =~ ^[0-9]+$ ]] || continue
+    [[ "$(_tmp_starttime "$p")" == "${n#*.}" ]] && continue   # the owner is alive
+    rm -rf -- "$d"
+  done
+}
+_tmp_claim() {  # give THIS process (BASHPID, so a background subshell too) its own TMPDIR
+  local p="$BASHPID" st d
+  _TMP_OWN=""; _TMP_OWN_PID=""
+  if [[ -n "$_TMP_ROOT" ]] && st=$(_tmp_starttime "$p") \
+     && ( umask 077; mkdir -p -- "$_TMP_ROOT" ) 2>/dev/null && [[ -O "$_TMP_ROOT" && ! -L "$_TMP_ROOT" ]]; then
+    d="$_TMP_ROOT/$p.$st"
+    if mkdir -m 700 -- "$d" 2>/dev/null || [[ -d "$d" && -O "$d" && ! -L "$d" ]]; then
+      _TMP_OWN="$d"; _TMP_OWN_PID="$p"; export TMPDIR="$d"; return 0
+    fi
+  fi
+  if [[ -n "$_TMP_INHERITED_SET" ]]; then export TMPDIR="$_TMP_INHERITED"; else unset TMPDIR; fi
+  return 1
+}
+_tmp_release() {
+  [[ -n "$_TMP_OWN" && "$BASHPID" == "$_TMP_OWN_PID" ]] || return 0
+  rm -rf -- "$_TMP_OWN"
+}
+_tmp_exec() { _tmp_claim; exec "$@"; }   # `_tmp_exec <cmd…> &` — see DETACHED above
+trap() {
+  if [[ $# -eq 2 && "$2" == EXIT && "$1" != - ]]; then set -- "$1"$'\n''_tmp_release' EXIT; fi
+  if [[ $# -eq 2 && "$2" == EXIT && "$1" == - ]]; then set -- '_tmp_release' EXIT; fi
+  builtin trap "$@"
+}
+_tmp_reap
+_tmp_claim
+builtin trap '_tmp_release' EXIT
+# <<< DIVE-5190
 
 # A URL WHERE A PROFILE NAME GOES (DIVE-4943 scope 5). `read https://…` picks its
 # own profile — the host's one login, or the public profile when there is none —
