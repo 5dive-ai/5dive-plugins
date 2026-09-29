@@ -37,7 +37,7 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 // (or collision with) whatever each plugin already imports from 'fs'.
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { parseGateReply, resolveGateReply, gateAlertIdent } from './gatereply'
-import { renderRoster, renderLog, renderLineage, renderVerify, COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
+import { COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { createFiveRunner, createFailureBreaker, type FiveRunner } from './cliexec.ts'
 import { planAutoAttach, autoAttachFooter, attachedNames, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
@@ -3267,24 +3267,6 @@ const commandHandlers: Record<string, CommandHandler> = {
     await report(['on', `--at=${hour}`])
   },
 
-  // DIVE-1494 (3): read-only Council view. Render the roster header (who sits, the
-  // pass rule, the founder-veto holder, the sealed lineage head) and carry three
-  // tap buttons for the sealed governance record — log / lineage / verify. All
-  // read-only: no nonce, no mutate (the founder-veto TAP is a separate authenticated
-  // path, DIVE-1546). paired-5dive scope hides this on non-5dive hosts.
-  council: async ctx => {
-    const j = await read5diveJson(['council', 'roster', '--json'])
-    if (!j) {
-      await ctx.reply(`Couldn't read the Council from the 5dive CLI — try again in a moment.`)
-      return
-    }
-    // Tolerate the {ok,data} envelope or a bare object (mirrors the digest handler).
-    const data = j?.data ?? j
-    await ctx.reply(renderRoster(data), {
-      reply_markup: { inline_keyboard: [COUNCIL_BUTTONS] },
-    })
-  },
-
   // /stop — interrupt the agent's current task. Sends C-c to the tmux pane
   // the running claude session lives in. Same effect as the user pressing
   // Esc / Ctrl-C in the local terminal.
@@ -5523,34 +5505,13 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  // DIVE-1494 (3): read-only Council taps from the /council header. cl:log / cl:lin /
-  // cl:ver shell `sudo 5dive council {log,lineage ls,verify} --json` and edit the
-  // message in place with a formatted summary. READ-ONLY — no nonce, no mutation
-  // (the authenticated founder-veto tap is a separate path, DIVE-1546). The allowFrom
-  // gate at the top of this router already vetted the tapper. Fully fail-soft.
-  if (data === 'cl:log' || data === 'cl:lin' || data === 'cl:ver') {
-    await ctx.answerCallbackQuery({ text: 'Reading the sealed record…' }).catch(() => {})
-    let body: string
-    try {
-      if (data === 'cl:ver') {
-        const j = await read5diveJson(['council', 'verify', '--json'])
-        body = renderVerify(j?.data ?? j)
-      } else if (data === 'cl:lin') {
-        const j = await read5diveJson(['council', 'lineage', 'ls', '--json'])
-        body = renderLineage((j?.data ?? j)?.entries)
-      } else {
-        const j = await read5diveJson(['council', 'log', '--limit=5', '--json'])
-        body = renderLog((j?.data ?? j)?.entries)
-      }
-    } catch {
-      body = "Couldn't read the Council record from the 5dive CLI — try /council again in a moment."
-    }
-    // Re-attach the same read-only keyboard so the user can hop between views without
-    // re-running /council. A grammy "message is not modified" (identical body) is
-    // swallowed by the catch so a double-tap on the same view doesn't error.
-    await ctx
-      .editMessageText(body, { reply_markup: { inline_keyboard: [COUNCIL_BUTTONS] } })
-      .catch(() => {})
+  // DIVE-5164: /council and its read-only log / lineage / verify views were removed
+  // (lodar). A cl:* tap left on an older /council message clears its spinner and drops
+  // the dead keyboard. The veto and ballot taps above are how a human answers a live
+  // council gate, and they stay.
+  if (COUNCIL_BUTTONS.some(b => b.callback_data === data)) {
+    await ctx.answerCallbackQuery({ text: 'The Council view was removed from Telegram.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup().catch(() => {})
     return
   }
 
