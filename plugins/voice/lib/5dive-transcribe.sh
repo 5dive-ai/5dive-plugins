@@ -7,6 +7,7 @@
 #   openrouter  POST to OpenRouter's /audio/transcriptions. More accurate, costs
 #               about $0.00006 for a 20s note — AND THE AUDIO LEAVES THE BOX.
 # Switch with:  sudo 5dive voice backend local|openrouter
+# Hearing alone: sudo 5dive voice config set stt_backend local|openrouter
 #
 # stdout is identical either way: the transcript, one line, nothing else. That
 # is load-bearing — every agent on the box already parses it, and a backend
@@ -43,7 +44,7 @@ SRC="${1:-}"
 [[ -n "$SRC" && -f "$SRC" ]] \
   || { echo "usage: 5dive-transcribe [--json] [--backend=local|openrouter] <audio-path>" >&2; exit 2; }
 
-BACKEND="${BACKEND_OVERRIDE:-$(voice_effective_backend)}"
+BACKEND="${BACKEND_OVERRIDE:-$(voice_effective_stt_backend)}"
 
 transcribe_openrouter() {
   voice_require_cmd ffmpeg || return 1
