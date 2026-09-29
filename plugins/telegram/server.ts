@@ -52,7 +52,7 @@ import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelr
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
-import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, recordOpsDetail, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
+import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, recordOpsDetail, liteWelcome, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -4597,7 +4597,7 @@ async function buildTaskDetail(id: number): Promise<{ text: string; keyboard?: I
 // lite nothing below sees an update this does not pass on. Only the paired
 // owner (the Managed Bots creator the box allowlisted), only in a private chat;
 // anyone else gets silence, never a pairing code. A slash command is answered
-// here from the six lite commands (org commands route to /help). Plain text goes
+// here from the four lite commands (org commands route to /help). Plain text goes
 // straight to the relay, past the gate-answer hears. Media and button taps go on
 // to their normal handlers. On the default profile this is not registered.
 const liteAbout = new Map<Lang, { text: string; at: number }>()
@@ -4618,25 +4618,26 @@ async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: str
   const accountUrl = liteAccountUrl(process.env.TELEGRAM_ACCOUNT_URL)
   const accountKb = accountUrl ? new InlineKeyboard().url(s.accountButton, accountUrl) : undefined
   if (cmd === 'start') {
-    // The agent greets in its own voice (LITE_INSTRUCTIONS); a deep-link
-    // payload rides along in the text.
-    await handleInbound(ctx, text, undefined)
-    return
-  }
-  if (cmd === 'new' || cmd === 'stop') {
-    const user = process.env.USER ?? process.env.LOGNAME ?? ''
-    const target = user.startsWith('agent-') ? user : ''
-    try {
-      if (!target) throw new Error(`can't determine tmux session name (USER=${user || '?'})`)
-      await execFileP(TMUX, cmd === 'new'
-        ? ['send-keys', '-t', `${target}:0`, '/clear', 'Enter']
-        : ['send-keys', '-t', `${target}:0`, 'C-c'])
-      if (cmd === 'stop') stopTypingLoop(String(ctx.chat!.id))
-      await ctx.reply(cmd === 'new' ? s.newDone : s.stopDone)
-    } catch (err) {
-      recordOpsDetail(`/${cmd}`, err instanceof Error ? err.message : String(err))
-      await ctx.reply(s.failed).catch(() => {})
+    // DIVE-5173: the pack's welcome goes out at once, no model turn. It is
+    // logged like a reply so recent_messages shows the agent already greeted.
+    // A deep-link payload still goes to the model after it; with no welcome in
+    // the pack the agent greets in its own voice (LITE_INSTRUCTIONS), as before.
+    const welcome = liteWelcome(lang)
+    if (welcome) {
+      const chatId = String(ctx.chat!.id)
+      const sent = await ctx.reply(welcome).catch(err => {
+        recordOpsDetail('/start', `welcome send failed: ${err instanceof Error ? err.message : String(err)}`)
+        return null
+      })
+      if (sent) {
+        try {
+          const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'
+          msglogAppend(MSGLOG_DIR, chatId, { ts: new Date().toISOString(), dir: 'out', user: me, text: welcome, message_id: String(sent.message_id) })
+        } catch {}
+        if (!liteStartPayload(text)) return
+      }
     }
+    await handleInbound(ctx, text, undefined)
     return
   }
   if (cmd === 'usage') {
