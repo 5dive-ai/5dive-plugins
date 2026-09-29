@@ -92,7 +92,10 @@ describe('silence-watchdog under lite is the default watchdog', () => {
     expect(dflt.status).toBe(0)
     expect(lite.stdout).toContain('The user alarms at >60s silence.')
     expect(lite.stdout).toContain('Send a fresh reply')
-    expect(lite.stdout).toBe(dflt.stdout)
+    // the two runs can straddle a second under load, so the elapsed count is
+    // the one field allowed to differ
+    const words = (o: string) => o.replace(/gone \d+s and/, 'gone Ns and')
+    expect(words(lite.stdout)).toBe(words(dflt.stdout))
   })
 
   test('a message answered before the threshold gets no nudge (lite and default alike)', () => {
