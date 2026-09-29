@@ -24,7 +24,7 @@
 import { readPayload } from './lib/payload'
 import { loadAccess } from './lib/access'
 import { loadSilence, saveSilence } from './lib/state'
-import { decideNag } from './lib/silence-decision'
+import { decideNag, decideLiteNudge } from './lib/silence-decision'
 import { emitPostToolContext } from './lib/output'
 import { readEntries, analyzeTurn } from './lib/transcript'
 import { TG_TOOL_PREFIX } from './lib/paths'
@@ -34,8 +34,23 @@ import { isLite } from './lib/lite'
 // check below); the rest is unused.
 const payload = await readPayload<{ transcript_path?: string }>()
 
-// DIVE-5121: an operator alarm. A lite (partner-client) box never runs it.
-if (isLite()) process.exit(0)
+// DIVE-5121 dropped this hook on lite as an operator alarm, and with no ack
+// reaction either, a client watched a long task in total silence (DIVE-5166).
+// Lite gets its own narrow arm: one nudge to the AGENT (never the client) when
+// the newest message has had no reply after LITE_FIRST_FIRE_SECONDS. No
+// progress-edit nags, no call counting — that is the operator cadence.
+const LITE_FIRST_FIRE_SECONDS = 20
+if (isLite()) {
+  const s = loadSilence()
+  const d = decideLiteNudge(s, Math.floor(Date.now() / 1000), LITE_FIRST_FIRE_SECONDS)
+  if (d.shouldFire) {
+    saveSilence({ ...s, lastReminderAt: Math.floor(Date.now() / 1000) })
+    emitPostToolContext(
+      `The person has waited ${d.waited}s on their latest message with no reply. Send one short line now with the reply tool saying you are on it, in their language and your own voice, then keep working and send the result as a new message.`,
+    )
+  }
+  process.exit(0)
+}
 
 // First-fire silence threshold (seconds since last reply). Lower = the agent
 // is forced to ack sooner; higher = quieter but more perceived silence. The

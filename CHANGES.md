@@ -1,5 +1,21 @@
 ## Unreleased
 
+### Fixed — a lite client bot says it is on a long request before it goes to work (DIVE-5166), telegram 0.5.67
+
+A partner client asked their bot for a site with a week calendar and heard nothing until the file
+was done. The `lite` instructions had dropped the default profile's ack-first rule, `lite` has no
+ack reaction (no-emoji brand rule), and the silence watchdog exited on `lite`, so nothing asked the
+agent for an "on it" line. Two changes:
+
+- `LITE_INSTRUCTIONS` carries the rule in consumer wording: a request that takes more than a few
+  seconds gets one short "on it" line in the persona's voice, then the result as a new message; a
+  quick question gets one reply and no "on it" line.
+- The watchdog has a narrow `lite` arm: when the newest message has had no reply, edit or reaction
+  after 20s, it reminds the AGENT once for that message to send the line. It never messages the
+  client, never nags for progress edits, and stays quiet on a message already answered.
+
+**Unchanged:** the default profile's instructions and watchdog, byte for byte.
+
 ### Removed — `/council` leaves the Telegram bot's menu (DIVE-5164), telegram 0.5.66
 
 lodar asked for the council command to go. `/council` is gone from the command registry, so the
