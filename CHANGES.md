@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — a lite client bot never asks the client for a key when a voice reply fails (DIVE-5162), telegram 0.5.68
+
+On a partner client box, a voice reply failed and the client's agent then changed the box's voice
+settings itself and asked the client to type in a key and to agree to their text leaving the
+machine. `LITE_INSTRUCTIONS` now carries one consumer-worded line: answer voice messages; if a
+voice reply does not work, answer in text and say only that; never ask the client to pick a
+setting, give a key or password, or agree to send anything elsewhere; never change voice settings
+yourself. Default profile unchanged — the line is in the lite block only.
+
 ### Fixed — a lite client bot says it is on a long request before it goes to work (DIVE-5166), telegram 0.5.67
 
 A partner client asked their bot for a site with a week calendar and heard nothing until the file
