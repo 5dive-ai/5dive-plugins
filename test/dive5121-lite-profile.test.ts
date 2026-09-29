@@ -91,15 +91,18 @@ describe('no profile set = the plugin as it is today', () => {
     expect(renderHelpBody(COMMAND_REGISTRY, true)).not.toContain('/council')
   })
 
-  test('the default MCP instructions block is byte-identical to the 0.5.64 release', () => {
+  test('the default MCP instructions block is byte-identical to the 0.5.64 release plus the DIVE-5171 tap line', () => {
     // Extracted exactly as tests/telegram_instructions_unit.sh extracts it.
+    // DIVE-5171 (0.5.68) added one sentence on purpose — a via="button" inbound
+    // is the user's real answer — so the pin moved with it. 0.5.64's block was
+    // d04d20b5cacd135bd079e80b3222f0f118aebd941862bb228dbd2c96db16e9ac.
     const lines = SERVER.split('\n')
     const start = lines.indexOf('    instructions: [')
     const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
     expect(start).toBeGreaterThan(0)
     expect(end).toBeGreaterThan(start)
     const block = lines.slice(start + 1, end).join('\n') + '\n'
-    expect(sha(block)).toBe('d04d20b5cacd135bd079e80b3222f0f118aebd941862bb228dbd2c96db16e9ac')
+    expect(sha(block)).toBe('d9fcec695f9d1193ae09aaeb1fd42c13ba736b68ccb8f333340b71c5d57d322e')
     // The lite block is a LATER key that only exists when LITE is true.
     expect(lines[end]).toBe("    ].join('\\n'),")
     expect(lines.slice(end + 1, end + 5).join('\n')).toContain('...(LITE ? { instructions: LITE_INSTRUCTIONS } : {}),')
