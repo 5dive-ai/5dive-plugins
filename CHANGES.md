@@ -1,5 +1,26 @@
 ## Unreleased
 
+### Changed — a lite client bot has four commands and greets from its pack (DIVE-5173), telegram 0.5.71
+
+Three owner asks for partner client bots (`TELEGRAM_PROFILE=lite`), one release. The default
+profile is unchanged: its menu, instructions and hook pins, and the guard ratchet on every read of
+the profile, all pass as before.
+
+- `/new`, its hidden alias `/clear`, and `/stop` are gone. The menu is `start`, `usage`, `account`
+  (when the box has an account URL) and `help`. Those three now get the `/help` reply, like any
+  other command not on the list, and nothing sends `/clear` or Ctrl-C to the agent's session any
+  more. A client can no longer wipe the conversation or interrupt a turn from the chat; the
+  context still compacts on its own.
+- A bare `/start` is answered at once with the pack's welcome, with no model turn, in the client's
+  language. The text is `ext.5dive.welcome.en` / `.ru` in the agent's `persona.yaml` (the one pack
+  file `agent import` keeps on the box, at `~/.claude/persona.yaml`; the OpenAgent schema is closed
+  everywhere but `ext`). It is logged like a reply, so `recent_messages` shows the greeting. A
+  `/start` with a deep-link payload still goes to the model after the welcome. With no welcome for
+  that language, or no readable persona, the model greets as before.
+
+`test/dive5173-lite-welcome.test.ts` covers the welcome reader against real YAML, the `/start`
+order and the removed arm, with mutants that turn each check red.
+
 ### Fixed — Chrome's temp files no longer pile up in /tmp (DIVE-5190), browser 1.23.1
 
 A customer box had 3.0G in /tmp that was nothing but Chrome: 256 `.com.google.Chrome.*` files
