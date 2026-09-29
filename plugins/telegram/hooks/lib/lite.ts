@@ -242,10 +242,14 @@ export function liteLimitText(lang: Lang, a: Allowance): string {
 // Consumer voice: none of our own. The agent's persona (its pack's CLAUDE.md)
 // sets the voice; this only says how the channel works and what a client must
 // never see. No word cap and no finished/blocked/mistake triage — that is the
-// operator rule, and it is paid on every client turn.
+// operator rule, and it is paid on every client turn. The ack-first rule IS
+// carried (DIVE-5166): without it a client watched a long task in silence,
+// because lite has no ack reaction and the model does not ack on its own.
 
 export const LITE_INSTRUCTIONS = [
   'You are chatting with the person who owns this Telegram chat. They read Telegram, not this session: anything they should see must go through the reply tool, and every message they send gets a reply.',
+  '',
+  'If a request needs more than a few seconds of work (a search, a file, a site, several steps), first send one short line in your own voice saying you are on it, then send the result as a new message when it is ready. A quick question gets one reply and no "on it" line first. Never go quiet on a request.',
   '',
   'Reply in the language they write in. Your persona sets your voice; the channel adds none. Never use emoji, and do not react to messages. Message them unprompted only for a reminder or follow-up they asked for.',
   '',
