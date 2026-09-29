@@ -103,6 +103,8 @@ const GOLDEN_BASELINE_MENU = [
   // port; until then it's an intended baseline-only addition to the menu.
   'digest',
   // DIVE-5164: /council (DIVE-1494's read-only governance view) was removed (lodar).
+  // DIVE-5185: /app opens the my.5dive.ai Mini App; baseline-only, like /digest.
+  'app',
 ]
 const WATCHDOG_COMMON = ['startRearmWatchdog', 'REARM_IDLE_MS', 'markActivity', 'lastServerActivity']
 const TURN_LIVENESS = 'newestTurnMtimeMs' // codex+grok; agy pending DIVE-14

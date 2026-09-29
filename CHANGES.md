@@ -1,5 +1,24 @@
 ## Unreleased
 
+### Added — /app opens 5dive inside Telegram, signed into your existing account (DIVE-5185), telegram 0.5.76
+
+An existing 5dive customer can now open the my.5dive.ai Mini App from their own agent's bot. `/app`
+answers with an **Open 5dive** button. The first open signs into the account the dashboard shows,
+with the same server and agents. It never creates a second account. Billing stays on Stripe:
+Telegram Stars are sold only to accounts that were created in Telegram.
+
+- The button is a URL button to the 5dive bot's Mini App, never `web_app`. A `web_app` button here
+  would sign Telegram's initData with the agent's bot token, which 5dive's sign-in refuses.
+- The link is one-time, lasts 15 minutes, and works only for the Telegram user who asked. The box
+  mints it with `5dive telegram-app link --telegram-id=<sender>` (CLI), which checks the sender is
+  in this seat's allowlist, and 5dive-api binds the code to that id.
+- Additive: one new registry entry, last in the menu. Every other command, the lite profile (its
+  middleware answers `/app` with its own /help) and non-5dive hosts (paired-5dive scope hides it)
+  are unchanged. An old CLI answers "needs a newer 5dive CLI" until the nightly update.
+- `5dive config telegram-app=off` turns it off for the whole box.
+
+`test/dive5185-app-button.test.ts`.
+
 ### Added — stuck on a captcha, the agent asks the owner and then carries on (DIVE-5200), browser 1.24.0, telegram 0.5.75
 
 An agent's browser task used to end at the first captcha, and a person had to restart the job.

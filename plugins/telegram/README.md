@@ -100,6 +100,11 @@ indicator, the silence watchdog and the opt-in context nudge, whose text is the 
 `TELEGRAM_ACCOUNT_URL=https://…` adds the `/account` button. Anything else, including unset, is the
 default profile, which is unchanged. See `hooks/lib/lite.ts`.
 
+On a 5dive box the default profile also has `/app` (DIVE-5185): a button that opens 5dive inside Telegram
+(the my.5dive.ai Mini App), signed into the box owner's existing account. The button's link is minted
+for the paired user who asked and lasts 15 minutes. `5dive config telegram-app=off` turns it off for
+the box. See `appbutton.ts`.
+
 ## Tools exposed to the assistant
 
 | Tool | Purpose |

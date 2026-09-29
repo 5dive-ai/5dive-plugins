@@ -77,16 +77,17 @@ describe('no profile set = the plugin as it is today', () => {
     expect(resolveProfile({ TELEGRAM_STATE_DIR: stateDir('TELEGRAM_PROFILE=lite\n'), TELEGRAM_PROFILE: 'default' })).toBe('default')
   })
 
-  test('the default menu and /help are the 0.5.66 ones (the 0.5.64 commands.ts less the /council entry)', () => {
-    // sha of plugins/telegram/commands.ts in 0.5.66: the 0.5.64 release (243af25) with only
-    // the /council registry entry deleted (DIVE-5164, lodar). Every other command is unchanged.
-    expect(sha(readFileSync(join(TG, 'commands.ts'), 'utf8'))).toBe('37b3d0d6e5101ac5bb7512bf61bf7927cc104dd6dbc3f13af8a85db1b81ffd0a')
+  test('the default menu and /help are the 0.5.66 ones plus /app (DIVE-5185)', () => {
+    // sha of plugins/telegram/commands.ts: 0.5.66's (37b3d0d6…, the 0.5.64 release less the
+    // /council entry, DIVE-5164) with ONE registry entry appended, /app (DIVE-5185). Every
+    // other command is unchanged, so an existing bot's menu only gains the one line.
+    expect(sha(readFileSync(join(TG, 'commands.ts'), 'utf8'))).toBe('bfaac459e9b1dafa2648716ff46c9984bd727773825b079a65a0f3926d5cdea4')
     expect(COMMAND_REGISTRY.map(c => c.name)).toEqual([
       'start', 'help', 'status', 'context', 'stop', 'restart', 'clear', 'checkpoint', 'resume', 'agents', 'team',
       'tasks', 'inbox', 'heartbeat', 'task', 'org', 'update', 'model', 'effort', 'account', 'login', 'usage',
-      'goal', 'digest',
+      'goal', 'digest', 'app',
     ])
-    expect(botFatherCommands(undefined, true)).toHaveLength(20)
+    expect(botFatherCommands(undefined, true)).toHaveLength(21)
     expect(botFatherCommands(undefined, true).map(c => c.command)).not.toContain('council')
     expect(renderHelpBody(COMMAND_REGISTRY, true)).not.toContain('/council')
   })
@@ -213,8 +214,10 @@ describe('lite = the surface oinoa agreed', () => {
 
   test('every org command is unreachable: it routes to the /help reply', () => {
     const orgOnly = COMMAND_REGISTRY.map(c => c.name).filter(n => !(LITE_COMMANDS as readonly string[]).includes(n))
-    // 18 plus /stop and /clear, which DIVE-5173 took out of lite (19 → 18 was DIVE-5164's /council)
-    expect(orgOnly.length).toBe(20)
+    // 18 plus /stop and /clear, which DIVE-5173 took out of lite (19 → 18 was DIVE-5164's /council),
+    // plus /app (DIVE-5185), which a lite client reaches only as its own /help
+    expect(orgOnly.length).toBe(21)
+    expect(orgOnly).toContain('app')
     expect(orgOnly).toContain('stop')
     expect(orgOnly).toContain('clear')
     for (const n of orgOnly) expect(liteRoute(`/${n}`)).toBe('help')

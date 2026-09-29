@@ -26,6 +26,7 @@ import { readAccessFile as readAccessFileCore } from './access-core.ts'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { COMMAND_REGISTRY, renderHelpBody, botFatherCommands, MODEL_ALIASES, applyModelAliases, EFFORT_LEVELS } from './commands'
+import { appReply, APP_BUTTON_TEXT, APP_LINK_TIMEOUT_MS } from './appbutton'
 import {
   switchLine, switchAck, switchPending, classifySwitch,
   SWITCH_POLL_MS, SWITCH_POLL_STEP_MS, SWITCH_MENU_RE,
@@ -3936,6 +3937,15 @@ const commandHandlers: Record<string, CommandHandler> = {
   // detail view; /account shows the same signal as compact dots on the
   // switcher buttons). null usage for an account means no bound agent
   // rendered a statusline recently, so there are no live numbers to show.
+  // /app (DIVE-5185) — open 5dive inside Telegram, signed into the box owner's
+  // account. A URL button to the 5dive bot's Mini App with a one-time code the
+  // box minted for THIS sender (appbutton.ts has the why and the copy).
+  app: async (ctx, gate) => {
+    const j = await read5diveJson(['telegram-app', 'link', `--telegram-id=${gate.senderId}`, '--json'], APP_LINK_TIMEOUT_MS)
+    const r = appReply(j)
+    await ctx.reply(r.text, r.url ? { reply_markup: new InlineKeyboard().url(APP_BUTTON_TEXT, r.url) } : {})
+  },
+
   usage: async ctx => {
     const [board, usage] = await Promise.all([read5diveUsageBoard(), read5diveAccountUsage()])
     if (!usage) {

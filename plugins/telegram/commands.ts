@@ -180,6 +180,16 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     description: 'Daily standup digest on/off/at',
     scope: 'paired-5dive',
   },
+  {
+    // /app (DIVE-5185) — a button that opens 5dive inside Telegram (the
+    // my.5dive.ai Mini App), signed into the box owner's EXISTING account.
+    // Shells to `5dive telegram-app link` (appbutton.ts); paired-5dive so it
+    // hides and no-ops on a non-5dive host. A lite (partner) bot never reaches
+    // it: its middleware answers every slash command first.
+    name: 'app',
+    description: 'Open 5dive in Telegram',
+    scope: 'paired-5dive',
+  },
 ]
 
 /** Short model alias → full Claude Code model ID.
