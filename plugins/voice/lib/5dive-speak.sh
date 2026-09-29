@@ -54,10 +54,12 @@ BACKEND="${BACKEND_OVERRIDE:-$(voice_effective_backend)}"
 voice_require_cmd ffmpeg || exit 1
 
 # Telegram plays a voice message only as OGG/Opus; anything else arrives as a
-# file attachment with a paperclip. Both backends emit MP3, so the conversion is
-# the shared tail, not a per-backend detail.
-to_ogg() {  # to_ogg <src-mp3>
-  ffmpeg -hide_banner -loglevel error -y -i "$1" -c:a libopus -b:a 32k -ar 48000 -ac 1 "$OUT" </dev/null
+# file attachment with a paperclip. Every backend emits MP3 or raw PCM, so the
+# conversion is the shared tail, not a per-backend detail. Raw PCM carries no
+# header, so its shape comes in as ffmpeg input options (DIVE-5162).
+to_ogg() {  # to_ogg <src> [<ffmpeg input options>...]
+  local src="$1"; shift
+  ffmpeg -hide_banner -loglevel error -y "$@" -i "$src" -c:a libopus -b:a 32k -ar 48000 -ac 1 "$OUT" </dev/null
 }
 
 speak_local() {
@@ -73,19 +75,39 @@ speak_local() {
   to_ogg "$mp3"; local rc=$?; rm -f "$mp3"; return $rc
 }
 
-speak_openrouter() {
-  local model voice mp3
-  model=$(voice_tts_model); voice="${VOICE_OVERRIDE:-$(voice_tts_voice)}"
-  voice_require_cmd jq || return 1
-  mp3="$(mktemp --suffix=.mp3 /tmp/5dive-speak.XXXXXX)"
-  if ! VOICE_OR_ERRFILE="$mp3" voice_openrouter_curl /audio/speech \
+# tts_call <model> <voice> [<instructions>] — one /audio/speech call, then the
+# OGG tail. A model that answers PCM (Gemini) is asked for PCM; every other model
+# gets the request body it has always had, byte for byte.
+tts_call() {
+  local model="$1" voice="$2" instr="${3:-}" fmt raw
+  fmt=$(voice_tts_format "$model")
+  raw="$(mktemp --suffix=".$fmt" /tmp/5dive-speak.XXXXXX)"
+  if ! VOICE_OR_ERRFILE="$raw" voice_openrouter_curl /audio/speech \
         -H "Content-Type: application/json" \
-        --data "$(jq -nc --arg m "$model" --arg i "$TEXT" --arg v "$voice" \
-                    '{model:$m, input:$i, voice:$v, response_format:"mp3"}')" \
-        --output "$mp3" >/dev/null; then
-    rm -f "$mp3"; return 1
+        --data "$(jq -nc --arg m "$model" --arg i "$TEXT" --arg v "$voice" --arg f "$fmt" --arg s "$instr" \
+                    '{model:$m, input:$i, voice:$v, response_format:$f} + (if $s == "" then {} else {instructions:$s} end)')" \
+        --output "$raw" >/dev/null; then
+    rm -f "$raw"; return 1
   fi
-  to_ogg "$mp3"; local rc=$?; rm -f "$mp3"; return $rc
+  if [[ "$fmt" == pcm ]]; then to_ogg "$raw" -f s16le -ar 24000 -ac 1
+  else to_ogg "$raw"; fi
+  local rc=$?; rm -f "$raw"; return $rc
+}
+
+speak_openrouter() {
+  voice_require_cmd jq || return 1
+  # DIVE-5162: the calling agent's own character voice (its pack's voice.audio)
+  # comes first, with its style as the delivery instruction. An explicit --voice
+  # wins over it, as it wins over the box default. If the persona voice fails
+  # the reply is still spoken, in the box default — a voice the user did not
+  # expect beats a reply that never arrives.
+  local persona pbase
+  if [[ -z "$VOICE_OVERRIDE" ]] && persona=$(voice_persona_audio); then
+    pbase="${persona%%$'\n'*}"
+    tts_call "$(voice_persona_tts_model)" "$pbase" "${persona#*$'\n'}" && return 0
+    echo "5dive voice: this agent's own voice ($pbase) did not work; speaking in the box default voice instead." >&2
+  fi
+  tts_call "$(voice_tts_model)" "${VOICE_OVERRIDE:-$(voice_tts_voice)}"
 }
 
 case "$BACKEND" in
