@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Added — a lite client asks its agent to hire a colleague (DIVE-5168), telegram 0.5.68
+
+A partner client can now say "hire me a designer" in the chat. `LITE_INSTRUCTIONS` gets one
+paragraph: the agent names the colleague back in one short line, hires only after a clear yes by
+running `5dive partner hire <slug>` (its own command, never shown to the client), tells the client the
+colleague will appear in a minute, says "not available" if the catalogue has no such colleague, and
+never hires more than the one confirmed.
+
+**Unchanged:** the default profile's instructions, byte for byte. The lite "no 5dive in the
+instructions" checks now allow that one command and nothing else.
+
 ### Fixed — a lite client bot says it is on a long request before it goes to work (DIVE-5166), telegram 0.5.67
 
 A partner client asked their bot for a site with a week calendar and heard nothing until the file

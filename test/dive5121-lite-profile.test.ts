@@ -264,7 +264,21 @@ describe('lite = the surface oinoa agreed', () => {
       expect(LITE_INSTRUCTIONS).not.toContain(operator)
     for (const needed of ['reply tool', 'download_attachment', 'recent_messages', 'image_path', 'chat_id', '/start', 'Never use emoji'])
       expect(LITE_INSTRUCTIONS).toContain(needed)
-    expect(LITE_INSTRUCTIONS).not.toMatch(/5dive/i)
+    // the one command the agent runs is the only place the brand may appear (DIVE-5168)
+    expect(LITE_INSTRUCTIONS.replaceAll('`5dive partner hire <slug>`', '')).not.toMatch(/5dive/i)
+  })
+
+  test('DIVE-5168: lite instructions carry the hire-a-colleague rule; the default block does not', () => {
+    expect(LITE_INSTRUCTIONS).toContain('run `5dive partner hire <slug>`')
+    expect(LITE_INSTRUCTIONS).toContain('ask them to confirm. Only after a clear yes')
+    expect(LITE_INSTRUCTIONS).toContain('Never hire without that yes, and never hire more than the one they confirmed.')
+    expect(LITE_INSTRUCTIONS).toContain('is not available')
+    const lines = SERVER.split('\n')
+    const start = lines.indexOf('    instructions: [')
+    const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
+    const block = lines.slice(start + 1, end).join('\n')
+    expect(block).not.toContain('partner hire')
+    expect(block).not.toContain('colleague')
   })
 
   test('the question bridge drops its emoji lead in lite', () => {
