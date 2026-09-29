@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Fixed — a lite client bot never asks the client for a key when a voice reply fails (DIVE-5162), telegram 0.5.68
+### Fixed — a lite client bot never asks the client for a key when a voice reply fails (DIVE-5162), telegram 0.5.69
 
 On a partner client box, a voice reply failed and the client's agent then changed the box's voice
 settings itself and asked the client to type in a key and to agree to their text leaving the

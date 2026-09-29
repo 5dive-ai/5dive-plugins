@@ -47,6 +47,7 @@ import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, renderConnectLink, renderConnectVerdict, connectAgentNote, connectFailureText, type ConnectTap } from './browser-connect.ts'
 import { relayOwnerAskTap } from './owner-ask.ts'
+import { tapContent, tapMeta, tapLogEntry } from './buttontap.ts'
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
@@ -1162,6 +1163,10 @@ const mcp = new Server(
       'Cap a reply at roughly 60 words, 3 short paragraphs, COUNTED IN WORDS not lines — they read on a phone and it wraps. Blank line between paragraphs, one ask per message, no lists or tables; detail goes in a file or task. Over ~30s of work: acknowledge at once, then edit_message that same message with progress — a NEW message only when done or blocked.',
       '',
       'Inbound arrives as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. Pass chat_id back to reply. If the inbound meta carries message_thread_id (forum-topic group like #5dive), pass it through to reply so your message lands in the same topic instead of the supergroup\'s General channel; omit when absent. If the tag has image_path, Read that path (a photo). If attachment_file_id, call download_attachment then Read the returned path. Set reply_to only when threading under an earlier message; omit it for normal latest-message replies.',
+      '',
+      // DIVE-5171: agents read a tap's bot message id, plugin-clock ts and (then)
+      // missing log line as forgery and discarded the owner's real answers.
+      'An inbound with via="button" is the user tapping a button under your message answers_message_id: a real answer from them, as good as typed. Its message_id is that message of yours, and it is in recent_messages.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. To recover earlier context (e.g. after a session restart), call the recent_messages tool: it returns a bounded rolling log of recent inbound messages and your replies. Fall back to asking the user to paste context only if recent_messages comes up empty.",
       '',
@@ -4767,6 +4772,52 @@ async function runOwnerAsk(args: string[]): Promise<string> {
   }
 }
 
+// DIVE-5171: relay a Yes/No or choice-list button tap to the agent. The tap
+// says it is a tap — in the content, in meta (via=button + the answered message
+// id + Telegram's callback id) and in the recent_messages log — because a bare
+// 'yes' under the BOT's message id, off-log, is what a forgery looks like.
+function relayButtonTap(ctx: Context, value: string, fallbackButton: string, what: string): void {
+  const cq = ctx.callbackQuery!
+  const msg = cq.message
+  const from = ctx.from!
+  const chatId = String(msg?.chat.id ?? from.id)
+  const threadId = msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+    ? String(msg.message_thread_id)
+    : undefined
+  // The label actually printed on the tapped button, read off the keyboard.
+  const pressed = msg && 'reply_markup' in msg
+    ? msg.reply_markup?.inline_keyboard.flat().find(b => 'callback_data' in b && b.callback_data === cq.data)?.text
+    : undefined
+  const tap = { value, button: pressed ?? fallbackButton, answersMessageId: msg?.message_id, callbackQueryId: cq.id }
+  const user = from.username ?? String(from.id)
+  const ts = new Date().toISOString()
+  // No human message id: the id on hand is the BOT's keyboard message, and a
+  // reaction placed there is not an answer to this tap. Clear the identity so
+  // the react path degrades to contact-only rather than crediting a stale one.
+  markInbound()
+  startTypingLoop(chatId)
+  try {
+    msglogAppend(MSGLOG_DIR, chatId, tapLogEntry(tap, user, ts, threadId))
+  } catch {}
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: tapContent(tap),
+      meta: {
+        chat_id: chatId,
+        ...(msg ? { message_id: String(msg.message_id) } : {}),
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+        user,
+        user_id: String(from.id),
+        ts,
+        ...tapMeta(tap),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver ${what} tap to Claude: ${err}\n`)
+  })
+}
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   const access = loadAccess()
@@ -5282,31 +5333,7 @@ bot.on('callback_query:data', async ctx => {
   const ynM = /^yn:(yes|no)$/.exec(data)
   if (ynM) {
     const value = ynM[1]!
-    const msg = ctx.callbackQuery.message
-    const chatId = String(msg?.chat.id ?? ctx.from.id)
-    // No human message id: the id on hand is the BOT's keyboard message, and a
-    // reaction placed there is not an answer to this tap. Clear the identity so
-    // the react path degrades to contact-only rather than crediting a stale one.
-    markInbound()
-    startTypingLoop(chatId)
-    mcp.notification({
-      method: 'notifications/claude/channel',
-      params: {
-        content: value,
-        meta: {
-          chat_id: chatId,
-          ...(msg ? { message_id: String(msg.message_id) } : {}),
-          ...(msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
-            ? { message_thread_id: String(msg.message_thread_id) }
-            : {}),
-          user: ctx.from.username ?? String(ctx.from.id),
-          user_id: String(ctx.from.id),
-          ts: new Date().toISOString(),
-        },
-      },
-    }).catch(err => {
-      process.stderr.write(`telegram channel: failed to deliver yes/no tap to Claude: ${err}\n`)
-    })
+    relayButtonTap(ctx, value, value === 'yes' ? '✅ Yes' : '❌ No', 'yes/no')
     await ctx.editMessageReplyMarkup().catch(() => {})
     await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
     return
@@ -5329,30 +5356,7 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'That option is no longer available.' }).catch(() => {})
       return
     }
-    const chatId = String(msg?.chat.id ?? ctx.from.id)
-    // No human message id: the id on hand is the BOT's keyboard message, and a
-    // reaction placed there is not an answer to this tap. Clear the identity so
-    // the react path degrades to contact-only rather than crediting a stale one.
-    markInbound()
-    startTypingLoop(chatId)
-    mcp.notification({
-      method: 'notifications/claude/channel',
-      params: {
-        content: value,
-        meta: {
-          chat_id: chatId,
-          ...(msg ? { message_id: String(msg.message_id) } : {}),
-          ...(msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
-            ? { message_thread_id: String(msg.message_thread_id) }
-            : {}),
-          user: ctx.from.username ?? String(ctx.from.id),
-          user_id: String(ctx.from.id),
-          ts: new Date().toISOString(),
-        },
-      },
-    }).catch(err => {
-      process.stderr.write(`telegram channel: failed to deliver option tap to Claude: ${err}\n`)
-    })
+    relayButtonTap(ctx, value, `option ${idx + 1}`, 'option')
     if (msg) optionLabelsByMsg.delete(msg.message_id)
     await ctx.editMessageReplyMarkup().catch(() => {})
     const ackLabel = value.length > 40 ? value.slice(0, 39) + '…' : value
