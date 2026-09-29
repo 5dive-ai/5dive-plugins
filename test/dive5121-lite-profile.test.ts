@@ -77,16 +77,18 @@ describe('no profile set = the plugin as it is today', () => {
     expect(resolveProfile({ TELEGRAM_STATE_DIR: stateDir('TELEGRAM_PROFILE=lite\n'), TELEGRAM_PROFILE: 'default' })).toBe('default')
   })
 
-  test('the default menu and /help are the 0.5.64 ones (commands.ts is byte-identical to the 0.5.64 release)', () => {
-    // sha of plugins/telegram/commands.ts in the 0.5.64 release (243af25), the base of this branch
-    expect(sha(readFileSync(join(TG, 'commands.ts'), 'utf8'))).toBe('7f76351f9c6fa498a4e9c0324d716538a5998638aff572f3810e8178a0226bf3')
+  test('the default menu and /help are the 0.5.66 ones (the 0.5.64 commands.ts less the /council entry)', () => {
+    // sha of plugins/telegram/commands.ts in 0.5.66: the 0.5.64 release (243af25) with only
+    // the /council registry entry deleted (DIVE-5164, lodar). Every other command is unchanged.
+    expect(sha(readFileSync(join(TG, 'commands.ts'), 'utf8'))).toBe('37b3d0d6e5101ac5bb7512bf61bf7927cc104dd6dbc3f13af8a85db1b81ffd0a')
     expect(COMMAND_REGISTRY.map(c => c.name)).toEqual([
       'start', 'help', 'status', 'context', 'stop', 'restart', 'clear', 'checkpoint', 'resume', 'agents', 'team',
       'tasks', 'inbox', 'heartbeat', 'task', 'org', 'update', 'model', 'effort', 'account', 'login', 'usage',
-      'goal', 'digest', 'council',
+      'goal', 'digest',
     ])
-    expect(botFatherCommands(undefined, true)).toHaveLength(21)
-    expect(renderHelpBody(COMMAND_REGISTRY, true)).toContain('/council — Council roster')
+    expect(botFatherCommands(undefined, true)).toHaveLength(20)
+    expect(botFatherCommands(undefined, true).map(c => c.command)).not.toContain('council')
+    expect(renderHelpBody(COMMAND_REGISTRY, true)).not.toContain('/council')
   })
 
   test('the default MCP instructions block is byte-identical to the 0.5.64 release', () => {
@@ -204,9 +206,9 @@ describe('lite = the surface oinoa agreed', () => {
 
   test('every org command is unreachable: it routes to the /help reply', () => {
     const orgOnly = COMMAND_REGISTRY.map(c => c.name).filter(n => !(LITE_COMMANDS as readonly string[]).includes(n) && n !== 'clear')
-    expect(orgOnly.length).toBe(19)
+    expect(orgOnly.length).toBe(18) // 19 until DIVE-5164 removed /council from the registry
     for (const n of orgOnly) expect(liteRoute(`/${n}`)).toBe('help')
-    for (const n of ['task_12', 'nudges', 'whatever', 'login', 'status']) expect(liteRoute(`/${n}`)).toBe('help')
+    for (const n of ['task_12', 'nudges', 'whatever', 'login', 'status', 'council']) expect(liteRoute(`/${n}`)).toBe('help')
   })
 
   test('the six route to themselves; /clear is a hidden alias of /new; chat is not a command', () => {

@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Removed — `/council` leaves the Telegram bot's menu (DIVE-5164), telegram 0.5.66
+
+lodar asked for the council command to go. `/council` is gone from the command registry, so the
+menu pushed with `setMyCommands` at the next restart no longer lists it and `/help` no longer
+mentions it. The read-only roster, log, lineage and verify views went with it, since only that
+command used them. A Log, Lineage or Verify tap left on an older `/council` message now says the
+view was removed and drops its buttons.
+
+**Unchanged:** the founder-veto tap and the human seat's ballot tap. They are how a person answers
+a live council gate, and they route exactly as before. The council plugin itself is untouched.
+The `lite` profile's menu never had `/council` and is unchanged.
+
 ### Changed — the registry copy catches up to browser 1.23.0: paying asks by default on a customer box, and a third preset, `standard` (DIVE-5148)
 
 `plugins/browser/` mirrors 5dive-ai/5dive-browser at 1.23.0 (9b66ecc), byte for byte. The last mirror
