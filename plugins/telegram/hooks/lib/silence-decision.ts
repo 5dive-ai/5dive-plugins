@@ -89,26 +89,3 @@ export function decideNag(
   }
 }
 
-// DIVE-5166: the lite (partner-client) nudge. Narrower than decideNag on
-// purpose — a client is owed one "on it" line on a long request, not progress
-// edits, so this fires only while the NEWEST inbound has had no sign of life
-// at all, once per inbound, after `thresholdSeconds`. A request answered in
-// time never sees it (no ack spam on a quick question), and once the agent
-// has said anything the nudge is done until the next message.
-export function decideLiteNudge(
-  state: SilenceState,
-  now: number,
-  thresholdSeconds: number,
-): { shouldFire: boolean; waited: number } {
-  const lastInbound = state.lastInboundAt ?? 0
-  const lastContact = Math.max(state.lastContactAt ?? 0, state.lastReplyAt ?? 0)
-  const lastReminder = state.lastReminderAt ?? 0
-  const waited = lastInbound > 0 ? now - lastInbound : 0
-  const shouldFire =
-    lastInbound > 0 &&
-    waited <= 3600 &&
-    waited > thresholdSeconds &&
-    lastContact < lastInbound &&
-    lastReminder < lastInbound
-  return { shouldFire, waited }
-}
