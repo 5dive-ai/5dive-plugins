@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Changed — a lite client bot has four commands and greets from its pack (DIVE-5173), telegram 0.5.71
+### Changed — a lite client bot has four commands and greets from its pack (DIVE-5173), telegram 0.5.73
 
 Three owner asks for partner client bots (`TELEGRAM_PROFILE=lite`), one release. The default
 profile is unchanged: its menu, instructions and hook pins, and the guard ratchet on every read of
@@ -20,6 +20,17 @@ the profile, all pass as before.
 
 `test/dive5173-lite-welcome.test.ts` covers the welcome reader against real YAML, the `/start`
 order and the removed arm, with mutants that turn each check red.
+
+### Added — a lite client asks its agent to hire a colleague (DIVE-5168), telegram 0.5.72
+
+A partner client can now say "hire me a designer" in the chat. `LITE_INSTRUCTIONS` gets one
+paragraph: the agent names the colleague back in one short line, hires only after a clear yes by
+running `5dive partner hire <slug>` (its own command, never shown to the client), tells the client the
+colleague will appear in a minute, says "not available" if the catalogue has no such colleague, and
+never hires more than the one confirmed.
+
+**Unchanged:** the default profile's instructions, byte for byte. The lite "no 5dive in the
+instructions" checks now allow that one command and nothing else.
 
 ### Fixed — a lite client bot never asks the client for a key when a voice reply fails (DIVE-5162), telegram 0.5.70
 
