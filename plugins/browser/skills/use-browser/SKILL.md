@@ -55,6 +55,37 @@ they give you. Switching the proxy mid-session can end a site's login (the site 
 and the refusal names both. **Ask the owner which one, never guess**, then name it:
 `5dive browser act github.com_work <url> --steps=…`.
 
+## Stuck on a captcha: ask the owner to clear it, then carry on (DIVE-5200)
+
+A CAPTCHA, a "verify you are human" or a "Just a moment…" check is a hard stop. You never
+solve it and never look for a way round it. But you do not give up the task either: ask the
+person, wait, and finish the job yourself.
+
+```bash
+5dive browser connect-request <site> --challenge --url=<the page you were stopped on> \
+  --reason="<one line: what you were doing>"
+```
+
+`<site>` is the host (`futuretools.io`), even if you were browsing with nothing connected.
+A page verb that hits a check prints this exact command for you. Your paired owner gets
+"I'm stuck on a captcha on <site>" with an **Open <site>** button; their tap opens the box
+browser on that page and sends them a one-time link as code, from root, never through you.
+They clear the check and tap **Done**. Done closes their view and **leaves the browser
+running**, so the check stays cleared for you.
+
+After the `[browser challenge] … tapped Done` message, carry on **without asking again**:
+
+1. First check what already happened. If the step you were on may have gone through,
+   read the result (the listing, the sent folder, the confirmation page) before you redo it.
+   Nothing is sent twice.
+2. Re-read the page you were stopped on (`5dive browser snapshot <url>`). It goes through
+   the browser the owner just used.
+3. Clear: continue from that step. Still a check: say so once and stop.
+
+Do not poll while you wait. Do not open the link. A flat block with nothing to click
+("access denied", a 403 from a server IP) is not a check a person can clear; see
+"Blocked from a server IP".
+
 ## Paying, posting, sending and deleting are the owner's call
 
 **The owner's default is standard** (DIVE-5148): `act` runs post, send and delete steps without

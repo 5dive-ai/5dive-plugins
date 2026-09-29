@@ -1,5 +1,27 @@
 ## Unreleased
 
+### Added — stuck on a captcha, the agent asks the owner and then carries on (DIVE-5200), browser 1.24.0, telegram 0.5.70
+
+An agent's browser task used to end at the first captcha, and a person had to restart the job.
+Now `5dive browser connect-request <site> --challenge --url=<page>` sends the paired owner
+"<agent> is stuck on a captcha on <site>" with an **Open** button. Same rails as Connect
+(DIVE-4992): nothing is bound until the owner taps, root mints the one-time link and sends it as
+code, and only the paired owner's tap through the same seat counts.
+
+- The box browser opens on the page the agent was stopped on (`serve --url=`, a page of that
+  site only; checked by the agent verb, again by root, and again by `serve`).
+- The owner clears the check and taps **Done — carry on**. Done closes the view and leaves the
+  browser running (no stop, no probe), so the cleared check is still there when the agent
+  re-reads the page through it.
+- The agent's session is told to carry on without asking again, to check first that the step
+  it was on did not already go through, and never to try to solve a check.
+- A page verb whose render is titled like a check ("Just a moment…", "Verify you are human")
+  prints the exact command on stderr. Keyed on the title only, so a form that just embeds an
+  invisible reCAPTCHA is not a stop. The refusals for a connected site name it too.
+- 5dive still never solves or bypasses a challenge. A person does it.
+
+`tests/browser_connect_request_unit.sh` (C and H arms) and `test/dive5200-captcha-handoff.test.ts`.
+
 ### Fixed — Chrome's temp files no longer pile up in /tmp (DIVE-5190), browser 1.23.1
 
 A customer box had 3.0G in /tmp that was nothing but Chrome: 256 `.com.google.Chrome.*` files

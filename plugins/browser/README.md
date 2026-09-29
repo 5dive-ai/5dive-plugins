@@ -114,6 +114,8 @@ reaches it through a viewer that is handed out as a **one-time, expiring, sessio
 5dive browser viewer-revoke <site>                           # kill the view, keep the login
 5dive browser connect-request <site> --reason=<why>          # ask the paired owner: a Connect
                                                              # button in Telegram; their tap binds
+5dive browser connect-request <site> --challenge --url=<page>  # stuck on a captcha: the owner clears it
+                                                             # in the box browser, taps Done, you carry on
 ```
 
 A successful `viewer-redeem` prints the two things the relay needs, and prints them exactly once:

@@ -227,6 +227,89 @@ txt=$(jq -r 'select(.path|test("sendMessage")) | .form.text' "$TMP/stub.log" | t
 tn "Q5 control characters are stripped from the reason" $'\033' "$txt"
 t  "Q5 the reason is capped" 1 "$(( $(sed -n 's/^Why: //p' <<<"$txt" | wc -c) <= 201 ))"
 
+# ---- C: stuck on a captcha (DIVE-5200) -------------------------------------------------
+# The same rails as Connect — the owner's tap is the authorisation, the link goes
+# out from root as code — with three differences: the message says what is
+# blocking and where, the browser opens on the page the agent was stopped on,
+# and Done closes the view but LEAVES THE BROWSER RUNNING so the agent's next
+# read of the page goes through the browser the check was cleared in.
+reset; rm -rf "$TMP/req"/*
+PAGE="https://futuretools.io/submit-a-tool?ref=x"
+out=$("$BROWSER" connect-request futuretools.io --challenge --url="$PAGE" --reason="submitting 5dive to the directory" 2>&1); rc=$?
+t  "C1 connect-request --challenge exits 0" 0 "$rc"
+tc "C1 it tells the agent to carry on after Done, not to poll" "carry on from the step you stopped on" "$out"
+msg=$(jq -c 'select(.path|test("sendMessage"))' "$TMP/stub.log" | tail -1)
+txt=$(jq -r '.form.text' <<<"$msg")
+tc "C2 the message says what is blocking and where, in plain words" "is stuck on a captcha on futuretools.io" "$txt"
+tc "C2 ... what the agent was doing" "Doing: submitting 5dive to the directory" "$txt"
+tc "C2 ... and that the owner clears it, then taps Done" "Clear the check yourself, then tap Done" "$txt"
+tn "C2 the page's address is NOT in the message (Telegram would preview it)" "https://" "$txt"
+t  "C3 one button, labelled Open <site>" "Open futuretools.io" "$(jq -r '.form.reply_markup' <<<"$msg" | jq -r '.inline_keyboard[0][0].text')"
+CCODE=$(last_code)
+t  "C3 NO TAP -> NO BIND for a challenge either" 0 "$(binds)"
+t  "C3 ... and no browser" "" "$(cat "$FAKE_LOG")"
+out=$(priv tap "$CCODE" 999999 2>&1); rc=$?
+t  "C4 only the paired owner can open it" 77 "$rc"
+reset
+out=$(priv tap "$CCODE" "$OWNER" 2>&1); rc=$?
+t  "C5 the owner's tap succeeds" 0 "$rc"
+t  "C5 the browser opens ON THE PAGE the agent was stopped on" "serve futuretools.io --url=$PAGE" "$(head -1 "$FAKE_LOG")"
+t  "C5 exactly one bind" 1 "$(binds)"
+tc "C5 the link and a kind come back to the plugin" "kind=challenge" "$out"
+tc "C5 ... the one-time link" "url=https://box.example.5dive.ai/browser/viewer/futuretools.io/" "$out"
+CDONE=$(sed -n 's/^done=//p' <<<"$out")
+reset
+out=$(priv done "$CDONE" 999999 2>&1); rc=$?
+t  "C6 another person cannot press Done" 77 "$rc"
+out=$(priv done "$CDONE" "$OWNER" 2>&1); rc=$?
+t  "C7 the owner's Done succeeds" 0 "$rc"
+t  "C7 Done REVOKES the view and nothing else: no stop, no probe" "viewer-revoke futuretools.io" "$(tr '\n' '|' <"$FAKE_LOG" | sed 's/|$//')"
+tc "C7 the verdict says the browser is still open for the agent" "status=the view is closed and the browser is still open" "$out"
+tc "C7 ... and is a challenge verdict" "kind=challenge" "$out"
+out=$(priv done "$CDONE" "$OWNER" 2>&1); rc=$?
+t  "C8 Done is one-shot" 77 "$rc"
+# no --url: the site's own page
+reset; "$BROWSER" connect-request futuretools.io --challenge >/dev/null 2>&1; CCODE=$(last_code); : >"$FAKE_LOG"
+out=$(priv tap "$CCODE" "$OWNER" 2>&1); rc=$?
+t  "C9 no --url opens the site's own front page" "serve futuretools.io --url=https://futuretools.io/" "$(head -1 "$FAKE_LOG")"
+# the page must be ON the site
+reset
+for bad in "https://evil.example/futuretools.io" "javascript:alert(1)" "https://futuretools.io.evil.example/" "file:///etc/passwd" "https://futuretools.io/a b"; do
+  out=$("$BROWSER" connect-request futuretools.io --challenge --url="$bad" 2>&1); rc=$?
+  t  "C10 a page that is not on the site is refused: $bad" 64 "$rc"
+done
+t  "C10 ... and nobody was messaged" 0 "$(grep -c sendMessage "$TMP/stub.log")"
+out=$(printf '%s\0' challenge futuretools.io "https://evil.example/" "x" | "$BROWSER" _connect 2>&1); rc=$?
+t  "C11 root re-checks the page itself (the agent verb is not the only gate)" 64 "$rc"
+t  "C11 ... and messages nobody" 0 "$(grep -c sendMessage "$TMP/stub.log")"
+out=$("$BROWSER" connect-request futuretools.io --url="$PAGE" 2>&1); rc=$?
+t  "C12 --url without --challenge is a usage error" 64 "$rc"
+out=$("$BROWSER" connect-request futuretools.io.sub --challenge --url="https://sub.futuretools.io.sub/x" 2>&1); rc=$?
+t  "C12 a subdomain of the site is its page" 0 "$rc"
+# a request file tampered to point elsewhere is refused at the tap
+reset; "$BROWSER" connect-request futuretools.io --challenge --url="$PAGE" >/dev/null 2>&1; CCODE=$(last_code)
+f="$TMP/req/$(printf '%s' "$CCODE" | sha256sum | cut -d' ' -f1)"; sed -i 's|^url=.*|url=https://evil.example/|' "$f"; : >"$FAKE_LOG"
+out=$(priv tap "$CCODE" "$OWNER" 2>&1); rc=$?
+t  "C13 a stored page that is not on the site is refused at the tap" 77 "$rc"
+t  "C13 ... before any browser starts" "" "$(cat "$FAKE_LOG")"
+t  "C13 ... or any bind" 0 "$(binds)"
+# serve --url itself only opens pages of the site
+out=$("$BROWSER" serve futuretools.io --url=https://evil.example/ 2>&1); rc=$?
+t  "C14 serve --url refuses a page of another site" 64 "$rc"
+
+# ---- H: the page hint (DIVE-5200) — the public profile is never probed, so a
+# captcha interstitial there is named on the way out, keyed on the TITLE only.
+hint_fns=$(awk '/^CHALLENGE_TITLE_MARKER=/{print} /^_render_title\(\)/{print} /^_challenge_hint\(\) \{/{p=1} p{print} p&&/^}$/{exit}' "$BROWSER")
+hint() { ( PROG=browser; eval "$hint_fns"; _challenge_hint "$@" ) 2>&1; }
+printf '<html><head><title>Just a moment...</title></head><body>cf</body></html>' >"$TMP/cf.html"
+printf '<html><head><title>Submit a tool | FutureTools</title></head><body><div class="g-recaptcha"></div><form></form></body></html>' >"$TMP/form.html"
+out=$(hint "$TMP/cf.html" "https://futuretools.io/submit")
+tc "H1 a challenge interstitial names the handoff, with the host and the page" "connect-request futuretools.io --challenge --url=https://futuretools.io/submit" "$out"
+tc "H1 ... and says 5dive never solves one" "never solves one" "$out"
+t  "H2 a normal form that merely embeds a reCAPTCHA says nothing" "" "$(hint "$TMP/form.html" "https://futuretools.io/submit")"
+out=$(hint "$TMP/cf.html" "" "https://uneed.best/submit")
+tc "H3 with no landed URL, the asked URL names the host" "connect-request uneed.best --challenge" "$out"
+
 # ---- S: the seams are not a door under root -------------------------------------------
 seam_block=$(awk '/^if \[\[ \$EUID -ne 0 \]\]; then$/{p=1} p{print} p&&/^fi$/{exit}' "$BROWSER")
 for v in FIVEDIVE_BROWSER_CONNECT_DIR FIVEDIVE_CONNECTOR_DIR FIVEDIVE_CONNECTORD_ENV FIVEDIVE_PROVISIONING_ENV FIVEDIVE_SHELLD_URL FIVEDIVE_TELEGRAM_API FIVEDIVE_BROWSER_CONNECT_SELF FIVEDIVE_BROWSER_CONNECT_PRIV; do

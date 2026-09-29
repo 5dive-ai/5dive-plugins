@@ -14,9 +14,17 @@ type Entity = { type: 'code'; offset: number; length: number }
 
 export type ConnectTap = { op: 'tap' | 'done'; code: string }
 
-export type ConnectLink = { site: string; url: string; expires: string; done: string }
+// DIVE-5200: 'challenge' is the agent stuck on a captcha. Same rails, different
+// words, and Done leaves the browser running for the agent instead of probing.
+export type ConnectKind = 'login' | 'challenge'
 
-export type ConnectVerdict = { site: string; rc: number; status: string }
+export type ConnectLink = { site: string; url: string; expires: string; done: string; kind: ConnectKind }
+
+export type ConnectVerdict = { site: string; rc: number; status: string; kind: ConnectKind }
+
+function kindOf(v: string | undefined): ConnectKind {
+  return v === 'challenge' ? 'challenge' : 'login'
+}
 
 const TAP_RE = /^b(conn|done):([0-9a-f]{48})$/
 const SITE_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/
@@ -56,7 +64,7 @@ export function parseConnectLink(stdout: string): ConnectLink | null {
   const expires = m.get('expires') ?? ''
   if (!SITE_RE.test(site) || !URL_RE.test(url) || !CODE_RE.test(done)) return null
   if (!url.includes(`/browser/viewer/${site}/`)) return null
-  return { site, url, expires, done }
+  return { site, url, expires, done, kind: kindOf(m.get('kind')) }
 }
 
 export function parseConnectVerdict(stdout: string): ConnectVerdict | null {
@@ -64,7 +72,7 @@ export function parseConnectVerdict(stdout: string): ConnectVerdict | null {
   const site = m.get('site') ?? ''
   if (!SITE_RE.test(site)) return null
   const rc = Number(m.get('status_rc') ?? 'NaN')
-  return { site, rc: Number.isFinite(rc) ? rc : -1, status: m.get('status') ?? '' }
+  return { site, rc: Number.isFinite(rc) ? rc : -1, status: m.get('status') ?? '', kind: kindOf(m.get('kind')) }
 }
 
 /** The link message. The URL is a CODE entity and previews are off: a link
@@ -76,20 +84,25 @@ export function renderConnectLink(l: ConnectLink): {
   link_preview_options: { is_disabled: true }
   reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] }
 } {
+  const challenge = l.kind === 'challenge'
   const head =
-    `🔐 Log in to ${l.site}.\n\n` +
+    (challenge ? `🧩 Clear the check on ${l.site}.\n\n` : `🔐 Log in to ${l.site}.\n\n`) +
     `Copy-paste this one-time link into your browser. Do not paste it back here. ` +
     `It works once${l.expires ? ` and expires ${l.expires}` : ''}.\n\n`
-  const tail = `\n\nLog in, close the tab, then tap Done so the agent can check the login.`
+  const tail = challenge
+    ? `\n\nClear the captcha yourself, close the tab, then tap Done so the agent carries on.`
+    : `\n\nLog in, close the tab, then tap Done so the agent can check the login.`
+  const button = challenge ? `Done — carry on` : `Done — check ${l.site}`
   return {
     text: head + l.url + tail,
     entities: [{ type: 'code', offset: head.length, length: l.url.length }],
     link_preview_options: { is_disabled: true },
-    reply_markup: { inline_keyboard: [[{ text: `Done — check ${l.site}`, callback_data: `bdone:${l.done}` }]] },
+    reply_markup: { inline_keyboard: [[{ text: button, callback_data: `bdone:${l.done}` }]] },
   }
 }
 
 export function renderConnectVerdict(v: ConnectVerdict): string {
+  if (v.kind === 'challenge') return `✅ Thanks. The agent is carrying on with ${v.site}.`
   const ok = v.rc === 0
   return ok
     ? `✅ ${v.site} is connected. The agent can use it now.`
@@ -97,7 +110,15 @@ export function renderConnectVerdict(v: ConnectVerdict): string {
 }
 
 /** What the agent's session is told, so it can carry on without polling. */
-export function connectAgentNote(kind: 'opened' | 'verdict', site: string, detail = ''): string {
+export function connectAgentNote(kind: 'opened' | 'verdict', site: string, detail = '', what: ConnectKind = 'login'): string {
+  if (what === 'challenge') {
+    return kind === 'opened'
+      ? `[browser challenge] The owner tapped Open for ${site}. The one-time link was sent to them. Wait for their Done; do not open the link, and do not touch ${site} until then.`
+      : `[browser challenge] The owner cleared the check on ${site} and tapped Done. The box browser for ${site} is still open with it cleared. ` +
+          `Carry on with the task now, without asking them again: first check what already happened (did the step you were on go through?) so nothing is sent twice, ` +
+          `then re-read the page you were stopped on (5dive browser snapshot <that url>) and continue from that step. ` +
+          `If the check is still there, say so once and stop; never try to solve it.`
+  }
   return kind === 'opened'
     ? `[browser connect] The owner tapped Connect for ${site}. The one-time login link was sent to them. Wait for their Done; do not open the link.`
     : `[browser connect] The owner finished logging in to ${site}. ${detail}`.trim()

@@ -279,6 +279,12 @@ usage() {
                                       # they get a "Connect <site>" button, their tap opens
                                       # the one-time link, their "Done" tap checks the login.
                                       # Nothing is bound until they tap.
+  5dive browser connect-request <site> --challenge [--url=<page>] [--reason=<what you were doing>]
+                                      # stuck on a captcha: the owner gets an "Open <site>"
+                                      # button, clears the check in the box browser on that
+                                      # page, taps Done — and the browser STAYS OPEN so your
+                                      # next read of the page goes through it. You never
+                                      # solve the check; you carry on after their Done.
 
   5dive browser adblock status              # is ad filtering on, and which sites is it off for
   sudo 5dive browser adblock off <site>     # this site breaks under filtering — stop filtering it
@@ -1894,7 +1900,7 @@ cmd_run() {
   local state; state=$(_probe "$site" "$dir")
   case "$state" in
     CHALLENGE*)
-      die "$E_COLD" "$site is presenting a security challenge. Stopping: 5dive does not attempt to solve one, by decision and not by limitation. A person clears it — 5dive browser auth $site" ;;
+      die "$E_COLD" "$site is presenting a security challenge. Stopping: 5dive does not attempt to solve one, by decision and not by limitation. A person clears it. Ask your owner to, then carry on after their Done: 5dive browser connect-request $site --challenge --url=<the page you were on>" ;;
     session\ expired*)
       die "$E_COLD" "$site is logged out. Failing closed: no retry, no login attempt, no falling through to a generic click. A person clears this — 5dive browser auth $site" ;;
     authenticated*)
@@ -2534,6 +2540,25 @@ _adapter_write_dir() {  # <seat> — where approve writes; the first place the p
 # The probe's engine, counted: grep -oiE, zero is an answer and not a failure.
 _marker_count() { { grep -oiE -- "$1" "$2" 2>/dev/null || true; } | wc -l | tr -d ' '; }
 _render_title() { { grep -oiE '<title[^>]*>[^<]{1,200}' "$1" 2>/dev/null || true; } | head -n1 | sed -E 's/<title[^>]*>//'; }
+
+# DIVE-5200: THE HARD STOP ASKS THE PERSON. The public profile is never probed
+# (it has no login), so a captcha interstitial on a public page used to come back
+# as an ordinary render and the agent had nothing to do with it but give up.
+# This says what it is and names the handoff. Keyed on the page TITLE only
+# ("Just a moment…", "Verify you are human", …): a submission form that merely
+# embeds an invisible reCAPTCHA is not a stop, and must not send the owner a
+# link to nothing. A hint on stderr, never a refusal: the render is unchanged.
+_challenge_hint() {  # <html> <landed url> [<asked url>]
+  local f="$1" u="${2:-}" host title
+  [[ -n "$u" ]] || u="${3:-}"
+  [[ -s "$f" ]] || return 0
+  title="$(_render_title "$f")"
+  grep -qiE "$CHALLENGE_TITLE_MARKER" <<<"$title" || return 0
+  host="${u#*://}"; host="${host%%/*}"; host="${host%%\?*}"; host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
+  [[ -n "$host" && "$host" != "$u" ]] || host="<site>"
+  printf '%s: STOP — this page is a security check ("%s"), not the page you asked for. 5dive never solves one. Ask your owner to clear it, wait for their Done, then re-run this step: 5dive browser connect-request %s --challenge --url=%s  (A flat block with nothing to click, such as "access denied" or a 403, is the site refusing this box'"'"'s IP, and a person cannot clear that one either.)\n' \
+    "$PROG" "$(cut -c1-80 <<<"$title")" "$host" "${u:-<the page>}" >&2
+}
 _render_is_challenge() {  # <site> <html>
   grep -qiE "$(_site_challenge_marker "$1")" "$2" 2>/dev/null && return 0
   grep -qiE "$CHALLENGE_TITLE_MARKER" <<<"$(_render_title "$2")"
@@ -3364,10 +3389,11 @@ _serve_running() {  # _serve_running <dir> -> echoes display, 0 if live
 _kv() { [[ -f "$1" ]] && sed -n "s/^$2=//p" "$1" | head -1; }
 
 cmd_serve() {
-  local site="" stop=0
+  local site="" stop=0 start_url=""
   while (($#)); do
     case "$1" in
       --stop) stop=1 ;;
+      --url=*) start_url="${1#*=}" ;;
       -h|--help) usage; return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
       *) site="$1" ;;
@@ -3375,6 +3401,14 @@ cmd_serve() {
   done
   [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser serve linkedin.com"
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  # DIVE-5200: a captcha handoff opens the browser on the page the agent was
+  # stopped on, not the site's front page. Only a page OF THIS SITE.
+  if [[ -n "$start_url" ]]; then
+    _connect_page_ok "$site" "$start_url" \
+      || die "$E_USAGE" "--url must be an http(s) page on $site, got: $start_url"
+  else
+    start_url="$(_site_url "$site")"
+  fi
   # SERVING IS THE OWNER'S ACT. A brokered seat asking to serve is asking to
   # open a profile directory it cannot read; saying so beats an EACCES from
   # somewhere deep inside Chrome.
@@ -3417,6 +3451,8 @@ cmd_serve() {
   if disp=$(_serve_running "$dir"); then
     printf 'already serving %s on :%s\n' "$site" "$disp"; return 0
   fi
+  # (An already-running browser keeps the tab it has; --url only picks where a
+  # NEW one opens. The person at the viewer can still move it themselves.)
   _serve_requires
 
   disp=$(_display_num "$site")
@@ -3465,7 +3501,7 @@ cmd_serve() {
     # The start URL is the cold path's last argument below, handed to the daemon
     # so a warm serve opens the SITE and not about:blank (DIVE-4944).
     DISPLAY=":$disp" FIVEDIVE_BROWSER_CHROME="$chrome_path" \
-      FIVEDIVE_BROWSER_START_URL="$(_site_url "$site")" \
+      FIVEDIVE_BROWSER_START_URL="$start_url" \
       _tmp_exec "$daemon" serve "$dir" "$dsock" $dbroker >"$rdy" 2>"$derr" &
     dpid=$!
     # READY IS A LINE THE DAEMON PRINTS WHEN THE CONTEXT IS OPEN AND THE SOCKET
@@ -3516,7 +3552,7 @@ cmd_serve() {
   ( umask 077; : > "$errlog" ) 2>/dev/null || true
   DISPLAY=":$disp" _tmp_exec "$chrome" --user-data-dir="$dir" --no-first-run \
       --no-default-browser-check --window-size=1280,800 \
-      --disable-features=TranslateUI "$(_site_url "$site")" >/dev/null 2>"$errlog" &
+      --disable-features=TranslateUI "$start_url" >/dev/null 2>"$errlog" &
   local cpid=$!
 
   # WAIT FOR THE BROWSER BEFORE ADVERTISING IT. `serve` used to print success
@@ -4015,7 +4051,7 @@ _page_open_probe() {
     BROKEN*)
       die "$E_UNAVAILABLE" "$state. Nothing was rendered and nothing was read: a browser that will not start is a box fault, not a verdict about the $site session." ;;
     CHALLENGE*)
-      die "$E_COLD" "$site is presenting a security challenge, so anything rendered now is the challenge page and not the page you asked for. A person clears it — 5dive browser auth $site" ;;
+      die "$E_COLD" "$site is presenting a security challenge, so anything rendered now is the challenge page and not the page you asked for. A person clears it. Ask your owner to, then carry on after their Done: 5dive browser connect-request $site --challenge --url=<the page you asked for>" ;;
     session\ expired*)
       die "$E_COLD" "$site is logged out. Refusing rather than handing back a screenshot of the sign-in page: that PNG would look exactly like evidence and would be the opposite. A person clears this — 5dive browser auth $site" ;;
     *)
@@ -4414,6 +4450,7 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
   fi
 
   _signin_guard "$stage/page.html"
+  _challenge_hint "$stage/page.html" "$url"
   local extra rrc=0
   extra=$(_ready_verdict "$url" "$wait_for" "$waitj" "$stage/page.html" "$stage/tree.json" "$partial" "$capture") || rrc=$?
   _derive_capture "$stage" "$url" "$chrome" "$capture" "$extra"
@@ -4585,6 +4622,7 @@ cmd_snapshot() {
 
   [[ -s "$stage/page.html" ]] || die "$E_UNAVAILABLE" "the capture produced no document; no evidence files were written"
   _signin_guard "$stage/page.html" "$(jq -r '.url // ""' <<<"$payload" 2>/dev/null)"
+  _challenge_hint "$stage/page.html" "$(jq -r '.url // ""' <<<"$payload" 2>/dev/null)" "$url"
 
   # tree.json is the refs, written from the same payload the walk returned — so
   # "what I can click" and "what the page said" are one observation on disk.
@@ -5021,6 +5059,7 @@ cmd_act() {
   _policy_log "$site" "$errf" "$final" "$out/page.png"
 
   _signin_guard "$stage/page.html" "$final"
+  _challenge_hint "$stage/page.html" "$final"
 
   # THE SAME TRIPLE A SNAPSHOT LEAVES (DIVE-4983): page.md and page.meta.json from
   # the page the steps left, beside the tree.json the executor walked. Never
@@ -5680,6 +5719,7 @@ CONNECT_REQ_TTL=900          # the owner has 15 minutes to tap Connect
 CONNECT_DONE_TTL=7200        # and two hours to tap Done after that
 CONNECT_VIEW_TTL=$VIEWER_TTL_DEFAULT
 CONNECT_REASON_MAX=200
+CONNECT_URL_MAX=1000
 CONNECT_CONNECTORS_DIR=/etc/5dive/connectors
 CONNECT_CONNECTORD_ENV=/etc/5dive/connectord.env
 CONNECT_PROVISIONING_ENV=/etc/5dive/provisioning.env
@@ -5752,10 +5792,27 @@ _connect_file() { printf '%s/%s' "$CONNECT_DIR" "$(printf '%s' "$1" | sha256sum 
 
 _connect_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
 
-_connect_request() {  # <caller> <site> <reason>
-  local caller="$1" site="$2" reason="$3" code f now exp label text kb sent=0 o resp
+# DIVE-5200: the page a captcha handoff opens on. An http(s) page OF THIS SITE,
+# nothing else: the owner is about to be shown it as "the page your agent was
+# stuck on", so it must not be a way to show them some other site.
+_connect_page_ok() {  # <site> <url>
+  local u="$2" host
+  (( ${#u} <= CONNECT_URL_MAX )) || return 1
+  [[ "$u" =~ ^https?://[^[:space:][:cntrl:]]+$ ]] || return 1
+  host="${u#*://}"; host="${host%%/*}"; host="${host%%\?*}"; host="${host%%#*}"; host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
+  [[ -n "$host" ]] && _shot_host_ok "$1" "$host"
+}
+
+_connect_request() {  # <caller> <site> <reason> [challenge <url>]
+  local caller="$1" site="$2" reason="$3" kind="${4:-login}" url="${5:-}" code f now exp label text kb sent=0 o resp
   _valid_site "$site" && [[ "$site" != "$PUBLIC_SITE" ]] \
     || die "$E_USAGE" "'$site' is not a site a person can log in to"
+  if [[ "$kind" == challenge ]]; then
+    [[ -n "$url" ]] || url="$(_site_url "$site")"
+    _connect_page_ok "$site" "$url" || die "$E_USAGE" "--url must be an http(s) page on $site"
+  else
+    kind=login url=""
+  fi
   reason=$(printf '%s' "$reason" | tr -d '\000-\037\177' | cut -c1-"$CONNECT_REASON_MAX")
   _connect_channel "$caller" \
     || die "$E_UNAVAILABLE" "seat '$caller' has no paired Telegram channel, so there is nobody to ask. Ask the owner to use Connected sites in the 5dive dashboard."
@@ -5768,14 +5825,23 @@ _connect_request() {  # <caller> <site> <reason>
   code=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
   f=$(_connect_file "$code")
   now=$(date -u +%s); exp=$(( now + CONNECT_REQ_TTL ))
-  ( umask 077; printf 'op=request\nseat=%s\nsite=%s\nexpires_at=%s\ncreated_at=%s\n' \
-      "$caller" "$site" "$exp" "$now" > "$f" )
+  ( umask 077; printf 'op=request\nseat=%s\nsite=%s\nexpires_at=%s\ncreated_at=%s\nkind=%s\nurl=%s\n' \
+      "$caller" "$site" "$exp" "$now" "$kind" "$url" > "$f" )
 
   label="${caller#agent-}"
-  text="🔐 ${label} asks you to log in to ${site} in the browser on your box."
-  [[ -n "$reason" ]] && text+=$'\n'"Why: ${reason}"
-  text+=$'\n\n'"Tap Connect for a one-time login link. Nothing opens unless you tap. You log in yourself; ${label} never sees your password."
-  kb=$(jq -nc --arg t "Connect ${site}" --arg d "bconn:${code}" '{inline_keyboard:[[{text:$t,callback_data:$d}]]}')
+  if [[ "$kind" == challenge ]]; then
+    # Plain words, what is blocking and where. The page's address stays out of
+    # the message: Telegram would preview it, and the site is all they need.
+    text="🧩 ${label} is stuck on a captcha on ${site} and cannot go on by itself."
+    [[ -n "$reason" ]] && text+=$'\n'"Doing: ${reason}"
+    text+=$'\n\n'"Tap Open for a one-time link to the browser on your box, on the page ${label} stopped at. Clear the check yourself, then tap Done and ${label} carries on. ${label} never solves these."
+    kb=$(jq -nc --arg t "Open ${site}" --arg d "bconn:${code}" '{inline_keyboard:[[{text:$t,callback_data:$d}]]}')
+  else
+    text="🔐 ${label} asks you to log in to ${site} in the browser on your box."
+    [[ -n "$reason" ]] && text+=$'\n'"Why: ${reason}"
+    text+=$'\n\n'"Tap Connect for a one-time login link. Nothing opens unless you tap. You log in yourself; ${label} never sees your password."
+    kb=$(jq -nc --arg t "Connect ${site}" --arg d "bconn:${code}" '{inline_keyboard:[[{text:$t,callback_data:$d}]]}')
+  fi
   for o in $CONNECT_TG_OWNERS; do
     resp=$(_connect_tg sendMessage --data-urlencode "chat_id=$o" --data-urlencode "text=$text" --data-urlencode "reply_markup=$kb")
     [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == true ]] && sent=$((sent + 1))
@@ -5784,9 +5850,15 @@ _connect_request() {  # <caller> <site> <reason>
     rm -f "$f"
     die "$E_UNAVAILABLE" "Telegram did not accept the Connect message, so nobody was asked. Nothing was bound."
   fi
-  printf 'asked the owner to connect %s (%s message%s). Nothing is bound until they tap; the request expires %s.\n' \
-    "$site" "$sent" "$([[ $sent == 1 ]] || echo s)" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)"
-  printf 'You will get a channel message when they tap and when they finish. Then `5dive browser status %s` has the verdict.\n' "$site"
+  if [[ "$kind" == challenge ]]; then
+    printf 'asked the owner to clear the check on %s (%s message%s). Nothing is bound until they tap; the request expires %s.\n' \
+      "$site" "$sent" "$([[ $sent == 1 ]] || echo s)" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'You will get a channel message when they tap and when they finish. Do not poll. After their Done, re-read the page and carry on from the step you stopped on; check what already happened first, so nothing is sent twice.\n'
+  else
+    printf 'asked the owner to connect %s (%s message%s). Nothing is bound until they tap; the request expires %s.\n' \
+      "$site" "$sent" "$([[ $sent == 1 ]] || echo s)" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'You will get a channel message when they tap and when they finish. Then `5dive browser status %s` has the verdict.\n' "$site"
+  fi
 }
 
 # Claim a code exactly once: the rename is atomic, so two taps (or a tap and a
@@ -5810,6 +5882,9 @@ _connect_claim() {  # <caller> <code> <op> <sender>  -> sets CONNECT_SITE; print
     die "$E_PERM" "that button has expired. Ask the agent to send a new one."
   fi
   CONNECT_SITE=$(_connect_field "$claimed" site)
+  CONNECT_KIND=$(_connect_field "$claimed" kind)
+  CONNECT_URL=$(_connect_field "$claimed" url)
+  [[ "$CONNECT_KIND" == challenge ]] || CONNECT_KIND=login CONNECT_URL=""
   rm -f "$claimed"
 }
 
@@ -5829,14 +5904,19 @@ _connect_tap() {  # <caller> <code> <sender>
   _connect_claim "$caller" "$code" request "$sender"
   site="$CONNECT_SITE"
   _valid_site "$site" || die "$E_PERM" "the request names no usable site"
+  local kind="$CONNECT_KIND"; local -a at=()
+  if [[ "$kind" == challenge ]]; then
+    _connect_page_ok "$site" "$CONNECT_URL" || die "$E_PERM" "the request names no usable page"
+    at=("--url=$CONNECT_URL")
+  fi
 
   err=$(mktemp); trap 'rm -f "$err"' EXIT
   # serve first, so an existing profile resolves the way it always has; auth
   # only when serve says there is no profile, then serve once more (DIVE-4895).
-  rc=0; _connect_as_box serve "$site" >/dev/null 2>"$err" || rc=$?
+  rc=0; _connect_as_box serve "$site" "${at[@]}" >/dev/null 2>"$err" || rc=$?
   if (( rc != 0 )) && grep -q '\bno profile for\b' "$err"; then
     rc=0; _connect_as_box auth "$site" >/dev/null 2>"$err" || rc=$?
-    (( rc == 0 )) && { rc=0; _connect_as_box serve "$site" >/dev/null 2>"$err" || rc=$?; }
+    (( rc == 0 )) && { rc=0; _connect_as_box serve "$site" "${at[@]}" >/dev/null 2>"$err" || rc=$?; }
   fi
   (( rc == 0 )) || die "$E_UNAVAILABLE" "the browser for $site did not start: $(tail -1 "$err")"
 
@@ -5870,10 +5950,10 @@ _connect_tap() {  # <caller> <code> <sender>
 
   done_code=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
   f=$(_connect_file "$done_code")
-  ( umask 077; printf 'op=done\nseat=%s\nsite=%s\nexpires_at=%s\n' \
-      "$caller" "$site" "$(( $(date -u +%s) + CONNECT_DONE_TTL ))" > "$f" )
-  printf 'site=%s\nurl=https://%s%s\nexpires=%s\ndone=%s\n' \
-    "$site" "$host" "$path" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)" "$done_code"
+  ( umask 077; printf 'op=done\nseat=%s\nsite=%s\nexpires_at=%s\nkind=%s\n' \
+      "$caller" "$site" "$(( $(date -u +%s) + CONNECT_DONE_TTL ))" "$kind" > "$f" )
+  printf 'site=%s\nurl=https://%s%s\nexpires=%s\ndone=%s\nkind=%s\n' \
+    "$site" "$host" "$path" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)" "$done_code" "$kind"
 }
 
 _connect_done() {  # <caller> <code> <sender>
@@ -5881,6 +5961,17 @@ _connect_done() {  # <caller> <code> <sender>
   _connect_claim "$caller" "$code" done "$sender"
   site="$CONNECT_SITE"
   _valid_site "$site" || die "$E_PERM" "the request names no usable site"
+  if [[ "$CONNECT_KIND" == challenge ]]; then
+    # DIVE-5200: a cleared check lives in THAT browser (the clearance cookie, and
+    # for a check inside a form, the page itself), so Done closes the person's
+    # view and leaves the browser running for the agent to carry on in. No
+    # probe: a served profile cannot be probed, and whether the page is clear is
+    # the agent's own next read of it, not a login verdict.
+    _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
+    printf 'site=%s\nkind=challenge\nstatus_rc=0\nstatus=%s\n' "$site" \
+      "the view is closed and the browser is still open, so the agent carries on in it"
+    return 0
+  fi
   # revoke -> stop -> probe, in that order: a served profile cannot be probed
   # honestly, and only this last command may stamp the liveness file.
   _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
@@ -5902,21 +5993,25 @@ cmd_connect_priv() {
   case "${w[0]:-}" in
     request) (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect request <site> <reason>"
              _connect_request "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
+    challenge) (( ${#w[@]} == 4 )) || die "$E_USAGE" "_connect challenge <site> <url> <reason>"
+             _connect_request "$CONNECT_CALLER" "${w[1]}" "${w[3]}" challenge "${w[2]}" ;;
     tap)     (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect tap <code> <telegram user id>"
              _connect_tap "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
     done)    (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect done <code> <telegram user id>"
              _connect_done "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
-    *) die "$E_USAGE" "_connect: request, tap or done" ;;
+    *) die "$E_USAGE" "_connect: request, challenge, tap or done" ;;
   esac
 }
 
 # `connect-request` — the agent's verb. Unprivileged: it only hands the request
 # to root, which is where the code is minted and the button sent.
 cmd_connect_request() {
-  local site="" reason="" rc=0
+  local site="" reason="" rc=0 challenge=0 url=""
   while (($#)); do
     case "$1" in
       --reason=*) reason="${1#*=}" ;;
+      --challenge) challenge=1 ;;
+      --url=*) url="${1#*=}" ;;
       -h|--help) usage; return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
       *) [[ -z "$site" ]] || die "$E_USAGE" "one site at a time"; site="$1" ;;
@@ -5924,7 +6019,17 @@ cmd_connect_request() {
   done
   [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser connect-request booking.com --reason=\"to search hotels for you\""
   _valid_site "$site" && [[ "$site" != "$PUBLIC_SITE" ]] || die "$E_USAGE" "'$site' is not a site a person can log in to"
-  printf '%s\0' request "$site" "$reason" | "${CONNECT_PRIV[@]}" || rc=$?
+  if (( challenge )); then
+    # DIVE-5200: stuck on a captcha. Name the SITE (the host), even when the page
+    # was read in the public profile: the check is cleared in a box browser for
+    # that site, and your next read of the page goes through it.
+    [[ -z "$url" ]] || _connect_page_ok "$site" "$url" \
+      || die "$E_USAGE" "--url must be the http(s) page on $site you were stopped on, got: $url"
+    printf '%s\0' challenge "$site" "$url" "$reason" | "${CONNECT_PRIV[@]}" || rc=$?
+  else
+    [[ -z "$url" ]] || die "$E_USAGE" "--url goes with --challenge (the page you were stopped on)"
+    printf '%s\0' request "$site" "$reason" | "${CONNECT_PRIV[@]}" || rc=$?
+  fi
   if (( rc == 1 )) && [[ "${CONNECT_PRIV[0]}" == sudo ]] && ! sudo -n -l /usr/local/bin/5dive browser _connect >/dev/null 2>&1; then
     die "$E_PERM" "this seat has no grant to send a Connect request. Ask the owner to use Connected sites in the 5dive dashboard."
   fi
