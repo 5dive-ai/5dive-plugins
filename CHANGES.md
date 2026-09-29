@@ -21,6 +21,15 @@ the profile, all pass as before.
 `test/dive5173-lite-welcome.test.ts` covers the welcome reader against real YAML, the `/start`
 order and the removed arm, with mutants that turn each check red.
 
+### Fixed — a lite client bot never asks the client for a key when a voice reply fails (DIVE-5162), telegram 0.5.70
+
+On a partner client box, a voice reply failed and the client's agent then changed the box's voice
+settings itself and asked the client to type in a key and to agree to their text leaving the
+machine. `LITE_INSTRUCTIONS` now carries one consumer-worded line: answer voice messages; if a
+voice reply does not work, answer in text and say only that; never ask the client to pick a
+setting, give a key or password, or agree to send anything elsewhere; never change voice settings
+yourself. Default profile unchanged — the line is in the lite block only.
+
 ### Fixed — Chrome's temp files no longer pile up in /tmp (DIVE-5190), browser 1.23.1
 
 A customer box had 3.0G in /tmp that was nothing but Chrome: 256 `.com.google.Chrome.*` files
