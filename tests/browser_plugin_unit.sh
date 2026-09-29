@@ -7664,5 +7664,141 @@ for f in plugins/browser/README.md plugins/browser/AGENTS.md plugins/browser/ski
 done
 tc 'T46e CHANGES.md carries the entry' 'DIVE-620' "$(cat "$ROOT/CHANGES.md")"
 
+# --- T47 a person's view is plain Chrome (DIVE-5203) ------------------------------------------
+# Google refuses a sign-in typed into a browser under automation control, and the warm serve IS
+# one (the daemon's Playwright launch, --remote-debugging-pipe). Measured on two boxes: refused
+# through the daemon serve, signed in first try through plain Chrome on the same profile. The
+# property graded here is structural, so it holds whatever the caller: the browser a VIEWER is
+# minted onto is launched with no debugging channel — and once the person has gone, the agents'
+# warm session comes back. Every mutant below is a way that goes wrong.
+# THE ARGV IS RECORDED, not read from /proc: every fake Chrome here `exec`s sleep to stay up, so
+# /proc/<pid>/cmdline says `sleep 300` whatever the product passed — an arm on it is vacuous.
+CHR47="$TMP/t47/bin"; mkdir -p "$CHR47"; C47ARGV="$TMP/t47/chrome.argv"; : > "$C47ARGV"
+cat > "$CHR47/google-chrome" <<CHR
+#!/usr/bin/env bash
+for a in "\$@"; do case "\$a" in --headless) exec sleep 0 ;; esac; done
+printf '%s\\n' "\$*" >> "$C47ARGV"
+exec sleep 300
+CHR
+chmod +x "$CHR47/google-chrome"
+SPATH_PRE47="$SPATH"; SPATH="$CHR47:$SPATH"
+chrome_debug_flags() {  # automation/debug flags on the last served Chrome's argv
+  tail -n1 "$C47ARGV" | tr ' ' '\n' | grep -cE -- '^--(remote-debugging|enable-automation)'
+}
+S47=plain47.test
+D47="$(mkprofile "$S47" "$LIVE_DOM")"
+P47="$D47/.5dive-serve"
+
+# --- T47a the dashboard's order: serve (warm), then viewer ---
+dserve "$S47"
+DP47="$(dkv "$P47" daemon_pid)"
+t  'T47a (setup) the serve is warm first, as the dashboard leaves it' 'yes' \
+   "$([[ -n "$DP47" ]] && kill -0 "$DP47" 2>/dev/null && echo yes || echo no)"
+_reset_argv x11vnc websockify
+dwarm "$BROWSER" viewer "$S47" --bind=sess-47 --ttl=600
+t  'T47a viewer on a warm serve mints' 0 "$RC"
+tc 'T47a ...a link' "/browser/viewer/$S47/" "$OUT"
+tc 'T47a ...and says the browser was re-served plain for a person' 'plain Chrome for a person to sign in' "$ERR"
+t  'T47a ...the daemon that held it is gone' 'no' "$(kill -0 "${DP47:-0}" 2>/dev/null && echo yes || echo no)"
+C47="$(dkv "$P47" chrome_pid)"
+t  'T47a ...the pidfile names a plain Chrome and no daemon' 'yes no' \
+   "$([[ -n "$C47" ]] && echo yes || echo no) $([[ -n "$(dkv "$P47" daemon_pid)" ]] && echo yes || echo no)"
+t  'T47a ...that Chrome is alive' 'yes' "$(kill -0 "${C47:-0}" 2>/dev/null && echo yes || echo no)"
+t  'T47a ...launched once, on THIS profile' '1 1' \
+   "$(wc -l < "$C47ARGV") $(tail -n1 "$C47ARGV" | tr ' ' '\n' | grep -cxF -- "--user-data-dir=$D47")"
+t  'T47a ...and its argv carries no --remote-debugging-* / --enable-automation' 0 "$(chrome_debug_flags)"
+t  'T47a ...marked as a login serve' 1 "$(dkv "$P47" login)"
+tc 'T47a ...the view points at the display that Chrome is on' ":$(dkv "$P47" display) " "$(cat "$ARGV/x11vnc.argv" 2>/dev/null)"
+t  'T47a ...and no warm socket is left for a seat to call a dead daemon on' 'no' \
+   "$([[ -S "$(dkv "$P47" sock)" || -S "$D47/.5dive-session.sock" || -S "$TMP/browser-sessions/$SEAT/$S47.sock" ]] && echo yes || echo no)"
+
+# --- T47b a second mint on the plain serve does not restart the person's browser ---
+dwarm "$BROWSER" viewer "$S47" --bind=sess-47b --ttl=600
+t  'T47b a re-mint on the plain serve mints' 0 "$RC"
+t  'T47b ...onto the SAME Chrome (no restart under the person)' "$C47" "$(dkv "$P47" chrome_pid)"
+
+# --- T47c a person is in it: a plain `serve` (an agent restore, the dashboard) leaves it alone ---
+dserve "$S47"
+t  'T47c serve while the view is live reuses it' 0 "$RC"
+tc 'T47c ...says already serving' 'already serving' "$OUT"
+t  'T47c ...and it is still the plain Chrome' "$C47 " "$(dkv "$P47" chrome_pid) $(dkv "$P47" daemon_pid)"
+
+# --- T47d the person has gone: the next serve brings the warm session back ---
+env PATH="$SPATH" "$BROWSER" viewer-revoke "$S47" >/dev/null 2>&1
+dserve "$S47"
+t  'T47d serve after the view ended runs' 0 "$RC"
+tc 'T47d ...says the login view ended' 'login view of' "$ERR"
+tc 'T47d ...and it is the warm session again' 'warm session' "$OUT"
+t  'T47d ...a daemon holds it, no plain Chrome, no login mark' 'yes  ' \
+   "$([[ -n "$(dkv "$P47" daemon_pid)" ]] && echo yes || echo no) $(dkv "$P47" chrome_pid) $(dkv "$P47" login)"
+t  'T47d ...and the plain Chrome was stopped (Chrome allows one per profile)' 'no' \
+   "$(kill -0 "${C47:-0}" 2>/dev/null && echo yes || echo no)"
+
+# --- T47e `serve --login` by hand, both ways ---
+DP47E="$(dkv "$P47" daemon_pid)"
+run env PATH="$SPATH" DISPLAY= "$BROWSER" serve "$S47" --login
+t  'T47e serve --login on a warm serve runs' 0 "$RC"
+tc 'T47e ...and serves plain' 'plain Chrome for a person' "$OUT"
+t  'T47e ...the daemon is gone' 'no' "$(kill -0 "${DP47E:-0}" 2>/dev/null && echo yes || echo no)"
+t  'T47e ...its Chrome carries no debug flags' '0 --user-data-dir' "$(chrome_debug_flags) $(tail -n1 "$C47ARGV" | tr ' ' '\n' | grep -o -- '^--user-data-dir' )"
+C47E="$(dkv "$P47" chrome_pid)"
+run env PATH="$SPATH" DISPLAY= "$BROWSER" serve "$S47" --login
+tc 'T47e serve --login on a plain serve reuses it' 'already serving' "$OUT"
+t  'T47e ...same Chrome' "$C47E" "$(dkv "$P47" chrome_pid)"
+env PATH="$SPATH" "$BROWSER" serve "$S47" --stop >/dev/null 2>&1
+
+# --- T47f a box with NO daemon: a plain serve is not swapped for nothing ---
+run env PATH="$SPATH" DISPLAY= "$BROWSER" serve "$S47" --login
+C47F="$(dkv "$P47" chrome_pid)"
+run env PATH="$SPATH" DISPLAY= FIVEDIVE_BROWSER_NO_DAEMON=1 "$BROWSER" serve "$S47"
+tc 'T47f serve with no daemon possible keeps the login serve' 'already serving' "$OUT"
+t  'T47f ...same Chrome, not a restart for nothing' "$C47F" "$(dkv "$P47" chrome_pid)"
+env PATH="$SPATH" "$BROWSER" serve "$S47" --stop >/dev/null 2>&1
+
+# --- T47g auth on a display-less box serves for a login ---
+S47G=auth47.test
+D47G="$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT/$S47G"
+dwarm env DISPLAY= "$BROWSER" auth "$S47G"
+t  'T47g auth on a display-less box runs' 0 "$RC"
+t  'T47g ...and the browser it serves is plain, marked login' 'yes 1' \
+   "$([[ -n "$(dkv "$D47G/.5dive-serve" chrome_pid)" && -z "$(dkv "$D47G/.5dive-serve" daemon_pid)" ]] && echo yes || echo no) $(dkv "$D47G/.5dive-serve" login)"
+env PATH="$SPATH" "$BROWSER" serve "$S47G" --stop >/dev/null 2>&1
+
+# --- T47h a PROXIED seat keeps the daemon and says so (DIVE-4951) ---
+run "$BROWSER" proxy set "$PXURL"
+t  'T47h (setup) proxy set' 0 "$RC"
+dserve "$S47"
+DP47H="$(dkv "$P47" daemon_pid)"
+dwarm "$BROWSER" viewer "$S47" --bind=sess-47h --ttl=600
+t  'T47h viewer on a proxied warm serve mints' 0 "$RC"
+t  'T47h ...on the SAME daemon — the proxy is kept, never the box IP' "$DP47H" "$(dkv "$P47" daemon_pid)"
+t  'T47h ...no plain Chrome was started' '' "$(dkv "$P47" chrome_pid)"
+tc 'T47h ...and it says Google-style sign-ins will be refused there' 'Sign in with Google' "$ERR"
+run env PATH="$SPATH" DISPLAY= "$BROWSER" serve "$S47" --login
+tc 'T47h serve --login on a proxied seat also keeps the daemon, and says so' 'proxy' "$ERR"
+t  'T47h ...same daemon' "$DP47H" "$(dkv "$P47" daemon_pid)"
+env PATH="$SPATH" "$BROWSER" viewer-revoke "$S47" >/dev/null 2>&1
+env PATH="$SPATH" "$BROWSER" serve "$S47" --stop >/dev/null 2>&1
+run "$BROWSER" proxy clear
+
+# --- T47i MUTANT: the viewer's conversion removed — the view lands on the automated browser ---
+MUT47="$TMP/t47/mut"; rm -rf "$MUT47"; mkdir -p "$TMP/t47"; cp -r "$ROOT/plugins/browser" "$MUT47"
+perl -0pi -e 's/  if _daemon_live "\$dir"; then\n    \( cmd_serve "\$site" --login >\/dev\/null \)/  if false; then\n    ( cmd_serve "\$site" --login >\/dev\/null )/' "$MUT47/bin/browser"
+t  'T47i (anchor) the mutation applied' 1 "$(grep -c '^  if false; then$' "$MUT47/bin/browser")"
+dserve "$S47" FIVEDIVE_BROWSER_SESSION_DAEMON="$MUT47/bin/session-daemon"
+DP47I="$(dkv "$P47" daemon_pid)"
+dwarm env FIVEDIVE_BROWSER_SESSION_DAEMON="$MUT47/bin/session-daemon" "$MUT47/bin/browser" viewer "$S47" --bind=sess-47i --ttl=600
+t  'T47i the mutant still mints' 0 "$RC"
+t  'T47i ...and the view lands on the automated browser — what T47a exists to catch' "$DP47I" "$(dkv "$P47" daemon_pid)"
+env PATH="$SPATH" "$MUT47/bin/browser" viewer-revoke "$S47" >/dev/null 2>&1
+env PATH="$SPATH" FIVEDIVE_BROWSER_SESSION_DAEMON="$MUT47/bin/session-daemon" "$MUT47/bin/browser" serve "$S47" --stop >/dev/null 2>&1
+
+SPATH="$SPATH_PRE47"
+
+# --- T47j the words ---
+tc 'T47j usage names serve --login' 'serve <site> --login' "$(env PATH="$SPATH" "$BROWSER" --help 2>&1)"
+tc 'T47j CHANGES.md carries the entry' 'DIVE-5203' "$(cat "$ROOT/CHANGES.md")"
+tc 'T47j README says a person signs in through plain Chrome' 'no automation control' "$(tr -s ' \n' '  ' < "$ROOT/plugins/browser/README.md")"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

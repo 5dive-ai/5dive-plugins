@@ -147,6 +147,9 @@ reset
 out=$(priv tap "$CODE" "$OWNER" 2>&1); rc=$?
 t  "T1 the owner's tap succeeds (refused taps did not burn it)" 0 "$rc"
 t  "T2 serve then viewer, as the relay would" "serve booking.com|viewer" "$(head -2 "$FAKE_LOG" | cut -d' ' -f1,2 | tr '\n' '|' | sed 's/|$//' | sed 's/^serve booking.com|viewer.*/serve booking.com|viewer/')"
+# DIVE-5203: the browser a person signs in through is plain Chrome, so the tap
+# serves it that way from the start instead of starting a daemon to stop it.
+t  "T2 ... and the serve is for a login" "serve booking.com --login" "$(head -1 "$FAKE_LOG")"
 bindrec=$(jq -c 'select(.path=="/shell/browser-viewer-bind")' "$TMP/stub.log")
 t  "T3 exactly one bind registered" 1 "$(binds)"
 t  "T3 ... with the connectord token" "Bearer connectord-secret-token-0123456789" "$(jq -r '.auth' <<<"$bindrec")"
