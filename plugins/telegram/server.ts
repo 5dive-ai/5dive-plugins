@@ -38,7 +38,12 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { parseGateReply, resolveGateReply, gateAlertIdent } from './gatereply'
 import { COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
-import { createFiveRunner, createFailureBreaker, type FiveRunner } from './cliexec.ts'
+import { createFiveRunner, createFailureBreaker, isSudoDenial, type FiveRunner } from './cliexec.ts'
+import {
+  seatCanAdmin, classifyAccountUsage, accountReadOnlyText, accountSwitchPendingText,
+  accountSwitchDoneText, accountSwitchFailedText, USAGE_NOT_AVAILABLE_TEXT, USAGE_READ_FAILED_TEXT,
+  type SeatAdmin, type SeatSudo,
+} from './seatpriv.ts'
 import { planAutoAttach, autoAttachFooter, attachedNames, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
@@ -2136,6 +2141,11 @@ type FiveDiveAgentEntry = {
   // confuses (DIVE-150). Matches the `types` entries on FiveDiveAccountEntry.
   type?: string
   authProfile?: string
+  // DIVE-5220: the stored isolation label and the MEASURED sudo grant. Read by
+  // seatCanAdmin() so /account and /usage stop offering root-only verbs on a
+  // standard seat.
+  isolation?: string
+  sudo?: SeatSudo
 }
 
 // Run `sudo -n 5dive <args>` and return the parsed JSON envelope from STDOUT,
@@ -2331,6 +2341,13 @@ type FiveDiveAccountUsage = {
 // /account button dots and the /usage board. Best-effort: returns null on any
 // failure (e.g. a CLI without the `usage` subcommand yet) so callers degrade
 // to "no usage" rather than erroring.
+// DIVE-5220: may THIS seat run root-only 5dive verbs? Pass `agents` when the
+// caller already holds the list, so it is not read twice.
+async function thisSeatAdmin(me: string, agents?: FiveDiveAgentEntry[] | null): Promise<SeatAdmin> {
+  const list = agents === undefined ? await read5diveAgentList() : agents
+  return seatCanAdmin(list?.find(a => a.name === me) ?? null, fiveRunner().sudoDenied())
+}
+
 async function read5diveAccountUsage(): Promise<FiveDiveAccountUsage[] | null> {
   const j = await read5diveJson(['account', 'usage', '--json'])
   return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAccountUsage[]) : null
@@ -2571,10 +2588,17 @@ function rotationBody(rot: { enabled: boolean; allAccounts?: boolean; accounts: 
 // render identically. Returns {error} when the account list can't be read.
 async function buildAccountMenu(
   me: string,
-): Promise<{ text: string; keyboard: InlineKeyboard } | { error: string }> {
-  const [accounts, agents, usage, rotation] = await Promise.all([
+): Promise<{ text: string; keyboard?: InlineKeyboard } | { error: string }> {
+  // DIVE-5220: a seat that cannot run set-account gets the current account,
+  // read-only, and no buttons — not a picker whose every tap is refused. Read
+  // the agent list first so such a seat never spawns the root-only reads below
+  // (each refused sudo mails root, DIVE-4397).
+  const agents = await read5diveAgentList()
+  if ((await thisSeatAdmin(me, agents)) === 'no') {
+    return { text: accountReadOnlyText(agents?.find(a => a.name === me)?.authProfile || 'default') }
+  }
+  const [accounts, usage, rotation] = await Promise.all([
     read5diveAccountList(),
-    read5diveAgentList(),
     read5diveAccountUsage(),
     read5diveRotation(me),
   ])
@@ -2711,21 +2735,33 @@ async function applyAccount(name: string, chatId: number): Promise<ApplyResult> 
   if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name) && name !== 'default') {
     return { text: `Invalid account name.` }
   }
+  // DIVE-5220: a seat whose grant does not cover set-account (standard
+  // isolation) is told so up front, and sudo is never spawned for it. A stale
+  // picker from before the seat was narrowed still reaches here.
+  if ((await thisSeatAdmin(me)) === 'no') {
+    return { text: accountSwitchFailedText(name, true, '') }
+  }
   return {
-    text: `✅ Account → ${name}\n\n⚠️  Claude is restarting to apply it — back in ~20-30s once the new session loads.`,
-    // Runs after the handler's editMessageText + reply have been awaited, so
-    // the ack is on the wire before set-account schedules the restart. On the
-    // rare failure (sudo denied, CLI error) no restart fires and the bot is
-    // still alive, so we correct the optimistic ✅ with a fresh reply.
+    // DIVE-5220: NO ✅ here. This text is on the wire before set-account has
+    // run, so it may only say that a switch has started. The ✅ is sent by
+    // after(), once set-account has returned ok — and not before.
+    text: accountSwitchPendingText(name),
+    // Runs after the handler's Telegram I/O has been awaited. The CLI's
+    // deferred restart (~1s after set-account returns) can still beat the ✅
+    // reply; then the owner is left with the ⏳ line and the agent comes back
+    // on the new account, which is true. On a failure no restart fires, the bot
+    // is alive, and exactly one message says what happened.
     after: () => {
       void execFileP(SUDO, ['-n', '5dive', 'agent', 'set-account', me, name], { timeout: 5000 })
-        .catch((err: any) => {
-          const stderr = err?.stderr ? String(err.stderr).trim() : ''
-          void bot.api.sendMessage(
-            chatId,
-            `❌ Failed to switch account: ${stderr || (err instanceof Error ? err.message : String(err))}`,
-          ).catch(() => {})
-        })
+        .then(
+          () => bot.api.sendMessage(chatId, accountSwitchDoneText(name)),
+          (err: any) => {
+            const stderr = err?.stderr ? String(err.stderr).trim() : ''
+            const detail = stderr || (err instanceof Error ? err.message : String(err))
+            return bot.api.sendMessage(chatId, accountSwitchFailedText(name, isSudoDenial(err), detail))
+          },
+        )
+        .catch(() => {})
     },
   }
 }
@@ -3929,7 +3965,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       await ctx.reply(menu.error)
       return
     }
-    await ctx.reply(menu.text, { reply_markup: menu.keyboard })
+    await ctx.reply(menu.text, menu.keyboard ? { reply_markup: menu.keyboard } : {})
   },
 
   // /usage — the full Anthropic 5h/1w limit board across every account (the
@@ -3937,11 +3973,25 @@ const commandHandlers: Record<string, CommandHandler> = {
   // switcher buttons). null usage for an account means no bound agent
   // rendered a statusline recently, so there are no live numbers to show.
   usage: async ctx => {
-    const [board, usage] = await Promise.all([read5diveUsageBoard(), read5diveAccountUsage()])
-    if (!usage) {
-      await ctx.reply(`Couldn't read usage — your 5dive CLI may be out of date. Update to the latest 5dive CLI, then try again.`)
+    // DIVE-5220: both reads are root-only. On a seat whose grant does not
+    // cover them, say so — never "CLI out of date", which was false there —
+    // and do not spawn the sudo that would only be refused and mail root.
+    const me = thisAgentName()
+    const seat: SeatAdmin = me ? await thisSeatAdmin(me) : 'unknown'
+    if (seat === 'no') {
+      await ctx.reply(USAGE_NOT_AVAILABLE_TEXT)
       return
     }
+    const [board, usageEnv] = await Promise.all([
+      read5diveUsageBoard(),
+      read5diveJson(['account', 'usage', '--json']),
+    ])
+    const read = classifyAccountUsage<FiveDiveAccountUsage>(usageEnv, seat, fiveRunner().sudoDenied())
+    if (read.kind !== 'ok') {
+      await ctx.reply(read.kind === 'refused' ? USAGE_NOT_AVAILABLE_TEXT : USAGE_READ_FAILED_TEXT)
+      return
+    }
+    const usage = read.data
     if (usage.length === 0) {
       await ctx.reply(`No accounts configured.`)
       return
@@ -5646,18 +5696,14 @@ bot.on('callback_query:data', async ctx => {
   if (accountM) {
     const chatId = ctx.chat?.id ?? Number(ctx.callbackQuery.from.id)
     const r = await applyAccount(accountM[1]!, chatId)
-    await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Failed' }).catch(() => {})
-    // Clear the keyboard so the picker can't be re-tapped, then send a fresh
-    // reply for the push (editMessageText is silent; the CLI schedules a
-    // SIGTERM ~1s out so the user needs to know the switch landed). We strip
-    // only the markup rather than rewriting the body, which previously showed
-    // the same ack twice. On failure, no reply fires, so edit the body instead.
-    if (r.after) {
-      await ctx.editMessageReplyMarkup().catch(() => {})
-      await ctx.reply(r.text).catch(() => {})
-    } else {
-      await ctx.editMessageText(r.text).catch(() => {})
-    }
+    await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Not switched' }).catch(() => {})
+    // DIVE-5220: rewrite the picker in place (which also drops its keyboard so
+    // it can't be re-tapped) — to the ⏳ pending line on a switch, or to the
+    // refusal on a seat that can't switch. The edit is silent; the push is the
+    // single outcome message after() sends once set-account has answered: ✅
+    // on ok, ❌ with the reason otherwise. The old shape pushed "✅ … restarting"
+    // here, before set-account had run, and then a ❌ when sudo refused it.
+    await ctx.editMessageText(r.text).catch(() => {})
     r.after?.()
     return
   }
@@ -5690,7 +5736,7 @@ bot.on('callback_query:data', async ctx => {
         await ctx.editMessageText(menu.error).catch(() => {})
         return
       }
-      await ctx.editMessageText(menu.text, { reply_markup: menu.keyboard }).catch(() => {})
+      await ctx.editMessageText(menu.text, menu.keyboard ? { reply_markup: menu.keyboard } : {}).catch(() => {})
       return
     }
     // Mutating taps: read current → mutate → write → re-render.

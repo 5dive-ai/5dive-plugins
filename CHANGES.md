@@ -1,5 +1,23 @@
 ## Unreleased
 
+### Fixed — on a standard agent, the Telegram bot no longer claims an account switch it can't make, or blames an old CLI for /usage (DIVE-5220), telegram 0.5.76
+
+On an agent whose access is limited to its own work (standard isolation), tapping an account in
+/account showed "✅ Account → mark … restarting" and then "❌ Failed to switch account: sudo: a
+password is required". /usage said "your 5dive CLI may be out of date", which was false. Both
+were a refused sudo: switching accounts and reading account limits need an admin, by design.
+
+- /account on such an agent shows the current account, read-only, and says an admin switches it.
+  No picker, and no refused sudo is spawned.
+- /usage on such an agent says usage isn't available there. The out-of-date hint is kept only for
+  an admin agent that got nothing usable back.
+- On every agent, the ✅ is sent only after the switch has succeeded. The tap first shows
+  "⏳ Switching…", and a failure is one message that says what happened.
+- The seat's own access is read from `agent list --json` (the measured grant beats the label).
+  The standard seat's sudo grant is NOT widened (DIVE-4397).
+
+`test/dive5220-standard-seat-honest.test.ts`.
+
 ### Added — stuck on a captcha, the agent asks the owner and then carries on (DIVE-5200), browser 1.24.0, telegram 0.5.75
 
 An agent's browser task used to end at the first captcha, and a person had to restart the job.
