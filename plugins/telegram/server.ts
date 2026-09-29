@@ -48,6 +48,7 @@ import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, renderConnectLink, renderConnectVerdict, connectAgentNote, connectFailureText, type ConnectTap } from './browser-connect.ts'
 import { relayOwnerAskTap } from './owner-ask.ts'
 import { tapContent, tapMeta, tapLogEntry } from './buttontap.ts'
+import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
@@ -170,6 +171,68 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // context after a restart (the Bot API has no history/search). Bounded +
 // local-only; see msglog.ts for the privacy posture.
 const MSGLOG_DIR = join(STATE_DIR, 'msglog')
+
+// DIVE-5186: where a channel inbound goes. When this session asked Claude Code
+// for the telegram channel and Claude Code REFUSED it (the `tengu_harbor` flag
+// an OpenRouter-authed seat never gets), a `notifications/claude/channel` is
+// dropped unheard — so type the message into the seat's own pane instead. Every
+// other case keeps the notification, which is what makes it one delivery, never
+// two. The refusal is read from Claude Code's own MCP log for THIS process; the
+// marker below is how we find that file (Claude Code logs server stderr into it).
+// See channelroute.ts for the evidence and the log lines it reads.
+const ROUTE_BOOT_MS = Date.now()
+const ROUTE_MARKER = `telegram channel: route-marker ${process.pid}.${ROUTE_BOOT_MS}`
+process.stderr.write(`${ROUTE_MARKER}\n`)
+const inboundRoute = makeRouteProbe({
+  marker: ROUTE_MARKER,
+  bootPpid: process.ppid,
+  cacheRoot: join(homedir(), '.cache', 'claude-cli-nodejs'),
+  bootMs: ROUTE_BOOT_MS,
+})
+let lastRouteNoted = ''
+
+type ChannelInbound = { content: string; meta: Record<string, string> }
+
+async function deliverInbound(params: ChannelInbound): Promise<void> {
+  let route = inboundRoute.route()
+  // A message that beats Claude Code's gate decision at boot waits for it
+  // (bounded) rather than guessing — a wrong guess is a lost or a doubled message.
+  for (let i = 0; i < 20 && route === 'mcp' && inboundRoute.pending(); i++) {
+    await new Promise(r => setTimeout(r, 500))
+    route = inboundRoute.route()
+  }
+  const why = `${route} (${inboundRoute.describe()})`
+  if (why !== lastRouteNoted) {
+    lastRouteNoted = why
+    process.stderr.write(`telegram channel: inbound route ${why}\n`)
+  }
+  if (route === 'inject') {
+    try {
+      await injectIntoSession(formatInjection(params.content, params.meta))
+      return
+    } catch (err) {
+      process.stderr.write(`telegram channel: session inject failed, falling back to the channel notification: ${err}\n`)
+    }
+  }
+  await mcp.notification({ method: 'notifications/claude/channel', params })
+}
+
+// Type one inbound into the seat's pane and submit it (channelroute.ts: the
+// keystroke contract). Built on first use: TMUX is declared further down.
+let sessionInjector: ((text: string) => Promise<void>) | null = null
+function injectIntoSession(text: string): Promise<void> {
+  if (!sessionInjector) {
+    const user = process.env.USER ?? process.env.LOGNAME ?? ''
+    sessionInjector = makeSessionInjector({
+      tmuxBin: TMUX,
+      socket: (process.env.TMUX ?? '').split(',')[0] ?? '',
+      target: process.env.TMUX_PANE || (user.startsWith('agent-') ? `${user}:0` : ''),
+      exec: (bin, args) => execFileP(bin, args),
+    })
+  }
+  return sessionInjector(text)
+}
+
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 // Liveness beacon for the single getUpdates slot (DIVE-818). The active poller
 // bumps this file's mtime every HEARTBEAT_MS; a newcomer treats the slot as HELD
@@ -1758,19 +1821,16 @@ if (SEND_ONLY) {
                 process.stderr.write(`telegram channel: relay gate-clear reply failed: ${err}\n`)
               })
           } else {
-            mcp.notification({
-              method: 'notifications/claude/channel',
-              params: {
-                content: String(p.content ?? ''),
-                meta: {
-                  chat_id: String(p.chat_id),
-                  ...(p.message_id != null ? { message_id: String(p.message_id) } : {}),
-                  ...(p.message_thread_id != null ? { message_thread_id: String(p.message_thread_id) } : {}),
-                  user: String(p.user ?? 'team'),
-                  ...(p.user_id != null ? { user_id: String(p.user_id) } : {}),
-                  ts: String(p.ts ?? new Date().toISOString()),
-                  ...(p.image_path ? { image_path: String(p.image_path) } : {}),
-                },
+            deliverInbound({
+              content: String(p.content ?? ''),
+              meta: {
+                chat_id: String(p.chat_id),
+                ...(p.message_id != null ? { message_id: String(p.message_id) } : {}),
+                ...(p.message_thread_id != null ? { message_thread_id: String(p.message_thread_id) } : {}),
+                user: String(p.user ?? 'team'),
+                ...(p.user_id != null ? { user_id: String(p.user_id) } : {}),
+                ts: String(p.ts ?? new Date().toISOString()),
+                ...(p.image_path ? { image_path: String(p.image_path) } : {}),
               },
             }).catch((err: unknown) => {
               process.stderr.write(`telegram channel: relay-in deliver failed: ${err}\n`)
@@ -4711,16 +4771,13 @@ function runConnectPriv(stdin: string, timeoutMs: number): Promise<{ code: numbe
 function notifyAgentOfConnect(ctx: Context, content: string): void {
   const chatId = String(ctx.callbackQuery?.message?.chat.id ?? ctx.from?.id ?? '')
   markInbound()
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content,
-      meta: {
-        chat_id: chatId,
-        user: ctx.from?.username ?? String(ctx.from?.id ?? ''),
-        user_id: String(ctx.from?.id ?? ''),
-        ts: new Date().toISOString(),
-      },
+  deliverInbound({
+    content,
+    meta: {
+      chat_id: chatId,
+      user: ctx.from?.username ?? String(ctx.from?.id ?? ''),
+      user_id: String(ctx.from?.id ?? ''),
+      ts: new Date().toISOString(),
     },
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver browser-connect note to Claude: ${err}\n`)
@@ -4799,19 +4856,16 @@ function relayButtonTap(ctx: Context, value: string, fallbackButton: string, wha
   try {
     msglogAppend(MSGLOG_DIR, chatId, tapLogEntry(tap, user, ts, threadId))
   } catch {}
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: tapContent(tap),
-      meta: {
-        chat_id: chatId,
-        ...(msg ? { message_id: String(msg.message_id) } : {}),
-        ...(threadId != null ? { message_thread_id: threadId } : {}),
-        user,
-        user_id: String(from.id),
-        ts,
-        ...tapMeta(tap),
-      },
+  deliverInbound({
+    content: tapContent(tap),
+    meta: {
+      chat_id: chatId,
+      ...(msg ? { message_id: String(msg.message_id) } : {}),
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+      user,
+      user_id: String(from.id),
+      ts,
+      ...tapMeta(tap),
     },
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver ${what} tap to Claude: ${err}\n`)
@@ -5687,20 +5741,17 @@ bot.on('callback_query:data', async ctx => {
     // the react path degrades to contact-only rather than crediting a stale one.
     markInbound()
     startTypingLoop(chatId)
-    mcp.notification({
-      method: 'notifications/claude/channel',
-      params: {
-        content: `[callback_query data=${data}]`,
-        meta: {
-          chat_id: chatId,
-          ...(msg ? { message_id: String(msg.message_id) } : {}),
-          ...(msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
-            ? { message_thread_id: String(msg.message_thread_id) }
-            : {}),
-          user: ctx.from.username ?? String(ctx.from.id),
-          user_id: String(ctx.from.id),
-          ts: new Date().toISOString(),
-        },
+    deliverInbound({
+      content: `[callback_query data=${data}]`,
+      meta: {
+        chat_id: chatId,
+        ...(msg ? { message_id: String(msg.message_id) } : {}),
+        ...(msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+          ? { message_thread_id: String(msg.message_thread_id) }
+          : {}),
+        user: ctx.from.username ?? String(ctx.from.id),
+        user_id: String(ctx.from.id),
+        ts: new Date().toISOString(),
       },
     }).catch(err => {
       process.stderr.write(`telegram channel: failed to deliver callback_query to Claude: ${err}\n`)
@@ -6372,26 +6423,23 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
+  deliverInbound({
+    content: text,
+    meta: {
+      chat_id,
+      ...(msgId != null ? { message_id: String(msgId) } : {}),
+      ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
+      user: from.username ?? String(from.id),
+      user_id: String(from.id),
+      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      ...(imagePath ? { image_path: imagePath } : {}),
+      ...(attachment ? {
+        attachment_kind: attachment.kind,
+        attachment_file_id: attachment.file_id,
+        ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+        ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+        ...(attachment.name ? { attachment_name: attachment.name } : {}),
+      } : {}),
     },
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
