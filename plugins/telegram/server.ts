@@ -52,7 +52,7 @@ import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelr
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
-import { resolveProfile, ackReactionFor, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, recordOpsDetail, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
+import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, recordOpsDetail, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -60,6 +60,7 @@ import {
   mostRecentChatId as msglogMostRecent,
   MSGLOG_MAX_PER_CHAT,
 } from './msglog'
+import { ackReactionFor } from './hooks/lib/lite.ts'
 
 // Plugin version is sourced from .claude-plugin/plugin.json — the same
 // manifest the Claude Code plugin system reads, so /status can never
