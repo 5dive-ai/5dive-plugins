@@ -45,6 +45,7 @@ usage() {
   5dive voice config [--json]          # every setting and its current value
   5dive voice config get <key>
   sudo 5dive voice config set <key> <value>
+  sudo 5dive voice config init <key>=<value>...   # only on a box with no config yet
   5dive voice --help
 
 BACKENDS
@@ -58,6 +59,9 @@ BACKENDS
               the box. More accurate, and it costs about $0.00006 to hear a 20s
               voice note and $0.0045 to speak a 300-character reply.
               Needs a key:  sudo 5dive-write-connector openrouter.env <<< "OPENROUTER_API_KEY=sk-or-..."
+
+  Hearing alone can run elsewhere:  sudo 5dive voice config set stt_backend local
+  (a 5dive box is built that way: it hears on this box and speaks on OpenRouter).
 
 MODELS (openrouter only; sudo 5dive voice config set <key> <value>)
 
@@ -189,6 +193,7 @@ config_field() { jq -c --arg k "$1" '(.fivedive.settings.fields // [])[] | selec
 config_value() {
   case "$1" in
     backend)   voice_backend_configured ;;
+    stt_backend) voice_stt_backend_configured ;;
     stt_model) voice_stt_model ;;
     tts_model) voice_tts_model ;;
     *)         voice_config_get "$1" "$(config_field "$1" | jq -r '.default // empty')" ;;
@@ -205,11 +210,73 @@ config_json() {
   # but there is no key, so every call is quietly running locally. `connector`
   # names the store entry that fixes it; the dashboard points at its own way to
   # add one and never takes the key itself.
-  if [[ "$(voice_backend_configured)" == openrouter ]] && ! voice_openrouter_key >/dev/null 2>&1; then
+  if [[ "$(voice_backend_configured)" == openrouter || "$(voice_stt_backend_configured)" == openrouter ]] \
+     && ! voice_openrouter_key >/dev/null 2>&1; then
     notices=$(jq -c '. + [{key: "backend", connector: "openrouter.env",
       text: "Set to OpenRouter, but this server has no OpenRouter key, so voice is running on this server instead. Add a key to switch it over."}]' <<<"$notices")
   fi
   jq -cn --argjson values "$vals" --argjson notices "$notices" '{ok: true, values: $values, notices: $notices}'
+}
+
+# config_validate <key> <value> <field-json> — dies unless value fits the field.
+config_validate() {
+  local key="$1" value="$2" field="$3" type
+  type=$(jq -r '.type' <<<"$field")
+  case "$type" in
+    enum)
+      jq -e --arg v "$value" '[.options[]? | if type == "object" then .value else . end] | index($v) != null' <<<"$field" >/dev/null \
+        || die "'$value' is not a choice for $key (want: $(jq -r '[.options[]? | if type == "object" then .value else . end] | join(" | ")' <<<"$field"))" 2
+      ;;
+    string)
+      [[ "$value" =~ $CONFIG_STRING_RE ]] \
+        || die "'$value' is not a valid $key — letters, digits and . _ : / @ + - only, starting with a letter or digit, at most 128 characters" 2
+      ;;
+    *) die "the manifest declares $key with type '$type', which this verb does not know how to set" 2 ;;
+  esac
+}
+
+# ---- config init: a box's FIRST config, never a second (DIVE-5189) ------
+#
+# 5dive's own build and its backfill turn voice on for a box by writing the
+# config BEFORE `voice setup` runs (setup keeps a config that exists, and so
+# does the nightly). It writes ONLY when the box has no config: a choice the
+# customer already made — or an earlier install's — is never overwritten, and
+# `kept` says so. It needs no engine (the lib arrives with setup, after it), so
+# it runs before the engine check. Every pair is validated the way `set` does,
+# and nothing is written unless all of them pass.
+cmd_config_init() {
+  local json="$1"; shift
+  [[ $# -gt 0 ]] || die "usage: sudo 5dive voice config init <key>=<value>..." 64
+  [[ $EUID -eq 0 ]] || die "writing the voice config needs root. Run: sudo 5dive voice config init $*"
+  config_need_manifest
+  local dir="${VOICE_STATE_DIR:-${STATE_DIR:-/var/lib/5dive}/voice}"
+  local cfg="${VOICE_CONFIG:-$dir/config}"
+  local pair key value field lines=()
+  for pair in "$@"; do
+    [[ "$pair" == *=* ]] || die "'$pair' is not <key>=<value>" 64
+    key="${pair%%=*}"; value="${pair#*=}"
+    field=$(config_field "$key")
+    [[ -n "$field" ]] || die "unknown setting '$key' (settable: $(config_keys | paste -sd' '))" 2
+    config_validate "$key" "$value" "$field"
+    lines+=("$key=$value")
+  done
+  local state=kept
+  if [[ ! -e "$cfg" ]]; then
+    mkdir -p "$dir" || die "could not create $dir"
+    chmod 755 "$dir" 2>/dev/null || true
+    chown root:claude "$dir" 2>/dev/null || true
+    local tmp
+    tmp="$(mktemp "$dir/.config.XXXXXX")" || die "could not write in $dir"
+    { printf '# Set when 5dive turned voice on for this box. Change any line with:\n'
+      printf '#   sudo 5dive voice config set <key> <value>\n'
+      printf '%s\n' "${lines[@]}"; } > "$tmp"
+    chmod 644 "$tmp"; chown root:claude "$tmp" 2>/dev/null || true
+    # -n: a config that appeared since the check above wins over this one.
+    mv -n "$tmp" "$cfg" 2>/dev/null
+    if [[ -e "$tmp" ]]; then rm -f "$tmp"; else state=written; fi
+  fi
+  if [[ "$json" == 1 ]]; then jq -cn --arg s "$state" '{ok: true, config: $s}'
+  else printf 'config: %s\n' "$state"; fi
 }
 
 cmd_config() {
@@ -222,6 +289,8 @@ cmd_config() {
   [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && json=1
   if [[ "${1:-}" == --json ]]; then json=1; shift; fi
   local sub="${1:-}"
+
+  if [[ "$sub" == init ]]; then shift; cmd_config_init "$json" "$@"; return; fi
 
   if [[ ! -r "$VOICE_LIB" ]]; then
     if (( json )); then
@@ -254,26 +323,21 @@ cmd_config() {
       [[ -n "$key" && $# -eq 3 ]] || die "usage: sudo 5dive voice config set <key> <value>" 64
       field=$(config_field "$key")
       [[ -n "$field" ]] || die "unknown setting '$key' (settable: $(config_keys | paste -sd' '))" 2
-      type=$(jq -r '.type' <<<"$field")
-      case "$type" in
-        enum)
-          jq -e --arg v "$value" '[.options[]? | if type == "object" then .value else . end] | index($v) != null' <<<"$field" >/dev/null \
-            || die "'$value' is not a choice for $key (want: $(jq -r '[.options[]? | if type == "object" then .value else . end] | join(" | ")' <<<"$field"))" 2
-          ;;
-        string)
-          [[ "$value" =~ $CONFIG_STRING_RE ]] \
-            || die "'$value' is not a valid $key — letters, digits and . _ : / @ + - only, starting with a letter or digit, at most 128 characters" 2
-          ;;
-        *) die "the manifest declares $key with type '$type', which this verb does not know how to set" 2 ;;
-      esac
+      config_validate "$key" "$value" "$field"
       # backend decides whether audio leaves the box, and already has its own
       # verb with the keyless refusal and the plain-words notice. One path.
       if [[ "$key" == backend ]]; then cmd_backend "$value"; return; fi
       [[ $EUID -eq 0 ]] || die "changing voice settings needs root. Run: sudo 5dive voice config set $key $value"
+      # stt_backend moves hearing alone (DIVE-5189); moving it to OpenRouter gets
+      # the same keyless refusal the backend verb gives.
+      if [[ "$key" == stt_backend && "$value" == openrouter ]] && ! voice_openrouter_key >/dev/null 2>&1; then
+        printf '5dive voice: refusing to move hearing to openrouter — %s' "$(voice_key_fix_line)" >&2
+        exit 1
+      fi
       config_write_key "$key" "$value"
       printf '%s: %s\n' "$key" "$value"
       ;;
-    *) die "unknown: 5dive voice config $sub (want: config [--json] | config get <key> | config set <key> <value>)" 64 ;;
+    *) die "unknown: 5dive voice config $sub (want: config [--json] | config get <key> | config set <key> <value> | config init <key>=<value>...)" 64 ;;
   esac
 }
 
@@ -324,26 +388,31 @@ cmd_status() {
   if command -v 5dive-speak >/dev/null 2>&1; then report 5dive-speak yes "$(command -v 5dive-speak)"
   else report 5dive-speak no "the wrapper that honours the backend switch"; fi
 
-  local backend="unknown"
+  local backend="unknown" hearing="unknown"
   if [[ -r "$VOICE_LIB" ]]; then
     # shellcheck source=/dev/null
     . "$VOICE_LIB"
     backend=$(voice_effective_backend 2>/dev/null)
-    report backend yes "$backend"
+    hearing=$(voice_effective_stt_backend 2>/dev/null)
+    if [[ "$hearing" == "$backend" ]]; then report backend yes "$backend"
+    else report backend yes "hearing: $hearing, speaking: $backend"; fi
   else
     report backend no "$VOICE_LIB not installed"
   fi
 
-  # The local engine is only REQUIRED when the box is actually using it. On
-  # openrouter a cold whisper-service is the expected state, not a fault, and
-  # reporting it as MISSING would train users to ignore this output.
-  if [[ "$backend" == openrouter ]]; then
-    printf '  %-22s %s\n' "whisper-service" "not needed (backend=openrouter)"
+  if [[ "$backend" == openrouter || "$(voice_stt_backend_configured 2>/dev/null)" == openrouter ]]; then
     if voice_openrouter_key >/dev/null 2>&1; then
       printf '  %-22s %s\n' "openrouter key" "present"
     else
-      report "openrouter key" no "backend=openrouter but no key — calls fall back to local"
+      report "openrouter key" no "set to openrouter but no key — calls fall back to local"
     fi
+  fi
+
+  # The local engine is only REQUIRED when the box actually HEARS on it. On
+  # openrouter a cold whisper-service is the expected state, not a fault, and
+  # reporting it as MISSING would train users to ignore this output.
+  if [[ "$hearing" == openrouter ]]; then
+    printf '  %-22s %s\n' "whisper-service" "not needed (hearing on openrouter)"
   else
     # A listening socket is the only honest test of "warm": the unit can be
     # enabled and the model still not loaded, and `systemctl is-active` would

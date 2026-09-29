@@ -50,7 +50,16 @@ VENV="/home/claude/.venv"
 CLAUDE_MD="${CLAUDE_MD:-/home/claude/projects/CLAUDE.md}"
 MARKER_OLD="<!-- 5dive-setup-voice: voice section -->"
 MARKER_V2="<!-- 5dive-setup-voice: voice section v2 -->"
-MARKER="<!-- 5dive-setup-voice: voice section v3 -->"
+MARKER_V3="<!-- 5dive-setup-voice: voice section v3 -->"
+MARKER="<!-- 5dive-setup-voice: voice section v4 -->"
+# v4 is the first version with a CLOSING marker (DIVE-5189). Every section a
+# later release appends below this one (human-messaging, agent-sites) would be
+# eaten by the old "marker to end of file" strip, so a strip is now bounded.
+MARKER_END="<!-- /5dive-setup-voice: voice section -->"
+# The last line of the v3 block, which had no closing marker: the bound for
+# stripping it.
+V3_LAST_LINE='^- \*\*Reply order for speed\*\*'
+
 WHISPER_MODEL="${WHISPER_MODEL:-small}"
 # DIVE-4439. The backend choice is host state, not plugin code, so it does NOT
 # live in the plugin's version-keyed cache dir — that path is keyed on version
@@ -244,6 +253,8 @@ step_state() {
 #   openrouter  both halves call OpenRouter. Audio and reply text leave the box.
 #               Needs a key in /etc/5dive/connectors/openrouter.env.
 backend=local
+# stt_backend=local|openrouter moves HEARING alone; unset, it follows backend.
+# A 5dive box is built with stt_backend=local and backend=openrouter.
 
 # Only read when backend=openrouter.
 # stt_model: openai/whisper-large-v3-turbo is the default — 99+ languages
@@ -266,7 +277,7 @@ step_claudemd() {
   fi
 
   if grep -qF "$MARKER" "$CLAUDE_MD"; then
-    ok "Voice section already present (v3) — not re-appending."
+    ok "Voice section already present (v4) — not re-appending."
     return
   fi
 
@@ -275,11 +286,18 @@ step_claudemd() {
   # the v2 block. If the user has manually added content after the v1 marker,
   # they'll need to restore it from the .bak we leave behind.
   local old_marker=""
-  if   grep -qF "$MARKER_V2"  "$CLAUDE_MD"; then old_marker="$MARKER_V2"
+  if   grep -qF "$MARKER_V3"  "$CLAUDE_MD"; then old_marker="$MARKER_V3"
+  elif grep -qF "$MARKER_V2"  "$CLAUDE_MD"; then old_marker="$MARKER_V2"
   elif grep -qF "$MARKER_OLD" "$CLAUDE_MD"; then old_marker="$MARKER_OLD"; fi
   if [[ -n "$old_marker" ]]; then
     cp -a "$CLAUDE_MD" "${CLAUDE_MD}.bak"
-    sed -i "\|${old_marker}|,\$d" "$CLAUDE_MD"
+    if [[ "$old_marker" == "$MARKER_V3" ]] && sed -n "\|${MARKER_V3}|,\$p" "$CLAUDE_MD" | grep -qE "$V3_LAST_LINE"; then
+      # Bounded: only the v3 block's own lines go, and whatever a later release
+      # appended below it stays.
+      sed -i "\|${MARKER_V3}|,\|${V3_LAST_LINE}|d" "$CLAUDE_MD"
+    else
+      sed -i "\|${old_marker}|,\$d" "$CLAUDE_MD"
+    fi
     warn "Removed the previous voice section. Backup at ${CLAUDE_MD}.bak."
   fi
 
@@ -289,9 +307,11 @@ $MARKER
 # Voice
 - Voice transcription: \`5dive-transcribe <path>\` outputs the transcribed text on stdout (\`--json\` for the full backend response).
 - Voice replies: \`5dive-speak "<text>"\` prints the path to a Telegram-ready OGG/Opus file. Use it instead of calling edge-tts directly — it is the only thing that honours the backend switch.
-- Which backend: \`5dive voice backend\` prints it; \`sudo 5dive voice backend local|openrouter\` changes it. \`local\` is the default. On \`local\`, hearing runs on this box (warm whisper-service at http://127.0.0.1:8765, unit \`whisper-service.service\`) but SPEAKING still sends the reply text to Microsoft, because edge-tts is an online voice service. On \`openrouter\`, both the audio and the reply text leave the box.
+- Which backend: \`5dive voice\` prints it; \`sudo 5dive voice backend local|openrouter\` changes it, and \`stt_backend\` in \`5dive voice config\` moves hearing alone. On \`local\`, hearing runs on this box (warm whisper-service at http://127.0.0.1:8765, unit \`whisper-service.service\`) but SPEAKING still sends the reply text to Microsoft, because edge-tts is an online voice service. On \`openrouter\`, speaking uses your character's own voice when your persona has one.
 - When receiving a Telegram voice message, always transcribe it before responding.
 - **Reply order for speed**: ALWAYS send the text reply first (so the user sees it immediately), then generate and send the voice attachment as a follow-up message. Never bundle them together — text first, voice second.
+- **When a voice reply fails** (for example OpenRouter answers HTTP 402 because this box's voice credit is used up), your text reply is the answer: say in one line that the voice reply did not work this time. Do not retry it in a loop, do not change voice settings, and never ask the user for a key.
+$MARKER_END
 EOF
 
   chown claude:claude "$CLAUDE_MD" 2>/dev/null || true

@@ -6,8 +6,12 @@
 # It lives in one file on purpose. 5dive-setup-voice already carries the lesson
 # one layer down ("a guard restated in three places is a guard that silently
 # goes missing from one"), and the fallback rule below is exactly that shape:
-# hearing and speaking must agree about where the audio goes, or a box ends up
-# transcribing locally while narrating to a vendor.
+# hearing and speaking read the same config through the same accessors.
+#
+# DIVE-5189: they may now run on DIFFERENT backends, but only when the config
+# says so in its own key: `stt_backend` moves hearing alone (a 5dive box hears
+# on local whisper and speaks on OpenRouter). Without that key hearing follows
+# `backend`, exactly as before, so no existing box changes.
 #
 # NOTHING SECRET IS WRITTEN HERE. The config file records a choice; the key
 # stays in /etc/5dive/connectors, root-owned, group-readable, as every other
@@ -57,6 +61,16 @@ voice_config_get() {
 voice_backend_configured() {
   local b; b=$(voice_config_get backend local)
   case "$b" in openrouter) printf 'openrouter\n' ;; *) printf 'local\n' ;; esac
+}
+
+# voice_stt_backend_configured — where HEARING was told to run: `stt_backend`
+# when the config sets it, else whatever `backend` says (DIVE-5189).
+voice_stt_backend_configured() {
+  case "$(voice_config_get stt_backend)" in
+    local) printf 'local\n' ;;
+    openrouter) printf 'openrouter\n' ;;
+    *) voice_backend_configured ;;
+  esac
 }
 
 voice_stt_model() { voice_config_get stt_model "$VOICE_DEFAULT_STT_MODEL"; }
@@ -142,8 +156,13 @@ voice_key_fix_line() {
 # because the alternative is dropping a message the user already sent. It never
 # falls the other way: a box configured `local` never reaches the network, so a
 # missing local engine is an error, not a silent upgrade to a paid vendor.
-voice_effective_backend() {
-  local want; want=$(voice_backend_configured)
+# voice_effective_backend is SPEAKING's (and `backend`'s); hearing asks
+# voice_effective_stt_backend, which applies the same rule to its own key.
+voice_effective_backend() { voice_effective_from "$(voice_backend_configured)"; }
+voice_effective_stt_backend() { voice_effective_from "$(voice_stt_backend_configured)"; }
+
+voice_effective_from() {
+  local want="$1"
   if [[ "$want" != openrouter ]]; then printf 'local\n'; return 0; fi
   if voice_openrouter_key >/dev/null 2>&1; then printf 'openrouter\n'; return 0; fi
   printf '5dive voice: backend=openrouter but %s' "$(voice_key_fix_line)" >&2
