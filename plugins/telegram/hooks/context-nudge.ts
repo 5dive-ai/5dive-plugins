@@ -34,7 +34,7 @@ import { getToken } from './lib/telegram'
 import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { nudgeFile } from './lib/paths'
 import type { HookPayload } from './lib/types'
-import { isLite } from './lib/lite'
+import { isLite, readLiteLang, LITE_STRINGS } from './lib/lite'
 
 // Opt-in gate: the carry-over nudge is OFF by default and only fires once the
 // user has turned it on for this agent with `/context on` (writes
@@ -60,8 +60,10 @@ const TIERS: { at: number; text: string }[] = [
 
 const payload = await readPayload<HookPayload>()
 
-// DIVE-5121: an operator nudge (/new is a lite client's lever). A lite box never runs it.
-if (isLite()) process.exit(0)
+// DIVE-5194: lite runs this hook too (DIVE-5121 had dropped it). Its message
+// reaches the client, so under lite only the WORDING changes: the same tiers
+// and buttons, in the client's language, with no word about context.
+const liteCarry = isLite() ? LITE_STRINGS[readLiteLang()].carryover : null
 
 // Re-entry from a blocked Stop (stop-reply-check) isn't a fresh natural break —
 // skip so the nudge only ever rides a clean turn end.
@@ -133,13 +135,14 @@ if (!target) process.exit(0)
 const token = getToken()!
 const reply_markup = {
   inline_keyboard: [
-    [{ text: 'Clear now', callback_data: 'ho:clear' }],
-    [{ text: 'Remember & clear', callback_data: 'ho:now' }],
-    [{ text: 'Not yet', callback_data: 'ho:skip' }],
+    [{ text: liteCarry?.clear ?? 'Clear now', callback_data: 'ho:clear' }],
+    [{ text: liteCarry?.remember ?? 'Remember & clear', callback_data: 'ho:now' }],
+    [{ text: liteCarry?.notYet ?? 'Not yet', callback_data: 'ho:skip' }],
   ],
 }
 try {
-  const params = new URLSearchParams({ chat_id: target.chatId, text: crossed.text })
+  const text = liteCarry ? liteCarry.tiers[TIERS.indexOf(crossed)]! : crossed.text
+  const params = new URLSearchParams({ chat_id: target.chatId, text })
   if (target.threadId) params.set('message_thread_id', target.threadId)
   params.set('reply_markup', JSON.stringify(reply_markup))
   const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {

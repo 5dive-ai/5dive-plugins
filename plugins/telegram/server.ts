@@ -52,7 +52,7 @@ import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelr
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
-import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, recordOpsDetail, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
+import { resolveProfile, ackReactionFor, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, recordOpsDetail, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -5471,14 +5471,20 @@ bot.on('callback_query:data', async ctx => {
   //
   // NB: plugin slash commands are namespaced `/<plugin>:<command>`, so this MUST
   // be `/telegram:carryover` — bare `/carryover` resolves to "Unknown command".
+  //
+  // DIVE-5194: lite runs context-nudge again, so a client can tap these. The
+  // actions are the same; only the words they read are the lite strings.
+  const liteHo = LITE && data.startsWith('ho:') ? LITE_STRINGS[liteLang(ctx.from.language_code)] : null
   if (data === 'ho:clear') {
     const dispatched = proxyToClaudeTUI('/clear')
-    await ctx.answerCallbackQuery({ text: dispatched ? 'Clearing…' : 'Type /clear in your session' }).catch(() => {})
+    const liteText = liteHo && (dispatched ? liteHo.newDone : liteHo.failed)
+    await ctx.answerCallbackQuery({ text: liteText || (dispatched ? 'Clearing…' : 'Type /clear in your session') }).catch(() => {})
     await ctx
       .editMessageText(
-        dispatched
+        liteText ||
+        (dispatched
           ? 'Cleared the context now — nothing saved.'
-          : "Couldn't reach the session from here — type /clear in your terminal.",
+          : "Couldn't reach the session from here — type /clear in your terminal."),
       )
       .catch(() => {})
     return
@@ -5486,12 +5492,14 @@ bot.on('callback_query:data', async ctx => {
   if (data === 'ho:now') {
     const baseline = newestCarryoverMtime()
     const dispatched = proxyToClaudeTUI('/telegram:carryover')
-    await ctx.answerCallbackQuery({ text: dispatched ? 'Saving, then clearing…' : 'Run /telegram:carryover in your session' }).catch(() => {})
+    const liteText = liteHo && (dispatched ? liteHo.carryover.saving : liteHo.failed)
+    await ctx.answerCallbackQuery({ text: liteText || (dispatched ? 'Saving, then clearing…' : 'Run /telegram:carryover in your session') }).catch(() => {})
     await ctx
       .editMessageText(
-        dispatched
+        liteText ||
+        (dispatched
           ? 'Saving the carryover, then clearing — the fresh session reloads it from memory.'
-          : "Couldn't reach the session from here — type /telegram:carryover then /clear in your terminal.",
+          : "Couldn't reach the session from here — type /telegram:carryover then /clear in your terminal."),
       )
       .catch(() => {})
     if (dispatched) {
@@ -5501,7 +5509,7 @@ bot.on('callback_query:data', async ctx => {
     return
   }
   if (data === 'ho:skip') {
-    await ctx.answerCallbackQuery({ text: 'Okay, carrying on.' }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: liteHo?.carryover.carryOn ?? 'Okay, carrying on.' }).catch(() => {})
     await ctx.editMessageReplyMarkup().catch(() => {})
     return
   }
@@ -6381,14 +6389,19 @@ async function handleInbound(
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
   // something outside that set the API rejects it and we swallow.
-  // DIVE-5121: lite never reacts (no emoji, a partner brand rule); the typing
-  // indicator above is its ack. It remembers the client's language instead, for
-  // the hooks, which answer out of process with no update to read it from.
+  // DIVE-5194: lite reacts too. DIVE-5121 had dropped the reaction on a partner
+  // no-emoji rule, and lodar: "no emoji rule was for his dashboard ui". Same
+  // path as the default profile; a lite box that names no reaction gets 👀
+  // (ackReactionFor), because no lite box writes one and the model cannot be
+  // relied on to react.
+  // Lite also remembers the client's language, for the hooks, which answer out
+  // of process with no update to read it from.
   if (LITE) writeLiteLang(STATE_DIR, liteLang(from.language_code))
-  if (!LITE && access.ackReaction && msgId != null) {
+  const ackReaction = ackReactionFor(access.ackReaction, LITE)
+  if (ackReaction && msgId != null) {
     void bot.api
       .setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
+        { type: 'emoji', emoji: ackReaction as ReactionTypeEmoji['emoji'] },
       ])
       .catch(() => {})
   }

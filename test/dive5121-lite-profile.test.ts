@@ -120,7 +120,9 @@ describe('no profile set = the plugin as it is today', () => {
       /^const LITE = resolveProfile\(\) === 'lite'$/,
       /^\s*if \(LITE\) (writeLiteLang|void \(async)/,
       /^\s*if \(LITE\) \{$/,
-      /^\s*if \(!LITE && access\.ackReaction && msgId != null\) \{$/,
+      // DIVE-5194: the ack reaction is no longer guarded; lite only defaults it.
+      /^\s*const ackReaction = ackReactionFor\(access\.ackReaction, LITE\)$/,
+      /^\s*const liteHo = LITE && data\.startsWith\('ho:'\) \? LITE_STRINGS\[liteLang\(ctx\.from\.language_code\)\] : null$/,
       /^\s*if \(!LITE\) void \(async \(\) => \{$/,
       /^if \(!STATIC && !SEND_ONLY && !LITE\) \{$/,
       /^\s*if \(LITE \|\| !yesNoChoice\(text\)\) return \{ stripped: text \}$/,
@@ -131,7 +133,7 @@ describe('no profile set = the plugin as it is today', () => {
     ]
     const odd = uses.filter(l => !shapes.some(re => re.test(l)))
     expect(odd).toEqual([])
-    expect(uses).toHaveLength(13)
+    expect(uses).toHaveLength(14)
   })
 
   test('the lite front door is registered only under LITE, ahead of every other update handler', () => {
@@ -186,6 +188,8 @@ function clientVisible(lang: Lang): string[] {
   const out: string[] = [
     s.newDone, s.stopDone, s.failed, s.accountPrompt, s.accountButton, s.helpQuestions,
     ...Object.values(s.menu),
+    // DIVE-5194: the carry-over nudge and its buttons now reach a lite client.
+    ...s.carryover.tiers, s.carryover.clear, s.carryover.remember, s.carryover.notYet, s.carryover.saving, s.carryover.carryOn,
     liteHelpBody(lang, { account: true }),
     liteHelpBody(lang, { account: false }),
   ]
@@ -323,10 +327,12 @@ describe('the hooks under lite', () => {
       timeout: 20_000,
     })
 
-  test('silence-watchdog is dropped: under lite it never touches its state; the default run (control) does', () => {
-    // A paired owner is what makes the default hook bump silence.json on every
-    // tool call, so the file is the discriminator. Without the control run the
-    // lite arm would pass on a hook that simply had nothing to do.
+  // DIVE-5194 rewrote the next two arms. They pinned DIVE-5121 dropping
+  // silence-watchdog and context-nudge on lite; lodar, 2026-09-29 06:43Z: "we
+  // shouldn't customize our perfectly working hooks too much" — a hook whose
+  // output never reaches the client is not lite's to touch, and one whose
+  // output does only changes its wording. They now pin the restore.
+  test('silence-watchdog runs under lite exactly as under default (it talks to the agent, never the client)', () => {
     const paired = (envFile: string) => {
       const d = stateDir(envFile)
       writeFileSync(join(d, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['1'], groups: {}, pending: {} }))
@@ -339,18 +345,15 @@ describe('the hooks under lite', () => {
     const lite = paired('TELEGRAM_BOT_TOKEN=1:x\nTELEGRAM_PROFILE=lite\n')
     const rl = run('silence-watchdog.ts', { TELEGRAM_STATE_DIR: lite })
     expect(rl.status).toBe(0)
-    expect(rl.stdout).toBe('')
-    expect(existsSync(join(lite, 'silence.json'))).toBe(false)
+    expect(existsSync(join(lite, 'silence.json'))).toBe(true)
+    expect(readFileSync(join(TG, 'hooks', 'silence-watchdog.ts'), 'utf8')).not.toMatch(/isLite|LITE/)
   })
 
-  test('context-nudge is dropped: the lite exit sits after the payload read and before any send', () => {
-    // Its send is a hardcoded api.telegram.org call, so this arm reads the order.
+  test('context-nudge runs under lite; only its words change (no lite exit)', () => {
     const src = readFileSync(join(TG, 'hooks', 'context-nudge.ts'), 'utf8')
-    const read = src.indexOf('const payload = await readPayload<HookPayload>()')
-    const exit = src.indexOf('if (isLite()) process.exit(0)')
-    expect(read).toBeGreaterThan(0)
-    expect(exit).toBeGreaterThan(read)
-    expect(src.indexOf('await fetch(')).toBeGreaterThan(exit)
+    expect(src).not.toContain('if (isLite()) process.exit(0)')
+    expect(src).toContain("const liteCarry = isLite() ? LITE_STRINGS[readLiteLang()].carryover : null")
+    // still opt-in: not turned on → silent, in either profile
     const r = run('context-nudge.ts', { TELEGRAM_STATE_DIR: stateDir('TELEGRAM_PROFILE=lite\n') })
     expect(r.status).toBe(0)
     expect(r.stdout).toBe('')

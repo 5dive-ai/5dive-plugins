@@ -52,6 +52,13 @@ export function isLite(env: NodeJS.ProcessEnv = process.env): boolean {
   return resolveProfile(env) === 'lite'
 }
 
+/** DIVE-5194: the reaction put on each inbound message. The box's own setting
+ *  wins, and "" still turns it off; a lite box that names none gets 👀, since
+ *  no lite box writes one. Default profile: exactly the setting, as before. */
+export function ackReactionFor(configured: string | undefined, lite: boolean): string | undefined {
+  return configured ?? (lite ? '👀' : undefined)
+}
+
 /** The client's Telegram language → the strings table. Russian, else English. */
 export function liteLang(code?: string | null): Lang {
   return typeof code === 'string' && code.toLowerCase().startsWith('ru') ? 'ru' : 'en'
@@ -110,6 +117,20 @@ export const LITE_STRINGS = {
     },
     limitReached: (when: string | null) =>
       when ? `Недельный лимит исчерпан, обновится ${when}. Подробности в кабинете.` : 'Лимит исчерпан. Подробности в кабинете.',
+    // DIVE-5194: the carry-over nudge (context-nudge.ts and its ho: buttons),
+    // one line per tier, in the words a client can read.
+    carryover: {
+      tiers: [
+        'Разговор становится длинным. В новом разговоре ответы будут точнее. Начать заново или продолжаем?',
+        'Разговор уже длинный, и ответы могут стать менее точными. Лучше начать новый.',
+        'Разговор очень длинный. Советую начать новый прямо сейчас. Больше не напомню.',
+      ],
+      clear: 'Начать заново',
+      remember: 'Запомнить и начать заново',
+      notYet: 'Пока нет',
+      saving: 'Запоминаю главное и начинаю заново.',
+      carryOn: 'Хорошо, продолжаем.',
+    },
   },
   en: {
     menu: { start: 'Start', new: 'New conversation', stop: 'Stop', usage: 'Allowance', account: 'My account', help: 'Help' },
@@ -130,6 +151,18 @@ export const LITE_STRINGS = {
     },
     limitReached: (when: string | null) =>
       when ? `This week's allowance is used up, it renews ${when}. Details are in your account.` : 'Your allowance is used up. Details are in your account.',
+    carryover: {
+      tiers: [
+        'This conversation is getting long. A new one keeps answers sharp. Start fresh, or keep going?',
+        'This conversation is long now, and answers can start to slip. Starting a new one keeps them sharp.',
+        'This conversation is very long. I suggest starting a new one now. This is the last reminder.',
+      ],
+      clear: 'Start fresh',
+      remember: 'Remember and start fresh',
+      notYet: 'Not yet',
+      saving: 'Keeping what matters, then starting fresh.',
+      carryOn: 'Okay, carrying on.',
+    },
   },
 } as const
 
@@ -243,8 +276,9 @@ export function liteLimitText(lang: Lang, a: Allowance): string {
 // sets the voice; this only says how the channel works and what a client must
 // never see. No word cap and no finished/blocked/mistake triage — that is the
 // operator rule, and it is paid on every client turn. The ack-first rule IS
-// carried (DIVE-5166): without it a client watched a long task in silence,
-// because lite has no ack reaction and the model does not ack on its own.
+// carried (DIVE-5166): without it a client watched a long task in silence.
+// Since DIVE-5194 it is no longer the only mechanism: lite gets the default
+// ack reaction and the default silence watchdog back.
 
 export const LITE_INSTRUCTIONS = [
   'You are chatting with the person who owns this Telegram chat. They read Telegram, not this session: anything they should see must go through the reply tool, and every message they send gets a reply.',
