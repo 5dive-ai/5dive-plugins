@@ -4787,7 +4787,7 @@ function notifyAgentOfConnect(ctx: Context, content: string): void {
 }
 
 async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: string): Promise<void> {
-  await ctx.answerCallbackQuery({ text: tap.op === 'tap' ? 'Opening the browser…' : 'Checking the login…' }).catch(() => {})
+  await ctx.answerCallbackQuery({ text: tap.op === 'tap' ? 'Opening the browser…' : 'Got it…' }).catch(() => {})
   // Drop the button now: a second tap while root works could only be refused.
   await ctx.editMessageReplyMarkup().catch(() => {})
   let stdin: string
@@ -4807,7 +4807,7 @@ async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: 
     await ctx
       .editMessageText(m.text, { entities: m.entities, link_preview_options: m.link_preview_options, reply_markup: m.reply_markup })
       .catch(() => {})
-    notifyAgentOfConnect(ctx, connectAgentNote('opened', link.site))
+    notifyAgentOfConnect(ctx, connectAgentNote('opened', link.site, '', link.kind))
     return
   }
   const v = r.code === 0 ? parseConnectVerdict(r.stdout) : null
@@ -4816,7 +4816,7 @@ async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: 
     return
   }
   await ctx.editMessageText(renderConnectVerdict(v)).catch(() => {})
-  notifyAgentOfConnect(ctx, connectAgentNote('verdict', v.site, `\`5dive browser status ${v.site}\` said: ${v.status || 'nothing'}`))
+  notifyAgentOfConnect(ctx, connectAgentNote('verdict', v.site, `\`5dive browser status ${v.site}\` said: ${v.status || 'nothing'}`, v.kind))
 }
 
 // DIVE-4982: `owner-ask tap` runs only as root (it refuses any other uid), so

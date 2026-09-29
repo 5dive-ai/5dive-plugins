@@ -50,7 +50,7 @@ describe('connectStdin', () => {
 
 describe('parseConnectLink', () => {
   test('root\'s answer parses', () => {
-    expect(parseConnectLink(ROOT_OK)).toEqual({ site: 'booking.com', url: URL, expires: '2026-09-25T15:00:00Z', done: DONE })
+    expect(parseConnectLink(ROOT_OK)).toEqual({ site: 'booking.com', url: URL, expires: '2026-09-25T15:00:00Z', done: DONE, kind: 'login' })
   })
   test('anything that is not exactly a viewer URL for that site is refused', () => {
     expect(parseConnectLink(ROOT_OK.replace(URL, 'https://evil.example/x'))).toBeNull()
