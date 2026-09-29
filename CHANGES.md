@@ -1,5 +1,28 @@
 ## Unreleased
 
+### Fixed — Chrome's temp files no longer pile up in /tmp (DIVE-5190), browser 1.23.1
+
+A customer box had 3.0G in /tmp that was nothing but Chrome: 256 `.com.google.Chrome.*` files
+(~9.7M each) and `scoped_dir*` directories (~52M each). Chrome writes both into `$TMPDIR` and
+removes them only on a clean close, and most of this plugin's browsers end with a kill (a timeout,
+an evict, a stopped serve), so every one of them left its set behind and nothing swept /tmp.
+
+- Every `5dive browser` launch now gets its own `TMPDIR`, `~/.cache/5dive-browser/tmp/<pid>.<start>`
+  (the seat's own home, never /tmp), and every Chrome it starts inherits it: the headless probes,
+  the Playwright driver, the session daemon and `auth`'s window.
+- It is removed when the command exits, including through a verb's own exit cleanup and after an
+  error. A launch that was killed outright is swept by the next launch, which removes every
+  directory whose owning process is gone. The process start time is part of the name, so a
+  recycled pid does not keep a dead launch's files alive, and a live owner is never touched.
+- A served browser (the session daemon, or plain Chrome when there is none) outlives the command
+  that started it, so it gets a directory of its own, named for its own pid; it stays while that
+  browser runs and is swept by the first command after it stops.
+- Where no private directory can be made (no home owned by this user), the launch goes ahead with
+  the `TMPDIR` it was given, as before. `FIVEDIVE_BROWSER_TMP_ROOT` moves the root.
+
+`tests/browser_tmpdir_unit.sh` grades it through the real `bin/browser` with a fake Chrome that
+litters `$TMPDIR`, and runs in CI.
+
 ### Fixed — a lite client bot says it is on a long request before it goes to work (DIVE-5166), telegram 0.5.67
 
 A partner client asked their bot for a site with a week calendar and heard nothing until the file
