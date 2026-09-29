@@ -5474,19 +5474,19 @@ bot.on('callback_query:data', async ctx => {
   // NB: plugin slash commands are namespaced `/<plugin>:<command>`, so this MUST
   // be `/telegram:carryover` — bare `/carryover` resolves to "Unknown command".
   //
-  // DIVE-5194: lite runs context-nudge again, so a client can tap these. The
-  // actions are the same; only the words they read are the lite strings.
+  // DIVE-5194: lite runs context-nudge again, so a client can tap these, and
+  // reads the lite strings. A client has no ho:clear: DIVE-5173 took away
+  // wiping the conversation from the chat, so the lite keyboard never offers
+  // it and a stale or forged tap falls through to ho:skip below.
   const liteHo = LITE && data.startsWith('ho:') ? LITE_STRINGS[liteLang(ctx.from.language_code)] : null
-  if (data === 'ho:clear') {
+  if (data === 'ho:clear' && !liteHo) {
     const dispatched = proxyToClaudeTUI('/clear')
-    const liteText = liteHo && (dispatched ? liteHo.newDone : liteHo.failed)
-    await ctx.answerCallbackQuery({ text: liteText || (dispatched ? 'Clearing…' : 'Type /clear in your session') }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: dispatched ? 'Clearing…' : 'Type /clear in your session' }).catch(() => {})
     await ctx
       .editMessageText(
-        liteText ||
-        (dispatched
+        dispatched
           ? 'Cleared the context now — nothing saved.'
-          : "Couldn't reach the session from here — type /clear in your terminal."),
+          : "Couldn't reach the session from here — type /clear in your terminal.",
       )
       .catch(() => {})
     return
@@ -5510,7 +5510,7 @@ bot.on('callback_query:data', async ctx => {
     }
     return
   }
-  if (data === 'ho:skip') {
+  if (data === 'ho:skip' || data === 'ho:clear') {
     await ctx.answerCallbackQuery({ text: liteHo?.carryover.carryOn ?? 'Okay, carrying on.' }).catch(() => {})
     await ctx.editMessageReplyMarkup().catch(() => {})
     return

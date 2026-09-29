@@ -133,12 +133,19 @@ if (!target) process.exit(0)
 //            so a later tier can still escalate if the user keeps going.
 // Full-width rows (one button each) — Telegram renders single-column buttons wide.
 const token = getToken()!
+// Lite has no clear row (DIVE-5173: a client cannot wipe the conversation from
+// the chat); server.ts answers a stray ho:clear from a client as ho:skip.
 const reply_markup = {
-  inline_keyboard: [
-    [{ text: liteCarry?.clear ?? 'Clear now', callback_data: 'ho:clear' }],
-    [{ text: liteCarry?.remember ?? 'Remember & clear', callback_data: 'ho:now' }],
-    [{ text: liteCarry?.notYet ?? 'Not yet', callback_data: 'ho:skip' }],
-  ],
+  inline_keyboard: liteCarry
+    ? [
+        [{ text: liteCarry.remember, callback_data: 'ho:now' }],
+        [{ text: liteCarry.notYet, callback_data: 'ho:skip' }],
+      ]
+    : [
+        [{ text: 'Clear now', callback_data: 'ho:clear' }],
+        [{ text: 'Remember & clear', callback_data: 'ho:now' }],
+        [{ text: 'Not yet', callback_data: 'ho:skip' }],
+      ],
 }
 try {
   const text = liteCarry ? liteCarry.tiers[TIERS.indexOf(crossed)]! : crossed.text

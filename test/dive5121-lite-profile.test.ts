@@ -189,7 +189,7 @@ function clientVisible(lang: Lang): string[] {
     s.failed, s.accountPrompt, s.accountButton, s.helpQuestions,
     ...Object.values(s.menu),
     // DIVE-5194: the carry-over nudge and its buttons now reach a lite client.
-    ...s.carryover.tiers, s.carryover.clear, s.carryover.remember, s.carryover.notYet, s.carryover.saving, s.carryover.carryOn,
+    ...s.carryover.tiers, s.carryover.remember, s.carryover.notYet, s.carryover.saving, s.carryover.carryOn,
     liteHelpBody(lang, { account: true }),
     liteHelpBody(lang, { account: false }),
   ]

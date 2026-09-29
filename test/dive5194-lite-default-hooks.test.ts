@@ -20,7 +20,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { ackReactionFor, LITE_STRINGS } from '../plugins/telegram/hooks/lib/lite'
+import { ackReactionFor, LITE_STRINGS, liteLang } from '../plugins/telegram/hooks/lib/lite'
 
 const TG = join(import.meta.dir, '..', 'plugins', 'telegram')
 const SERVER = readFileSync(join(TG, 'server.ts'), 'utf8')
@@ -149,11 +149,11 @@ describe('context-nudge under lite', () => {
     return { text: p.get('text'), buttons: JSON.parse(p.get('reply_markup')!).inline_keyboard.map((row: any) => row[0].text) }
   }
 
-  test('turned on, a lite client gets the tier in their language, with no word about context', () => {
+  test('turned on, a lite client gets the tier in their language, with no word about context and no clear-without-saving button (DIVE-5173)', () => {
     const ru = LITE_STRINGS.ru.carryover
-    expect(run('lite', 'ru')).toEqual({ text: ru.tiers[0]!, buttons: [ru.clear, ru.remember, ru.notYet] })
+    expect(run('lite', 'ru')).toEqual({ text: ru.tiers[0]!, buttons: [ru.remember, ru.notYet] })
     const en = LITE_STRINGS.en.carryover
-    expect(run('lite', 'en')).toEqual({ text: en.tiers[0]!, buttons: [en.clear, en.remember, en.notYet] })
+    expect(run('lite', 'en')).toEqual({ text: en.tiers[0]!, buttons: [en.remember, en.notYet] })
   })
 
   test('control: the default profile sends the operator text it always did', () => {
@@ -163,11 +163,73 @@ describe('context-nudge under lite', () => {
     })
   })
 
-  test('the ho: buttons answer a lite client in the lite strings; default keeps its text', () => {
-    expect(SERVER).toContain("const liteHo = LITE && data.startsWith('ho:') ? LITE_STRINGS[liteLang(ctx.from.language_code)] : null")
-    expect(SERVER).toContain('const liteText = liteHo && (dispatched ? liteHo.newDone : liteHo.failed)')
-    expect(SERVER).toContain('const liteText = liteHo && (dispatched ? liteHo.carryover.saving : liteHo.failed)')
-    expect(SERVER).toContain("text: liteHo?.carryover.carryOn ?? 'Okay, carrying on.'")
-    expect(SERVER).toContain("'Cleared the context now — nothing saved.'")
+  // The ho: handlers are cut out of server.ts (which cannot be imported: it
+  // long-polls) and RUN with stubs, so the arms read what a tap actually does.
+  const hoSource = () => {
+    const from = SERVER.indexOf("  const liteHo = LITE && data.startsWith('ho:')")
+    const to = SERVER.indexOf('  // ho:restart → full agent restart', from)
+    expect(from).toBeGreaterThan(0)
+    expect(to).toBeGreaterThan(from)
+    return SERVER.slice(from, to)
+  }
+  const tap = async (src: string, data: string, lite: boolean, lang: 'ru' | 'en') => {
+    const dir = tmp()
+    const js = new Bun.Transpiler({ loader: 'ts' }).transformSync(
+      `export default async function (ctx: any, data: string, LITE: boolean, LITE_STRINGS: any, liteLang: any, proxyToClaudeTUI: any, newestCarryoverMtime: any, clearAfterCarryover: any) {\n${src}\n}`,
+    )
+    writeFileSync(join(dir, 'ho.mjs'), js)
+    const handler = (await import(join(dir, 'ho.mjs'))).default
+    const seen = { ran: [] as string[], toast: undefined as unknown, edit: undefined as unknown, stripped: false }
+    const ctx = {
+      from: { language_code: lang },
+      answerCallbackQuery: async (o: { text?: unknown }) => { seen.toast = o.text },
+      editMessageText: async (t: unknown) => { seen.edit = t },
+      editMessageReplyMarkup: async () => { seen.stripped = true },
+    }
+    await handler(ctx, data, lite, LITE_STRINGS, liteLang, (cmd: string) => { seen.ran.push(cmd); return true }, () => 0, async () => {})
+    return seen
+  }
+
+  test('every lite string an ho: arm reads is a non-empty string in both languages (catches a key a later PR deletes)', () => {
+    const fields = [...hoSource().matchAll(/liteHo\??\.([A-Za-z_][\w.]*)/g)].map(m => m[1]!)
+    expect(fields.length).toBeGreaterThan(0)
+    for (const lang of ['ru', 'en'] as const) {
+      for (const f of fields) {
+        const v = f.split('.').reduce<any>((o, k) => o?.[k], LITE_STRINGS[lang])
+        expect({ lang, f, ok: typeof v === 'string' && v.length > 0 }).toEqual({ lang, f, ok: true })
+      }
+    }
+  })
+
+  test('a lite ho:clear tap wipes nothing and reads "carrying on" in the client\'s language; ho:now and ho:skip read lite strings', async () => {
+    const src = hoSource()
+    for (const lang of ['ru', 'en'] as const) {
+      const s = LITE_STRINGS[lang]
+      expect(await tap(src, 'ho:clear', true, lang)).toEqual({ ran: [], toast: s.carryover.carryOn, edit: undefined, stripped: true })
+      expect(await tap(src, 'ho:skip', true, lang)).toEqual({ ran: [], toast: s.carryover.carryOn, edit: undefined, stripped: true })
+      expect(await tap(src, 'ho:now', true, lang)).toEqual({ ran: ['/telegram:carryover'], toast: s.carryover.saving, edit: s.carryover.saving, stripped: false })
+    }
+  })
+
+  test('control: the default profile keeps its clear and its operator text', async () => {
+    const src = hoSource()
+    expect(await tap(src, 'ho:clear', false, 'ru')).toEqual({ ran: ['/clear'], toast: 'Clearing…', edit: 'Cleared the context now — nothing saved.', stripped: false })
+    expect(await tap(src, 'ho:skip', false, 'en')).toEqual({ ran: [], toast: 'Okay, carrying on.', edit: undefined, stripped: true })
+  })
+
+  test('mutants: a lite read of a deleted key, or a lite clear that wipes, each red the arms above', async () => {
+    // 1. the iteration-2 bug: the clear arm reads liteHo.newDone again.
+    const readsNewDone = hoSource().replace(
+      "if (data === 'ho:clear' && !liteHo) {\n    const dispatched = proxyToClaudeTUI('/clear')",
+      "if (data === 'ho:clear') {\n    const dispatched = proxyToClaudeTUI('/clear')\n    if (liteHo) { await ctx.answerCallbackQuery({ text: liteHo.newDone }); return }",
+    )
+    expect(readsNewDone).not.toBe(hoSource())
+    const fields = [...readsNewDone.matchAll(/liteHo\??\.([A-Za-z_][\w.]*)/g)].map(m => m[1]!)
+    expect(fields.some(f => typeof f.split('.').reduce<any>((o, k) => o?.[k], LITE_STRINGS.ru) !== 'string')).toBe(true)
+    expect((await tap(readsNewDone, 'ho:clear', true, 'en')).ran).toEqual(['/clear'])
+    // 2. the guard dropped: a lite client can wipe the conversation again.
+    const wipes = hoSource().replace("if (data === 'ho:clear' && !liteHo) {", "if (data === 'ho:clear') {")
+    expect(wipes).not.toBe(hoSource())
+    expect((await tap(wipes, 'ho:clear', true, 'ru')).ran).toEqual(['/clear'])
   })
 })

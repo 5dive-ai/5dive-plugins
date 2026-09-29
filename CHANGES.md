@@ -16,7 +16,9 @@ and changes only what the client reads:
   touches it. DIVE-5166's narrow lite arm (`decideLiteNudge`) is removed.
 - **Context nudge runs on lite.** Still opt-in. Its message and buttons reach the client, so under
   lite they are the localized, neutral lines (no word about context), and the `ho:` button answers
-  are too.
+  are too. Lite offers only "Remember and start fresh" and "Not yet": the clear-without-saving
+  button stays off a client's keyboard, in line with DIVE-5173, and a stray `ho:clear` tap from a
+  client is answered as "Not yet" and wipes nothing.
 - The typing indicator already repeats every 4s for the whole turn under both profiles; it is now
   pinned by a test. No canned "on it" line and no lite-only typing loop were added.
 
