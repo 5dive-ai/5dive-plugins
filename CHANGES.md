@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Fixed — a bare /start on an agent's bot greets at once, with no model turn (DIVE-5298), telegram 0.5.78
+
+On a my.5dive box, `/start` on a new agent's bot got silence (lodar, 2026-09-30). On the lite
+profile it only answered from the pack's `ext.5dive.welcome`, which no 5dive-marketplace pack
+carries, so it fell through to a model turn. A box with no AI account never answers that turn. On
+the default profile (builder seats), it told the paired owner how to pair a bot that was already
+theirs. Now both profiles send the pack's welcome at once, or, when there is none, a greeting
+built from the persona's name (else the bot's) and the bot's short description. 5dive-api sets
+that description from the catalogue tagline when it creates the bot (DIVE-5296). An unpaired
+sender still gets the pairing text. A deep-link payload still goes to the model after the
+greeting.
+
 ### Added — input mode: agents act in plain Chrome through the screen, keyboard and mouse (DIVE-5287), browser 1.25.0
 
 Registry mirror of 5dive-ai/5dive-browser (`browser/` read as `plugins/browser/`). The full

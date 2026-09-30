@@ -215,10 +215,10 @@ export function personaFile(env: NodeJS.ProcessEnv = process.env): string {
   return join(env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'persona.yaml')
 }
 
-/** Read the welcome from this agent's persona.yaml. Bun's built-in YAML parser
- *  (no dependency, so the hooks can still import this file); a runtime without
- *  it, a missing file or bad YAML all mean null. Never throws. */
-export function liteWelcome(lang: Lang, env: NodeJS.ProcessEnv = process.env): string | null {
+/** This agent's parsed persona.yaml. Bun's built-in YAML parser (no
+ *  dependency, so the hooks can still import this file); a runtime without it,
+ *  a missing file or bad YAML all mean null. Never throws. */
+function readPersona(env: NodeJS.ProcessEnv): unknown {
   let raw: string
   try { raw = readFileSync(personaFile(env), 'utf8') } catch { return null }
   try {
@@ -227,11 +227,54 @@ export function liteWelcome(lang: Lang, env: NodeJS.ProcessEnv = process.env): s
       recordOpsDetail('/start', 'persona.yaml present but this runtime has no Bun.YAML; the model greets instead', env)
       return null
     }
-    return liteWelcomeFrom(parse(raw), lang)
+    return parse(raw)
   } catch (err) {
     recordOpsDetail('/start', `persona.yaml did not parse: ${err instanceof Error ? err.message : String(err)}`, env)
     return null
   }
+}
+
+/** Read the welcome from this agent's persona.yaml. null = no welcome. Never throws. */
+export function liteWelcome(lang: Lang, env: NodeJS.ProcessEnv = process.env): string | null {
+  return liteWelcomeFrom(readPersona(env), lang)
+}
+
+// DIVE-5298: most packs carry no welcome (5dive-marketplace had none at
+// writing), and a box with no AI account never answers a model turn, so a bare
+// /start was silence. With no welcome the bot greets from what it already has:
+// the persona's name (else the bot's own), and the bot's short description,
+// which 5dive-api sets from the catalogue tagline when it creates the bot
+// (DIVE-5296). A tagline written as a verb phrase ("answers your community")
+// reads after the name; a full sentence stands on its own.
+const GREETING = {
+  en: { hi: (n: string) => `Hi, I'm ${n}.`, hiAnon: 'Hi!', ask: 'Tell me what you need, and I will get on it.' },
+  ru: { hi: (n: string) => `Здравствуйте, я ${n}.`, hiAnon: 'Здравствуйте!', ask: 'Напишите, что нужно сделать, и я возьмусь.' },
+} as const
+
+export function liteGreeting(lang: Lang, name: string | null | undefined, about: string | null | undefined): string {
+  const g = GREETING[lang]
+  const n = name?.trim()
+  let a = about?.trim() ?? ''
+  if (a && n && /^\p{Ll}/u.test(a)) a = `${n} ${a}`
+  if (a && !/[.!?…]$/.test(a)) a += '.'
+  if (a) a = a[0].toUpperCase() + a.slice(1)
+  const head = n ? g.hi(n) : g.hiAnon
+  return `${a ? `${head}\n${a}` : head}\n\n${g.ask}`
+}
+
+/** The persona's display name, or null. */
+export function personaName(env: NodeJS.ProcessEnv = process.env): string | null {
+  const n = (readPersona(env) as { name?: unknown } | null)?.name
+  return typeof n === 'string' && n.trim() ? n.trim() : null
+}
+
+/** What a bare /start answers at once: the pack's welcome, else the greeting. Never throws. */
+export function startGreeting(
+  lang: Lang,
+  bot: { name?: string | null; about?: string | null },
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return liteWelcome(lang, env) ?? liteGreeting(lang, personaName(env) ?? bot.name, bot.about)
 }
 
 /** The deep-link payload of a /start (`/start ref123` → 'ref123'), or ''. */
