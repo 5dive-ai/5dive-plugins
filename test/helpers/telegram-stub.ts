@@ -30,6 +30,9 @@ const server = Bun.serve({
         chatId: body.get('chat_id') ?? '',
         threadId: body.get('message_thread_id') ?? undefined,
         text: body.get('text') ?? '',
+        // DIVE-5256: the buttons, when a send carries any (absent otherwise, so
+        // every earlier arm reads the same line it always did).
+        markup: body.get('reply_markup') ?? undefined,
       }) + '\n',
     )
     const reject = mode === 'reject-all' || (mode === 'reject-first' && n === 1)

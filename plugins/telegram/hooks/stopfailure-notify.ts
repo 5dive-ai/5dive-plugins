@@ -26,6 +26,7 @@ import { parseResetEpoch } from './lib/time'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
+import { onDemoAccount, readDemoKey, isKeyLimitText, claimDemoNotice, releaseDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
 
 const payload = await readPayload<HookPayload>()
 const msg = [payload.message, payload.reason, typeof payload.error === 'string' ? payload.error : undefined, payload.stopReason]
@@ -226,6 +227,27 @@ if (LITE) {
   if (limitHit && accountUrl) markup = { inline_keyboard: [[{ text: LITE_STRINGS[lang].accountButton, url: accountUrl }]] }
 }
 
+// DIVE-5256: an agent on the box's demo account whose key is used up says so
+// ONCE per key, in plain words, with Connect — on any profile. The claim is the
+// same O_EXCL stamp the server's check takes, so whichever fires first sends
+// and every later failed turn on that key sends nothing at all (not even the
+// generic line above). Any other agent or failure: untouched.
+let demoFingerprint: string | null = null
+if (onDemoAccount()) {
+  const demo = await readDemoKey({ sawKeyLimit: isKeyLimitText(raw) })
+  if (demo.kind === 'used-up') {
+    if (!claimDemoNotice(stateDir(), demo.fingerprint)) {
+      console.error('[stopfailure-notify] demo key used up — notice already sent for this key, staying quiet')
+      signalTurnEnded()
+      process.exit(0)
+    }
+    demoFingerprint = demo.fingerprint
+    const lang = readLiteLang()
+    text = demoNoticeText(lang)
+    markup = demoNoticeMarkup(demoNoticeButtons(lang, demoAccountUrl()))
+  }
+}
+
 // Caller-only narrowing: prefer the inbound chat (and its forum topic) the
 // user actually wrote from. On an autonomous turn (no telegram inbound in the
 // transcript — cron-triggered, long-running background agent, etc) fall back
@@ -345,12 +367,15 @@ let shouldSend = true
   // token so the three kinds get independent stamps.
   const stamp = notifyStampPath(dir, `${account}:${notifyKind}`, isRateLimit ? resetEpoch : null)
   const res = claimNotify(stamp, Date.now())
-  shouldSend = res.send
+  // DIVE-5256: the demo notice has its own once-per-key claim, taken above;
+  // a recent unrelated notice of the same kind must not swallow it.
+  shouldSend = res.send || demoFingerprint !== null
   // One-line stderr trace (lands in the resume log) so we can see hits vs sends.
   console.error(`[stopfailure-notify] ${notifyKind} dedup: ${res.send ? 'SEND' : 'suppress'} (${res.reason}) account=${account} reset=${resetEpoch ?? 'null'}`)
   if (res.send) pruneStaleNotifyStamps(dir, Date.now())
 }
 
+let demoFallbackOk = false
 if (shouldSend) {
   // DIVE-4401: trace the route and the OUTCOME of every send. Before this the
   // hook logged its dedup decision and nothing else, so "the bot never sent it"
@@ -388,6 +413,7 @@ if (shouldSend) {
     if (fallback.length > 0) {
       console.error(`[stopfailure-notify] all ${results.length} routed send(s) failed — falling back to ${fallback.join(',')}`)
       const fbResults = await Promise.all(fallback.map(id => sendMessage(id, text, undefined, markup)))
+      demoFallbackOk = fbResults.some(Boolean)
       fallback.forEach((id, i) => {
         console.error(`[stopfailure-notify] fallback send ${id}: ${fbResults[i] ? 'ok' : 'FAILED'}`)
       })
@@ -400,6 +426,9 @@ if (shouldSend) {
       console.error('[stopfailure-notify] all routed send(s) failed and no other paired chat to fall back to')
     }
   }
+  // DIVE-5256: a demo notice that reached nobody gives its claim back, so the
+  // next trigger (the server's check, or the next failed turn) tries again.
+  if (demoFingerprint && (results.length === 0 || results.every(ok => !ok)) && !demoFallbackOk) releaseDemoNotice(stateDir(), demoFingerprint)
 }
 
 // Detach the recovery helper (we already hold the lock). Two flows share the

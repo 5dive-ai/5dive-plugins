@@ -57,7 +57,7 @@ import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelr
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
-import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, recordOpsDetail, liteWelcome, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
+import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, liteWelcome, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -66,6 +66,7 @@ import {
   MSGLOG_MAX_PER_CHAT,
 } from './msglog'
 import { ackReactionFor } from './hooks/lib/lite.ts'
+import { onDemoAccount, readDemoKey, claimDemoNotice, releaseDemoNotice, rearmDemoNotice, pruneDemoStamps, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './hooks/lib/demo-key.ts'
 
 // Plugin version is sourced from .claude-plugin/plugin.json — the same
 // manifest the Claude Code plugin system reads, so /status can never
@@ -1122,6 +1123,54 @@ if (!STATIC && !SEND_ONLY) setInterval(checkApprovals, 5000).unref()
 if (!STATIC && !SEND_ONLY && !LITE) {
   setTimeout(() => void reconcileNeedsBanner(), 3000).unref()
   setInterval(() => void reconcileNeedsBanner(), 60_000).unref()
+}
+
+// DIVE-5256: the free AI that came with a my.5dive server, used up. An agent on
+// the box's demo account says so ONCE per key in its own chat, with Connect
+// (hooks/lib/demo-key.ts holds the decision and the claim; the StopFailure hook
+// takes the same claim, so a failed turn after this sends nothing). Checked on a
+// slow timer, so the owner hears it even from an agent they are not talking to,
+// and on each inbound, so the first message after it runs out gets the answer
+// before the model fails. Any agent not on the demo account: never armed.
+// `chatId` = the chat that just wrote; the timer tells every paired DM.
+let demoCheckAt = 0
+async function checkDemoKey(chatId?: string, lang?: Lang): Promise<void> {
+  const now = Date.now()
+  if (now - demoCheckAt < 60_000) return
+  demoCheckAt = now
+  const demo = await readDemoKey()
+  if (demo.kind === 'left') {
+    if (demo.rearm) rearmDemoNotice(STATE_DIR, demo.fingerprint)
+    pruneDemoStamps(STATE_DIR, demo.fingerprint)
+    return
+  }
+  if (demo.kind !== 'used-up') return
+  pruneDemoStamps(STATE_DIR, demo.fingerprint)
+  if (!claimDemoNotice(STATE_DIR, demo.fingerprint)) return
+  const l = lang ?? readLiteLang()
+  const text = demoNoticeText(l)
+  const markup = demoNoticeMarkup(demoNoticeButtons(l, demoAccountUrl()))
+  const targets = chatId ? [chatId] : loadAccess().allowFrom
+  let sentAny = false
+  for (const target of targets) {
+    const sent = await bot.api.sendMessage(target, text, markup ? { reply_markup: markup } : {}).catch(err => {
+      process.stderr.write(`telegram channel: demo-key notice to ${target} failed: ${err instanceof Error ? err.message : String(err)}\n`)
+      return null
+    })
+    if (!sent) continue
+    sentAny = true
+    try {
+      const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'
+      msglogAppend(MSGLOG_DIR, target, { ts: new Date().toISOString(), dir: 'out', user: me, text, message_id: String(sent.message_id) })
+    } catch {}
+  }
+  process.stderr.write(`telegram channel: demo key used up — notice ${sentAny ? 'sent' : 'NOT sent'} to ${targets.join(',') || '(no paired chat)'}\n`)
+  // Reached nobody: give the claim back so the next trigger tries again.
+  if (!sentAny) releaseDemoNotice(STATE_DIR, demo.fingerprint)
+}
+if (!STATIC && !SEND_ONLY && onDemoAccount()) {
+  setTimeout(() => void checkDemoKey(), 30_000).unref()
+  setInterval(() => void checkDemoKey(), 10 * 60_000).unref()
 }
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
@@ -6211,6 +6260,9 @@ async function handleInbound(
   if (!from.is_bot) {
     recordLastHumanChat(chat_id, ctx.message?.is_topic_message ? threadId ?? null : null)
   }
+  // DIVE-5256: the first message after the demo key runs out gets the notice
+  // at once; the message still goes to the model as before.
+  if (!from.is_bot && ctx.chat?.type === 'private' && onDemoAccount()) void checkDemoKey(chat_id, liteLang(from.language_code))
 
   // Reply-to-answer for a button-less human gate (DIVE-145). When this message
   // replies to one of our own "🙋 [DIVE-N] needs you" alerts, treat the reply

@@ -1,5 +1,21 @@
 ## Unreleased
 
+### Added — when the free AI that came with a my.5dive server runs out, each agent says so once, with Connect (DIVE-5256), telegram 0.5.77
+
+On a my.5dive server the agents run on a small one-time AI allowance. When it ran out the agents just
+went quiet, and nothing said why. Now each agent on it sends its owner one message in its own chat:
+"I've used up the free AI that came with your server. Connect your own AI subscription to keep me
+talking and speaking.", with a **Connect my AI** button to the app (English and Russian).
+
+- Only agents on the server's `demo-ai` account (the account that holds that allowance). Dashboard
+  and partner servers have no such account, and nothing changes for them.
+- Once per key. The server checks the key every 10 minutes and on each message; a failed turn
+  checks too. All three take the same one-shot claim, so a second failed turn sends nothing. A new
+  key, or credit added to this one, makes the next time it runs out news again.
+- The buttons are a list, so a later "Top up" button is one more entry.
+
+`test/dive5256-demo-key-used-up.test.ts`.
+
 ### Fixed — on a standard agent, the Telegram bot no longer claims an account switch it can't make, or blames an old CLI for /usage (DIVE-5220), telegram 0.5.76
 
 On an agent whose access is limited to its own work (standard isolation), tapping an account in
