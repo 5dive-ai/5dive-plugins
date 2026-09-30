@@ -1,5 +1,27 @@
 ## Unreleased
 
+### Added — input mode: agents act in plain Chrome through the screen, keyboard and mouse (DIVE-5287), browser 1.25.0
+
+Registry mirror of 5dive-ai/5dive-browser (`browser/` read as `plugins/browser/`). The full
+record, including the choices and the alternatives not taken, is that repository's CHANGES.md.
+
+tiktok.com would not render for the automated browser (blank `/foryou` through the daemon's
+Playwright launch; fine in plain Chrome on the same box and IP). An adapter can now say
+`"drive": "input"`, and `tiktok.com.json` ships with it. That site is then served as plain Chrome
+with no automation channel. Agents read it by screenshot and window title, and act through real
+XTEST pointer and keyboard input (`lib/x11.cjs`, pure Node). `handoff <site>` hands the same live
+window to the owner through the Connect button, and resumes after their Done. DOM verbs refuse by
+name. The owner's pay/publish/send/delete policy applies to a step's declared kind. A challenge
+title stops an act. The broker, lease and audit are unchanged. In this copy the handoff sits next
+to DIVE-5200's `connect-request --challenge`: `_connect_request` takes `challenge <url>` or
+`handoff`.
+
+Input is held until the page takes it, and a lost click fails the step. Chrome drops input sent
+within ~100ms of a page's title appearing (measured on Chrome 153 / Xvfb: X focus was on Chrome
+all along), and the daemon used to report rc=0 over it. Every step now waits for a quiet title
+(500ms). `ready` means a viewable window holding a confirmed keyboard focus. A click checks the
+window under the pointer before the press and the focus after it, and fails non-zero on
+either.
 ### Fixed — a login made just before Done is no longer lost (DIVE-5286), browser 1.24.2
 
 A person signed in to GitHub through the dashboard's Connect, pressed Done 13 seconds later, and was

@@ -257,7 +257,7 @@ function assertLease(req, where) {
 }
 
 // ---------------------------------------------------------------- serve mode
-async function serveMode(profile, sock, broker) {
+async function serveMode(profile, sock, broker, input) {
   if (!profile || !fs.existsSync(profile)) die(E_UNAVAILABLE, `no profile directory at ${profile}`);
   const site = path.basename(profile);
   const selfBrowser = path.join(__dirname, 'browser');
@@ -286,6 +286,12 @@ async function serveMode(profile, sock, broker) {
   if (!chrome) die(E_UNAVAILABLE, 'no chrome named for this daemon — a session must be held in the same ' +
     'browser the profile was logged in with, so the executable is passed in rather than guessed here.');
 
+  // INPUT MODE (DIVE-5287): plain Chrome, driven through the X display. No
+  // Playwright, no CDP pipe, nothing on the page to detect. See inputLaunch.
+  let ctx;
+  if (input) {
+    ctx = await inputLaunch(profile, chrome);
+  } else {
   // DIVE-4951. Read ONCE, at start: a running daemon keeps the route it launched
   // with, and `proxy set`/`clear` say so rather than moving a live login's IP.
   let viaProxy;
@@ -299,7 +305,6 @@ async function serveMode(profile, sock, broker) {
     viewport: null,
     ...(viaProxy ? { proxy: viaProxy } : {}),
   });
-  let ctx;
   try {
     ctx = await launch(sandboxWanted());
   } catch (e) {
@@ -327,6 +332,7 @@ async function serveMode(profile, sock, broker) {
       .then((p) => p.goto(startUrl, { waitUntil: 'domcontentloaded' }))
       .catch((e) => process.stderr.write(`${PROG}: NOTE — could not open ${startUrl}: ` +
         `${String(e && e.message).split('\n')[0]}\n`));
+  }
   }
 
   // THE BROWSER IS THE DAEMON'S REASON TO EXIST. When Chrome goes, the daemon
@@ -415,6 +421,16 @@ async function serveMode(profile, sock, broker) {
         return end(r.status === null ? E_UNAVAILABLE : r.status);
       }
 
+      // THE HANDOFF AND THE TITLE ARE ANSWERED AT ONCE (DIVE-5287). Neither
+      // touches the page: `hand` flips who may drive, `title` reads the window
+      // name. A person being called in must not queue behind the very run that
+      // is calling them, and `handoff --wait` polls `hand status` for minutes.
+      if (input && (req.op === 'hand' || req.op === 'title')) {
+        try { await inputRequest(ctx, profile, req, send, end, behalf); }
+        catch (e) { send({ t: 'err', msg: e && e.message ? e.message : String(e) }); end(E_FAILED); }
+        return;
+      }
+
       // ONE REQUEST AT A TIME — AND A SHORT WAIT, THEN A REFUSAL (DIVE-4927).
       // This used to refuse on the spot, on the theory that the lease already
       // serialises callers so a second request mid-run must be one that skipped
@@ -438,7 +454,8 @@ async function serveMode(profile, sock, broker) {
       busy = { op: String(req.op), seat: behalf, since: Date.now() };
       try {
         if (behalf) brokerCall(['_broker-audit', site, req.op, String(req.url || '')], behalf);
-        if (req.op === 'probe') await probeRequest(ctx, req, send, end);
+        if (input) await inputRequest(ctx, profile, req, send, end, behalf);
+        else if (req.op === 'probe') await probeRequest(ctx, req, send, end);
         else if (req.op === 'tree') await treeRequest(ctx, req, send, end);
         else if (req.op === 'snapshot') await snapshotRequest(ctx, req, send, end);
         else if (req.op === 'render') await renderRequest(ctx, req, send, end);
@@ -876,6 +893,405 @@ async function sendReport(page, req, send) {
 // ---------------------------------------------------------------- call mode
 // The client half, in this same file on purpose: one program that knows the
 // protocol cannot drift from itself across a release.
+// ============================================================================
+// INPUT MODE (DIVE-5287) — plain Chrome, driven the way a person drives it.
+//
+// Some sites will not render for a browser under automation control. tiktok.com
+// was measured on chill-gorge 2026-09-30: through the Playwright launch above
+// (--remote-debugging-pipe) /foryou stayed a blank loading page with no
+// challenge and no sign-in form, while plain Chrome on the same profile, box and
+// IP rendered it. So the fix is the channel, not the IP.
+//
+// In this mode the daemon launches Chrome itself, with exactly the flags of the
+// DIVE-5203 login view (no --remote-debugging-*, no --enable-automation, no
+// headless) on the site's Xvfb, and holds NO channel into it. It acts through
+// the X server (lib/x11.cjs: XTEST pointer and keys, which the page receives
+// as isTrusted input) and reads through a screenshot of the display and the
+// window title. The person's viewer streams the same display, so a handoff is
+// the same window with no restart and no profile swap.
+//
+// WHAT IT CANNOT DO, said rather than faked: there is no DOM here. `tree`, the
+// DOM `snapshot`, `render` with HTML, adapter `run` plans and the DOM sign-in
+// guard all need a channel into the page, and this mode exists because that
+// channel is what the site refuses. Those ops answer with a refusal naming the
+// input-mode verb to use instead.
+// ============================================================================
+const INPUT_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_SETTLE_MS || 1200);
+const INPUT_GOTO_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_GOTO_SETTLE_MS || 2500);
+const INPUT_WINDOW_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_WINDOW_WAIT_MS || 20000);
+// THE PAGE MUST BE TAKING INPUT BEFORE INPUT IS SENT (quinn's rejection of the
+// first delivery). Measured on Chrome 153 / Xvfb, 2026-09-30: a click and keys
+// sent within ~100ms of a page's title appearing are DROPPED — no mousedown, no
+// keydown, nothing in the page, and every X request succeeds, so the daemon
+// used to report rc=0 over input that never landed. At 100ms and later, 5 of 5
+// landed. X focus was on Chrome's window in every dropped run, so this is
+// Chrome still bringing the page up, not a focus problem. The daemon therefore
+// watches the window title and holds each input request until the title has
+// been quiet for INPUT_QUIET_MS (bounded by INPUT_QUIET_CAP_MS: a page that
+// retitles itself forever, a ticker or a chat badge, is driven anyway).
+const INPUT_QUIET_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_QUIET_MS || 500);
+const INPUT_QUIET_CAP_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_QUIET_CAP_MS || 8000);
+const INPUT_MAX_STEPS = 50, INPUT_MAX_TEXT = 5000, INPUT_MAX_WAIT_MS = 30000;
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The SAME refusal as launchArgs, widened by the two flags this mode exists to
+// be without: an --enable-automation or a --headless in the operator's extra
+// args would quietly turn input mode back into the browser the site refuses.
+function plainArgs(profile, sandbox) {
+  const extra = (process.env.FIVEDIVE_BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);
+  const args = [`--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check',
+    '--window-size=1280,800', '--window-position=0,0', '--disable-features=TranslateUI',
+    ...(sandbox ? [] : ['--no-sandbox']), ...extra];
+  const bad = args.filter(a => /^--(remote-debugging|enable-automation|headless)/.test(a));
+  if (bad.length) {
+    die(E_NOTHING_RAN, `refusing to launch an input-mode browser with ${bad.join(' ')}. Input mode is plain ` +
+      `Chrome with no automation channel; any of these makes it the browser the site refuses (and a debug ` +
+      `port is full control of the session for every seat on the box).`);
+  }
+  return args;
+}
+
+async function inputLaunch(profile, chrome) {
+  const x11 = require(path.join(__dirname, '..', 'lib', 'x11.cjs'));
+  if (!process.env.DISPLAY) die(E_UNAVAILABLE, 'input mode needs the display the browser is drawn on, and no DISPLAY was set.');
+  // A PROXIED SEAT DOES NOT GET INPUT MODE (DIVE-4951's rule, same reason).
+  // Plain Chrome cannot carry the proxy's login, so it would put this login on
+  // the box's own IP — the route the proxy is there to avoid.
+  let viaProxy = null;
+  try { viaProxy = proxy.launchProxy(profile); } catch (e) { die(E_UNAVAILABLE, e.message); }
+  if (viaProxy) {
+    die(E_UNAVAILABLE, 'this seat has a proxy set, and input mode is plain Chrome, which cannot carry a proxy ' +
+      'login: it would take this login out through the box\'s own IP. Nothing was started. Clear the proxy ' +
+      '(`5dive browser proxy clear`) to use input mode here.');
+  }
+  const startUrl = process.env.FIVEDIVE_BROWSER_START_URL || '';
+  const start = async (sandbox) => {
+    const args = plainArgs(profile, sandbox);
+    if (/^https?:\/\//i.test(startUrl)) args.push(startUrl);
+    const child = cp.spawn(chrome, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let tail = '';
+    child.stderr.on('data', (d) => { tail = (tail + d.toString('utf8')).slice(-2000); });
+    const x = await x11.open(process.env.DISPLAY);
+    const until = Date.now() + INPUT_WINDOW_WAIT_MS;
+    while (Date.now() < until) {
+      if (child.exitCode !== null || child.signalCode) {
+        x.close();
+        const why = tail.split('\n').filter(l => l && !/dbus|DBus/.test(l)).slice(-3).join(' ').slice(0, 400);
+        throw new Error(`Chrome exited (${child.exitCode ?? child.signalCode}) before it opened a window${why ? ': ' + why : ''}`);
+      }
+      const t = await x.windowTitle().catch(() => ({ window: '' }));
+      // READY IS A WINDOW THAT HOLDS THE KEYBOARD, not a window with a name.
+      // A named window is mapped and viewable (windowTitle reads only those);
+      // the focus is then made explicit and confirmed with the server, so the
+      // first key does not depend on how Chrome read a pointer it never saw
+      // cross into it.
+      if (t.window && t.id && (await x.isBrowserWindow(t.id, child.pid))) {
+        try { await x.ensureBrowserFocus(child.pid, Math.max(1000, until - Date.now())); }
+        catch (e) {
+          // Not ours to leave running: the no-sandbox retry below would meet
+          // this Chrome's profile lock and exit into it.
+          try { child.kill('SIGKILL'); } catch (e2) { /* gone */ }
+          x.close();
+          throw e;
+        }
+        return { child, x };
+      }
+      await sleepMs(200);
+    }
+    try { child.kill('SIGKILL'); } catch (e) { /* gone */ }
+    x.close();
+    throw new Error(`Chrome opened no window within ${Math.round(INPUT_WINDOW_WAIT_MS / 1000)}s`);
+  };
+  let got;
+  try { got = await start(sandboxWanted()); }
+  catch (e) {
+    if (!sandboxWanted()) die(E_UNAVAILABLE, `could not open the ${path.basename(profile)} profile in plain Chrome: ${e.message}`);
+    process.stderr.write(`${PROG}: NOTE — Chrome would not start with its sandbox (${e.message}); starting it without the sandbox.\n`);
+    try { got = await start(false); }
+    catch (e2) { die(E_UNAVAILABLE, `could not open the ${path.basename(profile)} profile in plain Chrome: ${e2.message}`); }
+  }
+  const { child, x } = got;
+  // The title watcher behind the quiet gate (INPUT_QUIET_MS). One title read
+  // is a handful of X round trips; every 100ms is nothing next to a screenshot.
+  const seen = { title: null, since: Date.now() };
+  const watch = setInterval(() => {
+    x.windowTitle().then((t) => {
+      if (t.window !== seen.title) { seen.title = t.window; seen.since = Date.now(); }
+    }).catch(() => { /* the display is going; close() follows */ });
+  }, 100);
+  watch.unref();
+  child.on('exit', () => clearInterval(watch));
+  return {
+    input: true, child, x, seen,
+    handoff: null,
+    // SIGTERM is Chrome's clean shutdown: it writes the profile out, which is
+    // the durable half (the login). SIGKILL only for one that will not go.
+    close: async () => {
+      if (child.exitCode !== null || child.signalCode) return;
+      try { child.kill('SIGTERM'); } catch (e) { return; }
+      for (let i = 0; i < 100 && child.exitCode === null && !child.signalCode; i++) await sleepMs(50);
+      if (child.exitCode === null && !child.signalCode) { try { child.kill('SIGKILL'); } catch (e) { /* gone */ } }
+      x.close();
+    },
+    on: (ev, fn) => { if (ev === 'close') child.on('exit', fn); },
+  };
+}
+
+// Is a person in the viewer right now? The viewer's pidfile names x11vnc, and
+// x11vnc is -once: alive means a person holds (or is about to hold) this display.
+function viewerLive(profile) {
+  let txt;
+  try { txt = fs.readFileSync(path.join(profile, '.5dive-viewer'), 'utf8'); } catch (e) { return false; }
+  const m = txt.match(/^vnc_pid=(\d+)$/m);
+  if (!m) return false;
+  try { process.kill(Number(m[1]), 0); return true; } catch (e) { return false; }
+}
+
+// ONE DRIVER AT A TIME (the row's rule 3), checked before EVERY input step, not
+// once per request: a person who arrives mid-plan stops the next keystroke.
+function inputRefusal(be, profile, req, where) {
+  if (be.handoff) {
+    return `${where}: the owner has this tab — handed over ${Math.round((Date.now() - be.handoff.since) / 1000)}s ago` +
+      `${be.handoff.reason ? ` (${be.handoff.reason})` : ''}. The agent's input is suspended until they tap Done. ` +
+      `Wait for them: 5dive browser handoff ${path.basename(profile)} --wait`;
+  }
+  if (viewerLive(profile)) {
+    return `${where}: a person is in the viewer on this browser, so an agent's input is refused until they leave. ` +
+      `Nothing was typed or clicked.`;
+  }
+  assertLease(req, where);
+  return null;
+}
+
+// Hold until the page has stopped changing title for INPUT_QUIET_MS (see the
+// constant for the measurement). Returns the ms it waited.
+async function settled(be) {
+  const t0 = Date.now(), cap = t0 + INPUT_QUIET_CAP_MS;
+  for (;;) {
+    const t = await be.x.windowTitle();
+    if (t.window !== be.seen.title) { be.seen.title = t.window; be.seen.since = Date.now(); }
+    const quiet = Date.now() - be.seen.since;
+    if (quiet >= INPUT_QUIET_MS || Date.now() >= cap) return Date.now() - t0;
+    await sleepMs(Math.min(100, INPUT_QUIET_MS - quiet));
+  }
+}
+
+// Keys go to the focus window. Make it the browser's, confirmed, or throw:
+// typing on regardless is how input used to vanish with rc=0.
+async function keysReachBrowser(be) {
+  await be.x.ensureBrowserFocus(be.child.pid, 2000);
+}
+
+// A click is delivered to the window under the pointer, whoever owns it. The
+// point is checked AFTER the pointer is there (a window can open under it on
+// the way) and BEFORE the button goes down; afterwards the browser must hold
+// the keyboard focus, or the next step's keys would go nowhere.
+async function pointerOnBrowser(be, what) {
+  const under = await be.x.underPointer();
+  if (!(await be.x.anyBrowser(under, be.child.pid))) {
+    const p = await be.x.pointer();
+    throw new Error(`nothing was ${what}: the point ${p.x},${p.y} is covered by a window that is not the browser ` +
+      `(0x${(under[0] || 0).toString(16)}), so the input would land there instead`);
+  }
+}
+
+async function clickInBrowser(be, s) {
+  await be.x.move(s.x, s.y);
+  await pointerOnBrowser(be, 'clicked');
+  await be.x.click(s.x, s.y, { button: { left: 1, middle: 2, right: 3 }[s.button || 'left'], count: s.count || 1,
+    steps: 0, from: { x: s.x, y: s.y } });
+  let k;
+  for (let i = 0; i < 20; i++) {
+    k = await be.x.keyboardTarget(be.child.pid);
+    if (k.browser) return;
+    await sleepMs(50);
+  }
+  throw new Error(`the click at ${s.x},${s.y} was sent, but afterwards the keyboard focus is not on the browser ` +
+    `(${k.focus === 0 ? 'no window' : k.focus === 1 ? 'the window under the pointer' : '0x' + k.focus.toString(16)}), ` +
+    `so it may not have reached the page; stopping rather than typing into nothing`);
+}
+
+async function gotoByKeys(be, url) {
+  // As a person does it: focus the address bar, type, Enter. isTrusted keys all
+  // the way; the page sees a navigation typed by a person, not a script's goto.
+  const x = be.x;
+  await settled(be);
+  await keysReachBrowser(be);
+  await x.press('ctrl+l'); await sleepMs(150);
+  await x.type(url, process.env.FIVEDIVE_BROWSER_INPUT_FAST === '1' ? 0 : 12);
+  await sleepMs(80);
+  await x.press('Return');
+}
+
+async function screenOf(be) {
+  const png = await be.x.screenshotPNG();
+  const t = await be.x.windowTitle();
+  return { drive: 'input', title: t.page, window_title: t.window, width: be.x.width, height: be.x.height,
+    png_b64: png.toString('base64') };
+}
+
+const INPUT_STEPS = {
+  click:  (s) => num(s.x) && num(s.y) && (s.button === undefined || ['left', 'middle', 'right'].includes(s.button))
+                 && (s.count === undefined || [1, 2, 3].includes(s.count)),
+  move:   (s) => num(s.x) && num(s.y),
+  type:   (s) => typeof s.value === 'string' && s.value.length > 0 && s.value.length <= INPUT_MAX_TEXT,
+  press:  (s) => typeof s.key === 'string' && /^[A-Za-z0-9+_ -]{1,40}$|^.$/u.test(s.key),
+  scroll: (s) => (s.dy === undefined || (Number.isInteger(s.dy) && Math.abs(s.dy) <= 50))
+                 && (s.dx === undefined || (Number.isInteger(s.dx) && Math.abs(s.dx) <= 50))
+                 && (s.dy !== undefined || s.dx !== undefined),
+  goto:   (s) => typeof s.url === 'string' && /^https?:\/\/[^\s]+$/.test(s.url) && s.url.length <= 2000,
+  wait:   (s) => Number.isInteger(s.ms) && s.ms >= 0 && s.ms <= INPUT_MAX_WAIT_MS,
+};
+function num(v) { return Number.isInteger(v) && v >= 0 && v < 10000; }
+const INPUT_VOCAB = 'click{x,y[,button,count]} move{x,y} type{value} press{key} scroll{dy[,dx,x,y]} goto{url} wait{ms}';
+
+async function inputRequest(be, profile, req, send, end, behalf) {
+  const site = path.basename(profile);
+  const reChallenge = reOf(req.challenge);
+  const out = (o) => send({ t: 'out', data: JSON.stringify(o) + '\n' });
+
+  if (req.op === 'hand') {
+    const act = req.act;
+    if (act === 'open') {
+      if (!be.handoff) {
+        be.handoff = { since: Date.now(), by: behalf || 'owner',
+          reason: String(req.reason || '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200) };
+      }
+    } else if (act === 'close') {
+      be.handoff = null;
+    } else if (act !== 'status') {
+      send({ t: 'err', msg: `hand act must be open, close or status; got '${act}'` }); return end(E_NOTHING_RAN);
+    }
+    const t = await be.x.windowTitle().catch(() => ({ page: '', window: '' }));
+    out({ open: !!be.handoff, since: be.handoff ? new Date(be.handoff.since).toISOString() : null,
+      by: be.handoff ? be.handoff.by : null, reason: be.handoff ? be.handoff.reason : null,
+      viewer: viewerLive(profile), title: t.page });
+    return end(0);
+  }
+
+  if (req.op === 'title') {
+    const t = await be.x.windowTitle();
+    // `focused`: the browser holds the keyboard (explicit X focus, confirmed).
+    // `quiet_ms`: how long the title has been unchanged — input is held until
+    // it reaches INPUT_QUIET_MS. Together they are the readiness input waits on.
+    const k = await be.x.keyboardTarget(be.child.pid).catch(() => ({ browser: 0 }));
+    out({ drive: 'input', title: t.page, window_title: t.window, handoff: !!be.handoff, viewer: viewerLive(profile),
+      focused: !!k.browser, quiet_ms: t.window === be.seen.title ? Date.now() - be.seen.since : 0 });
+    return end(0);
+  }
+
+  if (req.op === 'screen') {
+    try {
+      if (req.url) {
+        if (!INPUT_STEPS.goto({ url: req.url })) { send({ t: 'err', msg: 'screen --url needs an http(s) url' }); return end(E_NOTHING_RAN); }
+        const no = inputRefusal(be, profile, req, 'screen');
+        if (no) { send({ t: 'err', msg: no }); return end(E_UNAVAILABLE); }
+        await gotoByKeys(be, req.url);
+        await sleepMs(Number.isFinite(Number(req.wait)) && req.wait !== undefined ? Number(req.wait) : INPUT_GOTO_SETTLE_MS);
+      } else if (Number(req.wait) > 0) await sleepMs(Math.min(Number(req.wait), INPUT_MAX_WAIT_MS));
+      const shot = await screenOf(be);
+      out({ ...shot, url_requested: req.url || null, handoff: !!be.handoff, viewer: viewerLive(profile) });
+      if (reChallenge && reChallenge.test(shot.title)) {
+        send({ t: 'err', msg: `CHALLENGE: the page title is "${shot.title}", which is a security check. A person clears it: 5dive browser handoff ${site}` });
+        return end(75);
+      }
+      return end(0);
+    } catch (e) {
+      send({ t: 'err', msg: `could not read the ${site} screen: ${e.message}` }); return end(E_FAILED);
+    }
+  }
+
+  if (req.op === 'input') {
+    const steps = Array.isArray(req.steps) ? req.steps : null;
+    if (!steps || !steps.length) { send({ t: 'err', msg: 'the input plan carries no steps' }); return end(E_NOTHING_RAN); }
+    if (steps.length > INPUT_MAX_STEPS) { send({ t: 'err', msg: `at most ${INPUT_MAX_STEPS} input steps per call` }); return end(E_NOTHING_RAN); }
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i] || {};
+      const ok = INPUT_STEPS[s.op];
+      if (!ok || !ok(s)) {
+        send({ t: 'err', msg: `step ${i + 1} ${ok ? `(${s.op}) has missing or out-of-range fields` : `uses '${s.op}', which is not an input-mode step`}. ` +
+          `Input mode takes: ${INPUT_VOCAB} — coordinates are pixels of the ${be.x.width}x${be.x.height} screenshot. Nothing ran.` });
+        return end(E_NOTHING_RAN);
+      }
+      if ((s.op === 'click' || s.op === 'move' || (s.op === 'scroll' && s.x !== undefined)) &&
+          ((s.x !== undefined && s.x >= be.x.width) || (s.y !== undefined && s.y >= be.x.height))) {
+        send({ t: 'err', msg: `step ${i + 1} (${s.op}) points at ${s.x},${s.y}, outside the ${be.x.width}x${be.x.height} screen. Nothing ran.` });
+        return end(E_NOTHING_RAN);
+      }
+    }
+    let ran = 0;
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const s = steps[i], where = `step ${i + 1} (${s.op})`;
+        const no = inputRefusal(be, profile, req, where);
+        if (no) throw Object.assign(new Error(no), { refused: true });
+        // Every step waits for a quiet page, so a step after one that
+        // navigated does not type into a page still coming up. Cheap when the
+        // page is quiet already: one title read.
+        if (s.op !== 'wait') await settled(be);
+        ran++;
+        try {
+          switch (s.op) {
+            case 'click': await clickInBrowser(be, s); break;
+            case 'move': await be.x.move(s.x, s.y); break;
+            case 'type': await keysReachBrowser(be); await be.x.type(s.value); break;
+            case 'press': await keysReachBrowser(be); await be.x.press(s.key); break;
+            case 'scroll':
+              if (s.x !== undefined) await be.x.move(s.x, s.y);
+              await pointerOnBrowser(be, 'scrolled');   // wheel notches go to the window under the pointer, too
+              await be.x.scroll(s.dy || 0, s.dx || 0, null); break;
+            case 'goto': await gotoByKeys(be, s.url); await sleepMs(INPUT_GOTO_SETTLE_MS); break;
+            case 'wait': await sleepMs(s.ms); break;
+          }
+        } catch (e) { e.message = `${where}: ${e.message}`; throw e; }
+        send({ t: 'log', line: `  ${where} ok` });
+        // THE HARD STOP, between steps: a plan does not keep typing into a
+        // challenge that appeared under it.
+        if (reChallenge) {
+          const t = await be.x.windowTitle();
+          if (reChallenge.test(t.page)) {
+            await sleepMs(300);
+            out({ ...(await screenOf(be)), act_report: true, steps_run: ran });
+            send({ t: 'err', msg: `CHALLENGE after ${where}: the page title is "${t.page}", which is a security check. Stopped; the rest of the plan did not run. A person clears it: 5dive browser handoff ${site}` });
+            return end(75);
+          }
+        }
+      }
+    } catch (e) {
+      send({ t: 'err', msg: e.message });
+      if (!ran) {
+        send({ t: 'err', msg: 'not one input step ran, so nothing was typed or clicked.' });
+        return end(e.refused ? E_UNAVAILABLE : E_NOTHING_RAN);
+      }
+      try { out({ ...(await screenOf(be)), act_report: true, steps_run: ran }); } catch (e2) { /* the report is best effort */ }
+      return end(E_FAILED);
+    }
+    const ms = Number.isFinite(Number(req.settle)) && req.settle !== undefined ? Number(req.settle) : INPUT_SETTLE_MS;
+    if (ms > 0) await sleepMs(Math.min(ms, INPUT_MAX_WAIT_MS));
+    const shot = await screenOf(be);
+    out({ ...shot, act_report: true, steps_run: ran });
+    if (reChallenge && reChallenge.test(shot.title)) {
+      send({ t: 'err', msg: `CHALLENGE: the page the steps left is titled "${shot.title}", which is a security check. A person clears it: 5dive browser handoff ${site}` });
+      return end(75);
+    }
+    return end(0);
+  }
+
+  // THE DOM OPS, REFUSED BY NAME. This browser has no channel into the page —
+  // that is the point of it — so an answer here would be an invention.
+  const instead = {
+    probe: 'the login state is read from the window title here, not a DOM probe',
+    tree: 'there is no DOM tree to enumerate: read the screenshot (`5dive browser shot`) and act on pixel coordinates',
+    snapshot: '`5dive browser snapshot` on an input-mode site returns the screenshot and the window title, not a DOM',
+    render: '`5dive browser shot` on an input-mode site returns a screenshot of the live window',
+    plan: 'adapter actions address the page by selector, and input mode has no DOM to resolve a selector in: use `5dive browser act <site> --steps=` with input steps (' + INPUT_VOCAB + ')',
+  }[req.op];
+  send({ t: 'err', msg: instead
+    ? `${site} is served in INPUT mode (plain Chrome, no automation channel), so '${req.op}' cannot run here: ${instead}.`
+    : `unknown op '${req.op}'` });
+  return end(E_NOTHING_RAN);
+}
+
 function callMode(sock) {
   const raw = fs.readFileSync(0, 'utf8');
   let req;
@@ -922,14 +1338,15 @@ function main() {
     // on is a security rule, and a security rule that keys on a string
     // comparison is one rename away from being silently off.
     const broker = rest.includes('--broker');
-    const sock = rest.filter(a => a !== '--broker')[0] || path.join(profile || '', '.5dive-session.sock');
-    return serveMode(profile, sock, broker).catch(e => die(E_UNAVAILABLE, e && e.message ? e.message : String(e)));
+    const input = rest.includes('--input');
+    const sock = rest.filter(a => a !== '--broker' && a !== '--input')[0] || path.join(profile || '', '.5dive-session.sock');
+    return serveMode(profile, sock, broker, input).catch(e => die(E_UNAVAILABLE, e && e.message ? e.message : String(e)));
   }
   if (mode === 'call') {
     if (!arg) die(E_USAGE_MISSING, 'call needs a socket path');
     return callMode(arg);
   }
-  die(64, 'usage: session-daemon serve <profile> [<socket>] | session-daemon call <socket>');
+  die(64, 'usage: session-daemon serve <profile> [<socket>] [--broker] [--input] | session-daemon call <socket>');
 }
 const E_USAGE_MISSING = 64;
 main();

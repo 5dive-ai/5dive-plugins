@@ -877,6 +877,56 @@ The off list lives at `/var/lib/5dive/browser/ubol/adblock-off` and IS the sourc
 truth: the nightly root converge re-renders the policy file from it, so a host you
 remove from that list comes back filtered.
 
+## Input mode: plain Chrome, driven through the screen (DIVE-5287)
+
+Some sites refuse to render for a browser under automation control. tiktok.com is the measured
+case (chill-gorge, 2026-09-30). Through the session daemon's Playwright launch
+(`--remote-debugging-pipe`), `/foryou` stayed a blank loading page with no challenge and no
+sign-in form. Plain Chrome on the same profile, box and IP rendered it. So the blocker is the
+channel, not the IP, and a proxy does not fix it.
+
+An adapter opts a site in with `"drive": "input"`. Any site can; `tiktok.com.json` ships with it.
+Then:
+
+- `serve` starts `session-daemon --input`. That daemon launches Chrome with exactly the DIVE-5203
+  login view's flags: no `--remote-debugging-*`, no `--enable-automation`, not headless. It holds
+  **no channel into the browser**, and it refuses to launch if the operator's extra args would
+  add one.
+- It acts through the X display (`lib/x11.cjs`, pure Node, no xdotool): XTEST pointer moves,
+  clicks, wheel notches and key presses. Chrome delivers them to the page as `isTrusted` events.
+  It reads by `GetImage` of the display (encoded to PNG) and by the window title. The harness
+  grades `navigator.webdriver === false`, the command line, and trusted click and key events on
+  a real Chrome.
+- The broker socket, the lease, `SO_PEERCRED` attribution and the audit log are unchanged. A
+  brokered seat reaches it exactly as it reaches a warm session. Every input step re-checks the
+  lease, whether a person is in the viewer, and whether a handoff is open.
+- `shot` and `snapshot` return the screen plus the title. `act` takes pixel-coordinate steps
+  (`click move type press scroll goto wait`). `tree`, `read`, `links`, `run` and selector steps
+  are **refused by name**: there is no DOM here, and an answer would be invented.
+- The owner's pay/publish/send/delete policy applies to the kinds a step *declares* (`"kind"`).
+  With no DOM, a click cannot be classified by the button it lands on. A kind set to `ask`
+  stops with 73 before anything runs, and the route is a handoff; there is no in-mode approval
+  yet.
+- `handoff <site>` suspends agent input at the daemon and sends the owner the Connect button. It
+  opens onto **the same window** (an input browser is already plain Chrome, so `serve --login`
+  and `viewer` leave it alone). Their Done closes the handoff instead of stopping the browser
+  (`_connect_done`), and `handoff --wait` returns. A view that ended 20s after a person was in it
+  also counts as done.
+- A challenge whose page title says so (adapter `probe.challenge_when_title_matches`, else a
+  generic list) stops an act between steps with 75. TikTok's slider captcha is an in-page overlay
+  and does not change the title; the agent sees it in the screenshot, and the skill tells it to
+  hand the window over.
+- `status` reads the title and never navigates, because loading the probe URL would move the
+  window someone is working in. It says `unconfirmed`, because there is no DOM to confirm a login
+  from.
+- A proxied seat is refused input mode rather than served off its proxy, for DIVE-4951's reason:
+  plain Chrome cannot carry a proxy login.
+
+Why screenshots and not a Chrome extension, which main's design note preferred: branded Google
+Chrome has ignored `--load-extension` since 137. On this host's Chrome 153 both the flag and its
+`DisableLoadExtensionCommandLineSwitch` escape hatch load nothing (measured). CHANGES.md lists
+the routes left and why none was taken in this release.
+
 ## Limits: sites that block datacenter IPs
 
 A box is a datacenter IP, and some sites refuse those outright ("Request blocked by network

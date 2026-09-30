@@ -1,0 +1,11 @@
+{
+  "_comment": "INPUT MODE (DIVE-5287). tiktok.com will not render for a browser under automation control: through the session daemon's Playwright launch (--remote-debugging-pipe) /foryou stayed a blank loading page with no challenge and no sign-in form, while plain Chrome on the same profile, box and IP rendered it (chill-gorge, 2026-09-30, lodar's own login). So this site is served as plain Chrome and driven through the screen, keyboard and mouse. There is no DOM probe here on purpose: nothing reads the page's DOM in this mode, so a DOM marker would never be checked. `status` reads the window title instead.",
+  "site": "tiktok.com",
+  "drive": "input",
+  "probe": {
+    "url": "https://www.tiktok.com/",
+    "challenge_when_title_matches": "just a moment|attention required|captcha|verify you are human|are you a robot|security check|unusual (activity|traffic)|verification required|too many attempts",
+    "_comment_challenge": "TikTok's slider/puzzle captcha is an in-page overlay and does NOT change the page title, so this list does not catch it. It is caught by the agent reading the screenshot: the skill tells it to hand the window to a person (`5dive browser handoff tiktok.com`) the moment one is on screen. The titles here are the full-page interstitials."
+  },
+  "actions": {}
+}
