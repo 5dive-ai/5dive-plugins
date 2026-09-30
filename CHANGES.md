@@ -1,5 +1,21 @@
 ## Unreleased
 
+### Added — input mode: agents act in plain Chrome through the screen, keyboard and mouse (DIVE-5287), browser 1.25.0
+
+Registry mirror of 5dive-ai/5dive-browser (`browser/` read as `plugins/browser/`). The full
+record, including the choices and the alternatives not taken, is that repository's CHANGES.md.
+
+tiktok.com would not render for the automated browser (blank `/foryou` through the daemon's
+Playwright launch; fine in plain Chrome on the same box and IP). An adapter can now say
+`"drive": "input"`, and `tiktok.com.json` ships with it. That site is then served as plain Chrome
+with no automation channel. Agents read it by screenshot and window title, and act through real
+XTEST pointer and keyboard input (`lib/x11.cjs`, pure Node). `handoff <site>` hands the same live
+window to the owner through the Connect button, and resumes after their Done. DOM verbs refuse by
+name. The owner's pay/publish/send/delete policy applies to a step's declared kind. A challenge
+title stops an act. The broker, lease and audit are unchanged. In this copy the handoff sits next
+to DIVE-5200's `connect-request --challenge`: `_connect_request` takes `challenge <url>` or
+`handoff`.
+
 ### Fixed — a signed-in Reddit no longer reads as a security challenge (DIVE-5285), browser 1.24.1
 
 Registry mirror of 5dive-ai/5dive-browser (`browser/` read as `plugins/browser/`).

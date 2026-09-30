@@ -38,6 +38,49 @@ repo — and that is the `connect-site` skill, not this one.
 `read`, `links` and `shot` take a URL the same way when you only need the text, the links or a
 picture of a page.
 
+## Input mode: sites that refuse an automated browser (tiktok.com)
+
+Some sites will not render for a browser under automation control. For those, the site's
+adapter says `"drive": "input"`, and the browser is **plain Chrome, driven the way a person
+drives it**: you read the screen and act through a real keyboard and mouse. There is no
+automation channel, so to the page it is indistinguishable from the owner's own window.
+tiktok.com is the first such site. The verbs tell you when a site is in input mode.
+
+```bash
+5dive browser shot tiktok.com https://www.tiktok.com/@someone   # a PNG of the live window (1280x800) + its title
+5dive browser shot tiktok.com                                     # the window as it is now, no navigation
+5dive browser act tiktok.com --steps='[{"op":"click","x":922,"y":674},
+                                       {"op":"type","value":"hello"},{"op":"press","key":"Enter"}]'
+```
+
+1. **Look first.** Every decision starts from a `shot` (or the `page.png` the last `act` left).
+   The coordinates are pixels of that PNG. The address bar is in the picture, so you can see
+   which page you are on.
+2. **Act in small steps**: `click{x,y[,button,count]}`, `move{x,y}`, `type{value}` (into
+   whatever has focus), `press{key}` (`Enter`, `Tab`, `Escape`, `PageDown`, `ctrl+l`, …),
+   `scroll{dy}` (wheel notches, + is down), `goto{url}` (typed into the address bar),
+   `wait{ms}`. Then read the `page.png` it wrote before the next act.
+3. **There is no DOM here.** `tree`, `read`, `links`, adapter `run` actions and `selector`/`ref`
+   steps are refused, by name. Do not ask for them; use the screen.
+4. **Say what a step does when it matters.** Nothing here can read a button's label, so a step
+   that pays, publishes, sends or deletes must carry `"kind":"pay"` (or `publish`, `send`,
+   `delete`). The owner's policy applies to what you declare: a kind they set to `ask` (pay, by
+   default) stops with exit 73 before anything runs. Never leave the kind off to get past that.
+   An undeclared purchase is still a purchase.
+
+**Hand the window to the owner whenever a person is needed.** A captcha or slider puzzle, a
+verification code, an "unusual activity" page, or a judgement call that is theirs:
+
+```bash
+5dive browser handoff tiktok.com --reason="solve the slider puzzle"   # they get a Connect button
+5dive browser handoff tiktok.com --wait                               # returns when they are done
+```
+
+They open the **same window** you were driving. Your input is refused while they have it, and
+when they tap Done you carry on from the page they left. Take a `shot` before your next act.
+A challenge whose title says so stops an act by itself (exit 75). TikTok's puzzle does not change
+the title, so when you see one in a screenshot, hand the window over. Never try to solve it.
+
 ## Pages that need the owner's login
 
 A page verb refuses a page that is visibly a sign-in form or a challenge, and never hands one

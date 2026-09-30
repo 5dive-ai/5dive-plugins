@@ -335,6 +335,22 @@ t  "H2 a normal form that merely embeds a reCAPTCHA says nothing" "" "$(hint "$T
 out=$(hint "$TMP/cf.html" "" "https://uneed.best/submit")
 tc "H3 with no landed URL, the asked URL names the host" "connect-request uneed.best --challenge" "$out"
 
+# ---- H: the handoff (DIVE-5287) — the same button, onto the agent's live window ----
+reset; rm -rf "$TMP/req"/*
+out=$(priv handoff tiktok.com "solve the slider puzzle" 2>&1); rc=$?
+t  "H1 a handoff request is sent" 0 "$rc"
+msg=$(jq -c 'select(.path|test("sendMessage"))' "$TMP/stub.log" | tail -1)
+tc "H1 ... asking the owner to TAKE OVER, not to log in" "needs you to take over" "$(jq -r '.form.text' <<<"$msg")"
+tc "H1 ... with what for" "What for: solve the slider puzzle" "$(jq -r '.form.text' <<<"$msg")"
+tc "H1 ... and that the agent resumes where they leave it" "carries on from the page you left" "$(jq -r '.form.text' <<<"$msg")"
+t  "H1 ... on the same Connect button" "Connect tiktok.com" "$(jq -r '.form.reply_markup' <<<"$msg" | jq -r '.inline_keyboard[0][0].text')"
+CODE=$(last_code); : >"$FAKE_LOG"
+out=$(priv tap "$CODE" "$OWNER" 2>&1); rc=$?
+t  "H2 the owner's tap on a handoff opens the view" 0 "$rc"
+DONE=$(sed -n 's/^done=//p' <<<"$out"); : >"$FAKE_LOG"
+out=$(priv done "$DONE" "$OWNER" 2>&1); rc=$?
+t  "H3 Done on an input-mode site hands the window BACK and does not stop it" "viewer-revoke tiktok.com|handoff tiktok.com --close|status tiktok.com" "$(tr '\n' '|' <"$FAKE_LOG" | sed 's/|$//')"
+
 # ---- S: the seams are not a door under root -------------------------------------------
 seam_block=$(awk '/^if \[\[ \$EUID -ne 0 \]\]; then$/{p=1} p{print} p&&/^fi$/{exit}' "$BROWSER")
 for v in FIVEDIVE_BROWSER_CONNECT_DIR FIVEDIVE_CONNECTOR_DIR FIVEDIVE_CONNECTORD_ENV FIVEDIVE_PROVISIONING_ENV FIVEDIVE_SHELLD_URL FIVEDIVE_TELEGRAM_API FIVEDIVE_BROWSER_CONNECT_SELF FIVEDIVE_BROWSER_CONNECT_PRIV; do

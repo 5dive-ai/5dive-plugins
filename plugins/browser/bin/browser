@@ -291,6 +291,18 @@ usage() {
                                       # on the page, so your next read goes through it. You never
                                       # solve the check; you carry on after their Done.
 
+  INPUT MODE (an adapter with "drive": "input", e.g. tiktok.com): the site refuses an automated
+  browser, so it is plain Chrome driven through the screen, keyboard and mouse. No DOM:
+  5dive browser shot <site> [<url>]   # a PNG of the live window + the page title
+  5dive browser act <site> [<url>] --steps='[{"op":"click","x":640,"y":400},{"op":"type","value":"hi"}]'
+                                      # click{x,y} move{x,y} type{value} press{key} scroll{dy}
+                                      # goto{url} wait{ms}; "kind":"pay|publish|send|delete"
+                                      # on a step that does one, and the owner's policy applies
+  5dive browser handoff <site> [--reason=<what for>]
+                                      # hand the SAME live window to the owner (Connect button);
+                                      # agent input is suspended until they tap Done
+  5dive browser handoff <site> --wait[=<s>] | --status | --close
+
   5dive browser adblock status              # is ad filtering on, and which sites is it off for
   sudo 5dive browser adblock off <site>     # this site breaks under filtering — stop filtering it
   sudo 5dive browser adblock on  <site>     # filter it again
@@ -407,10 +419,13 @@ _rv_offer() { echo "$SESSION_ROOT/$1/$2.offered"; }
 # Publish the one public fact. Best-effort on purpose: a box whose rendezvous
 # root was never created (an older install that has not re-run setup) must keep
 # working exactly as it did, just without brokering.
-_rv_offer_write() {  # _rv_offer_write <seat> <site>
+_rv_offer_write() {  # _rv_offer_write <seat> <site> [input]
   local d; d="$(_rv_dir "$1")"
   [[ -d "$d" && -w "$d" ]] || return 0
-  ( umask 037; printf 'site=%s\nowner=%s\n' "$2" "$1" > "$(_rv_offer "$1" "$2")" ) 2>/dev/null || true
+  # drive=input (DIVE-5287) is how a brokered seat learns the box serves this
+  # site in input mode: it cannot read the owner's adapters or serve record,
+  # and asking the daemon would queue behind whatever the daemon is doing.
+  ( umask 037; printf 'site=%s\nowner=%s\n%s' "$2" "$1" "${3:+drive=$3$'\n'}" > "$(_rv_offer "$1" "$2")" ) 2>/dev/null || true
 }
 
 # CAN THIS BOX NAME THE CALLER? The rendezvous socket is reachable by every agent
@@ -1028,8 +1043,30 @@ _signin_guard() {
   return 0
 }
 
+_input_probe() {  # <site> <dir>
+  local site="$1" dir="$2" t title
+  if ! _daemon_live "$dir" || ! t=$(_daemon_call "$dir" '{"op":"title"}' 2>/dev/null) \
+     || [[ "$(jq -r '.drive // empty' <<<"$t" 2>/dev/null)" != input ]]; then
+    echo "UNKNOWN (input mode, and no input-mode browser is serving $site — nothing loads a page to check it; 5dive browser serve $site)"
+    return 0
+  fi
+  title=$(jq -r '.title // ""' <<<"$t")
+  if grep -qiE -- "$(_input_challenge_title "$site")" <<<"$title"; then
+    echo "CHALLENGE — human action required (the window shows \"$title\"; we do not solve these: 5dive browser handoff $site)"
+    return 1
+  fi
+  echo "unconfirmed (input mode: the window shows \"$title\" — there is no DOM to confirm a login from; a screen is the check: 5dive browser shot $site)"
+  return 0
+}
+
 _probe() {
   local site="$1" dir="$2"
+  # INPUT MODE HAS NO DOM TO PROBE (DIVE-5287), and loading the probe URL would
+  # move the window an agent or a person is working in. It reads the title.
+  if [[ "$(_site_drive_adapter "$site")" == input ]] \
+     || { (( ! _SITE_BROKERED )) && [[ "$(_kv "$(_serve_pidfile "$dir")" drive)" == input ]]; }; then
+    _input_probe "$site" "$dir"; return $?
+  fi
   # SERVED MEANS WE CANNOT LOOK, AND SAYING SO IS THE WHOLE FIX. Chrome allows one
   # instance per --user-data-dir (SingletonLock); a second one launched at a held
   # profile hands its URL to the running instance and exits with an EMPTY document,
@@ -2325,6 +2362,13 @@ cmd_evict() {
     if _viewer_live "$d"; then
       printf '  %-20s kept: a person is in it\n' "$site"; continue
     fi
+    # A HANDOFF IS A PERSON ON THEIR WAY (DIVE-5287): the window was handed to the
+    # owner and may sit untouched until they tap Connect. Evicting it would throw
+    # away the page they were called in to act on.
+    if [[ "$(_kv "$(_serve_pidfile "$d")" drive)" == input ]] \
+       && [[ "$(_daemon_call "$d" '{"op":"hand","act":"status"}' 2>/dev/null | jq -r '.open // false' 2>/dev/null)" == true ]]; then
+      printf '  %-20s kept: handed to the owner, waiting for them\n' "$site"; continue
+    fi
     if _lease_live "$d"; then
       printf '  %-20s kept: %s\n' "$site" "$(_lease_describe "$d")"; continue
     fi
@@ -3469,8 +3513,20 @@ cmd_serve() {
   # fresh login. That seat gets the automated browser WITH its proxy, and is
   # told that Google-style sign-ins will be refused in it rather than finding
   # out from a refusal page.
+  # INPUT MODE (DIVE-5287) IS ALREADY PLAIN. Its browser is the login view's
+  # launch, held by a daemon that drives it through the display rather than a
+  # CDP pipe — so a person's view and an agent's work are the SAME window, and
+  # `--login` has nothing to swap. A proxied seat cannot have it: plain Chrome
+  # cannot carry the proxy's login (DIVE-4951), and the site is served as input
+  # BECAUSE the automated browser does not work there.
+  local input=0
+  [[ "$(_site_drive_adapter "$site")" == input ]] && input=1
+  if (( input )) && [[ -f "$(_proxy_file)" ]]; then
+    die "$E_UNAVAILABLE" "$site is set to input mode (plain Chrome, driven through the screen — the site refuses an automated browser), and this seat has a proxy set, which plain Chrome cannot carry: serving it would put this login on the box's own IP. Nothing was started. \`5dive browser proxy clear\` to use input mode here."
+  fi
+
   local plain=0 _lnote=""
-  if (( login )); then
+  if (( login && ! input )); then
     if [[ -f "$(_proxy_file)" ]]; then
       _lnote="$PROG: NOTE — $site is served for a login through this seat's proxy, which only the automated browser can carry. Sites that refuse sign-in in an automated browser (Google, and any \"Sign in with Google\") will refuse it here; this seat keeps the proxy rather than logging in from the box's own IP."
     else
@@ -3480,7 +3536,18 @@ cmd_serve() {
 
   local disp
   if disp=$(_serve_running "$dir"); then
-    if (( plain )) && _daemon_live "$dir"; then
+    if (( input )) && [[ "$(_kv "$(_serve_pidfile "$dir")" drive)" == input ]]; then
+      printf 'already serving %s on :%s (input mode)\n' "$site" "$disp"; return 0
+    elif (( input )); then
+      # Served the other way (a warm session from before the adapter said
+      # input, or a login view). Switch it — never with a person inside.
+      ! _viewer_live "$dir" \
+        || die "$E_UNAVAILABLE" "$site is set to input mode but is being viewed by a person in the other browser right now; not switching it under them. Try again when they are done."
+      ( cmd_serve "$site" --stop >/dev/null 2>&1 ) || true
+      ! _serve_running "$dir" >/dev/null \
+        || die "$E_UNAVAILABLE" "$site is served in the automated browser and it did not stop, so it cannot be re-served in input mode. Try again, or: 5dive browser serve $site --stop"
+      printf '%s: %s is set to input mode; re-serving it as plain Chrome driven through the screen.\n' "$PROG" "$site" >&2
+    elif (( plain )) && _daemon_live "$dir"; then
       # The daemon is holding the profile, and Chrome allows one instance per
       # --user-data-dir: stop it (gracefully — that is how the profile is
       # written out) and serve again below, plain.
@@ -3540,7 +3607,13 @@ cmd_serve() {
   local chrome_path; chrome_path=$(command -v "$chrome" 2>/dev/null || printf '%s' "$chrome")
   local daemon; daemon="$(_daemon_bin)"
   local dpid="" derr; derr="$(_daemon_errlog "$dir")"
-  if (( ! plain )) && [[ -x "$daemon" && -z "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then
+  # Input mode needs no playwright-core, so FIVEDIVE_BROWSER_NO_DAEMON (which is
+  # about the Playwright launch) does not turn it off.
+  if (( input )) && [[ ! -x "$daemon" ]]; then
+    kill "$xpid" 2>/dev/null; wait "$xpid" 2>/dev/null || true
+    die "$E_UNAVAILABLE" "$site is set to input mode and this install has no session daemon at $daemon to drive it. Nothing was started."
+  fi
+  if (( input )) || { (( ! plain )) && [[ -x "$daemon" && -z "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; }; then
     local rdy="$dir/.5dive-session.ready"
     ( umask 077; : > "$rdy"; : > "$derr" ) 2>/dev/null || true
     # THE SOCKET IS THE BROKER (DIVE-4664). When it lands in the rendezvous the
@@ -3556,7 +3629,7 @@ cmd_serve() {
     # so a warm serve opens the SITE and not about:blank (DIVE-4944).
     DISPLAY=":$disp" FIVEDIVE_BROWSER_CHROME="$chrome_path" \
       FIVEDIVE_BROWSER_START_URL="$start_url" \
-      _tmp_exec "$daemon" serve "$dir" "$dsock" $dbroker >"$rdy" 2>"$derr" &
+      _tmp_exec "$daemon" serve "$dir" "$dsock" $dbroker $( (( input )) && printf -- --input) >"$rdy" 2>"$derr" &
     dpid=$!
     # READY IS A LINE THE DAEMON PRINTS WHEN THE CONTEXT IS OPEN AND THE SOCKET
     # IS ACCEPTING — not when bash got a pid back. 30s is a ceiling and not a
@@ -3576,15 +3649,26 @@ cmd_serve() {
       kill "$dpid" 2>/dev/null; wait "$dpid" 2>/dev/null || true; dpid=""
       rm -f "$dsock"
       local dwhy; dwhy=$(tr -s '\n' ' ' < "$derr" 2>/dev/null | sed 's/^ *//;s/ *$//' | cut -c1-300)
+      # NO FALLBACK FOR INPUT MODE. The fallback below is a browser nobody can
+      # drive, for a site served this way because the other way does not work.
+      if (( input )); then
+        kill "$xpid" 2>/dev/null; wait "$xpid" 2>/dev/null || true
+        die "$E_UNAVAILABLE" "$site (input mode) is NOT being served: the browser did not come up. ${dwhy:-the session daemon printed nothing}"
+      fi
       printf '%s: NOTE — no warm session for %s, so every command will stop and restart this browser. %s\n' \
         "$PROG" "$site" "${dwhy:-the session daemon printed nothing}" >&2
     fi
   fi
   if [[ -n "$dpid" ]]; then
     ( umask 077; printf 'display=%s\nxvfb_pid=%s\ndaemon_pid=%s\nsock=%s\nstarted_at=%s\n' \
-        "$disp" "$xpid" "$dpid" "$dsock" "$(date -u +%s)" > "$(_serve_pidfile "$dir")" )
-    _rv_offer_write "$(_seat)" "$site"
+        "$disp" "$xpid" "$dpid" "$dsock" "$(date -u +%s)" > "$(_serve_pidfile "$dir")"
+      (( input )) && printf 'drive=input\n' >> "$(_serve_pidfile "$dir")" )
+    _rv_offer_write "$(_seat)" "$site" "$( (( input )) && printf input)"
+    if (( input )); then
+      printf 'serving %s on :%s (input mode — plain Chrome with no automation channel; agents act through the screen, keyboard and mouse, and a person'"'"'s view is the same window)\n' "$site" "$disp"
+    else
     printf 'serving %s on :%s (warm session — the profile outlives every viewer, and the browser outlives every command)\n' "$site" "$disp"
+    fi
     [[ -n "$dbroker" ]] && printf '  brokered at %s — other seats on this box use THIS login, with no second login of their own\n' "$dsock"
     [[ -n "$_lnote" ]] && printf '%s\n' "$_lnote" >&2
     return 0
@@ -3695,6 +3779,9 @@ cmd_viewer() {
   # caller that did not know it. A warm serve is re-served plain here; see
   # cmd_serve --login for why, and for the proxied seat that keeps the daemon.
   # The subshell: cmd_serve reports failure by dying (see _shot_restore).
+  # An INPUT-mode browser (DIVE-5287) is already plain: `serve --login` answers
+  # "already serving" and leaves it alone, so the person's view is the window
+  # the agent was driving, which is the whole point of a handoff.
   if _daemon_live "$dir"; then
     ( cmd_serve "$site" --login >/dev/null ) \
       || die "$E_UNAVAILABLE" "$site could not be re-served as plain Chrome for a person to sign in (above), so no link was issued. The profile is untouched."
@@ -5875,13 +5962,15 @@ _connect_page_ok() {  # <site> <url>
   [[ -n "$host" ]] && _shot_host_ok "$1" "$host"
 }
 
-_connect_request() {  # <caller> <site> <reason> [challenge <url>]
+_connect_request() {  # <caller> <site> <reason> [challenge <url> | handoff]
   local caller="$1" site="$2" reason="$3" kind="${4:-login}" url="${5:-}" code f now exp label text kb sent=0 o resp
   _valid_site "$site" && [[ "$site" != "$PUBLIC_SITE" ]] \
     || die "$E_USAGE" "'$site' is not a site a person can log in to"
   if [[ "$kind" == challenge ]]; then
     [[ -n "$url" ]] || url="$(_site_url "$site")"
     _connect_page_ok "$site" "$url" || die "$E_USAGE" "--url must be an http(s) page on $site"
+  elif [[ "$kind" == handoff ]]; then
+    url=""   # DIVE-5287: an input-mode window, opened as it is — no page to move it to
   else
     kind=login url=""
   fi
@@ -5908,6 +5997,12 @@ _connect_request() {  # <caller> <site> <reason> [challenge <url>]
     [[ -n "$reason" ]] && text+=$'\n'"Doing: ${reason}"
     text+=$'\n\n'"Tap Open for a one-time link to the browser on your box, on the page ${label} stopped at. Clear the check yourself, then tap Done and ${label} carries on. ${label} never solves these."
     kb=$(jq -nc --arg t "Open ${site}" --arg d "bconn:${code}" '{inline_keyboard:[[{text:$t,callback_data:$d}]]}')
+  elif [[ "$kind" == handoff ]]; then
+    # DIVE-5287: the SAME Connect button, onto the window the agent was driving.
+    text="🖐 ${label} is working in ${site} on your box and needs you to take over."
+    [[ -n "$reason" ]] && text+=$'\n'"What for: ${reason}"
+    text+=$'\n\n'"Tap Connect to open the same browser window it is using. ${label} is paused while you are in it; tap Done when you are finished and it carries on from the page you left."
+    kb=$(jq -nc --arg t "Connect ${site}" --arg d "bconn:${code}" '{inline_keyboard:[[{text:$t,callback_data:$d}]]}')
   else
     text="🔐 ${label} asks you to log in to ${site} in the browser on your box."
     [[ -n "$reason" ]] && text+=$'\n'"Why: ${reason}"
@@ -6034,6 +6129,19 @@ _connect_tap() {  # <caller> <code> <sender>
     "$site" "$host" "$path" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)" "$done_code" "$kind"
 }
 
+# Is the box's <site> an input-mode browser? Read from the box's own files, as
+# root, rather than by asking it: the box seat's adapter, then the shipped one,
+# then the running serve's record.
+_connect_site_is_input() {  # <site>
+  local b a; b="$(_site_base "$1")"
+  for a in "$PROFILE_ROOT/$BOX_SEAT/$ADAPTER_SEAT_SUBDIR/$b.json" "${FIVEDIVE_BROWSER_ADAPTER_DIR:-$ADAPTER_PKG_DIR}/$b.json"; do
+    [[ -f "$a" ]] || continue
+    [[ "$(jq -r '.drive // empty' "$a" 2>/dev/null)" == input ]] && return 0
+    break
+  done
+  [[ "$(_kv "$PROFILE_ROOT/$BOX_SEAT/$1/.5dive-serve" drive 2>/dev/null)" == input ]]
+}
+
 _connect_done() {  # <caller> <code> <sender>
   local caller="$1" code="$2" sender="$3" site out rc
   _connect_claim "$caller" "$code" done "$sender"
@@ -6060,7 +6168,14 @@ _connect_done() {  # <caller> <code> <sender>
   # revoke -> stop -> probe, in that order: a served profile cannot be probed
   # honestly, and only this last command may stamp the liveness file.
   _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
-  _connect_as_box serve "$site" --stop >/dev/null 2>&1 || true
+  # AN INPUT-MODE WINDOW IS KEPT (DIVE-5287). Stopping it here existed to swap a
+  # login view back to the warm session; an input browser IS the session, and
+  # the agent resumes on the page the person left. Done hands the window back.
+  if _connect_site_is_input "$site"; then
+    _connect_as_box handoff "$site" --close >/dev/null 2>&1 || true
+  else
+    _connect_as_box serve "$site" --stop >/dev/null 2>&1 || true
+  fi
   rc=0; out=$(_connect_as_box status "$site" 2>&1) || rc=$?
   printf 'site=%s\nstatus_rc=%s\nstatus=%s\n' "$site" "$rc" "$(printf '%s\n' "$out" | grep -v '^$' | tail -1)"
 }
@@ -6080,11 +6195,13 @@ cmd_connect_priv() {
              _connect_request "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
     challenge) (( ${#w[@]} == 4 )) || die "$E_USAGE" "_connect challenge <site> <url> <reason>"
              _connect_request "$CONNECT_CALLER" "${w[1]}" "${w[3]}" challenge "${w[2]}" ;;
+    handoff) (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect handoff <site> <reason>"
+             _connect_request "$CONNECT_CALLER" "${w[1]}" "${w[2]}" handoff ;;
     tap)     (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect tap <code> <telegram user id>"
              _connect_tap "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
     done)    (( ${#w[@]} == 3 )) || die "$E_USAGE" "_connect done <code> <telegram user id>"
              _connect_done "$CONNECT_CALLER" "${w[1]}" "${w[2]}" ;;
-    *) die "$E_USAGE" "_connect: request, challenge, tap or done" ;;
+    *) die "$E_USAGE" "_connect: request, challenge, handoff, tap or done" ;;
   esac
 }
 
@@ -6256,6 +6373,337 @@ _tmp_claim
 builtin trap '_tmp_release' EXIT
 # <<< DIVE-5190
 
+# ------------------------------------------------------------ input drive mode
+#
+# DIVE-5287. A site whose adapter says `"drive": "input"` is served as PLAIN
+# Chrome — the DIVE-5203 login-view launch, no --remote-debugging-*, no
+# --enable-automation — and agents act on it the way the person at the viewer
+# does: through the X display (bin/session-daemon --input, lib/x11.cjs). Reads
+# are screenshots and the window title; acts are real pointer and keyboard
+# input at pixel coordinates. tiktok.com is the first site: it will not render
+# for the automation channel at all (measured on chill-gorge 2026-09-30), and it
+# renders fine in plain Chrome on the same box and IP.
+#
+# THE SAME DOOR, THE SAME LEASE, THE SAME BROKER. The daemon holds the socket
+# the warm session would hold, so a brokered seat reaches it exactly as before,
+# every request still carries the caller's lease and is re-checked before each
+# step, and a person in the viewer still preempts an agent. What changes is
+# only what is on the other end of the socket.
+#
+# WHAT IT DOES NOT DO, said here so no verb pretends otherwise: there is no DOM.
+# `tree`, `read`, `links` and adapter `run` actions refuse by name; `shot` and
+# `snapshot` return a screenshot and the page title; `act` takes coordinates.
+# A security challenge still STOPS the agent. In this mode the stop is a
+# handoff: `5dive browser handoff <site>` calls the owner onto the same window.
+_site_drive_adapter() {  # the adapter's word for it: input, or empty
+  local a; a="$(_adapter_path "$1")"
+  [[ -f "$a" ]] && jq -r 'if .drive == "input" then "input" else empty end' "$a" 2>/dev/null
+}
+
+# Is <site> served (or to be served) in input mode? The adapter says so for the
+# owner; a brokered seat cannot read the owner's adapters, so it reads the
+# `.offered` marker the owner's serve wrote. NOT a daemon call: every page verb
+# asks this, and a warm session would queue the question behind its current
+# request and write an audit row for it.
+_site_is_input() {  # _site_is_input <site>
+  local site="$1"
+  _is_public "$site" && return 1
+  [[ "$(_site_drive_adapter "$site")" == input ]] && return 0
+  [[ -d "$PROFILE_ROOT" ]] || return 1
+  _resolve_site "$site" >/dev/null 2>&1 || return 1
+  if (( _SITE_BROKERED )); then
+    [[ "$(_kv "$(_rv_offer "$_SITE_OWNER" "$site")" drive)" == input ]]
+    return $?
+  fi
+  [[ "$(_kv "$(_serve_pidfile "$_SITE_DIR")" drive)" == input ]] && _serve_running "$_SITE_DIR" >/dev/null
+}
+
+# The title markers of a security check, for a page with no DOM to grep. An
+# adapter can name its own (probe.challenge_when_title_matches). The generic
+# list is the interstitials' own titles: Cloudflare's "Just a moment...",
+# "Attention Required!", and the words "captcha", "verify you are human",
+# "security check", "unusual activity", "prove your humanity".
+INPUT_CHALLENGE_TITLE='just a moment|attention required|captcha|verify you are human|are you a robot|security check|unusual (activity|traffic)|prove your humanity|verification required'
+_input_challenge_title() {
+  local a m=""; a="$(_adapter_path "$1")"
+  [[ -f "$a" ]] && m=$(jq -r '.probe.challenge_when_title_matches // empty' "$a" 2>/dev/null)
+  printf '%s\n' "${m:-$INPUT_CHALLENGE_TITLE}"
+}
+
+# Open an input-mode site for a verb: the profile, a live input daemon, and
+# (unless <purpose> is empty) the lease. The owner's own seat starts the serve
+# if nothing holds the profile; a brokered seat cannot, and is told how.
+_input_open() {  # _input_open <site> <purpose> <lease-wait|no>
+  local site="$1" purpose="$2" wait="${3:-no}"
+  command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is needed to talk to the $site browser and is not installed for this seat"
+  _open_site "$site"
+  local dir="$_SITE_DIR"
+  if (( ! _SITE_BROKERED )) && ! _daemon_live "$dir"; then
+    ( cmd_serve "$site" >/dev/null ) || die "$E_UNAVAILABLE" "the $site browser (input mode) did not start; its reason is above."
+  fi
+  local t; t=$(_daemon_call "$dir" '{"op":"title"}' 2>/dev/null | jq -r '.drive // empty' 2>/dev/null)
+  if [[ "$t" != input ]]; then
+    if (( _SITE_BROKERED )); then
+      die "$E_UNAVAILABLE" "$site is set to input mode, but the browser the '$_SITE_OWNER' seat is serving for it is the automated one, which this site refuses. Restart it so it comes back in input mode:  sudo -u $_SITE_OWNER 5dive browser serve $site --stop && sudo 5dive browser serve $site"
+    fi
+    ( cmd_serve "$site" >/dev/null ) || die "$E_UNAVAILABLE" "the $site browser could not be re-served in input mode; its reason is above."
+    t=$(_daemon_call "$dir" '{"op":"title"}' 2>/dev/null | jq -r '.drive // empty' 2>/dev/null)
+    [[ "$t" == input ]] || die "$E_UNAVAILABLE" "the $site browser is not answering in input mode. Nothing ran."
+  fi
+  if [[ -n "$purpose" ]]; then
+    _lease_take "$site" "$dir" "$purpose" "$wait"
+    trap '_lease_release' EXIT
+  fi
+}
+
+# The request's common tail: the lease and the challenge titles.
+_input_req() {  # _input_req <site> <json-object>
+  local lease='{}'
+  [[ -n "${_LEASE_TOKEN:-}" ]] && lease="$(_daemon_lease_json)"
+  jq -c --arg c "$(_input_challenge_title "$1")" --argjson l "$lease" '. + {challenge:$c} + $l' <<<"$2"
+}
+
+# Write what the daemon answered: page.png and page.meta.json in <out>.
+_input_write() {  # _input_write <answer-json> <png-path> [<meta-path>]
+  local ans="$1" png="$2" meta="${3:-}"
+  jq -r '.png_b64 // empty' <<<"$ans" | base64 -d > "$png" 2>/dev/null || true
+  [[ -s "$png" ]] || { rm -f "$png"; return 1; }
+  [[ -n "$meta" ]] && jq '{drive, title, window_title, width, height, url_requested, steps_run, handoff, viewer}
+      | with_entries(select(.value != null))
+      + {dom: "none — input mode reads the screen, not the page. Coordinates in act are pixels of this PNG."}' \
+      <<<"$ans" > "$meta"
+  return 0
+}
+
+_input_refuse_dom() {  # <verb> <site>
+  local why
+  case "$1" in
+    tree)       why="there is no DOM tree to enumerate here. Read the screen with \`5dive browser shot $2\` and act on pixel coordinates with \`5dive browser act $2 --steps=…\`." ;;
+    read|links) why="reading needs the page's DOM, and this site is driven with no channel into the page. \`5dive browser shot $2 <url>\` returns a screenshot of it." ;;
+    run)        why="adapter actions address the page by selector, and there is no DOM to resolve a selector in. Use \`5dive browser act $2 --steps=…\` with input steps." ;;
+  esac
+  die "$E_UNAVAILABLE" "$2 is served in INPUT mode (plain Chrome, no automation channel — the site refuses an automated browser), so \`$1\` cannot run: $why"
+}
+
+_input_rc() {  # map the daemon's exit to this command's, with the handoff advice
+  local rc="$1" site="$2"
+  case "$rc" in
+    0) return 0 ;;
+    75) printf '%s: a security check is on screen. The agent does not solve it — hand the tab to a person, on the same window:\n  5dive browser handoff %s --reason="<what they need to do>"\n  5dive browser handoff %s --wait\n' "$PROG" "$site" "$site" >&2
+        exit "$E_COLD" ;;
+    *) exit "$rc" ;;
+  esac
+}
+
+cmd_input_verb() {  # <verb> <site> [<url>] [flags]
+  local verb="$1"; shift
+  local site="" url="" out="" steps="" json=0 wait="no" settle="" swait=""
+  while (($#)); do
+    case "$1" in
+      --out=*)   out="${1#*=}" ;;
+      --steps=*) steps="${1#*=}" ;;
+      --steps-file=*) [[ -r "${1#*=}" ]] || die "$E_USAGE" "cannot read ${1#*=}"; steps="$(cat -- "${1#*=}")" ;;
+      --json)    json=1 ;;
+      --settle=*) settle="${1#*=}" ;;
+      --wait)    wait="$LEASE_WAIT_DEFAULT" ;;
+      --wait=*)  if [[ "$verb" == act ]]; then wait="${1#*=}"; else swait="${1#*=}"; fi ;;
+      # Flags of the DOM verbs that mean nothing here are accepted and ignored
+      # rather than refused, so an agent's habitual call still gets its screen.
+      --interactive|--full|--size=*|--dom=*|--wait-for=*|--expect=*|--expect-wait=*|--no-shot) ;;
+      -h|--help)
+        printf '%s %s <site> [<url>] — input mode: the screen of the live window, and real keyboard/mouse input.\n' "$PROG" "$verb"
+        printf '  act steps: click{x,y[,button,count]} move{x,y} type{value} press{key} scroll{dy[,dx,x,y]} goto{url} wait{ms}\n'
+        printf '  a step that pays, publishes, sends or deletes says so with "kind", and the owner'"'"'s policy applies.\n'
+        return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site?"
+  case "$verb" in tree|read|links|run) _input_refuse_dom "$verb" "$site" ;; esac
+  [[ -z "$settle" || "$settle" =~ ^[0-9]{1,5}$ ]] || die "$E_USAGE" "--settle takes milliseconds; got: $settle"
+  [[ -z "$swait" || "$swait" =~ ^[0-9]{1,5}$ ]] || die "$E_USAGE" "--wait takes milliseconds; got: $swait"
+  if [[ -n "$url" ]]; then
+    [[ "$url" =~ ^https?://[^/]+ ]] || die "$E_USAGE" "input mode opens only http(s) pages; got: $url"
+    local host="${url#*://}"; host="${host%%/*}"; host="${host%%\?*}"; host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
+    _shot_host_ok "$site" "$host" || die "$E_USAGE" "$url is not a page of '$site' (its host is $host) — a login is scoped to its own site."
+  fi
+
+  if [[ "$verb" == act ]]; then
+    _input_act "$site" "$url" "$steps" "$out" "$json" "$wait" "$settle"; return $?
+  fi
+
+  # shot / snapshot: the screen, after typing <url> into the address bar if given.
+  _input_open "$site" "input:$verb" no
+  local req; req=$(jq -nc --arg u "$url" --arg w "$swait" \
+      '{op:"screen"} + (if $u == "" then {} else {url:$u} end) + (if $w == "" then {} else {wait:($w|tonumber)} end)')
+  local ans rc=0; ans=$(_daemon_call "$_SITE_DIR" "$(_input_req "$site" "$req")") || rc=$?
+  _lease_release; trap - EXIT
+  [[ -n "$ans" ]] || { _input_rc "$rc" "$site"; die "$E_UNAVAILABLE" "the $site browser answered without a screen"; }
+  local title; title=$(jq -r '.title // ""' <<<"$ans")
+  local stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  if [[ "$verb" == shot ]]; then
+    [[ -n "$out" ]] || out="$PWD/${site}-${stamp}.png"
+    [[ -d "$(dirname "$out")" ]] || die "$E_USAGE" "no directory $(dirname "$out") to write the PNG into"
+    rm -f "$out"
+    _input_write "$ans" "$out" || die "$E_UNAVAILABLE" "the $site browser answered without an image. Nothing was written."
+    printf 'screen of %s (input mode: the live window, %sx%s)\n  %s\n  title: %s\n' \
+      "$site" "$(jq -r .width <<<"$ans")" "$(jq -r .height <<<"$ans")" "$out" "$title"
+  else
+    out="$(_read_output_dir "$site" "$out" "$_SITE_DIR")"
+    _input_write "$ans" "$out/page.png" "$out/page.meta.json" || die "$E_UNAVAILABLE" "the $site browser answered without an image. Nothing was written."
+    if (( json )); then jq -c --arg d "$out" '. + {dir:$d, png:($d + "/page.png")}' "$out/page.meta.json"
+    else
+      printf 'snapshot of %s (input mode — a screenshot and the page title; there is no DOM, no tree.json, no page.md)\n  %s/page.png\n  %s/page.meta.json\n  title: %s\n' \
+        "$site" "$out" "$out" "$title"
+    fi
+  fi
+  _input_rc "$rc" "$site"
+}
+
+_input_act() {  # <site> <url> <steps> <out> <json> <lease-wait> <settle>
+  local site="$1" url="$2" steps="$3" out="$4" json="$5" wait="$6" settle="$7"
+  command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to read the steps"
+  [[ -n "$steps" ]] || die "$E_USAGE" "usage: 5dive browser act $site --steps='[{\"op\":\"click\",\"x\":640,\"y\":400}]' (input mode: pixel coordinates of the screenshot)"
+  jq -e 'type=="array" and length>0' <<<"$steps" >/dev/null 2>&1 \
+    || die "$E_USAGE" "--steps is a JSON array, e.g. [{\"op\":\"click\",\"x\":640,\"y\":400},{\"op\":\"type\",\"value\":\"hello\"}]"
+  if jq -e 'any(.[]; has("selector"))' <<<"$steps" >/dev/null 2>&1; then
+    die "$E_USAGE" "$site is served in INPUT mode: there is no DOM, so a step cannot name a selector or a ref. Take a screen (5dive browser shot $site), then give pixel coordinates: {\"op\":\"click\",\"x\":…,\"y\":…}"
+  fi
+  [[ -n "$url" ]] && steps=$(jq -c --arg u "$url" '[{op:"goto", url:$u}] + .' <<<"$steps")
+  local g host
+  while IFS= read -r g; do
+    [[ -n "$g" ]] || continue
+    [[ "$g" =~ ^https?://[^/]+ ]] || die "$E_USAGE" "act opens only http(s) pages; got: $g"
+    host="${g#*://}"; host="${host%%/*}"; host="${host%%\?*}"; host="${host##*@}"; host="${host%%:*}"; host="${host,,}"
+    _shot_host_ok "$site" "$host" || die "$E_USAGE" "$g is not a page of '$site' (its host is $host) — a login is scoped to its own site."
+  done < <(jq -r '.[] | select(.op=="goto") | .url // ""' <<<"$steps")
+
+  # THE OWNER'S POLICY, ON WHAT THE AGENT DECLARES. The DOM path classifies a
+  # click by reading the button it lands on; here there is no button to read,
+  # only pixels. So a step that pays, publishes, sends or deletes carries
+  # "kind", and a kind the owner's policy sets to `ask` stops before anything
+  # runs. There is no in-mode approval yet: the route is a handoff, and the
+  # owner does that step themselves on the same window.
+  local kinds k pol
+  kinds=$(jq -r '[.[] | .kind // empty | select(. == "pay" or . == "publish" or . == "send" or . == "delete")] | unique | .[]' <<<"$steps")
+  if jq -e 'any(.[]; has("kind") and ((.kind == "pay" or .kind == "publish" or .kind == "send" or .kind == "delete") | not))' <<<"$steps" >/dev/null 2>&1; then
+    die "$E_USAGE" "a step's \"kind\" is one of pay, publish, send, delete. Nothing ran."
+  fi
+  pol="$(_policy_json)"
+  for k in $kinds; do
+    if [[ "$(jq -r --arg k "$k" '.[$k]' <<<"$pol")" == ask ]]; then
+      die "$E_NEEDS_OWNER" "this plan has a step that would $k, and the owner's policy asks before anything that does. Nothing ran. Input mode cannot carry an approval yet, so the owner does this step themselves, on this same window:
+  5dive browser handoff $site --reason=\"please $k: <what exactly>\"
+  5dive browser handoff $site --wait"
+    fi
+  done
+
+  _input_open "$site" "input:act" "$wait"
+  local req; req=$(jq -nc --argjson s "$(jq -c 'map(del(.kind, .intent))' <<<"$steps")" --arg st "$settle" \
+      '{op:"input", steps:$s} + (if $st == "" then {} else {settle:($st|tonumber)} end)')
+  local ans rc=0; ans=$(_daemon_call "$_SITE_DIR" "$(_input_req "$site" "$req")") || rc=$?
+  _lease_release; trap - EXIT
+  for k in $kinds; do _audit_row "$_SITE_DIR" "input-$k" "$(jq -c '[.[] | select(.kind != null)]' <<<"$steps" | cut -c1-300)" 2>/dev/null || true; done
+  if [[ -n "$ans" ]] && jq -e '.act_report' <<<"$ans" >/dev/null 2>&1; then
+    out="$(_read_output_dir "$site" "$out" "$_SITE_DIR")"
+    _input_write "$ans" "$out/page.png" "$out/page.meta.json" || true
+    if (( json )); then jq -c --arg d "$out" '. + {dir:$d, png:($d + "/page.png")}' "$out/page.meta.json"
+    else
+      printf 'acted on %s (input mode): %s step(s) ran\n  %s/page.png  — the screen the steps left; read it before the next act\n  title: %s\n' \
+        "$site" "$(jq -r '.steps_run // 0' <<<"$ans")" "$out" "$(jq -r '.title // ""' <<<"$ans")"
+    fi
+  fi
+  _input_rc "$rc" "$site"
+}
+
+# ------------------------------------------------------------------ handoff
+#
+# "Human can be called to continue any time" (lodar, 2026-09-30 15:11Z). The
+# agent hands the LIVE window to the owner: its own input is suspended at the
+# daemon (every step re-checks), the owner is sent the Connect button, and the
+# link opens the same display the agent was driving — no restart, no profile
+# swap, because an input-mode browser is already the plain Chrome a person
+# signs in through. When they tap Done the handoff closes and the agent
+# carries on from whatever page they left.
+HANDOFF_WAIT_DEFAULT=900
+cmd_handoff() {
+  local site="" reason="" act=open wait="" ask=1
+  while (($#)); do
+    case "$1" in
+      --reason=*) reason="${1#*=}" ;;
+      --status)   act=status ;;
+      --close|--done) act=close ;;
+      --wait)     act=wait; wait="$HANDOFF_WAIT_DEFAULT" ;;
+      --wait=*)   act=wait; wait="${1#*=}" ;;
+      --no-ask)   ask=0 ;;
+      -h|--help)
+        printf '%s handoff <site> [--reason=<what the person should do>] [--no-ask]   # hand the live window to the owner\n' "$PROG"
+        printf '%s handoff <site> --wait[=<seconds>]   # until they are done (default %ss)\n' "$PROG" "$HANDOFF_WAIT_DEFAULT"
+        printf '%s handoff <site> --status | --close\n' "$PROG"
+        return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) [[ -z "$site" ]] || die "$E_USAGE" "one site at a time"; site="$1" ;;
+    esac; shift
+  done
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser handoff tiktok.com --reason=\"solve the captcha\""
+  _valid_site "$site" && ! _is_public "$site" || die "$E_USAGE" "'$site' is not a site a person can take over"
+  [[ -z "$wait" || "$wait" =~ ^[0-9]{1,5}$ ]] || die "$E_USAGE" "--wait takes seconds; got: $wait"
+  _site_is_input "$site" || die "$E_UNAVAILABLE" "$site is not in input mode, so there is no live window to hand over. For a login, ask the owner to connect it: 5dive browser connect-request $site"
+  _input_open "$site" "" no
+  local dir="$_SITE_DIR" st
+  case "$act" in
+    status) _daemon_call "$dir" '{"op":"hand","act":"status"}'; return $? ;;
+    close)
+      st=$(_daemon_call "$dir" '{"op":"hand","act":"close"}') || die "$E_UNAVAILABLE" "the $site browser did not answer"
+      printf 'the %s window is back with the agent. Page now: %s\n' "$site" "$(jq -r '.title // ""' <<<"$st")"
+      return 0 ;;
+    open)
+      reason=$(printf '%s' "$reason" | tr -d '\000-\037\177' | cut -c1-200)
+      st=$(_daemon_call "$dir" "$(jq -nc --arg r "$reason" '{op:"hand", act:"open", reason:$r}')") \
+        || die "$E_UNAVAILABLE" "the $site browser did not take the handoff; nothing changed."
+      printf 'handed the live %s window to the owner%s. Agent input on it is suspended until they are done.\n' \
+        "$site" "${reason:+ ($reason)}"
+      if (( ask )); then
+        local rc=0
+        printf '%s\0' handoff "$site" "$reason" | "${CONNECT_PRIV[@]}" || rc=$?
+        if (( rc != 0 )); then
+          printf '%s: the owner could not be asked over Telegram (above). They can take over from the dashboard: Connected sites -> %s -> Connect opens this same window.\n' "$PROG" "$site" >&2
+        fi
+      fi
+      printf 'Wait for them:  5dive browser handoff %s --wait\n' "$site"
+      return 0 ;;
+    wait)
+      local deadline=$(( $(date +%s) + wait )) seen_viewer=0 gone_since=0 now open viewer
+      while :; do
+        st=$(_daemon_call "$dir" '{"op":"hand","act":"status"}' 2>/dev/null) \
+          || die "$E_UNAVAILABLE" "the $site browser stopped answering while it was with the owner. The profile is intact; the window is gone."
+        open=$(jq -r '.open' <<<"$st"); viewer=$(jq -r '.viewer' <<<"$st"); now=$(date +%s)
+        if [[ "$open" != true ]]; then
+          printf 'the owner is done with %s; the agent has the window again. Page now: %s\nTake a screen before acting: 5dive browser shot %s\n' "$site" "$(jq -r '.title // ""' <<<"$st")" "$site"
+          return 0
+        fi
+        # A VIEW THAT ENDED IS A PERSON WHO LEFT. x11vnc is -once, so the view
+        # does not come back on its own; after a person was in it and it has
+        # been gone for a while, the window is the agent's again even if nobody
+        # tapped Done. Before anyone came, an absent viewer means nothing.
+        if [[ "$viewer" == true ]]; then seen_viewer=1; gone_since=0
+        elif (( seen_viewer )); then
+          (( gone_since )) || gone_since=$now
+          if (( now - gone_since >= 20 )); then
+            _daemon_call "$dir" '{"op":"hand","act":"close"}' >/dev/null 2>&1 || true
+            printf 'the owner left the %s view without tapping Done; the agent has the window again. Page now: %s\nTake a screen before acting: 5dive browser shot %s\n' "$site" "$(jq -r '.title // ""' <<<"$st")" "$site"
+            return 0
+          fi
+        fi
+        if (( now >= deadline )); then
+          die "$E_COLD" "the $site window is still with the owner after ${wait}s$([[ $seen_viewer == 1 ]] || printf ' (they have not opened it yet)'). It stays theirs; wait again, or take it back with: 5dive browser handoff $site --close"
+        fi
+        sleep 3
+      done ;;
+  esac
+}
+
 # A URL WHERE A PROFILE NAME GOES (DIVE-4943 scope 5). `read https://…` picks its
 # own profile — the host's one login, or the public profile when there is none —
 # so an agent on a box with nothing connected can still use the browser at all.
@@ -6265,6 +6713,15 @@ case "${1:-}" in
       _v="$1"; _u="$2"; shift 2
       _r="$(_route_site "$_u")" || exit $?
       set -- "$_v" "$_r" "$_u" "$@"
+    fi ;;
+esac
+
+# INPUT MODE TAKES THE PAGE VERBS (DIVE-5287). After the URL routing above, so
+# `shot https://www.tiktok.com/…` lands here too.
+case "${1:-}" in
+  shot|snapshot|act|tree|read|links|run)
+    if [[ -n "${2:-}" && "${2:-}" != -* ]] && _valid_site "$2" && _site_is_input "$2"; then
+      _v="$1"; shift; cmd_input_verb "$_v" "$@"; exit $?
     fi ;;
 esac
 
@@ -6309,6 +6766,7 @@ case "${1:-}" in
   viewer-redeem) shift; cmd_viewer_redeem "$@" ;;
   viewer-revoke) shift; cmd_viewer_revoke "$@" ;;
   connect-request) shift; cmd_connect_request "$@" ;;
+  handoff) shift; cmd_handoff "$@" ;;
   # Not in usage: the privileged half, reached only as `sudo -n … browser _connect`.
   _connect) shift; cmd_connect_priv "$@" ;;
   *) die "$E_USAGE" "unknown: $PROG $1 (see: $PROG --help)" ;;
