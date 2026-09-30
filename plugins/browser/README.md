@@ -164,12 +164,14 @@ carry the proxy's username and password (DIVE-4951) and would sign the person in
 own IP. `viewer` and `serve --login` say so on stderr: sign-ins that check for automation will be
 refused through that seat.
 
-**`serve --stop` lets Chrome finish before it takes the display** (DIVE-5286). Chrome writes its
-cookie store on a timer of about 30 seconds, and on a graceful shutdown. So a login made seconds
-before Done is on disk only if Chrome shuts down cleanly. `--stop` sends Chrome SIGTERM and waits
+**`serve --stop` waits for a login view's cookies to reach disk** (DIVE-5286). Chrome commits
+cookie changes about 30 seconds after the first change of a batch, and a SIGTERM shutdown does not
+reliably write the pending batch. So `--stop` of a login view first waits for the Cookies DB to be
+written after the stop was asked for, capped at `FIVEDIVE_BROWSER_COOKIE_SETTLE` seconds (default
+24, which keeps the dashboard's Done inside its 30 s request). Then it sends Chrome SIGTERM and waits
 for it to exit (bounded at `FIVEDIVE_BROWSER_STOP_GRACE` seconds, default 10, then SIGKILL) before
 it stops the Xvfb. It returns only once the profile is free, so the status check Done runs next
-never finds the profile still locked.
+never finds the profile still locked. An agent's plain Chrome does not wait for the cookie commit.
 
 ### What protects the session while the viewer is open
 

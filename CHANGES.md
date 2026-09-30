@@ -3,16 +3,24 @@
 ### Fixed — a login made just before Done is no longer lost (DIVE-5286), browser 1.24.2
 
 A person signed in to GitHub through the dashboard's Connect, pressed Done 13 seconds later, and was
-told to log in again. Every agent then refused the site as logged out. `serve --stop` killed the
-login view's Chrome and its Xvfb in the same instant. Chrome died on the lost display before its
-graceful shutdown wrote the cookie store, which it otherwise commits only every ~30 s. The session
-cookies never reached disk, but the page history (committed every ~10 s) did.
+told to log in again. Every agent then refused the site as logged out. Chrome batches cookie
+changes and commits them to disk ~30 s after the first change of a batch, and its SIGTERM shutdown
+does not reliably write the pending batch. So a sign-in less than ~30 s before Done was lost
+(13 s, 8 s and 9 s on the same box; 20 s ones survived).
 
-- `serve --stop` now sends Chrome SIGTERM and waits for it to exit before it stops the display.
-  The wait is bounded at 10 s (`FIVEDIVE_BROWSER_STOP_GRACE`); after that it sends SIGKILL.
-- It returns only once Chrome is gone. The status check Done runs next no longer races the dying
-  browser for the profile. That race was the "Failed to create SingletonLock: File exists" that
-  `ls` printed as UNKNOWN.
+- `serve --stop` of a login view now waits for Chrome's next cookie commit before it stops Chrome:
+  it watches the Cookies DB for a write after the stop was asked for, and every change made
+  before that is in it. The wait is capped at `FIVEDIVE_BROWSER_COOKIE_SETTLE` seconds (default
+  24), so the dashboard's Done (revoke, stop and status in one request the proxy cuts at 30 s)
+  still answers. What the cap gives up: a sign-in under ~6 s before Done can still be lost.
+  Measured through `serve --login`/`--stop` with the real Chrome: a cookie set 8 s before the stop
+  was kept 5/5 (stop ~22.5 s), and 0/5 without the wait; set 3 s before, the cap cuts in and it is
+  lost (0/3), which is the residual above.
+- An agent's plain Chrome is not held: only a login view (`login=1`) waits.
+- Then it sends Chrome SIGTERM and waits for it to exit before it stops the display (bounded at
+  `FIVEDIVE_BROWSER_STOP_GRACE`, 10 s, then SIGKILL). It returns only once Chrome is gone, so the
+  status check Done runs next no longer races the dying browser for the profile. That race was the
+  "Failed to create SingletonLock: File exists" that `ls` printed as UNKNOWN.
 
 Mirrored from 5dive-browser; the browser files match the source hunk for hunk. Also in `tests/browser_plugin_unit.sh` (T49).
 

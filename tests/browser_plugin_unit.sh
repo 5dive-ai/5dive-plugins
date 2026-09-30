@@ -7664,13 +7664,15 @@ for f in plugins/browser/README.md plugins/browser/AGENTS.md plugins/browser/ski
 done
 tc 'T46e CHANGES.md carries the entry' 'DIVE-620' "$(cat "$ROOT/CHANGES.md")"
 
-# --- T49 serve --stop lets Chrome finish before it takes the display (DIVE-5286) ---------------
-# A login lost on Done: `serve --stop` killed a plain login Chrome and its Xvfb in the same breath,
-# so Chrome died on the lost display before its graceful shutdown wrote the cookie store (a GitHub
-# sign-in 13 s before Done never reached disk, chill-gorge 2026-09-30). The fake Chrome here does
-# what the real one does on SIGTERM: it spends a moment writing its cookies, and the write only
-# lands if its X display is still up when it gets there. It finds that display's Xvfb through the
-# pid the fake Xvfb below records, keyed by the DISPLAY the product launched it on.
+# --- T49 serve --stop waits for a login view's cookies to reach disk (DIVE-5286) ---------------
+# A login lost on Done: a GitHub sign-in 13 s before Done never reached disk (chill-gorge
+# 2026-09-30), nor did 8 s and 9 s ones. Chrome commits cookie changes on a ~30 s batch timer, and
+# its SIGTERM shutdown does not reliably write the pending batch — measured with the real Chrome
+# and the login serve's argv: kept 1/5 with the old stop, 0/5 with a stop that only waited for the
+# exit, 5/5 with a stop that waited for the next commit. The fake Chrome here does what the real
+# one was measured doing: the sign-in's cookie is written to Default/Cookies only when its commit
+# timer fires (T49_COMMIT_MS after the test signs in by touching $T49D/signin; never when unset),
+# and SIGTERM exits WITHOUT writing it.
 T49D="$TMP/t49"; mkdir -p "$T49D/bin"
 cat > "$T49D/bin/Xvfb" <<XVFB49
 #!/usr/bin/env bash
@@ -7681,62 +7683,90 @@ exec sleep 300
 XVFB49
 cat > "$T49D/bin/google-chrome" <<CHR49
 #!/usr/bin/env bash
-for a in "\$@"; do case "\$a" in --headless) exec sleep 0 ;; esac; done
+ud=""
+for a in "\$@"; do case "\$a" in --headless) exec sleep 0 ;; --user-data-dir=*) ud="\${a#*=}" ;; esac; done
 echo \$\$ > "$T49D/chrome.pid"
-flush() {
-  sleep "\${T49_FLUSH:-0.6}"
-  x=\$(cat "$T49D/xvfb.\${DISPLAY#:}.pid" 2>/dev/null)
-  if [[ -n "\$x" ]] && kill -0 "\$x" 2>/dev/null; then echo user_session > "$T49D/cookies"; fi
-  kill "\$sp" 2>/dev/null; exit 0
-}
-[[ -n "\${T49_DEAF:-}" ]] && trap '' TERM || trap flush TERM
-sleep 300 & sp=\$!; echo "\$sp" >> "$T49D/sleeps"
-while :; do wait "\$sp"; kill -0 "\$sp" 2>/dev/null || exit 0; done
+[[ -n "\${T49_DEAF:-}" ]] && trap '' TERM || trap 'exit 0' TERM
+t0=""; done=0
+while :; do
+  [[ -z "\$t0" && -e "$T49D/signin" ]] && t0=\$(date +%s%3N)
+  if [[ -n "\${T49_COMMIT_MS:-}" && -n "\$t0" ]] && (( ! done && \$(date +%s%3N) - t0 >= T49_COMMIT_MS )); then
+    mkdir -p "\$ud/Default"; echo user_session > "\$ud/Default/Cookies"; done=1
+  fi
+  sleep 0.05
+done
 CHR49
 chmod +x "$T49D/bin/Xvfb" "$T49D/bin/google-chrome"
 T49PATH="$T49D/bin:$SPATH"
 S49=stop49.test
 D49="$(mkprofile "$S49" "$LIVE_DOM")"
 t49_serve() {  # a person's login view: plain Chrome on its own Xvfb
-  rm -f "$T49D/cookies" "$T49D/chrome.pid"
+  rm -f "$T49D/chrome.pid" "$T49D/signin" "$D49/Default/Cookies" "$D49/Default/Network/Cookies"
   run env PATH="$T49PATH" DISPLAY= "$@" "$BROWSER" serve "$S49" --login
 }
 t49_alive() { kill -0 "$(cat "$T49D/chrome.pid" 2>/dev/null)" 2>/dev/null && echo yes || echo no; }
+t49_cookie() { cat "$D49/Default/Cookies" 2>/dev/null; }
+t49_stop() {  # t49_stop [env...] — times the stop into T49MS
+  local s; s=$(date +%s%3N)
+  run env PATH="$T49PATH" "$@" "${T49BIN:-$BROWSER}" serve "$S49" --stop
+  T49MS=$(( $(date +%s%3N) - s ))
+}
 
-# --- T49a the cookies a person just signed in with reach disk ---
-t49_serve
+# --- T49a a sign-in's cookies pending at Done reach disk: the stop waits for Chrome's commit ---
+t49_serve T49_COMMIT_MS=1500
 t  'T49a (setup) the login view serves' 0 "$RC"
-t  'T49a (setup) ...as plain Chrome — the fake that flushes on SIGTERM' 'yes' "$(t49_alive)"
-run env PATH="$T49PATH" "$BROWSER" serve "$S49" --stop
+t  'T49a (setup) ...as plain Chrome — the fake whose commit is still pending' 'yes' "$(t49_alive)"
+sleep 2
+t  'T49a (setup) ...and with no sign-in nothing is on disk, however long it has been up' '' "$(t49_cookie)"
+: > "$T49D/signin"   # the person signs in; Done comes at once, before the commit
+t49_stop
 t  'T49a serve --stop stops' 0 "$RC"
-t  'T49a ...and Chrome wrote its cookies while its display was still up' 'user_session' "$(cat "$T49D/cookies" 2>/dev/null)"
+t  'T49a ...and the cookies a person just signed in with are on disk' 'user_session' "$(t49_cookie)"
+t  'T49a ...and it left on the commit, not the 24 s cap' 'yes' "$( (( T49MS < 6000 )) && echo yes || echo "no (${T49MS}ms)")"
 # --- T49b the probe Done runs next does not race the profile lock ---
 t  'T49b ...Chrome is gone by the time stop returns (no SingletonLock left for the Done probe)' 'no' "$(t49_alive)"
 t  'T49b ...and the pidfile is gone' 'no' "$([[ -f "$D49/.5dive-serve" ]] && echo yes || echo no)"
 
+# --- T49e nothing pending: the wait is capped, and the stop still stops ---
+t49_serve
+t  'T49e (setup) a login view with no commit coming serves' 'yes' "$(t49_alive)"
+t49_stop FIVEDIVE_BROWSER_COOKIE_SETTLE=1
+t  'T49e serve --stop stops' 0 "$RC"
+t  'T49e ...after waiting out the cap' 'yes' "$( (( T49MS >= 900 && T49MS < 4000 )) && echo yes || echo "no (${T49MS}ms)")"
+t  'T49e ...and Chrome is gone' 'no' "$(t49_alive)"
+
 # --- T49c a Chrome that ignores SIGTERM is still stopped: SIGKILL after the bound ---
 t49_serve T49_DEAF=1
 t  'T49c (setup) a deaf Chrome serves' 'yes' "$(t49_alive)"
-T49S=$(date +%s)
-run env PATH="$T49PATH" FIVEDIVE_BROWSER_STOP_GRACE=1 "$BROWSER" serve "$S49" --stop
-T49E=$(( $(date +%s) - T49S ))
+t49_stop FIVEDIVE_BROWSER_COOKIE_SETTLE=1 FIVEDIVE_BROWSER_STOP_GRACE=1
 t  'T49c serve --stop still stops' 0 "$RC"
 sleep 0.2
 t  'T49c ...and the deaf Chrome was killed, not left holding the profile' 'no' "$(t49_alive)"
-t  'T49c ...within the bound, not forever' 'yes' "$( (( T49E <= 4 )) && echo yes || echo no)"
+t  'T49c ...within the bounds, not forever' 'yes' "$( (( T49MS < 5000 )) && echo yes || echo "no (${T49MS}ms)")"
 
-# --- T49d MUTANT: the wait removed (the pre-fix stop) — the cookies are lost, what T49a catches ---
+# --- T49f an agent's plain Chrome (not a login view) is not held: only a person's sign-in is ---
+sleep 300 & T49X=$!
+sleep 300 & T49C=$!
+( umask 077; printf 'display=349\nxvfb_pid=%s\nchrome_pid=%s\nstarted_at=%s\n' \
+    "$T49X" "$T49C" "$(date -u +%s)" > "$D49/.5dive-serve" )
+t49_stop
+t  'T49f a plain serve that is not a login view stops' 0 "$RC"
+t  'T49f ...without the cookie wait' 'yes' "$( (( T49MS < 3000 )) && echo yes || echo "no (${T49MS}ms)")"
+kill "$T49X" "$T49C" 2>/dev/null
+
+# --- T49d MUTANT: no cookie wait (PR #33's stop: SIGTERM, wait for the exit) — the login is lost ---
 MUT49="$T49D/mut"; rm -rf "$MUT49"; cp -r "$ROOT/plugins/browser" "$MUT49"
-perl -0pi -e 's/\n      while \(\( cw < cmax \)\)[^\n]*\n      _pid_live "\$cpid" && kill -KILL "\$cpid" 2>\/dev\/null//' "$MUT49/bin/browser"
-t  'T49d (anchor) the mutation applied' 0 "$(grep -c 'cw < cmax' "$MUT49/bin/browser")"
-t49_serve
+sed -i 's/FIVEDIVE_BROWSER_COOKIE_SETTLE:-24}/FIVEDIVE_BROWSER_COOKIE_SETTLE:-0}/' "$MUT49/bin/browser"
+t  'T49d (anchor) the mutation applied' 1 "$(grep -c 'FIVEDIVE_BROWSER_COOKIE_SETTLE:-0}' "$MUT49/bin/browser")"
+t49_serve T49_COMMIT_MS=1500
 t  'T49d (setup) the login view serves' 'yes' "$(t49_alive)"
-run env PATH="$T49PATH" "$MUT49/bin/browser" serve "$S49" --stop
+: > "$T49D/signin"
+T49BIN="$MUT49/bin/browser" t49_stop
 t  'T49d the mutant still says it stopped' 0 "$RC"
-t  'T49d ...and the cookies never reached disk — the lost login' '' "$(cat "$T49D/cookies" 2>/dev/null)"
-t  'T49d ...and the dying Chrome still held the profile when it returned' 'yes' "$(t49_alive)"
-sleep 1
-kill $(cat "$T49D/sleeps" 2>/dev/null) 2>/dev/null; true
+t  'T49d ...and the cookies never reached disk — the lost login' '' "$(t49_cookie)"
+t  'T49d ...even though it waited for Chrome to exit' 'no' "$(t49_alive)"
+sleep 2
+t  'T49d (control) ...and the commit it cut off never came' '' "$(t49_cookie)"
 
 # --- T47 a person's view is plain Chrome (DIVE-5203) ------------------------------------------
 # Google refuses a sign-in typed into a browser under automation control, and the warm serve IS
