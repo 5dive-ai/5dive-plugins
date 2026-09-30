@@ -3445,7 +3445,52 @@ cmd_serve() {
       while (( w < 100 )) && _pid_live "$dpid"; do sleep 0.05; w=$(( w + 1 )); done
       _pid_live "$dpid" && kill "$dpid" 2>/dev/null
     fi
-    [[ -n "$cpid" ]] && kill "$cpid" 2>/dev/null
+    # A LOGIN VIEW'S COOKIES ARE ON DISK ONLY AFTER CHROME'S NEXT COMMIT (DIVE-5286).
+    # Chrome batches cookie writes and commits them ~30 s after the first change
+    # of a batch, and a SIGTERM shutdown does NOT reliably write the pending
+    # batch: measured with the login serve's own Chrome and argv, a persistent
+    # cookie set 3 s before the stop survived 1 time in 5 with the old stop and 0
+    # in 5 with a stop that waited for Chrome to exit; waiting for the next commit
+    # kept it 5 in 5. A GitHub sign-in 13 s before Done was lost this way, and so
+    # were 8 s and 9 s ones on the same box; 20 s ones survived. So a stop of a
+    # login view (a person's plain Chrome, not an agent's browser) first waits for
+    # the Cookies DB to be written after the moment the stop was asked for — every
+    # change made before then is in that commit. It is capped, because nothing may
+    # be pending at all: the dashboard's Done runs revoke, this stop and a status
+    # probe in ONE request that the proxy cuts at 30 s (and the stop alone at 30
+    # s), so the default 24 s keeps the whole of Done inside it. What the cap
+    # gives up: a sign-in under ~6 s before Done can still be lost.
+    if [[ -n "$cpid" && "$(_kv "$f" login)" == 1 ]] && _pid_live "$cpid"; then
+      local cs="${FIVEDIVE_BROWSER_COOKIE_SETTLE:-24}"; [[ "$cs" =~ ^[0-9]+$ ]] || cs=24
+      local sref; sref=$(mktemp "${TMPDIR:-/tmp}/5dive-stop.XXXXXX" 2>/dev/null) || sref=""
+      if [[ -n "$sref" ]] && (( cs > 0 )); then
+        # A WALL-CLOCK deadline, not a count of sleeps: each turn of this loop
+        # forks, and 480 turns of "0.05 s" measured 27.5 s — past the budget.
+        local sdl=$(( $(date +%s%3N) + cs * 1000 )) ck committed=0
+        while (( $(date +%s%3N) < sdl )) && _pid_live "$cpid"; do
+          for ck in "$dir/Default/Network/Cookies" "$dir/Default/Cookies"; do
+            [[ "$ck" -nt "$sref" ]] && { committed=1; break 2; }
+          done
+          sleep 0.05
+        done
+        # Seen mid-transaction: give the commit a moment to finish before SIGTERM.
+        (( committed )) && sleep 0.5
+      fi
+      [[ -n "$sref" ]] && rm -f "$sref"
+    fi
+    # CHROME GOES FIRST, AND ALL THE WAY, BEFORE ITS DISPLAY (DIVE-5286). A stop
+    # that returns while Chrome still holds SingletonLock hands the probe Done
+    # runs next a profile it cannot open — the "Failed to create SingletonLock:
+    # File exists" UNKNOWN in `ls`. (Waiting for the exit does NOT by itself save
+    # the cookies — the wait above does that.) So: SIGTERM, wait for it to exit,
+    # SIGKILL only once the bound has passed, and only then the display.
+    if [[ -n "$cpid" ]] && _pid_live "$cpid"; then
+      kill "$cpid" 2>/dev/null
+      local cg="${FIVEDIVE_BROWSER_STOP_GRACE:-10}"; [[ "$cg" =~ ^[0-9]+$ ]] || cg=10
+      local cw=0 cmax=$(( cg * 20 ))
+      while (( cw < cmax )) && _pid_live "$cpid"; do sleep 0.05; cw=$(( cw + 1 )); done
+      _pid_live "$cpid" && kill -KILL "$cpid" 2>/dev/null
+    fi
     [[ -n "$xpid" ]] && kill "$xpid" 2>/dev/null
     local ssock; ssock="$(_kv "$f" sock)"
     rm -f "$f" "${ssock:-$dir/.5dive-session.sock}"
