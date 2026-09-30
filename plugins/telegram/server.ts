@@ -57,7 +57,7 @@ import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelr
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
-import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, liteWelcome, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
+import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, startGreeting, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
   readMessages as msglogRead,
@@ -3204,7 +3204,13 @@ function parseDigestHour(raw: string): number | null {
 }
 
 const commandHandlers: Record<string, CommandHandler> = {
-  start: async ctx => {
+  start: async (ctx, { access, senderId }) => {
+    // DIVE-5298: the paired owner is greeted by the agent, at once, not told
+    // how to pair a bot that is already theirs. Anyone else still gets pairing.
+    if (access.allowFrom.includes(senderId)) {
+      await ctx.reply(await startGreetingFor(ctx, liteLang(ctx.from?.language_code)))
+      return
+    }
     await ctx.reply(
       `This bot bridges Telegram to a Claude Code session.\n\n` +
       `To pair:\n` +
@@ -4713,6 +4719,11 @@ async function liteAboutText(lang: Lang): Promise<string> {
   return text
 }
 
+// DIVE-5298: what a bare /start answers at once, on either profile.
+async function startGreetingFor(ctx: Context, lang: Lang): Promise<string> {
+  return startGreeting(lang, { name: ctx.me?.first_name, about: await liteAboutText(lang) })
+}
+
 async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: string): Promise<void> {
   const s = LITE_STRINGS[lang]
   const accountUrl = liteAccountUrl(process.env.TELEGRAM_ACCOUNT_URL)
@@ -4720,9 +4731,11 @@ async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: str
   if (cmd === 'start') {
     // DIVE-5173: the pack's welcome goes out at once, no model turn. It is
     // logged like a reply so recent_messages shows the agent already greeted.
-    // A deep-link payload still goes to the model after it; with no welcome in
-    // the pack the agent greets in its own voice (LITE_INSTRUCTIONS), as before.
-    const welcome = liteWelcome(lang)
+    // A deep-link payload still goes to the model after it.
+    // DIVE-5298: with no welcome in the pack, a greeting from the bot's name and
+    // short description, never a model turn (a box with no AI account never
+    // answers one, so /start was silence).
+    const welcome = await startGreetingFor(ctx, lang)
     if (welcome) {
       const chatId = String(ctx.chat!.id)
       const sent = await ctx.reply(welcome).catch(err => {
