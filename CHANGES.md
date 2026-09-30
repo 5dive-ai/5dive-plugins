@@ -24,6 +24,26 @@ does not reliably write the pending batch. So a sign-in less than ~30 s before D
 
 Mirrored from 5dive-browser; the browser files match the source hunk for hunk. Also in `tests/browser_plugin_unit.sh` (T49).
 
+### Fixed — a signed-in Reddit no longer reads as a security challenge (DIVE-5285), browser 1.24.1
+
+Registry mirror of 5dive-ai/5dive-browser (`browser/` read as `plugins/browser/`).
+
+Every agent reading a connected, signed-in Reddit was told "reddit.com is presenting a security
+challenge" and stopped. The reddit adapter probes `/login/`, and that page carries Google's
+invisible reCAPTCHA (`<textarea name="g-recaptcha-response">`) whether or not the session is
+signed in. The probe checks for a challenge first, and the generic challenge list matches bare
+`g-recaptcha`, so a healthy session was read as a challenge. The browser launch and the IP were
+not involved.
+
+- `plugins/browser/adapters/reddit.com.json` now has its own `challenge_when_dom_matches`: the generic list without
+  `g-recaptcha`, plus the words of Reddit's own block pages ("Prove your humanity", "blocked by
+  network security"). A signed-in `/login/` reads `authenticated`, a signed-out one `expired`, and
+  Reddit's real interstitial is still a challenge.
+- The generic default is unchanged. A site with no marker of its own still names a reCAPTCHA page
+  a challenge.
+- A box that worked around this with a seat copy at `<profile-root>/<seat>/.adapters/reddit.com.json`
+  can delete it once 1.24.1 is installed. The seat copy wins over the shipped one until then.
+
 ### Added — when the free AI that came with a my.5dive server runs out, each agent says so once, with Connect (DIVE-5256), telegram 0.5.77
 
 On a my.5dive server the agents run on a small one-time AI allowance. When it ran out the agents just
