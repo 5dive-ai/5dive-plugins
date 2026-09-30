@@ -15,6 +15,13 @@ name. The owner's pay/publish/send/delete policy applies to a step's declared ki
 title stops an act. The broker, lease and audit are unchanged. In this copy the handoff sits next
 to DIVE-5200's `connect-request --challenge`: `_connect_request` takes `challenge <url>` or
 `handoff`.
+
+Input is held until the page takes it, and a lost click fails the step. Chrome drops input sent
+within ~100ms of a page's title appearing (measured on Chrome 153 / Xvfb: X focus was on Chrome
+all along), and the daemon used to report rc=0 over it. Every step now waits for a quiet title
+(500ms). `ready` means a viewable window holding a confirmed keyboard focus. A click checks the
+window under the pointer before the press and the focus after it, and fails non-zero on
+either.
 ### Fixed — a login made just before Done is no longer lost (DIVE-5286), browser 1.24.2
 
 A person signed in to GitHub through the dashboard's Connect, pressed Done 13 seconds later, and was

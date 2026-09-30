@@ -59,7 +59,11 @@ tiktok.com is the first such site. The verbs tell you when a site is in input mo
 2. **Act in small steps**: `click{x,y[,button,count]}`, `move{x,y}`, `type{value}` (into
    whatever has focus), `press{key}` (`Enter`, `Tab`, `Escape`, `PageDown`, `ctrl+l`, …),
    `scroll{dy}` (wheel notches, + is down), `goto{url}` (typed into the address bar),
-   `wait{ms}`. Then read the `page.png` it wrote before the next act.
+   `wait{ms}`. Then read the `page.png` it wrote before the next act. A click that opens a new
+   page ends that act: type into the new page in the next one, after you have seen it. A click
+   on a spot another window covers, or keys that cannot reach the browser, fail the step (exit
+   1) with nothing sent past it. Read the error and the screenshot; do not repeat the same step
+   blind.
 3. **There is no DOM here.** `tree`, `read`, `links`, adapter `run` actions and `selector`/`ref`
    steps are refused, by name. Do not ask for them; use the screen.
 4. **Say what a step does when it matters.** Nothing here can read a button's label, so a step

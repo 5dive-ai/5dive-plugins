@@ -42,7 +42,7 @@ const X11_DIR = process.env.FIVEDIVE_BROWSER_X11_DIR || '/tmp/.X11-unix';
 // Core request opcodes used here.
 const OP = {
   GetWindowAttributes: 3, QueryTree: 15, InternAtom: 16, GetProperty: 20,
-  QueryPointer: 38, GetInputFocus: 43, GetImage: 73, QueryExtension: 98,
+  QueryPointer: 38, SetInputFocus: 42, GetInputFocus: 43, GetImage: 73, QueryExtension: 98,
   ChangeKeyboardMapping: 100, GetKeyboardMapping: 101,
 };
 // XTEST FakeInput event types.
@@ -249,10 +249,114 @@ class X11 {
       const t = (await this.prop(w, '_NET_WM_NAME', 'UTF8_STRING')) || (await this.prop(w, 'WM_NAME', 'STRING'));
       if (!t) continue;
       const score = /(Google Chrome|Chromium)$/.test(t) ? 2 : 1;
-      if (!best || score > best.score) best = { t, score };
+      if (!best || score > best.score) best = { t, score, id: w };
     }
-    if (!best) return { window: '', page: '' };
-    return { window: best.t, page: best.t.replace(/ [-–—] (Google Chrome|Chromium)(?: [^-–—]*)?$/, '') };
+    if (!best) return { window: '', page: '', id: 0 };
+    return { window: best.t, page: best.t.replace(/ [-–—] (Google Chrome|Chromium)(?: [^-–—]*)?$/, ''), id: best.id };
+  }
+
+  // ---- whose window is it -------------------------------------------------
+  // WHY THIS EXISTS (DIVE-5287, quinn's rejection). XTEST input is delivered by
+  // the X server to whichever window has the keyboard focus (keys) or is under
+  // the pointer (buttons). Neither is Chrome's just because Chrome's window is
+  // up: with no window manager, Chrome only makes itself active when the
+  // pointer CROSSES into it, and a window mapped under a pointer that is
+  // already there gets no crossing. Keys sent then are dropped with no error
+  // anywhere. So the daemon checks, and makes true, the two facts input needs.
+
+  async parent(win) {
+    const b = Buffer.alloc(4); b.writeUInt32LE(win, 0);
+    const r = await this.req(OP.QueryTree, 0, b, true);
+    return r.readUInt32LE(12);
+  }
+
+  async prop32(win, name) {
+    const b = Buffer.alloc(20);
+    b.writeUInt32LE(win, 0); b.writeUInt32LE(await this.atom(name), 4);
+    b.writeUInt32LE(0, 8); b.writeUInt32LE(0, 12); b.writeUInt32LE(1, 16);
+    let r;
+    try { r = await this.req(OP.GetProperty, 0, b, true); } catch (e) { return null; }
+    return r[1] === 32 && r.readUInt32LE(16) ? r.readUInt32LE(32) : null;
+  }
+
+  // Chrome's own windows: _NET_WM_PID is the browser process, or (a wrapper
+  // that did not exec, a browser that did not set the pid) WM_CLASS names it.
+  async isBrowserWindow(win, pid) {
+    if (!win || win === this.root) return false;
+    if (pid && (await this.prop32(win, '_NET_WM_PID')) === pid) return true;
+    return /chrom/i.test(await this.prop(win, 'WM_CLASS', 'STRING'));
+  }
+
+  // The window and its ancestors up to (not including) the root: with a window
+  // manager the browser's window sits inside a frame, and the frame is not it.
+  async lineage(win) {
+    const out = [];
+    for (let w = win, i = 0; w && w !== this.root && i < 16; i++) {
+      out.push(w);
+      try { w = await this.parent(w); } catch (e) { break; }
+    }
+    return out;
+  }
+
+  // The stack of windows under the pointer, outermost first.
+  async underPointer() {
+    const out = [];
+    let w = this.root;
+    for (let i = 0; i < 16; i++) {
+      const b = Buffer.alloc(4); b.writeUInt32LE(w, 0);
+      let r;
+      try { r = await this.req(OP.QueryPointer, 0, b, true); } catch (e) { break; }
+      const child = r.readUInt32LE(12);
+      if (!child) break;
+      out.push(child); w = child;
+    }
+    return out;
+  }
+
+  async anyBrowser(wins, pid) {
+    for (const w of wins) if (await this.isBrowserWindow(w, pid)) return w;
+    return 0;
+  }
+
+  // Where the keyboard goes: { focus, browser } — `focus` is the raw focus
+  // window (0 None, 1 PointerRoot), `browser` the browser window it resolves to
+  // (0 when keys would go somewhere else, or nowhere).
+  // PointerRoot (the server's start state) is NOT counted: the server does
+  // route keys to the window under the pointer then, but Chrome only treats
+  // itself as active after a pointer crossing, so it is the ambiguous state
+  // this exists to leave. Only an explicit focus on the browser counts.
+  async keyboardTarget(pid) {
+    const r = await this.req(OP.GetInputFocus, 0, null, true);
+    const focus = r.readUInt32LE(8);
+    if (focus === 0 || focus === 1) return { focus, browser: 0 };
+    return { focus, browser: await this.anyBrowser(await this.lineage(focus), pid) };
+  }
+
+  async setFocus(win) {
+    const b = Buffer.alloc(8); b.writeUInt32LE(win, 0); b.writeUInt32LE(0, 4);   // CurrentTime
+    this.req(OP.SetInputFocus, 2 /* RevertToParent */, b, false);
+    await this.sync();
+  }
+
+  // Make the browser's window the one keys go to — what a window manager does
+  // when a window maps or is clicked — and CONFIRM it with the server. Throws
+  // when it cannot be made true: input sent anyway would be dropped silently.
+  async ensureBrowserFocus(pid, waitMs) {
+    let t = await this.keyboardTarget(pid);
+    if (t.browser) return t.browser;
+    const main = (await this.windowTitle()).id;
+    if (!main || !(await this.isBrowserWindow(main, pid))) {
+      throw new Error('no browser window is showing on the display, so there is nothing to send keys to');
+    }
+    const until = Date.now() + (waitMs || 2000);
+    for (;;) {
+      try { await this.setFocus(main); } catch (e) { /* not viewable yet: BadMatch; retried below */ }
+      t = await this.keyboardTarget(pid);
+      if (t.browser) return t.browser;
+      if (Date.now() >= until) break;
+      await sleep(50);
+    }
+    throw new Error(`the keyboard focus is not on the browser window (it is on ${t.focus === 0 ? 'no window' : t.focus === 1 ? 'the window under the pointer' : '0x' + t.focus.toString(16)}) and could not be moved there`);
   }
 
   // ---- input --------------------------------------------------------------
@@ -379,6 +483,7 @@ function parseSetup(b) {
   const nScreens = b[28], nFormats = b[29];
   const imageByteOrder = b[30];
   const minKeycode = b[34], maxKeycode = b[35];
+  const ridBase = b.readUInt32LE(12), ridMask = b.readUInt32LE(16);
   let off = 40 + vlen + pad4(vlen);
   const formats = [];
   for (let i = 0; i < nFormats; i++, off += 8) formats.push({ depth: b[off], bpp: b[off + 1], pad: b[off + 2] });
@@ -388,7 +493,7 @@ function parseSetup(b) {
     rootDepth: b[off + 38],
   };
   return {
-    imageByteOrder, minKeycode, maxKeycode, formats, screen,
+    imageByteOrder, minKeycode, maxKeycode, formats, screen, ridBase, ridMask,
     bppOf: (depth) => { const f = formats.find(x => x.depth === depth); return f ? f.bpp : 0; },
   };
 }

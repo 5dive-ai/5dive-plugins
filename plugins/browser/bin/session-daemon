@@ -919,6 +919,18 @@ async function sendReport(page, req, send) {
 const INPUT_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_SETTLE_MS || 1200);
 const INPUT_GOTO_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_GOTO_SETTLE_MS || 2500);
 const INPUT_WINDOW_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_WINDOW_WAIT_MS || 20000);
+// THE PAGE MUST BE TAKING INPUT BEFORE INPUT IS SENT (quinn's rejection of the
+// first delivery). Measured on Chrome 153 / Xvfb, 2026-09-30: a click and keys
+// sent within ~100ms of a page's title appearing are DROPPED — no mousedown, no
+// keydown, nothing in the page, and every X request succeeds, so the daemon
+// used to report rc=0 over input that never landed. At 100ms and later, 5 of 5
+// landed. X focus was on Chrome's window in every dropped run, so this is
+// Chrome still bringing the page up, not a focus problem. The daemon therefore
+// watches the window title and holds each input request until the title has
+// been quiet for INPUT_QUIET_MS (bounded by INPUT_QUIET_CAP_MS: a page that
+// retitles itself forever, a ticker or a chat badge, is driven anyway).
+const INPUT_QUIET_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_QUIET_MS || 500);
+const INPUT_QUIET_CAP_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_QUIET_CAP_MS || 8000);
 const INPUT_MAX_STEPS = 50, INPUT_MAX_TEXT = 5000, INPUT_MAX_WAIT_MS = 30000;
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -968,7 +980,15 @@ async function inputLaunch(profile, chrome) {
         throw new Error(`Chrome exited (${child.exitCode ?? child.signalCode}) before it opened a window${why ? ': ' + why : ''}`);
       }
       const t = await x.windowTitle().catch(() => ({ window: '' }));
-      if (t.window) return { child, x };
+      // READY IS A WINDOW THAT HOLDS THE KEYBOARD, not a window with a name.
+      // A named window is mapped and viewable (windowTitle reads only those);
+      // the focus is then made explicit and confirmed with the server, so the
+      // first key does not depend on how Chrome read a pointer it never saw
+      // cross into it.
+      if (t.window && t.id && (await x.isBrowserWindow(t.id, child.pid))) {
+        await x.ensureBrowserFocus(child.pid, Math.max(1000, until - Date.now()));
+        return { child, x };
+      }
       await sleepMs(200);
     }
     try { child.kill('SIGKILL'); } catch (e) { /* gone */ }
@@ -984,8 +1004,18 @@ async function inputLaunch(profile, chrome) {
     catch (e2) { die(E_UNAVAILABLE, `could not open the ${path.basename(profile)} profile in plain Chrome: ${e2.message}`); }
   }
   const { child, x } = got;
+  // The title watcher behind the quiet gate (INPUT_QUIET_MS). One title read
+  // is a handful of X round trips; every 100ms is nothing next to a screenshot.
+  const seen = { title: null, since: Date.now() };
+  const watch = setInterval(() => {
+    x.windowTitle().then((t) => {
+      if (t.window !== seen.title) { seen.title = t.window; seen.since = Date.now(); }
+    }).catch(() => { /* the display is going; close() follows */ });
+  }, 100);
+  watch.unref();
+  child.on('exit', () => clearInterval(watch));
   return {
-    input: true, child, x,
+    input: true, child, x, seen,
     handoff: null,
     // SIGTERM is Chrome's clean shutdown: it writes the profile out, which is
     // the durable half (the login). SIGKILL only for one that will not go.
@@ -1026,9 +1056,60 @@ function inputRefusal(be, profile, req, where) {
   return null;
 }
 
-async function gotoByKeys(x, url) {
+// Hold until the page has stopped changing title for INPUT_QUIET_MS (see the
+// constant for the measurement). Returns the ms it waited.
+async function settled(be) {
+  const t0 = Date.now(), cap = t0 + INPUT_QUIET_CAP_MS;
+  for (;;) {
+    const t = await be.x.windowTitle();
+    if (t.window !== be.seen.title) { be.seen.title = t.window; be.seen.since = Date.now(); }
+    const quiet = Date.now() - be.seen.since;
+    if (quiet >= INPUT_QUIET_MS || Date.now() >= cap) return Date.now() - t0;
+    await sleepMs(Math.min(100, INPUT_QUIET_MS - quiet));
+  }
+}
+
+// Keys go to the focus window. Make it the browser's, confirmed, or throw:
+// typing on regardless is how input used to vanish with rc=0.
+async function keysReachBrowser(be) {
+  await be.x.ensureBrowserFocus(be.child.pid, 2000);
+}
+
+// A click is delivered to the window under the pointer, whoever owns it. The
+// point is checked AFTER the pointer is there (a window can open under it on
+// the way) and BEFORE the button goes down; afterwards the browser must hold
+// the keyboard focus, or the next step's keys would go nowhere.
+async function pointerOnBrowser(be, what) {
+  const under = await be.x.underPointer();
+  if (!(await be.x.anyBrowser(under, be.child.pid))) {
+    const p = await be.x.pointer();
+    throw new Error(`nothing was ${what}: the point ${p.x},${p.y} is covered by a window that is not the browser ` +
+      `(0x${(under[0] || 0).toString(16)}), so the input would land there instead`);
+  }
+}
+
+async function clickInBrowser(be, s) {
+  await be.x.move(s.x, s.y);
+  await pointerOnBrowser(be, 'clicked');
+  await be.x.click(s.x, s.y, { button: { left: 1, middle: 2, right: 3 }[s.button || 'left'], count: s.count || 1,
+    steps: 0, from: { x: s.x, y: s.y } });
+  let k;
+  for (let i = 0; i < 20; i++) {
+    k = await be.x.keyboardTarget(be.child.pid);
+    if (k.browser) return;
+    await sleepMs(50);
+  }
+  throw new Error(`the click at ${s.x},${s.y} was sent, but afterwards the keyboard focus is not on the browser ` +
+    `(${k.focus === 0 ? 'no window' : k.focus === 1 ? 'the window under the pointer' : '0x' + k.focus.toString(16)}), ` +
+    `so it may not have reached the page; stopping rather than typing into nothing`);
+}
+
+async function gotoByKeys(be, url) {
   // As a person does it: focus the address bar, type, Enter. isTrusted keys all
   // the way; the page sees a navigation typed by a person, not a script's goto.
+  const x = be.x;
+  await settled(be);
+  await keysReachBrowser(be);
   await x.press('ctrl+l'); await sleepMs(150);
   await x.type(url, process.env.FIVEDIVE_BROWSER_INPUT_FAST === '1' ? 0 : 12);
   await sleepMs(80);
@@ -1083,7 +1164,12 @@ async function inputRequest(be, profile, req, send, end, behalf) {
 
   if (req.op === 'title') {
     const t = await be.x.windowTitle();
-    out({ drive: 'input', title: t.page, window_title: t.window, handoff: !!be.handoff, viewer: viewerLive(profile) });
+    // `focused`: the browser holds the keyboard (explicit X focus, confirmed).
+    // `quiet_ms`: how long the title has been unchanged — input is held until
+    // it reaches INPUT_QUIET_MS. Together they are the readiness input waits on.
+    const k = await be.x.keyboardTarget(be.child.pid).catch(() => ({ browser: 0 }));
+    out({ drive: 'input', title: t.page, window_title: t.window, handoff: !!be.handoff, viewer: viewerLive(profile),
+      focused: !!k.browser, quiet_ms: t.window === be.seen.title ? Date.now() - be.seen.since : 0 });
     return end(0);
   }
 
@@ -1093,7 +1179,7 @@ async function inputRequest(be, profile, req, send, end, behalf) {
         if (!INPUT_STEPS.goto({ url: req.url })) { send({ t: 'err', msg: 'screen --url needs an http(s) url' }); return end(E_NOTHING_RAN); }
         const no = inputRefusal(be, profile, req, 'screen');
         if (no) { send({ t: 'err', msg: no }); return end(E_UNAVAILABLE); }
-        await gotoByKeys(be.x, req.url);
+        await gotoByKeys(be, req.url);
         await sleepMs(Number.isFinite(Number(req.wait)) && req.wait !== undefined ? Number(req.wait) : INPUT_GOTO_SETTLE_MS);
       } else if (Number(req.wait) > 0) await sleepMs(Math.min(Number(req.wait), INPUT_MAX_WAIT_MS));
       const shot = await screenOf(be);
@@ -1132,16 +1218,25 @@ async function inputRequest(be, profile, req, send, end, behalf) {
         const s = steps[i], where = `step ${i + 1} (${s.op})`;
         const no = inputRefusal(be, profile, req, where);
         if (no) throw Object.assign(new Error(no), { refused: true });
+        // Every step waits for a quiet page, so a step after one that
+        // navigated does not type into a page still coming up. Cheap when the
+        // page is quiet already: one title read.
+        if (s.op !== 'wait') await settled(be);
         ran++;
-        switch (s.op) {
-          case 'click': await be.x.click(s.x, s.y, { button: { left: 1, middle: 2, right: 3 }[s.button || 'left'], count: s.count || 1 }); break;
-          case 'move': await be.x.move(s.x, s.y); break;
-          case 'type': await be.x.type(s.value); break;
-          case 'press': await be.x.press(s.key); break;
-          case 'scroll': await be.x.scroll(s.dy || 0, s.dx || 0, s.x !== undefined ? { x: s.x, y: s.y } : null); break;
-          case 'goto': await gotoByKeys(be.x, s.url); await sleepMs(INPUT_GOTO_SETTLE_MS); break;
-          case 'wait': await sleepMs(s.ms); break;
-        }
+        try {
+          switch (s.op) {
+            case 'click': await clickInBrowser(be, s); break;
+            case 'move': await be.x.move(s.x, s.y); break;
+            case 'type': await keysReachBrowser(be); await be.x.type(s.value); break;
+            case 'press': await keysReachBrowser(be); await be.x.press(s.key); break;
+            case 'scroll':
+              if (s.x !== undefined) await be.x.move(s.x, s.y);
+              await pointerOnBrowser(be, 'scrolled');   // wheel notches go to the window under the pointer, too
+              await be.x.scroll(s.dy || 0, s.dx || 0, null); break;
+            case 'goto': await gotoByKeys(be, s.url); await sleepMs(INPUT_GOTO_SETTLE_MS); break;
+            case 'wait': await sleepMs(s.ms); break;
+          }
+        } catch (e) { e.message = `${where}: ${e.message}`; throw e; }
         send({ t: 'log', line: `  ${where} ok` });
         // THE HARD STOP, between steps: a plan does not keep typing into a
         // challenge that appeared under it.

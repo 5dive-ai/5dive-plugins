@@ -20,13 +20,21 @@
 #        R8 regression: a CDP site is never routed to the input verbs
 #   L  LIVE, when this machine has Xvfb and Chrome (GitHub's ubuntu runner does):
 #      the real daemon, real plain Chrome, real XTEST input.
-#        L1 the page sees navigator.webdriver === false
+#        L1 the page sees navigator.webdriver === false, and the daemon reports
+#           the browser holding the keyboard focus
+#        L1b the page has RECEIVED pointer input (a handshake) before L3 — L3 is
+#           gated on observed readiness, not on the title alone (quinn, iter 1)
 #        L2 Chrome's command line carries no --remote-debugging / --enable-automation
 #        L3 a click and typed text arrive as isTrusted events, non-ASCII included
 #        L4 `screen` returns a PNG of the whole display
 #        L5 an open handoff refuses agent input; closing it restores it
 #        L6 DOM ops are refused by name
+#        L8 a click on a point another window covers fails the step non-zero,
+#           and the plan stops there (it used to report rc=0 over a lost click)
+#        L9 keyboard focus taken by another window is moved back before typing
 #        L7 shutdown takes Chrome with it
+#        L10 a FRESH page driven the instant its title appears still gets the
+#           text: the daemon holds input until the page is quiet (the CI race)
 set -uo pipefail
 printf 'grading tree: %s @ %s\n' "$PWD" "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" >&2
 cd "$(dirname "$0")/.."
@@ -276,6 +284,8 @@ else
 <script>
 const t = document.getElementById('t'); let trusted = 'none';
 document.title = 'ready:wd=' + navigator.webdriver;
+let armed = false;
+addEventListener('mousemove', () => { if (!armed && document.title.startsWith('ready:')) { armed = true; document.title = 'armed:wd=' + navigator.webdriver; } });
 t.addEventListener('mousedown', (e) => { trusted = String(e.isTrusted); });
 t.addEventListener('input', (e) => { document.title = 'typed:' + t.value + ':click=' + trusted + ':key=' + e.isTrusted; });
 </script></body></html>
@@ -289,8 +299,19 @@ HTML
   if ! grep -q '^ready' "$TMP/l.ready"; then
     arm 'L0 the live input daemon came up' ready "$(grep -v -i dbus "$TMP/l.err" | tail -2 | tr '\n' ' ')"
   else
-    t=""; for i in $(seq 1 60); do t=$(lc '{"op":"title"}' 2>/dev/null | jq -r .title); [[ "$t" == ready:* ]] && break; sleep 0.25; done
-    arm 'L1 the page sees navigator.webdriver === false' 'ready:wd=false' "$t"
+    t=""; for i in $(seq 1 80); do
+      t=$(lc '{"op":"title"}' 2>/dev/null | jq -r '"\(.title) focused=\(.focused)"')
+      [[ "$t" == "ready:wd=false focused=true" ]] && break; sleep 0.25
+    done
+    arm 'L1 the page sees navigator.webdriver === false, and the browser holds the keyboard' 'ready:wd=false focused=true' "$t"
+    # THE HANDSHAKE (quinn, iteration 1): the title only says the page's script
+    # ran. Input readiness is shown by the page RECEIVING input — a pointer move
+    # it answers by retitling. Only then is L3 a test of delivery, not of timing.
+    t=""; for i in $(seq 1 40); do
+      lc "{\"op\":\"input\",\"steps\":[{\"op\":\"move\",\"x\":$((600 + (i % 2) * 40)),\"y\":450}],\"settle\":0}" >/dev/null 2>&1
+      t=$(lc '{"op":"title"}' 2>/dev/null | jq -r .title); [[ "$t" == armed:* ]] && break; sleep 0.25
+    done
+    arm 'L1b the page receives pointer input before L3 is sent (readiness observed, not assumed)' 'armed:wd=false' "$t"
     cpid=$(pgrep -f -- "--user-data-dir=$LP" | head -1)
     cmd=$(tr '\0' ' ' < "/proc/$cpid/cmdline" 2>/dev/null)
     arm 'L2 Chrome runs with no --remote-debugging and no --enable-automation' 'yes no' \
@@ -310,12 +331,76 @@ HTML
     arm 'L5 ...and closing it gives the window back' '0 yes' "$rc $(yn grep -q 'héllo ✓!' <<<"$(jq -r .title "$TMP/l.in2")")"
     lc '{"op":"tree","url":"https://example.com/"}' >/dev/null 2>"$TMP/l.t"; rc=$?
     arm 'L6 a DOM op is refused by name (70)' '70 yes' "$rc $(yn grep -q 'INPUT mode' "$TMP/l.t")"
+    # A FOREIGN WINDOW over part of Chrome, holding the keyboard focus: what an
+    # agent's input meets when anything else is on the display.
+    DISPLAY=":$disp" node -e '
+      const x11 = require(process.argv[1]);
+      (async () => {
+        const x = await x11.open(process.env.DISPLAY);
+        const wid = x.setup.ridBase | 0x1234, b = Buffer.alloc(32);
+        b.writeUInt32LE(wid, 0); b.writeUInt32LE(x.root, 4);
+        b.writeInt16LE(400, 8); b.writeInt16LE(300, 10); b.writeUInt16LE(200, 12); b.writeUInt16LE(200, 14);
+        b.writeUInt16LE(0, 16); b.writeUInt16LE(1, 18); b.writeUInt32LE(0, 20);
+        b.writeUInt32LE(0x2, 24); b.writeUInt32LE(0xff0000, 28);        // CWBackPixel: red
+        x.req(1, 0, b, false);                                          // CreateWindow
+        const m = Buffer.alloc(4); m.writeUInt32LE(wid, 0); x.req(8, 0, m, false);   // MapWindow
+        await x.sync();
+        for (let i = 0; i < 50 && !(await x.viewable(wid)); i++) await new Promise(r => setTimeout(r, 20));
+        await x.setFocus(wid);
+        process.stdout.write("up\n");
+        setInterval(() => {}, 1000);
+      })().catch(e => { console.error(e.message); process.exit(1); });' "$X11LIB" > "$TMP/l.fw" 2>&1 &
+    FW=$!; _KILL+=("$FW")
+    for i in $(seq 1 100); do grep -q '^up' "$TMP/l.fw" && break; sleep 0.05; done
+    lc '{"op":"input","steps":[{"op":"click","x":500,"y":400},{"op":"type","value":"Z"}],"settle":300}' > "$TMP/l.cv" 2>"$TMP/l.cverr"; rc=$?
+    arm 'L8 a click on a point another window covers fails non-zero, naming it, and the plan stops' '1 yes 1 no' \
+      "$rc $(yn grep -q 'covered by a window that is not the browser' "$TMP/l.cverr") $(jq -r .steps_run "$TMP/l.cv" 2>/dev/null) $(yn grep -q 'Z' <<<"$(jq -r .title "$TMP/l.cv" 2>/dev/null)")"
+    lc '{"op":"input","steps":[{"op":"type","value":"Q"}],"settle":300}' > "$TMP/l.fq" 2>/dev/null; rc=$?
+    arm 'L9 keyboard focus held by another window is moved back to the browser before typing' '0 yes' \
+      "$rc $(yn grep -q 'héllo ✓!Q' <<<"$(jq -r .title "$TMP/l.fq" 2>/dev/null)")"
+    kill "$FW" 2>/dev/null; wait "$FW" 2>/dev/null
     lc '{"op":"shutdown"}' >/dev/null 2>&1
     for i in $(seq 1 100); do kill -0 "$LD" 2>/dev/null || break; sleep 0.05; done
     chrome_up() { pgrep -f -- "--user-data-dir=$LP" >/dev/null; }
     for i in $(seq 1 100); do chrome_up || break; sleep 0.05; done
     arm 'L7 shutdown takes the daemon and Chrome with it' 'no no' \
       "$(yn kill -0 "$LD" 2>/dev/null) $(yn chrome_up)"
+
+    # L10 — THE CI RACE, head on: a fresh browser, and the click + text sent the
+    # moment the title reads ready, with no handshake. Chrome drops input that
+    # early (measured: see INPUT_QUIET_MS in the daemon); the daemon must hold
+    # it until the page is quiet rather than send it into nothing with rc=0.
+    LP2="$TMP/lp2"; mkdir -m 700 "$LP2"
+    DISPLAY=":$disp" FIVEDIVE_BROWSER_CHROME="$REAL_CHROME" FIVEDIVE_BROWSER_CHROME_ARGS="file://$PAGE" \
+      FIVEDIVE_BROWSER_INPUT_FAST=1 "$REAL_DAEMON" serve "$LP2" "$LP2/s.sock" --input > "$TMP/l2.ready" 2> "$TMP/l2.err" &
+    LD2=$!; _KILL+=("$LD2")
+    for i in $(seq 1 600); do grep -q '^ready' "$TMP/l2.ready" 2>/dev/null && break; kill -0 "$LD2" 2>/dev/null || break; sleep 0.05; done
+    # Polled IN-PROCESS every 10ms and sent on the same tick: a `call` per poll
+    # costs a node start (~50ms+), which is longer than the window Chrome drops
+    # input in, and would hide the race this arm exists to hold shut.
+    node -e '
+      const net = require("net"), sock = process.argv[1];
+      const ask = (req) => new Promise((resolve) => {
+        const c = net.createConnection(sock); let buf = "", outs = [], rc = null;
+        c.on("data", (d) => { buf += d; let nl; while ((nl = buf.indexOf("\n")) >= 0) {
+          const m = JSON.parse(buf.slice(0, nl)); buf = buf.slice(nl + 1);
+          if (m.t === "out") outs.push(m.data); if (m.t === "end") rc = m.rc; } });
+        c.on("close", () => resolve({ rc, out: outs.join("") })); c.on("error", () => resolve({ rc: -1, out: "" }));
+        c.write(JSON.stringify(req) + "\n");
+      });
+      (async () => {
+        for (let i = 0; i < 1500; i++) {
+          const r = await ask({ op: "title" });
+          try { if (JSON.parse(r.out).title.startsWith("ready:")) break; } catch (e) {}
+          await new Promise(r => setTimeout(r, 10));
+        }
+        const r = await ask({ op: "input", steps: [{ op: "click", x: 640, y: 500 }, { op: "type", value: "go" }], settle: 300 });
+        process.stdout.write(r.out); process.exit(r.rc === null ? 1 : r.rc);
+      })();' "$LP2/s.sock" > "$TMP/l2.in" 2>/dev/null; rc=$?
+    arm 'L10 a fresh page driven the instant its title appears still gets the click and the text' '0 typed:go:click=true:key=true' \
+      "$rc $(jq -r .title "$TMP/l2.in" 2>/dev/null)"
+    "$REAL_DAEMON" call "$LP2/s.sock" <<<'{"op":"shutdown"}' >/dev/null 2>&1
+    for i in $(seq 1 100); do kill -0 "$LD2" 2>/dev/null || break; sleep 0.05; done
   fi
 fi
 
