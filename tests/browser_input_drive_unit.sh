@@ -49,12 +49,28 @@ REAL_CHROME="$(command -v google-chrome || command -v chromium || command -v chr
 # makes the daemon bind a truncated name and every arm below read "not live".
 TMP="$(mktemp -d /tmp/d5287.XXXXXX)"
 _KILL=()
-trap 'rc=$?; for p in "${_KILL[@]}"; do kill "$p" 2>/dev/null; done; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+# CI ANNOTATIONS. A failing arm and the live daemon's stderr are written as
+# ::error annotations too: Actions LOGS need a GitHub login to read, check-run
+# annotations do not, so a seat with no gh credential can still see which arm
+# went red and why (DIVE-5287: a red run nobody at the maker seat could read).
+gha() {  # gha <title> <text>
+  [[ "${GITHUB_ACTIONS:-}" == true ]] || return 0
+  local m="$2"; m="${m//'%'/%25}"; m="${m//$'\r'/%0D}"; m="${m//$'\n'/%0A}"
+  printf '::error title=%s::%s\n' "${1//[:,]/ }" "$m"
+}
+_diag() {
+  (( ${FAIL:-0} )) || return 0
+  local f; for f in l.err l.inerr l.cverr l2.err; do
+    [[ -s "$TMP/$f" ]] && gha "input harness: daemon stderr ($f)" "$(grep -v -i dbus "$TMP/$f" | tail -15)"
+  done; return 0
+}
+trap 'rc=$?; _diag; for p in "${_KILL[@]}"; do kill "$p" 2>/dev/null; done; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 
 PASS=0; FAIL=0; SKIP=0
 arm() {  # arm <name> <expected> <got>
   if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); printf 'PASS: %s\n' "$1"
-  else FAIL=$((FAIL+1)); printf 'FAIL: %s\n   expected: %s\n   got:      %s\n' "$1" "$2" "$3"; fi
+  else FAIL=$((FAIL+1)); printf 'FAIL: %s\n   expected: %s\n   got:      %s\n' "$1" "$2" "$3"
+    gha "input harness FAIL: ${1:0:80}" "expected: $2"$'\n'"got: $3"; fi
 }
 yn() { if "$@"; then echo yes; else echo no; fi; }
 

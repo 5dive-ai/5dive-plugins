@@ -986,7 +986,14 @@ async function inputLaunch(profile, chrome) {
       // first key does not depend on how Chrome read a pointer it never saw
       // cross into it.
       if (t.window && t.id && (await x.isBrowserWindow(t.id, child.pid))) {
-        await x.ensureBrowserFocus(child.pid, Math.max(1000, until - Date.now()));
+        try { await x.ensureBrowserFocus(child.pid, Math.max(1000, until - Date.now())); }
+        catch (e) {
+          // Not ours to leave running: the no-sandbox retry below would meet
+          // this Chrome's profile lock and exit into it.
+          try { child.kill('SIGKILL'); } catch (e2) { /* gone */ }
+          x.close();
+          throw e;
+        }
         return { child, x };
       }
       await sleepMs(200);
