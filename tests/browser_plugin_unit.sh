@@ -7800,5 +7800,72 @@ tc 'T47j usage names serve --login' 'serve <site> --login' "$(env PATH="$SPATH" 
 tc 'T47j CHANGES.md carries the entry' 'DIVE-5203' "$(cat "$ROOT/CHANGES.md")"
 tc 'T47j README says a person signs in through plain Chrome' 'no automation control' "$(tr -s ' \n' '  ' < "$ROOT/plugins/browser/README.md")"
 
+# === T48 a signed-in reddit.com is not a challenge (DIVE-5285) ===============
+# The shipped reddit adapter probes /login/, and /login/ carries Google's
+# INVISIBLE reCAPTCHA whatever the session: a healthy signed-in profile was
+# served "Welcome to Reddit" there with `<textarea name="g-recaptcha-response">`
+# and no username field (main, chill-gorge, 2026-09-30). The generic challenge
+# default matches bare `g-recaptcha` and the probe tests challenge FIRST, so every
+# live Reddit session read `challenge` and every agent refused Reddit. Each arm
+# below drives the SHIPPED adapter file through the real `status` probe: the
+# package directory is the only adapter dir, and the profile's label keeps the
+# site base `reddit.com` without touching T12's profile.
+ADPOVERRIDE48="$FIVEDIVE_BROWSER_ADAPTER_DIR"
+export FIVEDIVE_BROWSER_ADAPTER_DIR="$PKGADP"
+R48=reddit.com_t48
+R48DIR="$(mkprofile "$R48" '')"
+R48_IN='<html><head><title>Welcome to Reddit</title></head><body><shreddit-app><div class="g-recaptcha" data-size="invisible"><iframe src="https://www.google.com/recaptcha/api2/anchor?k=x&amp;size=invisible"></iframe></div><textarea id="g-recaptcha-response-100000" name="g-recaptcha-response" class="g-recaptcha-response" style="display: none;"></textarea><a href="/user/me">avatar</a></shreddit-app></body></html>'
+R48_OUT='<html><head><title>Log In | Reddit</title></head><body><form action="/login/"><input name="username" type="text"><input name="password" type="password"></form><div class="g-recaptcha" data-size="invisible"></div><textarea id="g-recaptcha-response-100000" name="g-recaptcha-response" class="g-recaptcha-response"></textarea></body></html>'
+# Reddit's own interstitial, as a cold Chrome on a datacenter IP was served it at
+# /login/ on 2026-09-30: a VISIBLE reCAPTCHA (size=normal) under that title.
+R48_BLOCK='<html><head><title>Reddit - Prove your humanity</title></head><body><div class="main"><h1>Prove your humanity</h1><form><div class="g-recaptcha"><iframe src="https://www.google.com/recaptcha/api2/anchor?k=x&amp;size=normal"></iframe></div><textarea id="g-recaptcha-response" name="g-recaptcha-response" class="g-recaptcha-response"></textarea></form></div></body></html>'
+R48_NETBLOCK='<html><head><title>Blocked</title></head><body><h1>Whoa there, pardner!</h1><p>You'"'"'ve been blocked by network security.</p></body></html>'
+
+printf '%s' "$R48_IN" > "$R48DIR/.fake-dom"
+run "$BROWSER" status "$R48"
+t  'T48a a signed-in /login/ carrying the invisible reCAPTCHA is authenticated' 0 "$RC"
+tc 'T48a ...named authenticated'                                              'authenticated' "$OUT"
+tn 'T48a ...and NOT a challenge'                                              'CHALLENGE' "$OUT"
+printf '%s' "$R48_OUT" > "$R48DIR/.fake-dom"
+run "$BROWSER" status "$R48"
+t  'T48b a logged-out /login/ with the same reCAPTCHA is expired' 75 "$RC"
+tc 'T48b ...in the expired words'                                'session expired' "$OUT"
+tn 'T48b ...and NOT a challenge'                                 'CHALLENGE' "$OUT"
+printf '%s' "$R48_BLOCK" > "$R48DIR/.fake-dom"
+run "$BROWSER" status "$R48"
+t  'T48c reddit'"'"'s "Prove your humanity" page is still a challenge' 75 "$RC"
+tc 'T48c ...named as one'                                      'CHALLENGE' "$OUT"
+printf '%s' "$R48_NETBLOCK" > "$R48DIR/.fake-dom"
+run "$BROWSER" status "$R48"
+t  'T48d a network-security block is a challenge' 75 "$RC"
+tc 'T48d ...named as one'                          'CHALLENGE' "$OUT"
+# The generic markers other than g-recaptcha stay: the adapter narrows one word,
+# it does not stop reading challenges.
+RCH48="$(jq -r '.probe.challenge_when_dom_matches' "$PKGADP/reddit.com.json")"
+for w in '<div class="h-captcha" data-hcaptcha-widget-id="1">' 'cf-challenge' '/checkpoint/challenge' 'two-factor' 'verify-your-identity'; do
+  t "T48e the reddit marker still reads: $w" 'match' "$(grep -qiE "$RCH48" <<<"$w" && echo match || echo miss)"
+done
+t  'T48e ...and drops bare g-recaptcha' 'miss' \
+   "$(grep -qiE "$RCH48" <<<'<textarea name="g-recaptcha-response">' && echo match || echo miss)"
+# The generic default is NOT narrowed: a site with no marker of its own still
+# names a reCAPTCHA page a challenge (T8/T11c grade the same default through run).
+t  'T48f the generic default still carries g-recaptcha' 1 \
+   "$(grep -c "^  echo \"\${m:-(g-recaptcha|" "$ROOT/plugins/browser/bin/browser")"
+
+# --- T48g NEGATIVE CONTROL: the shipped adapter as it was (no marker of its own) ---
+# Same fixture, same probe, the one key deleted: the healthy session reads
+# CHALLENGE again. If this goes green, T48a is not grading the adapter.
+MUT48="$TMP/t48-adapters"; mkdir -p "$MUT48"
+jq 'del(.probe.challenge_when_dom_matches)' "$PKGADP/reddit.com.json" > "$MUT48/reddit.com.json"
+t  'T48g (anchor) the mutant adapter has no challenge marker' '' \
+   "$(jq -r '.probe.challenge_when_dom_matches // empty' "$MUT48/reddit.com.json")"
+printf '%s' "$R48_IN" > "$R48DIR/.fake-dom"
+run env FIVEDIVE_BROWSER_ADAPTER_DIR="$MUT48" "$BROWSER" status "$R48"
+t  'T48g the pre-fix adapter reads the healthy session as a challenge' 75 "$RC"
+tc 'T48g ...CHALLENGE — the defect this row fixed'                     'CHALLENGE' "$OUT"
+
+export FIVEDIVE_BROWSER_ADAPTER_DIR="$ADPOVERRIDE48"
+tc 'T48h CHANGES.md carries the entry' 'DIVE-5285' "$(cat "$ROOT/CHANGES.md")"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
