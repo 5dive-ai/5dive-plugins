@@ -164,6 +164,13 @@ carry the proxy's username and password (DIVE-4951) and would sign the person in
 own IP. `viewer` and `serve --login` say so on stderr: sign-ins that check for automation will be
 refused through that seat.
 
+**`serve --stop` lets Chrome finish before it takes the display** (DIVE-5286). Chrome writes its
+cookie store on a timer of about 30 seconds, and on a graceful shutdown. So a login made seconds
+before Done is on disk only if Chrome shuts down cleanly. `--stop` sends Chrome SIGTERM and waits
+for it to exit (bounded at `FIVEDIVE_BROWSER_STOP_GRACE` seconds, default 10, then SIGKILL) before
+it stops the Xvfb. It returns only once the profile is free, so the status check Done runs next
+never finds the profile still locked.
+
 ### What protects the session while the viewer is open
 
 A viewer onto a logged-in profile is not a screenshot; it is the credential with a keyboard

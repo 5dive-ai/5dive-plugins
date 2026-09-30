@@ -3445,7 +3445,22 @@ cmd_serve() {
       while (( w < 100 )) && _pid_live "$dpid"; do sleep 0.05; w=$(( w + 1 )); done
       _pid_live "$dpid" && kill "$dpid" 2>/dev/null
     fi
-    [[ -n "$cpid" ]] && kill "$cpid" 2>/dev/null
+    # CHROME GOES FIRST, AND ALL THE WAY, BEFORE ITS DISPLAY (DIVE-5286). The
+    # same reason as the daemon above, for the plain Chrome a login view runs:
+    # its graceful SIGTERM shutdown is what writes the cookie store, which Chrome
+    # otherwise commits on a ~30 s timer. Killing Xvfb in the same breath made
+    # Chrome die on the lost display before that write — a GitHub sign-in 13 s
+    # before Done never reached disk, and the dashboard said "log in again". And
+    # a stop that returns while Chrome still holds SingletonLock hands the probe
+    # Done runs next a profile it cannot open. So: SIGTERM, wait for it to exit,
+    # SIGKILL only once the bound has passed, and only then the display.
+    if [[ -n "$cpid" ]] && _pid_live "$cpid"; then
+      kill "$cpid" 2>/dev/null
+      local cg="${FIVEDIVE_BROWSER_STOP_GRACE:-10}"; [[ "$cg" =~ ^[0-9]+$ ]] || cg=10
+      local cw=0 cmax=$(( cg * 20 ))
+      while (( cw < cmax )) && _pid_live "$cpid"; do sleep 0.05; cw=$(( cw + 1 )); done
+      _pid_live "$cpid" && kill -KILL "$cpid" 2>/dev/null
+    fi
     [[ -n "$xpid" ]] && kill "$xpid" 2>/dev/null
     local ssock; ssock="$(_kv "$f" sock)"
     rm -f "$f" "${ssock:-$dir/.5dive-session.sock}"

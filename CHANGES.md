@@ -1,5 +1,21 @@
 ## Unreleased
 
+### Fixed — a login made just before Done is no longer lost (DIVE-5286), browser 1.24.2
+
+A person signed in to GitHub through the dashboard's Connect, pressed Done 13 seconds later, and was
+told to log in again. Every agent then refused the site as logged out. `serve --stop` killed the
+login view's Chrome and its Xvfb in the same instant. Chrome died on the lost display before its
+graceful shutdown wrote the cookie store, which it otherwise commits only every ~30 s. The session
+cookies never reached disk, but the page history (committed every ~10 s) did.
+
+- `serve --stop` now sends Chrome SIGTERM and waits for it to exit before it stops the display.
+  The wait is bounded at 10 s (`FIVEDIVE_BROWSER_STOP_GRACE`); after that it sends SIGKILL.
+- It returns only once Chrome is gone. The status check Done runs next no longer races the dying
+  browser for the profile. That race was the "Failed to create SingletonLock: File exists" that
+  `ls` printed as UNKNOWN.
+
+Mirrored from 5dive-browser; the browser files match the source hunk for hunk. Also in `tests/browser_plugin_unit.sh` (T49).
+
 ### Added — when the free AI that came with a my.5dive server runs out, each agent says so once, with Connect (DIVE-5256), telegram 0.5.77
 
 On a my.5dive server the agents run on a small one-time AI allowance. When it ran out the agents just
