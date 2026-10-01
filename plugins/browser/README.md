@@ -466,6 +466,41 @@ audit, the live-viewer refusal, the positive authenticated-session probe, the pe
 the rule that an output directory is never the profile or beneath it. A capture that came back
 empty writes **no** evidence at all.
 
+### `snapshot --delta` and routines — the second time costs less (DIVE-5335)
+
+```
+5dive browser snapshot <url> --interactive --delta
+5dive browser act <url> --steps=… --expect=… --record=<routine>
+5dive browser replay <site> <routine> [--values='["…"]'] [--from=<act>] [--approved=<id>] [--json]
+5dive browser routine ls [<site>] | show <site> <name> | forget <site> <name> [--from=<act>]
+```
+
+**`--delta`** answers a re-read with what changed since this seat's last snapshot of the site:
+refs added and removed, page text lines that appeared or went away, and **no `page.png` at all**
+when under 1% of its pixels moved (`FIVEDIVE_BROWSER_DELTA_PNG_THRESHOLD`). The comparison is
+`lib/delta.cjs` — a PNG decoder on node's own zlib, no new packages. Every snapshot moves the
+baseline (per seat, per site, beside the seat's read artifacts, never in a profile), so the first
+full snapshot of a flow is the one the next `--delta` reads against. A baseline older than 30 min
+(`FIVEDIVE_BROWSER_DELTA_TTL`) or a delta longer than the page (a navigation) prints the full
+snapshot and says why. `--json` carries `delta` in place of the node list; the full capture is
+still on disk either way.
+
+**A routine is an act that already worked, kept** (Stagehand's action caching). `act
+--record=<name>` keeps the steps of an act that **succeeded** — the refs that found each element,
+the URL it started from, its `--expect` — and **never a value that was typed**: each
+fill/type/select value becomes a numbered slot that `replay --values` fills. `replay` runs every
+recorded act as an ordinary `act` (same lease, scope, login gate, owner's policy and approvals),
+with no snapshot to read and no step for a model to choose, and reports its model calls. A ref the
+site renamed gets the executors' one re-pick (reflex, or a unique name match — never on a pay,
+post, send or delete step), and a rescued step is **written back** so the next replay finds it at
+once. A miss nothing can re-pick stops the replay on that act (exit 1) and names
+`routine forget --from=<k>` to re-record from there. An act with no URL joins the previous
+recorded act, because it continued on that page. Routines live under the seat's own 0700
+directory (`<profile-root>/<seat>/.routines/<site>/`), keyed by host on the public profile.
+
+Measured on en.wikipedia.org with real Chrome in CI (`tests/browser_routine_bench.sh`, the
+`routine-bench` job): the run-1-vs-run-3 table is in that job's summary and on the PR.
+
 ### `browser read` — Markdown and provenance from the authenticated page
 
 ```

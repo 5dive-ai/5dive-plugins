@@ -207,6 +207,17 @@ usage() {
                                       # default, standard). Under the owner's
                                       # `careful` all four STOP (exit 73) and name
                                       # the owner's ask; re-run with --approved=<id>.
+                                      # --record=<name> saves the steps (never the
+                                      # values typed) as a ROUTINE for replay.
+  5dive browser snapshot <url> --delta  # after the first full snapshot: only what
+                                      # changed (refs, text), and no page.png when
+                                      # under 1% of its pixels moved.
+  5dive browser replay <site> <name> [--values='["…"]'] [--from=<k>] [--json]
+                                      # run a recorded routine again WITHOUT the model:
+                                      # every step from the cache, one call. A step whose
+                                      # element moved is re-picked (reflex) and the cache
+                                      # updated; one that cannot be stops the replay.
+  5dive browser routine ls [<site>] | show <site> <name> | forget <site> <name> [--from=<k>]
   sudo 5dive browser approvals        # the owner: what agents are waiting to be allowed,
                                       # with what each would send, pay, post or delete
   sudo 5dive browser approve <id> [--deny] [--human-proof=<nonce>]
@@ -345,7 +356,7 @@ usage() {
                                       # at a time: two in one logged-in profile
                                       # overwrite each other and read as flakiness.
                                       # A person at the viewer PREEMPTS an agent.
-  5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--wait-for=<target>]
+  5dive browser snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--wait-for=<target>] [--delta]
                                       # ONE cycle, one page instant: the refs, the
                                       # document and a PNG of the same tab. What `tree`,
                                       # `read` and `shot` give you in three browser
@@ -4714,6 +4725,72 @@ cmd_links() { _cmd_read_like links "$@"; }
 # was paying three times for one answer.
 SNAP_SETTLE_DEFAULT=1200
 
+# ---- delta snapshots (DIVE-5335) ---------------------------------------------
+#
+# On a long flow the agent snapshots the same page again and again, and reads
+# the whole ref list, the whole page text and a PNG each time to find the line
+# that moved. `--delta` answers with the change since the seat's last snapshot of
+# the site: refs added and removed, text lines that appeared or went away, and no
+# page.png at all when under SNAP_DELTA_PNG of its pixels changed (a file that is
+# there gets opened). lib/delta.cjs holds the comparison and its reasons.
+#
+# THE BASELINE is per seat and per site, beside the seat's other read artifacts
+# (0700, never in a profile), and EVERY snapshot moves it, --delta or not, so the
+# first full snapshot of a flow is the one the next --delta reads against. Older
+# than SNAP_DELTA_TTL it is a different sitting, and the snapshot is full.
+# A delta bigger than the page (a navigation) prints the full snapshot instead.
+SNAP_DELTA_TTL="${FIVEDIVE_BROWSER_DELTA_TTL:-1800}"
+SNAP_DELTA_PNG="${FIVEDIVE_BROWSER_DELTA_PNG_THRESHOLD:-0.01}"
+# Keyed like a routine (_routine_key): the profile, or the host on the public one.
+_delta_base() { printf '%s/.read-artifacts/.delta/%s\n' "$(_seat_dir)" "$1"; }
+
+_snapshot_delta() {  # <site> <out> <want 0|1> -> sets _DELTA (json or "") and _DELTA_WHY
+  local site="$1" out="$2" want="$3" base age=-1 f
+  _DELTA=""; _DELTA_WHY=""
+  base="$(_delta_base "$site")"
+  if (( want )); then
+    if [[ -s "$base/tree.json" ]]; then age=$(( $(date +%s) - $(stat -c %Y "$base/tree.json" 2>/dev/null || echo 0) )); fi
+    if (( age < 0 )); then
+      _DELTA_WHY="this is your first snapshot of $site, so it is the full one; the next --delta compares against it"
+    elif (( age > SNAP_DELTA_TTL )); then
+      _DELTA_WHY="your last snapshot of $site is $((age / 60)) min old (over $((SNAP_DELTA_TTL / 60))), so this one is full"
+    elif ! _DELTA=$(node "$_SELF_DIR/../lib/delta.cjs" "$base" "$out" --png-threshold="$SNAP_DELTA_PNG" 2>/dev/null) \
+         || ! jq -e '.applied | type == "boolean"' <<<"$_DELTA" >/dev/null 2>&1; then
+      _DELTA=""; _DELTA_WHY="the comparison with your last snapshot failed, so this one is full"
+    else
+      jq -e '.applied' <<<"$_DELTA" >/dev/null || _DELTA_WHY="$(jq -r '.why' <<<"$_DELTA")"
+      _DELTA=$(jq -c --argjson a "$age" '. + {baseline_age_s:$a}' <<<"$_DELTA")
+    fi
+  fi
+  # Move the baseline BEFORE page.png may be dropped from <out> below. Never fatal:
+  # a snapshot whose baseline could not be written is still a full, true snapshot.
+  if (umask 077; mkdir -p -- "$base") 2>/dev/null; then
+    for f in tree.json page.md page.png; do
+      if [[ -s "$out/$f" ]]; then install -m 00600 "$out/$f" "$base/$f" 2>/dev/null || :
+      else rm -f -- "$base/$f"; fi
+    done
+  fi
+  if [[ -n "$_DELTA" ]] && jq -e '.applied and (.png.write | not)' <<<"$_DELTA" >/dev/null 2>&1; then
+    rm -f -- "$out/page.png"
+  fi
+  [[ -n "$_DELTA" ]] && printf '%s\n' "$_DELTA" > "$out/delta.json" 2>/dev/null && chmod 600 "$out/delta.json" 2>/dev/null
+  return 0
+}
+
+_snapshot_delta_print() {  # <out> <ready-rc>
+  local out="$1" rrc="$2" pngline
+  printf '  DELTA from your snapshot %ss ago%s — only what changed:\n' "$(jq -r '.baseline_age_s' <<<"$_DELTA")" \
+    "$(jq -r 'if .from_url == .url then " of this page" else " (it was \(.from_url))" end' <<<"$_DELTA")"
+  node "$_SELF_DIR/../lib/delta.cjs" --render-json <<<"$_DELTA" 2>/dev/null | sed 's/^/  /'
+  pngline=$(jq -r 'if .png.write then "page.png        the picture changed (\((.png.changed // 1) * 100 | floor)% of pixels): look again"
+     else "page.png        NOT written: \(.png.why) — the picture you have is current" end' <<<"$_DELTA")
+  (( rrc )) && printf '  NOT the page: see the reason above (partial: true)\n'
+  printf '  %s\n' "$out"
+  printf '    delta.json      this change, as data\n'
+  printf '    page.md / tree.json / page.html   the full capture, only if the delta is not enough\n'
+  printf '    %s\n' "$pngline"
+}
+
 # _settle_json <ms|""> — the settle knob as a JSON fragment for a daemon request.
 #
 # IT RIDES IN THE REQUEST BECAUSE IT CANNOT RIDE IN THE ENVIRONMENT (DIVE-4674).
@@ -4729,7 +4806,7 @@ _settle_json() {
 }
 
 cmd_snapshot() {
-  local site="" url="" out="" interactive=0 json=0 shot=1 full=0 wait="no" settle="" wait_for=""
+  local site="" url="" out="" interactive=0 json=0 shot=1 full=0 wait="no" settle="" wait_for="" delta=0
   while (($#)); do
     case "$1" in
       --out=*)  out="${1#*=}" ;;
@@ -4738,11 +4815,13 @@ cmd_snapshot() {
       --json)   json=1 ;;
       --no-shot) shot=0 ;;
       --full)   full=1 ;;
+      --delta)  delta=1 ;;
       --settle=*) settle="${1#*=}" ;;
       --wait)   wait="$LEASE_WAIT_DEFAULT" ;;
       --wait=*) wait="${1#*=}" ;;
       -h|--help)
-        printf '%s snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG"
+        printf '%s snapshot <site> <url> [--out=<dir>] [--interactive] [--json] [--no-shot] [--full] [--wait-for=<selector|ref=…|text=…>] [--delta]\n' "$PROG"
+        printf '  --delta: only what changed since your last snapshot of <site> (within %ss), and no page.png when it barely moved.\n' "$SNAP_DELTA_TTL"
         return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
       *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
@@ -4858,6 +4937,10 @@ cmd_snapshot() {
     fi
   fi
 
+  # THE BASELINE MOVES TO THIS SNAPSHOT, with or without --delta (DIVE-5335): the
+  # first, full snapshot of a flow is the one the next --delta compares against.
+  _snapshot_delta "$(_routine_key "$site" "$url")" "$out" "$delta"
+
   local nodes title final
   nodes=$(jq -r '.nodes | length' <<<"$payload")
   title=$(jq -r '.title // ""' <<<"$payload")
@@ -4870,11 +4953,19 @@ cmd_snapshot() {
   trap - EXIT
 
   if (( json )); then
-    jq -nc --argjson p "$payload" --arg o "$out" --argjson x "$extra" '$p + $x + {artifacts:$o}'
+    jq -nc --argjson p "$payload" --arg o "$out" --argjson x "$extra" --argjson d "${_DELTA:-null}" \
+      '$p + $x + {artifacts:$o} + (if $d == null then {} else {delta:$d} end)
+       | if ($d != null and $d.applied) then del(.nodes) else . end'
     return "$rrc"
   fi
   printf '%s\n' "$title"
   printf '  %s\n' "$final"
+  if [[ -n "${_DELTA:-}" ]] && [[ "$(jq -r '.applied' <<<"$_DELTA")" == true ]]; then
+    _snapshot_delta_print "$out" "$rrc"
+    (( rrc )) && return "$rrc"
+    return 0
+  fi
+  [[ -n "${_DELTA_WHY:-}" ]] && printf '  full snapshot: %s\n' "$_DELTA_WHY"
   if (( rrc )); then
     printf '  %s addressable node(s) — NOT the page: see the reason above (partial: true)\n' "$nodes"
   else
@@ -5099,9 +5190,10 @@ _policy_log() {  # <site> <stderr-file> <page> <screenshot>
 
 cmd_act() {
   local site="" url="" steps="" expect="" approved="" out="" json=0 wait="no" settle="" shot=1
-  local wait_for="" interactive=0 expect_wait="${FIVEDIVE_BROWSER_EXPECT_WAIT_MS:-$ACT_EXPECT_WAIT_DEFAULT}"
+  local wait_for="" interactive=0 expect_wait="${FIVEDIVE_BROWSER_EXPECT_WAIT_MS:-$ACT_EXPECT_WAIT_DEFAULT}" record=""
   while (($#)); do
     case "$1" in
+      --record=*) record="${1#*=}"; _valid_routine "$record" || die "$E_USAGE" "--record takes a routine name: lowercase letters, digits, . _ - (up to 64); got: $record" ;;
       --wait-for=*) wait_for="${1#*=}"; _wait_for_ok "$wait_for" || die "$E_USAGE" "--wait-for takes one CSS selector, ref=<role>/<name> or text=<words>" ;;
       --expect-wait=*) expect_wait="${1#*=}" ;;
       --interactive) interactive=1 ;;
@@ -5116,7 +5208,8 @@ cmd_act() {
       --wait)       wait="$LEASE_WAIT_DEFAULT" ;;
       --wait=*)     wait="${1#*=}" ;;
       -h|--help)
-        printf '%s act [<site>] <url> --steps=<json> [--expect=<regex>] [--expect-wait=<ms>] [--wait-for=<selector|ref=…|text=…>] [--interactive] [--approved=<id>] [--out=<dir>] [--json]\n' "$PROG"
+        printf '%s act [<site>] <url> --steps=<json> [--expect=<regex>] [--expect-wait=<ms>] [--wait-for=<selector|ref=…|text=…>] [--interactive] [--approved=<id>] [--out=<dir>] [--json] [--record=<routine>]\n' "$PROG"
+        printf '  --record=<routine> saves these steps (never the values typed) for `5dive browser replay`.\n'
         printf '  <url> may be omitted to continue on the page a served browser is already on.\n'
         printf '  --expect is re-read for up to --expect-wait ms (default %s) before NOT VERIFIED.\n' "$ACT_EXPECT_WAIT_DEFAULT"
         return 0 ;;
@@ -5141,6 +5234,7 @@ cmd_act() {
   (( n <= ACT_MAX_STEPS )) || die "$E_USAGE" "$n steps is more than one act ($ACT_MAX_STEPS). Split it: a long script run blind is the shape that ends up somewhere nobody looked."
   local bad; bad=$(jq -r --arg v " $ACT_VOCAB " '[.[] | (.op // "") as $o | select(($v|contains(" "+$o+" "))|not) | $o] | first // empty' <<<"$steps")
   [[ -z "$bad" ]] || die "$E_USAGE" "'$bad' is not an act step. The vocabulary is: $ACT_VOCAB"
+  local orig_steps="$steps"
   if [[ -n "$url" ]]; then
     steps=$(jq -c --arg u "$url" '[{op:"goto", url:$u}] + .' <<<"$steps")
   fi
@@ -5306,6 +5400,15 @@ cmd_act() {
   if (( rrc )) && [[ "$verdict" == executed || "$verdict" == not_verified ]]; then
     verdict=not_ready; rc=$E_NOT_READY
   fi
+  # A ROUTINE RECORDS ONLY WHAT WORKED (DIVE-5335): a step that failed, a page that
+  # never loaded or an --expect that did not match is not a way to do this again.
+  if [[ -n "$record" ]]; then
+    if (( rc == 0 )); then
+      _routine_record "$site" "$record" "$url" "$orig_steps" "$expect" "$wait_for" "$errf" >&2
+    else
+      printf '%s: NOT recorded into routine %s — this act did not succeed (%s).\n' "$PROG" "$record" "$verdict" >&2
+    fi
+  fi
   if (( json )); then
     jq -nc --arg v "$verdict" --arg u "$final" --arg t "$title" --arg o "$out" --argjson d "$drc" --argjson x "$extra" \
       --argjson fs "$([[ "$verdict" == step_failed && -n "$fstep" ]] && echo "$fstep" || echo null)" \
@@ -5348,6 +5451,255 @@ _act_session() {  # <site> <steps> <approved> <shot> <settle> <report> <allow-ki
     if (( shot )); then jq -r '.png_b64 // ""' <<<"$rep" | base64 -d > "$stage/page.png" 2>/dev/null || :; fi
   fi
   return "$rc"
+}
+
+# ======================================================= routines (DIVE-5335)
+#
+# A ROUTINE IS AN ACT THAT ALREADY WORKED, KEPT. The loop for a page is snapshot,
+# decide, act — and on a daily routine (the distribution team's clicker, a
+# publisher) the agent pays for that loop every day for the same clicks on the
+# same buttons: a full snapshot read, a model turn to pick the refs, another to
+# act, per page. Stagehand calls the fix action caching. Here: `act --record=<n>`
+# keeps the steps of an act that succeeded, and `replay <site> <n>` runs them
+# again in ONE call, with no snapshot to read and no step for a model to choose.
+#
+# WHAT IS KEPT is how to FIND each element, never what was typed into it. A ref
+# is already a re-derivable locator (lib/aria.cjs: role + accessible name), so
+# the step itself is the cache entry. A fill/type/select value becomes a numbered
+# SLOT and `replay --values='[…]'` fills it: credentials and form text never
+# reach the file, and a routine that posts different text each day is still one
+# routine.
+#
+# THE SELF-HEAL is the one the executors already have: a ref that matches nothing
+# gets one re-pick (reflex, or a unique name match — never on a step that pays,
+# posts, sends or deletes). When that rescues a step, the routine is rewritten
+# with the picked ref, so the next replay does not pay for the pick again. When
+# it cannot, the replay stops on that act, says which, and the agent snapshots
+# and re-records from there (`routine forget --from=<k>`).
+#
+# EVERY REPLAYED ACT IS AN `act`, run as a child of this script: the lease, the
+# host scope, the login gate, the owner's policy and its approvals are the act's,
+# not a second copy of them. A pay step under the owner's default stops a replay
+# exactly as it stops an act (exit 73).
+#
+# Per seat and per site, under the seat's own 0700 directory, beside the adapters
+# it is the cheap cousin of: an adapter is a reviewed recipe for every seat; a
+# routine is one seat's memory of what worked.
+ROUTINE_SUBDIR=".routines"
+_valid_routine() { [[ "$1" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; }
+_routine_dir()   { printf '%s/%s/%s\n' "$(_seat_dir)" "$ROUTINE_SUBDIR" "$1"; }
+_routine_file()  { printf '%s/%s.json\n' "$(_routine_dir "$1")" "$2"; }
+# WHAT A ROUTINE IS FILED UNDER: the profile, except the PUBLIC one, which every
+# site without a login shares — there it is the page's host, so wiki.test's and
+# github.com's routines do not land in one bucket.
+_routine_key() {  # <profile> <url|"">
+  local h="${2#*://}"
+  if _is_public "$1" && [[ "$2" =~ ^https?://[^/]+ ]]; then
+    h="${h%%/*}"; h="${h%%\?*}"; h="${h##*@}"; h="${h%%:*}"; printf '%s\n' "${h,,}"
+  else printf '%s\n' "$1"; fi
+}
+
+# The picks an executor made on this act, as "<plan step n>\t<ref>" lines: the
+# executors print `step N: <ref> matched nothing; reflex picked ref=X (conf C);
+# retried: ok` (lib/aria.cjs resolveOrRepick), and only an `ok` one is a fix.
+_routine_picks() {  # <stderr-file>
+  sed -nE 's/^ *step ([0-9]+): .* matched nothing; (reflex|name match) picked (ref=.*); retried: ok$/\1\t\3/p' "$1" 2>/dev/null \
+    | sed -E 's/ \(conf [^)]*\)$//'
+}
+
+# <steps> with each picked ref written over the step it rescued. <offset> is 1
+# when the plan had a goto put in front of the steps (an act given a URL).
+_routine_patch() {  # <steps-json> <offset> <stderr-file>
+  local steps="$1" off="$2" n ref
+  while IFS=$'\t' read -r n ref; do
+    [[ "$n" =~ ^[0-9]+$ && "$ref" == ref=* ]] || continue
+    steps=$(jq -c --argjson i "$((n - 1 - off))" --arg r "$ref" \
+      'if $i >= 0 and $i < length then .[$i].selector = $r else . end' <<<"$steps")
+  done < <(_routine_picks "$3")
+  printf '%s\n' "$steps"
+}
+
+_routine_record() {  # <site> <name> <url> <steps> <expect> <wait-for> <stderr-file>
+  local site="$1" name="$2" url="$3" steps="$4" expect="$5" wait_for="$6" errf="$7" dir file cur tmp off=0
+  [[ -n "$url" ]] && off=1
+  steps="$(_routine_patch "$steps" "$off" "$errf")"
+  local profile="$site"; site="$(_routine_key "$profile" "$url")"
+  dir="$(_routine_dir "$site")"; file="$(_routine_file "$site" "$name")"
+  (umask 077; mkdir -p -- "$dir") || { printf '%s: NOT recorded — cannot create %s\n' "$PROG" "$dir"; return 0; }
+  cur='null'; [[ -s "$file" ]] && cur="$(cat -- "$file")"
+  tmp="$(mktemp "$dir/.rec.XXXXXX")" || return 0
+  # An act with no URL continued on the page the last one left, so it is the
+  # same replayed act: its steps join the previous act's (up to the act cap).
+  if jq -c --argjson cur "$cur" --arg site "$site" --arg name "$name" --arg url "$url" \
+       --argjson st "$steps" --arg e "$expect" --arg wf "$wait_for" --arg p "$profile" \
+       --argjson now "$(date +%s)" --argjson max "$ACT_MAX_STEPS" '
+      ($cur // {version:1, site:$site, profile:$p, name:$name, created:$now, slots:0, replays:0, acts:[]}) as $r
+      | (reduce $st[] as $s ({n:$r.slots, out:[]};
+          if ($s | has("value")) then (.n + 1) as $k | .n = $k | .out += [($s | del(.value)) + {slot:$k}]
+          else .out += [$s] end)) as $x
+      | $r
+      | if $url == "" and (.acts | length) > 0 and ((.acts[-1].steps | length) + ($x.out | length)) <= $max
+        then .acts[-1].steps += $x.out
+             | .acts[-1].expect = (if $e == "" then null else $e end)
+             | .acts[-1].wait_for = (if $wf == "" then null else $wf end)
+        else .acts += [{url:(if $url == "" then null else $url end), steps:$x.out,
+                        expect:(if $e == "" then null else $e end), wait_for:(if $wf == "" then null else $wf end)}]
+        end
+      | .slots = $x.n | .updated = $now' <<<'null' > "$tmp" && mv -f -- "$tmp" "$file"; then
+    chmod 600 "$file" 2>/dev/null
+    printf '%s: recorded into routine %s (%s): now %s act(s), %s value slot(s) — values are never stored. Replay: 5dive browser replay %s %s%s\n' \
+      "$PROG" "$name" "$site" "$(jq '.acts | length' "$file")" "$(jq '.slots' "$file")" "$site" "$name" \
+      "$(jq -r 'if .slots > 0 then " --values='"'"'[" + ([range(.slots)] | map("\"…\"") | join(",")) + "]'"'"'" else "" end' "$file")"
+  else
+    rm -f -- "$tmp"; printf '%s: NOT recorded — the routine file %s could not be updated\n' "$PROG" "$file"
+  fi
+  return 0
+}
+
+cmd_routine() {
+  local sub="${1:-ls}"; shift || true
+  local site="" name="" from="" json=0 f
+  while (($#)); do
+    case "$1" in
+      --from=*) from="${1#*=}"; [[ "$from" =~ ^[1-9][0-9]{0,2}$ ]] || die "$E_USAGE" "--from takes an act number (1 is the first); got: $from" ;;
+      --json) json=1 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$name" ]]; then name="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac; shift
+  done
+  [[ -z "$site" ]] || _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  [[ -z "$name" ]] || _valid_routine "$name" || die "$E_USAGE" "'$name' is not a routine name"
+  case "$sub" in
+    ls)
+      local root; root="$(_seat_dir)/$ROUTINE_SUBDIR"
+      local any=0
+      for f in "$root"/${site:-*}/*.json; do
+        [[ -f "$f" ]] || continue; any=1
+        if (( json )); then jq -c '{site, name, acts:(.acts|length), steps:([.acts[].steps|length]|add), slots, replays, updated}' "$f"
+        else jq -r '"\(.site)  \(.name)  — \(.acts|length) act(s), \([.acts[].steps|length]|add) step(s), \(.slots) value slot(s), replayed \(.replays // 0)x"' "$f"; fi
+      done
+      (( any || json )) || printf 'no routines%s. Record one: 5dive browser act <url> --steps=… --record=<name>\n' "${site:+ for $site}" ;;
+    show)
+      [[ -n "$site" && -n "$name" ]] || die "$E_USAGE" "usage: 5dive browser routine show <site> <name>"
+      f="$(_routine_file "$site" "$name")"; [[ -s "$f" ]] || die "$E_USAGE" "no routine '$name' for $site"
+      if (( json )); then jq -c . "$f"; return 0; fi
+      jq -r '"routine \(.name) on \(.site): \(.acts|length) act(s), \(.slots) value slot(s), replayed \(.replays // 0)x",
+        (.acts | to_entries[] | "act \(.key + 1): \(.value.url // "(continues on the page the last act left)")"
+          + (if .value.expect then "   expect: \(.value.expect)" else "" end),
+          (.value.steps[] | "    \(.op) \(.selector // .url // "")" + (if .slot then "  <- value \(.slot)" else "" end)
+             + (if .key then "  key=\(.key)" else "" end)))' "$f" ;;
+    forget)
+      [[ -n "$site" && -n "$name" ]] || die "$E_USAGE" "usage: 5dive browser routine forget <site> <name> [--from=<act>]"
+      f="$(_routine_file "$site" "$name")"; [[ -s "$f" ]] || die "$E_USAGE" "no routine '$name' for $site"
+      if [[ -z "$from" || "$from" == 1 ]]; then rm -f -- "$f"; printf 'forgot routine %s (%s)\n' "$name" "$site"; return 0; fi
+      local tmp; tmp="$(mktemp "${f%/*}/.rec.XXXXXX")" || die "$E_UNAVAILABLE" "cannot rewrite $f"
+      # Slots after the cut go with it; the ones before keep their numbers.
+      jq -c --argjson k "$from" '.acts = .acts[:$k-1]
+        | .slots = ([.acts[].steps[] | .slot // 0] | max // 0)' "$f" > "$tmp" && mv -f -- "$tmp" "$f" && chmod 600 "$f"
+      printf 'routine %s (%s) now ends at act %s. Record the rest with --record=%s.\n' "$name" "$site" "$((from - 1))" "$name" ;;
+    *) die "$E_USAGE" "usage: 5dive browser routine ls [<site>] | show <site> <name> | forget <site> <name> [--from=<act>]" ;;
+  esac
+}
+
+cmd_replay() {
+  local site="" name="" values="[]" json=0 from=1 approved="" wait=""
+  while (($#)); do
+    case "$1" in
+      --values=*) values="${1#*=}" ;;
+      --from=*) from="${1#*=}"; [[ "$from" =~ ^[1-9][0-9]{0,2}$ ]] || die "$E_USAGE" "--from takes an act number (1 is the first); got: $from" ;;
+      --approved=*) approved="${1#*=}" ;;
+      --wait|--wait=*) wait="$1" ;;
+      --json) json=1 ;;
+      -h|--help)
+        printf '%s replay <site> <routine> [--values=<json array>] [--from=<act>] [--approved=<id>] [--json]\n' "$PROG"
+        printf '  Runs a routine recorded with act --record=<routine>: every step from the cache, no snapshot, one call.\n'
+        printf '  --approved applies to the FIRST act replayed: after an exit 73 on act k, re-run with --from=k --approved=<id>.\n'
+        return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$name" ]]; then name="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac; shift
+  done
+  [[ -n "$site" && -n "$name" ]] || die "$E_USAGE" "usage: 5dive browser replay <site> <routine> [--values='[\"…\"]']"
+  [[ "$site" =~ ^https?:// ]] && site="$(_routine_key "$PUBLIC_SITE" "$site")"
+  _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  _valid_routine "$name" || die "$E_USAGE" "'$name' is not a routine name"
+  command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to read the routine"
+  local file; file="$(_routine_file "$site" "$name")"
+  [[ -s "$file" ]] || die "$E_USAGE" "no routine '$name' for $site. Record one: 5dive browser act <url> --steps=… --record=$name$(f=$(_seat_dir)/$ROUTINE_SUBDIR/$site; ls "$f" 2>/dev/null | sed -n 's/\.json$//p' | tr '\n' ' ' | sed 's/^./ (recorded for this site: &/; s/ $/)/')"
+  jq -e 'type == "array" and all(.[]; type == "string")' <<<"$values" >/dev/null 2>&1 \
+    || die "$E_USAGE" "--values is a JSON array of strings, one per value slot: --values='[\"first\",\"second\"]'"
+  local slots nv acts
+  slots=$(jq '.slots' "$file"); nv=$(jq 'length' <<<"$values"); acts=$(jq '.acts | length' "$file")
+  if (( nv != slots )); then
+    die "$E_USAGE" "routine $name takes $slots value(s) and got $nv. In order: $(jq -r '[.acts[].steps[] | select(.slot) | "\(.slot)=\(.op) \(.selector // "")"] | join("; ")' "$file")"
+  fi
+  (( from <= acts )) || die "$E_USAGE" "routine $name has $acts act(s); --from=$from is past the end"
+
+  local self="${BASH_SOURCE[0]}" k seg steps url expect wf errf res rc=0 picks models=0 healed=0 nsteps=0 profile
+  profile="$(jq -r '.profile // .site' "$file")"
+  local t0; t0=$(date +%s%3N)
+  errf="$(mktemp /tmp/5dive-browser-replay.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the replay"
+  for (( k = from; k <= acts; k++ )); do
+    seg=$(jq -c --argjson i "$((k - 1))" '.acts[$i]' "$file")
+    steps=$(jq -c --argjson v "$values" '[.steps[] | if .slot then (del(.slot) + {value:$v[.slot - 1]}) else . end]' <<<"$seg")
+    url=$(jq -r '.url // ""' <<<"$seg"); expect=$(jq -r '.expect // ""' <<<"$seg"); wf=$(jq -r '.wait_for // ""' <<<"$seg")
+    local -a a=(act "$profile")
+    [[ -n "$url" ]] && a+=("$url")
+    a+=("--steps=$steps" --json)
+    [[ -n "$expect" ]] && a+=("--expect=$expect")
+    [[ -n "$wf" ]] && a+=("--wait-for=$wf")
+    [[ -n "$wait" ]] && a+=("$wait")
+    (( k == from )) && [[ -n "$approved" ]] && a+=("--approved=$approved")
+    rc=0; res=$("$self" "${a[@]}" 2>"$errf") || rc=$?
+    nsteps=$(( nsteps + $(jq 'length' <<<"$steps") ))
+    picks=$(_routine_picks "$errf" | wc -l | tr -d ' ')
+    models=$(( models + $(grep -cE '^ *step [0-9]+: .* matched nothing; reflex picked ref=.*; retried: ok$' "$errf" 2>/dev/null || true) ))
+    if (( picks > 0 )); then
+      # A re-pick that rescued a step is the cache's miss: write the picked ref
+      # back so the next replay finds it at once (the self-heal).
+      local off=0 fixed tmp; [[ -n "$url" ]] && off=1
+      fixed=$(_routine_patch "$(jq -c '.steps' <<<"$seg")" "$off" "$errf")
+      tmp="$(mktemp "${file%/*}/.rec.XXXXXX")" && jq -c --argjson i "$((k - 1))" --argjson s "$fixed" '.acts[$i].steps = $s' "$file" > "$tmp" \
+        && mv -f -- "$tmp" "$file" && chmod 600 "$file"
+      healed=$(( healed + picks ))
+    fi
+    if (( json == 0 )); then
+      printf 'act %s/%s: %s%s\n' "$k" "$acts" "$(jq -r '.verdict // "?"' <<<"$res" 2>/dev/null)" \
+        "$( (( picks )) && printf ' (%s step(s) re-picked, routine updated)' "$picks")"
+    fi
+    if (( rc != 0 )); then
+      cat -- "$errf" >&2
+      [[ -n "$res" ]] && printf '%s\n' "$res" >&2
+      case "$rc" in
+        "$E_NEEDS_OWNER") printf '%s: replay of %s stopped at act %s for the owner (above). On their yes: 5dive browser replay %s %s --from=%s --approved=<id>%s\n' \
+                            "$PROG" "$name" "$k" "$site" "$name" "$k" "$( (( slots )) && printf " --values='…'")" >&2 ;;
+        *) printf '%s: replay of %s MISSED at act %s (exit %s): the page is not the one it was recorded on. Snapshot it, then re-record from here:\n  5dive browser routine forget %s %s --from=%s   # then act the rest with --record=%s\n' \
+             "$PROG" "$name" "$k" "$rc" "$site" "$name" "$k" "$name" >&2 ;;
+      esac
+      rm -f -- "$errf"
+      if (( json )); then
+        jq -nc --arg n "$name" --arg s "$site" --argjson k "$k" --argjson a "$acts" --argjson rc "$rc" --argjson m "$models" \
+          --argjson h "$healed" --argjson st "$nsteps" --argjson ms "$(( $(date +%s%3N) - t0 ))" --argjson r "${res:-null}" \
+          '{routine:$n, site:$s, verdict:"stopped", stopped_at:$k, acts:$a, exit:$rc, steps:$st, model_calls:$m, repicked:$h, wall_ms:$ms, act:$r}' 2>/dev/null
+      fi
+      return "$rc"
+    fi
+  done
+  rm -f -- "$errf"
+  local tmp; tmp="$(mktemp "${file%/*}/.rec.XXXXXX")" && jq -c --argjson now "$(date +%s)" '.replays = ((.replays // 0) + 1) | .last_replayed = $now' "$file" > "$tmp" \
+    && mv -f -- "$tmp" "$file" && chmod 600 "$file"
+  local ms=$(( $(date +%s%3N) - t0 ))
+  if (( json )); then
+    jq -nc --arg n "$name" --arg s "$site" --argjson a "$acts" --argjson f "$from" --argjson m "$models" --argjson h "$healed" \
+      --argjson st "$nsteps" --argjson ms "$ms" --argjson r "${res:-null}" \
+      '{routine:$n, site:$s, verdict:"replayed", acts:($a - $f + 1), steps:$st, model_calls:$m, repicked:$h, wall_ms:$ms, last:$r}'
+    return 0
+  fi
+  printf 'replayed %s on %s: %s act(s), %s step(s) in %s ms, %s model call(s)%s\n' "$name" "$site" "$((acts - from + 1))" "$nsteps" "$ms" "$models" \
+    "$( (( healed )) && printf ' — %s step(s) re-picked and written back' "$healed" || printf ' — every step from the cache')"
+  printf '  the last page: %s\n  %s\n' "$(jq -r '.url // ""' <<<"$res")" "$(jq -r '.artifacts // ""' <<<"$res")"
+  [[ "$(jq -r '.verdict' <<<"$res")" == executed ]] && printf '  nothing re-graded the last act (it was recorded without --expect): read page.png before you report success.\n'
+  return 0
 }
 
 # THE OWNER'S YES (DIVE-4943). Root only — see _grant_uid. It prints what is being
@@ -6554,7 +6906,8 @@ cmd_input_verb() {  # <verb> <site> [<url>] [flags]
       --wait=*)  if [[ "$verb" == act ]]; then wait="${1#*=}"; else swait="${1#*=}"; fi ;;
       # Flags of the DOM verbs that mean nothing here are accepted and ignored
       # rather than refused, so an agent's habitual call still gets its screen.
-      --interactive|--full|--size=*|--dom=*|--wait-for=*|--expect=*|--expect-wait=*|--no-shot) ;;
+      --interactive|--full|--size=*|--dom=*|--wait-for=*|--expect=*|--expect-wait=*|--no-shot|--delta) ;;
+      --record=*) die "$E_USAGE" "a routine replays DOM steps by ref, and an input-mode site has no DOM: there is nothing to record. Act on the screen each time." ;;
       -h|--help)
         printf '%s %s <site> [<url>] — input mode: the screen of the live window, and real keyboard/mouse input.\n' "$PROG" "$verb"
         printf '  act steps: click{x,y[,button,count]} move{x,y} type{value} press{key} scroll{dy[,dx,x,y]} goto{url} wait{ms}\n'
@@ -6796,6 +7149,8 @@ case "${1:-}" in
   read)  shift; cmd_read  "$@" ;;
   snapshot) shift; cmd_snapshot "$@" ;;
   act)   shift; cmd_act "$@" ;;
+  replay) shift; cmd_replay "$@" ;;
+  routine) shift; cmd_routine "$@" ;;
   approve) shift; cmd_approve "$@" ;;
   approvals) shift; cmd_approvals "$@" ;;
   # Not in usage: the session daemon re-enters here as the profile's owner.

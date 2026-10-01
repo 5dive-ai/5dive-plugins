@@ -1,5 +1,18 @@
 ## Unreleased
 
+### Added — routines (`act --record`, `replay`) and `snapshot --delta` (DIVE-5335), browser 1.26.0
+
+Registry mirror of 5dive-browser's DIVE-5335 (`browser/` read as `plugins/browser/`). A browser
+routine an agent repeats now costs one call from the second run on: `act --record=<name>` keeps
+the steps of an act that worked (never a typed value — those become numbered slots), and
+`replay <site> <name> [--values=…]` runs them with no snapshot and no step for a model to pick.
+A renamed element is re-picked once and written back; a miss stops the replay on that act with
+the re-record command. `routine ls|show|forget` manage them. `snapshot --delta` returns only the
+refs and text that changed since the seat's last snapshot of the site, and no `page.png` when
+under 1% of its pixels moved (`lib/delta.cjs`, no new packages). The run-1-vs-run-3 numbers are
+measured on a real site in 5dive-browser's `routine-bench` CI job and are on its PR. Harness:
+`tests/browser_routine_delta_unit.sh` (parity.yml).
+
 ### Fixed — a busy server no longer tells you to update a current 5dive CLI (DIVE-5327), telegram 0.5.80
 
 On a loaded box, /tasks, /heartbeat, /task and the other 5dive commands answered "needs a newer 5dive
