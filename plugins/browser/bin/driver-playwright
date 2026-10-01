@@ -556,18 +556,28 @@ async function main() {
       }
       stepsRun++;  // entered, not completed — see stepsRun above
       if (s.op !== 'goto') acted = true;
+      // A REF WHOSE ELEMENT THE PAGE REPLACED IS FOUND AGAIN (DIVE-5335), never a
+      // step that may have acted, and the owner's check is read again on it —
+      // lib/aria.cjs onRef, shared by both loops.
+      const on = (act) => aria.onRef(page, s, sel, act, {
+        timeoutMs: STEP_TIMEOUT, log: (l) => process.stderr.write(`  ${l}\n`),
+        check: (plan.guard && !plan.approved) ? async (x) => {
+          const k = await aria.stepRisk(page, s, x);
+          return !k || (Array.isArray(plan.allow_kinds) && plan.allow_kinds.includes(k.cls));
+        } : null,
+      });
       switch (s.op) {
         case 'goto':
           await page.goto(s.url, { waitUntil: 'domcontentloaded' });
           if (RUN_SETTLE_MS > 0) await page.waitForTimeout(RUN_SETTLE_MS);
           break;
-        case 'fill':     await page.fill(sel, s.value); break;
+        case 'fill':     await on((x, timeout) => page.fill(x, s.value, { timeout })); break;
         case 'type':     await aria.typeKeys(page, sel, s.value, s.delay_ms, { timeoutMs: STEP_TIMEOUT }); break;
-        case 'click':    await page.click(sel); break;
+        case 'click':    await on((x, timeout) => page.click(x, { timeout })); break;
         case 'wait_for': await page.waitForSelector(sel); break;
-        case 'select':   await page.selectOption(sel, s.value); break;
-        case 'upload':   await page.setInputFiles(sel, s.path); break;
-        case 'press':    await page.press(sel, s.key); break;
+        case 'select':   await on((x, timeout) => page.selectOption(x, s.value, { timeout })); break;
+        case 'upload':   await on((x, timeout) => page.setInputFiles(x, s.path, { timeout })); break;
+        case 'press':    await on((x, timeout) => page.press(x, s.key, { timeout })); break;
       }
       if (retry) process.stderr.write(`  ${retry}ok\n`);
       retry = null;

@@ -87,6 +87,10 @@ jobs:
       # `plugins/browser/`. Its live arms use the runner's own Xvfb + Chrome.
       - name: browser input drive mode harness
         run: bash tests/browser_input_drive_unit.sh
+      # DIVE-5335: routines and delta snapshots, mirrored from 5dive-browser with
+      # `browser/` read as `plugins/browser/`.
+      - name: browser routine and delta harness
+        run: bash tests/browser_routine_delta_unit.sh
       # DIVE-4397: the unprivileged-first 5dive reader, and the arms that assert
       # all five telegram forks still route through it. `bun test` does not reach
       # it — the module is driven with an injected exec function from bash, and

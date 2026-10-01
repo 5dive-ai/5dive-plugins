@@ -317,6 +317,130 @@ async function resolveStepSelector(page, step, { timeoutMs = 30000, pollMs = 250
   return resolveRef(page, sel);
 }
 
+// ---- A REF WHOSE ELEMENT IS REPLACED IS FOUND AGAIN (DIVE-5335) --------------
+//
+// THE DEFECT. A ref resolves ONCE, to a marker attribute on the element the walk
+// saw. A page that swaps that element for a new one leaves the marker on a node
+// that is no longer in the document, and the step then waits out its whole
+// timeout for a selector nothing can match. Measured on en.wikipedia.org: `fill`
+// on `ref=searchbox/Search Wikipedia#1` focused the server-rendered input, the
+// focus loaded the typeahead, the typeahead mounted a NEW input in its place
+// (keeping the value and the focus), and `press Enter` on the same ref timed out
+// at 30 s with "element was detached from the DOM, retrying". Every `replay` of
+// that routine would have failed the same way.
+//
+// THE FIX. The step runs in short attempts. When an attempt fails AND the marker
+// now matches nothing, the ref is resolved again — the same role and accessible
+// name, re-derived from the page as it is now — and the step runs on that, until
+// the step's own timeout. A marker that is still on the page keeps its selector:
+// that element exists and is only slow, which is the old wait, unchanged.
+//
+// IT NEVER RE-RUNS A STEP THAT MAY HAVE ACTED. A re-run is allowed only when the
+// failure says the element was detached BEFORE the action (Playwright's call log)
+// and the page is still on the URL it was on: a click that navigated and then
+// timed out has acted, and running it again on the next page is a double action
+// in somebody's account. `type` is never re-run at all — it types key by key, so
+// a half-typed value re-typed is a wrong value. A plain CSS selector is the
+// agent's own and is never re-resolved.
+//
+// WHAT "THE SAME ELEMENT" MEANS, in order, the first that names exactly one:
+//   1. the same ref — role, accessible name and #n;
+//   2. the same accessible name in the same family of roles: a text field the
+//      page rebuilt as a typeahead is often a `combobox` where it was a
+//      `searchbox` (Wikipedia's is), and it is still the field the agent picked;
+//   3. for `press` only, the FOCUSED text field: a key press goes to the focused
+//      element, the replacement took the focus of the one it replaced, and that
+//      is the element a person pressing Enter there would have pressed it on.
+// Two candidates on any tier is not "the same element" and nothing is retried.
+//
+// THE OWNER'S CHECK IS READ AGAIN on the element found again (`check`), because
+// for `press` it reads the form around the element, and a new element can sit
+// in a new form.
+const REFIND_FAMILY = { textbox: 'text', searchbox: 'text', combobox: 'text' };
+// In the page: mark the focused text field, if that is what has the focus.
+function _markFocusedIn(arg) {
+  var a = document.activeElement;
+  if (!a || a === document.body) return false;
+  var tag = (a.tagName || '').toLowerCase();
+  var type = String(a.getAttribute('type') || 'text').toLowerCase();
+  var role = String(a.getAttribute('role') || '').toLowerCase();
+  var text = (tag === 'input' && ['text', 'search', 'email', 'url', 'tel', ''].indexOf(type) >= 0) ||
+    tag === 'textarea' || a.isContentEditable === true || ['textbox', 'searchbox', 'combobox'].indexOf(role) >= 0;
+  if (!text) return false;
+  a.setAttribute('data-5dive-ref', arg.id);
+  return true;
+}
+async function refind(page, step, { timeoutMs = 0, pollMs = 250 } = {}) {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  const ref = refBody(step.selector);
+  const { role, name } = refParts(ref);
+  const norm = (x) => String(x || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  let last;
+  for (;;) {
+    try { return { sel: await resolveRef(page, step.selector), how: 'the same ref' }; }
+    catch (e) { if (!e.refMiss) throw e; last = e; }
+    const fam = REFIND_FAMILY[role];
+    if (fam && norm(name)) {
+      const hits = (last.nodes || []).filter((n) => REFIND_FAMILY[n.role] === fam && norm(n.name) === norm(name));
+      if (hits.length === 1) {
+        try { return { sel: await resolveRef(page, REF_PREFIX + hits[0].ref), how: `ref=${hits[0].ref}, the same name` }; }
+        catch (e) { if (!e.refMiss) throw e; }
+      }
+    }
+    if (step.op === 'press' && fam) {
+      const id = `f${Date.now()}`;
+      let ok = false;
+      try { ok = await page.evaluate(_markFocusedIn, { id }); } catch (e) { ok = false; }
+      if (ok) return { sel: `[data-5dive-ref="${id}"]`, how: 'the focused text field' };
+    }
+    if (Date.now() >= deadline) throw last;
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+  }
+}
+const REFIND_OPS = { fill: 1, click: 1, press: 1, select: 1, upload: 1 };
+const REFIND_ATTEMPT_MS = 5000;
+const actedAlready = (msg) => /action done|navigat/i.test(String(msg || ''));
+async function onRef(page, step, sel, act, { timeoutMs = 30000, attemptMs = REFIND_ATTEMPT_MS, check = null, log = null } = {}) {
+  if (!isRef(step.selector) || !REFIND_OPS[step.op]) return act(sel, timeoutMs);
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  let cur = sel, refound = 0;
+  for (;;) {
+    const left = deadline - Date.now();
+    let urlBefore = '';
+    try { urlBefore = String(await page.url()); } catch (e) { /* compared as '' */ }
+    try {
+      return await act(cur, Math.max(1, Math.min(attemptMs, left)));
+    } catch (e) {
+      if (Date.now() >= deadline - 50) throw e;
+      let gone = false;
+      try { gone = (await page.locator(cur).count()) === 0; } catch (x) { throw e; }
+      if (!gone) {
+        // Still on the page: only slow. A non-timeout failure is a real one.
+        if (!(e && e.name === 'TimeoutError')) throw e;
+        continue;
+      }
+      let urlNow = '';
+      try { urlNow = String(await page.url()); } catch (x) { /* compared as '' */ }
+      if (actedAlready(e && e.message) || urlNow !== urlBefore) throw e;
+      let next, how;
+      try { ({ sel: next, how } = await refind(page, step, { timeoutMs: Math.max(0, deadline - Date.now()) })); }
+      catch (x) {
+        if (!x.refMiss) throw x;
+        // Say what the page holds now: the next run is fixed from this line.
+        e.message += ` The element ${step.selector} named was replaced on the page and nothing that is the same element was found again: ${x.message}`;
+        throw e;
+      }
+      if (check && !(await check(next))) {
+        e.message += ` The element was replaced, and the one found again for ${step.selector} is not one this step may act on without the owner, so it was not retried.`;
+        throw e;
+      }
+      refound++;
+      if (log) log(`step ${step.selector}: the element was replaced on the page; found it again as ${how} (${refound}x)`);
+      cur = next;
+    }
+  }
+}
+
 // ---- TYPE: KEY BY KEY --------------------------------------------------------
 //
 // `fill` sets the value in ONE input event, with no keydown, keypress or keyup,
@@ -944,6 +1068,7 @@ function render(nodes, { json = false } = {}) {
 
 module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
   resolveRefWithin, resolveStepSelector, resolveOrRepick, nameMatches, REPICK_MIN_CONFIDENCE,
+  onRef, refind, REFIND_OPS, _markFocusedIn,
   isRef, render, REF_PREFIX,
   typeDelay, typeRefusal, typeKeys, TYPE_DELAY_DEFAULT, TYPE_DELAY_MAX,
   classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER, OWNER_ALLOWED_PREFIX,
