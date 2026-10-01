@@ -330,8 +330,19 @@ let url = 'https://wiki.test/', walks = 0;
 const page = {
   url: () => url,
   locator: (sel) => ({ count: async () => (sel.includes('"r1"') ? 0 : 1) }),
-  evaluate: async (fn, arg) => { walks++; return { nodes: [{ role: 'searchbox', name: 'Search', ref: 'searchbox/Search#1' }], marker: arg && arg.mark ? 'r2' : null }; },
+  evaluate: async (fn, arg) => {
+    if (arg && arg.id) return focused;          // _markFocusedIn
+    walks++;
+    return { nodes, marker: arg && arg.mark && nodes.some((n) => n.ref === arg.mark) ? (arg.mark === 'searchbox/Search#1' ? 'r2' : 'r3') : null };
+  },
 };
+// What the page holds after the swap: by default the same ref; 'family' rebuilds
+// it as a combobox of the same name (Wikipedia's typeahead); 'focus*' leaves no
+// field of that name, only the focused one.
+let nodes = [{ role: 'searchbox', name: 'Search', ref: 'searchbox/Search#1' }], focused = false;
+if (scen === 'family') nodes = [{ role: 'combobox', name: 'Search', ref: 'combobox/Search' }];
+if (scen === 'family2') nodes = [{ role: 'combobox', name: 'Search', ref: 'combobox/Search#1' }, { role: 'textbox', name: 'Search', ref: 'textbox/Search' }];
+if (scen.startsWith('focus')) { nodes = [{ role: 'link', name: 'Home', ref: 'link/Home' }]; focused = true; }
 const detached = () => { const e = new Error('page.press: Timeout 5000ms exceeded.\n  - element was detached from the DOM, retrying'); e.name = 'TimeoutError'; return e; };
 let step = { op: 'press', selector: 'ref=searchbox/Search#1', key: 'Enter' };
 let act = async (sel, timeout) => { calls.push(sel); if (sel.includes('"r1"')) throw detached(); return 'ok'; };
@@ -341,14 +352,27 @@ if (scen === 'done') act = async (sel) => { calls.push(sel); const e = detached(
 if (scen === 'type') step = { op: 'type', selector: 'ref=searchbox/Search#1', value: 'x' };
 if (scen === 'css') step = { op: 'press', selector: '#q', key: 'Enter' };
 if (scen === 'check') check = async () => false;
+if (scen === 'focusclick' || scen === 'family2') step = { op: 'click', selector: 'ref=searchbox/Search#1' };
+if (scen === 'focusclick' || scen === 'family2') act = async (sel) => { calls.push(sel); if (sel.includes('"r1"')) throw detached(); return 'ok'; };
 a.onRef(page, step, '[data-5dive-ref="r1"]', act, { timeoutMs: 3000, attemptMs: 200, check, log: (l) => logs.push(l) })
   .then((r) => console.log(JSON.stringify({ r, calls, logs, walks })))
-  .catch((e) => console.log(JSON.stringify({ err: e.message.split('\n')[0], notRetried: /not retried/.test(e.message), calls, logs, walks })));
+  .catch((e) => console.log(JSON.stringify({ err: e.message.replace(/\n/g, ' '), notRetried: /not retried/.test(e.message), calls, logs, walks })));
 JS
 e1() { ARIA="${2:-$ROOT/plugins/browser/lib/aria.cjs}" node "$TMP/e1.js" "$1" 2>&1; }
 O="$(e1 replaced)"
 t  'E1 a replaced element is found again and the step runs on it' 'ok ["[data-5dive-ref=\"r1\"]","[data-5dive-ref=\"r2\"]"]' "$(jq -rc '"\(.r) \(.calls)"' <<<"$O")"
-tc 'E1 ...and says so' 'found it again (1x)' "$O"
+tc 'E1 ...and says so' 'found it again as the same ref (1x)' "$O"
+O="$(e1 family)"
+t  'E1 a search field rebuilt as a combobox of the same name is the same field' 'ok ["[data-5dive-ref=\"r1\"]","[data-5dive-ref=\"r3\"]"]' "$(jq -rc '"\(.r) \(.calls)"' <<<"$O")"
+tc 'E1 ...and says how it was found' 'ref=combobox/Search, the same name' "$O"
+O="$(e1 family2)"
+t  'E1 two fields of that name is not "the same element": not retried' '1 null' "$(jq -rc '"\(.calls|length) \(.r)"' <<<"$O")"
+O="$(e1 focus)"
+t  'E1 press with no field of that name goes to the focused text field' 'ok f' "$(jq -rc '"\(.r) \(.calls[1]|ltrimstr("[data-5dive-ref=\"")|.[0:1])"' <<<"$O")"
+tc 'E1 ...and says so' 'the focused text field' "$O"
+O="$(e1 focusclick)"
+t  'E1 a click never goes to the focused field' '1 null' "$(jq -rc '"\(.calls|length) \(.r)"' <<<"$O")"
+tc 'E1 ...and the failure says what the page holds now' 'nothing that is the same element was found again' "$(jq -rc '.err' <<<"$O")"
 O="$(e1 nav)"
 t  'E1 a step that navigated is NOT re-run on the next page' '1 null' "$(jq -rc '"\(.calls|length) \(.r)"' <<<"$O")"
 O="$(e1 done)"
