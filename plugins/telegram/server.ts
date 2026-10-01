@@ -41,8 +41,9 @@ import { COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { createFiveRunner, createFailureBreaker, isSudoDenial, type FiveRunner } from './cliexec.ts'
 import {
   seatCanAdmin, classifyAccountUsage, accountReadOnlyText, accountSwitchPendingText,
-  accountSwitchDoneText, accountSwitchFailedText, USAGE_NOT_AVAILABLE_TEXT, USAGE_READ_FAILED_TEXT,
-  type SeatAdmin, type SeatSudo,
+  accountSwitchDoneText, accountSwitchFailedText, USAGE_READ_FAILED_TEXT,
+  adminTierText, isAdminTierRequired, createSudoGate, standardSeatRoute, ownUsageText,
+  type SeatAdmin, type SeatSudo, type SudoGate, type StatuslineLimits,
 } from './seatpriv.ts'
 import { planAutoAttach, autoAttachFooter, attachedNames, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
@@ -2091,6 +2092,15 @@ function readStatuslineCache(): {
   }
 }
 
+// DIVE-5331: the same file, with the reset times, for /usage on a standard seat.
+function readStatuslineLimits(): StatuslineLimits | null {
+  try {
+    return JSON.parse(readFileSync(join(homedir(), '.claude', 'statusline-last.json'), 'utf8')) as StatuslineLimits
+  } catch {
+    return null
+  }
+}
+
 // Snapshot of the current context-window usage for the active session, used
 // by /context. Two sources, in order of preference:
 //
@@ -2424,6 +2434,44 @@ async function thisSeatAdmin(me: string, agents?: FiveDiveAgentEntry[] | null): 
   return seatCanAdmin(list?.find(a => a.name === me) ?? null, fiveRunner().sudoDenied())
 }
 
+// DIVE-5331: this seat's tier, for the sudo gate and the dispatcher. Cached for
+// ten minutes — a seat's grant does not change mid-conversation, and the read
+// (`agent list --json`, ~2s) would otherwise sit in front of every tap. A latched
+// sudo refusal is decisive at once; 'unknown' is never cached, so a list that
+// could not be read is retried rather than remembered.
+let SEAT_TIER: { v: SeatAdmin; at: number } | null = null
+const SEAT_TIER_TTL_MS = 10 * 60_000
+async function seatTier(): Promise<SeatAdmin> {
+  if (fiveRunner().sudoDenied()) return 'no'
+  const me = thisAgentName()
+  if (!me) return 'unknown'
+  if (SEAT_TIER && Date.now() - SEAT_TIER.at < SEAT_TIER_TTL_MS) return SEAT_TIER.v
+  const v = await thisSeatAdmin(me)
+  SEAT_TIER = v === 'unknown' ? null : { v, at: Date.now() }
+  return v
+}
+
+// DIVE-5331: the ONLY way this file spawns sudo. On an admin (or unknown) seat
+// it spawns exactly what the old raw `sudo -n <argv>` did; on a standard
+// seat it runs the seat's own grant as before, serves an unprivileged verb as
+// the seat's own uid when the call site asks for that, and otherwise throws
+// AdminTierRequired without spawning anything. See seatpriv.ts.
+// Built lazily for the same temporal-dead-zone reason as fiveRunner().
+let SUDO_GATE: SudoGate | null = null
+function sudoGate(): SudoGate {
+  return SUDO_GATE ??= createSudoGate({ execFile: execFileP as any, sudoBin: SUDO, fiveBin: FIVEDIVE, seat: seatTier })
+}
+function sudo5dive(
+  argv: string[],
+  opts?: unknown,
+  standard: 'plain' | 'refuse' = 'refuse',
+): Promise<{ stdout: string; stderr: string }> {
+  return sudoGate().run(argv, opts, standard)
+}
+function sudoGateCheck(argv: string[]): Promise<void> {
+  return sudoGate().check(argv)
+}
+
 async function read5diveAccountUsage(): Promise<FiveDiveAccountUsage[] | null> {
   const j = await read5diveJson(['account', 'usage', '--json'])
   return j?.ok && Array.isArray(j.data) ? (j.data as FiveDiveAccountUsage[]) : null
@@ -2486,9 +2534,8 @@ async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
 // + dedups. Returns an error string on failure, null on success.
 async function write5diveRotation(me: string, enabled: boolean, accountsArg: string): Promise<string | null> {
   try {
-    await execFileP(
-      SUDO,
-      ['-n', '5dive', 'agent', 'rotation', 'set', me, `--enabled=${enabled}`, `--accounts=${accountsArg}`],
+    await sudo5dive(
+      ['5dive', 'agent', 'rotation', 'set', me, `--enabled=${enabled}`, `--accounts=${accountsArg}`],
       { timeout: 5000 },
     )
     return null
@@ -2664,6 +2711,7 @@ function rotationBody(rot: { enabled: boolean; allAccounts?: boolean; accounts: 
 // render identically. Returns {error} when the account list can't be read.
 async function buildAccountMenu(
   me: string,
+  lang: Lang = 'en',
 ): Promise<{ text: string; keyboard?: InlineKeyboard } | { error: string }> {
   // DIVE-5220: a seat that cannot run set-account gets the current account,
   // read-only, and no buttons — not a picker whose every tap is refused. Read
@@ -2671,7 +2719,7 @@ async function buildAccountMenu(
   // (each refused sudo mails root, DIVE-4397).
   const agents = await read5diveAgentList()
   if ((await thisSeatAdmin(me, agents)) === 'no') {
-    return { text: accountReadOnlyText(agents?.find(a => a.name === me)?.authProfile || 'default') }
+    return { text: accountReadOnlyText(agents?.find(a => a.name === me)?.authProfile || 'default', lang) }
   }
   const [accounts, usage, rotation] = await Promise.all([
     read5diveAccountList(),
@@ -2800,7 +2848,7 @@ function applyModel(alias: string, chatId: number): ApplyResult {
 // restart clock only starts once the handler has finished sending the ack.
 // (/model and /effort defer too, but no longer to a restart — they defer the
 // live TUI switch and its pane poll.)
-async function applyAccount(name: string, chatId: number): Promise<ApplyResult> {
+async function applyAccount(name: string, chatId: number, lang: Lang = 'en'): Promise<ApplyResult> {
   const me = thisAgentName()
   if (!me) return { text: `Can't determine this agent's name (not running as agent-* user).` }
   // Validate against the shell command after() will construct. The CLI also
@@ -2815,7 +2863,7 @@ async function applyAccount(name: string, chatId: number): Promise<ApplyResult> 
   // isolation) is told so up front, and sudo is never spawned for it. A stale
   // picker from before the seat was narrowed still reaches here.
   if ((await thisSeatAdmin(me)) === 'no') {
-    return { text: accountSwitchFailedText(name, true, '') }
+    return { text: accountSwitchFailedText(name, true, '', lang) }
   }
   return {
     // DIVE-5220: NO ✅ here. This text is on the wire before set-account has
@@ -2828,13 +2876,13 @@ async function applyAccount(name: string, chatId: number): Promise<ApplyResult> 
     // on the new account, which is true. On a failure no restart fires, the bot
     // is alive, and exactly one message says what happened.
     after: () => {
-      void execFileP(SUDO, ['-n', '5dive', 'agent', 'set-account', me, name], { timeout: 5000 })
+      void sudo5dive(['5dive', 'agent', 'set-account', me, name], { timeout: 5000 })
         .then(
           () => bot.api.sendMessage(chatId, accountSwitchDoneText(name)),
           (err: any) => {
             const stderr = err?.stderr ? String(err.stderr).trim() : ''
             const detail = stderr || (err instanceof Error ? err.message : String(err))
-            return bot.api.sendMessage(chatId, accountSwitchFailedText(name, isSudoDenial(err), detail))
+            return bot.api.sendMessage(chatId, accountSwitchFailedText(name, isSudoDenial(err) || isAdminTierRequired(err), detail, lang))
           },
         )
         .catch(() => {})
@@ -3495,9 +3543,8 @@ const commandHandlers: Record<string, CommandHandler> = {
         `Reloads everything: fresh process + context, re-reads settings, latest CLI.\n\n` +
         `(Just need a clean slate in the same process? Use /clear — instant, keeps the running session.)`,
     )
-    void execFileP(
-      SUDO,
-      ['-n', '5dive', 'agent', '_self_restart'],
+    void sudo5dive(
+      ['5dive', 'agent', '_self_restart'],
       { timeout: 5000 },
     ).catch((err: any) => {
       const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -3565,9 +3612,8 @@ const commandHandlers: Record<string, CommandHandler> = {
     // survives this process's teardown, so the reply above is already on the
     // wire. On failure no restart fires (bot stays alive) — correct the
     // optimistic ack with a fresh reply.
-    void execFileP(
-      SUDO,
-      ['-n', '5dive', 'agent', '_self_restart'],
+    void sudo5dive(
+      ['5dive', 'agent', '_self_restart'],
       { timeout: 5000 },
     ).catch((err: any) => {
       const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -3591,9 +3637,8 @@ const commandHandlers: Record<string, CommandHandler> = {
     const chatId = ctx.chat?.id ?? Number(ctx.from?.id)
     let refreshStdout = ''
     try {
-      const { stdout } = await execFileP(
-        SUDO,
-        ['-n', '/usr/local/bin/5dive-refresh-plugins.sh', me],
+      const { stdout } = await sudo5dive(
+        ['/usr/local/bin/5dive-refresh-plugins.sh', me],
         { timeout: 120_000 },
       )
       refreshStdout = stdout
@@ -3625,9 +3670,8 @@ const commandHandlers: Record<string, CommandHandler> = {
         ? `Plugins refreshed (no version change):\n  ${after || before}`
         : `Plugins refreshed.`
     await ctx.reply(`${summary}\n\n⚠️  Restarting to apply — back in ~20-30s once the new session loads.`)
-    void execFileP(
-      SUDO,
-      ['-n', '5dive', 'agent', '_self_restart'],
+    void sudo5dive(
+      ['5dive', 'agent', '_self_restart'],
       { timeout: 5000 },
     ).catch((err: any) => {
       const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -3752,8 +3796,8 @@ const commandHandlers: Record<string, CommandHandler> = {
         return
       }
       try {
-        const { stdout } = await execFileP(
-          SUDO, ['-n', '5dive', 'agent', action, name, '--json'], { timeout: 8000 },
+        const { stdout } = await sudo5dive(
+          ['5dive', 'agent', action, name, '--json'], { timeout: 8000 },
         )
         const j = JSON.parse(stdout)
         if (!j.ok) {
@@ -3884,10 +3928,11 @@ const commandHandlers: Record<string, CommandHandler> = {
     }
     const from = ctx.from?.username || 'telegram'
     try {
-      const { stdout } = await execFileP(
-        SUDO,
-        ['-n', '5dive', 'task', 'add', '--json', `--from=${from}`, '--', title],
+      const { stdout } = await sudo5dive(
+        ['5dive', 'task', 'add', '--json', `--from=${from}`, '--', title],
         { timeout: 8000 },
+        // DIVE-5331: `task add` needs no root; a standard seat files it as itself.
+        'plain',
       )
       const j = JSON.parse(stdout)
       if (!j.ok) {
@@ -4043,7 +4088,7 @@ const commandHandlers: Record<string, CommandHandler> = {
       await ctx.reply(`Can't determine this agent's name (not running as agent-* user).`)
       return
     }
-    const menu = await buildAccountMenu(me)
+    const menu = await buildAccountMenu(me, liteLang(ctx.from?.language_code))
     if ('error' in menu) {
       await ctx.reply(menu.error)
       return
@@ -4059,10 +4104,12 @@ const commandHandlers: Record<string, CommandHandler> = {
     // DIVE-5220: both reads are root-only. On a seat whose grant does not
     // cover them, say so — never "CLI out of date", which was false there —
     // and do not spawn the sudo that would only be refused and mail root.
+    // DIVE-5331: instead of only refusing, a standard seat shows its OWN 5h/1w,
+    // read from its own statusline cache, and says where the board lives.
     const me = thisAgentName()
-    const seat: SeatAdmin = me ? await thisSeatAdmin(me) : 'unknown'
+    const seat: SeatAdmin = me ? await seatTier() : 'unknown'
     if (seat === 'no') {
-      await ctx.reply(USAGE_NOT_AVAILABLE_TEXT)
+      await ctx.reply(ownUsageText(liteLang(ctx.from?.language_code), readStatuslineLimits(), Date.now(), formatDuration))
       return
     }
     const [board, usageEnv] = await Promise.all([
@@ -4071,7 +4118,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     ])
     const read = classifyAccountUsage<FiveDiveAccountUsage>(usageEnv, seat, fiveRunner().sudoDenied())
     if (read.kind !== 'ok') {
-      await ctx.reply(read.kind === 'refused' ? USAGE_NOT_AVAILABLE_TEXT : USAGE_READ_FAILED_TEXT)
+      await ctx.reply(read.kind === 'refused' ? adminTierText(liteLang(ctx.from?.language_code)) : USAGE_READ_FAILED_TEXT)
       return
     }
     const usage = read.data
@@ -4482,7 +4529,11 @@ async function buildActionableInbox(
   // Fire it ONLY when a hard gate is actually pending, so the common all-soft
   // case never triggers a redundant second DM.
   let digestNote = ''
-  if (hardCount > 0) {
+  if (hardCount > 0 && (await seatTier()) === 'no') {
+    // DIVE-5331: the digest DM needs root; the gates are still listed above.
+    digestNote = `\n\n🔒 ${hardCount} hard gate${hardCount === 1 ? '' : 's'} (money/secret/destructive/brand) need a per-gate tap. ` +
+      TAP_STRINGS[langOfChat(senderId)].adminTier
+  } else if (hardCount > 0) {
     const sent = await handleInboxRequest('/inbox', senderId)
     digestNote =
       sent && sent.startsWith('📬')
@@ -4805,7 +4856,7 @@ async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: str
   if (cmd === 'restart') {
     const chatId = ctx.chat?.id ?? Number(ctx.from?.id)
     await ctx.reply(s.restarting)
-    void execFileP(SUDO, ['-n', '5dive', 'agent', '_self_restart'], { timeout: 5000 }).catch((err: any) => {
+    void sudo5dive(['5dive', 'agent', '_self_restart'], { timeout: 5000 }).catch((err: any) => {
       recordOpsDetail('/restart', err?.stderr ? String(err.stderr).trim() : err instanceof Error ? err.message : String(err))
       void bot.api.sendMessage(chatId, s.failed).catch(() => {})
     })
@@ -4866,6 +4917,13 @@ for (const def of COMMAND_REGISTRY) {
       // host doesn't leak the existence of 5dive-only commands. The /help
       // text already hides them for non-5dive hosts.
       await ctx.reply(`/${def.name} needs a newer 5dive CLI than this server is running. Update to the latest 5dive CLI, then try again.`)
+      return
+    }
+    // DIVE-5331: a command that needs root answers a standard-tier seat with the
+    // one admin-tier message, before anything runs. The seat is read only for
+    // such a command, and 'unknown' runs the handler as before.
+    if (standardSeatRoute(def.name, String(ctx.match ?? '')) === 'admin' && (await seatTier()) === 'no') {
+      await ctx.reply(adminTierText(liteLang(ctx.from?.language_code)))
       return
     }
     await handler(ctx, gate)
@@ -4957,6 +5015,17 @@ function notifyAgentOfConnect(ctx: Context, content: string): void {
 }
 
 async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: string): Promise<void> {
+  // DIVE-5331: `browser _connect` is not in a standard seat's grant. Say so once,
+  // in the owner's language, instead of a refused sudo behind a failure line.
+  try {
+    await sudoGateCheck(['5dive', 'browser', '_connect'])
+  } catch (e) {
+    if (!isAdminTierRequired(e)) throw e
+    const text = adminTierText(tapLang(ctx.from?.language_code, langOfChat(String(ctx.callbackQuery?.message?.chat.id ?? ''))))
+    await ctx.answerCallbackQuery({ text }).catch(() => {})
+    await ctx.editMessageText(text).catch(() => {})
+    return
+  }
   await ctx.answerCallbackQuery({ text: tap.op === 'tap' ? 'Opening the browser…' : 'Got it…' }).catch(() => {})
   // Drop the button now: a second tap while root works could only be refused.
   await ctx.editMessageReplyMarkup().catch(() => {})
@@ -4995,8 +5064,11 @@ async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: 
 // exits non-zero with its {ok:false} envelope on stdout, so stdout is kept.
 async function runOwnerAsk(args: string[]): Promise<string> {
   try {
-    return (await execFileP(SUDO, ['-n', '5dive', ...args], { timeout: 45_000 })).stdout
+    return (await sudo5dive(['5dive', ...args], { timeout: 45_000 })).stdout
   } catch (err) {
+    // DIVE-5331: a standard seat never spawns the root-only verb; the refusal
+    // rides the same {ok:false} envelope ownerAskOutcome already renders.
+    if (isAdminTierRequired(err)) return JSON.stringify({ ok: false, error: { class: 'permission', message: err.message } })
     return String((err as { stdout?: unknown })?.stdout ?? '')
   }
 }
@@ -5250,14 +5322,18 @@ bot.on('callback_query:data', async ctx => {
     }
     await ctx.answerCallbackQuery({ text: 'Recording veto…' }).catch(() => {})
     try {
-      await execFileP(
-        SUDO,
-        ['-n', '5dive', 'council', 'veto', 'exercise', `--receipt=${vetoTap.receipt}`, `--nonce=${vetoTap.nonce}`],
+      await sudo5dive(
+        ['5dive', 'council', 'veto', 'exercise', `--receipt=${vetoTap.receipt}`, `--nonce=${vetoTap.nonce}`],
         { timeout: 10000 },
       )
       // Exit 0 = the authenticated exercise sealed a veto record (the pass flips to blocked).
       await ctx.editMessageText('🛑 Veto recorded — the sealed pass is blocked, execution halted.').catch(() => {})
-    } catch {
+    } catch (e) {
+      // DIVE-5331: a standard seat cannot run the council bridge; say that, not "window closed".
+      if (isAdminTierRequired(e)) {
+        await ctx.editMessageText(tapStrings(ctx).adminTier).catch(() => {})
+        return
+      }
       // Refused (bad/expired nonce, window closed, already resolved) or a CLI/sudo error. Never
       // reveal the nonce; just drop the keyboard so it can't be re-tapped and ack softly.
       await ctx.answerCallbackQuery({ text: 'Veto not applied — the window may have closed or it was already resolved.' }).catch(() => {})
@@ -5289,14 +5365,17 @@ bot.on('callback_query:data', async ctx => {
     const label = cvoteTap.code === 'a' ? 'Approve' : cvoteTap.code === 'r' ? 'Reject' : 'Abstain'
     await ctx.answerCallbackQuery({ text: `Recording your vote: ${label}…` }).catch(() => {})
     try {
-      await execFileP(
-        SUDO,
-        ['-n', '5dive', 'council', 'ballot-tap', `--ref=${cvoteTap.ref}`, `--vote=${cvoteTap.code}`, `--nonce=${cvoteTap.nonce}`],
+      await sudo5dive(
+        ['5dive', 'council', 'ballot-tap', `--ref=${cvoteTap.ref}`, `--vote=${cvoteTap.code}`, `--nonce=${cvoteTap.nonce}`],
         { timeout: 10000 },
       )
       // Exit 0 = the bridge closed the ballot task with the COUNCIL-VOTE line (the convener tallies it).
       await ctx.editMessageText(`🗳️ Vote recorded: ${label}. Your council ballot is in.`).catch(() => {})
-    } catch {
+    } catch (e) {
+      if (isAdminTierRequired(e)) {
+        await ctx.editMessageText(tapStrings(ctx).adminTier).catch(() => {})
+        return
+      }
       // Refused (bad/expired nonce, already voted, ambiguous ref) or a CLI/sudo error. Never reveal the
       // nonce; just drop the keyboard so it can't be re-tapped and ack softly.
       await ctx.answerCallbackQuery({ text: 'Vote not recorded — the ballot may have closed or already been cast.' }).catch(() => {})
@@ -5316,7 +5395,7 @@ bot.on('callback_query:data', async ctx => {
   if (escM) {
     const taskId = escM[1]!
     try {
-      const r = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'escalate', taskId], { timeout: 8000 })
+      const r = await sudo5dive(['5dive', '--json', 'task', 'escalate', taskId], { timeout: 8000 }, 'plain')
       const pri = JSON.parse(r.stdout).data?.priority ?? 'high'
       await ctx.answerCallbackQuery({ text: `🔺 Escalated — priority ${pri}` }).catch(() => {})
       // DIVE-503: after escalating, swap the keyboard for a single "▶️ Do now"
@@ -5340,7 +5419,7 @@ bot.on('callback_query:data', async ctx => {
   if (dnM) {
     const taskId = dnM[1]!
     try {
-      const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
+      const show = await sudo5dive(['5dive', '--json', 'task', 'show', taskId], { timeout: 5000 }, 'plain')
       const task = JSON.parse(show.stdout).data?.task
       const assignee = task?.assignee ? String(task.assignee).replace(/^agent-/, '') : ''
       if (!assignee) {
@@ -5349,9 +5428,9 @@ bot.on('callback_query:data', async ctx => {
       }
       const ident = task?.ident ?? `task ${taskId}`
       // Flip to in_progress (idempotent; ignore if already started), then ping.
-      await execFileP(SUDO, ['-n', '5dive', 'task', 'start', taskId], { timeout: 8000 }).catch(() => {})
+      await sudo5dive(['5dive', 'task', 'start', taskId], { timeout: 8000 }, 'plain').catch(() => {})
       const msg = `▶️ Mark wants ${ident} done now — please pick it up immediately. Details: /task_${taskId}`
-      await execFileP(SUDO, ['-n', '5dive', 'agent', 'send', assignee, msg], { timeout: 8000 })
+      await sudo5dive(['5dive', 'agent', 'send', assignee, msg], { timeout: 8000 }, 'plain')
       await ctx.answerCallbackQuery({ text: `▶️ Pinged ${assignee} — on it now` }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
     } catch {
@@ -5367,7 +5446,7 @@ bot.on('callback_query:data', async ctx => {
   if (tdM) {
     const taskId = tdM[1]!
     try {
-      await execFileP(SUDO, ['-n', '5dive', 'task', 'done', taskId, `--result=${tapResult('done', taskId, senderId)}`], { timeout: 8000 })
+      await sudo5dive(['5dive', 'task', 'done', taskId, `--result=${tapResult('done', taskId, senderId)}`], { timeout: 8000 }, 'plain')
       await ctx.answerCallbackQuery({ text: '✅ Marked done' }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
     } catch (e) {
@@ -5392,7 +5471,7 @@ bot.on('callback_query:data', async ctx => {
   if (tccM) {
     const taskId = tccM[1]!
     try {
-      await execFileP(SUDO, ['-n', '5dive', 'task', 'cancel', taskId, `--result=${tapResult('cancel', taskId, senderId)}`], { timeout: 8000 })
+      await sudo5dive(['5dive', 'task', 'cancel', taskId, `--result=${tapResult('cancel', taskId, senderId)}`], { timeout: 8000 }, 'plain')
       await ctx.answerCallbackQuery({ text: '🚫 Cancelled' }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
     } catch (e) {
@@ -5457,6 +5536,11 @@ bot.on('callback_query:data', async ctx => {
   const grsM = GRESEND_RE.exec(data)
   if (grsM) {
     const taskId = grsM[1]!
+    // DIVE-5331: `task inbox --send` is root-only (require_root, task/inbox.sh).
+    if ((await seatTier()) === 'no') {
+      await ctx.answerCallbackQuery({ text: tapStrings(ctx).adminTier }).catch(() => {})
+      return
+    }
     try {
       const j = await write5diveJson(
         ['task', 'inbox', '--send', `--only=${taskId}`, `--channel-proof=${senderId}`, '--json'],
@@ -5476,7 +5560,7 @@ bot.on('callback_query:data', async ctx => {
   if (twM) {
     const taskId = twM[1]!
     try {
-      await execFileP(SUDO, ['-n', '5dive', 'task', 'unpark', taskId], { timeout: 8000 })
+      await sudo5dive(['5dive', 'task', 'unpark', taskId], { timeout: 8000 }, 'plain')
       await ctx.answerCallbackQuery({ text: '⏰ Woken — the owner picks it up on its next turn.' }).catch(() => {})
       const detail = await buildTaskDetail(Number(taskId))
       await ctx.editMessageText(detail.text, { reply_markup: detail.keyboard }).catch(() => {})
@@ -5711,9 +5795,8 @@ bot.on('callback_query:data', async ctx => {
     await ctx
       .editMessageText('🔄 New session — full restart (~20-30s). Fresh process + context, re-reads settings, latest CLI.')
       .catch(() => {})
-    void execFileP(
-      SUDO,
-      ['-n', '5dive', 'agent', '_self_restart'],
+    void sudo5dive(
+      ['5dive', 'agent', '_self_restart'],
       { timeout: 5000 },
     ).catch((err: any) => {
       const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -5823,7 +5906,7 @@ bot.on('callback_query:data', async ctx => {
   const accountM = /^account:([a-z][a-z0-9_-]{0,31}|default)$/.exec(data)
   if (accountM) {
     const chatId = ctx.chat?.id ?? Number(ctx.callbackQuery.from.id)
-    const r = await applyAccount(accountM[1]!, chatId)
+    const r = await applyAccount(accountM[1]!, chatId, tapLang(ctx.from?.language_code, langOfChat(String(chatId))))
     await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Not switched' }).catch(() => {})
     // DIVE-5220: rewrite the picker in place (which also drops its keyboard so
     // it can't be re-tapped) — to the ⏳ pending line on a switch, or to the
@@ -5845,6 +5928,15 @@ bot.on('callback_query:data', async ctx => {
     const me = thisAgentName()
     if (!me) {
       await ctx.answerCallbackQuery({ text: 'Not an agent user.' }).catch(() => {})
+      return
+    }
+    // DIVE-5331: `rotation set` is root-only. A standard seat's /account has no
+    // rotation button; a stale one gets the one message and the read-only view.
+    if ((await seatTier()) === 'no') {
+      const s = tapStrings(ctx)
+      await ctx.answerCallbackQuery({ text: s.adminTier }).catch(() => {})
+      const menu = await buildAccountMenu(me, tapLang(ctx.from?.language_code, langOfChat(String(ctx.callbackQuery.message?.chat.id ?? ''))))
+      if (!('error' in menu)) await ctx.editMessageText(menu.text).catch(() => {})
       return
     }
     if (data === 'rot:menu') {
@@ -6062,6 +6154,9 @@ async function handleInboxRequest(text: string, senderId: string): Promise<strin
   if (!INBOX_CMD_RE.test(text)) return null // not an /inbox trigger
   if (!senderId || !loadAccess().allowFrom.includes(senderId)) return null // not a registered human
   if (!(await read5diveVersion())) return null // 5dive-only surface; OSS hosts use buildInboxList
+  // DIVE-5331: the tap-button digest is minted by a root-only verb. A standard
+  // seat says so instead of spawning a sudo it would be refused.
+  if ((await seatTier()) === 'no') return TAP_STRINGS[langOfChat(senderId)].adminTier
   const j = await read5diveJson(['task', 'inbox', '--send', `--channel-proof=${senderId}`, '--json'], 10000)
   if (!j?.ok) {
     return `Couldn't send your gate inbox right now. ${String(j?.error?.message ?? '').slice(0, 160)}`.trim()
@@ -6397,13 +6492,13 @@ async function handleInbound(
   if (gateReply && gateReplyCtx.isDirect) {
     let handled = false
     try {
-      const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', gateReply.ident], { timeout: 5000 })
+      const show = await sudo5dive(['5dive', '--json', 'task', 'show', gateReply.ident], { timeout: 5000 }, 'plain')
       const gate = JSON.parse(show.stdout).data?.task
       const res = resolveGateReply(gateReply, gate, chat_id, msgId, text, gateReplyCtx)
       if (res.kind === 'answer') {
         handled = true
         try {
-          await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', ...res.answerArgs], { timeout: 15000 })
+          await sudo5dive(['5dive', '--json', 'task', 'answer', ...res.answerArgs], { timeout: 15000 }, 'plain')
           if (msgId != null) {
             void bot.api
               .setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '✅' as ReactionTypeEmoji['emoji'] }])
@@ -6440,7 +6535,7 @@ async function handleInbound(
     // behaviour is unchanged — only the derivation moved, so there is now one.
     const taskId = alertIdent.slice('DIVE-'.length)
     try {
-      const show = await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'show', taskId], { timeout: 5000 })
+      const show = await sudo5dive(['5dive', '--json', 'task', 'show', taskId], { timeout: 5000 }, 'plain')
       const task = JSON.parse(show.stdout).data?.task
       if (!task || !task.need_type) {
         await ctx.reply(`DIVE-${taskId} no longer has an open gate — nothing to answer.`).catch(() => {})
@@ -6466,7 +6561,7 @@ async function handleInbound(
         } else {
           // `task answer` records the value, clears the gate, and pings the owning
           // agent to resume (same path as the tna: button flow).
-          await execFileP(SUDO, ['-n', '5dive', '--json', 'task', 'answer', taskId, `--value=${value}`], { timeout: 8000 })
+          await sudo5dive(['5dive', '--json', 'task', 'answer', taskId, `--value=${value}`], { timeout: 8000 })
           if (msgId != null) {
             void bot.api
               .setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '✅' as ReactionTypeEmoji['emoji'] }])
@@ -6475,7 +6570,13 @@ async function handleInbound(
           await ctx.reply(`✅ Answered DIVE-${taskId} — the owning agent has been pinged to resume.`).catch(() => {})
         }
       }
-    } catch {
+    } catch (e) {
+      // DIVE-5331: a bare --value answer from a standard seat would land as the
+      // AGENT's answer, so the gate refuses it; say why, not a sudo recipe.
+      if (isAdminTierRequired(e)) {
+        await ctx.reply(TAP_STRINGS[langOfChat(chat_id)].adminTier).catch(() => {})
+        return
+      }
       // Stale message, deleted task, restarted agent, or a CLI/sudo failure (incl.
       // a gate answered between our show and answer). Nudge softly; never throw.
       await ctx
@@ -6546,9 +6647,8 @@ async function handleInbound(
       if (authedOk) {
         const me = thisAgentName()
         if (me) {
-          void execFileP(
-            SUDO,
-            ['-n', '5dive', 'agent', '_self_restart'],
+          void sudo5dive(
+            ['5dive', 'agent', '_self_restart'],
             { timeout: 5000 },
           ).catch((err: any) => {
             const stderr = err?.stderr ? String(err.stderr).trim() : ''

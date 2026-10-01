@@ -208,6 +208,18 @@ const TAP_EN = {
   alreadyAnswered: 'Already answered.',
   optionInvalid: 'That option is no longer valid.',
   expired: 'This prompt has expired.',
+  // DIVE-5331: the ONE answer a standard-tier agent gives for anything that
+  // needs root (the commands stay in the menu; lodar wants a reason, not a
+  // hidden command). Short enough for a tap toast (Telegram caps those at 200).
+  adminTier: 'This needs an admin-tier agent. Ask your box admin, or switch this agent to admin in the dashboard.',
+  // DIVE-5331: /usage on a standard seat — this agent's own 5h/1w, read from
+  // its own statusline, instead of the every-account board it may not read.
+  currentAccount: (name: string) => `Current account: ${name}`,
+  ownUsageTitle: "This agent's usage",
+  ownUsage5h: (pct: string, resets?: string) => `5h: ${pct}${resets ? ` · resets in ${resets}` : ''}`,
+  ownUsage1w: (pct: string, resets?: string) => `1w: ${pct}${resets ? ` · resets in ${resets}` : ''}`,
+  ownUsageNone: 'No usage reading yet — it appears after this agent next replies.',
+  ownUsageBoard: 'Usage for every account on this box needs an admin-tier agent, or the dashboard.',
 }
 
 export const TAP_STRINGS: Record<Lang, typeof TAP_EN> = {
@@ -230,6 +242,13 @@ export const TAP_STRINGS: Record<Lang, typeof TAP_EN> = {
     alreadyAnswered: 'Ответ уже получен.',
     optionInvalid: 'Этот вариант больше не действует.',
     expired: 'Этот вопрос уже неактуален.',
+    adminTier: 'Для этого нужен агент уровня admin. Попросите администратора сервера или переключите этого агента на admin в панели управления.',
+    currentAccount: (name: string) => `Текущий аккаунт: ${name}`,
+    ownUsageTitle: 'Расход этого агента',
+    ownUsage5h: (pct: string, resets?: string) => `5 ч: ${pct}${resets ? ` · сброс через ${resets}` : ''}`,
+    ownUsage1w: (pct: string, resets?: string) => `1 нед: ${pct}${resets ? ` · сброс через ${resets}` : ''}`,
+    ownUsageNone: 'Данных о расходе пока нет — они появятся после следующего ответа агента.',
+    ownUsageBoard: 'Расход по всем аккаунтам сервера доступен агенту уровня admin или в панели управления.',
   },
 }
 

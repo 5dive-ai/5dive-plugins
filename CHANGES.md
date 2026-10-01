@@ -1,5 +1,29 @@
 ## Unreleased
 
+### Fixed — Telegram on a standard-tier agent: commands work without root where they can, the rest say it needs an admin-tier agent (DIVE-5331), telegram 0.5.81
+
+New standard-tier seats are back on the full Telegram profile (5dive-ai/5dive#1194), and most of its
+commands still ran `sudo -n 5dive …`, which the seat's grant refuses. The owner read "sudo: a password is
+required", a generic "open the dashboard" toast, or nothing. lodar, 2026-10-01: "make it work as much as
+possible" and "tell proper you need to be admin tier error if not possible".
+
+Every command and button was audited against the standard grant and the CLI's own root checks (the
+table is on the PR). What needs no root now runs as the seat itself: `/task add`, the task-card
+Escalate / Do now / Done / Cancel / Wake buttons, and a typed gate answer that carries channel proof.
+`/usage` shows the seat's own 5h/1w and when each resets, read from its own statusline. Before, it was
+refused outright. `/account` shows the current account. `/inbox` lists every gate and says the
+tap-button digest for hard gates needs an admin tier.
+
+What needs root answers with one message, in English or Russian: *This needs an admin-tier agent. Ask
+your box admin, or switch this agent to admin in the dashboard.* That covers `/update`, `/login`,
+`/agents start|stop|restart`, `/digest on|off|at`, the account switch and rotation buttons, the tier-2
+gate resend, and the council, owner-ask and browser-connect taps. It replaces DIVE-5220's two separate
+strings. The commands stay in the menu. Every sudo spawn in `server.ts` now goes through one gate
+(`createSudoGate` in `seatpriv.ts`). On a standard seat the gate runs the seat's own grant
+(`_self_restart`), the unprivileged path for an audited verb, or refuses without spawning anything, so
+no refused sudo mails root. On an admin seat, or when the tier cannot be read, it spawns exactly the
+`sudo -n` argv as before. No grant was widened.
+
 ### Added — Telegram buttons follow the user's language, and lite gains /stop /status /restart /clear (DIVE-5306), telegram 0.5.79
 
 OINOA's users are mostly Russian speakers, and an agent's yes/no question came with English buttons
