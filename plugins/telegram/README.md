@@ -104,6 +104,14 @@ On both profiles, the buttons the bridge puts under an agent's question (Yes/No,
 permission prompt) and the replies to a tap are in the human's Telegram language: Russian for a `ru`
 app language, English for any other. What a tap tells the agent is English either way.
 
+On a **standard-tier** seat (the default for every agent after a box's first), the default profile keeps
+every command in the menu. A command that needs no root works as on an admin seat. `/task add`, the task
+card buttons and a typed gate answer run as the seat itself. `/usage` shows the seat's own 5h/1w, and
+`/account` shows the current account. Anything that needs root (`/update`, `/login`, `/agents
+start|stop|restart`, `/digest on|off`, switching account or rotation) answers with one message, in English
+or Russian: *This needs an admin-tier agent. Ask your box admin, or switch this agent to admin in the
+dashboard.* See `seatpriv.ts`.
+
 ## Tools exposed to the assistant
 
 | Tool | Purpose |

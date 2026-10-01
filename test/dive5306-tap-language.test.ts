@@ -158,9 +158,11 @@ describe('lite /stop /status /restart /clear', () => {
     expect(STOP_CLEAR).toContain("if (!user.startsWith('agent-'))")
   })
   test('/restart calls exactly sudo -n 5dive agent _self_restart, after the reply', () => {
-    expect(RESTART).toContain("execFileP(SUDO, ['-n', '5dive', 'agent', '_self_restart'], { timeout: 5000 })")
+    // DIVE-5331: via the sudo gate, which passes the seat's own grant straight to `sudo -n`.
+    expect(RESTART).toContain("sudo5dive(['5dive', 'agent', '_self_restart'], { timeout: 5000 })")
     expect(RESTART.indexOf('ctx.reply(s.restarting)')).toBeLessThan(RESTART.indexOf('_self_restart'))
-    expect((RESTART.match(/execFileP\(/g) ?? []).length).toBe(1)
+    expect((RESTART.match(/sudo5dive\(/g) ?? []).length).toBe(1)
+    expect(RESTART).not.toMatch(/execFileP\(/)
   })
   const noOrg = (a: string) => !/SUDO|sudo|digest|read5dive|execFileP/.test(a)
   test('/status reads only the seat\'s own session file: no sudo, no digest, no CLI', () => {

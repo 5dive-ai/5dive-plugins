@@ -72,7 +72,8 @@ describe('/usage says what happened', () => {
       expect(r.kind).toBe('refused')
     }
     expect(USAGE_NOT_AVAILABLE_TEXT).not.toContain('out of date')
-    expect(USAGE_NOT_AVAILABLE_TEXT).toContain("isn't available on this agent")
+    // DIVE-5331: the one admin-tier message replaced 5220's own string.
+    expect(USAGE_NOT_AVAILABLE_TEXT).toContain('needs an admin-tier agent')
   })
   test('an admin seat that reads the board gets the data', () => {
     const r = classifyAccountUsage({ ok: true, data: [{ name: 'mark', usage: null }] }, 'yes', false)
@@ -88,7 +89,7 @@ describe('/account never claims a switch it has not made', () => {
   test('the read-only view names the current account and who can switch it', () => {
     const t = accountReadOnlyText('mark')
     expect(t).toContain('Current account: mark')
-    expect(t).toContain('Only an admin switches')
+    expect(t).toContain('needs an admin-tier agent')
     expect(t).not.toContain('✅')
   })
   test('the pending text carries no ✅; only the done text does', () => {
@@ -99,7 +100,7 @@ describe('/account never claims a switch it has not made', () => {
   test('a refusal is one plain message, not a quoted sudo error', () => {
     const t = accountSwitchFailedText('mark', true, 'sudo: a password is required')
     expect(t).toStartWith('❌')
-    expect(t).toContain('Only an admin switches')
+    expect(t).toContain('needs an admin-tier agent')
     expect(t).not.toContain('sudo')
     expect(t).not.toContain('✅')
   })
@@ -125,7 +126,7 @@ describe('server.ts wiring', () => {
     expect(apply).toContain('text: accountSwitchPendingText(name)')
     expect(apply).not.toMatch(/text: `✅/)
     expect(apply).toMatch(/set-account'[\s\S]*\.then\(\s*\(\) => bot\.api\.sendMessage\(chatId, accountSwitchDoneText\(name\)\)/)
-    expect(apply).toContain('accountSwitchFailedText(name, isSudoDenial(err), detail)')
+    expect(apply).toContain('accountSwitchFailedText(name, isSudoDenial(err) || isAdminTierRequired(err), detail, lang)')
   })
   test('the picker is swapped for the read-only view on a standard seat, before the root-only reads', () => {
     const gate = menu.indexOf("=== 'no'")
@@ -136,7 +137,8 @@ describe('server.ts wiring', () => {
   test('/usage answers a standard seat without spawning the reads, and classifies the rest', () => {
     const gate = usage.indexOf("seat === 'no'")
     expect(gate).toBeGreaterThan(-1)
-    expect(usage.indexOf('USAGE_NOT_AVAILABLE_TEXT')).toBeGreaterThan(gate)
+    // DIVE-5331: the standard seat now gets its own usage, not only a refusal.
+    expect(usage.indexOf('ownUsageText(')).toBeGreaterThan(gate)
     expect(usage.indexOf("read5diveJson(['account', 'usage', '--json'])")).toBeGreaterThan(gate)
     expect(usage).toContain('classifyAccountUsage<FiveDiveAccountUsage>(')
     expect(usage).not.toContain('`Couldn\'t read usage')
