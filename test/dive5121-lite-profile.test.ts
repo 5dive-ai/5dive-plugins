@@ -118,7 +118,9 @@ describe('no profile set = the plugin as it is today', () => {
     const uses = SERVER.split('\n').filter(l => /\bLITE\b/.test(l) && !/^\s*\/\//.test(l))
     const shapes = [
       /^const LITE = resolveProfile\(\) === 'lite'$/,
-      /^\s*if \(LITE\) (writeLiteLang|void \(async)/,
+      // DIVE-5306: the language is recorded on every profile now (noteChatLang),
+      // so the `if (LITE) writeLiteLang` guard is gone and the count drops to 13.
+      /^\s*if \(LITE\) void \(async/,
       /^\s*if \(LITE\) \{$/,
       // DIVE-5194: the ack reaction is no longer guarded; lite only defaults it.
       /^\s*const ackReaction = ackReactionFor\(access\.ackReaction, LITE\)$/,
@@ -133,7 +135,7 @@ describe('no profile set = the plugin as it is today', () => {
     ]
     const odd = uses.filter(l => !shapes.some(re => re.test(l)))
     expect(odd).toEqual([])
-    expect(uses).toHaveLength(14)
+    expect(uses).toHaveLength(13)
   })
 
   test('the lite front door is registered only under LITE, ahead of every other update handler', () => {
@@ -188,6 +190,8 @@ function clientVisible(lang: Lang): string[] {
   const out: string[] = [
     s.failed, s.accountPrompt, s.accountButton, s.helpQuestions,
     ...Object.values(s.menu),
+    // DIVE-5306: /stop, /restart, /clear and /status replies.
+    s.stopped, s.restarting, s.cleared, s.status.working('3 min'), s.status.idle('5 min'), s.status.down,
     // DIVE-5194: the carry-over nudge and its buttons now reach a lite client.
     ...s.carryover.tiers, s.carryover.remember, s.carryover.notYet, s.carryover.saving, s.carryover.carryOn,
     liteHelpBody(lang, { account: true }),
@@ -201,31 +205,31 @@ const EMOJI = /\p{Extended_Pictographic}/u
 const leaks = (strings: string[]) => strings.filter(t => LEAK.test(t) || EMOJI.test(t))
 
 describe('lite = the surface oinoa agreed', () => {
-  test('the / menu is exactly the four commands, in both languages (DIVE-5173 dropped /new and /stop)', () => {
+  test('the / menu is exactly the eight commands, in both languages (DIVE-5306 added stop/status/restart/clear; /new stays out)', () => {
     for (const lang of ['ru', 'en'] as const) {
-      expect(liteMenu(lang, { account: true }).map(c => c.command)).toEqual(['start', 'usage', 'account', 'help'])
+      expect(liteMenu(lang, { account: true }).map(c => c.command)).toEqual(['start', 'usage', 'account', 'help', 'stop', 'status', 'restart', 'clear'])
       // no cabinet URL on the box → no button that goes nowhere
-      expect(liteMenu(lang, { account: false }).map(c => c.command)).toEqual(['start', 'usage', 'help'])
+      expect(liteMenu(lang, { account: false }).map(c => c.command)).toEqual(['start', 'usage', 'help', 'stop', 'status', 'restart', 'clear'])
     }
-    expect(liteMenu('ru', { account: true }).map(c => c.description)).toEqual(['Начать', 'Лимит', 'Мой кабинет', 'Помощь'])
-    expect(liteMenu('en', { account: true }).map(c => c.description)).toEqual(['Start', 'Allowance', 'My account', 'Help'])
+    expect(liteMenu('ru', { account: true }).map(c => c.description)).toEqual(['Начать', 'Лимит', 'Мой кабинет', 'Помощь', 'Остановить', 'Статус', 'Перезапустить', 'Новый разговор'])
+    expect(liteMenu('en', { account: true }).map(c => c.description)).toEqual(['Start', 'Allowance', 'My account', 'Help', 'Stop', 'Status', 'Restart', 'New conversation'])
   })
 
   test('every org command is unreachable: it routes to the /help reply', () => {
     const orgOnly = COMMAND_REGISTRY.map(c => c.name).filter(n => !(LITE_COMMANDS as readonly string[]).includes(n))
-    // 18 plus /stop and /clear, which DIVE-5173 took out of lite (19 → 18 was DIVE-5164's /council)
-    expect(orgOnly.length).toBe(20)
-    expect(orgOnly).toContain('stop')
-    expect(orgOnly).toContain('clear')
+    // 20 before DIVE-5306, which moved /stop, /clear, /status and /restart into lite.
+    expect(orgOnly.length).toBe(16)
+    for (const c of ['stop', 'clear', 'status', 'restart']) expect(orgOnly).not.toContain(c)
     for (const n of orgOnly) expect(liteRoute(`/${n}`)).toBe('help')
-    for (const n of ['task_12', 'nudges', 'whatever', 'login', 'status', 'council']) expect(liteRoute(`/${n}`)).toBe('help')
+    for (const n of ['task_12', 'nudges', 'whatever', 'login', 'council']) expect(liteRoute(`/${n}`)).toBe('help')
   })
 
-  test('the four route to themselves; /new, /clear and /stop get /help (DIVE-5173); chat is not a command', () => {
+  test('the eight route to themselves; /new gets /help (DIVE-5173); chat is not a command', () => {
     for (const c of LITE_COMMANDS) expect(liteRoute(`/${c}`)).toBe(c)
     expect(liteRoute('/start ref_abc123')).toBe('start')
-    for (const t of ['/new', '/NEW@MayaBot', '/clear', '/stop', '/stop@MayaBot now']) expect(liteRoute(t)).toBe('help')
-    for (const c of ['new', 'clear', 'stop']) expect(liteMenu('en', { account: true }).some(m => m.command === c)).toBe(false)
+    expect(liteRoute('/stop@MayaBot now')).toBe('stop')
+    for (const t of ['/new', '/NEW@MayaBot']) expect(liteRoute(t)).toBe('help')
+    expect(liteMenu('en', { account: true }).some(m => m.command === 'new')).toBe(false)
     for (const t of ['hello', '', ' /new', 'what does /usage say?', undefined]) expect(liteRoute(t)).toBeNull()
   })
 

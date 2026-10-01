@@ -46,6 +46,7 @@ import {
 } from './seatpriv.ts'
 import { planAutoAttach, autoAttachFooter, attachedNames, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
+import { questionLabel } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
@@ -66,6 +67,7 @@ import {
   MSGLOG_MAX_PER_CHAT,
 } from './msglog'
 import { ackReactionFor } from './hooks/lib/lite.ts'
+import { TAP_STRINGS, tapLang, liteStatusText } from './hooks/lib/lite.ts'
 import { onDemoAccount, readDemoKey, claimDemoNotice, releaseDemoNotice, rearmDemoNotice, pruneDemoStamps, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './hooks/lib/demo-key.ts'
 
 // Plugin version is sourced from .claude-plugin/plugin.json — the same
@@ -164,6 +166,27 @@ const SEND_ONLY = process.env.TELEGRAM_SEND_ONLY === '1'
 // TELEGRAM_PROFILE=lite, and every use below is `if (LITE)` / `!LITE`, so a box
 // that sets nothing runs the code it ran before the profile existed.
 const LITE = resolveProfile() === 'lite'
+
+// DIVE-5306: the language of the human in each chat, from the last inbound's
+// Telegram language_code, so the buttons the bridge writes (TAP_STRINGS) read
+// in it. Kept per chat in memory; the box-wide lite-lang file is the fallback
+// after a restart and is what the out-of-process hooks read. An inbound with
+// no code changes nothing, and a chat never heard from reads English.
+const chatLang = new Map<string, Lang>()
+function noteChatLang(chatId: string, code: string | undefined): void {
+  if (!code) return
+  const lang = liteLang(code)
+  chatLang.set(chatId, lang)
+  writeLiteLang(STATE_DIR, lang)
+}
+function langOfChat(chatId: string): Lang {
+  return chatLang.get(chatId) ?? readLiteLang()
+}
+/** The strings for a tap: the tapper's own code, else the chat's. */
+function tapStrings(ctx: Context): (typeof TAP_STRINGS)[Lang] {
+  const chatId = String(ctx.callbackQuery?.message?.chat.id ?? ctx.from?.id ?? '')
+  return TAP_STRINGS[tapLang(ctx.from?.language_code, langOfChat(chatId))]
+}
 
 if (!TOKEN) {
   process.stderr.write(
@@ -1317,12 +1340,14 @@ mcp.setNotificationHandler(
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
-    const text = `🔐 Permission: ${tool_name}`
-    const keyboard = new InlineKeyboard()
-      .text('See more', `perm:more:${request_id}`)
-      .text('✅ Allow', `perm:allow:${request_id}`)
-      .text('❌ Deny', `perm:deny:${request_id}`)
     for (const chat_id of access.allowFrom) {
+      // DIVE-5306: each DM in its own human's language.
+      const s = TAP_STRINGS[langOfChat(chat_id)]
+      const text = s.permTitle(tool_name)
+      const keyboard = new InlineKeyboard()
+        .text(s.permMore, `perm:more:${request_id}`)
+        .text(s.allow, `perm:allow:${request_id}`)
+        .text(s.deny, `perm:deny:${request_id}`)
       void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
         process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
       })
@@ -1440,16 +1465,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 // Opt-out: an agent can append `<!-- no-buttons -->` (or `<!-- no-yn -->`) to
 // suppress; the marker is stripped from the outgoing text either way.
 const YN_SUPPRESS = /\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i
-function yesNoButtons(text: string): { stripped: string; keyboard?: InlineKeyboard } {
+function yesNoButtons(text: string, lang: Lang): { stripped: string; keyboard?: InlineKeyboard } {
   if (YN_SUPPRESS.test(text)) return { stripped: text.replace(YN_SUPPRESS, '') }
   // DIVE-1429: pure polar-question detection lives in tna.ts (yesNoChoice); it
   // excludes wh-questions ("what's up?") that a Yes/No answer can't address.
   // DIVE-5121: no emoji Yes/No pair on a lite box (a partner brand rule, and
   // English-only labels); the client answers in words.
   if (LITE || !yesNoChoice(text)) return { stripped: text }
+  // DIVE-5306: labelled in the language of the chat it goes to.
+  const s = TAP_STRINGS[lang]
   return {
     stripped: text,
-    keyboard: new InlineKeyboard().text('✅ Yes', 'yn:yes').text('❌ No', 'yn:no'),
+    keyboard: new InlineKeyboard().text(s.yes, 'yn:yes').text(s.no, 'yn:no'),
   }
 }
 
@@ -1569,7 +1596,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         })()
         // DIVE-332: detect a trailing yes/no question and strip any opt-out
         // marker. The Yes/No keyboard attaches to the LAST text chunk only.
-        const { stripped: strippedRaw, keyboard: ynKeyboard } = yesNoButtons(text)
+        const { stripped: strippedRaw, keyboard: ynKeyboard } = yesNoButtons(text, langOfChat(chat_id))
         // DIVE-4280: the auto-attach footer goes on AFTER the button detectors
         // have read the original text — otherwise it eats the trailing '?' the
         // Yes/No and option keyboards key off. It IS part of the logical
@@ -3266,7 +3293,8 @@ const commandHandlers: Record<string, CommandHandler> = {
       lines.push(`plugin: v${PLUGIN_VERSION}`)
       const fiveDiveVersion = await read5diveVersion()
       if (fiveDiveVersion) {
-        lines.push(`5dive: v${fiveDiveVersion}`)
+        // DIVE-5306 (lodar: "dont show 5dive v0. just say cli v0").
+        lines.push(`cli: v${fiveDiveVersion}`)
         // Auth profile bound to this agent. Same source as the /account
         // picker. Skip on non-5dive hosts (no agent registry to consult).
         const me = thisAgentName()
@@ -4757,6 +4785,36 @@ async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: str
     await ctx.reply(liteUsageText(lang, await readAllowance()))
     return
   }
+  // DIVE-5306: /stop, /clear, /restart do what the full profile's handlers do
+  // (C-c or /clear into the seat's own pane, `_self_restart`), all of which a
+  // standard seat may run. The client is told the outcome in plain words; a
+  // pane name, a process or a session never reaches the chat (recordOpsDetail).
+  if (cmd === 'stop' || cmd === 'clear') {
+    const user = process.env.USER ?? process.env.LOGNAME ?? ''
+    const keys = cmd === 'stop' ? ['C-c'] : ['/clear', 'Enter']
+    try {
+      if (!user.startsWith('agent-')) throw new Error(`no agent pane (USER=${user || '?'})`)
+      await execFileP(TMUX, ['send-keys', '-t', `${user}:0`, ...keys])
+      await ctx.reply(cmd === 'stop' ? s.stopped : s.cleared)
+    } catch (err) {
+      recordOpsDetail(`/${cmd}`, err instanceof Error ? err.message : String(err))
+      await ctx.reply(s.failed)
+    }
+    return
+  }
+  if (cmd === 'restart') {
+    const chatId = ctx.chat?.id ?? Number(ctx.from?.id)
+    await ctx.reply(s.restarting)
+    void execFileP(SUDO, ['-n', '5dive', 'agent', '_self_restart'], { timeout: 5000 }).catch((err: any) => {
+      recordOpsDetail('/restart', err?.stderr ? String(err.stderr).trim() : err instanceof Error ? err.message : String(err))
+      void bot.api.sendMessage(chatId, s.failed).catch(() => {})
+    })
+    return
+  }
+  if (cmd === 'status') {
+    await ctx.reply(liteStatusText(lang, findActiveSession(), Date.now()))
+    return
+  }
   // A URL button, not web_app: a web_app button in THIS bot would sign initData
   // with this bot's token, which the partner's cabinet must reject.
   if (cmd === 'account' && accountKb) {
@@ -4947,7 +5005,7 @@ async function runOwnerAsk(args: string[]): Promise<string> {
 // says it is a tap — in the content, in meta (via=button + the answered message
 // id + Telegram's callback id) and in the recent_messages log — because a bare
 // 'yes' under the BOT's message id, off-log, is what a forgery looks like.
-function relayButtonTap(ctx: Context, value: string, fallbackButton: string, what: string): void {
+function relayButtonTap(ctx: Context, value: string, fallbackButton: string, what: string, canonical = false): void {
   const cq = ctx.callbackQuery!
   const msg = cq.message
   const from = ctx.from!
@@ -4959,7 +5017,7 @@ function relayButtonTap(ctx: Context, value: string, fallbackButton: string, wha
   const pressed = msg && 'reply_markup' in msg
     ? msg.reply_markup?.inline_keyboard.flat().find(b => 'callback_data' in b && b.callback_data === cq.data)?.text
     : undefined
-  const tap = { value, button: pressed ?? fallbackButton, answersMessageId: msg?.message_id, callbackQueryId: cq.id }
+  const tap = { value, button: (canonical ? undefined : pressed) ?? fallbackButton, answersMessageId: msg?.message_id, callbackQueryId: cq.id }
   const user = from.username ?? String(from.id)
   const ts = new Date().toISOString()
   // No human message id: the id on hand is the BOT's keyboard message, and a
@@ -5052,31 +5110,36 @@ bot.on('callback_query:data', async ctx => {
       ansExists = false
     }
     const r = resolveQuestionTap(data, reqRaw, ansExists)
+    const s = tapStrings(ctx)
     if (r.kind === 'answer') {
       try {
         const tmp = `${ansFile}.tmp.${process.pid}`
         writeFileSync(tmp, JSON.stringify({ idx: r.idx, answer: r.answer, at: Date.now() }), { mode: 0o600 })
         renameSync(tmp, ansFile)
-        const short = r.answer.length > 48 ? r.answer.slice(0, 47) + '…' : r.answer
-        await ctx.answerCallbackQuery({ text: `Sent: ${short}` }).catch(() => {})
+        // DIVE-5306: the answer written for the agent is an English sentence
+        // ("The user selected: …"); a non-English tapper is shown the option's
+        // own label instead. English keeps the sentence, as before.
+        const seen = s === TAP_STRINGS.en ? r.answer : questionLabel(reqRaw, r.idx) ?? r.answer
+        const short = seen.length > 48 ? seen.slice(0, 47) + '…' : seen
+        await ctx.answerCallbackQuery({ text: s.sent(short) }).catch(() => {})
         await ctx.editMessageText(`✅ ${short}`).catch(() => {})
       } catch {
-        await ctx.answerCallbackQuery({ text: "Couldn't record — reply in chat." }).catch(() => {})
+        await ctx.answerCallbackQuery({ text: s.notRecorded }).catch(() => {})
       }
       return
     }
     if (r.kind === 'already') {
-      await ctx.answerCallbackQuery({ text: 'Already answered.' }).catch(() => {})
+      await ctx.answerCallbackQuery({ text: s.alreadyAnswered }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
       return
     }
     if (r.kind === 'invalid') {
-      await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
+      await ctx.answerCallbackQuery({ text: s.optionInvalid }).catch(() => {})
       await ctx.editMessageReplyMarkup().catch(() => {})
       return
     }
     // expired: request file gone — hook timed out and cleaned up, or a restart.
-    await ctx.answerCallbackQuery({ text: 'This prompt has expired.' }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: s.expired }).catch(() => {})
     await ctx.editMessageReplyMarkup().catch(() => {})
     return
   }
@@ -5501,9 +5564,12 @@ bot.on('callback_query:data', async ctx => {
   const ynM = /^yn:(yes|no)$/.exec(data)
   if (ynM) {
     const value = ynM[1]!
-    relayButtonTap(ctx, value, value === 'yes' ? '✅ Yes' : '❌ No', 'yes/no')
+    // DIVE-5306: the agent reads the English label whatever the button showed
+    // (`canonical`); only the ack is in the tapper's language.
+    relayButtonTap(ctx, value, value === 'yes' ? '✅ Yes' : '❌ No', 'yes/no', true)
     await ctx.editMessageReplyMarkup().catch(() => {})
-    await ctx.answerCallbackQuery({ text: value === 'yes' ? '👍 Yes' : '👎 No' }).catch(() => {})
+    const s = tapStrings(ctx)
+    await ctx.answerCallbackQuery({ text: value === 'yes' ? s.yesAck : s.noAck }).catch(() => {})
     return
   }
 
@@ -5521,7 +5587,7 @@ bot.on('callback_query:data', async ctx => {
       ?? (msg && 'text' in msg && typeof msg.text === 'string' ? parseOptions(msg.text).map(o => o.label) : [])
     const value = labels[idx]
     if (value == null) {
-      await ctx.answerCallbackQuery({ text: 'That option is no longer available.' }).catch(() => {})
+      await ctx.answerCallbackQuery({ text: tapStrings(ctx).optionGone }).catch(() => {})
       return
     }
     relayButtonTap(ctx, value, `option ${idx + 1}`, 'option')
@@ -5880,9 +5946,10 @@ bot.on('callback_query:data', async ctx => {
   const [, behavior, request_id] = m
 
   if (behavior === 'more') {
+    const s = tapStrings(ctx)
     const details = pendingPermissions.get(request_id)
     if (!details) {
-      await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {})
+      await ctx.answerCallbackQuery({ text: s.permGone }).catch(() => {})
       return
     }
     const { tool_name, description, input_preview } = details
@@ -5893,13 +5960,13 @@ bot.on('callback_query:data', async ctx => {
       prettyInput = input_preview
     }
     const expanded =
-      `🔐 Permission: ${tool_name}\n\n` +
+      `${s.permTitle(tool_name)}\n\n` +
       `tool_name: ${tool_name}\n` +
       `description: ${description}\n` +
       `input_preview:\n${prettyInput}`
     const keyboard = new InlineKeyboard()
-      .text('✅ Allow', `perm:allow:${request_id}`)
-      .text('❌ Deny', `perm:deny:${request_id}`)
+      .text(s.allow, `perm:allow:${request_id}`)
+      .text(s.deny, `perm:deny:${request_id}`)
     await ctx.editMessageText(expanded, { reply_markup: keyboard }).catch(() => {})
     await ctx.answerCallbackQuery().catch(() => {})
     return
@@ -5910,7 +5977,7 @@ bot.on('callback_query:data', async ctx => {
     params: { request_id, behavior },
   })
   pendingPermissions.delete(request_id)
-  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+  const label = behavior === 'allow' ? tapStrings(ctx).allowed : tapStrings(ctx).denied
   await ctx.answerCallbackQuery({ text: label }).catch(() => {})
   // Replace buttons with the outcome so the same request can't be answered
   // twice and the chat history shows what was chosen.
@@ -6507,9 +6574,10 @@ async function handleInbound(
   // path as the default profile; a lite box that names no reaction gets 👀
   // (ackReactionFor), because no lite box writes one and the model cannot be
   // relied on to react.
-  // Lite also remembers the client's language, for the hooks, which answer out
-  // of process with no update to read it from.
-  if (LITE) writeLiteLang(STATE_DIR, liteLang(from.language_code))
+  // Remember the human's language: for the hooks, which answer out of process
+  // with no update to read it from, and (DIVE-5306) for the buttons the bridge
+  // writes. Lite only, until DIVE-5306 made it every profile's.
+  noteChatLang(chat_id, from.language_code)
   const ackReaction = ackReactionFor(access.ackReaction, LITE)
   if (ackReaction && msgId != null) {
     void bot.api

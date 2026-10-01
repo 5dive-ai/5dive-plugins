@@ -92,13 +92,17 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 ## Profiles
 
 `TELEGRAM_PROFILE=lite` in `~/.claude/channels/telegram/.env` gives a partner's client a light bot: the
-commands `/start /new /stop /usage /account /help` (English, and Russian for ru clients), consumer
+commands `/start /usage /account /help /stop /status /restart /clear` (English, and Russian for ru clients), consumer
 instructions with no operator rules, neutral emoji-free bot text, and none of a 5dive org's machinery
 (tasks, gates, council, banners). Only the allowlisted owner is answered. Everything the client does not
 see runs as in the default profile: the ack reaction (👀 unless `ackReaction` names another), the typing
 indicator, the silence watchdog and the opt-in context nudge, whose text is the neutral localized one.
 `TELEGRAM_ACCOUNT_URL=https://…` adds the `/account` button. Anything else, including unset, is the
 default profile, which is unchanged. See `hooks/lib/lite.ts`.
+
+On both profiles, the buttons the bridge puts under an agent's question (Yes/No, Allow/Deny on a
+permission prompt) and the replies to a tap are in the human's Telegram language: Russian for a `ru`
+app language, English for any other. What a tap tells the agent is English either way.
 
 ## Tools exposed to the assistant
 

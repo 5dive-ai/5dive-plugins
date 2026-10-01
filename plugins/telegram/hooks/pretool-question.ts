@@ -96,7 +96,7 @@ try {
   mkdirSync(questionDir(), { recursive: true, mode: 0o700 })
   writeFileSync(
     reqFile,
-    JSON.stringify({ tool, chatId, labels: spec!.buttons.map(b => b.answer), createdAt: Date.now() }),
+    JSON.stringify({ tool, chatId, labels: spec!.buttons.map(b => b.answer), shown: spec!.buttons.map(b => b.label), createdAt: Date.now() }),
     { mode: 0o600 },
   )
 } catch {

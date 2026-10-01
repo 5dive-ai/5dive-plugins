@@ -1,14 +1,15 @@
 // DIVE-5173: three lite changes, one release (owner asks, OINOA, 2026-09-29).
 //
-//   1. /new and its hidden /clear alias are gone: a client cannot wipe the
-//      conversation from the chat. They get the /help reply.
-//   2. /stop is gone too: a client cannot interrupt a turn from the chat.
+//   1. /new is gone: it gets the /help reply. (Its /clear alias came back as a
+//      command of its own in DIVE-5306.)
+//   2. /stop was gone too, until DIVE-5306 put it back (lodar, 2026-10-01: a
+//      sandboxed seat runs lite and has to be stoppable from chat).
 //   3. A bare /start is answered AT ONCE with the pack's welcome, no model turn.
 //      The text is `ext.5dive.welcome.{en,ru}` in the agent's persona.yaml.
 //      No welcome → the model greets, as before. A deep-link payload still goes
 //      to the model after the welcome.
 //
-// The menu/route half lives in dive5121-lite-profile.test.ts (four commands).
+// The menu/route half lives in dive5121-lite-profile.test.ts (eight commands).
 // server.ts long-polls Telegram on import, so it is read as TEXT here.
 
 import { describe, test, expect, afterEach } from 'bun:test'
@@ -102,9 +103,10 @@ function startArmOk(body: string): boolean {
   const inbound = arm.indexOf('await handleInbound(ctx, text, undefined)')
   return welcome > -1 && bareReturn > welcome && inbound > bareReturn && arm.includes('msglogAppend(MSGLOG_DIR, chatId,')
 }
-/** Nothing in liteCommand resets or interrupts the pane. */
+/** liteCommand has no /new arm. (DIVE-5306 brought /stop and /clear back,
+ *  so C-c and /clear into the pane are legitimate now; /new is not.) */
 function resetArmGone(body: string): boolean {
-  return !/cmd === 'new'|cmd === 'stop'|'\/clear', 'Enter'|'C-c'|newDone|stopDone/.test(body)
+  return !/cmd === 'new'|newDone/.test(body)
 }
 
 describe('server.ts liteCommand', () => {
@@ -114,20 +116,18 @@ describe('server.ts liteCommand', () => {
     expect(startArmOk(body)).toBe(true)
   })
 
-  test('the /new and /stop arm is gone: nothing sends /clear or C-c to the pane', () => {
+  test('the /new arm is gone', () => {
     expect(resetArmGone(body)).toBe(true)
     for (const lang of ['ru', 'en'] as const) {
-      expect(Object.keys(LITE_STRINGS[lang].menu)).toEqual(['start', 'usage', 'account', 'help'])
-      expect('newDone' in LITE_STRINGS[lang] || 'stopDone' in LITE_STRINGS[lang]).toBe(false)
+      expect(Object.keys(LITE_STRINGS[lang].menu)).not.toContain('new')
+      expect('newDone' in LITE_STRINGS[lang]).toBe(false)
     }
-    for (const t of ['/new', '/clear', '/stop']) expect(liteRoute(t)).toBe('help')
+    expect(liteRoute('/new')).toBe('help')
   })
 
   test('negative control: both checks go red on the mutants they exist to catch', () => {
     const sendsClear = body.replace("if (cmd === 'usage')", "if (cmd === 'new') {\n    await execFileP(TMUX, ['send-keys', '-t', 't:0', '/clear', 'Enter'])\n  }\n  if (cmd === 'usage')")
-    const sendsCtrlC = body.replace("if (cmd === 'usage')", "if (cmd === 'x') await execFileP(TMUX, ['send-keys', '-t', 't:0', 'C-c'])\n  if (cmd === 'usage')")
     expect(resetArmGone(sendsClear)).toBe(false)
-    expect(resetArmGone(sendsCtrlC)).toBe(false)
     const modelFirst = body.replace('if (!liteStartPayload(text)) return', '')          // bare /start → model turn
     const unlogged = body.replace('msglogAppend(MSGLOG_DIR, chatId,', 'void (0,')        // greeting not in recent_messages
     const noWelcome = body.replace('ctx.reply(welcome)', 'Promise.resolve(null)')         // welcome never sent

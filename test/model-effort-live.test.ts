@@ -413,11 +413,12 @@ describe('server.ts wiring', () => {
     for (const verb of ['restart', 'resume', 'update']) {
       expect(text).toContain(`  ${verb}: async ctx => {`)
     }
-    // Five callers remain: /restart, /resume, /update, ho:restart and /login
-    // (credentials are read only at boot). Model and effort are no longer among
-    // them — a count, so a sixth creeping back is visible here.
+    // Six callers remain: /restart, /resume, /update, ho:restart, /login
+    // (credentials are read only at boot) and the lite profile's /restart
+    // (DIVE-5306). Model and effort are no longer among them — a count, so a
+    // seventh creeping back is visible here.
     const calls = text.match(/'-n', '5dive', 'agent', '_self_restart'/g) ?? []
-    expect(calls.length).toBe(5)
+    expect(calls.length).toBe(6)
   })
 })
 
@@ -483,7 +484,7 @@ describe('MUTANT: the restart hook, restored', () => {
   })
   test('...and the caller count arm is RED too', () => {
     const calls = mutate(src()).match(/'-n', '5dive', 'agent', '_self_restart'/g) ?? []
-    expect(calls.length).toBe(6)
+    expect(calls.length).toBe(7)
   })
 
   // The same mutation on the OTHER half, because the two hooks were separate

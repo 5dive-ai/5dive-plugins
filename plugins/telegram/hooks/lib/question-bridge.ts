@@ -101,6 +101,20 @@ export function resolveQuestionTap(
   return { kind: 'answer', idx, answer: labels[idx]! }
 }
 
+// DIVE-5306: the option's own label (what the button showed, unclipped) for
+// the tap at idx, from the `shown` list the hook persists beside `labels`
+// (which hold the English answer sentences the agent reads). null when the
+// request predates `shown` or the index is out of range.
+export function questionLabel(reqRaw: string | null, idx: number): string | null {
+  try {
+    const shown = JSON.parse(reqRaw ?? '').shown
+    const v = Array.isArray(shown) ? shown[idx] : undefined
+    return typeof v === 'string' && v ? v : null
+  } catch {
+    return null
+  }
+}
+
 // Inline-keyboard button caption: kept to one tidy line. When markers is on we
 // prefix a letter (A, B, C…) mirroring DIVE-708's lettered choice buttons.
 export function buttonText(label: string, index: number, markers: boolean): string {

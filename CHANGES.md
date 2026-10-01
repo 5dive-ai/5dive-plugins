@@ -1,5 +1,30 @@
 ## Unreleased
 
+### Added — Telegram buttons follow the user's language, and lite gains /stop /status /restart /clear (DIVE-5306), telegram 0.5.79
+
+OINOA's users are mostly Russian speakers, and an agent's yes/no question came with English buttons
+(lodar, 2026-10-01). The buttons the bridge writes under an agent's question are now in the human's
+Telegram language on both profiles: Yes/No, the permission prompt's See more / Allow / Deny and their
+outcome line, and the replies to a tap (also for the question picker). A `ru` or `ru-*` app language gets
+Russian; any other gets English, byte-for-byte as before. The strings live in one table,
+`TAP_STRINGS` in `hooks/lib/lite.ts`, beside `LITE_STRINGS`. The language is the last inbound's
+`language_code` for that chat, now recorded on every profile (it used to be lite only), so a message
+with no code changes nothing. What a tap relays to the agent stays English: a tap on «✅ Да» still
+reads `yes (tapped the ✅ Yes button …)` with `button=✅ Yes`. The question picker shows a Russian
+tapper the option they picked instead of the English answer sentence the agent gets.
+
+Not translated: the task cards, the gate inbox and the admin pickers (/model, /effort, /account,
+rotation, /login). Their message bodies are English operator text, and Russian buttons under an English
+card would read worse than today. Lite keeps no Yes/No pair (DIVE-5121), unchanged.
+
+The lite profile gains `/stop`, `/status`, `/restart` and `/clear` (lodar, same day: a sandboxed seat
+will run lite and has to be stoppable from chat). They do what the full profile's commands do (Ctrl-C
+or `/clear` into the seat's own pane, `_self_restart`) and need no root. `/status` is one localized
+line, working or idle and for how long, read from the seat's own session file. Replies name no pane,
+process or session. This reverses DIVE-5173's removal of `/stop` and `/clear` for partner clients too,
+since the lite menu is one table. `/new` stays out. The full profile's `/status` now says `cli: v…`
+instead of `5dive: v…`.
+
 ### Fixed — a bare /start on an agent's bot greets at once, with no model turn (DIVE-5298), telegram 0.5.78
 
 On a my.5dive box, `/start` on a new agent's bot got silence (lodar, 2026-09-30). On the lite
