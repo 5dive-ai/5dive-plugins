@@ -39,6 +39,7 @@ import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSyn
 import { parseGateReply, resolveGateReply, gateAlertIdent } from './gatereply'
 import { COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { createFiveRunner, createFailureBreaker, isSudoDenial, type FiveRunner } from './cliexec.ts'
+import { createVersionReader } from './fivediveversion.ts'
 import {
   seatCanAdmin, classifyAccountUsage, accountReadOnlyText, accountSwitchPendingText,
   accountSwitchDoneText, accountSwitchFailedText, USAGE_READ_FAILED_TEXT,
@@ -2035,17 +2036,21 @@ function readClaudeModelAndEffort(pid: number): { model?: string; effort?: strin
 }
 
 // Read the host's `5dive` CLI version if the binary is on PATH. Returns
-// null when the binary is missing, throws, or prints an unexpected shape
-// so /status silently omits the line on non-5dive hosts. Output shape we
-// expect: `5dive X.Y.Z`.
+// null when the binary is missing, prints an unexpected shape, or (with
+// nothing cached yet) could not be read in time, so /status silently omits
+// the line on non-5dive hosts. Output shape we expect: `5dive X.Y.Z`.
+// DIVE-5327: cached per process with a TTL, and a cold read gets 10s, so a
+// box under load no longer flips every 5dive surface off — see
+// fivediveversion.ts. probe5diveVersion() tells "busy" from "absent".
+let fiveDiveVersionReader: ReturnType<typeof createVersionReader> | null = null
+function versionReader() {
+  return (fiveDiveVersionReader ??= createVersionReader({ bin: FIVEDIVE, exec: execFileP }))
+}
 async function read5diveVersion(): Promise<string | null> {
-  try {
-    const { stdout } = await execFileP(FIVEDIVE, ['--version'], { timeout: 2000 })
-    const m = stdout.trim().match(/^5dive\s+(\S+)$/)
-    return m ? m[1] : null
-  } catch {
-    return null
-  }
+  return versionReader().version()
+}
+async function probe5diveVersion() {
+  return versionReader().probe()
 }
 
 // True when the installed 5dive CLI is >= `min` (numeric dotted compare). Used to
@@ -4912,12 +4917,21 @@ for (const def of COMMAND_REGISTRY) {
       await ctx.reply(`Not paired — /${def.name} requires a paired session.`)
       return
     }
-    if (def.scope === 'paired-5dive' && !(await read5diveVersion())) {
+    if (def.scope === 'paired-5dive') {
       // Silently no-op rather than echoing "command unknown" so an upstream
       // host doesn't leak the existence of 5dive-only commands. The /help
       // text already hides them for non-5dive hosts.
-      await ctx.reply(`/${def.name} needs a newer 5dive CLI than this server is running. Update to the latest 5dive CLI, then try again.`)
-      return
+      // DIVE-5327: a probe that timed out is not an old CLI — on a busy box
+      // it told a user with a current CLI to update it. Say what we know.
+      const probe = await probe5diveVersion()
+      if (probe.kind === 'busy') {
+        await ctx.reply(`Couldn't check the 5dive CLI on this server (it may be busy). Try /${def.name} again in a moment.`)
+        return
+      }
+      if (probe.kind === 'absent') {
+        await ctx.reply(`/${def.name} needs a newer 5dive CLI than this server is running. Update to the latest 5dive CLI, then try again.`)
+        return
+      }
     }
     // DIVE-5331: a command that needs root answers a standard-tier seat with the
     // one admin-tier message, before anything runs. The seat is read only for
@@ -6809,8 +6823,8 @@ if (SEND_ONLY) {
           if (!LITE) void (async () => {
             // BotFather menu is a one-shot snapshot: setMyCommands runs once here
             // and is never re-run until the bot restarts. read5diveVersion() has a
-            // 2s timeout and returns null on a miss, and `5dive --version` can
-            // exceed that under transient startup load (many agents booting at
+            // 10s cold-read timeout (DIVE-5327; it was 2s) and returns null on a
+            // miss, and `5dive --version` can exceed that under transient startup load (many agents booting at
             // once). A single miss would permanently shrink the menu —
             // botFatherCommands drops every paired-5dive command when
             // fiveDivePresent is false — while /help stays full because it re-probes

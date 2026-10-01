@@ -24,6 +24,18 @@ strings. The commands stay in the menu. Every sudo spawn in `server.ts` now goes
 no refused sudo mails root. On an admin seat, or when the tier cannot be read, it spawns exactly the
 `sudo -n` argv as before. No grant was widened.
 
+### Fixed — a busy server no longer tells you to update a current 5dive CLI (DIVE-5327), telegram 0.5.80
+
+On a loaded box, /tasks, /heartbeat, /task and the other 5dive commands answered "needs a newer 5dive
+CLI … Update to the latest 5dive CLI" while the CLI was current (lodar, 2026-10-01: 0.65.1, load ~15 on
+4 cores). The bridge checked `5dive --version` with a 2-second limit on every command and read a timeout
+as an old CLI. The version is now cached per process (re-read after 10 minutes, and a failed re-read
+keeps the cached value), the first read gets 10 seconds, and a read that times out before anything is
+cached answers "Couldn't check the 5dive CLI on this server (it may be busy). Try again in a moment."
+The update message stays for a missing binary, one that exits non-zero, or output that is not a version.
+The inbox banner and /status read the same cache, so they no longer drop out under load either. Logic in
+`plugins/telegram/fivediveversion.ts`; arms in `test/dive5327-slow-version-probe.test.ts`.
+
 ### Added — Telegram buttons follow the user's language, and lite gains /stop /status /restart /clear (DIVE-5306), telegram 0.5.79
 
 OINOA's users are mostly Russian speakers, and an agent's yes/no question came with English buttons
