@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Added — routines (`act --record`, `replay`) and `snapshot --delta` (DIVE-5335), browser 1.26.0
+### Added — routines (`act --record`, `replay`) and `snapshot --delta` (DIVE-5335), browser 1.27.0
 
 Registry mirror of 5dive-browser's DIVE-5335 (`browser/` read as `plugins/browser/`). A browser
 routine an agent repeats now costs one call from the second run on: `act --record=<name>` keeps
@@ -13,7 +13,8 @@ under 1% of its pixels moved (`lib/delta.cjs`, no new packages). The run-1-vs-ru
 measured on a real site in 5dive-browser's `routine-bench` CI job and are on its PR. Harness:
 `tests/browser_routine_delta_unit.sh` (parity.yml). A ref whose element the page replaces (Wikipedia's
 search box, after a fill) is found again in both step loops (`lib/aria.cjs` `onRef`) — never after
-a navigation or a completed action, never for `type`.
+a navigation or a completed action, never for `type`. 1.27.0, not 1.26.0: the source repo's 1.26.0 is
+DIVE-5336 (authenticator seed), which this registry copy does not carry yet.
 
 ### Fixed — Telegram on a standard-tier agent: commands work without root where they can, the rest say it needs an admin-tier agent (DIVE-5331), telegram 0.5.81
 
