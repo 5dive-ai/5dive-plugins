@@ -816,6 +816,16 @@ async function planRequest(ctx, req, send, end) {
         } else if (risk) { needsOwner = { ...risk, step: i + 1, op: s.op }; break; }
       }
       stepsRun++;
+      // A REF WHOSE ELEMENT THE PAGE REPLACED IS FOUND AGAIN (DIVE-5335), never a
+      // step that may have acted, and the owner's check is read again on it —
+      // lib/aria.cjs onRef, shared by both loops.
+      const on = (act) => aria.onRef(page, s, sel, act, {
+        timeoutMs: STEP_TIMEOUT, log: (l) => send({ t: 'log', line: `  ${l}` }),
+        check: (req.guard && !req.approved) ? async (x) => {
+          const k = await aria.stepRisk(page, s, x);
+          return !k || (Array.isArray(req.allow_kinds) && req.allow_kinds.includes(k.cls));
+        } : null,
+      });
       switch (s.op) {
         case 'goto': {
           await page.goto(s.url, { waitUntil: 'domcontentloaded' });
@@ -823,13 +833,13 @@ async function planRequest(ctx, req, send, end) {
           if (ms > 0) await page.waitForTimeout(ms);
           break;
         }
-        case 'fill':     await page.fill(sel, s.value); break;
+        case 'fill':     await on((x, timeout) => page.fill(x, s.value, { timeout })); break;
         case 'type':     await aria.typeKeys(page, sel, s.value, s.delay_ms, { timeoutMs: STEP_TIMEOUT }); break;
-        case 'click':    await page.click(sel); break;
+        case 'click':    await on((x, timeout) => page.click(x, { timeout })); break;
         case 'wait_for': await page.waitForSelector(sel); break;
-        case 'select':   await page.selectOption(sel, s.value); break;
-        case 'upload':   await page.setInputFiles(sel, s.path); break;
-        case 'press':    await page.press(sel, s.key); break;
+        case 'select':   await on((x, timeout) => page.selectOption(x, s.value, { timeout })); break;
+        case 'upload':   await on((x, timeout) => page.setInputFiles(x, s.path, { timeout })); break;
+        case 'press':    await on((x, timeout) => page.press(x, s.key, { timeout })); break;
       }
       if (retry) send({ t: 'log', line: `  ${retry}ok` });
       retry = null;

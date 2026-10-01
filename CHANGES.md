@@ -11,7 +11,9 @@ the re-record command. `routine ls|show|forget` manage them. `snapshot --delta` 
 refs and text that changed since the seat's last snapshot of the site, and no `page.png` when
 under 1% of its pixels moved (`lib/delta.cjs`, no new packages). The run-1-vs-run-3 numbers are
 measured on a real site in 5dive-browser's `routine-bench` CI job and are on its PR. Harness:
-`tests/browser_routine_delta_unit.sh` (parity.yml).
+`tests/browser_routine_delta_unit.sh` (parity.yml). A ref whose element the page replaces (Wikipedia's
+search box, after a fill) is found again in both step loops (`lib/aria.cjs` `onRef`) — never after
+a navigation or a completed action, never for `type`.
 
 ### Fixed — Telegram on a standard-tier agent: commands work without root where they can, the rest say it needs an admin-tier agent (DIVE-5331), telegram 0.5.81
 

@@ -21,7 +21,12 @@
 #   D2  snapshot --delta through bin/browser: the first is full and says why,
 #       the second prints only the change, drops an unchanged page.png, and
 #       --json carries the delta and not the node list
-#   M*  mutants: value stripping removed, write-back removed, baseline frozen
+#   E1  a ref whose element the page REPLACED is found again (lib/aria.cjs onRef,
+#       the Wikipedia typeahead shape): re-resolved and re-run; never after a
+#       navigation or an action that is done, never for `type` or a CSS selector,
+#       and not onto an element the owner's check refuses. Both step loops use it.
+#   M*  mutants: value stripping removed, write-back removed, baseline frozen,
+#       re-find removed (E1 goes red)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -312,6 +317,57 @@ run env -u PWREFS PWWALK="$W1" PWSHOT_FILE="$TMP/p-a.png" "$BROWSER" snapshot ht
 run env -u PWREFS PWWALK="$W2" PWSHOT_FILE="$TMP/p-a.png" "$BROWSER" snapshot https://wiki.test/page --interactive --out="$TMP/n2"
 run env -u PWREFS PWWALK="$W2" PWSHOT_FILE="$TMP/p-a.png" "$BROWSER" snapshot https://wiki.test/page --interactive --delta --out="$TMP/n3"
 tc 'M3 (control) the real baseline moved: refs unchanged' 'refs: unchanged' "$OUT"
+
+# ---------------------------------------------------------------- E1 re-find
+# A fake page: the marker r1 is gone from the document after the first attempt,
+# and the walk re-marks the SAME ref as r2 — what Wikipedia's typeahead does to
+# its search input after a fill. Scenarios are picked by argv.
+cat > "$TMP/e1.js" <<'JS'
+const a = require(process.env.ARIA);
+const scen = process.argv[2];
+const calls = [], logs = [];
+let url = 'https://wiki.test/', walks = 0;
+const page = {
+  url: () => url,
+  locator: (sel) => ({ count: async () => (sel.includes('"r1"') ? 0 : 1) }),
+  evaluate: async (fn, arg) => { walks++; return { nodes: [{ role: 'searchbox', name: 'Search', ref: 'searchbox/Search#1' }], marker: arg && arg.mark ? 'r2' : null }; },
+};
+const detached = () => { const e = new Error('page.press: Timeout 5000ms exceeded.\n  - element was detached from the DOM, retrying'); e.name = 'TimeoutError'; return e; };
+let step = { op: 'press', selector: 'ref=searchbox/Search#1', key: 'Enter' };
+let act = async (sel, timeout) => { calls.push(sel); if (sel.includes('"r1"')) throw detached(); return 'ok'; };
+let check = null;
+if (scen === 'nav') act = async (sel) => { calls.push(sel); url = 'https://wiki.test/next'; throw detached(); };
+if (scen === 'done') act = async (sel) => { calls.push(sel); const e = detached(); e.message += '\n  - click action done'; throw e; };
+if (scen === 'type') step = { op: 'type', selector: 'ref=searchbox/Search#1', value: 'x' };
+if (scen === 'css') step = { op: 'press', selector: '#q', key: 'Enter' };
+if (scen === 'check') check = async () => false;
+a.onRef(page, step, '[data-5dive-ref="r1"]', act, { timeoutMs: 3000, attemptMs: 200, check, log: (l) => logs.push(l) })
+  .then((r) => console.log(JSON.stringify({ r, calls, logs, walks })))
+  .catch((e) => console.log(JSON.stringify({ err: e.message.split('\n')[0], notRetried: /not retried/.test(e.message), calls, logs, walks })));
+JS
+e1() { ARIA="${2:-$ROOT/plugins/browser/lib/aria.cjs}" node "$TMP/e1.js" "$1" 2>&1; }
+O="$(e1 replaced)"
+t  'E1 a replaced element is found again and the step runs on it' 'ok ["[data-5dive-ref=\"r1\"]","[data-5dive-ref=\"r2\"]"]' "$(jq -rc '"\(.r) \(.calls)"' <<<"$O")"
+tc 'E1 ...and says so' 'found it again (1x)' "$O"
+O="$(e1 nav)"
+t  'E1 a step that navigated is NOT re-run on the next page' '1 null' "$(jq -rc '"\(.calls|length) \(.r)"' <<<"$O")"
+O="$(e1 done)"
+t  'E1 a step whose action is done is NOT re-run' '1' "$(jq -rc '.calls|length' <<<"$O")"
+O="$(e1 type)"
+t  'E1 type is never re-run (a half-typed value re-typed is wrong)' '1' "$(jq -rc '.calls|length' <<<"$O")"
+O="$(e1 css)"
+t  'E1 a CSS selector is the agent'"'"'s own and never re-resolved' '1 0' "$(jq -rc '"\(.calls|length) \(.walks)"' <<<"$O")"
+O="$(e1 check)"
+t  'E1 the owner'"'"'s check refuses the element found again: not retried' 'true 1' "$(jq -rc '"\(.notRetried) \(.calls|length)"' <<<"$O")"
+for f in driver-playwright session-daemon; do
+  t "E1 $f routes fill/click/press/select/upload through onRef" 5 "$(grep -cE "case '(fill|click|press|select|upload)': +await on\(" "$ROOT/plugins/browser/bin/$f")"
+done
+# MUTANT: the re-find removed — onRef runs the step once on the first selector.
+rm -rf "$TMP/mut-refind"; cp -r "$ROOT/plugins/browser" "$TMP/mut-refind"
+sed -i 's#^  if (!isRef(step.selector) || !REFIND_OPS\[step.op\]) return act(sel, timeoutMs);#  return act(sel, timeoutMs);  // MUTANT (no re-find)#' "$TMP/mut-refind/lib/aria.cjs"
+t  'M4 mutant applied' yes "$(grep -q 'MUTANT (no re-find)' "$TMP/mut-refind/lib/aria.cjs" && echo yes || echo no)"
+O="$(e1 replaced "$TMP/mut-refind/lib/aria.cjs")"
+t  'M4 MUTANT (no re-find): the replaced element fails the step, as on Wikipedia' 'true 1' "$(jq -rc '"\(.err != null) \(.calls|length)"' <<<"$O")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
