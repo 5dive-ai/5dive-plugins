@@ -66,10 +66,12 @@ export function liteLang(code?: string | null): Lang {
 
 // ── commands ─────────────────────────────────────────────────────────────────
 
-// DIVE-5173: /new (and its /clear alias) and /stop are gone, the owner's call.
-// A client has no way to wipe the conversation or interrupt a turn from the
-// chat; the context still compacts on its own. They now get the /help reply.
-export const LITE_COMMANDS = ['start', 'usage', 'account', 'help'] as const
+// DIVE-5173: /new (and its /clear alias) and /stop were taken out, the owner's
+// call. DIVE-5306 (lodar, 2026-10-01: "ok add stop", "and add status", and yes
+// to /restart and /clear) puts /stop and /clear back and adds /status and
+// /restart, because a sandboxed seat now runs lite too and must be stoppable
+// from chat. /new stays out. None of the four needs root.
+export const LITE_COMMANDS = ['start', 'usage', 'account', 'help', 'stop', 'status', 'restart', 'clear'] as const
 export type LiteCommand = (typeof LITE_COMMANDS)[number]
 
 /**
@@ -97,7 +99,18 @@ const WEEKDAY: Record<Lang, string[]> = {
 
 export const LITE_STRINGS = {
   ru: {
-    menu: { start: 'Начать', usage: 'Лимит', account: 'Мой кабинет', help: 'Помощь' },
+    menu: {
+      start: 'Начать', usage: 'Лимит', account: 'Мой кабинет', help: 'Помощь',
+      stop: 'Остановить', status: 'Статус', restart: 'Перезапустить', clear: 'Новый разговор',
+    },
+    stopped: 'Остановлено.',
+    restarting: 'Перезапускаюсь, вернусь примерно через 30 секунд.',
+    cleared: 'Начали новый разговор.',
+    status: {
+      working: (since: string) => `Работаю над вашим запросом (${since}).`,
+      idle: (ago: string) => `Свободен. Последний ответ: ${ago} назад.`,
+      down: 'Сейчас не запущен. Попробуйте /restart.',
+    },
     failed: 'Не получилось, попробуйте ещё раз через минуту.',
     accountPrompt: 'Настройки, подписка и оплата — в кабинете.',
     accountButton: 'Открыть кабинет',
@@ -128,7 +141,18 @@ export const LITE_STRINGS = {
     },
   },
   en: {
-    menu: { start: 'Start', usage: 'Allowance', account: 'My account', help: 'Help' },
+    menu: {
+      start: 'Start', usage: 'Allowance', account: 'My account', help: 'Help',
+      stop: 'Stop', status: 'Status', restart: 'Restart', clear: 'New conversation',
+    },
+    stopped: 'Stopped.',
+    restarting: 'Restarting, back in about 30 seconds.',
+    cleared: 'Started a fresh conversation.',
+    status: {
+      working: (since: string) => `Working on your request (${since}).`,
+      idle: (ago: string) => `Ready. Last active ${ago} ago.`,
+      down: 'Not running right now. Try /restart.',
+    },
     failed: 'Something went wrong, please try again in a minute.',
     accountPrompt: 'Settings, your subscription and billing are in your account.',
     accountButton: 'Open my account',
@@ -157,6 +181,87 @@ export const LITE_STRINGS = {
     },
   },
 } as const
+
+// ── tap strings (both profiles) ──────────────────────────────────────────────
+// DIVE-5306: the labels and acks the bridge itself writes on the buttons under
+// an agent's question: Yes/No, the permission prompt, the question picker.
+// Unlike LITE_STRINGS these ship on the default profile too, so the `en` column
+// is byte-for-byte what the plugin printed before this table existed (the test
+// pins it). Only what the human SEES is here. The text a tap relays to the
+// agent stays English (buttontap.ts), and callback_data never changes.
+
+const TAP_EN = {
+  yes: '✅ Yes',
+  no: '❌ No',
+  yesAck: '👍 Yes',
+  noAck: '👎 No',
+  optionGone: 'That option is no longer available.',
+  permTitle: (tool: string) => `🔐 Permission: ${tool}`,
+  permMore: 'See more',
+  allow: '✅ Allow',
+  deny: '❌ Deny',
+  allowed: '✅ Allowed',
+  denied: '❌ Denied',
+  permGone: 'Details no longer available.',
+  sent: (answer: string) => `Sent: ${answer}`,
+  notRecorded: "Couldn't record — reply in chat.",
+  alreadyAnswered: 'Already answered.',
+  optionInvalid: 'That option is no longer valid.',
+  expired: 'This prompt has expired.',
+}
+
+export const TAP_STRINGS: Record<Lang, typeof TAP_EN> = {
+  en: TAP_EN,
+  ru: {
+    yes: '✅ Да',
+    no: '❌ Нет',
+    yesAck: '👍 Да',
+    noAck: '👎 Нет',
+    optionGone: 'Этот вариант уже недоступен.',
+    permTitle: (tool: string) => `🔐 Нужно разрешение: ${tool}`,
+    permMore: 'Подробнее',
+    allow: '✅ Разрешить',
+    deny: '❌ Запретить',
+    allowed: '✅ Разрешено',
+    denied: '❌ Запрещено',
+    permGone: 'Подробности уже недоступны.',
+    sent: (answer: string) => `Отправлено: ${answer}`,
+    notRecorded: 'Не удалось записать ответ — ответьте в чате.',
+    alreadyAnswered: 'Ответ уже получен.',
+    optionInvalid: 'Этот вариант больше не действует.',
+    expired: 'Этот вопрос уже неактуален.',
+  },
+}
+
+/** The language a tap is answered in: the tapper's own code when Telegram sent
+ *  one, else what the chat last spoke (a tap's update can omit it). */
+export function tapLang(code: string | null | undefined, chatLang: Lang): Lang {
+  return code ? liteLang(code) : chatLang
+}
+
+/** A short duration a client reads: under a minute, minutes, or hours and
+ *  minutes. Abbreviated in Russian, so no plural forms are needed. */
+export function liteDuration(lang: Lang, ms: number): string {
+  const min = Math.floor(Math.max(0, ms) / 60_000)
+  if (min < 1) return lang === 'ru' ? 'меньше минуты' : 'under a minute'
+  if (min < 60) return lang === 'ru' ? `${min} мин` : `${min} min`
+  const h = Math.floor(min / 60), m = min % 60
+  const hs = lang === 'ru' ? `${h} ч` : `${h} h`
+  return m ? `${hs} ${lang === 'ru' ? `${m} мин` : `${m} min`}` : hs
+}
+
+/** DIVE-5306: lite /status, one plain line from the seat's own session file
+ *  (no root, no org machinery). `session` is null when no live session. */
+export function liteStatusText(
+  lang: Lang,
+  session: { status: string; updatedAt: number } | null,
+  now: number,
+): string {
+  const s = LITE_STRINGS[lang].status
+  if (!session) return s.down
+  const span = liteDuration(lang, now - session.updatedAt)
+  return session.status === 'busy' ? s.working(span) : s.idle(span)
+}
 
 /** setMyCommands entries for one language. /account is listed only when the
  *  box has an account URL to open — a button that goes nowhere is worse than
@@ -396,7 +501,9 @@ export const LITE_INSTRUCTIONS = [
 // ── small state files (best-effort, never throw) ─────────────────────────────
 
 /** The client's language, remembered at each inbound so an out-of-process hook
- *  (which has no Telegram update to read it from) answers in the same one. */
+ *  (which has no Telegram update to read it from) answers in the same one.
+ *  DIVE-5306: written on every profile; the default one reads it only for the
+ *  TAP_STRINGS fallback and the demo-key notice. */
 export function writeLiteLang(stateDir: string, lang: Lang): void {
   try {
     const f = join(stateDir, 'lite-lang')
