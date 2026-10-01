@@ -87,7 +87,7 @@ function sitesOf(text: string): Site[] {
 const SITES = sitesOf(SERVER)
 
 // ── a fake that behaves like a real standard seat ───────────────────────────
-// Measured semantics (5dive-cli origin/main, audited on the PR):
+// Measured semantics (5dive-cli main branch as of 2026-10-01, audited on the PR):
 //   sudo -n <anything outside the grant> → "sudo: a password is required"
 //   5dive <root-only verb> as the seat   → {"ok":false,"error":{"class":"permission",…}}
 type Call = { file: string; args: string[] }
