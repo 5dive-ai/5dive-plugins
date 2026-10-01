@@ -417,7 +417,9 @@ describe('server.ts wiring', () => {
     // (credentials are read only at boot) and the lite profile's /restart
     // (DIVE-5306). Model and effort are no longer among them — a count, so a
     // seventh creeping back is visible here.
-    const calls = text.match(/'-n', '5dive', 'agent', '_self_restart'/g) ?? []
+    // DIVE-5331: the callers go through sudo5dive(['5dive', …]) now, so the
+    // count matches the argv tail both shapes share.
+    const calls = text.match(/'5dive', 'agent', '_self_restart'\]/g) ?? []
     expect(calls.length).toBe(6)
   })
 })
@@ -483,7 +485,7 @@ describe('MUTANT: the restart hook, restored', () => {
     expect(body).not.toContain("liveSwitch('model'")
   })
   test('...and the caller count arm is RED too', () => {
-    const calls = mutate(src()).match(/'-n', '5dive', 'agent', '_self_restart'/g) ?? []
+    const calls = mutate(src()).match(/'5dive', 'agent', '_self_restart'\]/g) ?? []
     expect(calls.length).toBe(7)
   })
 

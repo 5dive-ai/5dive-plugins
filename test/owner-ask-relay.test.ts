@@ -211,7 +211,8 @@ describe('wiring in the Claude Code bridge', () => {
   test("the tapper id is Telegram's from.id, and root is reached by the bare sudoers word", () => {
     const router = SERVER.slice(SERVER.indexOf(ROUTER))
     expect(router).toMatch(/const senderId = String\(ctx\.from\.id\)/)
-    expect(SERVER).toContain("execFileP(SUDO, ['-n', '5dive', ...args], { timeout: 45_000 })")
+    // DIVE-5331: through the sudo gate, which hands sudo the same bare word.
+    expect(SERVER).toContain("sudo5dive(['5dive', ...args], { timeout: 45_000 })")
   })
   test('the relay branch and its runner hold no file access', () => {
     const runner = SERVER.slice(SERVER.indexOf('async function runOwnerAsk('), SERVER.indexOf(ROUTER))

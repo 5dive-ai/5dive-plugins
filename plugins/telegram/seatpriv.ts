@@ -17,6 +17,8 @@
 // Everything here is pure so the suite can drive it without importing
 // server.ts, which long-polls Telegram on import.
 
+import { TAP_STRINGS, type Lang } from './hooks/lib/lite.ts'
+
 export type SeatSudo = { measured?: boolean; impliedIsolation?: string }
 export type SeatEntry = { name: string; isolation?: string; sudo?: SeatSudo }
 export type SeatAdmin = 'yes' | 'no' | 'unknown'
@@ -69,21 +71,18 @@ export function classifyAccountUsage<T>(
   return { kind: 'failed' }
 }
 
-export const USAGE_NOT_AVAILABLE_TEXT =
-  `Usage isn't available on this agent — its access is limited to its own work, ` +
-  `and reading account limits needs an admin. An admin agent's /usage or the dashboard shows it.`
+// DIVE-5331: was DIVE-5220's own "Usage isn't available on this agent" string.
+// A standard seat now has ONE refusal for everything that needs root.
+export const USAGE_NOT_AVAILABLE_TEXT = TAP_STRINGS.en.adminTier
 
 // Only for a seat that COULD read it and still got nothing usable back.
 export const USAGE_READ_FAILED_TEXT =
   `Couldn't read usage — your 5dive CLI may be out of date. Update to the latest 5dive CLI, then try again.`
 
-export function accountReadOnlyText(current: string): string {
-  return [
-    `Current account: ${current}`,
-    ``,
-    `Only an admin switches this agent's account — its access is limited to its own work. ` +
-      `Ask an admin agent, or use the dashboard.`,
-  ].join('\n')
+// DIVE-5331: what /account shows a standard seat — the account it is on (that
+// read needs no root), then the one admin-tier message in place of a picker.
+export function accountReadOnlyText(current: string, lang: Lang = 'en'): string {
+  return [TAP_STRINGS[lang].currentAccount(current), ``, adminTierText(lang)].join('\n')
 }
 
 // Shown in place of the picker the moment a switch is tapped. Deliberately no ✅:
@@ -99,11 +98,196 @@ export function accountSwitchDoneText(name: string): string {
 
 // The one message a failed switch produces. A sudo refusal is not an error the
 // owner can fix from Telegram, so it says who can, instead of quoting sudo.
-export function accountSwitchFailedText(name: string, refused: boolean, detail: string): string {
-  if (refused) {
-    return `❌ Account not switched — this agent is still on its current account. ` +
-      `Only an admin switches this agent's account (its access is limited to its own work). ` +
-      `Ask an admin agent, or use the dashboard.`
-  }
+export function accountSwitchFailedText(name: string, refused: boolean, detail: string, lang: Lang = 'en'): string {
+  if (refused) return `❌ ${adminTierText(lang)}`
   return `❌ Couldn't switch account → ${name}: ${detail || 'unknown error'}\n\nThis agent is still on its current account.`
+}
+
+// ── DIVE-5331: the full profile on a standard-tier seat ─────────────────────
+//
+// lodar, 2026-10-01: "make it work as much as possible" and "tell proper you
+// need to be admin tier error if not possible". Before this, 5220 had fixed
+// /account and /usage one string at a time; every other command still spawned
+// `sudo -n 5dive …` on a seat whose grant does not cover it, and the owner read
+// "sudo: a password is required" (or nothing, behind a generic toast).
+//
+// Two pieces, both pure:
+//   1. standardSeatRoute() — what each full-profile command does on a standard
+//      seat. The dispatcher refuses an 'admin' command up front, with the one
+//      message, BEFORE any side effect (no half-done /update, no auth session).
+//   2. createSudoGate() — the ONLY way server.ts spawns sudo. On a standard seat
+//      a verb in the seat's grant runs exactly as today; a verb the CLI serves
+//      to an unprivileged caller runs as the seat's own uid; anything else
+//      throws AdminTierRequired and sudo is never spawned (DIVE-4397: a refused
+//      sudo mails root). On an admin seat, and on 'unknown', the argv is
+//      byte-identical to the old `execFileP(SUDO, ['-n', …])` — never refuse on
+//      a guess.
+//
+// No grant is widened here, or may be to make a button work (DIVE-4397).
+
+/** The one refusal, in the human's language. */
+export function adminTierText(lang: Lang): string {
+  return TAP_STRINGS[lang].adminTier
+}
+
+/** Thrown by the sudo gate instead of spawning a sudo a standard seat would be
+ *  refused. Its message is the English admin-tier text, so a caller that only
+ *  prints `err.message` still says the right thing. */
+export class AdminTierRequired extends Error {
+  constructor(public readonly argv: string[]) {
+    super(TAP_STRINGS.en.adminTier)
+    this.name = 'AdminTierRequired'
+  }
+}
+export function isAdminTierRequired(e: unknown): e is AdminTierRequired {
+  return e instanceof AdminTierRequired || (e as { name?: unknown } | null)?.name === 'AdminTierRequired'
+}
+
+// The standard seat's sudoers grant, as 5dive-cli render_standard_sudoers
+// writes it (src/cmd_agent_create.sh). Only the verbs the PLUGIN itself spawns
+// matter here; _deliver/_task_channel/_task_answer are crossed by the CLI
+// internally, from an unprivileged call. Exact argv, no wildcard — the grant is
+// exact-path with no args.
+const STANDARD_SUDO_GRANT: string[][] = [
+  ['5dive', 'agent', '_self_restart'],
+]
+export function standardSeatMaySudo(argv: string[]): boolean {
+  return STANDARD_SUDO_GRANT.some(g => g.length === argv.length && g.every((w, i) => w === argv[i]))
+}
+
+// Verbs the CLI serves to an UNPRIVILEGED caller (5dive-cli origin/main,
+// audited for this row — the table is on the PR). Matched on the verb words
+// only, ignoring global flags (`--json`) and the arguments after the verb.
+//   task add/show/start/done/cancel/escalate/unpark: tasks dir is group-writable
+//     "used by every agent without sudo" (lib/state.sh); no require_root.
+//   task answer: only with --channel-proof, which the CLI carries over its
+//     exact-path _task_channel grant (answer.sh _task_channel_try). A bare
+//     --value would land as the AGENT's answer, not the human's — refused.
+//   agent send: re-execs over the seat's `_deliver` grant (cmd_agent_runtime.sh).
+const UNPRIVILEGED_VERBS: string[][] = [
+  ['task', 'add'], ['task', 'show'], ['task', 'start'], ['task', 'done'],
+  ['task', 'cancel'], ['task', 'escalate'], ['task', 'unpark'],
+  ['task', 'answer'],
+  ['agent', 'send'],
+]
+function verbWords(argv: string[]): string[] {
+  // argv[0] is the binary word ('5dive'); drop global flags before the verb.
+  return argv.slice(1).filter(w => !w.startsWith('-')).slice(0, 2)
+}
+export function standardSeatMayRunPlain(argv: string[]): boolean {
+  if (argv[0] !== '5dive') return false
+  const [a, b] = verbWords(argv)
+  if (!UNPRIVILEGED_VERBS.some(([x, y]) => x === a && y === b)) return false
+  if (a === 'task' && b === 'answer') return argv.some(w => w.startsWith('--channel-proof='))
+  return true
+}
+
+export type SudoExecFn = (file: string, args: string[], opts?: unknown) => Promise<{ stdout: string; stderr: string }>
+
+export type SudoGate = {
+  /**
+   * Run `argv` the way this seat may. `argv[0]` is the word handed to sudo
+   * ('5dive', or an absolute script path), exactly as the old call site wrote it.
+   * `standard: 'plain'` asks for the unprivileged path on a standard seat; it is
+   * honoured only for a verb in UNPRIVILEGED_VERBS, so a call site cannot route a
+   * root-only verb to a raw CLI error by asking for it.
+   */
+  run(argv: string[], opts?: unknown, standard?: 'plain' | 'refuse'): Promise<{ stdout: string; stderr: string }>
+  /** Throws AdminTierRequired when this seat may not run `argv` at all. For a
+   *  spawn the gate does not own (a streaming child). */
+  check(argv: string[]): Promise<void>
+}
+
+export function createSudoGate(o: {
+  execFile: SudoExecFn
+  sudoBin: string
+  /** absolute path of the bare binary, for the unprivileged path */
+  fiveBin: string
+  seat: () => Promise<SeatAdmin>
+}): SudoGate {
+  const allowed = async (argv: string[], standard: 'plain' | 'refuse'): Promise<'sudo' | 'plain'> => {
+    // The seat's own grant needs no lookup: it is the same on every tier.
+    if (standardSeatMaySudo(argv)) return 'sudo'
+    if ((await o.seat()) !== 'no') return 'sudo'
+    if (standard === 'plain' && standardSeatMayRunPlain(argv)) return 'plain'
+    throw new AdminTierRequired(argv)
+  }
+  return {
+    async run(argv, opts, standard = 'refuse') {
+      const how = await allowed(argv, standard)
+      if (how === 'plain') return o.execFile(o.fiveBin, argv.slice(1), opts)
+      return o.execFile(o.sudoBin, ['-n', ...argv], opts)
+    },
+    async check(argv) {
+      await allowed(argv, 'refuse')
+    },
+  }
+}
+
+export type StandardRoute =
+  /** same handler as an admin seat; nothing in it needs root */
+  | 'works'
+  /** the handler takes its own no-root branch on a standard seat */
+  | 'own'
+  /** the dispatcher answers with the one admin-tier message */
+  | 'admin'
+
+// What each full-profile command does on a standard seat. Every entry of
+// COMMAND_REGISTRY must be named here (the suite enforces it); an unnamed
+// command falls to 'admin', because a command nobody audited must not reach a
+// sudo prompt.
+const STANDARD_ROUTES: Record<string, StandardRoute | ((arg: string) => StandardRoute)> = {
+  start: 'works', help: 'works', status: 'works', context: 'works',
+  stop: 'works', clear: 'works', goal: 'works', model: 'works', effort: 'works',
+  checkpoint: 'works',
+  // `_self_restart` is in the standard grant.
+  restart: 'works', resume: 'works',
+  tasks: 'works', heartbeat: 'works', org: 'works',
+  // the list is a read; start/stop/restart of a seat take the registry lock (root).
+  agents: arg => /^(start|stop|restart)\b/i.test(arg.trim()) ? 'admin' : 'works',
+  team: arg => /^(start|stop|restart)\b/i.test(arg.trim()) ? 'admin' : 'works',
+  // the gate list is a read; only the tap-button digest (`inbox --send`) is root.
+  inbox: 'own',
+  // `task add` runs unprivileged; the handler drops sudo for it.
+  task: 'own',
+  // the current account is a read; switching it is root.
+  account: 'own',
+  // this seat's own 5h/1w instead of the every-account board.
+  usage: 'own',
+  // reading the state works; turning it on/off writes a root-owned file.
+  digest: arg => (arg.trim() === '' || arg.trim().toLowerCase() === 'status') ? 'works' : 'admin',
+  // the refresh script runs as root (sudo -u <seat> claude plugin …, root writes).
+  update: 'admin',
+  // `agent auth start` requires root (require_auth_session_root).
+  login: 'admin',
+}
+export function standardSeatRoute(cmd: string, arg: string = ''): StandardRoute {
+  const r = STANDARD_ROUTES[cmd]
+  if (r === undefined) return 'admin'
+  return typeof r === 'function' ? r(arg) : r
+}
+export const STANDARD_ROUTED_COMMANDS: readonly string[] = Object.keys(STANDARD_ROUTES)
+
+export type StatuslineLimits = {
+  rate_limits?: {
+    five_hour?: { used_percentage?: unknown; resets_at?: unknown }
+    seven_day?: { used_percentage?: unknown; resets_at?: unknown }
+  }
+}
+
+/** /usage on a standard seat: this agent's own 5h/1w from its own statusline
+ *  cache (~/.claude/statusline-last.json — no root, no other seat's data), then
+ *  one line on where the every-account board lives. `fmt` renders a duration. */
+export function ownUsageText(lang: Lang, cache: StatuslineLimits | null, nowMs: number, fmt: (ms: number) => string): string {
+  const s = TAP_STRINGS[lang]
+  const line = (w: { used_percentage?: unknown; resets_at?: unknown } | undefined, render: (p: string, r?: string) => string): string | null => {
+    if (!w || typeof w.used_percentage !== 'number') return null
+    const resets = typeof w.resets_at === 'number' && w.resets_at * 1000 > nowMs ? fmt(w.resets_at * 1000 - nowMs) : undefined
+    return render(`${Math.round(w.used_percentage)}%`, resets)
+  }
+  const lines = [
+    line(cache?.rate_limits?.five_hour, s.ownUsage5h),
+    line(cache?.rate_limits?.seven_day, s.ownUsage1w),
+  ].filter((l): l is string => l !== null)
+  return [s.ownUsageTitle, '', ...(lines.length ? lines : [s.ownUsageNone]), '', s.ownUsageBoard].join('\n')
 }
