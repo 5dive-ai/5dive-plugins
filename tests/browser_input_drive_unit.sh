@@ -18,6 +18,14 @@
 #        R6 handoff opens / reports / closes through `hand`
 #        R7 a proxied seat is refused input mode rather than served off-proxy
 #        R8 regression: a CDP site is never routed to the input verbs
+#        R10 the BOX default (DIVE-5338): `config drive=input` serves an adapter-less
+#           site as input; an adapter's "drive": "cdp" still wins; a proxied seat
+#           falls back to the automated browser with a note, not a refusal; the
+#           setting is root's; `auto` is the shipped default again
+#        R11 a person's sign-in survives Done on a daemon-held browser (DIVE-5374):
+#           the stop waits for the cookie commit when a viewer was redeemed on this
+#           serve — input or warm CDP — within 60 s of the person leaving, and not
+#           otherwise; a mutant without it loses it
 #   L  LIVE, when this machine has Xvfb and Chrome (GitHub's ubuntu runner does):
 #      the real daemon, real plain Chrome, real XTEST input.
 #        L1 the page sees navigator.webdriver === false, and the daemon reports
@@ -25,7 +33,15 @@
 #        L1b the page has RECEIVED pointer input (a handshake) before L3 — L3 is
 #           gated on observed readiness, not on the title alone (quinn, iter 1)
 #        L2 Chrome's command line carries no --remote-debugging / --enable-automation
-#        L3 a click and typed text arrive as isTrusted events, non-ASCII included
+#        L1c the browser is the TOPMOST window at the L3 click point
+#        L3 a click and typed text arrive as isTrusted events, non-ASCII included.
+#           The input is sent ONCE; the arm then waits (bounded) to SEE it, because
+#           Chrome retitles the window asynchronously and a loaded runner took
+#           longer than the 300ms settle to (DIVE-5342: L5 then read the text L3
+#           had "missed"). A red L3 prints the window stack at the click point and
+#           saves the screen to $INPUT_HARNESS_ARTIFACTS, so it explains itself.
+#        L3m the instrument: the same L3 check on a click point another window
+#           covers goes red, and its dump names that window as topmost
 #        L4 `screen` returns a PNG of the whole display
 #        L5 an open handoff refuses agent input; closing it restores it
 #        L6 DOM ops are refused by name
@@ -44,6 +60,9 @@ REAL_DAEMON="$ROOT/plugins/browser/bin/session-daemon"
 X11LIB="$ROOT/plugins/browser/lib/x11.cjs"
 REAL_XVFB="$(command -v Xvfb || true)"
 REAL_CHROME="$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)"
+# INPUT_DRIVE_SKIP_LIVE=1: the R arms only, on a host where real Chrome must not run
+# (the production API host). CI leaves it unset and runs the L arms.
+[[ -n "${INPUT_DRIVE_SKIP_LIVE:-}" ]] && REAL_XVFB=""
 
 # SHORT PATHS. A unix socket path is capped at 108 bytes; a long mktemp root
 # makes the daemon bind a truncated name and every arm below read "not live".
@@ -60,7 +79,7 @@ gha() {  # gha <title> <text>
 }
 _diag() {
   (( ${FAIL:-0} )) || return 0
-  local f; for f in l.err l.inerr l.cverr l2.err; do
+  local f; for f in l.err l3.err l.cverr l2.err; do
     [[ -s "$TMP/$f" ]] && gha "input harness: daemon stderr ($f)" "$(grep -v -i dbus "$TMP/$f" | tail -15)"
   done; return 0
 }
@@ -73,6 +92,8 @@ arm() {  # arm <name> <expected> <got>
     gha "input harness FAIL: ${1:0:80}" "expected: $2"$'\n'"got: $3"; fi
 }
 yn() { if "$@"; then echo yes; else echo no; fi; }
+# Where a red live arm's screen goes. CI sets it and uploads it on failure.
+ART="${INPUT_HARNESS_ARTIFACTS:-}"; [[ -n "$ART" ]] && mkdir -p "$ART"
 
 # ---------------------------------------------------------------- U: x11.cjs
 out=$(node -e '
@@ -146,6 +167,20 @@ const sock = rest.filter(a => !a.startsWith('--'))[0];
 fs.appendFileSync('$TMP/daemon.argv', process.argv.slice(2).join(' ') + '\n');
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
 let hand = false;
+// CHROME'S COOKIE BATCH (R11, DIVE-5374): what a person signs in with reaches
+// Default/Cookies only when the commit timer fires, FAKE_COMMIT_MS after the
+// sign-in (the test touches .fake-signin); a shutdown before then loses it.
+const commitMs = Number(process.env.FAKE_COMMIT_MS || 0);
+if (commitMs) {
+  let t0 = 0;
+  const iv = setInterval(() => {
+    if (!t0 && fs.existsSync(profile + '/.fake-signin')) t0 = Date.now();
+    if (t0 && Date.now() - t0 >= commitMs) {
+      fs.mkdirSync(profile + '/Default', { recursive: true });
+      fs.writeFileSync(profile + '/Default/Cookies', 'user_session\n'); clearInterval(iv);
+    }
+  }, 50);
+}
 const srv = net.createServer((c) => {
   let buf = '';
   c.on('data', (d) => {
@@ -158,6 +193,8 @@ const srv = net.createServer((c) => {
     if (req.op === 'ping') { send({ t: 'out', data: 'pong\n' }); return end(0); }
     // The real daemon re-enters bin/browser as the owner for this; the fake hands out a token.
     if (req.op === 'lease') { send({ t: 'out', data: req.act === 'acquire' ? 'fedcba9876543210fedcba9876543210\n' : 'free\n' }); return end(0); }
+    // Either mode: a warm (CDP) serve is stopped this way too (R11e).
+    if (req.op === 'shutdown') { end(0); srv.close(); try { fs.unlinkSync(sock); } catch (e) {} process.exit(0); }
     if (!input) { send({ t: 'err', msg: "unknown op '" + req.op + "'" }); return end(70); }
     if (req.op === 'title') { send({ t: 'out', data: JSON.stringify({ drive: 'input', title: 'Fake Page', handoff: hand, viewer: false }) + '\n' }); return end(0); }
     if (req.op === 'hand') { if (req.act === 'open') hand = true; if (req.act === 'close') hand = false;
@@ -168,7 +205,6 @@ const srv = net.createServer((c) => {
       if (rc === 75) send({ t: 'err', msg: 'CHALLENGE: fake' });
       return end(rc);
     }
-    if (req.op === 'shutdown') { end(0); srv.close(); try { fs.unlinkSync(sock); } catch (e) {} process.exit(0); }
     send({ t: 'err', msg: 'refused ' + req.op }); end(70);
   });
 });
@@ -281,6 +317,151 @@ arm 'R8 regression: shot on reddit.com (CDP) never reaches the input verbs' "$n0
   "$(reqs screen) $(yn grep -qi 'input mode' <<<"$o")"
 o=$("$BROWSER" tree reddit.com https://www.reddit.com/ 2>&1)
 arm 'R8 ...nor does tree' no "$(yn grep -q 'INPUT mode' <<<"$o")"
+
+# R10 — THE BOX DEFAULT (DIVE-5338). news.example.com has no adapter at all;
+# cdp.example.com has one that says "drive": "cdp".
+export FIVEDIVE_BROWSER_DRIVE_DEFAULT_FILE="$TMP/drive-default"
+for s in news.example.com cdp.example.com; do mkdir -p "$TMP/pr/$SEAT/$s"; chmod 700 "$TMP/pr/$SEAT/$s"; done
+printf '{"site":"cdp.example.com","drive":"cdp"}\n' > "$TMP/ad/cdp.example.com.json"
+arm 'R10 nothing set: config reads auto (the shipped default)' 'drive=auto' "$("$BROWSER" config 2>&1 | head -1)"
+n0=$(reqs screen)
+o=$("$BROWSER" shot news.example.com https://news.example.com/ --out="$TMP/n0.png" 2>&1)
+arm 'R10 ...and an adapter-less site is not input mode' "$n0 no" "$(reqs screen) $(yn grep -qi 'input mode' <<<"$o")"
+if [[ "$(id -u)" != 0 ]]; then
+  o=$("$BROWSER" config drive=input 2>&1); rc=$?
+  arm 'R10 a seat cannot set the box default (77), and nothing is written' '77 no' "$rc $(yn test -e "$TMP/drive-default")"
+fi
+o=$("$BROWSER" config drive=sideways 2>&1); rc=$?
+arm 'R10 an unknown drive value is refused (64)' 64 "$rc"
+printf '# set by root\ninput\n' > "$TMP/drive-default"   # what `sudo … config drive=input` writes
+arm 'R10 config reads it back' 'drive=input' "$("$BROWSER" config 2>&1 | head -1)"
+o=$("$BROWSER" serve news.example.com 2>&1); rc=$?
+arm 'R10 drive=input serves an adapter-less site as input mode' '0 yes' "$rc $(yn grep -q 'input mode' <<<"$o")"
+arm 'R10 ...the daemon was started with --input' yes "$(tail -1 "$TMP/daemon.argv" | grep -q -- '--input' && echo yes || echo no)"
+arm 'R10 ...the serve record and the .offered marker say input' 'input input' \
+  "$(sed -n 's/^drive=//p' "$TMP/pr/$SEAT/news.example.com/.5dive-serve") $(sed -n 's/^drive=//p' "$TMP/rv/$SEAT/news.example.com.offered")"
+_KILL+=("$(sed -n 's/^daemon_pid=//p' "$TMP/pr/$SEAT/news.example.com/.5dive-serve")" "$(sed -n 's/^xvfb_pid=//p' "$TMP/pr/$SEAT/news.example.com/.5dive-serve")")
+n0=$(reqs screen)
+o=$("$BROWSER" shot news.example.com https://news.example.com/ --out="$TMP/n1.png" 2>&1); rc=$?
+arm 'R10 shot on it takes the input verb' "0 $((n0 + 1))" "$rc $(reqs screen)"
+n0=$(wc -l < "$DREC")
+o=$("$BROWSER" read news.example.com https://news.example.com/ 2>&1); rc=$?
+arm 'R10 read on it is refused by name (69), nothing sent' "69 yes $n0" "$rc $(yn grep -q 'INPUT mode' <<<"$o") $(wc -l < "$DREC")"
+"$BROWSER" serve news.example.com --stop >/dev/null 2>&1
+n0=$(wc -l < "$TMP/daemon.argv")
+o=$("$BROWSER" serve cdp.example.com 2>&1); rc=$?
+arm 'R10 an adapter saying "drive": "cdp" wins over the box default' "0 no" "$rc $(tail -n +$((n0 + 1)) "$TMP/daemon.argv" | grep -q -- '--input' && echo yes || echo no)"
+_KILL+=("$(sed -n 's/^daemon_pid=//p' "$TMP/pr/$SEAT/cdp.example.com/.5dive-serve")" "$(sed -n 's/^xvfb_pid=//p' "$TMP/pr/$SEAT/cdp.example.com/.5dive-serve")")
+"$BROWSER" serve cdp.example.com --stop >/dev/null 2>&1
+printf 'http://u:p@example.com:8080\n' > "$TMP/pr/$SEAT/.5dive-proxy"; chmod 600 "$TMP/pr/$SEAT/.5dive-proxy"
+n0=$(wc -l < "$TMP/daemon.argv")
+o=$("$BROWSER" serve news.example.com 2>&1); rc=$?
+arm 'R10 a proxied seat falls back to the automated browser (0), not refused' "0 no" "$rc $(tail -n +$((n0 + 1)) "$TMP/daemon.argv" | grep -q -- '--input' && echo yes || echo no)"
+arm 'R10 ...and says so in ONE note line' 1 "$(grep -c 'defaults to input mode, but this seat has a proxy' <<<"$o")"
+_KILL+=("$(sed -n 's/^daemon_pid=//p' "$TMP/pr/$SEAT/news.example.com/.5dive-serve")" "$(sed -n 's/^xvfb_pid=//p' "$TMP/pr/$SEAT/news.example.com/.5dive-serve")")
+"$BROWSER" serve news.example.com --stop >/dev/null 2>&1
+o=$("$BROWSER" serve tiktok.com 2>&1); rc=$?
+arm 'R10 ...while an adapter'"'"'s own input is still refused under a proxy (69)' 69 "$rc"
+rm -f "$TMP/pr/$SEAT/.5dive-proxy"
+printf 'cdp\n' > "$TMP/drive-default"
+n0=$(reqs screen)
+o=$("$BROWSER" shot news.example.com https://news.example.com/ --out="$TMP/n2.png" 2>&1)
+arm 'R10 drive=cdp: the adapter-less site is the automated browser again' "$n0 no" "$(reqs screen) $(yn grep -qi 'input mode' <<<"$o")"
+arm 'R10 ...and tiktok.com is still input (its adapter wins)' 0 "$("$BROWSER" serve tiktok.com >/dev/null 2>&1; echo $?)"
+rm -f "$TMP/drive-default"
+unset FIVEDIVE_BROWSER_DRIVE_DEFAULT_FILE
+
+# R11 — A PERSON'S SIGN-IN SURVIVES DONE ON A DAEMON-HELD BROWSER (DIVE-5374). On an
+# input-mode box the viewer attaches to the session daemon's plain Chrome, so the stop
+# Done runs has no chrome_pid and no login=1 — and DIVE-5286's cookie-commit wait was
+# skipped: chill-gorge lost a github.com sign-in made 7 s before Done (2026-10-02). The
+# fake daemon above commits the sign-in FAKE_COMMIT_MS after it and loses it on shutdown.
+"$BROWSER" serve tiktok.com --stop >/dev/null 2>&1
+R11D="$TMP/pr/$SEAT/tiktok.com"
+r11_serve() {  # r11_serve [browser] — a fresh input serve whose commit is 1.5 s after the sign-in
+  rm -f "$R11D/.fake-signin" "$R11D/Default/Cookies" "$R11D/.5dive-viewer.admitted"
+  FAKE_COMMIT_MS=1500 "${1:-$BROWSER}" serve tiktok.com >/dev/null 2>&1
+  _KILL+=("$(sed -n 's/^daemon_pid=//p' "$R11D/.5dive-serve")" "$(sed -n 's/^xvfb_pid=//p' "$R11D/.5dive-serve")")
+}
+r11_admit() {  # what viewer-redeem writes (graded there, in browser_plugin_unit.sh T10d)
+  ( umask 077; printf 'admitted_at=%s\n' "${1:-$(date -u +%s)}" > "$R11D/.5dive-viewer.admitted" )
+}
+r11_stop() {  # r11_stop [browser] — times the stop into R11MS
+  local s; s=$(date +%s%3N)
+  "${1:-$BROWSER}" serve tiktok.com --stop >/dev/null 2>&1; R11RC=$?
+  R11MS=$(( $(date +%s%3N) - s ))
+}
+r11_cookie() { cat "$R11D/Default/Cookies" 2>/dev/null; }
+
+r11_serve; r11_admit
+arm 'R11a (setup) an input serve with a person admitted to it' 'yes yes' \
+  "$(yn grep -q '^drive=input' "$R11D/.5dive-serve") $(yn test -s "$R11D/.5dive-viewer.admitted")"
+: > "$R11D/.fake-signin"   # the person signs in; Done comes at once, before the commit
+r11_stop
+arm 'R11a serve --stop stops' 0 "$R11RC"
+arm 'R11a ...and the sign-in is on disk: the stop waited for the commit' 'user_session' "$(r11_cookie)"
+arm 'R11a ...and left on the commit, not the 24 s cap' yes "$( (( R11MS < 6000 )) && echo yes || echo "no (${R11MS}ms)")"
+arm 'R11a ...and the daemon, its serve record and the admitted marker are gone' 'no no' \
+  "$(yn test -e "$R11D/.5dive-serve") $(yn test -e "$R11D/.5dive-viewer.admitted")"
+
+# R11b nobody was let in: an agent's stop of the same browser is not held.
+r11_serve; : > "$R11D/.fake-signin"
+r11_stop
+arm 'R11b with no person admitted the stop is not held' yes "$( (( R11MS < 3000 )) && echo yes || echo "no (${R11MS}ms)")"
+arm 'R11b (control) ...and the fake did lose its pending commit on shutdown' '' "$(r11_cookie)"
+
+# R11c a marker from an EARLIER serve does not hold this one.
+r11_serve; r11_admit 1; : > "$R11D/.fake-signin"
+r11_stop
+arm 'R11c a person admitted before this serve started does not hold its stop' yes "$( (( R11MS < 3000 )) && echo yes || echo "no (${R11MS}ms)")"
+
+# R11d nothing pending: the wait is capped, and the stop still stops.
+r11_serve; r11_admit
+FIVEDIVE_BROWSER_COOKIE_SETTLE=1 r11_stop
+arm 'R11d with no commit coming the stop waits out the cap and stops' '0 yes no' \
+  "$R11RC $( (( R11MS >= 900 && R11MS < 4000 )) && echo yes || echo "no (${R11MS}ms)") $(yn test -e "$R11D/.5dive-serve")"
+
+# R11e a warm (CDP) serve a person was viewing waits too: the key is the person, not the mode.
+"$BROWSER" serve reddit.com --stop >/dev/null 2>&1
+R11W="$TMP/pr/$SEAT/reddit.com"; rm -f "$R11W/.fake-signin" "$R11W/Default/Cookies"
+FAKE_COMMIT_MS=1500 "$BROWSER" serve reddit.com >/dev/null 2>&1
+_KILL+=("$(sed -n 's/^daemon_pid=//p' "$R11W/.5dive-serve")")
+( umask 077; printf 'admitted_at=%s\n' "$(date -u +%s)" > "$R11W/.5dive-viewer.admitted" )
+arm 'R11e (setup) a warm CDP serve' no "$(yn grep -q '^drive=input' "$R11W/.5dive-serve")"
+: > "$R11W/.fake-signin"
+"$BROWSER" serve reddit.com --stop >/dev/null 2>&1
+arm 'R11e ...and the sign-in a person made in it is on disk after the stop' 'user_session' "$(cat "$R11W/Default/Cookies" 2>/dev/null)"
+
+# R11f a person who left long ago does not hold a later stop (the idle sweep's): the input
+# daemon lives for hours, and what they changed before leaving is on disk by now.
+r11_serve; : > "$R11D/.fake-signin"
+( umask 077; printf 'admitted_at=%s\nleft_at=%s\n' "$(( $(date -u +%s) - 700 ))" "$(( $(date -u +%s) - 600 ))" > "$R11D/.5dive-viewer.admitted" )
+sed -i "s/^started_at=.*/started_at=$(( $(date -u +%s) - 800 ))/" "$R11D/.5dive-serve"
+r11_stop
+arm 'R11f a person who left 10 min ago does not hold the stop' yes "$( (( R11MS < 3000 )) && echo yes || echo "no (${R11MS}ms)")"
+
+# R11g ...but Done after a LONG view does: its revoke takes the view down a second before the stop.
+r11_serve
+sed -i "s/^started_at=.*/started_at=$(( $(date -u +%s) - 800 ))/" "$R11D/.5dive-serve"
+r11_admit "$(( $(date -u +%s) - 700 ))"
+sleep 300 & R11V=$!; _KILL+=("$R11V")
+( umask 077; printf 'vnc_pid=%s\n' "$R11V" > "$R11D/.5dive-viewer" )
+"$BROWSER" viewer-revoke tiktok.com >/dev/null 2>&1
+arm 'R11g (setup) the revoke recorded when the person left' yes "$(yn grep -q '^left_at=' "$R11D/.5dive-viewer.admitted")"
+: > "$R11D/.fake-signin"
+r11_stop
+arm 'R11g a sign-in at the end of a 10-minute view is on disk after Done' 'user_session' "$(r11_cookie)"
+
+# R11m MUTANT: the 1.28.0 stop, whose wait keys on login=1 alone — the sign-in is lost.
+MUT11="$TMP/mut11"; rm -rf "$MUT11"; cp -r "$ROOT/plugins/browser" "$MUT11"
+sed -i 's/^_viewer_admitted_since() {.*/&\n  return 1/' "$MUT11/bin/browser"
+arm 'R11m (anchor) the mutation applied' 1 "$(grep -A1 '^_viewer_admitted_since() {' "$MUT11/bin/browser" | grep -c '^  return 1$')"
+r11_serve "$MUT11/bin/browser"; r11_admit; : > "$R11D/.fake-signin"
+r11_stop "$MUT11/bin/browser"
+arm 'R11m the mutant still says it stopped' 0 "$R11RC"
+arm 'R11m ...and the sign-in never reached disk — the lost login' '' "$(r11_cookie)"
+sleep 2
+arm 'R11m (control) ...and the commit it cut off never came' '' "$(r11_cookie)"
 export PATH="$OLDPATH"
 cd "$ROOT"
 
@@ -312,6 +493,41 @@ HTML
   LD=$!; _KILL+=("$LD")
   for i in $(seq 1 600); do grep -q '^ready' "$TMP/l.ready" 2>/dev/null && break; kill -0 "$LD" 2>/dev/null || break; sleep 0.05; done
   lc() { "$REAL_DAEMON" call "$LP/s.sock" <<<"$1"; }
+  # stack <label> <x> <y> — the window stack at a point (tests/x11_stack.cjs);
+  # its last line is `top=0x… browser=yes|no`. The screen goes to $ART if set.
+  stack() {
+    DISPLAY=":$disp" node "$ROOT/tests/x11_stack.cjs" "$1" "$2" "$3" "${cpid:-0}" ${ART:+"$ART/$1.png"} > "$TMP/stack.$1" 2>&1
+    tail -1 "$TMP/stack.$1"
+  }
+  # see_title <sock> <want> — poll the window title until it reads <want> or
+  # ~10s pass, and print what it read last. Sends NO input: a lost click or
+  # keystroke stays lost, and the arm reading this stays red.
+  see_title() {
+    local t="" i; for i in $(seq 1 50); do
+      t=$("$REAL_DAEMON" call "$1" <<<'{"op":"title"}' 2>/dev/null | jq -r .title)
+      [[ "$t" == "$2" ]] && break; sleep 0.2
+    done; printf '%s' "$t"
+  }
+  # drive <label> <x> <y> <text> <want-title> [expect-red] — L3's check: ONE
+  # click + type, then wait to see the page's title say it arrived. Sets GOT to
+  # "<rc> <title>". When it is not "0 <want>", the window stack at the click
+  # point and the screen are dumped (as ::error too, unless red is expected).
+  drive() {
+    local t0=$SECONDS rc t
+    lc "{\"op\":\"input\",\"steps\":[{\"op\":\"click\",\"x\":$2,\"y\":$3},{\"op\":\"type\",\"value\":\"$4\"}],\"settle\":300}" \
+      > "$TMP/$1.in" 2>"$TMP/$1.err"; rc=$?
+    t=$(jq -r .title "$TMP/$1.in" 2>/dev/null)
+    if (( rc == 0 )) && [[ "$t" != "$5" ]]; then
+      t=$(see_title "$LP/s.sock" "$5")
+      printf '   (%s: the title was not there at the 300ms settle; read after polling, %ss in all)\n' "$1" "$((SECONDS - t0))"
+    fi
+    GOT="$rc $t"
+    [[ "$GOT" == "0 $5" ]] && return 0
+    stack "$1" "$2" "$3" >/dev/null
+    sed 's/^/   /' "$TMP/stack.$1"
+    [[ -n "${6:-}" ]] || gha "input harness: window stack after a red $1" "$(cat "$TMP/stack.$1")"
+    return 0
+  }
   if ! grep -q '^ready' "$TMP/l.ready"; then
     arm 'L0 the live input daemon came up' ready "$(grep -v -i dbus "$TMP/l.err" | tail -2 | tr '\n' ' ')"
   else
@@ -329,12 +545,16 @@ HTML
     done
     arm 'L1b the page receives pointer input before L3 is sent (readiness observed, not assumed)' 'armed:wd=false' "$t"
     cpid=$(pgrep -f -- "--user-data-dir=$LP" | head -1)
+    # Nothing else may sit where L3 clicks: the display is this harness's own
+    # Xvfb, and this says so before L3 rather than after it goes red.
+    t=$(stack l1c 640 500)
+    arm 'L1c the browser is the topmost window at the L3 click point' 'browser=yes' "${t#* }"
+    [[ "${t#* }" == browser=yes ]] || sed 's/^/   /' "$TMP/stack.l1c"
     cmd=$(tr '\0' ' ' < "/proc/$cpid/cmdline" 2>/dev/null)
     arm 'L2 Chrome runs with no --remote-debugging and no --enable-automation' 'yes no' \
       "$(yn test -n "$cmd") $(yn grep -qE -- '--remote-debugging|--enable-automation' <<<"$cmd")"
-    lc '{"op":"input","steps":[{"op":"click","x":640,"y":500},{"op":"type","value":"héllo ✓"}],"settle":300}' > "$TMP/l.in" 2>"$TMP/l.inerr"; rc=$?
-    arm 'L3 a click and typed text arrive as isTrusted input, non-ASCII included' '0 typed:héllo ✓:click=true:key=true' \
-      "$rc $(jq -r .title "$TMP/l.in" 2>/dev/null)"
+    drive l3 640 500 'héllo ✓' 'typed:héllo ✓:click=true:key=true'
+    arm 'L3 a click and typed text arrive as isTrusted input, non-ASCII included' '0 typed:héllo ✓:click=true:key=true' "$GOT"
     lc '{"op":"screen"}' > "$TMP/l.sc" 2>/dev/null
     jq -r .png_b64 "$TMP/l.sc" | base64 -d > "$TMP/l.png" 2>/dev/null
     arm 'L4 screen returns a PNG of the whole 1280x800 display' '89504e47 1280 800' \
@@ -363,11 +583,20 @@ HTML
         await x.sync();
         for (let i = 0; i < 50 && !(await x.viewable(wid)); i++) await new Promise(r => setTimeout(r, 20));
         await x.setFocus(wid);
-        process.stdout.write("up\n");
+        process.stdout.write("up 0x" + wid.toString(16) + "\n");
         setInterval(() => {}, 1000);
       })().catch(e => { console.error(e.message); process.exit(1); });' "$X11LIB" > "$TMP/l.fw" 2>&1 &
     FW=$!; _KILL+=("$FW")
     for i in $(seq 1 100); do grep -q '^up' "$TMP/l.fw" && break; sleep 0.05; done
+    fwid=$(awk '/^up/{print $2}' "$TMP/l.fw")
+    # L3m — THE INSTRUMENT. L3's own check, pointed at a point the foreign
+    # window covers: it must go red, and its dump must name that window as the
+    # one on top. (The daemon refuses the click, so no key is sent: L9 below
+    # still starts from 'héllo ✓!'.)
+    drive l3m 500 400 M 'typed:héllo ✓!M:click=true:key=true' expect-red
+    arm 'L3m mutation: L3 on a click point another window covers goes red, and the dump names that window on top' \
+      "red top=${fwid:-?} browser=no" \
+      "$([[ "$GOT" == '0 typed:héllo ✓!M:click=true:key=true' ]] && echo green || echo red) $(tail -1 "$TMP/stack.l3m" 2>/dev/null)"
     lc '{"op":"input","steps":[{"op":"click","x":500,"y":400},{"op":"type","value":"Z"}],"settle":300}' > "$TMP/l.cv" 2>"$TMP/l.cverr"; rc=$?
     arm 'L8 a click on a point another window covers fails non-zero, naming it, and the plan stops' '1 yes 1 no' \
       "$rc $(yn grep -q 'covered by a window that is not the browser' "$TMP/l.cverr") $(jq -r .steps_run "$TMP/l.cv" 2>/dev/null) $(yn grep -q 'Z' <<<"$(jq -r .title "$TMP/l.cv" 2>/dev/null)")"
@@ -413,8 +642,11 @@ HTML
         const r = await ask({ op: "input", steps: [{ op: "click", x: 640, y: 500 }, { op: "type", value: "go" }], settle: 300 });
         process.stdout.write(r.out); process.exit(r.rc === null ? 1 : r.rc);
       })();' "$LP2/s.sock" > "$TMP/l2.in" 2>/dev/null; rc=$?
+    # As L3: the input went once; wait to SEE it, never re-send it.
+    t=$(jq -r .title "$TMP/l2.in" 2>/dev/null)
+    (( rc == 0 )) && [[ "$t" != 'typed:go:click=true:key=true' ]] && t=$(see_title "$LP2/s.sock" 'typed:go:click=true:key=true')
     arm 'L10 a fresh page driven the instant its title appears still gets the click and the text' '0 typed:go:click=true:key=true' \
-      "$rc $(jq -r .title "$TMP/l2.in" 2>/dev/null)"
+      "$rc $t"
     "$REAL_DAEMON" call "$LP2/s.sock" <<<'{"op":"shutdown"}' >/dev/null 2>&1
     for i in $(seq 1 100); do kill -0 "$LD2" 2>/dev/null || break; sleep 0.05; done
   fi

@@ -272,7 +272,10 @@ Some sites will not render for a browser under automation control. For those, th
 adapter says `"drive": "input"`, and the browser is **plain Chrome, driven the way a person
 drives it**: you read the screen and act through a real keyboard and mouse. There is no
 automation channel, so to the page it is indistinguishable from the owner's own window.
-tiktok.com is the first such site. The verbs tell you when a site is in input mode.
+tiktok.com is the first such site. A box can also make input mode the **default** for every
+logged-in site (`5dive browser config` shows it; root sets `drive=input`), and then this is how
+you work on all of them, unless a site's adapter says `"drive": "cdp"`. The verbs tell you when a
+site is in input mode: `read`, `tree` or `run` refused "INPUT mode" means use the screen.
 
 ```bash
 5dive browser shot tiktok.com https://www.tiktok.com/@someone   # a PNG of the live window (1280x800) + its title
@@ -308,6 +311,13 @@ They open the **same window** you were driving. Your input is refused while they
 when they tap Done you carry on from the page they left. Take a `shot` before your next act.
 A challenge whose title says so stops an act by itself (exit 75). TikTok's puzzle does not change
 the title, so when you see one in a screenshot, hand the window over. Never try to solve it.
+
+The one exception is the owner's own authenticator. On a site whose owner saved its
+authenticator seed on the box, `run` types the 2FA code itself, and
+`5dive browser totp fill <site> [<url>]` does it on demand. Neither shows you the code. With no
+seed saved, it stops like any challenge. `5dive browser totp status <site>` prints the secret
+gate to file so the owner can paste the seed on the box's one-time link. Never ask for the seed
+in chat.
 
 ## What will actually go wrong
 

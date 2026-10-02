@@ -7,6 +7,11 @@ attempts to solve one. That is a decision, not a limitation, and the second fram
 and reputational exposure the actual design avoids. Use the first one in docs, marketing and the
 plugin description.
 
+**One exception, and it is the owner's own (DIVE-5336): an authenticator-app 2FA prompt, on a
+site whose owner saved that site's authenticator seed on the box.** See
+[The owner's authenticator seed](#the-owners-authenticator-seed-dive-5336). A CAPTCHA, an emailed
+or SMS code and an "are you human" step still stop and ask for a person.
+
 `5dive browser` is a **general capability, not a distribution product.** We do not curate a
 platform list and we do not choose per-site API-vs-browser paths; the user does. Adapters are
 therefore a **public surface**, and "how does a user add a site" is a core design question rather
@@ -172,6 +177,13 @@ written after the stop was asked for, capped at `FIVEDIVE_BROWSER_COOKIE_SETTLE`
 for it to exit (bounded at `FIVEDIVE_BROWSER_STOP_GRACE` seconds, default 10, then SIGKILL) before
 it stops the Xvfb. It returns only once the profile is free, so the status check Done runs next
 never finds the profile still locked. An agent's plain Chrome does not wait for the cookie commit.
+
+The same wait covers a browser a person was let into through the viewer, whatever holds it
+(DIVE-5374). On an input-mode box (or a warm serve) the viewer attaches to the session daemon's
+Chrome, not to a login view. `viewer-redeem` records `.5dive-viewer.admitted`, and `--stop` of a
+serve started before that record waits for the commit before it asks the daemon to shut down, if
+the person left (or was admitted) within the last 60 s. A stop of a browser nobody viewed does not
+wait.
 
 ### What protects the session while the viewer is open
 
@@ -356,6 +368,14 @@ without a scheduled probe the agent finds out **mid-publish**. So:
   browser needs a CDP endpoint, and a loopback debugging port on a logged-in profile is reachable
   by every seat on the box — the credential the 0700 store exists to protect, handed over with no
   file permission needed. Not a trade `status` gets to make.
+- **Every headless launch has a wall-clock cap** (DIVE-5375). `--virtual-time-budget` bounds page
+  time, not a Chrome that wedges before or outside the page. The probe, the launch check, `shot` and
+  `capture` run Chrome under `timeout -k 5 <budget + FIVEDIVE_BROWSER_CHROME_SLACK_S>` (default
+  slack 30 s), as `read` already did. A capped probe reports and stamps `UNKNOWN — probe timed
+  out` and removes the SingletonLock its dead Chrome left. A probe that finds the profile locked by
+  a one-shot headless Chrome (`--headless` plus `--dump-dom`/`--screenshot`, no debugging channel)
+  older than `FIVEDIVE_BROWSER_PROBE_STALE_S` (default 600) stops it first. A viewer's, a served
+  or a session daemon's browser is never touched.
 - **`UNKNOWN` is deliberately asymmetric, and both halves are load-bearing.** `status` stays
   QUIET on it and exits 0 — a network blip must not page a person, or the signal becomes noise.
   `run` **refuses** on it, because the action is the irreversible half and an unverified session
@@ -1010,3 +1030,38 @@ proxy — any residential proxy that gives you a URL:
   **dedicated profile on that desktop, never the user's default**; reaching the default discards
   the entire reason profile-per-site is the design, turning an adapter bug into their bank and
   their email. Do not ship it unscoped.
+
+## The owner's authenticator seed (DIVE-5336)
+
+A box agent used to stall at every 2FA re-prompt until a person typed a code in. If the owner
+chooses to, they now save the site's **authenticator seed** (the base32 text under the QR code a
+site shows when you add an authenticator app, or the `otpauth://` link it encodes) on the box.
+At a 2FA prompt, `run` computes the current 6-digit code on the box (RFC 6238: SHA1, 30 s,
+6 digits) and types it in, then re-probes. That is the owner logging in as themselves. It is not
+a bypass, and nothing else changes: a CAPTCHA, an emailed or SMS code or an "are you human"
+page has no seed, re-probes as the same `CHALLENGE`, and stops exactly as before.
+
+- **How the seed gets on the box, without touching 5dive's servers.** The owner pastes it on the
+  box's one-time secrets link (DIVE-5319): an agent files
+  `5dive task need <DIVE-id> --type=secret --secret-key=TOTP_<SITE> --connector=browser-totp`
+  (`totp status <site>` prints the exact line; `github.com` is `TOTP_GITHUB_COM`). The link writes
+  it into the root-only connector store, and `sudo 5dive browser totp import <site>` moves it into
+  the site's profile and deletes the store's copy. `run` and `totp fill` attempt that import
+  themselves (`sudo -n`) when no seed is saved yet. At the box, `5dive browser totp set <site>`
+  reads it from stdin, with hidden input at a terminal.
+- **Where it lives.** `.5dive-totp`, 0600, inside the site's 0700 profile directory. It is held by
+  the same uid that holds the session, a brokered seat asks the session daemon to type the code
+  without ever reading the seed, and `forget` removes it along with the login. A seed file
+  that another uid can read is refused.
+- **What is typed, and where.** Only into the code box (`autocomplete="one-time-code"`, or the
+  names sites give it: `app_totp`, `otp`, `totpPin`, `otc`, a numeric 6-long `code`), and only on
+  a page whose host is the site itself or a subdomain of it. A redirect to another host gets
+  nothing. A code with less than 5 s left waits for the next window.
+- **Never shown.** The seed and the code are never printed, logged, put in an error or sent
+  anywhere. The executor's result line, the `run` stderr note and the `totp-fill` audit row name
+  the FIELD, never the value. `tests/browser_totp_unit.sh` greps `run`'s output and the audit log
+  for the seed and every code the test site accepted, and expects 0.
+- **Not in v1:** emailed and SMS codes (they need inbox or phone access, which is a separate
+  decision), input-mode sites (plain Chrome has no DOM to find the field in), and otpauth links
+  with anything other than SHA1 / 6 digits / 30 s, which are refused rather than stored.
+
