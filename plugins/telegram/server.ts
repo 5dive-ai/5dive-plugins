@@ -54,7 +54,7 @@ import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
-import { createAckStatus } from './ackstatus.ts'
+import { createAckStatus, restoreJournal, type ShownRecord } from './ackstatus.ts'
 import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, renderConnectLink, renderConnectVerdict, connectAgentNote, connectFailureText, type ConnectTap } from './browser-connect.ts'
 import { relayOwnerAskTap } from './owner-ask.ts'
 import { tapContent, tapMeta, tapLogEntry } from './buttontap.ts'
@@ -380,9 +380,44 @@ const typingLoops = new Map<string, ReturnType<typeof setInterval>>()
 // on the very next tick would put "typing…" under what may be the turn's FINAL
 // message for ~5s before the Stop signal lands, so the loop skips one beat.
 const typingQuietUntil = new Map<string, number>()
+// While a status line is on a message, its plain text is journalled here, so
+// a server killed mid-turn (crash, session restart) puts it back on the next
+// boot instead of leaving "⏳ …" on the human's message for good.
+const ACK_JOURNAL_FILE = join(STATE_DIR, 'ack-status.json')
+function readAckJournal(): Record<string, ShownRecord> {
+  try {
+    const j = JSON.parse(readFileSync(ACK_JOURNAL_FILE, 'utf8'))
+    return j && typeof j === 'object' ? (j as Record<string, ShownRecord>) : {}
+  } catch {
+    return {}
+  }
+}
+function writeAckJournal(j: Record<string, ShownRecord>): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = ACK_JOURNAL_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(j) + '\n', { mode: 0o600 })
+    renameSync(tmp, ACK_JOURNAL_FILE)
+  } catch {
+    // cosmetic state — a lost write only costs the boot-time restore
+  }
+}
+const ackJournal = {
+  set: (rec: ShownRecord) => writeAckJournal({ ...readAckJournal(), [`${rec.chatId}:${rec.messageId}`]: rec }),
+  del: (chatId: string, messageId: number) => {
+    const j = readAckJournal()
+    const key = `${chatId}:${messageId}`
+    if (!(key in j)) return
+    delete j[key]
+    writeAckJournal(j)
+  },
+}
+const editAck = (chatId: string, messageId: number, text: string, parseMode?: 'MarkdownV2') =>
+  bot.api.editMessageText(chatId, messageId, text, ...(parseMode ? [{ parse_mode: parseMode }] : []))
+void restoreJournal(Object.values(readAckJournal()), editAck, ackJournal.del)
 const ackStatus = createAckStatus({
-  edit: (chatId, messageId, text, parseMode) =>
-    bot.api.editMessageText(chatId, messageId, text, ...(parseMode ? [{ parse_mode: parseMode }] : [])),
+  edit: editAck,
+  journal: ackJournal,
   readLabel: () => {
     try {
       const j = JSON.parse(readFileSync(STATUS_LABEL_FILE, 'utf8')) as { at?: unknown; label?: unknown }

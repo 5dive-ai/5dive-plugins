@@ -29,6 +29,16 @@ export type AckStatusDeps = {
   readLabel: () => StatusLabel | null
   now?: () => number
   throttleMs?: number
+  // Survives a crash or restart mid-turn: a record is written while our line
+  // is on a message and dropped once it is off, so the next boot can put the
+  // text back (restoreJournal). Optional — tests and old callers pass none.
+  journal?: AckJournal
+}
+
+export type ShownRecord = { chatId: string; messageId: number; base: string; parseMode?: ParseMode }
+export type AckJournal = {
+  set: (rec: ShownRecord) => void
+  del: (chatId: string, messageId: number) => void
 }
 
 type Ack = {
@@ -96,6 +106,7 @@ export function createAckStatus(deps: AckStatusDeps) {
         if (ack.shown === null) return
         ack.shown = null
         await deps.edit(chatId, ack.messageId, ack.base, ack.parseMode).catch(() => {})
+        deps.journal?.del(chatId, ack.messageId)
       })
   }
 
@@ -154,6 +165,7 @@ export function createAckStatus(deps: AckStatusDeps) {
         turn.ack.base = text
         turn.ack.parseMode = parseMode
         turn.ack.shown = null
+        deps.journal?.del(chatId, messageId)
       }
     },
 
@@ -171,6 +183,9 @@ export function createAckStatus(deps: AckStatusDeps) {
       const text = withStatus(ack.base, line, ack.parseMode)
       if (text.length > MAX_TEXT) return null
       turn.lastEditAt = t
+      // Journal BEFORE the edit: a crash between the two then costs one
+      // harmless no-op restore, never a line left on the message.
+      deps.journal?.set({ chatId, messageId: ack.messageId, base: ack.base, parseMode: ack.parseMode })
       const p = deps
         .edit(chatId, ack.messageId, text, ack.parseMode)
         .then(() => {
@@ -180,7 +195,10 @@ export function createAckStatus(deps: AckStatusDeps) {
           const msg = err instanceof Error ? err.message : String(err)
           if (/not modified/i.test(msg)) ack.shown = line
           // Deleted, too old, or otherwise uneditable: stop targeting it.
-          else if (/not found|can't be edited|cannot be edited/i.test(msg) && turn.ack === ack) turn.ack = null
+          else if (/not found|can't be edited|cannot be edited/i.test(msg)) {
+            deps.journal?.del(chatId, ack.messageId)
+            if (turn.ack === ack) turn.ack = null
+          } else if (ack.shown === null) deps.journal?.del(chatId, ack.messageId)
         })
         .finally(() => {
           if (turn.inflight === p) turn.inflight = null
@@ -192,3 +210,24 @@ export function createAckStatus(deps: AckStatusDeps) {
 }
 
 export type AckStatus = ReturnType<typeof createAckStatus>
+
+// Boot-time clean-up for a process that died with a status line up: put each
+// journalled message back to its text, then forget it either way (a message
+// that can no longer be edited stays as it is — nothing better is possible).
+export async function restoreJournal(
+  records: ShownRecord[],
+  edit: AckStatusDeps['edit'],
+  del: AckJournal['del'],
+): Promise<number> {
+  let restored = 0
+  for (const r of records) {
+    try {
+      await edit(r.chatId, r.messageId, r.base, r.parseMode)
+      restored++
+    } catch {
+      // gone, too old, or already plain — nothing to do
+    }
+    del(r.chatId, r.messageId)
+  }
+  return restored
+}

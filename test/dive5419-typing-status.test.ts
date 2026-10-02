@@ -25,7 +25,7 @@ import { tmpdir } from 'node:os'
 import { spawn, spawnSync } from 'node:child_process'
 import { decideNag } from '../plugins/telegram/hooks/lib/silence-decision'
 import type { SilenceState } from '../plugins/telegram/hooks/lib/types'
-import { createAckStatus, statusLine, STATUS_THROTTLE_MS, FALLBACK_LABEL } from '../plugins/telegram/ackstatus'
+import { createAckStatus, restoreJournal, statusLine, STATUS_THROTTLE_MS, FALLBACK_LABEL, type ShownRecord } from '../plugins/telegram/ackstatus'
 import { labelFor, sanitizeLabel } from '../plugins/telegram/hooks/lib/status-label'
 import { analyzeTurn, isBareAck } from '../plugins/telegram/hooks/lib/transcript'
 import type { TranscriptEntry } from '../plugins/telegram/hooks/lib/types'
@@ -324,6 +324,68 @@ describe('(C) the ack carries a hook-driven status until the turn ends', () => {
     const start = SERVER.indexOf("case 'reply': {")
     const body = SERVER.slice(start, SERVER.indexOf("      case '", start + 10))
     expect(body).toMatch(/if \(!LITE\) ackStatus\.noteReply\(/)
+  })
+})
+
+describe('(C) a crash mid-turn does not leave the line up (ops flag 2)', () => {
+  function journalled() {
+    const j = new Map<string, ShownRecord>()
+    let clock = 1_000_000
+    const edits: Array<{ messageId: number; text: string }> = []
+    const ack = createAckStatus({
+      now: () => clock,
+      readLabel: () => null,
+      edit: async (_c, messageId, text) => { edits.push({ messageId, text }) },
+      journal: {
+        set: (r) => j.set(`${r.chatId}:${r.messageId}`, r),
+        del: (c, m) => j.delete(`${c}:${m}`),
+      },
+    })
+    return { ack, j, edits, advance: (ms: number) => { clock += ms } }
+  }
+
+  test('C12 the plain text is journalled while the line is up, and dropped once it is off', async () => {
+    const h = journalled()
+    h.ack.beginTurn(CHAT)
+    h.ack.noteReply(CHAT, 5, 'ack text')
+    h.advance(STATUS_THROTTLE_MS)
+    await h.ack.tick(CHAT)
+    expect([...h.j.values()]).toEqual([{ chatId: CHAT, messageId: 5, base: 'ack text', parseMode: undefined }])
+    await h.ack.endTurn(CHAT)
+    expect(h.j.size).toBe(0)
+  })
+
+  test('C13 the model\'s own edit replaces the line, so the journal entry goes too', async () => {
+    const h = journalled()
+    h.ack.beginTurn(CHAT)
+    h.ack.noteReply(CHAT, 5, 'ack')
+    h.advance(STATUS_THROTTLE_MS)
+    await h.ack.tick(CHAT)
+    await h.ack.beforeEdit(CHAT)
+    h.ack.afterEdit(CHAT, 5, 'ack\n\n→ done')
+    expect(h.j.size).toBe(0)
+  })
+
+  test('C14 boot restore puts each journalled message back and forgets it, even when an edit fails', async () => {
+    const recs: ShownRecord[] = [
+      { chatId: CHAT, messageId: 5, base: 'first' },
+      { chatId: CHAT, messageId: 6, base: 'gone' },
+    ]
+    const edited: string[] = []
+    const dropped: number[] = []
+    const n = await restoreJournal(
+      recs,
+      async (_c, m, text) => { if (m === 6) throw new Error('message to edit not found'); edited.push(text) },
+      (_c, m) => { dropped.push(m) },
+    )
+    expect(n).toBe(1)
+    expect(edited).toEqual(['first'])
+    expect(dropped).toEqual([5, 6])
+  })
+
+  test('C15 the server runs the restore at boot over its journal file', () => {
+    expect(SERVER).toContain('void restoreJournal(Object.values(readAckJournal()), editAck, ackJournal.del)')
+    expect(SERVER).toContain('journal: ackJournal,')
   })
 })
 
