@@ -2,20 +2,58 @@
 // tested without importing server.ts (which long-polls Telegram on import).
 //
 // The owner shares an agent from the Mini App ("Who can talk to {name}" →
-// Add to a group, t.me/<bot>?startgroup=1). A group added by someone already in
-// allowFrom is approved at once, mention-only, and the agent says hello. A group
-// added by anyone else stays in `discovered` until it is approved, as before,
-// and its join line points at the app instead of a dashboard or a terminal.
+// Add to a group, t.me/<bot>?startgroup=1). A group added by an OWNER is
+// approved at once, mention-only, and the agent says hello. A group added by
+// anyone else stays in `discovered` until it is approved, as before, and its
+// join line points at the app instead of a dashboard or a terminal.
 // A lite client's lines never name the platform and carry no emoji (DIVE-5121).
+//
+// Owner is NOT "in allowFrom": the app approves guests into allowFrom so they can
+// DM the agent, and a guest must not be able to put the agent, on the owner's
+// account, into a group of people the owner never saw (quinn, DIVE-5368 iter 1).
+// `access.owners` is the plugin's own record: ids paired through the owner-level
+// paths (`agent pair`, the /telegram:access skill), which both drop
+// approved/<id>; the app's guest approve never does. `telegram-access set`
+// rewrites only dmPolicy/allowFrom/groups, so the record survives the app.
 
 import type { Lang } from './hooks/lib/lite.ts'
 
 type From = { id: number | string; is_bot?: boolean } | undefined
 
-/** The adder is someone the bot already answers in private: approve the group. */
-export function addedByOwner(allowFrom: readonly string[], from: From): boolean {
-  if (!from || from.is_bot) return false
-  return allowFrom.includes(String(from.id))
+const USER_ID = /^\d+$/
+
+/** The adder is a recorded owner the bot still answers: approve the group.
+ *  No record yet (`owners` undefined) → nobody is the owner: the group waits. */
+export function addedByOwner(owners: readonly string[] | undefined, allowFrom: readonly string[], from: From): boolean {
+  if (!from || from.is_bot || !owners) return false
+  const id = String(from.id)
+  return owners.includes(id) && allowFrom.includes(id)
+}
+
+/** The join's decision, on the handler's copy of access: an owner's add puts
+ *  the group in `groups` mention-only; any other add leaves it only in
+ *  `discovered` (written by the handler before this), waiting for approval. */
+export function admitOnJoin(
+  access: { owners?: string[]; allowFrom: string[]; groups: Record<string, unknown> },
+  chatId: string,
+  from: From,
+): boolean {
+  const approved = !(chatId in access.groups) && addedByOwner(access.owners, access.allowFrom, from)
+  if (approved) access.groups[chatId] = { requireMention: true, allowFrom: [] }
+  return approved
+}
+
+/**
+ * The owners record after one pass, or null when it is unchanged.
+ * First sight seeds it from allowFrom: every id there came in through an
+ * owner-level pairing, because the app refuses a guest approve until this
+ * record exists (it is the app's proof the plugin can tell the two apart).
+ * Then each id paired since (an approved/<id> file) is added.
+ */
+export function nextOwners(cur: readonly string[] | undefined, allowFrom: readonly string[], paired: readonly string[]): string[] | null {
+  const next = cur ? [...cur] : allowFrom.filter((id) => USER_ID.test(id))
+  for (const id of paired) if (USER_ID.test(id) && !next.includes(id)) next.push(id)
+  return cur && next.length === cur.length ? null : next
 }
 
 export const GROUP_STRINGS = {

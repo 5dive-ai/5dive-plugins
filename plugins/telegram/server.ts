@@ -21,7 +21,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { readAccessFile as readAccessFileCore } from './access-core.ts'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
@@ -60,7 +60,7 @@ import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelr
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
-import { addedByOwner, groupJoinLines, ASK_OWNER } from './groupjoin.ts'
+import { admitOnJoin, nextOwners, groupJoinLines, ASK_OWNER } from './groupjoin.ts'
 import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, startGreeting, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
@@ -434,6 +434,8 @@ type Access = {
   discovered?: Record<string, DiscoveredGroup>
   /** DIVE-5368: getMe's Group Privacy bit (false = privacy on), for the app's screen */
   canReadAllGroupMessages?: boolean
+  /** DIVE-5368: who paired as an owner (not a guest the app let in); see groupjoin.ts */
+  owners?: string[]
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
   /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
@@ -495,6 +497,7 @@ function normalizeAccess(raw: unknown): Access {
     pending: parsed.pending ?? {},
     discovered: parsed.discovered,
     canReadAllGroupMessages: parsed.canReadAllGroupMessages,
+    owners: parsed.owners,
     mentionPatterns: parsed.mentionPatterns,
     ackReaction: parsed.ackReaction,
     replyToMode: parsed.replyToMode,
@@ -1141,6 +1144,7 @@ function checkApprovals(): void {
     return
   }
   if (files.length === 0) return
+  recordOwners(files)
 
   for (const senderId of files) {
     const file = join(APPROVED_DIR, senderId)
@@ -1156,6 +1160,23 @@ function checkApprovals(): void {
 }
 
 if (!STATIC && !SEND_ONLY) setInterval(checkApprovals, 5000).unref()
+
+// DIVE-5368: the owners record (groupjoin.ts). Seeded once on a box that already
+// has an access file, then grown by each owner-level pairing seen above. No file
+// yet: nothing to record; the first pairing writes one and drops approved/<id>.
+function recordOwners(paired: string[] = []): void {
+  if (STATIC || !existsSync(ACCESS_FILE)) return
+  try {
+    const a = readAccessFile()
+    const next = nextOwners(a.owners, a.allowFrom, paired)
+    if (!next) return
+    a.owners = next
+    saveAccess(a)
+  } catch (err) {
+    process.stderr.write(`telegram channel: owners record not written: ${err}\n`)
+  }
+}
+recordOwners()
 
 // DIVE-1503: keep the pinned "needs-you" banner in sync with the gate backlog.
 // Gated to the personal-bot / polled mode (same as checkApprovals). NOT armed in
@@ -6281,8 +6302,7 @@ bot.on('my_chat_member', async ctx => {
 
   // DIVE-5368: the owner added it (Mini App → Add to a group): approved at once,
   // mention-only. Anyone else's group waits for approval, as before.
-  const approved = !(chatId in access.groups) && addedByOwner(access.allowFrom, ctx.from)
-  if (approved) access.groups[chatId] = { requireMention: true, allowFrom: [] }
+  const approved = admitOnJoin(access, chatId, ctx.from)
   const announce = !approved && !(chatId in access.groups) && entry.announcedAt === undefined
   // Saved before any network wait below, so a group is live the moment it joins
   // and an app write landing meanwhile is not overwritten by this copy.
@@ -6328,8 +6348,9 @@ bot.on('my_chat_member', async ctx => {
     await bot.api.sendMessage(chat.id, text)
     sent = true
   } catch {
-    // Group may block bot posts — fall back to DMing the paired owner(s).
-    for (const uid of access.allowFrom) {
+    // Group may block bot posts — fall back to DMing the paired owner(s), never
+    // a guest (the line can carry the group's id).
+    for (const uid of (access.owners ?? access.allowFrom).filter((id) => access.allowFrom.includes(id))) {
       try {
         await bot.api.sendMessage(uid, text)
         sent = true

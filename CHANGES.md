@@ -4,8 +4,7 @@
 
 lodar, 2026-10-02: "access setting for each agent ... to make user use them in group, or to let other
 telegram chat IDs interact with his own agent". The Mini App's new "Who can talk to {name}" screen
-opens Telegram's add-to-group picker for the agent's bot. A group added by someone already in
-`allowFrom` (the owner) is now approved at once, mention-only (`requireMention: true`), and the agent
+opens Telegram's add-to-group picker for the agent's bot. A group added by an owner is now approved at once, mention-only (`requireMention: true`), and the agent
 says "Hi, I'm {name}. Mention me to ask something." A group anyone else adds still waits in
 `discovered`; its one-time line now points at the 5dive app instead of the dashboard or a terminal
 (off 5dive, `/telegram:access` stays). The Group Privacy warning (DIVE-246) is in plain words. The
@@ -14,7 +13,12 @@ group's plain text reach the gate (commands, taps and media in a group still get
 `dmPolicy: pairing` a stranger who DMs a lite bot is recorded as pending for the app's approve list
 and told once, in plain words, to ask the owner; never a code. Pending entries carry the sender's
 name, and access.json keeps getMe's Group Privacy bit (`canReadAllGroupMessages`) so the app can say when
-Telegram hides group messages from the bot. 0.5.84, not 0.5.83: DIVE-5367 is in flight on 0.5.82. Tests: `test/dive5368-share-agent.test.ts`.
+Telegram hides group messages from the bot. "Owner" is not "in `allowFrom`": the app lets guests
+into `allowFrom` to DM the agent, and a guest must not be able to share it into a group. access.json now
+carries `owners`, the plugin's own record: seeded once from `allowFrom` on a box that has an access
+file, then grown only by an owner-level pairing (`agent pair`, `/telegram:access`, each of which drops
+`approved/<id>`). An add by anyone not in both `owners` and `allowFrom` waits, and a blocked group post
+falls back to an owner's DM, never a guest's. 0.5.84, not 0.5.83: DIVE-5367 is in flight on 0.5.82. Tests: `test/dive5368-share-agent.test.ts`.
 
 ### Changed: Telegram /status names the CLI "5dive" again (telegram 0.5.82)
 

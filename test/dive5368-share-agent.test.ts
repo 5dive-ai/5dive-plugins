@@ -2,7 +2,9 @@
 // {name}"). Three things the plugin owes that screen:
 //   1. A group the OWNER adds the bot to is approved at once, mention-only, and
 //      the agent says hello. A group anyone else adds waits, and its line points
-//      at the app, not the dashboard or a terminal (negative control).
+//      at the app, not the dashboard or a terminal (negative control). Owner is
+//      the plugin's `owners` record, NOT allowFrom: a guest the app let in is in
+//      allowFrom and must not be able to share the agent (quinn, iteration 1).
 //   2. Under the lite profile a group the owner shared reaches the gate at all
 //      (the lite front door dropped every non-private update), and a stranger's
 //      DM is recorded for the app's approve list with one plain line, no code.
@@ -14,7 +16,7 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { addedByOwner, groupJoinLines, ASK_OWNER, GROUP_STRINGS, type JoinInput } from '../plugins/telegram/groupjoin'
+import { addedByOwner, admitOnJoin, nextOwners, groupJoinLines, ASK_OWNER, GROUP_STRINGS, type JoinInput } from '../plugins/telegram/groupjoin'
 
 const SERVER = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram', 'server.ts'), 'utf8')
 const LEAK = /5dive|claude|anthropic|openrouter|\bmodel|token|context|server|\bbox\b|\bcost|\$|сервер|токен|модел|контекст/i
@@ -43,24 +45,69 @@ function between(from: string, to: string): string {
 }
 
 describe('who added the bot decides whether the group is approved', () => {
-  test('the owner (already in allowFrom) → approved', () => {
-    expect(addedByOwner(['111', '222'], { id: 222 })).toBe(true)
-    expect(addedByOwner(['111'], { id: '111' })).toBe(true)
+  test('a recorded owner the bot still answers → approved', () => {
+    expect(addedByOwner(['111'], ['111', '222'], { id: 111 })).toBe(true)
+    expect(addedByOwner(['111', '222'], ['111', '222'], { id: '222' })).toBe(true)
   })
-  test('negative control: anyone else, a bot, or no adder → not approved', () => {
-    expect(addedByOwner(['111'], { id: 333 })).toBe(false)
-    expect(addedByOwner([], { id: 111 })).toBe(false)
-    expect(addedByOwner(['111'], { id: 111, is_bot: true })).toBe(false)
-    expect(addedByOwner(['111'], undefined)).toBe(false)
+  test('negative control: anyone else, a bot, no adder, no record, or an owner since removed → not approved', () => {
+    expect(addedByOwner(['111'], ['111'], { id: 333 })).toBe(false)
+    expect(addedByOwner(['111'], ['111'], { id: 111, is_bot: true })).toBe(false)
+    expect(addedByOwner(['111'], ['111'], undefined)).toBe(false)
+    expect(addedByOwner(undefined, ['111'], { id: 111 })).toBe(false)
+    expect(addedByOwner(['111'], [], { id: 111 })).toBe(false)
   })
-  test('the join handler approves mention-only, only on an owner add, and saves before any network wait', () => {
+  test('a GUEST (in allowFrom, not an owner) adds the bot: the group stays in discovered and is not added to groups', () => {
+    const access = {
+      owners: ['111'],
+      allowFrom: ['111', '222'],
+      groups: {} as Record<string, unknown>,
+      discovered: { '-100777': { title: 'Strangers', type: 'supergroup', addedBy: '222', firstSeenAt: 1 } },
+    }
+    expect(admitOnJoin(access, '-100777', { id: 222 })).toBe(false)
+    expect(access.groups).toEqual({})
+    expect(Object.keys(access.discovered)).toEqual(['-100777'])
+  })
+  test('the owner adds it: in groups, mention-only, nobody else listed', () => {
+    const access = { owners: ['111'], allowFrom: ['111', '222'], groups: {} as Record<string, unknown> }
+    expect(admitOnJoin(access, '-100888', { id: 111 })).toBe(true)
+    expect(access.groups).toEqual({ '-100888': { requireMention: true, allowFrom: [] } })
+    // an approved group's own settings are never reset by a re-add
+    access.groups['-100888'] = { requireMention: false, allowFrom: ['5'] }
+    expect(admitOnJoin(access, '-100888', { id: 111 })).toBe(false)
+    expect(access.groups['-100888']).toEqual({ requireMention: false, allowFrom: ['5'] })
+  })
+  test('the join handler decides with admitOnJoin and saves before any network wait', () => {
     const h = between("bot.on('my_chat_member'", "bot.on('message:text'")
-    expect(h).toContain("const approved = !(chatId in access.groups) && addedByOwner(access.allowFrom, ctx.from)")
-    expect(h).toContain("if (approved) access.groups[chatId] = { requireMention: true, allowFrom: [] }")
+    expect(h).toContain('const approved = admitOnJoin(access, chatId, ctx.from)')
+    expect(h).not.toContain('addedByOwner(access.allowFrom')
     // the group is live before getMe / the version probe / the send
     expect(h.indexOf('saveAccess(access)', h.indexOf('const announce'))).toBeLessThan(h.indexOf('getMe()'))
     // the one-time announce is stamped on a FRESH read, never the stale copy
     expect(h).toContain('const fresh = loadAccess()')
+    // a blocked group post falls back to an owner's DM, never a guest's
+    expect(h).toContain('(access.owners ?? access.allowFrom).filter((id) => access.allowFrom.includes(id))')
+  })
+})
+
+describe('the owners record: seeded once, grown only by an owner-level pairing', () => {
+  test('first sight seeds from allowFrom (numeric user ids only)', () => {
+    expect(nextOwners(undefined, ['111', '-100500', 'x'], [])).toEqual(['111'])
+    expect(nextOwners(undefined, [], [])).toEqual([])
+  })
+  test('an approved/<id> pairing adds that id; a guest the app adds to allowFrom later is NOT added', () => {
+    expect(nextOwners(['111'], ['111', '222'], [])).toBeNull()
+    expect(nextOwners(['111'], ['111', '333'], ['333'])).toEqual(['111', '333'])
+    expect(nextOwners(['111'], ['111'], ['111'])).toBeNull()
+    expect(nextOwners(['111'], ['111'], ['../x', '-5'])).toBeNull()
+  })
+  test('server keeps the record: typed, carried by the loader, written at boot and on each pairing', () => {
+    expect(SERVER).toContain('owners?: string[]')
+    expect(SERVER).toContain('owners: parsed.owners,')
+    const c = between('function checkApprovals(): void {', 'for (const senderId of files)')
+    expect(c).toContain('recordOwners(files)')
+    const r = between('function recordOwners(', '\nrecordOwners()\n')
+    expect(r).toContain('nextOwners(a.owners, a.allowFrom, paired)')
+    expect(r).toContain('!existsSync(ACCESS_FILE)')
   })
 })
 
