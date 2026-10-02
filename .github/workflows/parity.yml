@@ -95,6 +95,11 @@ jobs:
       # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
       - name: browser probe timeout harness
         run: bash tests/browser_probe_timeout_unit.sh
+      # DIVE-5388: served sites checked through their own browser, a headless bot
+      # check is `unverifiable` not "Needs you", and the generic header check —
+      # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
+      - name: browser served probe and generic check harness
+        run: bash tests/browser_served_probe_unit.sh
       # DIVE-4397: the unprivileged-first 5dive reader, and the arms that assert
       # all five telegram forks still route through it. `bun test` does not reach
       # it — the module is driven with an injected exec function from bash, and

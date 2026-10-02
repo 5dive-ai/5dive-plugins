@@ -49,6 +49,8 @@
 #           and the plan stops there (it used to report rc=0 over a lost click)
 #        L9 keyboard focus taken by another window is moved back before typing
 #        L7 shutdown takes Chrome with it
+#        L11 title_probe (DIVE-5388) reads a probe page's title in a tab of its own
+#           and closes only that tab; with a handoff open it does not navigate
 #        L10 a FRESH page driven the instant its title appears still gets the
 #           text: the daemon holds input until the page is quiet (the CI race)
 set -uo pipefail
@@ -131,6 +133,9 @@ export FIVEDIVE_BROWSER_TMP_ROOT="$TMP/tmproot"
 export FIVEDIVE_BROWSER_AUTO_PROPOSE=0 FIVEDIVE_BROWSER_DRIFT_ON_PROBE=0 FIVEDIVE_BROWSER_EVICT_ON_PROBE=0
 export FIVEDIVE_BROWSER_APPROVAL_POLICY="$TMP/no-policy.json"
 export FIVEDIVE_BROWSER_CONNECT_PRIV="$TMP/fake-connect"
+# NO ARM REACHES REAL SUDO for an on-demand serve (DIVE-5389). The R9b arms
+# point this at the plugin itself; everywhere else it is absent.
+export FIVEDIVE_BROWSER_WAKE_PRIV="$TMP/no-wake"
 SEAT="$(id -un)"
 mkdir -p "$TMP/pr/$SEAT" "$TMP/ad" "$TMP/x11"; chmod 711 "$TMP/pr"; chmod 700 "$TMP/pr/$SEAT"
 mkdir -p "$TMP/rv/$SEAT"   # the rendezvous: where serve publishes the .offered marker
@@ -306,6 +311,71 @@ if [[ -S "$TMP/rv/$SEAT/tiktok.com.sock" ]]; then
   n0=$(reqs title)
   o=$(brk tree reddit.com https://www.reddit.com/ 2>&1)
   arm 'R9 regression: a brokered verb on a CDP site sends the daemon no title probe' "$n0 no" "$(reqs title) $(yn grep -q 'INPUT mode' <<<"$o")"
+
+  # R9b — DIVE-5389: Connect then Done leaves the box login connected and NOT
+  # served. A brokered verb then has it started AS THE OWNER, on demand, through
+  # the one privileged verb (here the plugin itself: the seam runs it unprivileged).
+  wk() { FIVEDIVE_BROWSER_WAKE_PRIV="$BROWSER" brk "$@"; }
+  killserve() { _KILL+=("$(sed -n 's/^daemon_pid=//p' "$TMP/pr/$SEAT/$1/.5dive-serve" 2>/dev/null)" "$(sed -n 's/^xvfb_pid=//p' "$TMP/pr/$SEAT/$1/.5dive-serve" 2>/dev/null)"); }
+  "$BROWSER" serve tiktok.com --stop >/dev/null 2>&1
+  n0=$(wc -l < "$TMP/daemon.argv")
+  o=$(wk shot tiktok.com --out="$TMP/b2.png" 2>&1); rc=$?; killserve tiktok.com
+  arm 'R9b a brokered input verb on a connected, unserved site starts the serve and succeeds' "0 yes yes" \
+    "$rc $(yn test -s "$TMP/b2.png") $(yn test -S "$TMP/rv/$SEAT/tiktok.com.sock")"
+  arm 'R9b ...one browser was started, as the owner (its record is in the owner store)' "$((n0 + 1)) yes" \
+    "$(wc -l < "$TMP/daemon.argv") $(yn test -f "$TMP/pr/$SEAT/tiktok.com/.5dive-serve")"
+  arm 'R9b ...and the seat is told it was started, not told to ask a person' "yes no" \
+    "$(yn grep -q 'started the box browser' <<<"$o") $(yn grep -q 'Start one from here' <<<"$o")"
+  "$BROWSER" serve reddit.com --stop >/dev/null 2>&1
+  arm 'R9b (precondition) the CDP site is not being served' no "$(yn test -S "$TMP/rv/$SEAT/reddit.com.sock")"
+  o=$(wk tree reddit.com https://www.reddit.com/ 2>&1); rc=$?; killserve reddit.com
+  arm 'R9b ...a CDP site the same way (the shared broker check, not only input mode)' "yes yes" \
+    "$(yn test -S "$TMP/rv/$SEAT/reddit.com.sock") $(yn grep -q 'started the box browser' <<<"$o")"
+  [[ "$o" == *'started the box browser'* ]] || printf 'R9b CDP output was: %s\n' "$o"
+  o=$(wk shot tiktok.com --out="$TMP/b3.png" 2>&1); rc=$?
+  arm 'R9b ...a site already served is used as it is: nothing new is started' "0 no" \
+    "$rc $(yn grep -q 'started the box browser' <<<"$o")"
+
+  # Under the memory floor: refused with the floor reason, nothing started.
+  "$BROWSER" serve tiktok.com --stop >/dev/null 2>&1
+  printf 'MemTotal:        3900000 kB\nMemAvailable:     512000 kB\n' > "$TMP/meminfo.low"
+  n0=$(wc -l < "$TMP/daemon.argv")
+  o=$(FIVEDIVE_BROWSER_MEMINFO="$TMP/meminfo.low" wk shot tiktok.com --out="$TMP/b4.png" 2>&1); rc=$?
+  arm 'R9c under the memory floor the on-demand serve is refused (69) with the floor reason' "69 yes" \
+    "$rc $(yn grep -q '500 MB of memory free, under the 800 MB floor' <<<"$o")"
+  arm 'R9c ...and nothing was started' "$n0 no no" \
+    "$(wc -l < "$TMP/daemon.argv") $(yn test -S "$TMP/rv/$SEAT/tiktok.com.sock") $(yn test -f "$TMP/pr/$SEAT/tiktok.com/.5dive-serve")"
+  printf 'MemAvailable:    1200000 kB\n' > "$TMP/meminfo.ok"
+  o=$(FIVEDIVE_BROWSER_MEMINFO="$TMP/meminfo.ok" wk shot tiktok.com --out="$TMP/b5.png" 2>&1); rc=$?; killserve tiktok.com
+  arm 'R9c (control) above the floor the same call starts it' "0 yes" "$rc $(yn test -S "$TMP/rv/$SEAT/tiktok.com.sock")"
+  "$BROWSER" serve tiktok.com --stop >/dev/null 2>&1
+  o=$(FIVEDIVE_BROWSER_SERVE_MIN_MB=2000 FIVEDIVE_BROWSER_MEMINFO="$TMP/meminfo.ok" wk shot tiktok.com --out="$TMP/b6.png" 2>&1); rc=$?
+  arm 'R9c (control) the floor is the configured one, not a constant in the message' "69 yes" \
+    "$rc $(yn grep -q 'under the 2000 MB floor' <<<"$o")"
+
+  # No privileged path: the old refusal, now saying what was tried and why it failed.
+  o=$(brk shot tiktok.com --out="$TMP/b7.png" 2>&1); rc=$?
+  arm 'R9d with no way to start it the seat is refused (69), saying the start failed and how to get it' "69 yes yes" \
+    "$rc $(yn grep -q 'did not work' <<<"$o") $(yn grep -q 'sudo 5dive browser serve tiktok.com' <<<"$o")"
+  o=$(FIVEDIVE_BROWSER_NO_WAKE=1 FIVEDIVE_BROWSER_WAKE_PRIV="$BROWSER" brk shot tiktok.com --out="$TMP/b8.png" 2>&1); rc=$?
+  arm 'R9d ...FIVEDIVE_BROWSER_NO_WAKE keeps the old behaviour' "69 no" "$rc $(yn test -S "$TMP/rv/$SEAT/tiktok.com.sock")"
+
+  # The privileged verb's own refusals. It is the root half: one site on stdin,
+  # only a site the box OFFERS to a seat that has none of its own.
+  pv() { printf "$1" | FIVEDIVE_BROWSER_SEAT=agent-borrower FIVEDIVE_BROWSER_BOX_SEAT="$SEAT" "$BROWSER" _serve-offered 2>&1; }
+  o=$(pv 'nosuch.test\0'); rc=$?
+  arm 'R9e _serve-offered refuses a site the box has not connected (77)' "77 yes" "$rc $(yn grep -q 'not a box login offered' <<<"$o")"
+  o=$(pv 'tiktok.com\0reddit.com\0'); rc=$?
+  arm 'R9e ...takes exactly one site' 64 "$rc"
+  o=$(pv '../etc\0'); rc=$?
+  arm 'R9e ...refuses a name that is not a site' 64 "$rc"
+  o=$(printf 'tiktok.com\0' | FIVEDIVE_BROWSER_SEAT="$SEAT" FIVEDIVE_BROWSER_BOX_SEAT="$SEAT" "$BROWSER" _serve-offered 2>&1); rc=$?
+  arm 'R9e ...and refuses the owner itself (its own serve is not an on-demand one)' 77 "$rc"
+  mkdir -p "$TMP/pr/agent-borrower/tiktok.com"; chmod 700 "$TMP/pr/agent-borrower" "$TMP/pr/agent-borrower/tiktok.com"
+  o=$(pv 'tiktok.com\0'); rc=$?
+  arm 'R9e ...and a seat that keeps its own login for the site' 77 "$rc"
+  rm -rf "$TMP/pr/agent-borrower"
+  arm 'R9e none of those started a browser' no "$(yn test -S "$TMP/rv/$SEAT/tiktok.com.sock")"
 else
   SKIP=$((SKIP+1)); printf 'SKIP: R9 — this machine cannot open a broker socket (no SO_PEERCRED via python3)\n'
 fi
@@ -567,6 +637,26 @@ HTML
     arm 'L5 ...and closing it gives the window back' '0 yes' "$rc $(yn grep -q 'héllo ✓!' <<<"$(jq -r .title "$TMP/l.in2")")"
     lc '{"op":"tree","url":"https://example.com/"}' >/dev/null 2>"$TMP/l.t"; rc=$?
     arm 'L6 a DOM op is refused by name (70)' '70 yes' "$rc $(yn grep -q 'INPUT mode' "$TMP/l.t")"
+    # L11 (DIVE-5388) — the login check in a TAB OF ITS OWN: Ctrl+T, the probe URL
+    # typed, the settled title read, Ctrl+W. The person's tab must be exactly where
+    # it was afterwards, and Chrome must still be running (a Ctrl+W on the last tab
+    # would close it). A local http page, because a goto takes http(s) only.
+    node -e 'const h=require("http").createServer((q,r)=>{r.setHeader("content-type","text/html");r.end("<html><head><title>Log in to Fixture</title></head><body>sign in</body></html>")});h.listen(0,"127.0.0.1",()=>console.log(h.address().port))' > "$TMP/l.port" 2>/dev/null &
+    _KILL+=("$!")
+    for i in $(seq 1 50); do [[ -s "$TMP/l.port" ]] && break; sleep 0.1; done
+    before=$(lc '{"op":"title"}' 2>/dev/null | jq -r .window_title)
+    lc "{\"op\":\"title_probe\",\"url\":\"http://127.0.0.1:$(cat "$TMP/l.port")/\"}" > "$TMP/l.tp" 2>"$TMP/l.tp.err"; rc=$?
+    arm 'L11 title_probe loads the probe page in a new tab and reads its title' '0 true Log in to Fixture' \
+      "$rc $(jq -r '"\(.navigated) \(.title)"' "$TMP/l.tp" 2>/dev/null)"
+    after=""; for i in $(seq 1 25); do
+      after=$(lc '{"op":"title"}' 2>/dev/null | jq -r .window_title); [[ "$after" == "$before" ]] && break; sleep 0.2
+    done
+    arm 'L11 ...then closes ONLY that tab: the window is back on the page it was on' "$before" "$after"
+    arm 'L11 ...and Chrome is still running' yes "$(yn kill -0 "$cpid")"
+    lc '{"op":"hand","act":"open","reason":"test"}' >/dev/null 2>&1
+    lc "{\"op\":\"title_probe\",\"url\":\"http://127.0.0.1:$(cat "$TMP/l.port")/\"}" > "$TMP/l.tp2" 2>/dev/null; rc=$?
+    arm 'L11 ...with a handoff open it does not touch the window' '0 false' "$rc $(jq -r .navigated "$TMP/l.tp2" 2>/dev/null)"
+    lc '{"op":"hand","act":"close"}' >/dev/null 2>&1
     # A FOREIGN WINDOW over part of Chrome, holding the keyboard focus: what an
     # agent's input meets when anything else is on the display.
     DISPLAY=":$disp" node -e '

@@ -21,7 +21,7 @@ than a detail.
 5dive browser setup                 # once, as root: create the profile store
 5dive browser auth <site>           # a browser opens; you log in yourself
 5dive browser status                # per-site auth state; run this on a SCHEDULE
-5dive browser probe-all             # scheduled sweep; served profiles are skipped
+5dive browser probe-all             # scheduled sweep; a served site is checked through its own browser
 5dive browser ls                    # profiles, and when each was last seen alive
 5dive browser run <site> <action> [--key=value ...] [--approved-id=<id>]
 5dive browser tree <site> <url> [--settle=<ms>]   # refs; --settle also on snapshot,
@@ -332,21 +332,32 @@ without a scheduled probe the agent finds out **mid-publish**. So:
   that is what makes a window missed while the box was down run once when it comes back. Systemd,
   rather than cron, also keeps the seat identity explicit (`5dive-browser-probe@<seat>.timer`) and
   puts each sweep in the journal. Re-running setup reconciles and re-enables the same units.
-- `probe-all` attempts every eligible profile, but prints `skipped: served` and leaves the
-  liveness stamp untouched when a profile is open in server mode. Holding the profile makes a
-  second Chrome probe invalid; the next timer run, or the dashboard's close-view action, checks it
-  after the served browser stops.
+- `probe-all` attempts every eligible profile. A **served** one is checked through the browser
+  that holds it (DIVE-5388): a CDP session daemon answers the probe in its own tab, and an
+  input-mode one loads the probe page in a new tab of its own and reports its title (below). Only a
+  served browser with no session daemon (a plain-Chrome login view) still prints `skipped: served`
+  and leaves the stamp alone; it is checked once it stops.
 
 - `5dive browser status` is a cheap liveness probe **on a schedule, not at publish time**. One
   page load a day is worth more than any adapter. It reports `authenticated`, `session expired —
   human action required`, `CHALLENGE — human action required`, or `UNKNOWN` when the probe could
   not read the page at all (no browser on the box, a load that failed).
-- **`authenticated` requires an adapter, and with no adapter the answer is `UNKNOWN`.** The only
-  evidence for a login is the adapter's `logged_out_when_dom_matches` failing to match. Without
-  one that test is skipped, so anything that merely LOADED used to be stamped `authenticated` —
-  including a profile nobody had ever logged into, which is what the dashboard's Connected-sites
-  tile then showed. A challenge is still named without an adapter (that marker has a default), so
-  the one classification that does work with no adapter is not lost.
+- **With no adapter, the generic check reads the page header** (DIVE-5388,
+  `lib/generic-login.cjs`). Signed out: a Log in / Sign in / Sign up control (link, button or
+  `role=button`, by its whole text or `aria-label`) inside `<header>`, `<nav>`, `role=banner` or
+  `role=navigation`; a password field or a form posting to a login path anywhere; or, through a
+  served browser, a landing on a sign-in path. Signed in: a header WITH controls and none of them
+  a sign-in. Anything else is still `UNKNOWN`. A page that merely loaded is never `authenticated`
+  (the DIVE-4426 rule): the header has to have rendered and chosen not to offer a sign-in. The
+  challenge marker is tested first, as always. The page verbs' gate keeps its narrower check.
+- **A bot check that meets the check is not "Needs you"** (DIVE-5388). Reddit's "prove your
+  humanity" and Cloudflare Turnstile meet the headless probe and not the browser the session
+  lives in. Each signed-in read is remembered in `<profile>/.5dive-signed-in` as
+  `<iso> headless|served|input`. A headless `challenge` on a login whose last signed-in read came
+  from a served or input browser stamps **`unverifiable`**, and its stamp's date is that read
+  ("last seen signed in"). It exits 0. A challenge in the served browser itself, or with no such
+  read, is still `challenge`. A logged-out or challenged read in the owner's own browser clears
+  the record.
 - **A SINGLE-PAGE APP NEEDS A POSITIVE MARKER, AND THE PROBE WAITS FOR IT** (DIVE-4794). Telegram
   Web serves ONE static shell for both states — `has-auth-pages` is in the bytes the server sends —
   and removes it in JavaScript after its own network init decides it is logged in. Dumped at
@@ -361,13 +372,11 @@ without a scheduled probe the agent finds out **mid-publish**. So:
   An adapter with no positive marker is untouched — one look, classified on the negative alone —
   because without something to terminate on, waiting only adds a chrome launch to reach the same
   answer.
-- **A served profile is not probed.** Chrome allows one instance per profile directory, so a probe
-  launched at a profile `serve` is holding is handed off to the running browser and returns an
-  empty document. `status` says `UNKNOWN (served on :N …)` and leaves the last real verdict
-  standing rather than reporting a load failure that did not happen. Probing *through* the served
-  browser needs a CDP endpoint, and a loopback debugging port on a logged-in profile is reachable
-  by every seat on the box — the credential the 0700 store exists to protect, handed over with no
-  file permission needed. Not a trade `status` gets to make.
+- **A served profile is probed through its session daemon, or not at all.** Chrome allows one
+  instance per profile directory, so a probe launched at a profile `serve` is holding is handed
+  off to the running browser and returns an empty document. With a session daemon (a 0700 unix
+  socket, never a debugging port) the probe asks it instead. With none (a plain-Chrome login
+  view), `status` says `UNKNOWN (served on :N …)` and leaves the last real verdict standing.
 - **Every headless launch has a wall-clock cap** (DIVE-5375). `--virtual-time-budget` bounds page
   time, not a Chrome that wedges before or outside the page. The probe, the launch check, `shot` and
   `capture` run Chrome under `timeout -k 5 <budget + FIVEDIVE_BROWSER_CHROME_SLACK_S>` (default
@@ -971,9 +980,16 @@ Then:
   generic list) stops an act between steps with 75. TikTok's slider captcha is an in-page overlay
   and does not change the title; the agent sees it in the screenshot, and the skill tells it to
   hand the window over.
-- `status` reads the title and never navigates, because loading the probe URL would move the
-  window someone is working in. It says `unconfirmed`, because there is no DOM to confirm a login
-  from.
+- `status` (and `probe-all`) loads the probe URL in a **new tab of its own**, reads the window
+  title once it settles, and closes that tab (DIVE-5388). It does this only when nobody is driving:
+  no handoff, nobody in the viewer, no lease. Otherwise it reads the current title, says
+  `unconfirmed (… not checked now …)` and leaves the stamp alone. A challenge title is `challenge`.
+  A sign-in title (adapter `probe.logged_out_when_title_matches`, else generic words such as
+  "Log in", but never when the probe URL is itself a sign-in page) is `expired`. An adapter's
+  `probe.logged_in_when_title_matches` is `authenticated`. Anything else is `unverifiable`, dated
+  by the last signed-in read, or `unknown` when there has never been one. It is never
+  `authenticated` by elimination. A daemon from before 1.31.0 has no `title_probe`. Until it is
+  restarted, `status` behaves as before.
 - A proxied seat is refused input mode rather than served off its proxy, for DIVE-4951's reason:
   plain Chrome cannot carry a proxy login.
 

@@ -130,13 +130,15 @@ keyboard attached to the person's account.
   where the box has a login and something is serving it, your seat acts through the running
   browser and needs **no second human login**. A login you made yourself wins over the box's.
   The viewer stays the owning seat's act; the relay still redeems `claude`.
-- **If nothing is serving the box's login, START IT YOURSELF — do not hand a human a shell
-  command** (DIVE-4813). `sudo 5dive browser serve <site>`, from your own seat. Root re-execs
-  that as the seat that owns the session, so it does **not** need `sudo -u` — which is the
-  point, because `sudo -u <someone>` is a runas no 5dive agent grant contains, and printing it
-  for a person to run is the failure this rule exists to stop. Then act normally: `snapshot`,
-  `read`, `shot` all go through the running browser. If that `sudo` is itself refused, your
-  seat is not admin tier — say so plainly and name the site; do not improvise around it.
+- **If nothing is serving the box's login, just use it — your verb starts it** (DIVE-5389). A
+  site the owner connected and tapped Done on is connected but not served. Your first `status`,
+  `snapshot`, `shot` or `act` on it has the box start that browser as its owner, on demand, and
+  then runs; you will see one line saying it was started. Do not hand a human a shell command.
+  If it is refused, the message says why: under the box's memory floor (about 800 MB free)
+  nothing is started — say that plainly and name the site, do not retry in a loop. On a box whose
+  owner has not re-run `sudo 5dive browser setup` since this release, the older route still
+  works from an admin seat: `sudo 5dive browser serve <site>` (DIVE-4813; root re-execs it as the
+  owning seat, so it does **not** need `sudo -u`).
 - **`serve --stop` is still the owning seat's act**, and so is `lease --release`: they tear down
   a browser other seats and a human viewer may be using, which is not yours to do on their
   behalf. Stop only what your own seat serves.
@@ -149,13 +151,14 @@ keyboard attached to the person's account.
   end a site's login (the site sees a new IP), so set it before connecting, not after.
 - **A challenge is classified BEFORE a logged-out state**, because a challenge page still
   carries the login markup. Trust the label; do not re-derive it from the HTML.
-- **Sessions die on the site's schedule, not ours.** A scheduled check must skip a profile
-  while it is served, then probe it once the browser is stopped; otherwise the profile lock
-  produces `UNKNOWN` instead of a liveness verdict.
+- **Sessions die on the site's schedule, not ours.** A served site is checked through the
+  browser that holds it. Only a plain-Chrome login view is skipped, and it is checked once it stops.
 - **Setup installs that schedule.** `sudo 5dive browser setup` enables a per-seat systemd timer
-  which runs `5dive browser probe-all` about every six hours. The sweep prints `skipped: served`
-  and leaves the existing liveness stamp untouched for a profile whose browser is open; close the
-  view/browser before asking for an immediate check.
+  which runs `5dive browser probe-all` about every six hours.
+- **`unverifiable` is not a sign-out.** It means the automatic check met a bot check that the
+  site shows automated browsers (or, in input mode, the title could not tell). Its date is when
+  the login was last seen signed in. Do not send the owner to reconnect over it; a screen
+  (`5dive browser shot <site>`) is the check.
 - **Hand-written adapters live outside the installed plugin.** An upgrade replaces the plugin
   directory, so a custom `<site>.json` belongs in the relay seat's store named in step 1, never
   in the dispatched package's `adapters/`.
@@ -193,3 +196,10 @@ status` says which sites are currently unfiltered. It is off for the whole host
 (both `example.com` and its subdomains) — there is no partial setting — and a
 browser already running under `serve` may need `serve example.com --stop` before it
 picks the change up.
+
+## From real jobs
+
+Lessons from browser jobs that went wrong on real sites (DIVE-5390). One line each:
+
+- **Each site's login is its own.** A Google sign-in on one site does not carry to another, so "Sign in with Google" on a new site still needs the owner to connect that site.
+- **Served is not signed in.** A running browser can hold an expired session. Check `5dive browser status <site>` reads authenticated before you hand off work that needs the login, and run the connect handover if it does not.

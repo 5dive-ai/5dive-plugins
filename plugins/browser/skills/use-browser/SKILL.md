@@ -192,3 +192,18 @@ exits **73** with the ask, a screenshot and an approval id.
   placed. The check reads literal button labels, so a purchase behind a button labelled
   "Continue" is not caught by it — under `careful` that one is on you: if a step will pay, post,
   send or delete, ask first even when `act` does not stop you.
+
+## From real jobs
+
+Lessons from browser jobs that went wrong on real sites (DIVE-5390). One line each:
+
+- **Read the saved record back.** After a submit, open what the site saved and check every field landed where you meant: a URL can land in the name field while the page says "success".
+- **Look at the screenshot after a submit**, not only the exit code. A success line can show for a moment and the form reset under it.
+- **One run per form, every field in it.** Tabs keep page state between runs, so clear a pre-filled form and re-check it before you type.
+- **Never press a site's autofill or AI-assist button.** It writes text you were not given.
+- **A bot check can appear mid-flow**, after a sign-in or submit button, not only on page load. It is still a hard stop.
+- **Only a real browser render proves a page has no bot check.** A plain fetch of the page cannot see one.
+- **Patterns:** `--expect` already ignores case, so never put `(?i)` in it (grep -E rejects it). `--wait-for='text=<words>'` matches plain words in any case. A regex works only in a `wait_for` step's selector, as `text=/word/i`.
+- **A form that only says "thanks"** (Tally and the like) leaves no record to read back: report "submitted, not live".
+- **Served is not signed in.** Before you hand off work that needs the login, check `5dive browser status <site>` reads authenticated.
+- **Input mode: Chrome's "Restore pages?" bubble can cover the header's sign-in link or avatar.** Close it and take a new `shot` before you judge signed in or out, and check the URL bar in the screenshot shows the page you meant.

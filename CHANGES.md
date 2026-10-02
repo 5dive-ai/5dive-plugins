@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Changed — the registry copy is byte-for-byte 5dive-browser 1.32.0 (DIVE-5389, DIVE-5388)
+
+Brings this copy from 1.30.0 to 1.32.0 so the box converger's floor can reach both releases.
+1.31.0 (DIVE-5388): a served site is checked through its own browser, a headless bot check reads
+`unverifiable` instead of "Needs you", and a generic signed-in check covers sites with no adapter
+check. 1.32.0 (DIVE-5389): a hired seat that finds a site connected but not served gets it served on
+demand, as the owner, through one root verb with an 800 MB memory floor, so Connect then Done needs
+no admin step. The grant reaches a box only when `sudo 5dive browser setup` is re-run there.
+`plugins/browser` is again `rsync -a --delete` of 5dive-browser main dc04678 (`diff -r` empty);
+the mirrored harnesses take the same diff with `browser/` read as `plugins/browser/`, and CI now
+also runs the served-probe harness.
+
 ### Changed — the registry copy is byte-for-byte 5dive-browser again, at browser 1.30.0 (DIVE-5386)
 
 The two copies had diverged both ways. This registry copy (1.27.0) carried DIVE-5200's captcha ask,

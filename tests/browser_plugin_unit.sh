@@ -123,6 +123,9 @@ export FIVEDIVE_BROWSER_SESSION_DAEMON="$TMP/no-session-daemon"
 # owner-ask` when the CLI has it; on a developer box that is the live owner's
 # Telegram. T36 points this at a recording fake; everywhere else it is absent.
 export FIVEDIVE_BROWSER_CLI="$TMP/no-5dive-cli"
+# NO ARM REACHES REAL SUDO for a brokered seat's on-demand serve (DIVE-5389);
+# the input harness grades that path with the plugin standing in for root.
+export FIVEDIVE_BROWSER_WAKE_PRIV="$TMP/no-wake"
 # DIVE-4997: a login with no adapter starts a reflex proposal in the background,
 # and probe-all re-measures adapters once a day. Both are graded in
 # tests/browser_reflex_propose_unit.sh; here they would race every probe arm.
@@ -300,7 +303,7 @@ t  'T2c6 a root caller with SUDO_USER re-executes as the seat before touching a 
 # relay seat itself, only for serve/viewer/status. Dropped to the CALLER, it
 # would be the agent registering its own bind — the one thing the owner's tap
 # exists to prevent.
-t  'T2c7 ...but setup, adblock, config, the owner'"'"'s approve and the Connect relay stay root'"'"'s' 'yes' "$(grep -A8 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|adblock|config|approve|approvals|adapters|_connect|totp|-h|--help|help|"") ;;' && echo yes || echo no)"
+t  'T2c7 ...but setup, adblock, config, the owner'"'"'s approve and the Connect relay stay root'"'"'s' 'yes' "$(grep -A8 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -q 'setup|adblock|config|approve|approvals|adapters|_connect|_serve-offered|totp|-h|--help|help|"") ;;' && echo yes || echo no)"
 # DIVE-4997 added `adapters` (the owner's approve/reject/pending of a reflex
 # login check: root reads every seat's proposals and writes AS the seat), so six.
 # DIVE-5336 added `totp`, and only its `import` reaches the list (every other
@@ -308,7 +311,9 @@ t  'T2c7 ...but setup, adblock, config, the owner'"'"'s approve and the Connect 
 # secrets store and drops to the profile's owner itself to write the seed. Seven.
 # DIVE-5338 added `config`: it writes the box-wide default drive mode, a root-owned
 # file no seat may write. Eight.
-t  'T2c8 ...and no OTHER verb joined them' '8' "$(grep -A8 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -oP '^\s+\K[a-z_|]+(?=\|-h\|--help)' | tr '|' '\n' | grep -c .)"
+# DIVE-5389 added `_serve-offered`: a brokered seat's on-demand serve, which reads
+# the caller from SUDO_UID and drops to the box login's OWNER itself. Nine.
+t  'T2c8 ...and no OTHER verb joined them' '9' "$(grep -A8 'if \[\[ \$EUID -eq 0 && -n "\${SUDO_USER:-}"' "$ROOT/plugins/browser/bin/browser" | grep -oP '^\s+\K[a-z_|-]+(?=\|-h\|--help)' | tr '|' '\n' | grep -c .)"
 
 # DIVE-4813 — WHICH SEAT ROOT BECOMES. An admin agent asked to open a site the
 # box had connected under `claude` and was told to run `sudo -u claude 5dive
@@ -444,15 +449,29 @@ cat > "$SETUPBIN/5dive" <<'FIVE'
 #!/usr/bin/env bash
 exit 0
 FIVE
-chmod +x "$SETUPBIN/id" "$SETUPBIN/systemctl" "$SETUPBIN/5dive"
+# DIVE-5389: setup writes the on-demand serve grant through visudo. The fake
+# logs what it was asked to check and answers VISUDO_RC.
+cat > "$SETUPBIN/visudo" <<'VSD'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$VISUDO_LOG"
+exit "${VISUDO_RC:-0}"
+VSD
+chmod +x "$SETUPBIN/id" "$SETUPBIN/systemctl" "$SETUPBIN/5dive" "$SETUPBIN/visudo"
+SUDOD="$TMP/sudoers.d"; mkdir -p "$SUDOD"
+export VISUDO_LOG="$TMP/visudo.log"; : > "$VISUDO_LOG"
+export FIVEDIVE_BROWSER_SUDOERS_DIR="$SUDOD" FIVEDIVE_BROWSER_VISUDO="$SETUPBIN/visudo"
 
 SDIR="$TMP/systemd"
 SUNIT="$SDIR/5dive-browser-probe@.service"
 STIMER="$SDIR/5dive-browser-probe@.timer"
 export SYSTEMCTL_LOG="$TMP/systemctl.log"
 : > "$SYSTEMCTL_LOG"
+# The rendezvous group is THIS process's group: `setup` chowns the rendezvous to
+# seat:group, and a non-root runner can only chown to a group it is in — the
+# seat's NAMED primary group is not always the one this process runs with.
+SGRP="$(id -gn)"
 setup_run() {  # setup_run — drive a real cmd_setup into $TMP/setup-store
-  run env PATH="$SETUPBIN:$PATH" \
+  run env PATH="$SETUPBIN:$PATH" FIVEDIVE_BROWSER_AGENT_GROUP="$SGRP" \
       FIVEDIVE_BROWSER_PROFILE_ROOT="$TMP/setup-store" \
       FIVEDIVE_BROWSER_SYSTEMD_DIR="$SDIR" \
       FIVEDIVE_BROWSER_SYSTEMCTL=systemctl \
@@ -487,6 +506,25 @@ t  'T2c8 ...catch-up is real: Persistent= is paired with OnCalendar='  'yes' \
    "$(grep -q '^Persistent=true' "$STIMER" && grep -q '^OnCalendar=' "$STIMER" && echo yes || echo no)"
 tn 'T2c8 ...and not with a monotonic trigger that makes it inert' 'OnUnitActiveSec=' "$(cat "$STIMER")"
 tc 'T2c8 ...fleet does not probe in lockstep'  'RandomizedDelaySec=' "$(cat "$STIMER")"
+# DIVE-5389: the on-demand serve grant. One exact command for the rendezvous
+# group, no argument wildcard, checked by visudo before it is moved into place.
+WGRP="$SGRP"
+t  'T2c8w setup writes the on-demand serve grant' 'yes' "$([[ -f "$SUDOD/5dive-browser" ]] && echo yes || echo no)"
+t  'T2c8w ...0440, as sudo requires of a drop-in' '440' "$(stat -c '%a' "$SUDOD/5dive-browser" 2>/dev/null)"
+t  'T2c8w ...the one rule, for the rendezvous group, exact command' \
+   "%$WGRP ALL=(root) NOPASSWD: /usr/local/bin/5dive browser _serve-offered" \
+   "$(grep -v '^#' "$SUDOD/5dive-browser" 2>/dev/null)"
+t  'T2c8w ...and no wildcard anywhere in it' 'no' "$(grep -v '^#' "$SUDOD/5dive-browser" | grep -q '\*' && echo yes || echo no)"
+tc 'T2c8w ...visudo checked the staged file before it went in' '-cqf' "$(cat "$VISUDO_LOG")"
+t  'T2c8w ...no staged file is left behind' '0' "$(find "$SUDOD" -name '.5dive-browser.*' | wc -l)"
+tc 'T2c8w ...and setup says what it installed' "starts it as $SEAT, on demand" "$OUT"
+rm -f "$SUDOD/5dive-browser"
+VISUDO_RC=1 setup_run
+t  'T2c8w a grant visudo rejects is not installed' 'no' "$([[ -f "$SUDOD/5dive-browser" ]] && echo yes || echo no)"
+t  'T2c8w ...nor left staged' '0' "$(find "$SUDOD" -name '.5dive-browser.*' | wc -l)"
+t  'T2c8w ...and the store is still set up (the grant is best-effort)' 0 "$RC"
+tc 'T2c8w ...saying it is missing' 'no on-demand serve grant' "$ERR"
+setup_run
 # Idempotence: setup is documented as re-runnable. Re-running must not stack
 # units, leave staging files behind, or stop re-enabling the timer.
 _sum_before="$(cat "$SUNIT" "$STIMER" | md5sum)"
@@ -6784,8 +6822,12 @@ t  'T39f (anchor) the mutant package has no booking.com adapter, and google.com 
    "$([[ -e "$MUT39/adapters/booking.com.json" ]] && echo yes || echo no) $(jq -c .probe "$MUT39/adapters/google.com.json")"
 mkprofile booking.com "$BKOUT39" >/dev/null
 run env -u FIVEDIVE_BROWSER_ADAPTER_DIR "$MUT39/bin/browser" status booking.com
-tc 'T39f MUTANT (no shipped adapter), booking.com logged out: status can only say UNKNOWN' 'UNKNOWN (no adapter for booking.com' "$OUT"
-tn 'T39f ...so the expired session is never reported' 'session expired' "$OUT"
+# DIVE-5388: with no adapter, `status` now runs the generic header check, and the
+# measured logged-out booking.com header (its "Sign in" link) is exactly what it
+# reads. So this half no longer proves "no adapter, no verdict" — it proves the
+# generic check catches a real logged-out header. The adapter still outranks it.
+tc 'T39f MUTANT (no shipped adapter), booking.com logged out: the generic check reads the header Sign in' \
+   'session expired — human action required (generic check: a "Sign in" control in the page header)' "$OUT"
 mkprofile google.com "$GLOUT39" >/dev/null
 run env -u FIVEDIVE_BROWSER_ADAPTER_DIR "$MUT39/bin/browser" status google.com
 tc 'T39f MUTANT (no probe), google.com logged out: status can only say UNKNOWN' 'UNKNOWN (' "$OUT"
