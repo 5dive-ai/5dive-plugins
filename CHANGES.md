@@ -18,7 +18,18 @@ into `allowFrom` to DM the agent, and a guest must not be able to share it into 
 carries `owners`, the plugin's own record: seeded once from `allowFrom` on a box that has an access
 file, then grown only by an owner-level pairing (`agent pair`, `/telegram:access`, each of which drops
 `approved/<id>`). An add by anyone not in both `owners` and `allowFrom` waits, and a blocked group post
-falls back to an owner's DM, never a guest's. 0.5.84, not 0.5.83: DIVE-5367 is in flight on 0.5.82. Tests: `test/dive5368-share-agent.test.ts`.
+falls back to an owner's DM, never a guest's. 0.5.84: DIVE-5367 took 0.5.83. Tests: `test/dive5368-share-agent.test.ts`.
+
+### Fixed — Telegram /account and /usage work on a standard-tier agent (DIVE-5367), telegram 0.5.83
+
+lodar, 2026-10-02: on a standard-isolation agent (every agent after a box's first) `/account` only
+showed the current account and `/usage` only the agent's own 5h/1w. With 5dive-ai/5dive's new
+self-scoped account line on the seat, `/account` shows the picker again and a tap switches the agent
+and restarts it on the new account; `/usage` shows the limit board for every account on the box. The
+agent can switch only itself, and only between accounts the box already holds. The auto-rotate row
+and the 24h token-burn section stay admin-only, because both write or read beyond the seat. A seat
+whose CLI has not updated yet keeps today's read-only view, unchanged. The plugin asks `sudo -n -l`
+for the line once per ten minutes, and only on a scoped standard seat.
 
 ### Changed: Telegram /status names the CLI "5dive" again (telegram 0.5.82)
 
