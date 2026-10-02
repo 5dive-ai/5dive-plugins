@@ -127,3 +127,12 @@ describe('the lite front door lets the shared group and the invite through', () 
     expect(g).toContain('username: from.username,')
   })
 })
+
+describe("the app can say when Telegram hides group messages from the bot", () => {
+  test('getMe\'s privacy bit is recorded at start and on every join, and survives the loader', () => {
+    expect(SERVER).toContain('recordGroupPrivacy(info.can_read_all_group_messages)')
+    expect(between("bot.on('my_chat_member'", "bot.on('message:text'")).toContain('recordGroupPrivacy(me.can_read_all_group_messages)')
+    // normalizeAccess keeps only the keys it names; a key it drops is gone on the next save
+    expect(between('function normalizeAccess(', '\n}\n')).toContain('canReadAllGroupMessages: parsed.canReadAllGroupMessages,')
+  })
+})

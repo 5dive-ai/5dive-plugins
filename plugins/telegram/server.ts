@@ -432,6 +432,8 @@ type Access = {
   pending: Record<string, PendingEntry>
   /** DIVE-242: groups the bot sits in that await approval (not in `groups` yet) */
   discovered?: Record<string, DiscoveredGroup>
+  /** DIVE-5368: getMe's Group Privacy bit (false = privacy on), for the app's screen */
+  canReadAllGroupMessages?: boolean
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
   /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
@@ -492,6 +494,7 @@ function normalizeAccess(raw: unknown): Access {
     groups: parsed.groups ?? {},
     pending: parsed.pending ?? {},
     discovered: parsed.discovered,
+    canReadAllGroupMessages: parsed.canReadAllGroupMessages,
     mentionPatterns: parsed.mentionPatterns,
     ackReaction: parsed.ackReaction,
     replyToMode: parsed.replyToMode,
@@ -573,6 +576,18 @@ function migrateGroupChatId(oldId: string, newId: string): void {
     `telegram channel: group ${oldId} migrated to supergroup ${newId}` +
       (moved ? ' — access config moved to the new id\n' : ' (no access entry to move)\n'),
   )
+}
+
+// DIVE-5368: the app's "Who can talk to" screen says when Telegram hides group
+// messages from the bot; only getMe knows, so the plugin keeps the bit here.
+function recordGroupPrivacy(canRead: boolean | undefined): void {
+  if (typeof canRead !== 'boolean') return
+  try {
+    const access = loadAccess()
+    if (access.canReadAllGroupMessages === canRead) return
+    access.canReadAllGroupMessages = canRead
+    saveAccess(access)
+  } catch {}
 }
 
 // DIVE-243: an unconfigured group used to drop with zero trace. Log it so
@@ -6283,7 +6298,9 @@ bot.on('my_chat_member', async ctx => {
   let privacyOn = false
   if (ctx.myChatMember.new_chat_member.status !== 'administrator') {
     try {
-      privacyOn = !(await bot.api.getMe()).can_read_all_group_messages
+      const me = await bot.api.getMe()
+      privacyOn = !me.can_read_all_group_messages
+      recordGroupPrivacy(me.can_read_all_group_messages)
     } catch {
       // getMe hiccup — skip the hint rather than guess.
     }
@@ -6853,6 +6870,7 @@ if (SEND_ONLY) {
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          recordGroupPrivacy(info.can_read_all_group_messages)
           // DIVE-1883: resolve the /model picker against the CLI's model
           // catalogue so it can't drift a version behind agent-create again.
           void refreshModelAliases()

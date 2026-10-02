@@ -13,7 +13,8 @@ lite profile, which dropped every non-private update, now lets a join reach the 
 group's plain text reach the gate (commands, taps and media in a group still get nothing). Under
 `dmPolicy: pairing` a stranger who DMs a lite bot is recorded as pending for the app's approve list
 and told once, in plain words, to ask the owner; never a code. Pending entries carry the sender's
-name. 0.5.84, not 0.5.83: DIVE-5367 is in flight on 0.5.82. Tests: `test/dive5368-share-agent.test.ts`.
+name, and access.json keeps getMe's Group Privacy bit (`canReadAllGroupMessages`) so the app can say when
+Telegram hides group messages from the bot. 0.5.84, not 0.5.83: DIVE-5367 is in flight on 0.5.82. Tests: `test/dive5368-share-agent.test.ts`.
 
 ### Changed: Telegram /status names the CLI "5dive" again (telegram 0.5.82)
 
