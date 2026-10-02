@@ -1,5 +1,20 @@
 ## Unreleased
 
+### Added — the owner shares an agent with a group or other people from the Mini App (DIVE-5368), telegram 0.5.84
+
+lodar, 2026-10-02: "access setting for each agent ... to make user use them in group, or to let other
+telegram chat IDs interact with his own agent". The Mini App's new "Who can talk to {name}" screen
+opens Telegram's add-to-group picker for the agent's bot. A group added by someone already in
+`allowFrom` (the owner) is now approved at once, mention-only (`requireMention: true`), and the agent
+says "Hi, I'm {name}. Mention me to ask something." A group anyone else adds still waits in
+`discovered`; its one-time line now points at the 5dive app instead of the dashboard or a terminal
+(off 5dive, `/telegram:access` stays). The Group Privacy warning (DIVE-246) is in plain words. The
+lite profile, which dropped every non-private update, now lets a join reach the join handler and a
+group's plain text reach the gate (commands, taps and media in a group still get nothing). Under
+`dmPolicy: pairing` a stranger who DMs a lite bot is recorded as pending for the app's approve list
+and told once, in plain words, to ask the owner; never a code. Pending entries carry the sender's
+name. 0.5.84, not 0.5.83: DIVE-5367 is in flight on 0.5.82. Tests: `test/dive5368-share-agent.test.ts`.
+
 ### Changed: Telegram /status names the CLI "5dive" again (telegram 0.5.82)
 
 lodar, 2026-10-02: "I asked to change 5dive to cli only for light plugin", "keep 5dive", "for all

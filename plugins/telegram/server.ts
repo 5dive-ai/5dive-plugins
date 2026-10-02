@@ -60,6 +60,7 @@ import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelr
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
+import { addedByOwner, groupJoinLines, ASK_OWNER } from './groupjoin.ts'
 import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, startGreeting, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
@@ -397,6 +398,8 @@ type PendingEntry = {
   createdAt: number
   expiresAt: number
   replies: number
+  name?: string
+  username?: string
 }
 
 type GroupPolicy = {
@@ -1035,6 +1038,9 @@ function gate(ctx: Context): GateResult {
       createdAt: now,
       expiresAt: now + 60 * 60 * 1000, // 1h
       replies: 1,
+      // DIVE-5368: who it is, for the app's approve list (no lookup per row).
+      name: [from.first_name, from.last_name].filter(Boolean).join(' ') || undefined,
+      username: from.username,
     }
     saveAccess(access)
     return { action: 'pair', code, isResend: false }
@@ -4887,9 +4893,24 @@ async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: str
 
 if (LITE) {
   bot.use(async (ctx, next) => {
+    // DIVE-5368: a group the owner shared the agent with. A join or leave goes on
+    // to the my_chat_member handler; plain text goes to the gate (approved group,
+    // mention). Commands, button taps and media in a group get nothing.
+    if (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') {
+      if (ctx.myChatMember) return next()
+      const text = ctx.message?.text
+      if (text !== undefined && !text.startsWith('/') && ctx.from && !ctx.from.is_bot) await handleInbound(ctx, text, undefined)
+      return
+    }
     if (ctx.chat?.type !== 'private' || !ctx.from || ctx.from.is_bot) return
     const access = loadAccess()
-    if (access.dmPolicy === 'disabled' || !access.allowFrom.includes(String(ctx.from.id))) return
+    if (access.dmPolicy === 'disabled') return
+    if (!access.allowFrom.includes(String(ctx.from.id))) {
+      // DIVE-5368: someone the owner may let in. Under dmPolicy=pairing the gate
+      // records them for the app's approve list and they get one plain line.
+      if (access.dmPolicy === 'pairing' && ctx.message?.text !== undefined) await handleInbound(ctx, ctx.message.text, undefined)
+      return
+    }
     const text = ctx.message?.text
     const cmd = liteRoute(text)
     if (cmd) {
@@ -6243,15 +6264,14 @@ bot.on('my_chat_member', async ctx => {
   entry.type = chat.type
   delete entry.removedAt
 
-  const lines: string[] = []
-  const announce = !(chatId in access.groups) && entry.announcedAt === undefined
-  if (announce) {
-    lines.push(
-      `👋 Hi! I've been added to "${entry.title}" — group id: ${chatId}. ` +
-        `I'll stay quiet until this group is approved: use the 5dive dashboard ` +
-        `(agent → Telegram access) or run /telegram:access in the agent terminal.`,
-    )
-  }
+  // DIVE-5368: the owner added it (Mini App → Add to a group): approved at once,
+  // mention-only. Anyone else's group waits for approval, as before.
+  const approved = !(chatId in access.groups) && addedByOwner(access.allowFrom, ctx.from)
+  if (approved) access.groups[chatId] = { requireMention: true, allowFrom: [] }
+  const announce = !approved && !(chatId in access.groups) && entry.announcedAt === undefined
+  // Saved before any network wait below, so a group is live the moment it joins
+  // and an app write landing meanwhile is not overwritten by this copy.
+  saveAccess(access)
 
   // DIVE-246: a non-admin bot with BotFather's Group Privacy ON (the default)
   // receives NO regular group messages — Telegram withholds them before they
@@ -6260,45 +6280,54 @@ bot.on('my_chat_member', async ctx => {
   // (true = privacy off); admins receive everything regardless. Warn on every
   // join while the condition holds — a re-add without the BotFather fix should
   // warn again, and a re-add after the fix goes quiet on its own.
+  let privacyOn = false
   if (ctx.myChatMember.new_chat_member.status !== 'administrator') {
     try {
-      const me = await bot.api.getMe()
-      if (!me.can_read_all_group_messages) {
-        lines.push(
-          `⚠️ Heads-up: my Group Privacy is ON, so Telegram hides regular group ` +
-            `messages from me — I'd only see @mentions. To fix: (1) @BotFather → ` +
-            `Bot Settings → Group Privacy → Turn off, (2) then remove me from this ` +
-            `group and add me back — Telegram only applies the change on re-join. ` +
-            `Making me a group admin also works. Note: enabling Topics moves the ` +
-            `group to a new id, which then needs approving again.`,
-        )
-      }
+      privacyOn = !(await bot.api.getMe()).can_read_all_group_messages
     } catch {
       // getMe hiccup — skip the hint rather than guess.
     }
   }
 
-  if (lines.length === 0) {
-    saveAccess(access)
-    return
-  }
+  const lines = groupJoinLines({
+    lite: LITE,
+    lang: liteLang(ctx.from?.language_code),
+    name: ctx.me?.first_name || botUsername,
+    username: botUsername,
+    title: entry.title,
+    chatId,
+    approved,
+    announce,
+    privacyOn,
+    fivedive: announce && !!(await read5diveVersion()),
+  })
+
+  if (lines.length === 0) return
   const text = lines.join('\n\n')
+  let sent = false
   try {
     // The group may not be allowlisted yet, so this bypasses the outbound gate
     // on purpose — it's the one message that makes allowlisting possible.
     await bot.api.sendMessage(chat.id, text)
-    if (announce) entry.announcedAt = Date.now()
+    sent = true
   } catch {
     // Group may block bot posts — fall back to DMing the paired owner(s).
     for (const uid of access.allowFrom) {
       try {
         await bot.api.sendMessage(uid, text)
-        if (announce) entry.announcedAt = Date.now()
+        sent = true
         break
       } catch {}
     }
   }
-  saveAccess(access)
+  if (announce && sent) {
+    const fresh = loadAccess()
+    const e = fresh.discovered?.[chatId]
+    if (e) {
+      e.announcedAt = Date.now()
+      saveAccess(fresh)
+    }
+  }
 })
 
 bot.on('message:text', async ctx => {
@@ -6414,6 +6443,20 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// What a stranger's DM is answered under dmPolicy=pairing.
+async function replyPair(ctx: Context, result: { code: string; isResend: boolean }): Promise<void> {
+  // DIVE-5368: a lite client never sees a code or a terminal command; the
+  // owner lets them in from the app. Said once, the reminder stays silent.
+  if (LITE) {
+    if (!result.isResend) await ctx.reply(ASK_OWNER[liteLang(ctx.from?.language_code)])
+    return
+  }
+  const lead = result.isResend ? 'Still pending' : 'Pairing required'
+  await ctx.reply(
+    `${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`,
+  )
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -6425,10 +6468,7 @@ async function handleInbound(
   if (result.action === 'drop') return
 
   if (result.action === 'pair') {
-    const lead = result.isResend ? 'Still pending' : 'Pairing required'
-    await ctx.reply(
-      `${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`,
-    )
+    await replyPair(ctx, result)
     return
   }
 

@@ -132,10 +132,13 @@ describe('no profile set = the plugin as it is today', () => {
       /^\s*const alertIdent = LITE \? null : gateAlertIdent\(/,
       /^\s*const gateReply = LITE \? null : parseGateReply\(text\)$/,
       /^\s*\.\.\.\(LITE \? \{ instructions: LITE_INSTRUCTIONS \} : \{\}\),$/,
+      // DIVE-5368: the group join lines take the profile as data (groupjoin.ts).
+      /^\s*lite: LITE,$/,
     ]
     const odd = uses.filter(l => !shapes.some(re => re.test(l)))
     expect(odd).toEqual([])
-    expect(uses).toHaveLength(13)
+    // DIVE-5368: 15 — the lite pairing reply (`if (LITE) {`) and `lite: LITE,`.
+    expect(uses).toHaveLength(15)
   })
 
   test('the lite front door is registered only under LITE, ahead of every other update handler', () => {
