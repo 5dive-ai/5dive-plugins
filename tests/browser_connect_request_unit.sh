@@ -352,8 +352,14 @@ out=$(priv done "$DONE" "$OWNER" 2>&1); rc=$?
 t  "H3 Done on an input-mode site hands the window BACK and does not stop it" "viewer-revoke tiktok.com|handoff tiktok.com --close|status tiktok.com" "$(tr '\n' '|' <"$FAKE_LOG" | sed 's/|$//')"
 
 # ---- S: the seams are not a door under root -------------------------------------------
-seam_block=$(awk '/^if \[\[ \$EUID -ne 0 \]\]; then$/{p=1} p{print} p&&/^fi$/{exit}' "$BROWSER")
-for v in FIVEDIVE_BROWSER_CONNECT_DIR FIVEDIVE_CONNECTOR_DIR FIVEDIVE_CONNECTORD_ENV FIVEDIVE_PROVISIONING_ENV FIVEDIVE_SHELLD_URL FIVEDIVE_TELEGRAM_API FIVEDIVE_BROWSER_CONNECT_SELF FIVEDIVE_BROWSER_CONNECT_PRIV; do
+# EVERY top-level non-root block, not the first one: the on-demand serve's seams
+# (DIVE-5389) live in a second block, and an awk that exits at the first `fi`
+# never sees it — so a seam there could not be on the list below at all.
+seam_block=$(awk '/^if \[\[ \$EUID -ne 0 \]\]; then$/{p=1} p{print} p&&/^fi$/{p=0}' "$BROWSER")
+t  "S0 the scan reads every non-root block" "$(grep -c '^if \[\[ \$EUID -ne 0 \]\]; then$' "$BROWSER")" "$(grep -c '^if \[\[ \$EUID -ne 0 \]\]; then$' <<<"$seam_block")"
+for v in FIVEDIVE_BROWSER_CONNECT_DIR FIVEDIVE_CONNECTOR_DIR FIVEDIVE_CONNECTORD_ENV FIVEDIVE_PROVISIONING_ENV FIVEDIVE_SHELLD_URL FIVEDIVE_TELEGRAM_API FIVEDIVE_BROWSER_CONNECT_SELF FIVEDIVE_BROWSER_CONNECT_PRIV \
+         FIVEDIVE_BROWSER_WAKE_PRIV FIVEDIVE_BROWSER_SERVE_MIN_MB FIVEDIVE_BROWSER_MEMINFO FIVEDIVE_BROWSER_SUDOERS_DIR FIVEDIVE_BROWSER_VISUDO; do
+  t "S1 $v is used at all (a seam the file never reads grades nothing)" 1 "$(( $(grep -c "$v" "$BROWSER") > 0 ))"
   t "S1 $v is read only inside the non-root block" "$(grep -c "$v" "$BROWSER")" "$(grep -c "$v" <<<"$seam_block")"
 done
 t  "S2 _connect stays root under sudo (not dropped to the seat)" 1 "$(grep -c 'setup|adblock|config|approve|approvals|adapters|_connect|' "$BROWSER")"

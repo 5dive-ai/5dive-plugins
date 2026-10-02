@@ -582,6 +582,10 @@ async function probeRequest(ctx, req, send, end) {
       waited += step;
       html = await page.content();
     }
+    // WHERE THE PAGE LANDED (DIVE-5388), for the generic check: a redirect to a
+    // sign-in path is a signed-out login whatever the page says. A log line, so
+    // it reaches the caller's stderr and never the document it greps.
+    if (req.report_url) send({ t: 'log', line: `5dive-probe-final-url: ${page.url()}` });
     send({ t: 'out', data: html.endsWith('\n') ? html : html + '\n' });
     end(0);
   } catch (e) {
@@ -1217,6 +1221,44 @@ async function inputRequest(be, profile, req, send, end, behalf) {
     out({ drive: 'input', title: t.page, window_title: t.window, handoff: !!be.handoff, viewer: viewerLive(profile),
       focused: !!k.browser, quiet_ms: t.window === be.seen.title ? Date.now() - be.seen.since : 0 });
     return end(0);
+  }
+
+  // THE LOGIN CHECK, IN A TAB OF ITS OWN (DIVE-5388). bin/browser's probe asks
+  // only when nobody is driving; a person or a handoff that arrived since is
+  // re-checked here, before a key is pressed. New tab, the probe URL typed into
+  // it as a person would, the title read once it settles, the tab closed. The
+  // tab is closed only when it is provably OURS — the window title changed when
+  // Ctrl+T was pressed, and no person or handoff has arrived since — because
+  // Ctrl+W on the last tab of the person's window would close Chrome. A tab
+  // left open is the safe failure. Classification is the
+  // caller's: this only reports the title.
+  if (req.op === 'title_probe') {
+    const skip = (why) => { out({ drive: 'input', navigated: false, why, title: '' }); return end(0); };
+    if (!INPUT_STEPS.goto({ url: req.url })) { send({ t: 'err', msg: 'title_probe needs an http(s) url' }); return end(E_NOTHING_RAN); }
+    if (be.handoff) return skip('the owner has the window (handoff)');
+    if (viewerLive(profile)) return skip('a person is in the viewer');
+    try {
+      await settled(be);
+      await keysReachBrowser(be);
+      const before = (await be.x.windowTitle()).window;
+      await be.x.press('ctrl+t');
+      let opened = false;
+      for (let i = 0; i < 20 && !opened; i++) { await sleepMs(100); opened = (await be.x.windowTitle()).window !== before; }
+      if (!opened) return skip('no new tab opened, so nothing was loaded');
+      await gotoByKeys(be, req.url);
+      await sleepMs(Number.isFinite(Number(req.wait)) && req.wait !== undefined ? Math.min(Number(req.wait), INPUT_MAX_WAIT_MS) : INPUT_GOTO_SETTLE_MS);
+      await settled(be);
+      const t = await be.x.windowTitle();
+      if (!viewerLive(profile) && !be.handoff) {
+        await keysReachBrowser(be);
+        await be.x.press('ctrl+w');
+        await sleepMs(150);
+      }
+      out({ drive: 'input', navigated: true, url_requested: req.url, title: t.page, window_title: t.window });
+      return end(0);
+    } catch (e) {
+      send({ t: 'err', msg: `could not check ${site} in a tab of its own: ${e.message}` }); return end(E_FAILED);
+    }
   }
 
   if (req.op === 'screen') {

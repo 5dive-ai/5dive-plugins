@@ -236,7 +236,7 @@ usage() {
   5dive browser setup                 # one-time, as root: create the profile store
   5dive browser auth <site>           # open a browser; log in yourself, once
   5dive browser status [site]         # per-site auth state (run on a SCHEDULE)
-  5dive browser probe-all             # scheduled check; skips profiles in use
+  5dive browser probe-all             # scheduled check; a served site through its own browser
   5dive browser ls                    # profiles, and when each was last seen alive
 
   On a managed box there is no display, so the browser lives on one:
@@ -623,11 +623,159 @@ _require_store() {  # _require_store [<site>]
 _broker_ready() {  # _broker_ready <site> <profile-dir>
   (( _SITE_BROKERED )) || return 0
   _daemon_live "$2" && return 0
-  die "$E_UNAVAILABLE" "$1 is logged in on this box under the '$_SITE_OWNER' seat, but nothing is serving that session right now — and '$(_seat)' cannot open the profile directly: it is mode 0700 to $_SITE_OWNER, which is what stops any seat here from replaying somebody else's login. A brokered seat acts THROUGH the running browser or not at all.
+  # DIVE-5389: nothing serving is the NORMAL state after a Connect (Done stops
+  # the login view), so the seat starts it as the owner rather than asking.
+  local why
+  if why=$(_broker_wake "$1") && _daemon_live "$2"; then
+    printf '%s: %s was not being served; started the box browser for it as %s.\n' "$PROG" "$1" "$_SITE_OWNER" >&2
+    return 0
+  fi
+  [[ -n "$why" ]] || why="it started, but no browser answers on its socket."
+  die "$E_UNAVAILABLE" "$1 is logged in on this box under the '$_SITE_OWNER' seat, but nothing is serving that session right now, and starting it for '$(_seat)' did not work: $why
+'$(_seat)' cannot open the profile directly: it is mode 0700 to $_SITE_OWNER, which is what stops any seat here from replaying somebody else's login. A brokered seat acts THROUGH the running browser or not at all.
 Start one from here:  sudo 5dive browser serve $1
 (root re-execs that as '$_SITE_OWNER', which owns the session, so it does NOT need \`sudo -u\` — the admin grant on this box is enough. A seat without that grant asks the owner:  sudo -u $_SITE_OWNER 5dive browser serve $1)
 If that starts but says 'no warm session', this box has no playwright-core, so there is no daemon to broker through and only $_SITE_OWNER can use the profile:  npm install --prefix $(cd "$_SELF_DIR/.." && pwd)"
 }
+
+# >>> DIVE-5389 A BROKERED SEAT SERVES THE BOX LOGIN ON DEMAND
+#
+# Connect, then Done, leaves the site connected and NOT served: Done is
+# viewer-revoke -> serve --stop -> status. On a box with hired agents that was
+# the default state, and every brokered verb died here until somebody holding
+# the owner's seat ran `serve` by hand (chill-gorge, discord.com 2026-10-02,
+# devhunt.org 2026-09-30 — DIVE-5242's box-local route was that hand).
+#
+# So the seat asks ROOT to start it, through ONE exact sudo command whose only
+# argument (the site) travels on stdin — the `_connect` shape. Root re-derives
+# everything a caller could lie about: who asked (SUDO_UID), whether the box
+# offers this site to that seat (the same three box facts DIVE-4813's drop
+# reads), and whether there is room. It then runs plain `serve <site>` as the
+# owner and nothing else — no flags pass through, it cannot stop, auth or
+# forget, and it never creates a profile.
+#
+# THE MEMORY FLOOR. Each served site is a Chrome of ~420 MB; chill-gorge is a
+# 3.8 GB box. Below SERVE_MEM_FLOOR_MB of MemAvailable an on-demand start is
+# refused with that reason and starts nothing, rather than OOM the box. Only the
+# on-demand path is floored: an owner who serves by hand is deciding for
+# themselves. Unreadable meminfo is not a refusal (there is no measurement).
+#
+# WHY NOT "Done leaves it warm" (the row's alternative): that holds ~420 MB per
+# connected site whether anybody ever uses it; on demand costs it only for a
+# site an agent actually reaches for. Once started it stays up until the owner
+# stops it — the same as a hand serve.
+#
+# THE GRANT is written by `setup` (/etc/sudoers.d/5dive-browser) for the
+# rendezvous group — the group that can already connect to every served socket,
+# so it adds no reach into a session, only the ability to have one started.
+SERVE_MEM_FLOOR_MB=800
+SERVE_MEMINFO=/proc/meminfo
+WAKE_PRIV=(sudo -n /usr/local/bin/5dive browser _serve-offered)
+WAKE_SUDOERS_DIR=/etc/sudoers.d
+WAKE_VISUDO=visudo
+# TEST SEAMS, honoured only WITHOUT root, like CONNECT_PRIV's: unprivileged they
+# point the caller at its own files with its own rights. The sudoers dir and the
+# visudo binary are here too: under root, setup writes the grant to the real
+# dir through the real visudo, whatever the environment says.
+if [[ $EUID -ne 0 ]]; then
+  WAKE_SUDOERS_DIR="${FIVEDIVE_BROWSER_SUDOERS_DIR:-$WAKE_SUDOERS_DIR}"
+  WAKE_VISUDO="${FIVEDIVE_BROWSER_VISUDO:-$WAKE_VISUDO}"
+  SERVE_MEM_FLOOR_MB="${FIVEDIVE_BROWSER_SERVE_MIN_MB:-$SERVE_MEM_FLOOR_MB}"
+  SERVE_MEMINFO="${FIVEDIVE_BROWSER_MEMINFO:-$SERVE_MEMINFO}"
+  [[ -n "${FIVEDIVE_BROWSER_WAKE_PRIV:-}" ]] && WAKE_PRIV=("$FIVEDIVE_BROWSER_WAKE_PRIV" _serve-offered)
+fi
+[[ "$SERVE_MEM_FLOOR_MB" =~ ^[0-9]{1,6}$ ]] || SERVE_MEM_FLOOR_MB=800
+
+# Room for one more browser? Silent and 0 when there is; the reason and 1 when not.
+_serve_floor_refusal() {
+  local avail
+  avail=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' "$SERVE_MEMINFO" 2>/dev/null)
+  [[ "$avail" =~ ^[0-9]+$ ]] || return 0
+  (( avail >= SERVE_MEM_FLOOR_MB )) && return 0
+  printf 'this box has %s MB of memory free, under the %s MB floor for starting another browser (each one holds about 420 MB), so nothing was started. A served site nobody is using frees room when its owner stops it (`5dive browser served` lists them).\n' \
+    "$avail" "$SERVE_MEM_FLOOR_MB"
+  return 1
+}
+
+# The caller's half: ask root to start <site> as its owner. 0 when it did; the
+# reason on stdout when it did not.
+_broker_wake() {  # <site>
+  if [[ -n "${FIVEDIVE_BROWSER_NO_WAKE:-}" ]]; then
+    echo "on-demand serving is turned off for this seat (FIVEDIVE_BROWSER_NO_WAKE)."; return 1
+  fi
+  local err rc=0
+  err=$(printf '%s\0' "$1" | "${WAKE_PRIV[@]}" 2>&1 >/dev/null) || rc=$?
+  (( rc == 0 )) && return 0
+  if [[ "${WAKE_PRIV[0]}" == sudo ]] && ! sudo -n -l /usr/local/bin/5dive browser _serve-offered >/dev/null 2>&1; then
+    echo "this seat has no grant to start the box's browsers. The owner installs it once with:  $SETUP_CMD"
+    return 1
+  fi
+  err=$(printf '%s\n' "$err" | grep -v '^[[:space:]]*$' | tail -n 3)
+  printf '%s\n' "${err#"$PROG: "}"
+  return 1
+}
+
+# `_serve-offered` — the privileged half. In the root-kept verb list at the
+# DIVE-4348 drop below, because the drop would hand it to the caller's seat.
+cmd_serve_offered() {
+  local -a w=(); local a
+  while IFS= read -r -d '' a; do w+=("$a"); done
+  # Under root the caller is the kernel's answer through sudo, never a flag.
+  # Unprivileged (the test seam) it is this process's own seat, which grants
+  # nothing: every directory is still opened with this uid's rights.
+  local caller
+  if [[ $EUID -eq 0 ]]; then caller=$(_connect_caller); else caller=$(_seat); fi
+  [[ -n "$caller" ]] || die "$E_PERM" "_serve-offered must be reached through sudo from an agent seat"
+  (( ${#w[@]} == 1 )) || die "$E_USAGE" "_serve-offered takes exactly one site, NUL-terminated on stdin"
+  local site="${w[0]}"
+  _valid_site "$site" && ! _is_public "$site" || die "$E_USAGE" "'$site' is not a login this box can offer"
+  [[ "$caller" != "$BOX_SEAT" && "$(_root_drop_target "$caller" serve "$site")" == "$BOX_SEAT" ]] \
+    || die "$E_PERM" "$site is not a box login offered to '$caller' (the box has not connected it, or '$caller' is its owner or keeps its own login for it), so there is nothing to start for it"
+  _SITE_OWNER="$BOX_SEAT"; _SITE_BROKERED=1; _SITE_DIR="$PROFILE_ROOT/$BOX_SEAT/$site"
+  # One start at a time per owner, so two seats arriving together do not both
+  # pass the floor and start two browsers; the second finds the first's.
+  local lk; lk="$(_rv_dir "$BOX_SEAT")/.serve-offered.lock"
+  # (The braces matter: a bare `exec 9>>f 2>/dev/null` makes BOTH redirections
+  # permanent, and every refusal below would leave this process silently.)
+  if command -v flock >/dev/null 2>&1 && { exec 9>>"$lk"; } 2>/dev/null; then flock -w 90 9 || true; fi
+  if _daemon_live "$_SITE_DIR"; then printf '%s is already being served\n' "$site"; return 0; fi
+  local why; why=$(_serve_floor_refusal) || die "$E_UNAVAILABLE" "$why"
+  export FIVEDIVE_BROWSER_ON_BEHALF_OF="$caller"
+  # ITS OWN SCOPE, NOT THE CALLER'S UNIT. Started from inside the calling seat's
+  # service, the browser would be in that seat's cgroup: a restart of the agent
+  # that asked would kill a session every other seat is using, and its ~420 MB
+  # would count against that agent's memory limit. A transient scope outlives
+  # this command for as long as the browser does (DIVE-5242 measured the same
+  # shape on chill-gorge's hand route).
+  if [[ $EUID -eq 0 && -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --scope --quiet --collect --unit="5dive-browser-serve-${site//[^a-zA-Z0-9]/-}-$$" -- \
+      runuser -u "$BOX_SEAT" -- env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site"
+    return $?
+  fi
+  _as_seat "$BOX_SEAT" env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site"
+}
+
+# Written by `setup` for the rendezvous group. Best-effort like the rendezvous:
+# a box where it cannot be written keeps the old "ask the owner" refusal.
+_install_wake_grant() {  # <group> -> 0 when the grant is in place
+  local g="$1" f tmp
+  [[ "$g" =~ ^[a-z_][a-z0-9_-]{0,31}$ && -d "$WAKE_SUDOERS_DIR" ]] || return 1
+  f="$WAKE_SUDOERS_DIR/5dive-browser"
+  # A dot in the name: sudo skips the staged file until it is moved into place.
+  tmp=$(mktemp "$WAKE_SUDOERS_DIR/.5dive-browser.XXXXXX" 2>/dev/null) || return 1
+  cat >"$tmp" <<EOF
+# Managed by 5dive browser setup (DIVE-5389). Do not edit by hand; setup rewrites it.
+# A seat in group $g finds a site the box has connected but nobody is serving,
+# and has it started AS THE OWNER. One exact command, no argument wildcard: the
+# site travels on stdin, and the verb re-derives the caller, the offer and the
+# memory floor as root. It cannot stop, sign in, forget or create anything.
+%$g ALL=(root) NOPASSWD: /usr/local/bin/5dive browser _serve-offered
+EOF
+  chmod 0440 "$tmp"
+  if ! "$WAKE_VISUDO" -cqf "$tmp" >/dev/null 2>&1; then rm -f "$tmp"; return 1; fi
+  mv -f "$tmp" "$f"
+}
+# <<< DIVE-5389
 
 # >>> DIVE-4813 WHICH SEAT ROOT BECOMES, and why it is not always the caller
 #
@@ -845,11 +993,19 @@ cmd_setup() {
   fi
 
   _install_probe_timer "$seat"
-  printf 'profile store ready\n  %s  (root, 0711 — traverse, not list)\n  %s  (%s, 0700)\n  liveness probe: every ~6h (served profiles are skipped)\n' \
+  local wake_ok=0
+  (( rv_ok )) && _install_wake_grant "$agroup" && wake_ok=1
+  printf 'profile store ready\n  %s  (root, 0711 — traverse, not list)\n  %s  (%s, 0700)\n  liveness probe: every ~6h (a served site is checked through its own browser)\n' \
     "$PROFILE_ROOT" "$PROFILE_ROOT/$seat" "$seat"
   if (( rv_ok )); then
     printf '  %s  (%s:%s, 0750 — the broker rendezvous; every agent seat in group %s uses THIS box login, with no second login of its own)\n' \
       "$SESSION_ROOT/$seat" "$seat" "$agroup" "$agroup"
+    if (( wake_ok )); then
+      printf '  %s  (root, 0440 — a seat in %s that finds one of these logins unserved starts it as %s, on demand, above a %s MB memory floor)\n' \
+        "$WAKE_SUDOERS_DIR/5dive-browser" "$agroup" "$seat" "$SERVE_MEM_FLOOR_MB"
+    else
+      printf '  no on-demand serve grant in %s — a seat that finds one of these logins unserved is told to ask for it to be started.\n' "$WAKE_SUDOERS_DIR" >&2
+    fi
   else
     printf '  no broker rendezvous at %s — other seats on this box cannot use %s'"'"'s logins and each one would need a login of its own. Nothing else is affected.\n' \
       "$SESSION_ROOT/$seat" "$seat" >&2
@@ -1171,19 +1327,87 @@ _signin_guard() {
   return 0
 }
 
+# THE SIGN-IN WORDS, FOR A PAGE WITH NO DOM TO READ (DIVE-5388). A window
+# title naming a sign-in ("Log in to Discord", "Sign in - Google Accounts") is
+# the login page. Only used where the probe page is NOT itself a sign-in page:
+# an adapter whose probe.url is /login/ (reddit, x.com) shows those words to a
+# signed-in visitor too, and there only its own title markers can decide.
+INPUT_SIGNIN_TITLE='(^|[^a-z])(log ?in|login|sign ?in|signin|sign ?up|signup)([^a-z]|$)|登录|登入|ログイン|로그인'
+_input_title_marker() {  # <site> <logged_out|logged_in>
+  local a; a="$(_adapter_path "$1")"
+  [[ -f "$a" ]] && jq -r --arg k "$2" '.probe[$k + "_when_title_matches"] // empty' "$a" 2>/dev/null
+}
+
+# INPUT MODE: THE TITLE OF THE PROBE PAGE, LOADED IN A TAB OF ITS OWN (DIVE-5388).
+# There is no DOM here, and that is the point of the mode — the sites served
+# this way refuse an automated browser — so the check reads what a person at
+# the screen could: the window title after the probe page loads. It loads in a
+# NEW tab that is closed afterwards, and only when nobody is driving (no
+# handoff, no person in the viewer, no agent holding the lease): the window is
+# where an agent or a person works, and a health check must not move it.
+#   challenge title       -> challenge, seen in the owner's own browser: Needs you
+#   sign-in title         -> expired
+#   adapter's signed-in   -> authenticated
+#   anything else         -> unverifiable, dated by the last signed-in read; or
+#                            unknown when there has never been one. Never a login
+#                            by elimination.
 _input_probe() {  # <site> <dir>
-  local site="$1" dir="$2" t title
+  local site="$1" dir="$2" t title why="" looked=0
   if ! _daemon_live "$dir" || ! t=$(_daemon_call "$dir" '{"op":"title"}' 2>/dev/null) \
      || [[ "$(jq -r '.drive // empty' <<<"$t" 2>/dev/null)" != input ]]; then
     echo "UNKNOWN (input mode, and no input-mode browser is serving $site — nothing loads a page to check it; 5dive browser serve $site)"
     return 0
   fi
+  local url; url=$(_site_url "$site")
+  local challenge; challenge=$(_input_challenge_title "$site")
+  if (( _SITE_BROKERED )); then
+    why="this seat uses the box login and does not move the owner's window"
+  elif [[ "$(jq -r '.handoff // false' <<<"$t")" == true ]]; then
+    why="the owner has the window (handoff)"
+  elif [[ "$(jq -r '.viewer // false' <<<"$t")" == true ]]; then
+    why="a person is in the viewer"
+  elif _lease_live "$dir"; then
+    why="an agent holds the browser"
+  else
+    local ans
+    if ans=$(_daemon_call "$dir" "$(jq -nc --arg u "$url" --arg c "$challenge" '{op:"title_probe", url:$u, challenge:$c}')" 2>/dev/null) \
+       && [[ "$(jq -r '.navigated // false' <<<"$ans" 2>/dev/null)" == true ]]; then
+      t="$ans"; looked=1
+    else
+      why=$(jq -r '.why // empty' <<<"$ans" 2>/dev/null)
+      why="${why:-the browser did not open a tab for the check (a session daemon from before this check cannot; it is restarted by: 5dive browser serve $site --stop)}"
+    fi
+  fi
   title=$(jq -r '.title // ""' <<<"$t")
-  if grep -qiE -- "$(_input_challenge_title "$site")" <<<"$title"; then
+  if grep -qiE -- "$challenge" <<<"$title"; then
+    if (( looked )); then _signed_in_forget "$dir"; _stamp "$dir" challenge; fi
     echo "CHALLENGE — human action required (the window shows \"$title\"; we do not solve these: 5dive browser handoff $site)"
     return 1
   fi
-  echo "unconfirmed (input mode: the window shows \"$title\" — there is no DOM to confirm a login from; a screen is the check: 5dive browser shot $site)"
+  if (( ! looked )); then
+    echo "unconfirmed (input mode: not checked now — $why; the window shows \"$title\"; a screen is the check: 5dive browser shot $site)"
+    return 0
+  fi
+  local out_t in_t; out_t=$(_input_title_marker "$site" logged_out); in_t=$(_input_title_marker "$site" logged_in)
+  if [[ -z "$out_t" ]] && ! grep -qiE "$GENERIC_SIGNIN_URL" <<<"$url"; then out_t="$INPUT_SIGNIN_TITLE"; fi
+  if [[ -n "$out_t" ]] && grep -qiE -- "$out_t" <<<"$title"; then
+    _signed_in_forget "$dir"; _stamp "$dir" expired
+    echo "session expired — human action required (input mode: $url loaded as \"$title\")"
+    return 1
+  fi
+  if [[ -n "$in_t" ]] && grep -qiE -- "$in_t" <<<"$title"; then
+    _signed_in_note "$dir" input; _stamp "$dir" authenticated
+    echo "authenticated (input mode: $url loaded as \"$title\"; checked $(date -u +%Y-%m-%dT%H:%MZ))"
+    return 0
+  fi
+  local seen
+  if seen=$(_signed_in_last "$dir"); then
+    _stamp_at "$dir" "$seen" unverifiable
+    echo "unverifiable — input mode: $url loaded as \"$title\", and a title cannot say whether this is signed in; last seen signed in $seen. A screen is the check: 5dive browser shot $site"
+    return 0
+  fi
+  _stamp "$dir" unknown
+  echo "unconfirmed (input mode: $url loaded as \"$title\", and a title cannot say whether this is signed in; it has not been seen signed in yet. A screen is the check: 5dive browser shot $site)"
   return 0
 }
 
@@ -1192,7 +1416,8 @@ _probe() {
   # INPUT MODE HAS NO DOM TO PROBE (DIVE-5287), and loading the probe URL would
   # move the window an agent or a person is working in. It reads the title.
   if [[ "$(_site_drive_adapter "$site")" == input ]] \
-     || { (( ! _SITE_BROKERED )) && [[ "$(_kv "$(_serve_pidfile "$dir")" drive)" == input ]]; }; then
+     || { (( ! _SITE_BROKERED )) && [[ "$(_kv "$(_serve_pidfile "$dir")" drive)" == input ]]; } \
+     || { (( _SITE_BROKERED )) && [[ "$(_kv "$(_rv_offer "$_SITE_OWNER" "$site")" drive)" == input ]]; }; then
     _input_probe "$site" "$dir"; return $?
   fi
   # SERVED MEANS WE CANNOT LOOK, AND SAYING SO IS THE WHOLE FIX. Chrome allows one
@@ -1263,8 +1488,8 @@ _probe() {
   # THE GENERIC CHECK (DIVE-4943 scope 2), and only for a page verb's gate: with no
   # adapter, the one thing we can still recognise is a page that is VISIBLY a
   # sign-in — a password field, or a form that posts to a login/session/auth path.
-  # `status` keeps its UNKNOWN (the tile's memory must not claim a login nobody
-  # confirmed); only the gate in front of a render reads this.
+  # `status` reads the page's header instead (DIVE-5388, below the loop), which
+  # can also say signed IN; the gate keeps this narrower test and its guard.
   local generic=0
   if [[ -z "$marker" && -z "$positive" && "${_PROBE_GENERIC:-0}" == 1 ]]; then
     generic=1; marker="$GENERIC_SIGNIN_MARKER"
@@ -1287,7 +1512,7 @@ _probe() {
       # back. Two regex engines must never both be allowed to decide a login.
       _daemon_call "$dir" "$(jq -nc --arg u "$url" --arg o "$marker" --arg i "$positive" \
             --arg c "$challenge" --argjson w "$total" \
-            '{op:"probe", url:$u, wait:$w, until:{logged_out:$o, logged_in:$i, challenge:$c}}')" \
+            '{op:"probe", url:$u, wait:$w, until:{logged_out:$o, logged_in:$i, challenge:$c}, report_url:true}')" \
           >"$dom" 2>"$dom.err"
       rc=$?
     else
@@ -1355,16 +1580,57 @@ _probe() {
     _stamp "$dir" "UNKNOWN — chrome did not load the page${why:+: $why}"
     echo "UNKNOWN (chrome did not load the page${why:+ — $why})"; return 0
   fi
+  # THE GENERIC CHECK, FOR `status` TOO (DIVE-5388). A connected site with no
+  # adapter used to stop at UNKNOWN here — 7 of 13 sites on chill-gorge had no
+  # check at all. lib/generic-login.cjs reads the page's header: a Log in / Sign
+  # in / Sign up control there (or a password form anywhere, or a landing on a
+  # sign-in path) is signed out; a header WITH controls and none of them a
+  # sign-in is signed in; anything else is still UNKNOWN. Challenge was tested
+  # above, first, as it always is. The page verbs' gate keeps its own narrower
+  # reading (generic=1 below): this one is the tile's.
+  local gwhy="" furl=""
+  (( warm )) && furl=$(sed -n 's/^5dive-probe-final-url: //p' "$dom.err" 2>/dev/null | tail -1)
+  if [[ -z "$verdict" && -z "$marker" && -z "$positive" ]] && (( ! generic )) && _have node \
+     && [[ -r "$_SELF_DIR/../lib/generic-login.cjs" ]]; then
+    local g; g=$(node "$_SELF_DIR/../lib/generic-login.cjs" "$dom" 2>/dev/null)
+    gwhy=$(sed -n 2p <<<"$g")
+    if [[ -n "$furl" ]] && ! grep -qiE "$GENERIC_SIGNIN_URL" <<<"$url" && grep -qiE "$GENERIC_SIGNIN_URL" <<<"$furl"; then
+      verdict=expired gwhy="the page redirected to a sign-in ($furl)"
+    else
+      case "$(head -1 <<<"$g")" in
+        out) verdict=expired ;;
+        in)  verdict=authenticated ;;
+        *)   gwhy="" ;;
+      esac
+    fi
+    [[ -n "$verdict" ]] && _maybe_propose "$site" "$dir"
+  fi
   rm -f "$dom" "$dom.err"
+  local via=headless; (( warm )) && via=served
   case "$verdict" in
     challenge)
+      # A BOT CHECK THAT MEETS OUR CHECK IS NOT "NEEDS YOU" (DIVE-5388). Only the
+      # headless probe, and only for a login the owner's own served browser last
+      # read signed in: Reddit and Cloudflare Turnstile show their check to an
+      # automated headless Chrome and not to the browser the session lives in,
+      # so this verdict is about the probe. A challenge in the served browser
+      # itself (warm) is the real thing and still stops for a person.
+      local seen
+      if (( ! warm )) && seen=$(_signed_in_last "$dir" 'served|input'); then
+        _stamp_at "$dir" "$seen" unverifiable
+        echo "unverifiable — the automatic check met a bot check, which $site shows automated browsers; last seen signed in $seen in the served browser. Nothing for a person to do: serving it lets the check read it there (5dive browser serve $site)"
+        return 0
+      fi
+      (( warm )) && _signed_in_forget "$dir"
       # THERE IS DELIBERATELY NO BYPASS BEHIND THIS.
       _stamp "$dir" challenge
       echo "CHALLENGE — human action required (we do not solve these)"; return 1 ;;
     expired)
-      _stamp "$dir" expired; echo "session expired — human action required"; return 1 ;;
+      _signed_in_forget "$dir"
+      _stamp "$dir" expired; echo "session expired — human action required${gwhy:+ (generic check: $gwhy)}"; return 1 ;;
     authenticated)
-      _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0 ;;
+      _signed_in_note "$dir" "$via"
+      _stamp "$dir" authenticated; echo "authenticated (${gwhy:+generic check: $gwhy; }checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0 ;;
   esac
   # NO MARKER, NO VERDICT. `authenticated` is a claim about a LOGIN, and the only
   # evidence for it here is the adapter's logged-out marker failing to match. With
@@ -1400,6 +1666,7 @@ _probe() {
     echo "UNKNOWN (the page never showed either the signed-in or the signed-out marker within ${total}ms — the state could not be read; acting verbs stay refused)"
     return 0
   fi
+  _signed_in_note "$dir" "$via"
   _stamp "$dir" authenticated; echo "authenticated (checked $(date -u +%Y-%m-%dT%H:%MZ))"; return 0
 }
 # The liveness file is the TILE'S memory and it lives in the owner's 0700
@@ -1408,6 +1675,41 @@ _probe() {
 _stamp() {
   (( _SITE_BROKERED )) && return 0
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$1/.5dive-liveness" 2>/dev/null || true
+}
+# _stamp_at <dir> <iso> <word> — a stamp whose date is NOT now. Used only by
+# `unverifiable`, whose date is the last time the login was SEEN signed in: the
+# tile parses "<iso> <word>" and nothing else (the API's parseLs), so the one
+# date the line carries is the one the owner needs — "last seen signed in 3h
+# ago", not "we failed to look 2 minutes ago".
+_stamp_at() {
+  (( _SITE_BROKERED )) && return 0
+  printf '%s %s\n' "$2" "$3" > "$1/.5dive-liveness" 2>/dev/null || true
+}
+
+# THE LAST SIGNED-IN READ, AND THROUGH WHAT (DIVE-5388). "<iso> <via>", via one
+# of headless (the cold probe), served (a CDP session daemon) or input (the
+# owner's own plain Chrome). Kept beside the stamp, not in it, because the stamp
+# is overwritten by every verdict and this must survive the verdicts that are
+# about the CHECK rather than the login: on chill-gorge (2026-10-02) Reddit and
+# a Cloudflare Turnstile site showed their bot check to the headless probe and
+# not to the served browser the same login was working in, and the tile said
+# "Needs you" over two healthy sessions. A logged-out or challenged read in the
+# owner's own browser removes it — that is the login, not the check.
+_signed_in_file() { echo "$1/.5dive-signed-in"; }
+_signed_in_note() {  # <dir> <via>
+  (( _SITE_BROKERED )) && return 0
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$(_signed_in_file "$1")" 2>/dev/null || true
+}
+_signed_in_forget() {
+  (( _SITE_BROKERED )) && return 0
+  rm -f -- "$(_signed_in_file "$1")" 2>/dev/null || true
+}
+_signed_in_last() {  # <dir> [<via-alternation>] -> the iso, rc 1 when there is none (or not through <via>)
+  local l; l=$(head -1 "$(_signed_in_file "$1")" 2>/dev/null) || return 1
+  local iso="${l%% *}" via="${l#* }"
+  [[ "$iso" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z$ ]] || return 1
+  [[ -z "${2:-}" || "$via" =~ ^($2)$ ]] || return 1
+  printf '%s\n' "$iso"
 }
 
 cmd_probe_all() {
@@ -1420,8 +1722,15 @@ cmd_probe_all() {
     site=$(basename "$d")
     _is_public "$site" && continue   # the public profile is not a login (DIVE-4943)
     _audit "$d" 700
-    if _serve_running "$d" >/dev/null; then
-      printf '  %-20s skipped: served\n' "$site"
+    # A SERVED SITE IS CHECKED THROUGH THE BROWSER THAT HOLDS IT (DIVE-5388).
+    # This used to skip every served profile (DIVE-4519), and on a box that keeps
+    # its sites served the stamps aged to hours or a day and never saw a
+    # reconnect. A session daemon answers a probe in its own tab (CDP) or reads
+    # the window title after loading the probe page in a tab of its own (input
+    # mode), so only a served browser with NO daemon — a plain-Chrome login
+    # view, which nothing can ask — is still skipped.
+    if _serve_running "$d" >/dev/null && ! _daemon_live "$d"; then
+      printf '  %-20s skipped: served (a login view, which no probe can ask; checked when it stops)\n' "$site"
       continue
     fi
     output=$(_auth_status "$site" 2>&1); arc=$?
@@ -7055,6 +7364,8 @@ cmd_connect_request() {
 # is the seat's, like every other verb.
 # DIVE-5336: `totp import` reads the root-only secrets store, then drops to the
 # profile's owner itself to write the seed. Every other `totp` verb is the seat's.
+# DIVE-5389: `_serve-offered` re-derives the caller from SUDO_UID and drops to the
+# OWNER itself, so the drop here would hand it to the wrong seat.
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   _v1="${1:-}"; [[ "$_v1" == adapters && "${2:-}" == drift ]] && _v1=adapters-drift
   [[ "$_v1" == totp && "${2:-}" != import ]] && _v1=totp-seat
@@ -7062,7 +7373,7 @@ if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
     # `adblock` joins `setup` here: it writes the MACHINE-WIDE chrome policy
     # file, which is root's. Dropping to the seat would turn it into a refusal.
     # `config` too: the drive default is one box-wide file (DIVE-5338).
-    setup|adblock|config|approve|approvals|adapters|_connect|totp|-h|--help|help|"") ;;
+    setup|adblock|config|approve|approvals|adapters|_connect|_serve-offered|totp|-h|--help|help|"") ;;
     *)
       # DIVE-4813: usually the caller, and for a brokered `serve` the owner.
       _drop="$(_root_drop_target "${SUDO_USER}" "$@")"
@@ -7306,7 +7617,8 @@ _input_challenge_title() {
 
 # Open an input-mode site for a verb: the profile, a live input daemon, and
 # (unless <purpose> is empty) the lease. The owner's own seat starts the serve
-# if nothing holds the profile; a brokered seat cannot, and is told how.
+# if nothing holds the profile; a brokered seat has it started as the owner, on
+# demand, by `_open_site` -> `_broker_ready` (DIVE-5389).
 _input_open() {  # _input_open <site> <purpose> <lease-wait|no>
   local site="$1" purpose="$2" wait="${3:-no}"
   command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is needed to talk to the $site browser and is not installed for this seat"
@@ -7648,5 +7960,8 @@ case "${1:-}" in
   handoff) shift; cmd_handoff "$@" ;;
   # Not in usage: the privileged half, reached only as `sudo -n … browser _connect`.
   _connect) shift; cmd_connect_priv "$@" ;;
+  # Not in usage: a brokered seat's on-demand serve, reached only as
+  # `sudo -n … browser _serve-offered` with the site on stdin (DIVE-5389).
+  _serve-offered) shift; cmd_serve_offered "$@" ;;
   *) die "$E_USAGE" "unknown: $PROG $1 (see: $PROG --help)" ;;
 esac

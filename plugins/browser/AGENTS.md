@@ -329,8 +329,9 @@ in chat.
   get instead is a conversation with the browser that is already holding it: if the box has a
   login for the site and something is serving it, `status`, `tree`, `run`, `shot` and `read`
   all just work from your seat, with **no second human login**. Your own login for a site, if
-  you made one, wins over the box's. If nothing is serving it the refusal says exactly that
-  and names the seat to start it — that is not "log in again".
+  you made one, wins over the box's. If nothing is serving it, your verb has the box start it
+  as the owner first (DIVE-5389), above a memory floor of about 800 MB free; a refusal says
+  which of those it was — it is never "log in again".
 - **Every brokered request is attributed to YOU.** The daemon reads the calling seat from the
   kernel, so the lease and the audit row say `holder=claude on_behalf_of=<your seat>`. You
   cannot set that field and should not try to.
