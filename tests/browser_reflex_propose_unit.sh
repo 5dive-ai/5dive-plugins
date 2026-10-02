@@ -336,7 +336,7 @@ run bash "$BROWSER" --help
 tc 'H1 --help documents propose' '5dive browser propose <site>' "$OUT$ERR"
 tc 'H1 --help documents the owner'"'"'s approve' 'sudo 5dive browser adapters approve <site>' "$OUT$ERR"
 tc 'H1 --help documents drift' '5dive browser adapters drift' "$OUT$ERR"
-tc 'H2 root keeps adapters (approve reads every seat and writes as that seat)' 'setup|adblock|approve|approvals|adapters|_connect' "$(cat "$BROWSER")"
+tc 'H2 root keeps adapters (approve reads every seat and writes as that seat)' 'setup|adblock|config|approve|approvals|adapters|_connect' "$(cat "$BROWSER")"
 tc 'H2 ...but drift drops to the seat, because it captures' '_v1=adapters-drift' "$(cat "$BROWSER")"
 
 # ============================================================ mutants: the refusal arms can go red

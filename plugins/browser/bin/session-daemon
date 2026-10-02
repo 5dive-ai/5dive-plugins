@@ -51,6 +51,7 @@ const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
 // DIVE-4951: the seat's own proxy — the same parser the cold driver uses, so the
 // served browser and a cold run cannot leave through two different routes.
 const proxy = require(path.join(__dirname, '..', 'lib', 'proxy.cjs'));
+const totp = require(path.join(__dirname, '..', 'lib', 'totp.cjs'));
 
 // DIVE-4587: Chrome keeps its crashpad DB under $XDG_CONFIG_HOME whatever
 // --user-data-dir says, and 5dive boxes share one XDG_CONFIG_HOME across every
@@ -460,6 +461,7 @@ async function serveMode(profile, sock, broker, input) {
         else if (req.op === 'snapshot') await snapshotRequest(ctx, req, send, end);
         else if (req.op === 'render') await renderRequest(ctx, req, send, end);
         else if (req.op === 'plan') await planRequest(ctx, req, send, end);
+        else if (req.op === 'totp') await totpRequest(ctx, profile, req, send, end);
         else { send({ t: 'err', msg: `unknown op '${req.op}'` }); end(E_NOTHING_RAN); }
       } catch (e) {
         send({ t: 'err', msg: e && e.message ? e.message : String(e) });
@@ -584,6 +586,33 @@ async function probeRequest(ctx, req, send, end) {
     end(0);
   } catch (e) {
     send({ t: 'err', msg: `could not load ${req.url}: ${e.message}` });
+    end(E_FAILED);
+  } finally {
+    try { if (page) await page.close(); } catch (e) { /* the tab is going anyway */ }
+  }
+}
+
+// ---- totp: the owner's authenticator code (DIVE-5336) -----------------------
+//
+// IN ITS OWN TAB, like the probe: the first page may be a person's at the viewer.
+// The seed is read HERE, as the profile's owner, from inside the 0700 profile —
+// a brokered seat that asked for the fill never sees the seed or the code, only
+// which field was typed into. Lease re-read first, as every acting op does.
+async function totpRequest(ctx, profile, req, send, end) {
+  if (typeof req.url !== 'string' || !/^https?:\/\//.test(req.url)) {
+    send({ t: 'err', msg: 'totp needs the http(s) url where the site asks for the code' }); return end(E_NOTHING_RAN);
+  }
+  let page;
+  try {
+    assertLease(req, 'totp');
+    page = await ctx.newPage();
+    page.setDefaultTimeout(STEP_TIMEOUT);
+    const r = await totp.fill(page, profile, { url: req.url, base: req.host,
+      settleMs: Number(process.env.FIVEDIVE_BROWSER_RUN_SETTLE_MS || 1500) });
+    send({ t: 'out', data: JSON.stringify(r) + '\n' });
+    end(0);
+  } catch (e) {
+    send({ t: 'err', msg: `could not type the authenticator code: ${e.message}` });
     end(E_FAILED);
   } finally {
     try { if (page) await page.close(); } catch (e) { /* the tab is going anyway */ }

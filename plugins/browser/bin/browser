@@ -302,8 +302,9 @@ usage() {
                                       # on the page, so your next read goes through it. You never
                                       # solve the check; you carry on after their Done.
 
-  INPUT MODE (an adapter with "drive": "input", e.g. tiktok.com): the site refuses an automated
-  browser, so it is plain Chrome driven through the screen, keyboard and mouse. No DOM:
+  INPUT MODE (an adapter with "drive": "input", e.g. tiktok.com, or every logged-in site when the
+  box default is `config drive=input`): plain Chrome driven through the screen, keyboard and
+  mouse. No DOM:
   5dive browser shot <site> [<url>]   # a PNG of the live window + the page title
   5dive browser act <site> [<url>] --steps='[{"op":"click","x":640,"y":400},{"op":"type","value":"hi"}]'
                                       # click{x,y} move{x,y} type{value} press{key} scroll{dy}
@@ -314,6 +315,12 @@ usage() {
                                       # agent input is suspended until they tap Done
   5dive browser handoff <site> --wait[=<s>] | --status | --close
 
+  5dive browser config                      # the box's default drive mode for logged-in sites
+  sudo 5dive browser config drive=input|cdp|auto
+                                      # input: every logged-in site is plain Chrome driven
+                                      # through the screen unless its adapter says otherwise;
+                                      # cdp: the automated browser; auto: back to the shipped
+                                      # default (the adapter decides, else the automated one)
   5dive browser adblock status              # is ad filtering on, and which sites is it off for
   sudo 5dive browser adblock off <site>     # this site breaks under filtering — stop filtering it
   sudo 5dive browser adblock on  <site>     # filter it again
@@ -332,6 +339,25 @@ usage() {
   A security challenge (CAPTCHA, 2FA, "unusual activity") is a HARD STOP that asks
   for a person. 5dive does not attempt to solve one. What this is: persistent
   human-authenticated sessions — not anti-bot bypassing.
+  ONE EXCEPTION, AND IT IS THE OWNER'S: an authenticator-app 2FA prompt, on a site
+  whose owner saved that site's authenticator seed on this box. `run` then types
+  the current 6-digit code itself and carries on. The seed and the code are never
+  printed, logged or sent anywhere. CAPTCHAs, emailed or SMS codes still stop.
+  5dive browser totp set <site>       # save the site's authenticator seed (the base32
+                                      # secret behind its QR, or the otpauth:// link),
+                                      # read from stdin — hidden at a terminal. 0600,
+                                      # inside the site's profile; `forget` removes it.
+  sudo 5dive browser totp import <site>
+                                      # move a seed the owner pasted on the one-time
+                                      # secrets link (connector browser-totp, key
+                                      # TOTP_<SITE>) into the site's profile. `run` and
+                                      # `totp fill` try this themselves when no seed is saved.
+  5dive browser totp status <site>    # saved or not — never the seed, never a code
+  5dive browser totp fill <site> [<url>]
+                                      # type the current code into the 2FA field on <url>
+                                      # (default: the site's probe page). Prints the
+                                      # field it typed into, never the code.
+  5dive browser totp forget <site>
   5dive browser run <site> <action> [--key=value ...] [--approved-id=<id>]
                                       # execute an adapter action, deterministically,
                                       # inside the logged-in profile. The verdict is an
@@ -840,6 +866,93 @@ _chrome() {
   return 1
 }
 
+# A HEADLESS LAUNCH ALWAYS HAS A WALL-CLOCK CAP (DIVE-5375). --virtual-time-budget
+# bounds PAGE time; it says nothing about a Chrome that wedges before the page or
+# outside it. On chill-gorge (2026-10-01) a status probe's Chrome logged "Failed to
+# connect to the bus" at start and never exited: it held linkedin.com's
+# SingletonLock for 28 hours, every later probe failed on "SingletonLock: File
+# exists", and the tile read "Not checked yet" the whole time. So every one-shot
+# launch goes through `timeout`, the shape `read` already had: N is the budget
+# plus slack, -k 5 is the KILL for a Chrome that ignores TERM, and because timeout
+# makes its own process group, the TERM/KILL reaches Chrome's children too.
+# Exit 124 (TERM worked) or 137 (KILL was needed) means "capped", never a page.
+_chrome_capped() {  # <budget-ms> <chrome> <args...>
+  local ms="$1"; shift
+  [[ "$ms" =~ ^[0-9]{1,7}$ ]] || ms=8000
+  local slack="${FIVEDIVE_BROWSER_CHROME_SLACK_S:-30}"
+  [[ "$slack" =~ ^[0-9]{1,4}$ ]] || slack=30
+  timeout -k 5 "$(( (ms + 999) / 1000 + slack ))" "$@"
+}
+_chrome_cap_s() {  # <budget-ms> — the N _chrome_capped used, for a message
+  local ms="$1" slack="${FIVEDIVE_BROWSER_CHROME_SLACK_S:-30}"
+  [[ "$ms" =~ ^[0-9]{1,7}$ ]] || ms=8000
+  [[ "$slack" =~ ^[0-9]{1,4}$ ]] || slack=30
+  echo "$(( (ms + 999) / 1000 + slack ))"
+}
+
+# _lock_owner <profile-dir> — "<pid>" when the profile's SingletonLock names a
+# process on THIS host (Chrome writes it as a symlink to "<hostname>-<pid>"), and
+# a failure otherwise. A lock from another host is not ours to judge.
+_lock_owner() {
+  local t pid
+  t=$(readlink -- "$1/SingletonLock" 2>/dev/null) || return 1
+  pid="${t##*-}"
+  [[ "$pid" =~ ^[0-9]+$ && "${t%-*}" == "$(uname -n)" ]] || return 1
+  echo "$pid"
+}
+
+# _lock_clear_dead <profile-dir> — remove a SingletonLock whose process is gone.
+# Chrome would take over such a lock itself, but a capped launch that we just
+# killed is the one case where we KNOW the holder is dead, so say it in the
+# profile rather than leave the next reader to work it out. /proc, not kill -0:
+# a live process of another uid answers kill -0 with EPERM, which reads as dead.
+_lock_clear_dead() {
+  local pid; pid=$(_lock_owner "$1") || return 0
+  [[ -d "/proc/$pid" ]] && return 0
+  rm -f -- "$1/SingletonLock" "$1/SingletonSocket" "$1/SingletonCookie"
+}
+
+# _reap_stale_probe <profile-dir> — the profile is locked by a ONE-SHOT headless
+# Chrome (--headless plus --dump-dom or --screenshot, at exactly this
+# --user-data-dir, no debugging port) that has run longer than any capped launch
+# could: kill it, so this probe can open the profile. Such a process has no
+# viewer and no caller left — a launch from before the cap, or one whose
+# `timeout` was itself killed. Anything else holding the lock is NEVER touched: a
+# viewer's or a served browser is not headless, and the session daemon's Chrome
+# is driven over a pipe and has neither one-shot flag. Returns 0 when the lock is
+# now free of a live holder.
+_reap_stale_probe() {
+  local dir="${1%/}" pid a headless=0 oneshot=0 mine=0 port=0 age
+  pid=$(_lock_owner "$dir") || return 1
+  [[ -d "/proc/$pid" ]] || { _lock_clear_dead "$dir"; return 0; }
+  while IFS= read -r -d '' a; do
+    case "$a" in
+      --headless|--headless=*) headless=1 ;;
+      --dump-dom|--screenshot|--screenshot=*) oneshot=1 ;;
+      --remote-debugging-*) port=1 ;;
+      --user-data-dir=*) a="${a#--user-data-dir=}"; [[ "${a%/}" == "$dir" ]] && mine=1 ;;
+    esac
+  done < "/proc/$pid/cmdline" 2>/dev/null
+  (( headless && oneshot && mine && ! port )) || return 1
+  local stale="${FIVEDIVE_BROWSER_PROBE_STALE_S:-600}"
+  [[ "$stale" =~ ^[0-9]{1,7}$ ]] || stale=600
+  age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
+  [[ "$age" =~ ^[0-9]+$ ]] && (( age >= stale )) || return 1
+  printf '%s: a headless probe Chrome (pid %s, %ss old) was holding %s; stopping it\n' "$PROG" "$pid" "$age" "$dir" >&2
+  command -v pkill >/dev/null 2>&1 && pkill -TERM -P "$pid" 2>/dev/null
+  kill -TERM "$pid" 2>/dev/null
+  local i
+  for (( i = 0; i < 25; i++ )); do [[ -d "/proc/$pid" ]] || break; sleep 0.2; done
+  if [[ -d "/proc/$pid" ]]; then
+    command -v pkill >/dev/null 2>&1 && pkill -KILL -P "$pid" 2>/dev/null
+    kill -KILL "$pid" 2>/dev/null
+    for (( i = 0; i < 10; i++ )); do [[ -d "/proc/$pid" ]] || break; sleep 0.2; done
+  fi
+  [[ -d "/proc/$pid" ]] && return 1
+  _lock_clear_dead "$dir"
+  return 0
+}
+
 cmd_auth() {
   local site="" status=0
   while (($#)); do
@@ -1022,11 +1135,15 @@ _chrome_launch_error() {
   local chrome="$1"
   local d; d=$(mktemp -d) || { printf 'no scratch directory to test a launch in'; return 0; }
   local err
-  err=$("$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$d" \
+  err=$(_chrome_capped 2000 "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$d" \
         --virtual-time-budget=2000 --dump-dom about:blank 2>&1 >/dev/null)
   local rc=$?
   rm -rf "$d"
   (( rc == 0 )) && return 1
+  if (( rc == 124 || rc == 137 )); then
+    printf 'it did not finish an about:blank launch within %ss and was stopped' "$(_chrome_cap_s 2000)"
+    return 0
+  fi
   err=$(printf '%s' "$err" | tr '\n\r\t' '   ' | cut -c1-200)
   printf 'it exited %s%s' "$rc" "${err:+ — $err}"
   return 0
@@ -1157,6 +1274,11 @@ _probe() {
   [[ "$total" =~ ^[0-9]{1,7}$ ]] || total=8000
   [[ "$poll"  =~ ^[1-9][0-9]{0,6}$ ]] || poll=400
   local rc waited=0 verdict=""
+  # A PROFILE HELD BY A FORGOTTEN PROBE (DIVE-5375): see _reap_stale_probe. A
+  # second Chrome at a held profile exits at once with an empty document, so
+  # without this every probe after a wedged one reads UNKNOWN until a person
+  # finds the process.
+  (( warm )) || _reap_stale_probe "$dir" || true
   while :; do
     if (( warm )); then
       # THE DAEMON DOES THE WAITING ON THIS PATH, in one tab rather than one tab
@@ -1169,7 +1291,7 @@ _probe() {
           >"$dom" 2>"$dom.err"
       rc=$?
     else
-      "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
+      _chrome_capped 8000 "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
             --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
       rc=$?
     fi
@@ -1191,6 +1313,16 @@ _probe() {
     sleep "$(( poll / 1000 )).$(printf '%03d' "$(( poll % 1000 ))")"
     waited=$(( waited + poll ))
   done
+  if (( ! warm )) && (( rc == 124 || rc == 137 )); then
+    # CAPPED (DIVE-5375): Chrome was stopped at the wall-clock cap. Say so, and
+    # free the profile for the next probe. Not the launch diagnosis below: that
+    # would spend another capped launch to learn what this one just showed.
+    _lock_clear_dead "$dir"
+    rm -f "$dom" "$dom.err"
+    local cap; cap=$(_chrome_cap_s 8000)
+    _stamp "$dir" "UNKNOWN — probe timed out (chrome did not finish within ${cap}s and was stopped)"
+    echo "UNKNOWN (probe timed out: chrome did not finish within ${cap}s and was stopped)"; return 0
+  fi
   if (( rc != 0 )) || [[ ! -s "$dom" ]]; then
     # A BROWSER THAT CANNOT START IS NOT AN UNREADABLE SESSION (DIVE-4587). Both
     # arrive here as a non-zero chrome and an empty document, and collapsing them
@@ -1951,6 +2083,14 @@ cmd_run() {
   # scheduler, because a network blip must not page a person, and a REFUSAL
   # here, because the action is the irreversible half.
   local state; state=$(_probe "$site" "$dir")
+  # THE OWNER'S AUTHENTICATOR, BEFORE THE STOP (DIVE-5336). Only a challenge, only
+  # with a seed the owner saved, and only a verdict the RE-PROBE gives: a code
+  # that was typed and did not clear the page leaves the stop below exactly as it
+  # was. Anything a seed cannot answer (a CAPTCHA, an emailed code) re-probes as
+  # the same CHALLENGE and stops there.
+  if [[ "$state" == CHALLENGE* ]] && _totp_clear "$site" "$dir"; then
+    state=$(_probe "$site" "$dir")
+  fi
   case "$state" in
     CHALLENGE*)
       die "$E_COLD" "$site is presenting a security challenge. Stopping: 5dive does not attempt to solve one, by decision and not by limitation. A person clears it. Ask your owner to, then carry on after their Done: 5dive browser connect-request $site --challenge --url=<the page you were on>" ;;
@@ -2493,7 +2633,7 @@ cmd_capture() {
     f="$out/signed-out.html"; (( k == 2 )) && f="$out/signed-out-2.html"
     cold=$(mktemp -d) || die "$E_UNAVAILABLE" "mktemp failed"
     ( umask 077
-      "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$cold" \
+      _chrome_capped 8000 "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$cold" \
         --virtual-time-budget=8000 --dump-dom "$url" >"$f" 2>/dev/null ) || orc=$?
     rm -rf "$cold"
     (( orc == 0 )) || break
@@ -2511,9 +2651,10 @@ cmd_capture() {
   else
     how=cold
     ( umask 077
-      "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
+      _chrome_capped 8000 "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
         --virtual-time-budget=8000 --dump-dom "$url" >"$out/signed-in.html" 2>/dev/null )
     irc=$?
+    _lock_clear_dead "$dir"
   fi
   chmod 600 "$out"/*.html 2>/dev/null || true
   local ob ob2 ib; ob=$(wc -c <"$out/signed-out.html" 2>/dev/null || echo 0); ob2=$(wc -c <"$out/signed-out-2.html" 2>/dev/null || echo 0)
@@ -3340,6 +3481,25 @@ _daemon_lease_json() {
 }
 _viewer_ticket()  { echo "$1/.5dive-viewer.ticket"; }
 _viewer_pidfile() { echo "$1/.5dive-viewer"; }
+# A PERSON WAS LET IN (DIVE-5374). Written at redeem and outliving the ticket's
+# state, which the revoke Done runs first overwrites — the stop that follows must
+# still know a person was in this browser, because their sign-in may not be on
+# disk yet. `left_at` is when the view was taken down. Cleared with the serve it
+# belongs to.
+_viewer_admitted_file() { echo "$1/.5dive-viewer.admitted"; }
+# True when a person was admitted to THIS serve (at or after <serve-started-at>)
+# and was in it within the last 60 s. Chrome commits a cookie batch ~30 s after
+# its first change, so whatever a person changed before they left a minute ago is
+# on disk already. Without that bound an input-mode daemon (which lives for hours)
+# would make every later stop of it, the idle sweep's included, sit out the cap.
+_viewer_admitted_since() {  # _viewer_admitted_since <dir> <serve-started-at>
+  local af at left; af="$(_viewer_admitted_file "$1")"
+  at=$(_kv "$af" admitted_at); left=$(_kv "$af" left_at)
+  [[ "$at" =~ ^[0-9]+$ ]] || return 1
+  [[ "$2" =~ ^[0-9]+$ ]] && (( at < $2 )) && return 1
+  [[ "$left" =~ ^[0-9]+$ ]] && (( left > at )) && at=$left
+  (( $(date -u +%s) - at <= 60 ))
+}
 
 _have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -3489,17 +3649,6 @@ cmd_serve() {
     _viewer_stop "$dir"
     local f; f="$(_serve_pidfile "$dir")"
     local xpid cpid dpid; xpid=$(_kv "$f" xvfb_pid); cpid=$(_kv "$f" chrome_pid); dpid=$(_kv "$f" daemon_pid)
-    # ASK THE DAEMON TO GO, THEN INSIST (DIVE-4621). The graceful path closes the
-    # context, which is how Chrome writes the profile out; SIGKILL on a browser
-    # mid-write is how a profile that holds a login gets corrupted, and the login
-    # is the durable half this whole design protects. The kill below is the
-    # backstop for a daemon that is wedged, not the route.
-    if [[ -n "$dpid" ]] && _pid_live "$dpid"; then
-      _daemon_call "$dir" '{"op":"shutdown"}' >/dev/null 2>&1 || true
-      local w=0
-      while (( w < 100 )) && _pid_live "$dpid"; do sleep 0.05; w=$(( w + 1 )); done
-      _pid_live "$dpid" && kill "$dpid" 2>/dev/null
-    fi
     # A LOGIN VIEW'S COOKIES ARE ON DISK ONLY AFTER CHROME'S NEXT COMMIT (DIVE-5286).
     # Chrome batches cookie writes and commits them ~30 s after the first change
     # of a batch, and a SIGTERM shutdown does NOT reliably write the pending
@@ -3515,14 +3664,26 @@ cmd_serve() {
     # probe in ONE request that the proxy cuts at 30 s (and the stop alone at 30
     # s), so the default 24 s keeps the whole of Done inside it. What the cap
     # gives up: a sign-in under ~6 s before Done can still be lost.
-    if [[ -n "$cpid" && "$(_kv "$f" login)" == 1 ]] && _pid_live "$cpid"; then
+    #
+    # AND A PERSON'S SIGN-IN IS NOT ONLY EVER IN A LOGIN VIEW (DIVE-5374). On an
+    # input-mode box the viewer attaches to the session daemon's plain Chrome, and
+    # a warm (CDP) serve can be viewed too: neither has a chrome_pid or login=1 in
+    # this pidfile, so the wait above was skipped and the daemon's close()
+    # SIGTERMed Chrome 1 s after Done — a github.com sign-in 7 s before Done was
+    # lost that way on chill-gorge (2026-10-02). So the wait keys on what the
+    # stop is protecting — a person was admitted to THIS serve's browser — and
+    # runs BEFORE the daemon is asked to go, whichever process holds the Chrome.
+    local hpid=""
+    if [[ -n "$cpid" ]] && _pid_live "$cpid"; then hpid="$cpid"
+    elif [[ -n "$dpid" ]] && _pid_live "$dpid"; then hpid="$dpid"; fi
+    if [[ -n "$hpid" ]] && { [[ -n "$cpid" && "$(_kv "$f" login)" == 1 ]] || _viewer_admitted_since "$dir" "$(_kv "$f" started_at)"; }; then
       local cs="${FIVEDIVE_BROWSER_COOKIE_SETTLE:-24}"; [[ "$cs" =~ ^[0-9]+$ ]] || cs=24
       local sref; sref=$(mktemp "${TMPDIR:-/tmp}/5dive-stop.XXXXXX" 2>/dev/null) || sref=""
       if [[ -n "$sref" ]] && (( cs > 0 )); then
         # A WALL-CLOCK deadline, not a count of sleeps: each turn of this loop
         # forks, and 480 turns of "0.05 s" measured 27.5 s — past the budget.
         local sdl=$(( $(date +%s%3N) + cs * 1000 )) ck committed=0
-        while (( $(date +%s%3N) < sdl )) && _pid_live "$cpid"; do
+        while (( $(date +%s%3N) < sdl )) && _pid_live "$hpid"; do
           for ck in "$dir/Default/Network/Cookies" "$dir/Default/Cookies"; do
             [[ "$ck" -nt "$sref" ]] && { committed=1; break 2; }
           done
@@ -3532,6 +3693,17 @@ cmd_serve() {
         (( committed )) && sleep 0.5
       fi
       [[ -n "$sref" ]] && rm -f "$sref"
+    fi
+    # ASK THE DAEMON TO GO, THEN INSIST (DIVE-4621). The graceful path closes the
+    # context, which is how Chrome writes the profile out; SIGKILL on a browser
+    # mid-write is how a profile that holds a login gets corrupted, and the login
+    # is the durable half this whole design protects. The kill below is the
+    # backstop for a daemon that is wedged, not the route.
+    if [[ -n "$dpid" ]] && _pid_live "$dpid"; then
+      _daemon_call "$dir" '{"op":"shutdown"}' >/dev/null 2>&1 || true
+      local w=0
+      while (( w < 100 )) && _pid_live "$dpid"; do sleep 0.05; w=$(( w + 1 )); done
+      _pid_live "$dpid" && kill "$dpid" 2>/dev/null
     fi
     # CHROME GOES FIRST, AND ALL THE WAY, BEFORE ITS DISPLAY (DIVE-5286). A stop
     # that returns while Chrome still holds SingletonLock hands the probe Done
@@ -3548,7 +3720,7 @@ cmd_serve() {
     fi
     [[ -n "$xpid" ]] && kill "$xpid" 2>/dev/null
     local ssock; ssock="$(_kv "$f" sock)"
-    rm -f "$f" "${ssock:-$dir/.5dive-session.sock}"
+    rm -f "$f" "${ssock:-$dir/.5dive-session.sock}" "$(_viewer_admitted_file "$dir")"
     printf 'stopped the %s browser. The profile is untouched — it is the durable half.\n' "$site"
     return 0
   fi
@@ -3575,8 +3747,18 @@ cmd_serve() {
   # `--login` has nothing to swap. A proxied seat cannot have it: plain Chrome
   # cannot carry the proxy's login (DIVE-4951), and the site is served as input
   # BECAUSE the automated browser does not work there.
-  local input=0
-  [[ "$(_site_drive_adapter "$site")" == input ]] && input=1
+  # DIVE-5338: the box default applies only where no adapter said a word, and a
+  # proxied seat falls back to the automated browser instead of being refused.
+  local input=0 _dw; _dw="$(_site_drive_adapter "$site")"
+  if [[ "$_dw" == input ]]; then
+    input=1
+  elif [[ -z "$_dw" ]] && ! _is_public "$site" && [[ "$(_box_drive)" == input ]]; then
+    if [[ -f "$(_proxy_file)" ]]; then
+      printf '%s: NOTE — this box defaults to input mode, but this seat has a proxy, which plain Chrome cannot carry; %s keeps the automated browser.\n' "$PROG" "$site" >&2
+    else
+      input=1
+    fi
+  fi
   if (( input )) && [[ -f "$(_proxy_file)" ]]; then
     die "$E_UNAVAILABLE" "$site is set to input mode (plain Chrome, driven through the screen — the site refuses an automated browser), and this seat has a proxy set, which plain Chrome cannot carry: serving it would put this login on the box's own IP. Nothing was started. \`5dive browser proxy clear\` to use input mode here."
   fi
@@ -3790,6 +3972,12 @@ _viewer_stop() {
   local dir="$1" f; f="$(_viewer_pidfile "$dir")"
   local p
   for p in $(_kv "$f" vnc_pid) $(_kv "$f" ws_pid); do kill "$p" 2>/dev/null; done
+  # The view coming down is when the person left (DIVE-5374): Done's revoke lands
+  # here a second before its stop.
+  local af; af="$(_viewer_admitted_file "$dir")"
+  if [[ -f "$f" && -f "$af" ]]; then
+    ( umask 077; { grep -v '^left_at=' "$af"; printf 'left_at=%s\n' "$(date -u +%s)"; } > "$af.$$" && mv -f "$af.$$" "$af" ) 2>/dev/null || true
+  fi
   rm -f "$f"
   # The VNC password outlives nothing. It is only ever meaningful while the
   # process that was started with it is alive, so a copy left behind in the
@@ -4004,6 +4192,7 @@ cmd_viewer_redeem() {
   _lease_preempt "$dir" "a person at the viewer" "$lease_ttl" "${vncpid:-$$}" >/dev/null
 
   _viewer_revoke_file "$dir" consumed
+  ( umask 077; printf 'admitted_at=%s\n' "$(date -u +%s)" > "$(_viewer_admitted_file "$dir")" ) 2>/dev/null || true
   printf 'target=127.0.0.1:%s\npassword=%s\n' "$port" "$vncpw"
 }
 
@@ -4350,10 +4539,11 @@ cmd_shot() {
 
   # The flags are the security claim: --headless with NO --remote-debugging-*, so
   # this render opens no socket any other seat could reach. See the header.
-  "$chrome" --headless --no-sandbox --disable-gpu --hide-scrollbars \
+  _chrome_capped "$wait" "$chrome" --headless --no-sandbox --disable-gpu --hide-scrollbars \
       --user-data-dir="$dir" --window-size="$w,$h" \
       --virtual-time-budget="$wait" --screenshot="$out" "$url" >/dev/null 2>&1
   local rc=$?
+  _lock_clear_dead "$dir"
   if (( rc != 0 )) || [[ ! -s "$out" ]]; then
     rm -f "$out"
     die "$E_UNAVAILABLE" "the render produced no image (chrome exited $rc). Nothing was written — an empty, missing or stale PNG must not be reported as a screenshot."
@@ -4364,10 +4554,11 @@ cmd_shot() {
   # build decided wins. Two loads, each with one job, is the only shape whose
   # result is the same on every chrome.
   if [[ -n "$domout" ]]; then
-    "$chrome" --headless --no-sandbox --disable-gpu \
+    _chrome_capped "$wait" "$chrome" --headless --no-sandbox --disable-gpu \
         --user-data-dir="$dir" --virtual-time-budget="$wait" \
         --dump-dom "$url" >"$domout" 2>/dev/null
     local drc=$?
+    _lock_clear_dead "$dir"
     if (( drc != 0 )) || [[ ! -s "$domout" ]]; then
       rm -f "$domout"
       printf '%s: WARNING — the PNG rendered but the DOM dump did not (chrome exited %s). %s was not written.\n' "$PROG" "$drc" "$domout" >&2
@@ -6135,6 +6326,219 @@ cmd_proxy() {
   return 0
 }
 
+# >>> DIVE-5336 the owner's authenticator seed
+#
+# THE CARVE-OUT FROM "IT NEVER TYPES A PASSWORD", stated once so nobody widens it
+# by accident. The header's rule 1 stands: no password, ever. What is typed here
+# is the second factor the OWNER chose to put on this box, for the site the seed
+# was saved for, into a page on that site's own host — the owner logging in as
+# themselves. A CAPTCHA, an emailed or SMS code, an "are you human" step: none of
+# them has a seed, so none of them is answered, and they stop exactly as before.
+#
+# WHERE THE SEED LIVES: $TOTP_FILE_NAME, 0600, inside the site's 0700 profile.
+# Not the seat dir and not a store of its own, because the profile is already the
+# unit everything else is keyed on — the lease, the broker, `forget` — so the
+# seed is held by exactly the uid that holds the session, a brokered seat asks the
+# daemon to type it without ever reading it, and forgetting the login forgets it.
+#
+# HOW IT GETS HERE: never through 5dive's API (lodar 2026-10-01: "the secret
+# should never touch our api"). The owner pastes it on the box's one-time secrets
+# link (DIVE-5319), which lands it as TOTP_<SITE> in the root-only connector
+# store; `totp import` (root) moves it into the profile and deletes the store's
+# copy, so it exists in one place. `totp set` takes it on stdin at the box.
+TOTP_FILE_NAME=".5dive-totp"
+TOTP_CONNECTOR="browser-totp"
+CONNECTORS_DIR="${FIVEDIVE_BROWSER_CONNECTORS_DIR:-/etc/5dive/connectors}"
+# The seat's way to root's import, overridable for the harness like CONNECT_PRIV.
+TOTP_IMPORT=(sudo -n /usr/local/bin/5dive browser totp import)
+[[ -n "${FIVEDIVE_BROWSER_TOTP_IMPORT:-}" ]] && TOTP_IMPORT=("$FIVEDIVE_BROWSER_TOTP_IMPORT")
+
+# Ask root's import only when this seat holds the grant for it. A refused
+# `sudo -n` mails root (DIVE-4397) and a standard seat has no such grant, so the
+# grant is read first, the way _reflex_cli and _connect do; the `-l` probe of the
+# exact command is answered without a password and without a mail.
+_totp_ask_import() {  # <site>
+  if [[ "${TOTP_IMPORT[0]}" == sudo && $EUID -ne 0 ]]; then
+    sudo -n -l "${TOTP_IMPORT[@]:2}" "$1" --quiet >/dev/null 2>&1 || return 1
+  fi
+  "${TOTP_IMPORT[@]}" "$1" --quiet </dev/null >/dev/null 2>&1
+}
+
+# The connector KEY for a profile: TOTP_ + the name upper-cased, every non
+# alphanumeric an underscore. github.com -> TOTP_GITHUB_COM, github.com_work ->
+# TOTP_GITHUB_COM_WORK. The shape `5dive secret write` accepts.
+_totp_key() { local k; k="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"; printf 'TOTP_%s\n' "$k"; }
+
+# A seed in either form the owner is likely to have: the bare base32 secret
+# (spaces and lower case allowed, as apps print it), or the otpauth:// link the
+# QR encodes. An otpauth link that asks for anything but SHA1/6 digits/30 s is
+# REFUSED, not stored: its codes would be wrong forever and look like a broken
+# login. Prints the normalised base32, or returns 1. Never echoes its input.
+_totp_normalise() {
+  local v="$1" q
+  if [[ "$v" == otpauth://* ]]; then
+    [[ "$v" == otpauth://totp/* ]] || return 1
+    q="${v#*\?}"
+    local alg digits period secret kv
+    alg="$(tr '&' '\n' <<<"$q" | sed -n 's/^algorithm=//Ip' | head -1)"
+    digits="$(tr '&' '\n' <<<"$q" | sed -n 's/^digits=//Ip' | head -1)"
+    period="$(tr '&' '\n' <<<"$q" | sed -n 's/^period=//Ip' | head -1)"
+    secret="$(tr '&' '\n' <<<"$q" | sed -n 's/^secret=//Ip' | head -1)"
+    [[ -z "$alg" || "${alg^^}" == SHA1 ]] || return 2
+    [[ -z "$digits" || "$digits" == 6 ]] || return 2
+    [[ -z "$period" || "$period" == 30 ]] || return 2
+    v="$secret"
+  fi
+  v="$(printf '%s' "$v" | tr -d ' \t=-' | tr '[:lower:]' '[:upper:]')"
+  [[ "$v" =~ ^[A-Z2-7]{16,128}$ ]] || return 1
+  printf '%s\n' "$v"
+}
+
+cmd_totp() {
+  local sub="${1:-}" site="${2:-}"; shift 2 2>/dev/null || true
+  case "$sub" in
+    set|import|status|fill|forget) ;;
+    *) die "$E_USAGE" "usage: 5dive browser totp set|import|status|fill|forget <site>" ;;
+  esac
+  [[ -n "$site" ]] || die "$E_USAGE" "which site? e.g. 5dive browser totp $sub github.com"
+  _valid_site "$site" && ! _is_public "$site" || die "$E_USAGE" "'$site' is not a site a person logs in to"
+  case "$sub" in
+    import) _totp_import "$site" "$@"; return $? ;;
+    fill)
+      _open_site "$site"
+      local url="${1:-}"
+      [[ -z "$url" || "$url" =~ ^https?:// ]] || die "$E_USAGE" "totp fill takes an http(s) url; got: $url"
+      _lease_take "$site" "$_SITE_DIR" "totp fill" no
+      trap '_lease_and_serve_release' EXIT
+      local out rc=0; out="$(_totp_fill "$site" "$_SITE_DIR" "$url")" || rc=$?
+      printf '%s\n' "$out"
+      return "$rc" ;;
+  esac
+
+  _open_site "$site"
+  local dir="$_SITE_DIR" f="$_SITE_DIR/$TOTP_FILE_NAME"
+  if (( _SITE_BROKERED )); then
+    [[ "$sub" == status ]] || die "$E_PERM" "$site is the box's login, held by the '$_SITE_OWNER' seat, so its seed lives in that profile and only that seat writes it. Paste it on the secrets link instead (see: 5dive browser totp status $site), or run as the owner: sudo -u $_SITE_OWNER 5dive browser totp $sub $site"
+    printf '%s: %s is the box'"'"'s login, held by %s — a seat cannot look inside that profile. `run` asks the session to type the code when the site asks for one; if no seed is saved there, it stops as before.\n' "$PROG" "$site" "$_SITE_OWNER"
+    return 0
+  fi
+  case "$sub" in
+    status)
+      if [[ -f "$f" ]]; then
+        local m; m="$(stat -c '%a' "$f")"
+        [[ "$m" == 600 ]] || die "$E_PERM" "$f is mode $m, want 600 — it will not be used. Save it again: 5dive browser totp set $site"
+        printf '%s: %s: an authenticator seed is saved. `run` types the current code at a 2FA prompt on %s.\n' "$PROG" "$site" "$(_site_base "$site")"
+      else
+        printf '%s: %s: no authenticator seed saved — a 2FA prompt stops and asks the owner, as before.\n' "$PROG" "$site"
+        printf 'To save one without it touching 5dive'"'"'s servers, file a secret gate the owner answers on the box'"'"'s one-time link:\n  5dive task need <DIVE-id> --type=secret --secret-key=%s --connector=%s --ask="Paste the authenticator setup key for %s (the text under its QR code)"\nor, at this box:  5dive browser totp set %s\n' \
+          "$(_totp_key "$site")" "$TOTP_CONNECTOR" "$(_site_base "$site")" "$site"
+      fi
+      return 0 ;;
+    forget)
+      if [[ -e "$f" ]]; then
+        rm -f -- "$f" || die "$E_UNAVAILABLE" "could not remove $f"
+        _audit_row "$dir" totp-forget ""
+        printf '%s: %s: authenticator seed removed.\n' "$PROG" "$site"
+      else
+        printf '%s: %s: no authenticator seed was saved.\n' "$PROG" "$site"
+      fi
+      return 0 ;;
+  esac
+
+  # set — stdin only, never argv: an argument is in ps and in shell history.
+  local v
+  if [[ -t 0 ]]; then
+    printf 'Paste the authenticator setup key for %s (hidden), then Enter: ' "$site" >&2
+    IFS= read -rs v || v=""; printf '\n' >&2
+  else
+    IFS= read -r v || true
+  fi
+  v="${v%$'\r'}"
+  local norm nrc=0; norm="$(_totp_normalise "$v")" || nrc=$?
+  unset v
+  (( nrc == 2 )) && die "$E_USAGE" "that otpauth link asks for an algorithm, digit count or period other than SHA1 / 6 / 30 s. Those codes cannot be typed for you; nothing was saved."
+  (( nrc == 0 )) || die "$E_USAGE" "that is not an authenticator setup key: expected the base32 text under the QR code (letters A-Z and digits 2-7, at least 16) or an otpauth://totp/ link. Nothing was saved."
+  local tmp="$f.tmp.$$"
+  ( umask 077; printf '%s\n' "$norm" > "$tmp" ) && chmod 600 "$tmp" && mv -f "$tmp" "$f" \
+    || { rm -f "$tmp"; die "$E_UNAVAILABLE" "could not write the seed into $dir"; }
+  unset norm
+  _audit_row "$dir" totp-set ""
+  printf '%s: %s: authenticator seed saved. At a 2FA prompt on %s, `run` now types the current code itself.\n' "$PROG" "$site" "$(_site_base "$site")"
+}
+
+# ROOT ONLY: secrets store -> the profile's owner. The owner is whoever holds the
+# login the seed belongs to — the caller's own profile if it has one, else the
+# box's — never a seat the caller names. The store's copy is removed after the
+# write, so the seed is in one place; a failed write leaves it where it was.
+_totp_import() {
+  local site="$1" quiet=0; [[ "${2:-}" == --quiet ]] && quiet=1
+  [[ $EUID -eq 0 ]] || die "$E_PERM" "totp import reads the box's secrets store, which is root's: sudo 5dive browser totp import $site"
+  local caller="${SUDO_USER:-}" owner=""
+  [[ -n "$caller" && "$caller" != root && -d "$PROFILE_ROOT/$caller/$site" ]] && owner="$caller"
+  [[ -z "$owner" && -d "$PROFILE_ROOT/$BOX_SEAT/$site" ]] && owner="$BOX_SEAT"
+  [[ -n "$owner" ]] || die "$E_UNAVAILABLE" "no login for $site on this box to attach a seed to — connect the site first: 5dive browser auth $site"
+  local key env; key="$(_totp_key "$site")"; env="$CONNECTORS_DIR/$TOTP_CONNECTOR.env"
+  local line; line="$(grep -m1 -E "^${key}=" "$env" 2>/dev/null || true)"
+  if [[ -z "$line" ]]; then
+    (( quiet )) || printf '%s: no %s in the secrets store — nothing to import. The owner pastes it on the secret gate'"'"'s one-time link (connector %s).\n' "$PROG" "$key" "$TOTP_CONNECTOR" >&2
+    return 1
+  fi
+  printf '%s\n' "${line#*=}" | env -u FIVEDIVE_BROWSER_SEAT runuser -u "$owner" -- "$0" totp set "$site" >/dev/null \
+    || die "$E_UNAVAILABLE" "the seed in the secrets store could not be saved for $site (it is left there, unchanged)"
+  unset line
+  local tmp
+  if tmp="$(mktemp "$env.XXXXXX")"; then
+    chmod 600 "$tmp"
+    grep -vE "^${key}=" "$env" > "$tmp" || true
+    chown --reference="$env" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$env" || rm -f "$tmp"
+  fi
+  (( quiet )) || printf '%s: %s: authenticator seed moved from the secrets store into %s'"'"'s profile.\n' "$PROG" "$site" "$owner"
+  return 0
+}
+
+# One fill, through whichever process holds the profile: the warm session when
+# one is up (a brokered seat has nothing else), the one-shot driver otherwise.
+# Prints the executor's JSON line — which names a field, never a code.
+_totp_fill() {  # <site> <dir> [<url>]
+  local site="$1" dir="$2" url="${3:-}" host; host="$(_site_base "$site")"
+  [[ -n "$url" ]] || url="$(_site_url "$site")"
+  # NO SEED YET: take one from the secrets store if the owner put it there.
+  # Best-effort and silent — a seat without the grant never asks sudo. A brokered
+  # seat cannot see whether the owner's profile holds one, so it always asks;
+  # with nothing in the store, the import is a quiet no-op.
+  if (( _SITE_BROKERED )) || [[ ! -f "$dir/$TOTP_FILE_NAME" ]]; then
+    _totp_ask_import "$site" || true
+  fi
+  if (( _SITE_BROKERED )) || _daemon_live "$dir"; then
+    _daemon_call "$dir" "$(jq -nc --arg u "$url" --arg h "$host" --argjson l "$(_daemon_lease_json)" \
+        '{op:"totp", url:$u, host:$h} + $l')"
+  else
+    (( ! _SITE_BROKERED )) && [[ ! -f "$dir/$TOTP_FILE_NAME" ]] && { printf '{"filled":false,"why":"no-seed"}\n'; return 1; }
+    local chrome; chrome=$(_chrome) && chrome=$(command -v "$chrome" 2>/dev/null) \
+      || die "$E_UNAVAILABLE" "no chrome on this box to type the authenticator code in"
+    local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
+    jq -nc --arg p "$dir" --arg u "$url" --arg h "$host" '{mode:"totp", profile:$p, url:$u, host:$h}' \
+      | FIVEDIVE_BROWSER_PROFILE="$dir" FIVEDIVE_BROWSER_CHROME="$chrome" \
+        FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" FIVEDIVE_BROWSER_LEASE_TOKEN="$_LEASE_TOKEN" \
+        "$driver"
+  fi | { local r; IFS= read -r r || true; printf '%s\n' "$r"; jq -e '.filled == true' <<<"$r" >/dev/null 2>&1; }
+}
+
+# `run`'s half: try the owner's seed on a page that probed as a challenge. 0 only
+# when a code was typed; the caller re-probes, and the re-probe is the verdict.
+_totp_clear() {  # <site> <dir>
+  local r; r="$(_totp_fill "$1" "$2" 2>/dev/null)" || {
+    [[ "$(jq -r '.why // empty' <<<"$r" 2>/dev/null)" == foreign-host ]] \
+      && printf '%s: the %s challenge page is not on %s itself, so the authenticator code was not typed into it.\n' "$PROG" "$1" "$(_site_base "$1")" >&2
+    return 1; }
+  _audit_row "$2" totp-fill "$(jq -r '.field // ""' <<<"$r" 2>/dev/null)"
+  printf '%s: %s asked for a 2FA code; typed the owner'"'"'s authenticator code (field %s). Re-checking the session.\n' \
+    "$PROG" "$1" "$(jq -r '.field // "?"' <<<"$r")" >&2
+  return 0
+}
+# <<< DIVE-5336
+
 cmd_doc() {
   local target=""
   for a in "$@"; do
@@ -6649,12 +7053,16 @@ cmd_connect_request() {
 # DIVE-4997: the owner's `adapters pending|approve|reject` stay root (they read
 # every seat's proposals and write AS that seat); `adapters drift` captures, so it
 # is the seat's, like every other verb.
+# DIVE-5336: `totp import` reads the root-only secrets store, then drops to the
+# profile's owner itself to write the seed. Every other `totp` verb is the seat's.
 if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   _v1="${1:-}"; [[ "$_v1" == adapters && "${2:-}" == drift ]] && _v1=adapters-drift
+  [[ "$_v1" == totp && "${2:-}" != import ]] && _v1=totp-seat
   case "$_v1" in
     # `adblock` joins `setup` here: it writes the MACHINE-WIDE chrome policy
     # file, which is root's. Dropping to the seat would turn it into a refusal.
-    setup|adblock|approve|approvals|adapters|_connect|-h|--help|help|"") ;;
+    # `config` too: the drive default is one box-wide file (DIVE-5338).
+    setup|adblock|config|approve|approvals|adapters|_connect|totp|-h|--help|help|"") ;;
     *)
       # DIVE-4813: usually the caller, and for a brokered `serve` the owner.
       _drop="$(_root_drop_target "${SUDO_USER}" "$@")"
@@ -6792,9 +7200,75 @@ builtin trap '_tmp_release' EXIT
 # `snapshot` return a screenshot and the page title; `act` takes coordinates.
 # A security challenge still STOPS the agent. In this mode the stop is a
 # handoff: `5dive browser handoff <site>` calls the owner onto the same window.
-_site_drive_adapter() {  # the adapter's word for it: input, or empty
+_site_drive_adapter() {  # the adapter's word for it: input, cdp, or empty
   local a; a="$(_adapter_path "$1")"
-  [[ -f "$a" ]] && jq -r 'if .drive == "input" then "input" else empty end' "$a" 2>/dev/null
+  [[ -f "$a" ]] && jq -r 'if .drive == "input" or .drive == "cdp" then .drive else empty end' "$a" 2>/dev/null
+}
+
+# THE BOX DEFAULT (DIVE-5338). lodar, 2026-10-01: agents should browse in the
+# owner's own plain Chrome by default, and hand the same window over when a
+# person is needed. The default is ONE file for the whole box, root's, beside
+# the adblock off list: a seat cannot turn automation back on for itself, and
+# the trial on one box is a single write that every other box never sees.
+#
+# PRECEDENCE: a site adapter's explicit "drive" wins (tiktok.com stays input on
+# a cdp box; a site that only works through `run` can say "cdp" on an input
+# box), then this file, then the shipped default — the automated browser. The
+# public profile is never input: it has no owner window to share.
+#
+# A PROXIED SEAT FALLS BACK, IT IS NOT REFUSED. The adapter's input is refused
+# under a proxy (DIVE-4951) because that site does not work any other way. The
+# box default is a preference: the seat keeps its proxy and the automated
+# browser, and `serve` says so in one line.
+_DRIVE_DEFAULT_FILE="${FIVEDIVE_BROWSER_DRIVE_DEFAULT_FILE:-$STATE_DIR/browser/drive-default}"
+_box_drive() {  # input, cdp, or empty (nothing set: the shipped default)
+  [[ -f "$_DRIVE_DEFAULT_FILE" ]] || return 0
+  local w; w="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$_DRIVE_DEFAULT_FILE" 2>/dev/null | grep -v '^$' | head -1)"
+  case "$w" in input|cdp) printf '%s\n' "$w" ;; esac
+}
+# How THIS seat would serve <site>: input or cdp. The owner's decision; a
+# brokered seat routes by what the owner actually served (the .offered marker).
+_site_drive() {  # _site_drive <site>
+  local w; w="$(_site_drive_adapter "$1")"
+  [[ -n "$w" ]] && { printf '%s\n' "$w"; return 0; }
+  if ! _is_public "$1" && [[ "$(_box_drive)" == input && ! -f "$(_proxy_file)" ]]; then
+    printf 'input\n'; return 0
+  fi
+  printf 'cdp\n'
+}
+
+cmd_config() {
+  local a k v
+  if (( $# == 0 )); then
+    local d; d="$(_box_drive)"
+    printf 'drive=%s\n' "${d:-auto}"
+    case "$d" in
+      input) printf '  every logged-in site is served as plain Chrome, driven through the screen, keyboard and mouse,\n  unless its adapter says "drive": "cdp"; a seat with a proxy keeps the automated browser\n' ;;
+      cdp)   printf '  every logged-in site gets the automated browser unless its adapter says "drive": "input"\n' ;;
+      *)     printf '  the shipped default: a site adapter'"'"'s "drive" decides, otherwise the automated browser\n' ;;
+    esac
+    printf '  set by: %s\n' "$_DRIVE_DEFAULT_FILE"
+    return 0
+  fi
+  for a in "$@"; do
+    [[ "$a" == *=* ]] || die "$E_USAGE" "expected key=value, e.g. \`sudo 5dive browser config drive=input\`"
+    k="${a%%=*}"; v="${a#*=}"
+    [[ "$k" == drive ]] || die "$E_USAGE" "unknown setting '$k' — the one setting is drive=input|cdp|auto"
+    case "$v" in input|cdp|auto) ;; *) die "$E_USAGE" "drive=$v: expected input, cdp or auto" ;; esac
+  done
+  [[ "$(id -u)" == 0 ]] || die "$E_PERM" "the drive default is the whole box's, and root's to set. Run: sudo 5dive browser config drive=$v"
+  if [[ "$v" == auto ]]; then
+    rm -f "$_DRIVE_DEFAULT_FILE" || die "$E_UNAVAILABLE" "cannot remove $_DRIVE_DEFAULT_FILE"
+  else
+    mkdir -p "$(dirname "$_DRIVE_DEFAULT_FILE")" || die "$E_UNAVAILABLE" "cannot create $(dirname "$_DRIVE_DEFAULT_FILE")"
+    local tmp="$_DRIVE_DEFAULT_FILE.tmp"
+    { printf '# 5dive browser — the box default drive mode (DIVE-5338). A site adapter'"'"'s "drive" wins.\n'
+      printf '%s\n' "$v"; } > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$_DRIVE_DEFAULT_FILE" \
+      || { rm -f "$tmp"; die "$E_UNAVAILABLE" "cannot write $_DRIVE_DEFAULT_FILE"; }
+  fi
+  printf '%s: drive=%s for this box.' "$PROG" "$v"
+  [[ "$v" == input ]] && printf ' A site already served the other way switches on its next command, or now with: 5dive browser serve <site> --stop && sudo 5dive browser serve <site>'
+  printf '\n'
 }
 
 # Is <site> served (or to be served) in input mode? The adapter says so for the
@@ -6812,6 +7286,9 @@ _site_is_input() {  # _site_is_input <site>
     [[ "$(_kv "$(_rv_offer "$_SITE_OWNER" "$site")" drive)" == input ]]
     return $?
   fi
+  # The box default (DIVE-5338), for a site this seat owns: `_input_open` serves
+  # it as input, or switches a warm session over, on the first verb.
+  [[ "$(_site_drive "$site")" == input ]] && return 0
   [[ "$(_kv "$(_serve_pidfile "$_SITE_DIR")" drive)" == input ]] && _serve_running "$_SITE_DIR" >/dev/null
 }
 
@@ -7135,7 +7612,9 @@ case "${1:-}" in
   ls)    shift; cmd_ls    "$@" ;;
   doc)   shift; cmd_doc  "$@" ;;
   adblock) shift; cmd_adblock "$@" ;;
+  config) shift; cmd_config "$@" ;;
   proxy) shift; cmd_proxy "$@" ;;
+  totp)  shift; cmd_totp  "$@" ;;
   run)   shift; cmd_run   "$@" ;;
   tree)  shift; cmd_tree  "$@" ;;
   lease) shift; cmd_lease "$@" ;;

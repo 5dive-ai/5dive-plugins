@@ -1,5 +1,21 @@
 ## Unreleased
 
+### Changed — the registry copy is byte-for-byte 5dive-browser again, at browser 1.30.0 (DIVE-5386)
+
+The two copies had diverged both ways. This registry copy (1.27.0) carried DIVE-5200's captcha ask,
+which never reached 5dive-browser, and lacked the repo's 1.28–1.29.2: the owner's authenticator
+seed (DIVE-5336), a box-wide default drive mode (DIVE-5338), a sign-in that survives Done on an
+input-mode or warm browser (DIVE-5374) and the wedged probe Chrome cap (DIVE-5375). The box
+converger's floor can only name a version both copies carry, so it was held at 1.27.0 and
+DIVE-5374's login fix could not reach a box installed from this registry.
+
+5dive-browser 1.30.0 ports DIVE-5200, and `plugins/browser` is now
+`rsync -a --delete <5dive-browser>/browser/ plugins/browser/` of it, so `diff -r` is empty. The
+`connect-request --challenge` path that `plugins/telegram/browser-connect.ts` drives is unchanged.
+The mirrored harnesses under `tests/` are re-synced with `browser/` read as `plugins/browser/`
+(`browser_plugin_unit.sh` keeps its registry-only TR28 arms), and CI now also runs the probe
+timeout and totp harnesses.
+
 ### Added — the owner shares an agent with a group or other people from the Mini App (DIVE-5368), telegram 0.5.84
 
 lodar, 2026-10-02: "access setting for each agent ... to make user use them in group, or to let other

@@ -91,6 +91,10 @@ jobs:
       # `browser/` read as `plugins/browser/`.
       - name: browser routine and delta harness
         run: bash tests/browser_routine_delta_unit.sh
+      # DIVE-5375: a probe's Chrome that never exits is stopped at budget + slack,
+      # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
+      - name: browser probe timeout harness
+        run: bash tests/browser_probe_timeout_unit.sh
       # DIVE-4397: the unprivileged-first 5dive reader, and the arms that assert
       # all five telegram forks still route through it. `bun test` does not reach
       # it — the module is driven with an injected exec function from bash, and
@@ -113,3 +117,11 @@ jobs:
             bun build --no-bundle "$f" --outfile=/dev/null >/dev/null || { echo "PARSE FAILED: $f"; rc=1; }
           done
           exit $rc
+      # DIVE-5336: the owner's authenticator seed, mirrored from 5dive-browser
+      # (DIVE-5386). LAST in the job: its live arm needs the pinned
+      # playwright-core installed next to the plugin, and the browser suites
+      # above grade the executor's "playwright is absent" refusals.
+      - name: install the pinned browser playwright-core
+        run: npm install --prefix plugins/browser --no-audit --no-fund
+      - name: browser totp harness
+        run: bash tests/browser_totp_unit.sh

@@ -51,6 +51,7 @@ const path = require('path');
 const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
 // DIVE-4951: the seat's own proxy, parsed in ONE place for both launch sites.
 const proxy = require(path.join(__dirname, '..', 'lib', 'proxy.cjs'));
+const totp = require(path.join(__dirname, '..', 'lib', 'totp.cjs'));
 
 // DO NOT DELETE THIS. It is not dead code — it is the fix for DIVE-4587, and the
 // full mechanism is written out at the top of bin/browser. In one paragraph:
@@ -406,6 +407,28 @@ async function snapshotMode(plan) {
 //
 // DIVE-4983: it waits for --wait-for, polls --expect for its window, and writes
 // the refs too (report.tree), so an act leaves what a snapshot leaves.
+// THE OWNER'S AUTHENTICATOR CODE (DIVE-5336). One page, one field, one code,
+// and the line printed back names the field, never the code — see lib/totp.cjs.
+async function totpMode(plan) {
+  const profile = process.env.FIVEDIVE_BROWSER_PROFILE || plan.profile;
+  if (typeof plan.url !== 'string' || !/^https?:\/\//.test(plan.url)) {
+    die(E_NOTHING_RAN, 'totp needs the http(s) url where the site asks for the code');
+  }
+  const ctx = await openProfile(profile);
+  let payload;
+  try {
+    const page = ctx.pages()[0] || await ctx.newPage();
+    page.setDefaultTimeout(STEP_TIMEOUT);
+    assertLease('totp');
+    payload = await totp.fill(page, profile, { url: plan.url, base: plan.host, settleMs: RUN_SETTLE_MS });
+  } catch (e) {
+    die(E_FAILED, `could not type the authenticator code: ${e.message}`);
+  } finally {
+    try { await ctx.close(); } catch (e) { /* the code is already typed or not */ }
+  }
+  await printAndExit(payload);
+}
+
 async function writeReport(page, report) {
   try {
     const after = await aria.pageAfter(page, {
@@ -449,6 +472,7 @@ async function main() {
   // through the step vocabulary — and it must open the profile by the one
   // guarded road every other page in this plugin is opened by.
   if (plan.mode === 'snapshot') return await snapshotMode(plan);
+  if (plan.mode === 'totp') return await totpMode(plan);
 
   const steps = Array.isArray(plan.steps) ? plan.steps : null;
   if (!steps || !steps.length) die(E_NOTHING_RAN, 'the plan carries no steps');
