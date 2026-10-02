@@ -199,9 +199,9 @@ describe('lite /stop /status /restart /clear', () => {
   })
 })
 
-describe('full profile /status says cli, not 5dive (lodar: "dont show 5dive v0. just say cli v0")', () => {
-  test('the version line is cli: v…', () => {
-    expect(SERVER).toContain('lines.push(`cli: v${fiveDiveVersion}`)')
-    expect(SERVER).not.toContain('lines.push(`5dive: v${fiveDiveVersion}`)')
+describe('full profile /status says 5dive (lodar 2026-10-02: "keep 5dive" "for all even light")', () => {
+  test('the version line is 5dive: v…', () => {
+    expect(SERVER).toContain('lines.push(`5dive: v${fiveDiveVersion}`)')
+    expect(SERVER).not.toContain('lines.push(`cli: v${fiveDiveVersion}`)')
   })
 })
