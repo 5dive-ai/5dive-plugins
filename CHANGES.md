@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Changed: Telegram /status names the CLI "5dive" again (telegram 0.5.82)
+
+lodar, 2026-10-02: "I asked to change 5dive to cli only for light plugin", "keep 5dive", "for all
+even light". The full profile's /status version line goes back from `cli: v…` to `5dive: v…`. The
+light (lite) profile's /status prints no version line, so it needs no change.
+
 ### Added — routines (`act --record`, `replay`) and `snapshot --delta` (DIVE-5335), browser 1.27.0
 
 Registry mirror of 5dive-browser's DIVE-5335 (`browser/` read as `plugins/browser/`). A browser

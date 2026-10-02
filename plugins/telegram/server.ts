@@ -3346,8 +3346,9 @@ const commandHandlers: Record<string, CommandHandler> = {
       lines.push(`plugin: v${PLUGIN_VERSION}`)
       const fiveDiveVersion = await read5diveVersion()
       if (fiveDiveVersion) {
-        // DIVE-5306 (lodar: "dont show 5dive v0. just say cli v0").
-        lines.push(`cli: v${fiveDiveVersion}`)
+        // lodar 2026-10-02: "keep 5dive" "for all even light" (reverses
+        // DIVE-5306's cli label, which he had meant for the light bot only).
+        lines.push(`5dive: v${fiveDiveVersion}`)
         // Auth profile bound to this agent. Same source as the /account
         // picker. Skip on non-5dive hosts (no agent registry to consult).
         const me = thisAgentName()
