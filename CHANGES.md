@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.85: a freshly wired agent bot greets its owner once, with no /start (DIVE-5411)
+
+The manager bot tells the owner "@bot is ready, <Name> greets you in a moment" when the bot is
+created, but the seat's poller only comes up ~10 s later, after the box wires the token and
+restarts the seat. Until now the plugin greeted only in reply to /start, so the owner saw nothing,
+tapped Start again, and then got the greeting twice when the poller drained the queue. Now, 3 s
+after polling starts on a bot this state dir has not greeted before (and has never heard a human
+on), the plugin sends the greeting to each allowlisted owner. Both /start arms and that boot
+greeting share one claim per chat for 60 s, so queued /starts collapse to one greeting. A seat in
+use (a token rotation, or this upgrade) records the bot and greets nobody.
+
 ### Changed — the registry copy is byte-for-byte 5dive-browser 1.32.0 (DIVE-5389, DIVE-5388)
 
 Brings this copy from 1.30.0 to 1.32.0 so the box converger's floor can reach both releases.
