@@ -44,6 +44,7 @@ import {
   seatCanAdmin, classifyAccountUsage, accountReadOnlyText, accountSwitchPendingText,
   accountSwitchDoneText, accountSwitchFailedText, USAGE_READ_FAILED_TEXT,
   adminTierText, isAdminTierRequired, createSudoGate, standardSeatRoute, ownUsageText,
+  selfAccountGranted,
   type SeatAdmin, type SeatSudo, type SudoGate, type StatuslineLimits,
 } from './seatpriv.ts'
 import { planAutoAttach, autoAttachFooter, attachedNames, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
@@ -2456,6 +2457,21 @@ async function seatTier(): Promise<SeatAdmin> {
   return v
 }
 
+// DIVE-5367: does this standard seat hold its `_self_account` line (the CLI's
+// self-scoped account rail)? Same ten-minute cache as the tier: the line lands
+// at the nightly update's sudoers reconcile, not mid-conversation.
+let SELF_ACCOUNT: { v: boolean; at: number } | null = null
+async function seatHasSelfAccount(agents?: FiveDiveAgentEntry[] | null): Promise<boolean> {
+  if (SELF_ACCOUNT && Date.now() - SELF_ACCOUNT.at < SEAT_TIER_TTL_MS) return SELF_ACCOUNT.v
+  const me = thisAgentName()
+  if (!me) return false
+  const list = agents === undefined ? await read5diveAgentList() : agents
+  if (!list) return false
+  const v = await selfAccountGranted(list.find(a => a.name === me) ?? null, () => sudoGate().probeSelfAccount())
+  SELF_ACCOUNT = { v, at: Date.now() }
+  return v
+}
+
 // DIVE-5331: the ONLY way this file spawns sudo. On an admin (or unknown) seat
 // it spawns exactly what the old raw `sudo -n <argv>` did; on a standard
 // seat it runs the seat's own grant as before, serves an unprivileged verb as
@@ -2723,13 +2739,17 @@ async function buildAccountMenu(
   // the agent list first so such a seat never spawns the root-only reads below
   // (each refused sudo mails root, DIVE-4397).
   const agents = await read5diveAgentList()
-  if ((await thisSeatAdmin(me, agents)) === 'no') {
+  // DIVE-5367: a standard seat that holds its `_self_account` line gets the
+  // picker — the account list needs no root, and usage + the switch cross that
+  // line. It does NOT get the auto-rotate row: writing rotation stays root.
+  const standard = (await thisSeatAdmin(me, agents)) === 'no'
+  if (standard && !(await seatHasSelfAccount(agents))) {
     return { text: accountReadOnlyText(agents?.find(a => a.name === me)?.authProfile || 'default', lang) }
   }
   const [accounts, usage, rotation] = await Promise.all([
     read5diveAccountList(),
     read5diveAccountUsage(),
-    read5diveRotation(me),
+    standard ? Promise.resolve(null) : read5diveRotation(me),
   ])
   if (!accounts) return { error: `Failed to list accounts. Try: sudo 5dive account list` }
   if (accounts.length === 0) {
@@ -2867,7 +2887,10 @@ async function applyAccount(name: string, chatId: number, lang: Lang = 'en'): Pr
   // DIVE-5220: a seat whose grant does not cover set-account (standard
   // isolation) is told so up front, and sudo is never spawned for it. A stale
   // picker from before the seat was narrowed still reaches here.
-  if ((await thisSeatAdmin(me)) === 'no') {
+  // DIVE-5367: unless it holds its `_self_account` line — then the switch runs
+  // unprivileged and the CLI crosses that line for this seat only.
+  const standard = (await thisSeatAdmin(me)) === 'no'
+  if (standard && !(await seatHasSelfAccount())) {
     return { text: accountSwitchFailedText(name, true, '', lang) }
   }
   return {
@@ -2881,7 +2904,7 @@ async function applyAccount(name: string, chatId: number, lang: Lang = 'en'): Pr
     // on the new account, which is true. On a failure no restart fires, the bot
     // is alive, and exactly one message says what happened.
     after: () => {
-      void sudo5dive(['5dive', 'agent', 'set-account', me, name], { timeout: 5000 })
+      void sudo5dive(['5dive', 'agent', 'set-account', me, name], { timeout: standard ? 15000 : 5000 }, standard ? 'plain' : 'refuse')
         .then(
           () => bot.api.sendMessage(chatId, accountSwitchDoneText(name)),
           (err: any) => {
@@ -4112,17 +4135,21 @@ const commandHandlers: Record<string, CommandHandler> = {
     // and do not spawn the sudo that would only be refused and mail root.
     // DIVE-5331: instead of only refusing, a standard seat shows its OWN 5h/1w,
     // read from its own statusline cache, and says where the board lives.
+    // DIVE-5367: a standard seat holding its `_self_account` line reads the
+    // every-account limit board over it. The token-burn section above it reads
+    // every seat's transcripts and stays root-only, so it is not asked for.
     const me = thisAgentName()
     const seat: SeatAdmin = me ? await seatTier() : 'unknown'
-    if (seat === 'no') {
+    const selfAccount = seat === 'no' && await seatHasSelfAccount()
+    if (seat === 'no' && !selfAccount) {
       await ctx.reply(ownUsageText(liteLang(ctx.from?.language_code), readStatuslineLimits(), Date.now(), formatDuration))
       return
     }
     const [board, usageEnv] = await Promise.all([
-      read5diveUsageBoard(),
+      selfAccount ? Promise.resolve(null) : read5diveUsageBoard(),
       read5diveJson(['account', 'usage', '--json']),
     ])
-    const read = classifyAccountUsage<FiveDiveAccountUsage>(usageEnv, seat, fiveRunner().sudoDenied())
+    const read = classifyAccountUsage<FiveDiveAccountUsage>(usageEnv, selfAccount ? 'yes' : seat, fiveRunner().sudoDenied())
     if (read.kind !== 'ok') {
       await ctx.reply(read.kind === 'refused' ? adminTierText(liteLang(ctx.from?.language_code)) : USAGE_READ_FAILED_TEXT)
       return

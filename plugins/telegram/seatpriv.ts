@@ -14,12 +14,21 @@
 //              CLI may be out of date", which was false.
 // (lodar, 2026-09-29 15:35Z, on agent oinoa.)
 //
+// DIVE-5367 (lodar, 2026-10-02: "slash account … cannot work") reverses the
+// "must not be" above ON PURPOSE and narrowly: the CLI now writes ONE more
+// exact-path line for a standard seat, `5dive _self_account`, which reads the
+// every-account usage board and switches THIS seat (derived root-side from the
+// sudo caller) between accounts the box already holds. Still no other seat, and
+// nothing box-wide. The plugin never spawns that primitive itself: the ordinary
+// `agent set-account <me>` / `account usage` verbs cross it from an unprivileged
+// call, and the plugin only asks, once, whether this seat holds the line.
+//
 // Everything here is pure so the suite can drive it without importing
 // server.ts, which long-polls Telegram on import.
 
 import { TAP_STRINGS, type Lang } from './hooks/lib/lite.ts'
 
-export type SeatSudo = { measured?: boolean; impliedIsolation?: string }
+export type SeatSudo = { measured?: boolean; impliedIsolation?: string; grant?: string }
 export type SeatEntry = { name: string; isolation?: string; sudo?: SeatSudo }
 export type SeatAdmin = 'yes' | 'no' | 'unknown'
 
@@ -164,11 +173,16 @@ export function standardSeatMaySudo(argv: string[]): boolean {
 //     exact-path _task_channel grant (answer.sh _task_channel_try). A bare
 //     --value would land as the AGENT's answer, not the human's — refused.
 //   agent send: re-execs over the seat's `_deliver` grant (cmd_agent_runtime.sh).
+//   agent set-account: DIVE-5367 — crosses the seat's `_self_account` grant when
+//     the target is the caller itself; any other target stays on the root path
+//     and is refused there. Call sites ask for 'plain' only after
+//     selfAccountGranted() said yes.
 const UNPRIVILEGED_VERBS: string[][] = [
   ['task', 'add'], ['task', 'show'], ['task', 'start'], ['task', 'done'],
   ['task', 'cancel'], ['task', 'escalate'], ['task', 'unpark'],
   ['task', 'answer'],
   ['agent', 'send'],
+  ['agent', 'set-account'],
 ]
 function verbWords(argv: string[]): string[] {
   // argv[0] is the binary word ('5dive'); drop global flags before the verb.
@@ -180,6 +194,28 @@ export function standardSeatMayRunPlain(argv: string[]): boolean {
   if (!UNPRIVILEGED_VERBS.some(([x, y]) => x === a && y === b)) return false
   if (a === 'task' && b === 'answer') return argv.some(w => w.startsWith('--channel-proof='))
   return true
+}
+
+// ── DIVE-5367: the self-account grant ───────────────────────────────────────
+//
+// The CLI path `sudo -n -l` probes for the line. Only a seat whose grant is the
+// scoped standard one is ever asked: an admin seat does not need the rail, and a
+// sandboxed seat holds no sudoers entry at all, so asking it would only log (and
+// on a stock sudo, mail) a "not in sudoers" line for nothing (DIVE-4397).
+export const SELF_ACCOUNT_PROBE_ARGV = ['-n', '-l', '/usr/local/bin/5dive', '_self_account']
+export function mayProbeSelfAccount(entry: SeatEntry | null | undefined): boolean {
+  if (!entry) return false
+  const s = entry.sudo
+  if (s?.measured) return s.impliedIsolation === 'standard'
+  return entry.isolation === 'standard'
+}
+/** Does this seat hold the `_self_account` line? `probe` runs the sudo -l. */
+export async function selfAccountGranted(
+  entry: SeatEntry | null | undefined,
+  probe: () => Promise<boolean>,
+): Promise<boolean> {
+  if (!mayProbeSelfAccount(entry)) return false
+  try { return await probe() } catch { return false }
 }
 
 export type SudoExecFn = (file: string, args: string[], opts?: unknown) => Promise<{ stdout: string; stderr: string }>
@@ -196,6 +232,10 @@ export type SudoGate = {
   /** Throws AdminTierRequired when this seat may not run `argv` at all. For a
    *  spawn the gate does not own (a streaming child). */
   check(argv: string[]): Promise<void>
+  /** DIVE-5367: `sudo -n -l` for the seat's `_self_account` line. Lists, never
+   *  runs. Callers ask only through selfAccountGranted(), i.e. only on a seat
+   *  whose grant is the scoped standard one. */
+  probeSelfAccount(): Promise<boolean>
 }
 
 export function createSudoGate(o: {
@@ -220,6 +260,9 @@ export function createSudoGate(o: {
     },
     async check(argv) {
       await allowed(argv, 'refuse')
+    },
+    probeSelfAccount() {
+      return o.execFile(o.sudoBin, SELF_ACCOUNT_PROBE_ARGV, { timeout: 5000 }).then(() => true, () => false)
     },
   }
 }
@@ -250,9 +293,11 @@ const STANDARD_ROUTES: Record<string, StandardRoute | ((arg: string) => Standard
   inbox: 'own',
   // `task add` runs unprivileged; the handler drops sudo for it.
   task: 'own',
-  // the current account is a read; switching it is root.
+  // DIVE-5367: the picker and the switch cross the seat's `_self_account`
+  // grant; a seat without it (CLI not updated yet) keeps the read-only view.
   account: 'own',
-  // this seat's own 5h/1w instead of the every-account board.
+  // DIVE-5367: the every-account limit board over the same grant; without it,
+  // this seat's own 5h/1w.
   usage: 'own',
   // reading the state works; turning it on/off writes a root-owned file.
   digest: arg => (arg.trim() === '' || arg.trim().toLowerCase() === 'status') ? 'works' : 'admin',
