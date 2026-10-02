@@ -62,6 +62,7 @@ import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, 
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
 import { admitOnJoin, nextOwners, groupJoinLines, ASK_OWNER } from './groupjoin.ts'
+import { makeGreetClaims, botIdOf, bootGreetTargets, BOOT_GREET_DELAY_MS, WIRED_RECENTLY_MS } from './bootgreet.ts'
 import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, startGreeting, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
@@ -3353,7 +3354,11 @@ const commandHandlers: Record<string, CommandHandler> = {
     // DIVE-5298: the paired owner is greeted by the agent, at once, not told
     // how to pair a bot that is already theirs. Anyone else still gets pairing.
     if (access.allowFrom.includes(senderId)) {
-      await ctx.reply(await startGreetingFor(ctx, liteLang(ctx.from?.language_code)))
+      // DIVE-5411: one greeting per chat, so the /starts queued while the seat
+      // was being wired (or the boot greeting) do not each send one.
+      const chat = String(ctx.chat!.id)
+      if (!greetClaims.claim(chat)) return
+      await ctx.reply(await startGreetingFor(ctx, liteLang(ctx.from?.language_code))).catch(err => { greetClaims.release(chat); throw err })
       return
     }
     await ctx.reply(
@@ -4878,6 +4883,51 @@ async function startGreetingFor(ctx: Context, lang: Lang): Promise<string> {
   return startGreeting(lang, { name: ctx.me?.first_name, about: await liteAboutText(lang) })
 }
 
+// DIVE-5411: who was greeted when, shared by both /start arms and bootGreet.
+const greetClaims = makeGreetClaims()
+// The bot id this state dir already greeted its owner for (bootgreet.ts).
+const BOOT_GREETED_FILE = join(STATE_DIR, 'boot-greeted')
+
+// DIVE-5411: the manager bot tells the owner the agent "greets you in a moment"
+// before this poller exists, so a freshly wired bot greets its owner itself, once,
+// with no /start needed. It runs BOOT_GREET_DELAY_MS after polling starts, so a
+// /start queued meanwhile is answered first and this skips that chat. An owner who
+// never opened the bot gets a 403 here and the greeting on their first /start.
+async function bootGreet(): Promise<void> {
+  let marker: string | null = null
+  try { marker = readFileSync(BOOT_GREETED_FILE, 'utf8').trim() || null } catch {}
+  const access = loadAccess()
+  const botId = botIdOf(TOKEN)
+  let wiredRecently = false
+  try { wiredRecently = Date.now() - statSync(ENV_FILE).mtimeMs < WIRED_RECENTLY_MS } catch {}
+  const plan = bootGreetTargets({
+    botId,
+    marker,
+    heardHuman: existsSync(LAST_HUMAN_CHAT_FILE),
+    wiredRecently,
+    owners: access.owners,
+    allowFrom: access.allowFrom,
+  })
+  if (plan.record) {
+    try { writeFileSync(BOOT_GREETED_FILE, `${botId}\n`, { mode: 0o600 }) } catch {}
+  }
+  for (const owner of plan.greet) {
+    if (!greetClaims.claim(owner)) continue
+    const lang = langOfChat(owner)
+    const text = startGreeting(lang, { name: bot.botInfo.first_name, about: await liteAboutText(lang) })
+    try {
+      const sent = await bot.api.sendMessage(Number(owner), text)
+      try {
+        const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'
+        msglogAppend(MSGLOG_DIR, owner, { ts: new Date().toISOString(), dir: 'out', user: me, text, message_id: String(sent.message_id) })
+      } catch {}
+    } catch (err) {
+      greetClaims.release(owner)
+      process.stderr.write(`telegram channel: boot greeting to ${owner} not sent (waits for their /start): ${err instanceof Error ? err.message : String(err)}\n`)
+    }
+  }
+}
+
 async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: string): Promise<void> {
   const s = LITE_STRINGS[lang]
   const accountUrl = liteAccountUrl(process.env.TELEGRAM_ACCOUNT_URL)
@@ -4889,10 +4939,15 @@ async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: str
     // DIVE-5298: with no welcome in the pack, a greeting from the bot's name and
     // short description, never a model turn (a box with no AI account never
     // answers one, so /start was silence).
+    // DIVE-5411: one greeting per chat; a repeat inside the window (a queued
+    // /start, or the boot greeting already went out) is not greeted again.
+    const chatId = String(ctx.chat!.id)
+    const greet = greetClaims.claim(chatId)
+    if (!greet && !liteStartPayload(text)) return
     const welcome = await startGreetingFor(ctx, lang)
-    if (welcome) {
-      const chatId = String(ctx.chat!.id)
+    if (welcome && greet) {
       const sent = await ctx.reply(welcome).catch(err => {
+        greetClaims.release(chatId)
         recordOpsDetail('/start', `welcome send failed: ${err instanceof Error ? err.message : String(err)}`)
         return null
       })
@@ -6919,6 +6974,8 @@ if (SEND_ONLY) {
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           recordGroupPrivacy(info.can_read_all_group_messages)
+          // DIVE-5411: a freshly wired bot says hello without waiting for /start.
+          setTimeout(() => { void bootGreet().catch(err => process.stderr.write(`telegram channel: boot greeting failed: ${err}\n`)) }, BOOT_GREET_DELAY_MS).unref?.()
           // DIVE-1883: resolve the /model picker against the CLI's model
           // catalogue so it can't drift a version behind agent-create again.
           void refreshModelAliases()
