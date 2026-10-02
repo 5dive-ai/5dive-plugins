@@ -16,7 +16,10 @@
 'use strict';
 const path = require('path');
 const fs = require('fs');
-const x11 = require(path.join(__dirname, '..', 'browser', 'lib', 'x11.cjs'));
+// The lib sits at browser/lib in 5dive-browser and at plugins/browser/lib in
+// the 5dive-plugins mirror; take whichever this checkout has.
+const x11 = require([path.join(__dirname, '..', 'plugins', 'browser', 'lib', 'x11.cjs'),
+  path.join(__dirname, '..', 'browser', 'lib', 'x11.cjs')].find((f) => fs.existsSync(f)));
 
 const [label, xs, ys, pids, png] = process.argv.slice(2);
 const px = Number(xs), py = Number(ys), pid = Number(pids) || 0;
