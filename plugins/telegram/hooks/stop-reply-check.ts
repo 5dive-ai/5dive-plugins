@@ -56,6 +56,15 @@ import type { HookPayload, TranscriptEntry, TranscriptContentBlock } from './lib
 
 const payload = await readPayload<HookPayload>()
 
+// Every Stop ends a turn, so tell the long-running MCP server to stop its
+// "typing…" loop (and take its status line off the ack) FIRST, before any
+// early exit. DIVE-146 introduced the signal for the auto-relay path; since
+// DIVE-5419 the loop no longer stops at the first reply, so this signal (and
+// stopfailure-notify's) is what ends it on every turn — an a2a turn, a turn
+// with no inbound, a re-entered Stop alike. Left below the early exits, a turn
+// ending through one of them kept "typing…" up until the ceiling.
+signalTurnEnded()
+
 const transcriptPath = payload.transcript_path
 if (!transcriptPath || !existsSync(transcriptPath)) process.exit(0)
 
@@ -242,12 +251,7 @@ if (!a.hadInbound || !a.lastChatId || !getToken()) process.exit(0)
 const chatId = a.lastChatId
 const threadId = a.lastThreadId ?? undefined
 
-// The turn that handled this inbound has ended — tell the long-running MCP
-// server to stop its 'typing…' loop. The server re-sends sendChatAction
-// every 4s and only learns the turn is over via the reply tool, which the
-// auto-relay/diagnostic branches below bypass (separate process). Bumping
-// this file's mtime lets the server's typing loop notice and stop. DIVE-146.
-signalTurnEnded()
+// (signalTurnEnded() moved to the top of this hook — DIVE-5419.)
 
 // Turn-level rule: if the agent delivered text through the proper channel
 // — reply or edit_message — anywhere in this turn, every loose assistant
@@ -275,6 +279,11 @@ if (a.texts.length > 0) {
 
 // No text and no real send. A react-only ack is intentional — don't block.
 if (a.hadTool) process.exit(0)
+
+// DIVE-5419: the newest inbound was a bare acknowledgement ("ok", "thanks").
+// Saying nothing back is the house rule, so blocking the Stop here forced a
+// whole extra turn (a full re-read of the conversation) just to place a 👍.
+if (a.lastInboundBareAck) process.exit(0)
 
 // Empty-text branch: agent stopped with neither text nor a telegram tool
 // call. If a lock already exists, the harness lost re-entry tracking —

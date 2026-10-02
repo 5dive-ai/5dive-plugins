@@ -54,6 +54,7 @@ import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { createAckStatus } from './ackstatus.ts'
 import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, renderConnectLink, renderConnectVerdict, connectAgentNote, connectFailureText, type ConnectTap } from './browser-connect.ts'
 import { relayOwnerAskTap } from './owner-ask.ts'
 import { tapContent, tapMeta, tapLogEntry } from './buttontap.ts'
@@ -356,19 +357,49 @@ let botUsername = ''
 
 // Telegram clears the "typing…" indicator ~5s after each sendChatAction.
 // To keep it visible for long agent turns we re-send every 4s per chat
-// until the next outbound reply (or a 5min ceiling, in case the agent
-// crashes and never replies, so we don't loop forever).
+// until the TURN ENDS — the Stop hook's typing-stop signal — or a safety
+// ceiling, in case the agent crashes and no Stop ever fires.
+//
+// DIVE-5419: the loop used to stop at the first outbound reply. The ack IS
+// the first reply, so "typing…" vanished seconds into a long turn and the
+// silence watchdog then made the model fill the gap with edit_message calls,
+// each re-reading the whole conversation. Now the loop runs for the whole turn,
+// and the same tick drives ackStatus (ackstatus.ts): a status line the server
+// edits onto the ack itself, for zero model tokens. The ceiling went from 5 to
+// 30 minutes for the same reason — it is a crash guard, not a turn budget.
 const TYPING_INTERVAL_MS = 4_000
-const TYPING_CEILING_MS = 5 * 60 * 1000
+const TYPING_CEILING_MS = 30 * 60 * 1000
 // The Stop hook (hooks/stop-reply-check.ts) bumps this file's mtime when a
 // turn ends, since auto-relays are sent from a separate process and never
-// reach the reply tool that would otherwise stop the loop. See DIVE-146.
+// reach the reply tool. See DIVE-146; since DIVE-5419 it is the ONLY normal
+// way a loop stops.
 const TYPING_STOP_FILE = join(STATE_DIR, 'typing-stop')
+const STATUS_LABEL_FILE = join(STATE_DIR, 'status-label.json')
 const typingLoops = new Map<string, ReturnType<typeof setInterval>>()
-function startTypingLoop(chat_id: string) {
+// After a reply, Telegram shows the message and drops "typing…". Re-sending it
+// on the very next tick would put "typing…" under what may be the turn's FINAL
+// message for ~5s before the Stop signal lands, so the loop skips one beat.
+const typingQuietUntil = new Map<string, number>()
+const ackStatus = createAckStatus({
+  edit: (chatId, messageId, text, parseMode) =>
+    bot.api.editMessageText(chatId, messageId, text, ...(parseMode ? [{ parse_mode: parseMode }] : [])),
+  readLabel: () => {
+    try {
+      const j = JSON.parse(readFileSync(STATUS_LABEL_FILE, 'utf8')) as { at?: unknown; label?: unknown }
+      if (typeof j.at !== 'number' || typeof j.label !== 'string' || !j.label) return null
+      return { at: j.at, label: j.label.slice(0, 60) }
+    } catch {
+      return null
+    }
+  },
+})
+// `quiet`: open the loop without an immediate "typing…" — used when a reply
+// (not an inbound) starts it, for the same reason as typingQuietUntil.
+function startTypingLoop(chat_id: string, opts: { quiet?: boolean } = {}) {
   stopTypingLoop(chat_id)
   const startedAt = Date.now()
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  void ackStatus.beginTurn(chat_id)
+  if (!opts.quiet) void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
   const handle = setInterval(() => {
     // Stop if the hook signalled turn-end after this loop began. Wrapped in
     // try/catch so a missing/unreadable file falls back to the prior
@@ -381,10 +412,17 @@ function startTypingLoop(chat_id: string) {
     } catch {
       // file absent → keep prior behavior
     }
-    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+    if (Date.now() >= (typingQuietUntil.get(chat_id) ?? 0)) {
+      void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+    }
+    void ackStatus.tick(chat_id)
   }, TYPING_INTERVAL_MS)
   typingLoops.set(chat_id, handle)
-  setTimeout(() => stopTypingLoop(chat_id), TYPING_CEILING_MS)
+  // Only stop THIS loop — a ceiling timer outliving its loop used to cut short
+  // a later turn's loop for the same chat.
+  setTimeout(() => {
+    if (typingLoops.get(chat_id) === handle) stopTypingLoop(chat_id)
+  }, TYPING_CEILING_MS)
 }
 function stopTypingLoop(chat_id: string) {
   const handle = typingLoops.get(chat_id)
@@ -392,6 +430,8 @@ function stopTypingLoop(chat_id: string) {
     clearInterval(handle)
     typingLoops.delete(chat_id)
   }
+  // The turn is over: take the status line back off the ack.
+  void ackStatus.endTurn(chat_id)
 }
 
 type PendingEntry = {
@@ -1347,7 +1387,7 @@ const mcp = new Server(
       // stated where the tool that sends the message is defined.
       'Writing here: answer first — the conclusion in line one, no preamble and no narrating what you are about to do. Send three kinds of message and no others: finished, blocked on them (money, secrets, brand, anything irreversible), or your own mistake; progress and half-findings go where you track work, not the message.',
       '',
-      'Cap a reply at roughly 60 words, 3 short paragraphs, COUNTED IN WORDS not lines — they read on a phone and it wraps. Blank line between paragraphs, one ask per message, no lists or tables; detail goes in a file or task. Over ~30s of work: acknowledge at once, then edit_message that same message with progress — a NEW message only when done or blocked.',
+      'Cap a reply at roughly 60 words, 3 short paragraphs, COUNTED IN WORDS not lines — they read on a phone and it wraps. Blank line between paragraphs, one ask per message, no lists or tables; detail goes in a file or task. Over ~30s: ack first; the bridge shows a live status on it, so no progress edits. Reply again only when done or blocked.',
       '',
       'Inbound arrives as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. Pass chat_id back to reply. If the inbound meta carries message_thread_id (forum-topic group like #5dive), pass it through to reply so your message lands in the same topic instead of the supergroup\'s General channel; omit when absent. If the tag has image_path, Read that path (a photo). If attachment_file_id, call download_attachment then Read the returned path. Set reply_to only when threading under an earlier message; omit it for normal latest-message replies.',
       '',
@@ -1478,7 +1518,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'edit_message',
-      description: 'Edit a message the bot previously sent. Useful for interim progress updates. The server automatically prepends the original message text as a sticky header, so pass ONLY the new status — do not re-include the original ack. Edits don\'t trigger push notifications — send a new reply when a long task completes so the user\'s device pings.',
+      description: 'Edit a message the bot previously sent. Not needed for routine progress: the bridge already shows "typing…" and a live status line on your ack until the turn ends. Use it when the ack itself is wrong or a meaningful finding belongs on it. The server automatically prepends the original message text as a sticky header, so pass ONLY the new status — do not re-include the original ack. Edits don\'t trigger push notifications — send a new reply when a long task completes so the user\'s device pings.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1597,7 +1637,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         assertAllowedChat(chat_id)
-        stopTypingLoop(chat_id)
+        // DIVE-5419: a reply no longer stops "typing…" — the turn's end does.
+        typingQuietUntil.set(chat_id, Date.now() + TYPING_INTERVAL_MS + 1_000)
 
         for (const f of files) {
           assertSendable(f)
@@ -1721,6 +1762,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         })))
 
         markReplySent()
+        // DIVE-5419: the newest text reply is the ack the server keeps a status
+        // line on until the turn ends. A reply sent with no loop running (a
+        // turn that did not start from an inbound) opens one, quietly.
+        if (chunks.length > 0) {
+          if (!typingLoops.has(chat_id)) startTypingLoop(chat_id, { quiet: true })
+          // A lite client gets "typing…" only: the step labels are English
+          // and about our tooling, which is the plumbing lite keeps out of a
+          // client's chat (DIVE-5121).
+          if (!LITE) ackStatus.noteReply(
+            chat_id,
+            sentIds[chunks.length - 1],
+            chunks[chunks.length - 1],
+            parseMode,
+            !!lastKeyboard,
+          )
+        }
         // DIVE-1028: record our own reply in the rolling log too, so a
         // recovered transcript reads as a two-sided conversation. Log the
         // logical message (pre-chunk, opt-out markers stripped), not each
@@ -1826,12 +1883,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           ? `${body}\n\n${editParseMode ? mdv2(editFooter) : editFooter}`
           : body
         const finalText = anchor ? `${anchor}${ANCHOR_SEPARATOR}${bodyWithFooter}` : bodyWithFooter
-        const edited = await bot.api.editMessageText(
-          chat_id,
-          message_id,
-          finalText,
-          ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
-        )
+        // DIVE-5419: never cross the server's own status edit on the same ack.
+        await ackStatus.beforeEdit(chat_id)
+        let edited: Awaited<ReturnType<typeof bot.api.editMessageText>>
+        try {
+          edited = await bot.api.editMessageText(
+            chat_id,
+            message_id,
+            finalText,
+            ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
+          )
+        } catch (err) {
+          ackStatus.afterEdit(chat_id, message_id, null)
+          throw err
+        }
+        ackStatus.afterEdit(chat_id, message_id, finalText, editParseMode)
         await sendAutoAttachments(chat_id, editPlan, {})
         // DIVE-4276: an edit lands on a message we already sent, so it proves
         // liveness (clock reset) but cannot answer an inbound that arrived

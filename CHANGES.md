@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Changed — telegram 0.5.86: the bridge keeps the human posted after the ack, not the model (DIVE-5419)
+
+"typing…" used to stop at the agent's first reply — the ack — and the silence watchdog then
+re-fired every 5 tool calls or 60 s, so the model spent about one call in ten on progress edits,
+each re-reading the whole conversation. Now "typing…" runs until the turn ends (Stop hook signal,
+30-minute crash ceiling), and the server itself edits one status line onto the ack — the current
+step and elapsed time, at most once per 30 s — and takes it back off at turn end. The step label
+comes from a new PreToolUse hook that only writes a file: a Bash/Agent `description` with paths,
+flags, URLs and token-like words dropped, or a fixed phrase for every other tool. The watchdog now
+fires once, only when an inbound has had no reply, reaction or edit for 60 s. A bare "ok"/"thanks"
+no longer forces a Stop turn. Lite clients get the full-turn "typing…" but no status edits.
+
 ### Fixed — telegram 0.5.85: a freshly wired agent bot greets its owner once, with no /start (DIVE-5411)
 
 The manager bot tells the owner "@bot is ready, <Name> greets you in a moment" when the bot is

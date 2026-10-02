@@ -45,7 +45,7 @@ grade() {                     # grade <file> <label> -> non-zero if any check fa
   check "counted in WORDS, not lines"                'COUNTED IN WORDS'
   check "…with the reason a line cap fails"          'they read on a phone'
   check "detail is displaced, not just forbidden"    'not the message'
-  check "over ~30s: acknowledge, then EDIT"          'edit_message that same message'
+  check "over ~30s: ack, then the bridge's status"   'no progress edits'
   return $localfail
 }
 

@@ -90,11 +90,12 @@ describe('silence-watchdog under lite is the default watchdog', () => {
     const dflt = run(box('default', s))
     expect(lite.status).toBe(0)
     expect(dflt.status).toBe(0)
-    expect(lite.stdout).toContain('The user alarms at >60s silence.')
-    expect(lite.stdout).toContain('Send a fresh reply')
+    // DIVE-5419 reworded the nudge (one ack reminder, then the bridge's status).
+    expect(lite.stdout).toContain('has had no acknowledgement for')
+    expect(lite.stdout).toContain('Send a short reply now')
     // the two runs can straddle a second under load, so the elapsed count is
     // the one field allowed to differ
-    const words = (o: string) => o.replace(/gone \d+s and/, 'gone Ns and')
+    const words = (o: string) => o.replace(/acknowledgement for \d+s/, 'acknowledgement for Ns')
     expect(words(lite.stdout)).toBe(words(dflt.stdout))
   })
 

@@ -75,9 +75,13 @@ describe('decideNag: the clock runs on CONTACT, not on replies alone', () => {
     expect(d.unansweredInbound).toBe(true)
   })
 
-  test('NEGATIVE ARM: contact that is itself stale still fires', () => {
+  test('NEGATIVE ARM: contact from BEFORE the newest inbound still fires', () => {
+    // DIVE-5419: was "contact that is itself stale still fires" — contact
+    // AFTER the inbound, nagged again for being old. That re-fire after the
+    // ack is exactly what DIVE-5419 deleted (the bridge keeps the human posted
+    // from there). What must still fire is an inbound nobody acknowledged.
     const d = decideNag(
-      { ...inbound(NOW - 600), lastContactAt: NOW - SILENT_FOR, lastReplyAt: NOW - 600 },
+      { ...inbound(NOW - SILENT_FOR), lastContactAt: NOW - 600, lastReplyAt: NOW - 600 },
       NOW, FIRST_FIRE, CALLS,
     )
     expect(d.shouldFire).toBe(true)
@@ -105,9 +109,10 @@ describe('decideNag: the clock runs on CONTACT, not on replies alone', () => {
   test('THE RACE (bug 2): a sibling hook that re-reads after the stamp lands stays quiet', () => {
     // The sibling read pre-reply state (11 calls, contact 275s ago) and would
     // fire; the re-read sees the reply's stamp and its counter reset.
-    const stale: SilenceState = { ...inbound(NOW - 400), lastContactAt: NOW - SILENT_FOR, toolCallsSinceReply: CALLS - 1 }
+    // DIVE-5419: the stale read is an inbound with no ack yet (contact predates it).
+    const stale: SilenceState = { ...inbound(NOW - 100), lastContactAt: NOW - SILENT_FOR, toolCallsSinceReply: CALLS - 1 }
     expect(decideNag(stale, NOW, FIRST_FIRE, CALLS).shouldFire).toBe(true)
-    const settled: SilenceState = { ...inbound(NOW - 400), lastReplyAt: NOW, lastContactAt: NOW, toolCallsSinceReply: 0 }
+    const settled: SilenceState = { ...inbound(NOW - 100), lastReplyAt: NOW, lastContactAt: NOW, toolCallsSinceReply: 0 }
     expect(decideNag(settled, NOW, FIRST_FIRE, (settled.toolCallsSinceReply ?? 0) + 1).shouldFire).toBe(false)
   })
 

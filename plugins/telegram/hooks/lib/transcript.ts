@@ -95,6 +95,9 @@ export type TurnAnalysis = {
   texts: string[]
   lastChatId: string | null
   lastMessageId: string | null
+  // DIVE-5419: the newest inbound is a bare acknowledgement ("ok", "thanks",
+  // "👍") with no attachment and no button tap — nothing in it to answer.
+  lastInboundBareAck: boolean
   lastThreadId: string | null
   // DIVE-4889: a `react` in this turn targeted the turn's NEWEST inbound
   // (same chat_id AND message_id as lastChatId/lastMessageId, judged at the
@@ -212,6 +215,35 @@ export function trustedChannelTagsForEntry(content: unknown): string[] {
   return out
 }
 
+// DIVE-5419: a message that only acknowledges. Deliberately narrow — "yes",
+// "no", "go", "do it" are ANSWERS and stay out; so is anything with a second
+// sentence. A miss here costs one forced turn (the old behaviour), a false hit
+// would drop a real request, so the list only grows on evidence.
+const BARE_ACK_RE =
+  /^(ok(ay)?|k+|kk|okie|alright|thanks?|thank you|thx|ty|tysm|cheers|cool|great|nice|perfect|noted|got it|sounds good|👍|👌|🙏|❤️|🙂|😊|✅)( (thanks?|thank you|thx|ty))?$/i
+
+export function isBareAck(body: string): boolean {
+  const t = body
+    .trim()
+    .replace(/[\s.!]+$/u, '')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+  return t.length > 0 && t.length <= 24 && BARE_ACK_RE.test(t)
+}
+
+// The text of the channel block that `tag` opens, from the same entry text.
+function channelBody(texts: string[], tag: string): string | null {
+  for (const t of texts) {
+    const at = t.indexOf(tag)
+    if (at < 0) continue
+    const open = t.indexOf('>', at + tag.length)
+    if (open < 0) return null
+    const close = t.indexOf('</channel>', open)
+    return t.slice(open + 1, close < 0 ? undefined : close)
+  }
+  return null
+}
+
 export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnAnalysis {
   // Find turn start.
   let turnStart = 0
@@ -247,6 +279,7 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
   let lastChatId: string | null = null
   let lastMessageId: string | null = null
   let lastThreadId: string | null = null
+  let lastInboundBareAck = false
   const reacts: Array<{ chatId: string; messageId: string }> = []
 
   for (const e of turn) {
@@ -262,6 +295,9 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
         if (mm) lastMessageId = mm[1]
         const tm = /message_thread_id="(-?\d+)"/.exec(tag)
         lastThreadId = tm ? tm[1] : null
+        const plain = !/\b(via|image_path|attachment_file_id|attachment_kind)=/.test(tag)
+        const body = plain ? channelBody(entryTexts(e.message?.content ?? ''), tag) : null
+        lastInboundBareAck = body !== null && isBareAck(body)
       }
     } else if (e.type === 'assistant') {
       const content = e.message?.content
@@ -298,7 +334,7 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
     lastMessageId !== null &&
     reacts.some((r) => r.chatId === lastChatId && r.messageId === lastMessageId)
 
-  return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId, lastThreadId, reactedNewest, a2aTurn }
+  return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId, lastThreadId, lastInboundBareAck, reactedNewest, a2aTurn }
 }
 
 // Scan transcript entries past a given line index for any telegram tool
