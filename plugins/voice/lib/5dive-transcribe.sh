@@ -9,6 +9,16 @@
 # Switch with:  sudo 5dive voice backend local|openrouter
 # Hearing alone: sudo 5dive voice config set stt_backend local|openrouter
 #
+# WHEN LOCAL HEARING FAILS (DIVE-5398). A box that already SPEAKS on OpenRouter
+# (backend=openrouter, hearing split off with stt_backend=local — the 5dive box
+# default) hears that one note on OpenRouter instead, and says so on stderr.
+# Its reply text already goes there, so the audio following it moves no new
+# kind of data off the box, and a note the user already sent is not dropped.
+# A box whose `backend` is local keeps the one-way rule in voice-backend.sh:
+# it never reaches the network, whatever key sits on disk. If nothing can hear
+# the note, stderr tells the calling agent to ask the user to type: the owner of
+# a Mini App box has no shell, so a sudo hint relayed to them is a dead end.
+#
 # stdout is identical either way: the transcript, one line, nothing else. That
 # is load-bearing — every agent on the box already parses it, and a backend
 # switch that changed the output shape would be a rewrite disguised as a flag.
@@ -45,6 +55,11 @@ SRC="${1:-}"
   || { echo "usage: 5dive-transcribe [--json] [--backend=local|openrouter] <audio-path>" >&2; exit 2; }
 
 BACKEND="${BACKEND_OVERRIDE:-$(voice_effective_stt_backend)}"
+# The warm whisper-service. Overridable so the offline harness can run its own
+# fake beside a real service that already holds :8765.
+WHISPER_URL="${VOICE_WHISPER_URL:-http://127.0.0.1:8765}"
+# Why local hearing failed, in one line; set by transcribe_local.
+LOCAL_FAIL=""
 
 transcribe_openrouter() {
   voice_require_cmd ffmpeg || return 1
@@ -66,24 +81,54 @@ transcribe_openrouter() {
 }
 
 transcribe_local() {
-  voice_require_cmd jq || return 1
-  local ext staged payload resp
+  voice_require_cmd jq || { LOCAL_FAIL="jq is missing"; return 1; }
+  local ext staged payload resp code
   ext="${SRC##*.}"; [[ "$ext" == "$SRC" ]] && ext="bin"
   staged="$(mktemp --suffix=".${ext}" /tmp/5dive-transcribe.XXXXXX)"
   chmod 644 "$staged"
-  cp -- "$SRC" "$staged" || { rm -f "$staged"; return 1; }
+  cp -- "$SRC" "$staged" || { rm -f "$staged"; LOCAL_FAIL="could not stage the file for whisper-service"; return 1; }
   payload=$(jq -nc --arg p "$staged" '{path:$p}')
-  resp=$(curl -fsS --max-time 120 \
+  # No -f: a 500 carries the service's own reason in its JSON body, and curl -f
+  # throws that away, which is how a dependency break read as "500" and nothing
+  # more (DIVE-5398).
+  resp=$(curl -sS --max-time 120 -w '\n%{http_code}' \
     -H "Content-Type: application/json" \
-    -X POST http://127.0.0.1:8765/transcribe \
-    --data "$payload") || { rm -f "$staged"; echo "5dive voice: whisper-service on :8765 did not answer (sudo systemctl status whisper-service)" >&2; return 1; }
+    -X POST "${WHISPER_URL}/transcribe" \
+    --data "$payload" 2>/dev/null) || { rm -f "$staged"; LOCAL_FAIL="whisper-service did not answer"; return 1; }
   rm -f "$staged"
+  code="${resp##*$'\n'}"; resp="${resp%$'\n'*}"
+  if [[ "$code" != 2* ]]; then
+    LOCAL_FAIL="whisper-service answered HTTP ${code}: $(printf '%s' "$resp" | jq -r '.error // empty' 2>/dev/null | head -c 300)"
+    return 1
+  fi
   if (( JSON_OUT )); then printf '%s\n' "$resp"
   else printf '%s' "$resp" | jq -r .text; fi
 }
 
+# hearing_failed [<reason>] — nothing could hear the note. The second line is
+# addressed to the agent that called us, because it is the one that relays it.
+hearing_failed() {
+  echo "5dive voice: could not hear this voice note${1:+ (${1})}." >&2
+  echo "5dive voice: ask the user to type their message instead. Do not ask them to run a command or restart anything." >&2
+  exit 1
+}
+
+# may_fall_back — local hearing failed: may this note go to OpenRouter? Only on
+# a box that already speaks there, with a key, and never on a call that forced
+# --backend=local (that is someone testing the local engine on purpose).
+may_fall_back() {
+  [[ -z "$BACKEND_OVERRIDE" ]] || return 1
+  [[ "$(voice_backend_configured)" == openrouter ]] || return 1
+  voice_openrouter_key >/dev/null 2>&1
+}
+
 case "$BACKEND" in
-  openrouter) transcribe_openrouter ;;
-  local)      transcribe_local ;;
+  openrouter) transcribe_openrouter || hearing_failed ;;
+  local)
+    transcribe_local && exit 0
+    may_fall_back || hearing_failed "$LOCAL_FAIL"
+    echo "5dive voice: local hearing failed (${LOCAL_FAIL}); heard this note on OpenRouter instead." >&2
+    transcribe_openrouter || hearing_failed "$LOCAL_FAIL; OpenRouter failed too"
+    ;;
   *)          echo "5dive voice: unknown backend '$BACKEND'" >&2; exit 2 ;;
 esac
