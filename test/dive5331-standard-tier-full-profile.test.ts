@@ -176,8 +176,9 @@ describe('a standard seat: the grant, the no-root path, or the one refusal', () 
     const calls: Call[] = []
     const gate = gateFor('no', calls)
     const plain = SITES.filter(s => s.standard === 'plain')
-    // task add/show/start/done/cancel/escalate/unpark, the channel-proof answer, agent send
-    expect(plain.length).toBe(11)
+    // task add/show/start/done/cancel/escalate/unpark, the channel-proof answer, agent send,
+    // and (DIVE-5367) the self set-account, which the CLI crosses over `_self_account`
+    expect(plain.length).toBe(12)
     for (const s of plain) expect({ argv: s.argv, o: await drive(gate, calls, s) }).toEqual({ argv: s.argv, o: { ok: true, via: 'plain' } })
   })
   test('sudo is spawned only for the seat\'s own grant', async () => {
@@ -196,9 +197,13 @@ describe('a standard seat: the grant, the no-root path, or the one refusal', () 
     expect(await via(['5dive', 'task', 'done', '7', '--result=r'], 'plain')).toEqual({ ok: true, via: 'plain' })
     expect(await via(['5dive', '--json', 'task', 'answer', 'DIVE-1', '--value=y', '--channel-proof=1'], 'plain')).toEqual({ ok: true, via: 'plain' })
     expect(await via(['5dive', 'agent', '_self_restart'], 'refuse')).toEqual({ ok: true, via: 'sudo' })
+    // DIVE-5367: the seat's own switch runs as the seat; the CLI crosses its
+    // `_self_account` line (and refuses any other target on the root path).
+    expect(await via(['5dive', 'agent', 'set-account', 'me', 'mark'], 'plain')).toEqual({ ok: true, via: 'plain' })
+    // ...and is never handed to sudo as the broad verb
+    expect(await via(['5dive', 'agent', 'set-account', 'me', 'mark'], 'refuse')).toEqual({ ok: false, refusal: 'admin-tier' })
     // root-only, whatever the call site asks for
     for (const argv of [
-      ['5dive', 'agent', 'set-account', 'me', 'mark'],
       ['5dive', 'agent', 'stop', 'peer', '--json'],
       ['5dive', 'agent', 'rotation', 'set', 'me', '--enabled=true', '--accounts=all'],
       ['/usr/local/bin/5dive-refresh-plugins.sh', 'me'],
@@ -265,7 +270,8 @@ describe('server.ts wiring', () => {
   })
   test('/usage on a standard seat reads only its own statusline', () => {
     const usage = SERVER.slice(SERVER.indexOf('  usage: async ctx => {'), SERVER.indexOf('  goal: async ctx => {'))
-    const gate = usage.indexOf("if (seat === 'no') {")
+    // DIVE-5367: …unless the seat holds its `_self_account` line
+    const gate = usage.indexOf("if (seat === 'no' && !selfAccount) {")
     const own = usage.indexOf('ownUsageText(')
     expect(gate).toBeGreaterThan(-1)
     expect(own).toBeGreaterThan(gate)
@@ -349,14 +355,14 @@ describe('MUTANT: a gate that ignores the seat (today\'s raw `sudo -n`)', () => 
 describe('MUTANT: a call site that asks for the unprivileged path for a root-only verb', () => {
   test('is still refused, never a raw CLI error', async () => {
     const calls: Call[] = []
-    const o = await drive(gateFor('no', calls), calls, { argv: ['5dive', 'agent', 'set-account', 'me', 'x'], standard: 'plain', at: 0 })
+    const o = await drive(gateFor('no', calls), calls, { argv: ['5dive', 'agent', 'rotation', 'set', 'me', '--enabled=true'], standard: 'plain', at: 0 })
     expect(o).toEqual({ ok: false, refusal: 'admin-tier' })
     expect(calls).toEqual([])
   })
   test('without the allowlist it would leak the permission envelope', async () => {
     const calls: Call[] = []
     const exec = standardSeatExec(calls)
-    const o = await exec(FIVE, ['agent', 'set-account', 'me', 'x']).then(() => 'ok', (e: { stdout?: string }) => String(e.stdout))
+    const o = await exec(FIVE, ['agent', 'rotation', 'set', 'me', '--enabled=true']).then(() => 'ok', (e: { stdout?: string }) => String(e.stdout))
     expect(o).toContain('must run as root')
   })
 })
@@ -364,8 +370,8 @@ describe('MUTANT: a call site that asks for the unprivileged path for a root-onl
 describe('MUTANT: a raw sudo call reintroduced in server.ts', () => {
   test('the static arm goes RED', () => {
     const mutated = SERVER.replace(
-      "void sudo5dive(['5dive', 'agent', 'set-account', me, name], { timeout: 5000 })",
-      "void execFileP(SUDO, ['-n', '5dive', 'agent', 'set-account', me, name], { timeout: 5000 })",
+      "void sudo5dive(['5dive', 'agent', '_self_restart'], { timeout: 5000 })",
+      "void execFileP(SUDO, ['-n', '5dive', 'agent', '_self_restart'], { timeout: 5000 })",
     )
     expect(mutated).not.toBe(SERVER)
     expect(mutated).toMatch(/execFileP\(\s*SUDO/)
