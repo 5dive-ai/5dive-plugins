@@ -30,6 +30,8 @@ export type SilenceDecision = {
   // Seconds since the last sign of life (reply, edit or reaction), or since
   // the inbound when we have never contacted this thread at all.
   sinceContact: number
+  // DIVE-5419: seconds since the newest inbound — the one clock the nudge reads.
+  sinceInbound: number
   calls: number
   // The human's newest message has had no reply/latest-inbound reaction yet.
   unansweredInbound: boolean
@@ -63,25 +65,27 @@ export function decideNag(
     sinceContact = now - lastInbound
   }
 
-  let shouldFire = false
-  if (inConversation) {
-    const crossedCount = calls >= 5
-    const crossedTime = sinceContact > firstFireSeconds
-    if (crossedCount || crossedTime) {
-      if (lastReminder === 0 || lastReminder < lastContact || lastReminder < lastInbound) {
-        // First time crossing the threshold since the last contact/inbound.
-        shouldFire = true
-      } else if (calls >= 5 && calls % 5 === 0) {
-        shouldFire = true
-      } else if (now - lastReminder >= 60) {
-        shouldFire = true
-      }
-    }
-  }
+  // DIVE-5419: ONE rule. The nudge exists to get the ack out, and only that:
+  // fire once when the newest inbound has had no contact (reply, react or
+  // edit) for longer than the threshold. After the ack the bridge keeps
+  // "typing…" and a hook-driven status line on it by itself (ackstatus.ts),
+  // so the old re-fire — every 5 calls or 60s, forever, after the ack — only
+  // bought model calls spent on progress edits, each one re-reading the whole
+  // conversation. `calls` is kept for the message text, not the decision.
+  // The clock runs from the INBOUND: contact from before it says nothing about
+  // whether this message was seen.
+  const acked = lastContact >= lastInbound
+  const sinceInbound = lastInbound > 0 ? now - lastInbound : 0
+  const shouldFire =
+    inConversation &&
+    !acked &&
+    sinceInbound > firstFireSeconds &&
+    lastReminder < lastInbound
 
   return {
     shouldFire,
     sinceContact,
+    sinceInbound,
     calls,
     unansweredInbound: lastInbound > lastReply,
     inConversation,

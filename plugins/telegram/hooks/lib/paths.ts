@@ -31,6 +31,11 @@ export function silenceFile(): string {
 export function nudgeFile(): string {
   return join(stateDir(), 'context-nudge.json')
 }
+// DIVE-5419: the latest step label ({at, label}), written by the PreToolUse
+// hook hooks/status-label.ts and read by the server's ack-status tick.
+export function statusLabelFile(): string {
+  return join(stateDir(), 'status-label.json')
+}
 // Touched (mtime bumped) by the Stop hook to tell the long-running MCP
 // server's typing loop that the turn ended — the server can't otherwise
 // learn this when the hook auto-relays out-of-process. See server.ts

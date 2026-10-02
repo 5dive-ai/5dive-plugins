@@ -1,25 +1,27 @@
 #!/usr/bin/env -S bun
-// PostToolUse hook: nudge the agent when it's gone quiet on Telegram.
+// PostToolUse hook: nudge the agent once when it has not acknowledged a
+// Telegram message.
 //
-// Why: agents paired over Telegram sometimes go silent for minutes while
-// they crunch through tool calls. CLAUDE.md and the notify-user skill both
-// say "ack within 30s, edit your last message every ~30s", but Claude
-// reads those at session start and ignores them mid-task once it's deep
-// in work. This hook is the forcing function — it injects a fresh
+// Why: agents paired over Telegram sometimes dive into tool calls without
+// saying "on it". CLAUDE.md and the notify-user skill both say "ack within
+// 30s", but Claude reads those at session start and ignores them mid-task
+// once it's deep in work. This hook is the forcing function — it injects a fresh
 // <system-reminder> into the next tool result after the silence threshold
 // is crossed, so the model sees it in the live context window instead of
 // having to recall a session-load directive.
 //
-// Triggers (PostToolUse, after every tool call) when ALL of:
+// Triggers (PostToolUse) ONCE per inbound, when ALL of:
 //   - access.json has at least one allowFrom entry (paired)
-//   - silence.json shows recent TG activity (inbound within last hour)
-//   - EITHER (now - lastContactAt > FIRST_FIRE_SECONDS) OR (toolCallsSinceReply >= 5)
-//     where lastContactAt is the newest of reply / edit_message / react
-//     (DIVE-4276 — a reaction is contact, so it must silence this hook)
+//   - the newest inbound is under an hour old
+//   - nothing reached the human since it (reply, edit_message or react —
+//     lastContactAt, DIVE-4276) for more than FIRST_FIRE_SECONDS
 //
-// Re-firing policy (avoids one-shot fatigue without spamming):
-//   - First time after contact: fire immediately when threshold crossed
-//   - After first fire: re-fire only on multiples of 5 calls OR every 60s
+// DIVE-5419 deleted the re-fire (every 5 calls / every 60s, after the ack too).
+// Once the ack is out, the bridge keeps "typing…" running and edits a status
+// line onto the ack itself (ackstatus.ts + hooks/status-label.ts) for zero
+// model tokens. The re-fire only made the model do the same job by hand: ~1
+// call in 10 of a working session, each re-reading the whole conversation,
+// plus every injection staying in context for the rest of the session.
 
 import { readPayload } from './lib/payload'
 import { loadAccess } from './lib/access'
@@ -39,11 +41,12 @@ const payload = await readPayload<{ transcript_path?: string }>()
 // perfectly working hooks too much"). DIVE-5121 had dropped it on lite and
 // DIVE-5166 had put back a narrower lite arm; both are gone.
 
-// First-fire silence threshold (seconds since last reply). Lower = the agent
+// Ack threshold (seconds since the newest inbound with no contact). Lower = the agent
 // is forced to ack sooner; higher = quieter but more perceived silence. The
 // single retune knob for the ack/annoyance balance. Stepped down 90 -> 60
 // gradually 2026-06-22 (Mark) — quick tasks finish under it and never ack,
 // long tasks cross it and buzz exactly once. Candidate next step: 45.
+// Still the one knob after DIVE-5419; it now also is the ONLY firing.
 const FIRST_FIRE_SECONDS = 60
 
 const access = loadAccess()
@@ -57,8 +60,8 @@ const state = loadSilence()
 const calls = (state.toolCallsSinceReply ?? 0) + 1
 
 // Race window between server.ts reset and this hook's increment is benign:
-// the counter ends up at 1 after a reply (instead of 0), so the threshold
-// fires after 4 more tool calls — close enough for a heuristic.
+// the counter is informational only since DIVE-5419 (the decision no longer
+// reads it).
 
 // DIVE-4276: the clock runs from the last CONTACT (reply, edit or reaction),
 // not from the last reply alone — a 👍 on an acknowledgement is an answer, and
@@ -105,17 +108,10 @@ saveSilence({
 })
 
 if (shouldFire) {
-  // Pick the right verb. If the latest inbound hasn't been replied to yet,
-  // the user expects an answer BELOW their question — edits land on older
-  // messages and look misplaced. Only edit when the in-flight task already
-  // has an ack and no new inbound has landed since.
-  const unansweredInbound = decision.unansweredInbound
-  const sinceReply = decision.sinceContact
-  const action = unansweredInbound
-    ? 'Send a fresh reply (mcp__plugin_telegram_telegram__reply, reply_to the latest inbound) — the user is waiting on an answer to their newest message.'
-    : 'Edit your last reply (mcp__plugin_telegram_telegram__edit_message) with a one-line status — same in-flight task, no new inbound, so an edit avoids re-pinging their phone.'
   emitPostToolContext(
-    `You've gone ${sinceReply}s and ${freshCalls} tool calls without sending a Telegram message. The user alarms at >60s silence. ${action} Don't go silent.`,
+    `The user's newest Telegram message has had no acknowledgement for ${decision.sinceInbound}s. ` +
+      'Send a short reply now (mcp__plugin_telegram_telegram__reply, reply_to the latest inbound), or react if it needs no answer. ' +
+      'After that the bridge keeps "typing…" and a live status line on your reply by itself — do not spend edit_message on progress.',
   )
 }
 process.exit(0)

@@ -15,22 +15,20 @@ Telegram message MUST get a `reply` before the turn ends, even if it's just
 - **Inbound → ack <5s.** Send a short "on it" reply before starting any
   non-trivial work. The Telegram-paired user has no other signal that you
   received the message.
-- **Long work → edit only if you're still the latest message.** Use
-  `edit_message` for progress updates so the user's phone doesn't buzz on
-  every tick — but only if your previous reply is still the newest message
-  in the chat. If a fresher message exists (a new inbound from the user, or
-  another reply you sent in between), the older message will be missed in
-  scrollback; send a new `reply` instead.
+- **Long work → just work.** After the ack the bridge keeps "typing…"
+  running and edits a short status line onto your ack (the current step and
+  elapsed time) by itself, until the turn ends — zero model calls. Do not
+  spend `edit_message` on routine progress (DIVE-5419).
+- **Edit only for substance.** If the ack itself was wrong, or a real
+  finding belongs on it, `edit_message` it — but only if it is still the
+  newest message in the chat; otherwise send a new `reply`.
 - **Editing keeps a sticky header.** The server auto-prepends the original
-  reply's text on every `edit_message`, so the task ack stays visible while
-  the status below it changes. Pass ONLY the new status as the `text` arg —
-  don't re-include the original ack, or it'll be doubled (the server tries
-  to detect and strip echoed headers, but it's best to just send the delta).
+  reply's text on every `edit_message`, so pass ONLY the new text as the
+  `text` arg — don't re-include the original ack.
 - **Done or blocked → new reply.** A fresh `reply` triggers push
   notification; an edit does not.
-- **Silence ceiling: ~60s.** Beyond that the user starts assuming the
-  bridge broke. Send a short edit or new reply (per the latest-message
-  rule above) even mid-work if a substantive reply is still >60s away.
+- **Ack ceiling: ~60s.** An inbound with no reply or reaction after ~60s
+  gets you ONE reminder. After the ack, liveness is the bridge's job.
 
 ## Hard rules
 

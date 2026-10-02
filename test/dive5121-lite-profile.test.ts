@@ -96,20 +96,27 @@ describe('no profile set = the plugin as it is today', () => {
     // DIVE-5171 (0.5.68) added one sentence on purpose — a via="button" inbound
     // is the user's real answer — so the pin moved with it. 0.5.64's block was
     // d04d20b5cacd135bd079e80b3222f0f118aebd941862bb228dbd2c96db16e9ac.
+    // DIVE-5419 (0.5.86) changed one sentence on purpose: after the ack the
+    // bridge shows a live status, so "edit_message that same message with
+    // progress" became "no progress edits". 0.5.85's block was
+    // d9fcec695f9d1193ae09aaeb1fd42c13ba736b68ccb8f333340b71c5d57d322e.
     const lines = SERVER.split('\n')
     const start = lines.indexOf('    instructions: [')
     const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
     expect(start).toBeGreaterThan(0)
     expect(end).toBeGreaterThan(start)
     const block = lines.slice(start + 1, end).join('\n') + '\n'
-    expect(sha(block)).toBe('d9fcec695f9d1193ae09aaeb1fd42c13ba736b68ccb8f333340b71c5d57d322e')
+    expect(sha(block)).toBe('80ac9995f08d3f4d70487129fcbf5fd7122d9a75f5ddfaade16d6e4a417fcd1a')
     // The lite block is a LATER key that only exists when LITE is true.
     expect(lines[end]).toBe("    ].join('\\n'),")
     expect(lines.slice(end + 1, end + 5).join('\n')).toContain('...(LITE ? { instructions: LITE_INSTRUCTIONS } : {}),')
   })
 
-  test('the hook registrations are byte-identical to the 0.5.64 release (all six hooks still wired)', () => {
-    expect(sha(readFileSync(join(TG, 'hooks', 'hooks.json'), 'utf8'))).toBe('a1e2b5be3c402b822d9c6ac0b58dab97435bad0c2418f283a45f09075db9ea15')
+  test('the hook registrations are byte-identical to the 0.5.64 release plus the DIVE-5419 status hook (all six hooks still wired)', () => {
+    // DIVE-5419 (0.5.86) added one PreToolUse entry (hooks/status-label.ts) and
+    // reworded the watchdog in the description. 0.5.64 → 0.5.85 was
+    // a1e2b5be3c402b822d9c6ac0b58dab97435bad0c2418f283a45f09075db9ea15.
+    expect(sha(readFileSync(join(TG, 'hooks', 'hooks.json'), 'utf8'))).toBe('6793abd08b2733cd7a2210d137de5994ef9cd195baeb80d79427d56ecbd1c992')
   })
 
   test('every read of the profile in server.ts is a guard of a known shape', () => {
@@ -134,11 +141,14 @@ describe('no profile set = the plugin as it is today', () => {
       /^\s*\.\.\.\(LITE \? \{ instructions: LITE_INSTRUCTIONS \} : \{\}\),$/,
       // DIVE-5368: the group join lines take the profile as data (groupjoin.ts).
       /^\s*lite: LITE,$/,
+      // DIVE-5419: lite gets "typing…" but no status edits on a client's chat.
+      /^\s*if \(!LITE\) ackStatus\.noteReply\($/,
     ]
     const odd = uses.filter(l => !shapes.some(re => re.test(l)))
     expect(odd).toEqual([])
     // DIVE-5368: 15 — the lite pairing reply (`if (LITE) {`) and `lite: LITE,`.
-    expect(uses).toHaveLength(15)
+    // DIVE-5419: 16 — the status-edit guard on the reply.
+    expect(uses).toHaveLength(16)
   })
 
   test('the lite front door is registered only under LITE, ahead of every other update handler', () => {
