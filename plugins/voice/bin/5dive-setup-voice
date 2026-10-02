@@ -51,7 +51,11 @@ CLAUDE_MD="${CLAUDE_MD:-/home/claude/projects/CLAUDE.md}"
 MARKER_OLD="<!-- 5dive-setup-voice: voice section -->"
 MARKER_V2="<!-- 5dive-setup-voice: voice section v2 -->"
 MARKER_V3="<!-- 5dive-setup-voice: voice section v3 -->"
-MARKER="<!-- 5dive-setup-voice: voice section v4 -->"
+MARKER_V4="<!-- 5dive-setup-voice: voice section v4 -->"
+# v5 (DIVE-5397): a voice reply only when the user spoke. v4 said "ALWAYS send
+# the text reply first, then ... the voice attachment", which agents read as a
+# voice note after every reply, typed messages included.
+MARKER="<!-- 5dive-setup-voice: voice section v5 -->"
 # v4 is the first version with a CLOSING marker (DIVE-5189). Every section a
 # later release appends below this one (human-messaging, agent-sites) would be
 # eaten by the old "marker to end of file" strip, so a strip is now bounded.
@@ -160,7 +164,11 @@ step_pip() {
     as_claude python3 -m venv "$VENV"
     ok "created venv at $VENV"
   fi
-  as_claude "$VENV/bin/pip" install --quiet --upgrade faster-whisper edge-tts
+  # PyAV 19 (2026-09-29) dropped av.open(metadata_errors=), which faster-whisper
+  # 1.2.1 still passes: every transcribe 500s. Hold av below 19 until a
+  # faster-whisper release stops passing it. Re-running this step on a box that
+  # already got av 19 downgrades it.
+  as_claude "$VENV/bin/pip" install --quiet --upgrade faster-whisper edge-tts 'av<19'
   # edge-tts is used directly by agents; whisper is called via the HTTP service
   # below, so no need to symlink faster-whisper.
   if [[ -x "$VENV/bin/edge-tts" ]]; then
@@ -277,8 +285,17 @@ step_claudemd() {
   fi
 
   if grep -qF "$MARKER" "$CLAUDE_MD"; then
-    ok "Voice section already present (v4) — not re-appending."
+    ok "Voice section already present (v5) — not re-appending."
     return
+  fi
+
+  # v4 has a closing marker, so it is replaced by its own lines only: whatever a
+  # later release appended below it stays (DIVE-5397).
+  if grep -qF "$MARKER_V4" "$CLAUDE_MD" \
+     && sed -n "\|${MARKER_V4}|,\$p" "$CLAUDE_MD" | grep -qF "$MARKER_END"; then
+    cp -a "$CLAUDE_MD" "${CLAUDE_MD}.bak"
+    sed -i "\|${MARKER_V4}|,\|${MARKER_END}|d" "$CLAUDE_MD"
+    warn "Removed the v4 voice section. Backup at ${CLAUDE_MD}.bak."
   fi
 
   # v1 marker present from an earlier setup run — strip the old block (marker
@@ -286,7 +303,8 @@ step_claudemd() {
   # the v2 block. If the user has manually added content after the v1 marker,
   # they'll need to restore it from the .bak we leave behind.
   local old_marker=""
-  if   grep -qF "$MARKER_V3"  "$CLAUDE_MD"; then old_marker="$MARKER_V3"
+  if   grep -qF "$MARKER_V4"  "$CLAUDE_MD"; then old_marker="$MARKER_V4"
+  elif grep -qF "$MARKER_V3"  "$CLAUDE_MD"; then old_marker="$MARKER_V3"
   elif grep -qF "$MARKER_V2"  "$CLAUDE_MD"; then old_marker="$MARKER_V2"
   elif grep -qF "$MARKER_OLD" "$CLAUDE_MD"; then old_marker="$MARKER_OLD"; fi
   if [[ -n "$old_marker" ]]; then
@@ -309,7 +327,8 @@ $MARKER
 - Voice replies: \`5dive-speak "<text>"\` prints the path to a Telegram-ready OGG/Opus file. Use it instead of calling edge-tts directly — it is the only thing that honours the backend switch.
 - Which backend: \`5dive voice\` prints it; \`sudo 5dive voice backend local|openrouter\` changes it, and \`stt_backend\` in \`5dive voice config\` moves hearing alone. On \`local\`, hearing runs on this box (warm whisper-service at http://127.0.0.1:8765, unit \`whisper-service.service\`) but SPEAKING still sends the reply text to Microsoft, because edge-tts is an online voice service. On \`openrouter\`, speaking uses your character's own voice when your persona has one.
 - When receiving a Telegram voice message, always transcribe it before responding.
-- **Reply order for speed**: ALWAYS send the text reply first (so the user sees it immediately), then generate and send the voice attachment as a follow-up message. Never bundle them together — text first, voice second.
+- **Answer in the way the user wrote**: a typed message gets a text reply only — no voice note. Send a voice reply only when the user's own message was a voice note, or when they ask you for one. A voice reply spends credit, so never add one nobody asked for.
+- **Reply order for speed** (voice replies only): send the text reply first (so the user sees it immediately), then generate and send the voice attachment as a follow-up message. Never bundle them together — text first, voice second.
 - **When a voice reply fails** (for example OpenRouter answers HTTP 402 because this box's voice credit is used up), your text reply is the answer: say in one line that the voice reply did not work this time. Do not retry it in a loop, do not change voice settings, and never ask the user for a key.
 $MARKER_END
 EOF

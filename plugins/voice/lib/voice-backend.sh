@@ -36,7 +36,7 @@ VOICE_DEFAULT_EDGE_VOICE="${VOICE_DEFAULT_EDGE_VOICE:-en-US-AriaNeural}"
 # (Charon, Kore, Puck, Sulafat, Achird, ...), which only a Gemini TTS model
 # knows — so a persona voice is spoken on this model whatever tts_model says.
 # tts_model/tts_voice stay the box default for an agent that carries no voice.
-VOICE_DEFAULT_PERSONA_TTS_MODEL="${VOICE_DEFAULT_PERSONA_TTS_MODEL:-google/gemini-3.8-flash-tts}"
+VOICE_DEFAULT_PERSONA_TTS_MODEL="${VOICE_DEFAULT_PERSONA_TTS_MODEL:-google/gemini-3.8-flash-lite-tts}"
 # The installed persona of the agent that is CALLING: `agent import` puts it at
 # ~/.claude/persona.yaml of the agent's own unix user, and a seat runs its tools
 # as that user, so the caller's home is the only lookup there is.
