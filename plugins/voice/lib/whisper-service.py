@@ -7,6 +7,7 @@
 import json
 import os
 import sys
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from faster_whisper import WhisperModel
@@ -70,7 +71,11 @@ class Handler(BaseHTTPRequestHandler):
                 "segments": out_segments,
             })
         except Exception as e:
-            return self._json(500, {"error": str(e)})
+            # The journal gets the traceback and the caller gets the exception's
+            # name: a bare str(e) on a 500 is how PyAV 19's dropped keyword read
+            # as "whisper 500s" with no cause anywhere (DIVE-5398).
+            traceback.print_exc()
+            return self._json(500, {"error": f"{type(e).__name__}: {e}"})
 
 
 if __name__ == "__main__":
