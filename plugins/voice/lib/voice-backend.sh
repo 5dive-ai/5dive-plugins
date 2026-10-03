@@ -112,6 +112,159 @@ print(" ".join(style.split())[:500] if isinstance(style, str) else "")
 PY
 }
 
+# DIVE-5443: on the free (local) backend each agent speaks in its OWN Microsoft
+# voice. Until now every agent on a box spoke en-US-AriaNeural, so a male agent
+# sounded female and two agents sounded the same.
+#
+# THE TABLE. Each of the 30 Gemini prebuilt voices an OpenAgent pack can carry
+# in voice.audio.base gets one fixed edge voice of the SAME gender, closest to
+# Google's one-word descriptor, and no two Gemini voices share an edge voice.
+# Genders are Google's own (Cloud TTS Chirp 3 HD list, read 2026-10-03: 14
+# female, 16 male), not guessed from the names. The edge names were read off
+# `edge-tts --list-voices` the same day. Aria is deliberately absent: it stays
+# the "nothing resolved" voice, so hearing Aria means the pick did not run.
+# Columns: gemini-base gender(F|M) edge-voice descriptor.
+VOICE_EDGE_TABLE='Zephyr F en-PH-RosaNeural bright
+Puck M en-US-RogerNeural upbeat
+Charon M en-US-ChristopherNeural informative
+Kore F en-GB-SoniaNeural firm
+Fenrir M en-US-GuyNeural excitable
+Leda F en-US-AvaNeural youthful
+Orus M en-GB-RyanNeural firm
+Aoede F en-AU-NatashaNeural breezy
+Callirrhoe F en-CA-ClaraNeural easy-going
+Autonoe F en-GB-LibbyNeural bright
+Enceladus M en-IE-ConnorNeural breathy
+Iapetus M en-CA-LiamNeural clear
+Umbriel M en-AU-WilliamMultilingualNeural easy-going
+Algieba M en-US-AndrewNeural smooth
+Despina F en-US-EmmaNeural smooth
+Erinome F en-IE-EmilyNeural clear
+Algenib M en-ZA-LukeNeural gravelly
+Rasalgethi M en-GB-ThomasNeural informative
+Laomedeia F en-NZ-MollyNeural upbeat
+Achernar F en-US-MichelleNeural soft
+Alnilam M en-US-SteffanNeural firm
+Schedar M en-US-EricNeural even
+Gacrux F en-ZA-LeahNeural mature
+Pulcherrima F en-IN-NeerjaNeural forward
+Achird M en-US-BrianNeural friendly
+Zubenelgenubi M en-NZ-MitchellNeural casual
+Vindemiatrix F en-SG-LunaNeural gentle
+Sadachbia M en-SG-WayneNeural lively
+Sadaltager M en-IN-PrabhatNeural knowledgeable
+Sulafat F en-US-JennyNeural warm'
+# Edge voices are per-locale and Russian and Ukrainian have one voice per
+# gender, so agents there share by gender; that is the pool, not a bug.
+VOICE_EDGE_RU_F=ru-RU-SvetlanaNeural; VOICE_EDGE_RU_M=ru-RU-DmitryNeural
+VOICE_EDGE_UK_F=uk-UA-PolinaNeural;   VOICE_EDGE_UK_M=uk-UA-OstapNeural
+# Who is on this box, for the no-repeat rule. Overridable so the offline battery
+# can stage a box; a seat's tools run as the seat, so `id -un` is the caller.
+VOICE_PASSWD_FILE="${VOICE_PASSWD_FILE:-}"
+
+# voice_edge_for_base <gemini-base> — "<edge-voice> <F|M>" from the table, rc 1
+# for a name the table does not hold (another provider's voice, a typo, "unset").
+voice_edge_for_base() {
+  local want="${1,,}" g gen e _
+  while read -r g gen e _; do
+    [[ "${g,,}" == "$want" ]] && { printf '%s %s\n' "$e" "$gen"; return 0; }
+  done <<<"$VOICE_EDGE_TABLE"
+  return 1
+}
+
+# voice_edge_locale <text> — en|ru|uk from the reply itself: whichever script
+# carries more letters. A Russian client's agent replies in Russian, and an
+# English voice reading Cyrillic is worse than any voice reading its own
+# language. і ї є ґ exist in Ukrainian and not in Russian.
+voice_edge_locale() {
+  local t="$1" cyr lat
+  # Every letter in U+0400-U+04FF has exactly one UTF-8 lead byte in D0-D3, so
+  # counting those bytes counts Cyrillic letters, in any locale and any grep.
+  cyr=$(printf '%s' "$t" | LC_ALL=C tr -cd '\320-\323' | wc -c)
+  lat=$(printf '%s' "$t" | LC_ALL=C tr -cd 'A-Za-z' | wc -c)
+  if (( cyr == 0 || cyr < lat )); then printf 'en\n'
+  elif [[ "$t" == *і* || "$t" == *ї* || "$t" == *є* || "$t" == *ґ* || "$t" == *І* || "$t" == *Ї* || "$t" == *Є* || "$t" == *Ґ* ]]; then printf 'uk\n'
+  else printf 'ru\n'; fi
+}
+
+# voice_box_seats — "<name> <persona-file>" for every agent seat on the box, in
+# uid order, which is creation order: a NEW agent never moves an older agent's
+# voice. Seats are `claude` and `agent-*` with a login uid.
+voice_box_seats() {
+  { if [[ -n "$VOICE_PASSWD_FILE" ]]; then cat "$VOICE_PASSWD_FILE"; else getent passwd; fi; } 2>/dev/null \
+    | awk -F: '($1 == "claude" || $1 ~ /^agent-/) && $3 >= 1000 { print $3, $1, $6 "/.claude/persona.yaml" }' \
+    | sort -n -k1,1 | cut -d' ' -f2-
+}
+
+# voice_persona_bases — reads "<name> <persona-file>" lines, prints "<name>
+# <base>" for each seat whose persona carries a plain voice.audio.base. One
+# python start for the whole box; an unreadable home is simply absent.
+voice_persona_bases() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 -c '
+import re, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(0)
+for line in sys.stdin:
+    name, _, path = line.rstrip("\n").partition(" ")
+    try:
+        with open(path) as f:
+            d = yaml.safe_load(f) or {}
+        base = ((d.get("voice") or {}).get("audio") or {}).get("base")
+    except Exception:
+        continue
+    if isinstance(base, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", base.strip()):
+        print(name, base.strip())
+' 2>/dev/null
+}
+
+# voice_agent_edge_voice <text> — the calling agent's own edge voice, on stdout.
+#   1. its pack's voice.audio.base, through the table (same character, same
+#      gender as on OpenRouter);
+#   2. otherwise a stable hash of its unix name into the table's 30 voices,
+#      stepping past any voice another seat on this box already holds: first
+#      every persona seat's table voice, then each older seat's own pick. Two
+#      agents share a voice only when the box has more seats than the pool.
+# The locale is picked from the text, keeping the gender. rc 1 = nothing
+# resolved, and the caller falls back to the box default.
+voice_agent_edge_voice() {
+  local text="$1" me pick="" persona e gen name base path h i k n
+  me="${VOICE_AGENT_NAME:-$(id -un 2>/dev/null)}"
+  if persona=$(voice_persona_audio); then pick=$(voice_edge_for_base "${persona%%$'\n'*}") || pick=""; fi
+  if [[ -z "$pick" && -n "$me" ]]; then
+    local -a pool=() gens=() order=()
+    local -A held=() persona_of=()
+    while read -r base gen e _; do pool+=("$e"); gens+=("$gen"); done <<<"$VOICE_EDGE_TABLE"
+    n=${#pool[@]}
+    local seats; seats=$(voice_box_seats)
+    while read -r name path; do [[ -n "$name" ]] && order+=("$name"); done <<<"$seats"
+    while read -r name base; do
+      [[ -n "$name" && "$name" != "$me" ]] || continue
+      e=$(voice_edge_for_base "$base") || continue
+      for ((i = 0; i < n; i++)); do [[ "${pool[$i]}" == "${e%% *}" ]] && held[$i]=1; done
+      persona_of[$name]=1
+    done < <(printf '%s\n' "$seats" | voice_persona_bases)
+    [[ " ${order[*]} " == *" $me "* ]] || order+=("$me")
+    for name in "${order[@]}"; do
+      [[ -n "${persona_of[$name]:-}" ]] && continue
+      h=$(printf '%s' "$name" | cksum); h=${h%% *}; i=$((h % n)); k=0
+      while [[ -n "${held[$i]:-}" ]] && (( k < n )); do i=$(((i + 1) % n)); k=$((k + 1)); done
+      (( k < n )) || i=$((h % n))
+      held[$i]=1
+      [[ "$name" == "$me" ]] && { pick="${pool[$i]} ${gens[$i]}"; break; }
+    done
+  fi
+  [[ -n "$pick" ]] || return 1
+  e="${pick%% *}"; gen="${pick##* }"
+  case "$(voice_edge_locale "$text")" in
+    ru) [[ "$gen" == M ]] && e=$VOICE_EDGE_RU_M || e=$VOICE_EDGE_RU_F ;;
+    uk) [[ "$gen" == M ]] && e=$VOICE_EDGE_UK_M || e=$VOICE_EDGE_UK_F ;;
+  esac
+  printf '%s\n' "$e"
+}
+
 # voice_openrouter_key — the box's existing OpenRouter credential. No new secret
 # store (DIVE-4439 scope line). Canonical name is openrouter.env (the shape
 # 5dive-write-connector enforces); the bare `openrouter` file predates that
