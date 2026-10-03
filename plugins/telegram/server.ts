@@ -4478,13 +4478,20 @@ function clampList(header: string, lines: string[], total = lines.length): strin
 function taskRow(t: any, needTag = false): string {
   const TITLE_MAX = 80
   const mine = taskAssignedToMe(t.assignee) ? '⭐ ' : ''
-  const flag = t.status === 'in_progress' ? '▶ ' : t.status === 'blocked' ? '⛔ ' : ''
+  // A parked row (blocked with a wake_at and no gate) waits on the clock, not on
+  // anyone: ⏰ and the day it wakes, so it does not read as stuck (lodar 2026-10-03).
+  const parked = t.status === 'blocked' && !!t.wake_at && !t.need_type
+  const flag = t.status === 'in_progress' ? '▶ ' : parked ? '⏰ ' : t.status === 'blocked' ? '⛔ ' : ''
   let title = String(t.title ?? '')
   if (title.length > TITLE_MAX) title = title.slice(0, TITLE_MAX - 1) + '…'
   const tag = needTag && t.need_type ? ` [${t.need_type}]` : ''
   // Show the assignee (bare agent name) so it's clear who owns each row.
   const who = t.assignee ? ` (${String(t.assignee).replace(/^agent-/, '')})` : ''
-  return `${mine}${flag}${t.ident} · ${title}${tag}${who}  /task_${t.id}`
+  const wakeAt = parked ? new Date(String(t.wake_at).replace(' ', 'T') + 'Z') : null
+  const wake = wakeAt && !isNaN(wakeAt.getTime())
+    ? ` · until ${wakeAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })}`
+    : ''
+  return `${mine}${flag}${t.ident} · ${title}${tag}${wake}${who}  /task_${t.id}`
 }
 
 async function buildTaskList(): Promise<string> {
