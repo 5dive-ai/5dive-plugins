@@ -36,7 +36,7 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 // DIVE-2846: aliased so the durable tap-failure record needs no surgery on
 // (or collision with) whatever each plugin already imports from 'fs'.
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
-import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
+import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 
@@ -3151,6 +3151,20 @@ function writeBannerStore(store: Record<string, BannerState>): void {
   } catch {}
 }
 
+// DIVE-5447: the banner is off unless TELEGRAM_NEEDS_BANNER=1 (banner.ts). Off,
+// this runs once at boot instead of the timer: unpin every banner the store
+// still remembers and write back only the ones Telegram could not be reached for,
+// so the next boot finds an empty store and does nothing.
+async function retireNeedsBanners(): Promise<void> {
+  try {
+    const store = readBannerStore()
+    if (Object.keys(store).length === 0) return
+    writeBannerStore(await retireBannerStore(store, bot.api))
+  } catch {
+    // heuristic surface — a boot task must never crash the bot
+  }
+}
+
 // DIVE-1503/1558: reconcile the pinned "needs-you" banner in every paired DM
 // against the current gate backlog. Pin on the first gate, edit in place as the
 // backlog changes, unpin at zero — so a pending gate can never scroll out of
@@ -3288,8 +3302,9 @@ async function reconcileNeedsBanner(): Promise<void> {
 // pin only needs to survive scroll, not tick in real time; first run deferred so
 // bot.api + access.json are settled.
 if (!SEND_ONLY) {
-  setTimeout(() => void reconcileNeedsBanner(), 3000).unref()
-  setInterval(() => void reconcileNeedsBanner(), 60_000).unref()
+  // DIVE-5447: off unless the seat opts in with TELEGRAM_NEEDS_BANNER=1; off, the
+  // boot retires any pin already in a DM instead (armNeedsBanner, banner.ts).
+  armNeedsBanner(process.env, { reconcile: reconcileNeedsBanner, retire: retireNeedsBanners })
 }
 
 if (SEND_ONLY) {

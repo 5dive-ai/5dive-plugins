@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Changed — telegram 0.5.87 (+ agy/codex/grok 0.5.22, opencode 0.5.13, pi 0.1.13): the pinned needs-you banner is off (DIVE-5447)
+
+The owner found the pinned "N gates need you" message too noisy (2026-10-03), so no telegram
+plugin pins it any more. Gate alerts, /inbox and the dashboard are unchanged. On the first boot
+after the update each seat unpins the banner it had pinned in every paired DM, relabels it "This
+pinned reminder is switched off", and empties `needs-banner.json`; a pin it could not reach (network
+blip) is retried on the next boot. The code is kept: `TELEGRAM_NEEDS_BANNER=1` in a seat's telegram
+connector env brings the 60 s banner back exactly as before. With it off the DIVE-2041
+"SUPPRESSED FLEET-WIDE" log line never prints, since only the banner tick printed it.
+
 ### Changed — telegram 0.5.86: the bridge keeps the human posted after the ack, not the model (DIVE-5419)
 
 "typing…" used to stop at the agent's first reply — the ack — and the silence watchdog then
