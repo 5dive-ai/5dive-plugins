@@ -51,7 +51,7 @@ import { planAutoAttach, autoAttachFooter, attachedNames, AUTO_PHOTO_EXTS, type 
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { questionLabel } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
-import { summarizeNeeds, reconcileBanner, type BannerState, type NeedSummary } from './banner'
+import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { createAckStatus, restoreJournal, type ShownRecord } from './ackstatus.ts'
@@ -815,6 +815,20 @@ function writeBannerStore(store: Record<string, BannerState>): void {
   } catch {}
 }
 
+// DIVE-5447: the banner is off unless TELEGRAM_NEEDS_BANNER=1 (banner.ts). Off,
+// this runs once at boot instead of the timer: unpin every banner the store
+// still remembers and write back only the ones Telegram could not be reached for,
+// so the next boot finds an empty store and does nothing.
+async function retireNeedsBanners(): Promise<void> {
+  try {
+    const store = readBannerStore()
+    if (Object.keys(store).length === 0) return
+    writeBannerStore(await retireBannerStore(store, bot.api))
+  } catch {
+    // heuristic surface — a boot task must never crash the bot
+  }
+}
+
 // DIVE-1503: reconcile the pinned "needs-you" banner in every paired DM against
 // the current gate backlog. Pin on the first gate, edit in place as the backlog
 // changes, unpin at zero — so a pending gate can never scroll out of sight. Runs
@@ -1265,8 +1279,9 @@ recordOwners()
 // is deferred so the bot/api and access.json are settled.
 // DIVE-5121: a lite client has no gates, so no needs-you banner.
 if (!STATIC && !SEND_ONLY && !LITE) {
-  setTimeout(() => void reconcileNeedsBanner(), 3000).unref()
-  setInterval(() => void reconcileNeedsBanner(), 60_000).unref()
+  // DIVE-5447: off unless the seat opts in with TELEGRAM_NEEDS_BANNER=1; off, the
+  // boot retires any pin already in a DM instead (armNeedsBanner, banner.ts).
+  armNeedsBanner(process.env, { reconcile: reconcileNeedsBanner, retire: retireNeedsBanners })
 }
 
 // DIVE-5256: the free AI that came with a my.5dive server, used up. An agent on

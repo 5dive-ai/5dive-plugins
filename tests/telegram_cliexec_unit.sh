@@ -238,10 +238,14 @@ for FORK in telegram-grok telegram-codex telegram-agy telegram-pi telegram-openc
      "execText('sudo', ['-n', '5dive', '--version'])" "$SRC"
   # the reason this is worth a test and not a comment: every fork still has a
   # 60s timer on that reader, which is the thing that multiplied one denial into
-  # 83,898 of them.
-  tc "T11 $FORK: still on the 60s banner timer (so the fix must hold)" \
-     'reconcileNeedsBanner(), 60_000' "$SRC"
+  # 83,898 of them. DIVE-5447 put it behind TELEGRAM_NEEDS_BANNER=1 (off by
+  # default); the 60s cadence itself now lives in the byte-identical banner.ts,
+  # and an opted-in seat runs it, so the fix must still hold.
+  tc "T11 $FORK: still arms the 60s banner timer when opted in (so the fix must hold)" \
+     'armNeedsBanner(process.env, { reconcile: reconcileNeedsBanner' "$SRC"
 done
+tc "T11 banner.ts: the opted-in cadence is still 60s" \
+   'NEEDS_BANNER_EVERY_MS = 60_000' "$(cat "$ROOT/plugins/telegram/banner.ts")"
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

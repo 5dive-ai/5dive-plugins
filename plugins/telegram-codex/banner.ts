@@ -141,3 +141,86 @@ export function reconcileBanner(
   if (prev.fingerprint !== fingerprint) return { kind: 'edit', messageId: prev.messageId, text, fingerprint }
   return { kind: 'none' }
 }
+
+// DIVE-5447 — THE BANNER IS OFF UNLESS A SEAT OPTS IN.
+//
+// lodar, 2026-10-03: "Let's disable inbox pinning because it feels too noisy."
+// The gate alerts, /inbox and the dashboard stay; only the proactive pin goes.
+// The code stays behind TELEGRAM_NEEDS_BANNER=1 (the seat's telegram connector
+// env or its channel .env) so it can come back without a rewrite. Off also
+// silences the DIVE-2041 "SUPPRESSED FLEET-WIDE" line: it is only ever printed
+// from inside the reconcile tick, and with the switch off no tick runs.
+//
+// Off is not just "stop pinning": every DM that already carries a pin would keep
+// it forever, because the only code that ever unpinned was the tick being turned
+// off. So when the switch is off, the bot retires what its store remembers ONCE
+// at boot (retireBannerStore below) and writes back only what it could not reach.
+export const NEEDS_BANNER_ENV = 'TELEGRAM_NEEDS_BANNER'
+export const NEEDS_BANNER_FIRST_MS = 3000
+export const NEEDS_BANNER_EVERY_MS = 60_000
+
+export function needsBannerEnabled(env: Record<string, string | undefined>): boolean {
+  return env[NEEDS_BANNER_ENV] === '1'
+}
+
+export interface BannerTimers {
+  setTimeout(fn: () => void, ms: number): { unref?(): unknown }
+  setInterval(fn: () => void, ms: number): { unref?(): unknown }
+}
+
+// The one place the banner's timers are armed. Opted in: the DIVE-1503 cadence
+// (first tick deferred so the bot and access.json are settled, then every 60s).
+// Off: no interval at all, one deferred retire. Timers are injected so a test can
+// count them instead of trusting a comment.
+export function armNeedsBanner(
+  env: Record<string, string | undefined>,
+  run: { reconcile: () => Promise<void>; retire: () => Promise<void> },
+  timers: BannerTimers = globalThis as unknown as BannerTimers,
+): 'armed' | 'retiring' {
+  if (needsBannerEnabled(env)) {
+    timers.setTimeout(() => void run.reconcile(), NEEDS_BANNER_FIRST_MS).unref?.()
+    timers.setInterval(() => void run.reconcile(), NEEDS_BANNER_EVERY_MS).unref?.()
+    return 'armed'
+  }
+  timers.setTimeout(() => void run.retire(), NEEDS_BANNER_FIRST_MS).unref?.()
+  return 'retiring'
+}
+
+// What a retired pin is edited to. Not BANNER_CLEAR_TEXT: "all caught up" would
+// be a false claim on a DM whose gates are still pending.
+export const BANNER_RETIRED_TEXT = 'This pinned reminder is switched off. Tap /inbox to see anything that needs you.'
+
+// Telegram's answers that mean the pinned message no longer exists (or can no
+// longer be touched): nothing left to retire, so forget it.
+export function isBannerGoneError(err: unknown): boolean {
+  const msg = String((err as { description?: unknown })?.description ?? err)
+  return /message to edit not found|message can't be edited|MESSAGE_ID_INVALID|to unpin not found|chat not found|bot was blocked/i.test(msg)
+}
+
+export interface BannerUnpinApi {
+  unpinChatMessage(chatId: string, messageId: number): Promise<unknown>
+  editMessageText(chatId: string, messageId: number, text: string): Promise<unknown>
+}
+
+// Unpin and relabel every remembered banner. Returns the store to write back:
+// empty once every pin is gone, so the next boot does nothing. A pin the API
+// could not reach for a transient reason (network, 429) is kept for the next boot
+// rather than forgotten with the pin still showing. The relabel is best-effort:
+// the unpin is the part the owner sees.
+export async function retireBannerStore(
+  store: Record<string, BannerState>,
+  api: BannerUnpinApi,
+): Promise<Record<string, BannerState>> {
+  const left: Record<string, BannerState> = {}
+  for (const [chat, st] of Object.entries(store)) {
+    if (!st || typeof st.messageId !== 'number') continue
+    try {
+      await api.unpinChatMessage(chat, st.messageId)
+    } catch (err) {
+      if (!isBannerGoneError(err)) left[chat] = st
+      continue
+    }
+    await api.editMessageText(chat, st.messageId, BANNER_RETIRED_TEXT).catch(() => {})
+  }
+  return left
+}
