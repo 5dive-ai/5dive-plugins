@@ -271,6 +271,9 @@ backend=local
 # stt_model=openai/whisper-large-v3-turbo
 # tts_model=microsoft/mai-voice-2-flash
 # tts_voice=alloy
+
+# Only read when backend=local. Unset (this line stays a comment), each agent
+# speaks in its own Microsoft voice. Uncomment it to give every agent one voice.
 # edge_voice=en-US-AriaNeural
 VOICECFG
   ok "wrote $VOICE_STATE_DIR/config (backend=local)"

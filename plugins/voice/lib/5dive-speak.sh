@@ -65,7 +65,12 @@ to_ogg() {  # to_ogg <src> [<ffmpeg input options>...]
 
 speak_local() {
   local voice mp3
-  voice="${VOICE_OVERRIDE:-$(voice_config_get edge_voice "$VOICE_DEFAULT_EDGE_VOICE")}"
+  # DIVE-5443: --voice, then an `edge_voice=` line the owner wrote, then this
+  # agent's own voice, then Aria. The `# edge_voice=` line setup seeds is a
+  # comment and counts as unset, so no box is flattened back to one voice.
+  voice="${VOICE_OVERRIDE:-$(voice_config_get edge_voice)}"
+  [[ -n "$voice" ]] || voice=$(voice_agent_edge_voice "$TEXT") || voice="$VOICE_DEFAULT_EDGE_VOICE"
+  [[ -n "$voice" ]] || voice="$VOICE_DEFAULT_EDGE_VOICE"
   voice_require_cmd edge-tts || return 1
   mp3="$(mktemp --suffix=.mp3 /tmp/5dive-speak.XXXXXX)"
   if ! edge-tts --voice "$voice" --text "$TEXT" --write-media "$mp3" >/dev/null 2>&1; then
