@@ -125,6 +125,22 @@ describe('what the group is told', () => {
     expect(lines[1]).toBe(GROUP_STRINGS.en.privacy)
     expect(lines[1]).toContain('make me an admin')
   })
+  // DIVE-5454: Telegram never passes a non-admin privacy-mode bot a mention
+  // (measured with a test account: forum topic, General, plain group; only
+  // replies to its own messages and /cmd@bot arrive). An admin bot gets it.
+  test('non-admin with privacy on: never promises that a mention works', () => {
+    for (const lang of ['en', 'ru'] as const)
+      for (const lite of [true, false]) {
+        const lines = groupJoinLines({ ...base, lang, lite, approved: true, privacyOn: true })
+        expect(lines.join(' ')).not.toMatch(/Mention me|mention me or reply|Упомяните меня|где меня упомянули/)
+      }
+    expect(groupJoinLines({ ...base, approved: true, privacyOn: true })[0]).toBe("Hi, I'm Olivia. Reply to one of my messages to ask something.")
+    expect(groupJoinLines({ ...base, lite: false, approved: true, privacyOn: true })[0]).toBe("👋 Hi, I'm Olivia. Reply to one of my messages to ask something.")
+    expect(GROUP_STRINGS.en.privacy).toContain('not mentions')
+  })
+  test('added as an admin (privacy does not apply): the mention hello stays', () => {
+    expect(groupJoinLines({ ...base, approved: true, privacyOn: false })).toEqual(["Hi, I'm Olivia. Mention me (@olivia_x1_bot) to ask something."])
+  })
   test('Russian for a Russian adder', () => {
     expect(groupJoinLines({ ...base, lang: 'ru', approved: true })[0]).toStartWith('Привет, я Olivia.')
   })
