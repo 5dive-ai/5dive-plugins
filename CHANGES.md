@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.88: a group join no longer promises that a mention works (DIVE-5454)
+
+lodar added his hired Cue to a group, mentioned it, and got no answer. Measured with a test account: Telegram never passes a non-admin bot with Group Privacy on (every agent bot) an @mention, in a forum topic, General or a plain group. It passes only replies to the bot's own messages and `/cmd@bot`. Made an admin, even with only the "manage chat" right, the bot gets the mention. So when the bot joins as a plain member, its hello now says "Reply to one of my messages to ask something", and the privacy line says that mentions need it to be an admin. A bot added as an admin keeps "Mention me". The Mini App's Add to a group now adds it as an admin (5dive-frontend, same row).
+
 ### Changed — telegram 0.5.87 (+ agy/codex/grok 0.5.22, opencode 0.5.13, pi 0.1.13): the pinned needs-you banner is off (DIVE-5447)
 
 The owner found the pinned "N gates need you" message too noisy (2026-10-03), so no telegram

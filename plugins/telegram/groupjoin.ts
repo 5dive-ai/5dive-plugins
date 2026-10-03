@@ -58,20 +58,28 @@ export function nextOwners(cur: readonly string[] | undefined, allowFrom: readon
 
 export const GROUP_STRINGS = {
   en: {
-    hello: (name: string, username: string) =>
-      `Hi, I'm ${name}. Mention me${username ? ` (@${username})` : ''} to ask something.`,
+    // DIVE-5454: `replyOnly` = a non-admin bot with Group Privacy on. Telegram never
+    // passes it a mention (measured 2026-10-03: topic, General, plain group), only
+    // replies to its own messages and /cmd@bot. So "mention me" would be a promise
+    // the bot cannot keep.
+    hello: (name: string, username: string, replyOnly = false) =>
+      replyOnly
+        ? `Hi, I'm ${name}. Reply to one of my messages to ask something.`
+        : `Hi, I'm ${name}. Mention me${username ? ` (@${username})` : ''} to ask something.`,
     waiting: (name: string) => `Hi, I'm ${name}. I'll stay quiet here until my owner lets this group in.`,
     privacy:
-      'Heads-up: Telegram only shows me messages here that mention me or reply to me. ' +
-      'To let me read every message, make me an admin of this group.',
+      'Heads-up: Telegram only passes me replies to my own messages here, not mentions. ' +
+      'To answer when someone mentions me, make me an admin of this group.',
   },
   ru: {
-    hello: (name: string, username: string) =>
-      `Привет, я ${name}. Упомяните меня${username ? ` (@${username})` : ''}, чтобы задать вопрос.`,
+    hello: (name: string, username: string, replyOnly = false) =>
+      replyOnly
+        ? `Привет, я ${name}. Чтобы задать вопрос, ответьте на одно из моих сообщений.`
+        : `Привет, я ${name}. Упомяните меня${username ? ` (@${username})` : ''}, чтобы задать вопрос.`,
     waiting: (name: string) => `Привет, я ${name}. Я буду молчать здесь, пока владелец не разрешит эту группу.`,
     privacy:
-      'Важно: Telegram показывает мне здесь только сообщения, где меня упомянули или ответили мне. ' +
-      'Чтобы я видел все сообщения, сделайте меня администратором группы.',
+      'Важно: Telegram передаёт мне здесь только ответы на мои сообщения, а не упоминания. ' +
+      'Чтобы я отвечал на упоминания, сделайте меня администратором группы.',
   },
 } as const
 
@@ -104,12 +112,12 @@ export function groupJoinLines(i: JoinInput): string[] {
   const lines: string[] = []
   if (i.lite) {
     const s = GROUP_STRINGS[i.lang]
-    if (i.approved) lines.push(s.hello(i.name, i.username))
+    if (i.approved) lines.push(s.hello(i.name, i.username, i.privacyOn))
     else if (i.announce) lines.push(s.waiting(i.name))
     if (i.privacyOn) lines.push(s.privacy)
     return lines
   }
-  if (i.approved) lines.push(`👋 ${GROUP_STRINGS.en.hello(i.name, i.username)}`)
+  if (i.approved) lines.push(`👋 ${GROUP_STRINGS.en.hello(i.name, i.username, i.privacyOn)}`)
   else if (i.announce) {
     lines.push(
       `👋 Hi! I've been added to "${i.title}" — group id: ${i.chatId}. ` +
@@ -118,8 +126,8 @@ export function groupJoinLines(i: JoinInput): string[] {
           : `I'll stay quiet until this group is approved: run /telegram:access in the agent terminal.`),
     )
   }
-  // DIVE-246, in plain words. Mention-only groups work with privacy on; this is
-  // for the owner who wants the agent to read everything.
+  // DIVE-246, in plain words. DIVE-5454: with privacy on and no admin rights a
+  // mention never arrives, so this is how a mention-only group starts working.
   if (i.privacyOn) {
     lines.push(
       `⚠️ ${GROUP_STRINGS.en.privacy} (Or turn Group Privacy off in @BotFather → Bot Settings, ` +
