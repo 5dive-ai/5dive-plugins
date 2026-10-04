@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Added — telegram-codex 0.5.29: one quiet progress message per Codex turn, one notification (DIVE-5504)
+
+A Codex agent on Telegram showed only "typing…" during a long job, then sent every message the model wrote, and each one buzzed the phone. Now a turn that runs longer than 8 seconds gets one silent message, "⏳ Working on it · running `npm test` · 40s", edited in place as Codex works (running a command, editing files, searching the web), and closed with "✅ Done in 2m 10s · 6 steps" or "⚠️ Stopped after …". A quick answer arrives alone, with no progress message. Only the turn's last answer notifies: Codex's in-between commentary arrives silently, and on models that do not say which message is final, each message waits until the next one shows it was not the last. Dashboard turns are unchanged.
+
 ### Added — telegram-codex 0.5.28: recent_messages, and a lost Codex thread recovers the chat (DIVE-5504)
 
 A Codex agent that lost its thread, or started without one, could not see what the owner had just said and had to ask them to repeat it. The bridge now keeps Claude's bounded rolling log of each chat (the last 200 inbound messages and replies, local and private to the seat) and offers it as the `recent_messages` tool, as Claude's bridge does. On the dispatcher path, whose model has no tools, the first turn after a thread that could not be resumed carries the chat's last few messages (up to 12, about 4,000 characters) as background. A resumed thread, an interrupted turn and a deliberate fresh session do not, since they keep their history or chose to drop it.

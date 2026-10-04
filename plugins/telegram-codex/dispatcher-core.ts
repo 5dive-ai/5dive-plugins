@@ -179,8 +179,19 @@ export interface StateStore {
   quarantine?(reason: string): void
 }
 
+export type PublishMeta = {
+  turnId: string
+  itemId?: string
+  /** `progress`/`progress-done` drive the adapter's one silent ack (DIVE-5504). */
+  kind: 'message' | 'error' | 'control' | 'progress' | 'progress-done'
+  /** false: deliver silently. Only a turn's last answer notifies (DIVE-5504). */
+  notify?: boolean
+  /** Tool steps so far, on progress events. */
+  steps?: number
+}
+
 export interface DispatchSink {
-  publish(route: DispatchRoute, text: string, meta: { turnId: string; itemId?: string; kind: 'message' | 'error' | 'control' }): Promise<void>
+  publish(route: DispatchRoute, text: string, meta: PublishMeta): Promise<void>
   /** Best-effort; a sink that cannot record a sample must not fail the turn. */
   usage?(sample: UsageSample): void
   /**
@@ -217,6 +228,40 @@ export function recoveryTranscript(rows: TranscriptRow[], current: string): stri
   if (!lines.length) return ''
   return '[5dive recovery] The earlier conversation is not in this thread. The last messages in this chat, oldest first, '
     + `as background only (do not redo them):\n${lines.join('\n')}`
+}
+
+/**
+ * One short status for a tool step, or null for items that are not one
+ * (DIVE-5504): this is what the sticky ack shows, not a transcript.
+ */
+export function progressStatus(item: any): string | null {
+  const clip = (t: unknown, n = 60) => {
+    const flat = String(t ?? '').replace(/\s+/g, ' ').trim()
+    return flat.length > n ? `${flat.slice(0, n - 1)}…` : flat
+  }
+  switch (item?.type) {
+    case 'commandExecution': return item.command ? `running \`${clip(item.command)}\`` : 'running a command'
+    case 'fileChange': {
+      const n = Array.isArray(item.changes) ? item.changes.length : 0
+      return n ? `editing ${n} file${n === 1 ? '' : 's'}` : 'editing files'
+    }
+    case 'webSearch': return item.query ? `searching the web for "${clip(item.query, 40)}"` : 'searching the web'
+    case 'mcpToolCall': return `using ${clip([item.server, item.tool].filter(Boolean).join('.'), 40) || 'a tool'}`
+    case 'dynamicToolCall': return 'using a tool'
+    case 'imageGeneration': return 'making an image'
+    case 'imageView': return 'looking at an image'
+    case 'plan': return 'planning'
+    case 'collabAgentToolCall': case 'subAgentActivity': return 'working with a helper agent'
+    default: return null
+  }
+}
+
+/** Progress events go out at most this often per turn; the rest are dropped. */
+export const PROGRESS_MIN_MS = 3_000
+
+function fmtElapsed(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000))
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
 }
 
 const MAX_SEEN = 512
@@ -453,6 +498,12 @@ export class ChannelDispatcher {
   private configured: ModelSelection = {}
   /** The last provider rate-limit report (in memory; a restart re-reads). */
   private limits?: RateLimitRecord
+  /**
+   * The running Telegram turn's progress (DIVE-5504): steps for the sticky ack,
+   * and an agent message of unknown phase held back until the next one shows it
+   * was not the last, so only the turn's last answer notifies.
+   */
+  private progress?: { turnId: string; steps: number; startedAt: number; lastAt: number; held?: { text: string; itemId: string } }
 
   constructor(
     private readonly rpc: RpcPort,
@@ -803,6 +854,18 @@ export class ChannelDispatcher {
         this.persist()
         return
       }
+      if (method === 'item/started' && this.progress && params?.turnId === this.progress.turnId
+        && this.state.active?.turnId === this.progress.turnId) {
+        const status = progressStatus(params?.item)
+        if (!status) return
+        const p = this.progress
+        p.steps++
+        const now = Date.now()
+        if (now - p.lastAt < PROGRESS_MIN_MS) return
+        p.lastAt = now
+        await this.publishProgress(this.state.active.route, status, { turnId: p.turnId, kind: 'progress', steps: p.steps })
+        return
+      }
       if (method === 'item/agentMessage/delta') {
         const key = `${params?.turnId ?? ''}:${params?.itemId ?? ''}`
         this.itemText.set(key, (this.itemText.get(key) ?? '') + String(params?.delta ?? ''))
@@ -815,13 +878,38 @@ export class ChannelDispatcher {
         const key = `${turnId}:${itemId}`
         const text = String(params.item.text ?? this.itemText.get(key) ?? '').trim()
         this.itemText.delete(key)
-        if (text) await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message' })
+        if (!text) return
+        const p = this.progress?.turnId === turnId ? this.progress : undefined
+        if (!p) {
+          await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message' })
+          return
+        }
+        // Commentary goes now, silently; a final answer notifies. An unknown
+        // phase (older models) waits for the next message or the turn's end to
+        // learn whether it was the last one.
+        await this.flushHeld(false)
+        const phase = params?.item?.phase
+        if (phase === 'commentary' || phase === 'final_answer') {
+          await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message', notify: phase === 'final_answer' })
+        } else {
+          p.held = { text, itemId }
+        }
         return
       }
       if (method === 'turn/completed') {
         const turnId = String(params?.turn?.id ?? '')
         if (!this.state.active || this.state.active.turnId !== turnId) return
         const completed = this.state.active
+        const progress = this.progress?.turnId === turnId ? this.progress : undefined
+        // The held message was the turn's last: it notifies, unless an error follows.
+        if (progress) await this.flushHeld(params?.turn?.status === 'completed', completed.route)
+        this.progress = undefined
+        if (progress) {
+          const took = fmtElapsed(Date.now() - progress.startedAt)
+          const steps = progress.steps ? ` · ${progress.steps} step${progress.steps === 1 ? '' : 's'}` : ''
+          await this.publishProgress(completed.route, params?.turn?.status === 'completed'
+            ? `✅ Done in ${took}${steps}` : `⚠️ Stopped after ${took}${steps}`, { turnId, kind: 'progress-done', steps: progress.steps })
+        }
         this.state.active = undefined
         const compaction = completed.message.control === 'compact' ? this.state.compacting : undefined
         if (compaction) this.state.compacting = undefined
@@ -873,6 +961,15 @@ export class ChannelDispatcher {
     const turnId = result?.turn?.id
     if (typeof turnId !== 'string' || !turnId) throw new Error('turn/start returned no turn id')
     this.state.active = { turnId, routeKey: routeKey(message.route), route: message.route, message }
+    // A Telegram turn gets the sticky ack: the first progress event opens it
+    // (the adapter waits a few seconds before showing it, so a quick answer
+    // arrives alone). Other channels keep their plain replies.
+    if (message.route.source === 'telegram') {
+      this.progress = { turnId, steps: 0, startedAt: Date.now(), lastAt: Date.now() }
+      await this.publishProgress(message.route, 'starting', { turnId, kind: 'progress', steps: 0 })
+    } else {
+      this.progress = undefined
+    }
     // An accepted turn override IS the thread's model from here on (measured on
     // codex 0.153.3: the rollout's turn_context follows it even when the resume
     // reported the old one), and the app-server sends no settings event for it.
@@ -890,6 +987,20 @@ export class ChannelDispatcher {
     this.remember(message)
     this.markSeen(message.id)
     this.persist()
+  }
+
+  /** Progress is decoration: a failed write must never fail the turn. */
+  private async publishProgress(route: DispatchRoute, text: string, meta: PublishMeta): Promise<void> {
+    try { await this.sink.publish(route, text, meta) } catch {}
+  }
+
+  /** Send the held message, if any: notify only when it proved to be the last. */
+  private async flushHeld(notify: boolean, route = this.state.active?.route): Promise<void> {
+    const p = this.progress
+    if (!p?.held || !route) return
+    const { text, itemId } = p.held
+    p.held = undefined
+    await this.sink.publish(route, text, { turnId: p.turnId, itemId, kind: 'message', notify })
   }
 
   private async startNext(): Promise<void> {

@@ -277,9 +277,12 @@ function recordUsageSample(sample: UsageSample): void {
 
 let outSeq = 0
 async function publish(route: DispatchRoute, text: string, meta: Record<string, unknown>): Promise<void> {
-  const outbound = parseOutboundMessage(text)
-  health.lastOutboundAt = new Date().toISOString()
-  process.stdout.write(`${outbound.text}\n`)
+  const progress = meta.kind === 'progress' || meta.kind === 'progress-done'
+  const outbound = progress ? { text, files: [] } : parseOutboundMessage(text)
+  if (!progress) {
+    health.lastOutboundAt = new Date().toISOString()
+    process.stdout.write(`${outbound.text}\n`)
+  }
   if (route.source === 'agent') return
   if (!outbound.text) throw new Error('dispatcher reply has no text after attachment directives')
   const dir = join(OUTBOX_DIR, route.source)

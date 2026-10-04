@@ -43,6 +43,7 @@ import { EFFORT_LEVELS, fmtTokens, type ControlOp } from './dispatcher-core.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { TurnAttachMemo, planOutboxAttachments, type OutboxAttachPlan } from './outbox-attach.ts'
 import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts'
+import { ProgressAcks } from './progress.ts'
 import {
   appendMessage as msglogAppend, formatRecent as msglogFormat, mostRecentChatId as msglogMostRecent,
   readMessages as msglogRead, MSGLOG_MAX_PER_CHAT,
@@ -743,6 +744,15 @@ const dispatcherOutboxBusy = new Set<string>()
 // files in the per-turn memo and send none of them.
 const outboxAttachMemo = new TurnAttachMemo()
 const outboxAttachPlans = new Map<string, OutboxAttachPlan>()
+// DIVE-5504: one silent, edited ack per Codex turn (progress.ts).
+const progressAcks = new ProgressAcks({
+  send: async (chatId, threadId, text) => (await bot.api.sendMessage(chatId, text, {
+    disable_notification: true, ...(threadId ? { message_thread_id: Number(threadId) } : {}),
+  })).message_id,
+  edit: async (chatId, messageId, text) => { await bot.api.editMessageText(chatId, messageId, text) },
+  now: () => Date.now(),
+  later: (fn, ms) => { setTimeout(fn, ms).unref?.() },
+})
 function ingestDispatcherOutbox(name: string): void {
   if (!name.endsWith('.json') || dispatcherOutboxBusy.has(name)) return
   const full = join(DISPATCHER_OUTBOX_DIR, name)
@@ -753,10 +763,24 @@ function ingestDispatcherOutbox(name: string): void {
     try { unlinkSync(full) } catch {}
     return
   }
+  if (obj.kind === 'progress' || obj.kind === 'progress-done') {
+    // Decoration, never retried: a lost progress line is replaced by the next.
+    try { unlinkSync(full) } catch {}
+    const key = `${obj.chat_id}:${obj.turnId ?? ''}`
+    if (obj.kind === 'progress') {
+      progressAcks.progress(key, String(obj.chat_id), obj.message_thread_id ? String(obj.message_thread_id) : undefined, String(obj.text))
+    } else {
+      progressAcks.done(key, String(obj.text))
+    }
+    return
+  }
   dispatcherOutboxBusy.add(name)
+  // Only a turn's last answer notifies; commentary and earlier messages arrive
+  // silently (the dispatcher sets `notify: false` on those).
+  const silent = obj.notify === false ? { disable_notification: true } : {}
   const options = obj.message_thread_id
-    ? { message_thread_id: Number(obj.message_thread_id) }
-    : undefined
+    ? { message_thread_id: Number(obj.message_thread_id), ...silent }
+    : (obj.notify === false ? silent : undefined)
   const explicit = Array.isArray(obj.files)
     ? obj.files.filter((f: unknown): f is string => typeof f === 'string' && f.startsWith('/')).slice(0, 10)
     : []
