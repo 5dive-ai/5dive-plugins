@@ -38,8 +38,8 @@ import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvide
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
 import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
-import { modelStatusLines, readHealth } from './health.ts'
-import { fmtTokens } from './dispatcher-core.ts'
+import { HEALTH_SCHEMA, modelStatusLines, readHealth, staleAfterMs } from './health.ts'
+import { EFFORT_LEVELS, fmtTokens, type ControlOp } from './dispatcher-core.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 
 const PLUGIN_VERSION = (() => {
@@ -504,13 +504,19 @@ let dispatcherInboxSeq = 0
 // as the text "/clear" — the dispatcher would submit that as a user turn and
 // reset nothing. Only meaningful when the dispatcher owns the thread; the pane
 // path has its own /compact and /new typed into the TUI.
-function postDispatcherControl(op: 'compact' | 'new-session', chat_id: string, message_thread_id?: string): void {
+// set-effort, usage and account (0.5.25) never touch the thread: the
+// dispatcher runs them at once, even mid-turn, and answers through the outbox.
+const CONTROL_TEXT: Record<ControlOp, string> = {
+  'compact': '/context compact', 'new-session': '/clear', 'set-effort': '/effort', 'usage': '/usage', 'account': '/account',
+}
+function postDispatcherControl(op: ControlOp, chat_id: string, message_thread_id?: string, effort?: string): void {
   const seq = `${Date.now()}-${process.pid}-${dispatcherInboxSeq++}`
   const tmp = join(DISPATCHER_INBOX_DIR, `.${seq}.tmp`)
   writeFileSync(tmp, JSON.stringify({
     id: `telegram-control:${op}:${seq}`,
-    text: op === 'compact' ? '/context compact' : '/clear',
+    text: op === 'set-effort' ? `/effort ${effort}` : CONTROL_TEXT[op],
     control: op,
+    ...(op === 'set-effort' ? { effort } : {}),
     route: { source: 'telegram', chat_id, ...(message_thread_id ? { message_thread_id } : {}) },
     received_at: new Date().toISOString(),
   }) + '\n', { mode: 0o600 })
@@ -527,6 +533,64 @@ function contextControlRefusal(): string | null {
     return 'The Codex bridge on this seat is too old for context controls. Restart it (/restart) after the plugin updates.'
   }
   return null
+}
+
+/** Why /effort, /usage or the /account sign-in line cannot run here, or null. */
+function dispatcherControlRefusal(op: ControlOp, cmd: string): string | null {
+  if (PANE_IS_THE_MODEL) {
+    return `This seat runs Codex in its terminal session, so ${cmd} is not available from Telegram here. It needs the dispatcher bridge.`
+  }
+  if (!readHealth(DISPATCHER_STATE_DIR)?.controls?.includes(op)) {
+    return `The Codex bridge on this seat is too old for ${cmd}. Restart it (/restart) after the plugin updates.`
+  }
+  return null
+}
+
+// /effort: the configured level, and what the conversation actually runs when
+// the two differ (a change applies from the next turn), like /status's model.
+function effortText(): string {
+  const configured = readConfigKey('model_reasoning_effort')
+  const h = readHealth(DISPATCHER_STATE_DIR)
+  const updated = h ? Date.parse(h.updatedAt) : NaN
+  const live = h?.schema === HEALTH_SCHEMA && Number.isFinite(updated) && Date.now() - updated <= staleAfterMs(h)
+  const running = live ? h?.threadEffort : undefined
+  const lines = running && configured && running !== configured
+    ? [`🧠 Effort: ${configured}`, `conversation: ${running} (changes at the next turn)`]
+    : [`🧠 Effort: ${configured ?? running ?? 'Codex default'}`]
+  lines.push('', 'Higher thinks longer and uses more of your plan. A change applies from the next turn, no restart.')
+  return lines.join('\n')
+}
+
+const EFFORT_BUTTONS = ['low', 'medium', 'high', 'xhigh'] as const
+const EFFORT_KEYBOARD = (current: string | null) => {
+  const kb = new InlineKeyboard()
+  for (const level of EFFORT_BUTTONS) kb.text(`${level === current ? '✓ ' : ''}${level}`, `eff:${level}`)
+  return kb
+}
+
+// /account, the 5dive half: which 5dive account this agent is bound to, and
+// the accounts that hold Codex credentials. Read-only: switching restarts the
+// agent through a sudo verb this bridge does not port yet, so it says where to
+// switch instead of offering buttons a standard seat would have refused.
+async function accountBindingText(): Promise<string> {
+  let info: any = null
+  let list: any = null
+  try { info = await run5dive(['agent', 'info', agentName(), '--json']) } catch {}
+  try { list = await run5dive(['account', 'list', '--json']) } catch {}
+  const current = info?.data?.authProfile || 'default'
+  const type = String(info?.data?.type || 'codex')
+  const lines = [`🔐 5dive account: ${current}`]
+  const accounts = list?.ok && Array.isArray(list.data) ? list.data as Array<{ name: string; types?: string[] }> : null
+  if (!accounts) {
+    lines.push("Couldn't list this box's accounts.")
+  } else {
+    const scoped = accounts.filter(a => a?.name && (a.name === current || !Array.isArray(a.types) || a.types.includes(type)))
+    lines.push(scoped.length
+      ? `${type} accounts: ${scoped.map(a => a.name === current ? `${a.name} ✓` : a.name).join(', ')}`
+      : `No accounts on this box hold ${type} credentials.`)
+  }
+  lines.push('Switch accounts from the 5dive dashboard.')
+  return lines.join('\n')
 }
 
 function contextText(): string {
@@ -872,6 +936,9 @@ const BOT_COMMANDS: Array<{ command: string; description: string; menuHidden?: b
   { command: 'task',    description: 'Add a task — /task add <title>' },
   { command: 'org',     description: 'Show the agent org chart' },
   { command: 'model',   description: 'Pick model' },
+  { command: 'effort',  description: 'Reasoning effort' },
+  { command: 'usage',   description: 'Plan limits and session tokens' },
+  { command: 'account', description: 'Signed-in account' },
   { command: 'ping',    description: 'Liveness check' },
   { command: 'start',   description: 'Pair this chat' },
 ]
@@ -1561,6 +1628,12 @@ async function reportLoginFork(sid: string, chatId: string, s: AuthState | null,
   }
 }
 
+// The forum topic a command came from, so a control's answer lands there too.
+function topicThread(ctx: Context): string | undefined {
+  return ctx.message && 'is_topic_message' in ctx.message && ctx.message.is_topic_message
+    && ctx.message.message_thread_id != null ? String(ctx.message.message_thread_id) : undefined
+}
+
 // Returns true if this message was handled as a slash command (caller
 // should NOT enqueue it for Codex).
 async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> {
@@ -1633,8 +1706,7 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         const refusal = contextControlRefusal()
         if (refusal) { await md(refusal); return true }
         const sub = cmd === 'clear' ? 'new' : cmdArg.toLowerCase()
-        const thread = ctx.message && 'is_topic_message' in ctx.message && ctx.message.is_topic_message
-          && ctx.message.message_thread_id != null ? String(ctx.message.message_thread_id) : undefined
+        const thread = topicThread(ctx)
         if (sub === 'compact' || sub === 'new') {
           postDispatcherControl(sub === 'compact' ? 'compact' : 'new-session', chat_id, thread)
           // The dispatcher answers when it runs the control. Only say something
@@ -1649,6 +1721,39 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
           reply_markup: CONTEXT_KEYBOARD(),
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         })
+        return true
+      }
+      case 'effort': {
+        const refusal = dispatcherControlRefusal('set-effort', '/effort')
+        if (refusal) { await md(refusal); return true }
+        const level = cmdArg.toLowerCase()
+        if (!level) {
+          await bot.api.sendMessage(chat_id, effortText(), {
+            reply_markup: EFFORT_KEYBOARD(readConfigKey('model_reasoning_effort')),
+            ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+          })
+          return true
+        }
+        if (!(EFFORT_LEVELS as readonly string[]).includes(level)) {
+          await md(`Unknown effort. Pick one of: ${EFFORT_LEVELS.join(', ')}.`)
+          return true
+        }
+        // The dispatcher answers with the result; nothing to say before it.
+        postDispatcherControl('set-effort', chat_id, topicThread(ctx), level)
+        return true
+      }
+      case 'usage': {
+        const refusal = dispatcherControlRefusal('usage', '/usage')
+        if (refusal) { await md(refusal); return true }
+        postDispatcherControl('usage', chat_id, topicThread(ctx))
+        return true
+      }
+      case 'account': {
+        await bot.api.sendMessage(chat_id, await accountBindingText(), {
+          ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+        })
+        // The sign-in line comes from Codex itself, through the dispatcher.
+        if (!dispatcherControlRefusal('account', '/account')) postDispatcherControl('account', chat_id, topicThread(ctx))
         return true
       }
       case 'model': {
@@ -2445,6 +2550,27 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery({
       text: (ctxM[1] === 'compact' ? '🗜 Compacting' : '🆕 Starting a fresh session') + (busy ? ' after the current turn' : '…'),
     }).catch(() => {})
+    return
+  }
+
+  // DIVE-5502: the /effort buttons. Same re-gate as every other tap.
+  const effM = /^eff:(low|medium|high|xhigh)$/.exec(data)
+  if (effM) {
+    if (!loadAccess().allowFrom.includes(String(ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const refusal = dispatcherControlRefusal('set-effort', '/effort')
+    if (refusal) {
+      await ctx.answerCallbackQuery({ text: refusal.slice(0, 190), show_alert: true }).catch(() => {})
+      return
+    }
+    const msg = ctx.callbackQuery.message
+    const thread = msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+      ? String(msg.message_thread_id) : undefined
+    postDispatcherControl('set-effort', String(msg?.chat.id ?? ctx.from.id), thread, effM[1])
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    await ctx.answerCallbackQuery({ text: `🧠 Effort → ${effM[1]}` }).catch(() => {})
     return
   }
 

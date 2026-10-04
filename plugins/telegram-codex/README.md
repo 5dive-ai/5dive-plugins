@@ -54,6 +54,20 @@ posting one. Every model call appends a line to
 `~/.codex/channels/dispatcher/usage.jsonl` (input, cached, output, reasoning,
 context size): the before/after record for these controls.
 
+Phone controls that do not touch the thread (DIVE-5502, v0.5.25) run the
+moment they arrive, even mid-turn; they are never queued behind the running
+turn and never steered into it. `/effort` shows the configured reasoning effort
+(and the conversation's, when a change is still pending) with low / medium /
+high / xhigh buttons; a choice is written through app-server
+`config/value/write` (`model_reasoning_effort`) and passed on the next
+`turn/start`, with no restart. `/usage` reports OpenAI's own rate-limit windows
+(`account/rateLimits/read`: 5h, weekly, used %, reset time, plan, credits) and,
+separately, this session's token counts; it never turns tokens into a quota
+percentage. `/account` shows the Codex sign-in (`account/read`) and the 5dive
+account this agent is bound to, with the box's Codex accounts; switching stays
+on the dashboard for now. The verbs are `set-effort` (with `effort`), `usage`
+and `account`; the last provider report is kept in `health.json` `rateLimits`.
+
 Dashboard delivery keeps using `~/.claude/channels/dashboard/` as a runtime-
 neutral compatibility path because shelld writes durable inbound drops there.
 To attach a local file in dispatcher mode, Codex emits a non-empty caption plus
@@ -295,7 +309,7 @@ Rolling back the whole fleet means reverting on `main`.
 | --------------------- | -------------------------------------- | -------------------------------- |
 | Inbound delivery      | `claude/channel` JSON-RPC notification | app-server `turn/start` / `turn/steer` (MCP polling fallback retained) |
 | Permission relay      | `claude/channel/permission` protocol   | `PermissionRequest` hook + buttons |
-| Slash commands        | `/telegram:configure`, `:access`, …    | bot-side menu (`/help` `/status` `/context` `/stop` `/restart` `/clear` `/agents` `/tasks` `/task` `/org` `/model` `/ping` `/start`) |
+| Slash commands        | `/telegram:configure`, `:access`, …    | bot-side menu (`/help` `/status` `/context` `/stop` `/restart` `/clear` `/agents` `/tasks` `/task` `/org` `/model` `/effort` `/usage` `/account` `/ping` `/start`) |
 | Lifecycle hooks       | PreToolUse, Stop, etc.                 | `Stop` hook ships in `hooks/`    |
 | State dir             | `~/.claude/channels/telegram/`         | `~/.codex/channels/telegram/`    |
 | Pairing flow          | code via DM → `/telegram:access pair`  | `bun pair.ts` standalone CLI     |
@@ -334,3 +348,4 @@ relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
 - v0.5.22 — DIVE-5447: the pinned needs-you banner is off unless the seat sets `TELEGRAM_NEEDS_BANNER=1`. With it off, the bridge unpins and relabels every banner it pinned earlier (from `needs-banner.json`) once at startup and empties the store; gate alerts and `/inbox` are unchanged.
 - v0.5.23 — DIVE-5490: no lone 🎙 before a voice note. When every attached file is audio and the text is emoji-only, the reply sends the files alone; `text` may be empty when files are attached (a files-only send, which the transport guard used to refuse).
 - v0.5.24 — DIVE-5502: `/context` (size, last call's cached share, Compact and Fresh session buttons) and `/clear` on the dispatcher path. Inbox `control` verbs `compact` and `new-session`, advertised in `health.json`; one `usage.jsonl` line per model call.
+- v0.5.25 — DIVE-5502: `/effort` (buttons; applies from the next turn, no restart), `/usage` (OpenAI's 5h and weekly windows, kept apart from session token counts) and read-only `/account` (Codex sign-in and the 5dive account binding) on the dispatcher path. Inbox verbs `set-effort`, `usage`, `account` run at once, even mid-turn; `health.json` carries the last `rateLimits` report.

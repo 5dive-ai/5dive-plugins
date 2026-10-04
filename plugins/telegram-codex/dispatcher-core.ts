@@ -21,15 +21,46 @@ export type DispatchMessage = {
    * burns a turn and resets nothing (the residual 5dive's CLI names on DIVE-4036).
    */
   control?: ControlOp
+  /** The level a `set-effort` control asks for; refused on any other verb. */
+  effort?: string
 }
 
 /**
  * `compact` summarises the live thread in place (the app-server runs it as a
  * turn). `new-session` saves a receipt for the current thread and starts a
  * bounded new one, carrying a one-paragraph handoff into its first turn.
+ *
+ * `set-effort`, `usage` and `account` never touch the thread, so they run the
+ * moment they arrive, even mid-turn: never queued behind the active turn, never
+ * steered into it (IMMEDIATE_CONTROLS).
  */
-export type ControlOp = 'compact' | 'new-session'
-export const CONTROL_OPS: readonly ControlOp[] = ['compact', 'new-session']
+export type ControlOp = 'compact' | 'new-session' | 'set-effort' | 'usage' | 'account'
+export const CONTROL_OPS: readonly ControlOp[] = ['compact', 'new-session', 'set-effort', 'usage', 'account']
+export const IMMEDIATE_CONTROLS: readonly ControlOp[] = ['set-effort', 'usage', 'account']
+
+/** Codex reasoning-effort levels `set-effort` accepts (codex 0.153.3). */
+export const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
+export function isEffortLevel(level: unknown): level is (typeof EFFORT_LEVELS)[number] {
+  return typeof level === 'string' && (EFFORT_LEVELS as readonly string[]).includes(level)
+}
+
+/**
+ * The provider's own rate-limit report (app-server `account/rateLimits/read`
+ * and `account/rateLimits/updated`). Percentages here are OpenAI's numbers; this
+ * bridge never derives one from token counts (the codex audit's item 5).
+ */
+export type RateLimitWindow = { usedPercent: number; windowDurationMins: number | null; resetsAt: number | null }
+export type RateLimitSnapshot = {
+  limitId?: string | null
+  limitName?: string | null
+  primary?: RateLimitWindow | null
+  secondary?: RateLimitWindow | null
+  credits?: { hasCredits: boolean; unlimited: boolean; balance: string | null } | null
+  planType?: string | null
+  rateLimitReachedType?: string | null
+}
+/** The last provider report this dispatcher saw, and when. */
+export type RateLimitRecord = { buckets: RateLimitSnapshot[]; at: string; from: 'read' | 'updated' }
 
 /**
  * The thread's token accounting, as `thread/tokenUsage/updated` last reported
@@ -205,6 +236,147 @@ export function fmtTokens(n: number): string {
   return String(n)
 }
 
+/** `5h`, `weekly`, `3d`: a window named by its length, never by its slot. */
+export function windowName(mins: number | null | undefined, slot: string): string {
+  if (mins == null || !Number.isFinite(mins) || mins <= 0) return slot
+  if (mins === 300) return '5h'
+  if (mins === 10080) return 'weekly'
+  if (mins % 1440 === 0) return `${mins / 1440}d`
+  if (mins % 60 === 0) return `${mins / 60}h`
+  return `${mins}m`
+}
+
+function fmtSpan(ms: number): string {
+  const m = Math.max(0, Math.round(ms / 60_000))
+  const d = Math.floor(m / 1440)
+  const h = Math.floor((m % 1440) / 60)
+  if (d) return `${d}d ${h}h`
+  if (h) return `${h}h ${m % 60}m`
+  return `${m}m`
+}
+
+const DAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** `resets 14:05 UTC (in 2h 10m)` today, `resets Tue 6 Oct 09:00 UTC (in 2d 3h)` later. */
+export function fmtReset(resetsAtSec: number, now: number): string {
+  const at = new Date(resetsAtSec * 1000)
+  if (Number.isNaN(at.getTime())) return ''
+  const hhmm = at.toISOString().slice(11, 16)
+  const today = at.toISOString().slice(0, 10) === new Date(now).toISOString().slice(0, 10)
+  const when = today ? `${hhmm} UTC` : `${DAY[at.getUTCDay()]} ${at.getUTCDate()} ${MON[at.getUTCMonth()]} ${hhmm} UTC`
+  const left = at.getTime() - now
+  return left > 0 ? `resets ${when} (in ${fmtSpan(left)})` : `reset at ${when}`
+}
+
+function planName(plan: unknown): string {
+  return typeof plan === 'string' && plan ? plan.replace(/_/g, ' ') : ''
+}
+
+function bucketLines(b: RateLimitSnapshot, now: number): string[] {
+  const lines: string[] = []
+  for (const [slot, w] of [['primary', b.primary], ['secondary', b.secondary]] as const) {
+    if (!w || !Number.isFinite(Number(w.usedPercent))) continue
+    const reset = w.resetsAt != null ? fmtReset(Number(w.resetsAt), now) : ''
+    lines.push(`${windowName(w.windowDurationMins, slot)}: ${Math.round(Number(w.usedPercent))}% used${reset ? ` · ${reset}` : ''}`)
+  }
+  if (!lines.length) lines.push('no usage windows reported for this account')
+  const c = b.credits
+  if (c?.unlimited) lines.push('credits: unlimited')
+  else if (c?.hasCredits && c.balance) lines.push(`credits: ${c.balance}`)
+  if (b.rateLimitReachedType) lines.push(`⚠️ limit reached (${b.rateLimitReachedType.replace(/_/g, ' ')})`)
+  return lines
+}
+
+function providerLines(buckets: RateLimitSnapshot[], now: number): string[] {
+  const lines: string[] = []
+  const plan = planName(buckets.find(b => b.planType)?.planType)
+  if (plan) lines.push(`plan: ${plan}`)
+  for (const b of buckets) {
+    if (buckets.length > 1) lines.push(`${b.limitName || b.limitId || 'limit'}:`)
+    lines.push(...bucketLines(b, now))
+  }
+  return lines
+}
+
+/** The read's buckets, the backward-compatible single view first. */
+export function rateLimitBuckets(read: any): RateLimitSnapshot[] | null {
+  const main = read?.rateLimits && typeof read.rateLimits === 'object' ? read.rateLimits as RateLimitSnapshot : undefined
+  const out: RateLimitSnapshot[] = main ? [main] : []
+  const by = read?.rateLimitsByLimitId
+  if (by && typeof by === 'object') {
+    for (const b of Object.values(by) as RateLimitSnapshot[]) {
+      if (!b || typeof b !== 'object') continue
+      if (out.some(o => (o.limitId ?? null) === (b.limitId ?? null))) continue
+      out.push(b)
+    }
+  }
+  return out.length ? out : null
+}
+
+const AUTH_REQUIRED = /authentication required|not (?:signed|logged) in|unauthori[sz]ed|\b401\b/i
+
+/**
+ * The /usage reply. Two blocks that are never mixed: what OpenAI reports about
+ * the plan's windows, and this session's token counts. A percentage only ever
+ * comes from the provider; token counts stay counts (codex audit, item 5).
+ */
+export function usageReport(o: {
+  buckets?: RateLimitSnapshot[] | null
+  error?: string
+  cached?: RateLimitRecord
+  context?: ContextUsage
+  now: number
+}): string {
+  const lines = ['📊 Usage', '', 'Provider-reported (OpenAI):']
+  if (o.buckets?.length) {
+    lines.push(...providerLines(o.buckets, o.now))
+  } else {
+    if (o.error && AUTH_REQUIRED.test(o.error)) {
+      lines.push('not available: Codex is not signed in with a ChatGPT plan, so OpenAI reports no plan limits.')
+    } else {
+      lines.push(`could not read it (${o.error || 'Codex returned no usage windows'}).`)
+    }
+    if (o.cached?.buckets.length) {
+      lines.push(`last report, ${o.cached.at.slice(11, 16)} UTC:`, ...providerLines(o.cached.buckets, o.now))
+    }
+  }
+  lines.push('', 'This session (token counts, not quota):')
+  const c = o.context
+  if (!c) {
+    lines.push('no model call on this session yet')
+  } else {
+    lines.push(`last call: ${fmtTokens(c.lastInput)} in, ${fmtTokens(c.lastCached)} cached, ${fmtTokens(c.lastOutput)} out`)
+    lines.push(`model calls: ${c.calls} · in context ~${fmtTokens(c.inContext)}`)
+  }
+  return lines.join('\n')
+}
+
+/** The /account identity line, from app-server `account/read`. */
+export function accountReport(read: any, error?: string): string {
+  if (error) return `Codex sign-in: could not read it (${error}).`
+  const a = read?.account
+  if (a?.type === 'chatgpt') {
+    const plan = planName(a.planType)
+    return `👤 Codex sign-in: ChatGPT${a.email ? `, ${a.email}` : ''}${plan ? ` (plan: ${plan})` : ''}.`
+  }
+  if (a?.type === 'apiKey') return '🔑 Codex sign-in: an OpenAI API key (billed per token, no plan limits).'
+  if (a?.type === 'amazonBedrock') return '☁️ Codex sign-in: Amazon Bedrock.'
+  if (a && typeof a.type === 'string') return `Codex sign-in: ${a.type}.`
+  return read?.requiresOpenaiAuth === false
+    ? 'Codex sign-in: none needed for this provider.'
+    : '⚠️ Codex sign-in: not signed in.'
+}
+
+/** Sparse update: a null field is "not in this update", never "cleared". */
+function mergeSnapshot(prev: RateLimitSnapshot | undefined, next: RateLimitSnapshot): RateLimitSnapshot {
+  const out: RateLimitSnapshot = { ...(prev ?? {}) }
+  for (const [k, v] of Object.entries(next ?? {})) {
+    if (v !== null && v !== undefined) (out as Record<string, unknown>)[k] = v
+  }
+  return out
+}
+
 function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?: string): Array<Record<string, unknown>> {
   const input: Array<Record<string, unknown>> = []
   if (recovery) input.push({ type: 'text', text: recoveryLine(recovery), text_elements: [] })
@@ -244,6 +416,8 @@ export class ChannelDispatcher {
   /** The seat config's choice, read once per start: a model switch is a config
    *  write plus a restart, so a restart is exactly when it can change. */
   private configured: ModelSelection = {}
+  /** The last provider rate-limit report (in memory; a restart re-reads). */
+  private limits?: RateLimitRecord
 
   constructor(
     private readonly rpc: RpcPort,
@@ -352,7 +526,13 @@ export class ChannelDispatcher {
     })
   }
 
-  async submit(message: DispatchMessage): Promise<'started' | 'steered' | 'queued' | 'duplicate'> {
+  /** What OpenAI last reported about the plan's windows, if anything. */
+  rateLimits(): RateLimitRecord | undefined {
+    return this.limits ? structuredClone(this.limits) : undefined
+  }
+
+  async submit(message: DispatchMessage): Promise<'started' | 'steered' | 'queued' | 'duplicate' | 'ran'> {
+    if (message.control && IMMEDIATE_CONTROLS.includes(message.control)) return this.runImmediate(message)
     return this.enqueueSerial(async () => {
       if (this.state.seen.includes(message.id) || this.state.pending.some(m => m.id === message.id)
         || this.state.active?.message.id === message.id) return 'duplicate'
@@ -393,6 +573,74 @@ export class ChannelDispatcher {
     })
   }
 
+  /**
+   * A control that does not touch the thread runs now, outside the turn queue:
+   * an effort change or a usage read must not wait behind a long turn, and is
+   * never steered into it. Only the dedup bookkeeping takes the serial lock, so
+   * a slow provider read never holds up the running turn's events.
+   */
+  private async runImmediate(message: DispatchMessage): Promise<'ran' | 'duplicate'> {
+    const dup = await this.enqueueSerial(async () => {
+      if (this.state.seen.includes(message.id)) return true
+      this.markSeen(message.id)
+      this.persist()
+      return false
+    })
+    if (dup) return 'duplicate'
+    const route = message.route
+    if (message.control === 'set-effort') {
+      await this.setEffort(message)
+    } else if (message.control === 'usage') {
+      let read: any
+      let error: string | undefined
+      try { read = await this.rpc.request('account/rateLimits/read', {}) } catch (err) { error = errText(err) }
+      const buckets = error ? null : rateLimitBuckets(read)
+      if (buckets) this.limits = { buckets, at: new Date().toISOString(), from: 'read' }
+      const ctx = this.state.context?.threadId === this.state.threadId ? this.state.context : undefined
+      await this.sink.publish(route, usageReport({ buckets, error, cached: this.limits, context: ctx, now: Date.now() }),
+        { turnId: '', kind: error ? 'error' : 'control' })
+    } else {
+      let read: any
+      let error: string | undefined
+      try { read = await this.rpc.request('account/read', {}) } catch (err) { error = errText(err) }
+      await this.sink.publish(route, accountReport(read, error), { turnId: '', kind: error ? 'error' : 'control' })
+    }
+    return 'ran'
+  }
+
+  /**
+   * Writes `model_reasoning_effort` through the app-server (config.toml, so a
+   * restart keeps it) and moves the configured effort the next `turn/start`
+   * passes. The running turn keeps the effort it started with.
+   */
+  private async setEffort(message: DispatchMessage): Promise<void> {
+    const route = message.route
+    const level = message.effort
+    if (!isEffortLevel(level)) {
+      await this.sink.publish(route, `Unknown effort "${String(level ?? '')}". Pick one of: ${EFFORT_LEVELS.join(', ')}.`,
+        { turnId: '', kind: 'error' })
+      return
+    }
+    const before = this.configured.effort ?? this.state.threadModel?.effort
+    let res: any
+    try {
+      res = await this.rpc.request('config/value/write', { keyPath: 'model_reasoning_effort', value: level, mergeStrategy: 'replace' })
+      if (res?.status !== 'ok' && res?.status !== 'okOverridden') throw new Error('Codex did not confirm the config write')
+    } catch (err) {
+      await this.sink.publish(route, `Could not change effort: ${errText(err)}. Still ${before ?? 'the default'}.`,
+        { turnId: '', kind: 'error' })
+      return
+    }
+    this.configured = { ...this.configured, effort: level }
+    const running = Boolean(this.state.active && !this.state.active.message.control)
+    const effective = res.status === 'okOverridden' ? res.overriddenMetadata?.effectiveValue : undefined
+    const override = typeof effective === 'string' && effective !== level
+      ? ` Another config layer sets ${effective}, so a restart goes back to it.` : ''
+    await this.sink.publish(route, running
+      ? `🧠 Effort now ${level}. It applies from the next turn; the running turn keeps ${before ?? 'its effort'}.${override}`
+      : `🧠 Effort now ${level}, from the next turn.${override}`, { turnId: '', kind: 'control' })
+  }
+
   /** Control verbs this dispatcher executes; advertised in health. */
   controls(): readonly ControlOp[] {
     return CONTROL_OPS
@@ -418,7 +666,12 @@ export class ChannelDispatcher {
       this.persist()
       return
     }
-    // new-session
+    if (op !== 'new-session') {
+      // Immediate verbs never reach the turn queue (submit runs them at once);
+      // one found here is a stray, and is dropped rather than read as a reset.
+      this.persist()
+      return
+    }
     const previous = this.state.threadId
     const usage = this.state.context?.threadId === previous ? this.state.context : undefined
     if (previous) {
@@ -490,6 +743,16 @@ export class ChannelDispatcher {
         // The app-server swapped the model mid-turn; effort is unchanged by it.
         this.recordModel('model/rerouted', params?.toModel, this.state.threadModel?.effort)
         this.persist()
+        return
+      }
+      if (method === 'account/rateLimits/updated' && params?.rateLimits && typeof params.rateLimits === 'object') {
+        // Sparse, per bucket: merge into the bucket it names (or the only one).
+        const next = params.rateLimits as RateLimitSnapshot
+        const buckets = [...(this.limits?.buckets ?? [])]
+        const i = buckets.findIndex(b => !next.limitId || !b.limitId || b.limitId === next.limitId)
+        if (i >= 0) buckets[i] = mergeSnapshot(buckets[i], next)
+        else buckets.push(mergeSnapshot(undefined, next))
+        this.limits = { buckets, at: new Date().toISOString(), from: 'updated' }
         return
       }
       if (method === 'thread/tokenUsage/updated' && params?.threadId === this.state.threadId) {
@@ -573,6 +836,10 @@ export class ChannelDispatcher {
     // reported the old one), and the app-server sends no settings event for it.
     if (this.configured.model) {
       this.recordModel('turn/start', this.configured.model, this.configured.effort ?? this.state.threadModel?.effort)
+    } else if (this.configured.effort && this.state.threadModel?.model) {
+      // An effort-only override (a /effort with no model pinned) is the
+      // thread's effort from this turn on, the same way.
+      this.recordModel('turn/start', this.state.threadModel.model, this.configured.effort)
     }
     // Consumed only once the turn it rode on actually exists: a `turn/start`
     // that threw leaves the context in state for the retry.

@@ -7,6 +7,10 @@ ordered by UX criticality unless noted.
 
 ## Still open
 
+- `/account` switching from Telegram. 0.5.25 is read-only: switching runs
+  `5dive agent set-account` (a restart, and a sudo verb on standard seats that
+  needs the Claude plugin's `_self_account` gating, DIVE-5220/5367). Port that
+  gating before offering buttons.
 - Republish `@5dive/telegram-codex-mcp` on npm. 0.5.7 is the newest published
   version, and `.mcp.json` pins it for the Codex plugin install. Publishing
   needs the npm credential.
@@ -30,6 +34,12 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.25 — DIVE-5502: `/effort`, `/usage` and `/account` on the dispatcher
+  path. Inbox verbs `set-effort`, `usage` and `account` run at once, even
+  mid-turn: an effort change is written with `config/value/write` and applies
+  from the next `turn/start`; `/usage` shows OpenAI's own windows and, apart,
+  the session's token counts; `/account` shows the Codex sign-in and the 5dive
+  binding. Account switching from Telegram is still a follow-up (see below).
 - v0.5.24 — DIVE-5502: context controls on the dispatcher path. `/context`
   shows the session's size (from app-server token accounting), the last model
   call's input/cached/output and the call count, with Compact and Fresh session

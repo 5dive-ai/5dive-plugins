@@ -7,7 +7,7 @@ import {
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
-  CONTROL_OPS, ChannelDispatcher, parseOutboundMessage, type DispatchMessage, type DispatchRoute, type UsageSample,
+  CONTROL_OPS, ChannelDispatcher, isEffortLevel, parseOutboundMessage, type DispatchMessage, type DispatchRoute, type UsageSample,
 } from './dispatcher-core.ts'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import {
@@ -139,6 +139,7 @@ function publishHealth(): void {
           lastCached: ctx.lastCached, lastOutput: ctx.lastOutput, calls: ctx.calls, at: ctx.at }
       : undefined
     health.lastSession = snap.sessions?.at(-1)
+    health.rateLimits = dispatcher.rateLimits()
     health.active = snap.active
       ? { turnId: snap.active.turnId, source: snap.active.route.source, startedAt: health.active?.turnId === snap.active.turnId ? health.active.startedAt : new Date().toISOString() }
       : undefined
@@ -333,6 +334,14 @@ function ingest(name: string): void {
   }
   if (msg?.control !== undefined && !CONTROL_OPS.includes(msg.control)) {
     process.stderr.write(`codex-dispatcher: unknown control verb in ${name}\n`)
+    try { unlinkSync(full) } catch {}
+    return
+  }
+  // `effort` rides `set-effort` only, and only as a level Codex knows: a stray
+  // or misspelled one is refused here rather than written into config.toml.
+  if ((msg?.effort !== undefined && msg?.control !== 'set-effort')
+    || (msg?.control === 'set-effort' && !isEffortLevel(msg?.effort))) {
+    process.stderr.write(`codex-dispatcher: invalid effort in ${name}\n`)
     try { unlinkSync(full) } catch {}
     return
   }
