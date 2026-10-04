@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Added — telegram-codex 0.5.26: Codex approvals as Telegram buttons on the dispatcher path (DIVE-5504)
+
+A Codex agent run by the dispatcher declined every command or file change its approval policy asked about, unseen, so a seat on an asking policy could not run a command from the phone. Now the dispatcher asks on Telegram with ✅/❌ buttons, in the chat the turn came from (else the owner's DM), using the same request/answer files as the approval hook. A tap resumes the waiting request and names who answered; no answer within 2 minutes (`CODEX_TG_APPROVAL_TIMEOUT_MS`) or no Telegram channel declines it and tells Codex why, and the prompt then says it expired. A late tap is refused. The seat's approval policy still decides whether Codex asks at all. Covers `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `execCommandApproval` and `applyPatchApproval`; other server requests keep their old answer.
+
 ### Added — telegram-codex 0.5.25: /effort, /usage and /account from the phone (DIVE-5502)
 
 A Codex agent's owner could not change its reasoning effort, see its plan limits or see which account it runs on without a terminal. Now `/effort` shows the effort level with low, medium, high and xhigh buttons; a tap saves it to the Codex config and the next turn uses it, with no restart, while the running turn keeps its old level. `/usage` shows OpenAI's own numbers (the 5-hour and weekly windows, how much is used, when each resets, the plan and any credits) and, in a separate block, this session's token counts, which are never turned into a quota percentage. `/account` shows who Codex is signed in as and which 5dive account the agent is bound to; switching accounts still happens on the dashboard. All three run at once, even in the middle of a turn, and a seat that runs Codex in its terminal says it cannot do this from Telegram.

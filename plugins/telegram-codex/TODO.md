@@ -34,6 +34,9 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.26 — DIVE-5504: Codex approval requests on the dispatcher path go to
+  Telegram buttons instead of an unseen decline (`approvals.ts`); timeout and
+  no-adapter stay explicit declines; the seat's approval policy is untouched.
 - v0.5.25 — DIVE-5502: `/effort`, `/usage` and `/account` on the dispatcher
   path. Inbox verbs `set-effort`, `usage` and `account` run at once, even
   mid-turn: an effort change is written with `config/value/write` and applies

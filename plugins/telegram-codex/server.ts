@@ -2372,6 +2372,7 @@ type PendingApproval = {
 }
 
 const pendingApprovals = new Map<string, PendingApproval>() // key = callback prefix
+const approvalsPrompted = new Set<string>()
 
 function shortToolDesc(req: any): string {
   const tool = req.tool_name ?? 'tool'
@@ -2399,8 +2400,10 @@ async function broadcastApproval(reqPath: string) {
     return
   }
 
+  const verb = req.tool_name === 'Edit' ? 'change files' : 'run'
+  const why = typeof req.reason === 'string' && req.reason ? `\n${req.reason.slice(0, 300)}` : ''
   const body =
-    `🔐 *Codex wants to run:*\n${shortToolDesc(req)}\n\n` +
+    `🔐 *Codex wants to ${verb}:*\n${shortToolDesc(req)}${why}\n\n` +
     `_cwd: ${req.cwd ?? '?'} · model: ${req.model ?? '?'}_`
 
   const kb = new InlineKeyboard()
@@ -2408,14 +2411,37 @@ async function broadcastApproval(reqPath: string) {
     .text('❌ deny',  `tgcodex:deny:${reqId}`)
 
   // DM the first allowFrom user. (We pick one chat to avoid double-decisions
-  // from multiple recipients racing each other on the same request.)
-  const chat_id = access.allowFrom[0]
+  // from multiple recipients racing each other on the same request.) A
+  // dispatcher request names the chat its turn came from (DIVE-5504): asked
+  // there, as long as that chat is one this bot may write to.
+  let chat_id = access.allowFrom[0]!
+  let threadOpt: { message_thread_id?: number } = {}
+  if (typeof req.chat_id === 'string' && req.chat_id) {
+    try {
+      assertAllowedChat(req.chat_id)
+      chat_id = req.chat_id
+      if (req.message_thread_id) threadOpt = { message_thread_id: Number(req.message_thread_id) }
+    } catch {}
+  }
+  // fs.watch fires on create AND on write: one request, one prompt.
+  if (approvalsPrompted.has(reqId)) return
+  approvalsPrompted.add(reqId)
+  if (approvalsPrompted.size > 256) approvalsPrompted.delete(approvalsPrompted.values().next().value!)
   try {
-    const sent = await bot.api.sendMessage(chat_id, body, {
-      parse_mode: 'Markdown',
-      reply_markup: kb,
-    })
+    // A command with a backtick or an underscore breaks Markdown, and a prompt
+    // that never arrives is a silent decline two minutes later: plain text then.
+    const sent = await bot.api.sendMessage(chat_id, body, { parse_mode: 'Markdown', reply_markup: kb, ...threadOpt })
+      .catch(() => bot.api.sendMessage(chat_id, body.replace(/[*_`]/g, ''), { reply_markup: kb, ...threadOpt }))
     pendingApprovals.set(reqId, { reqId, chat_id, message_id: sent.message_id })
+    const expires = Date.parse(String(req.expires_at ?? ''))
+    if (Number.isFinite(expires)) {
+      setTimeout(() => {
+        if (!pendingApprovals.has(reqId)) return
+        pendingApprovals.delete(reqId)
+        void bot.api.editMessageText(chat_id, sent.message_id, '⌛ No answer in time, so Codex was told no.', { reply_markup: undefined })
+          .catch(() => {})
+      }, Math.max(0, expires - Date.now()) + 1_000).unref?.()
+    }
   } catch (err) {
     process.stderr.write(`telegram-codex: failed to send approval prompt for ${reqId}: ${err}\n`)
   }
@@ -2932,6 +2958,14 @@ bot.on('callback_query:data', async ctx => {
 
   const pending = pendingApprovals.get(reqId)
   pendingApprovals.delete(reqId)
+
+  // Nobody waits on a request whose file is gone (it timed out and was
+  // declined): say so instead of writing an answer no one will read.
+  if (!/^[A-Za-z0-9_-]+$/.test(reqId) || !existsSync(join(PERMS_DIR, `req-${reqId}.json`))) {
+    await ctx.answerCallbackQuery({ text: 'This request expired; Codex was already told no.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    return
+  }
 
   // Write the response file (the hook polls for it).
   const resPath = join(PERMS_DIR, `res-${reqId}.json`)

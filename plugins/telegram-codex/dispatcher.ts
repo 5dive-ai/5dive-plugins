@@ -10,6 +10,7 @@ import {
   CONTROL_OPS, ChannelDispatcher, isEffortLevel, parseOutboundMessage, type DispatchMessage, type DispatchRoute, type UsageSample,
 } from './dispatcher-core.ts'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
+import { approvalAsk, approvalResult, askOnTelegram, isApprovalMethod, verdictLine } from './approvals.ts'
 import {
   HEALTH_HEARTBEAT_MS, HEALTH_SCHEMA, writeHealth,
   type ChannelHealth, type HealthFailure,
@@ -158,6 +159,9 @@ class JsonRpcProcess {
   private nextId = 1
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>()
   onNotification: (method: string, params: any) => void = () => {}
+  /** Answers a server request; resolves the JSON-RPC result, or null for
+   *  "not handled" (sent as method-not-found). Never leaves one hanging. */
+  onServerRequest: (method: string, params: any) => Promise<Record<string, unknown> | null> = async () => null
 
   constructor() {
     this.child = spawn(CODEX_BIN, [
@@ -194,19 +198,16 @@ class JsonRpcProcess {
           if (msg.error) waiter.reject(new Error(String(msg.error.message ?? 'app-server request failed')))
           else waiter.resolve(msg.result)
         } else if (msg.id != null && typeof msg.method === 'string') {
-          // The dispatcher has no local approval UI. Preserve the configured
-          // app-server policy and fail closed instead of overriding it to
-          // danger-full-access or leaving a server request hanging forever.
-          let result: Record<string, unknown> | null = null
-          if (msg.method === 'item/commandExecution/requestApproval'
-            || msg.method === 'item/fileChange/requestApproval') result = { decision: 'decline' }
-          if (msg.method === 'execCommandApproval' || msg.method === 'applyPatchApproval') {
-            result = { decision: { denied: { rejection: 'dispatcher has no interactive approval client' } } }
+          // Answered off the read loop: an approval waits on a person, and the
+          // turn's other events must keep flowing meanwhile (DIVE-5504).
+          const id = msg.id
+          const answer = (result: Record<string, unknown> | null) => {
+            const response = result
+              ? { id, result }
+              : { id, error: { code: -32601, message: 'dispatcher does not handle this server request' } }
+            try { this.child.stdin.write(`${JSON.stringify(response)}\n`) } catch {}
           }
-          const response = result
-            ? { id: msg.id, result }
-            : { id: msg.id, error: { code: -32601, message: 'dispatcher does not handle this server request' } }
-          this.child.stdin.write(`${JSON.stringify(response)}\n`)
+          void this.onServerRequest(msg.method, msg.params).then(answer, () => answer(null))
         } else if (typeof msg.method === 'string') {
           this.onNotification(msg.method, msg.params)
         }
@@ -295,6 +296,36 @@ async function configuredModel() {
 }
 
 const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, usage: recordUsageSample }, WORKDIR, configuredModel)
+
+// ── approvals (DIVE-5504) ───────────────────────────────────────────────────
+//
+// The seat's approval policy decides WHETHER Codex asks; this decides only who
+// answers. With the Telegram adapter up, the owner gets ✅/❌ buttons (the same
+// handshake as hooks/request-permission.ts); without it, or with no answer in
+// time, the request is declined and the reason reaches the model.
+const TELEGRAM_PERMS_DIR = join(process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.codex', 'channels', 'telegram'), 'permissions')
+async function answerServerRequest(method: string, params: any): Promise<Record<string, unknown> | null> {
+  if (!isApprovalMethod(method)) return null
+  const ask = approvalAsk(method, params)
+  const active = dispatcher.snapshot().active
+  let verdict
+  if (!CHANNELS.has('telegram') || !health.listening.includes('telegram')) {
+    verdict = { behavior: 'unavailable' as const, why: 'no Telegram channel is up to ask the owner' }
+  } else {
+    try { mkdirSync(TELEGRAM_PERMS_DIR, { recursive: true, mode: 0o700 }) } catch {}
+    verdict = await askOnTelegram({
+      permsDir: TELEGRAM_PERMS_DIR,
+      ask,
+      ...(active?.route.source === 'telegram'
+        ? { route: { chat_id: active.route.chat_id, ...(active.route.message_thread_id ? { message_thread_id: active.route.message_thread_id } : {}) } }
+        : {}),
+      model: dispatcher.snapshot().threadModel?.model,
+    })
+  }
+  process.stderr.write(`codex-dispatcher: ${method} ${verdictLine(verdict)}\n`)
+  return approvalResult(method, verdict)
+}
+rpc.onServerRequest = answerServerRequest
 rpc.onNotification = (method, params) => {
   void dispatcher.notification(method, params).catch(err => fatal(`event ${method} failed: ${err}`))
 }
