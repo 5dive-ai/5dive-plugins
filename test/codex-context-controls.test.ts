@@ -172,16 +172,50 @@ describe('Codex context controls (DIVE-5502)', () => {
     expect(await h.dispatcher.submit(tg('m1'))).toBe('started')
   })
 
-  test('a compaction whose turn never starts stops holding the queue after two minutes', async () => {
+  test('a compaction whose turn never starts releases the queue in order after two minutes', async () => {
     setSystemTime(new Date('2026-10-04T10:00:00Z'))
     const h = harness()
     await h.dispatcher.initialize()
     await h.dispatcher.submit(control('c1', 'compact'))
     expect(await h.dispatcher.submit(tg('m1'))).toBe('queued')
     setSystemTime(new Date('2026-10-04T10:02:01Z'))
-    expect(await h.dispatcher.submit(tg('m2'))).toBe('started')
-    // The message queued behind the lost compaction is not dropped.
-    expect(h.persisted().pending.map(m => m.id)).toEqual(['m1'])
+    // m1 waited longer, so it starts; m2 queues behind its turn.
+    expect(await h.dispatcher.submit(tg('m2'))).toBe('queued')
+    expect(turnStarts(h).map(r => r.params.clientUserMessageId)).toEqual(['m1'])
+    expect(h.persisted().pending.map(m => m.id)).toEqual(['m2'])
+    await h.dispatcher.notification('turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } })
+    expect(turnStarts(h).map(r => r.params.clientUserMessageId)).toEqual(['m1', 'm2'])
+  })
+
+  test('a /clear queued behind a lost compaction still runs before the next message', async () => {
+    setSystemTime(new Date('2026-10-04T10:00:00Z'))
+    const h = harness()
+    await h.dispatcher.initialize()
+    await h.dispatcher.submit(control('c1', 'compact'))
+    expect(await h.dispatcher.submit(control('c2', 'new-session'))).toBe('queued')
+    setSystemTime(new Date('2026-10-04T10:02:01Z'))
+    expect(await h.dispatcher.submit(tg('x', 'do X'))).toBe('started')
+    const [x] = turnStarts(h)
+    expect(x!.params.clientUserMessageId).toBe('x')
+    expect(x!.params.threadId).toBe('thread-2')
+    expect(h.persisted().sessions!.map(r => r.threadId)).toEqual(['thread-1'])
+    expect(h.persisted().pending).toEqual([])
+  })
+
+  test('the clock releases a lost compaction with no new inbound', async () => {
+    setSystemTime(new Date('2026-10-04T10:00:00Z'))
+    const h = harness()
+    await h.dispatcher.initialize()
+    await h.dispatcher.submit(control('c1', 'compact'))
+    expect(await h.dispatcher.submit(tg('m1'))).toBe('queued')
+    setSystemTime(new Date('2026-10-04T10:01:00Z'))
+    await h.dispatcher.tick()
+    expect(turnStarts(h)).toEqual([])
+    setSystemTime(new Date('2026-10-04T10:10:00Z'))
+    await h.dispatcher.tick()
+    expect(turnStarts(h).map(r => r.params.clientUserMessageId)).toEqual(['m1'])
+    expect(h.persisted().compacting).toBeUndefined()
+    expect(h.persisted().pending).toEqual([])
   })
 
   test('a new session that cannot start keeps the current thread', async () => {
