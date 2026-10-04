@@ -148,6 +148,12 @@ const LAST_REPLY_FILE = join(STATE_DIR, 'last-reply.stamp')
 // when an inbound arrived that wasn't replied to, so the idle wait_for_message
 // loop (which finishes a turn every few minutes with no real work) stays silent.
 const LAST_INBOUND_FILE = join(STATE_DIR, 'last-inbound.stamp')
+// DIVE-5505: the dispatcher path's own pair, so /status sees its activity.
+// Kept apart from the two above on purpose: the Stop hook (notify-stop.ts)
+// reads those, and a dispatcher turn can end before its answer leaves the
+// outbox, which would read as "inbound left unanswered" and ping every turn.
+const DISPATCH_INBOUND_FILE = join(STATE_DIR, 'dispatch-inbound.stamp')
+const DISPATCH_REPLY_FILE = join(STATE_DIR, 'dispatch-reply.stamp')
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
@@ -479,6 +485,7 @@ function enqueueInbound(msg: InboundMsg) {
       received_at: msg.ts,
     }) + '\n', { mode: 0o600 })
     renameSync(tmp, dest)
+    try { writeFileSync(DISPATCH_INBOUND_FILE, String(Date.now())) } catch {}
     return
   }
   // While the agent is in a detected stall (quota/auth/wedge) it can't run a
@@ -796,6 +803,8 @@ function ingestDispatcherOutbox(name: string): void {
     }
     try { unlinkSync(full) } catch {}
     outboxAttachPlans.delete(name)
+    // The turn's answer, not its silent commentary, is what makes it "replied".
+    if (obj.notify !== false) try { writeFileSync(DISPATCH_REPLY_FILE, String(Date.now())) } catch {}
     logMessage(String(obj.chat_id), 'out', agentName(), plan!.receipt ? `${text}\n[${plan!.receipt}]` : text,
       obj.message_thread_id ? { thread_id: String(obj.message_thread_id) } : {})
     if (plan!.receipt) process.stderr.write(`telegram-codex: dispatcher reply ${name} ${plan!.receipt}\n`)
@@ -1064,10 +1073,18 @@ function fmtVer(raw: string): string {
 // Listening vs working, from the inbound/reply stamps (same signal the Stop
 // hook uses): "working" only when the latest inbound hasn't been replied to
 // yet. Avoids the racy wait_for_message-waiter check.
+function readStamp(file: string): number {
+  try { return Number(readFileSync(file, 'utf8')) || 0 } catch { return 0 }
+}
+/** Latest inbound and reply, over the pane and dispatcher stamps (DIVE-5505). */
+function activityStamps(): { li: number; lr: number } {
+  return {
+    li: Math.max(readStamp(LAST_INBOUND_FILE), readStamp(DISPATCH_INBOUND_FILE)),
+    lr: Math.max(readStamp(LAST_REPLY_FILE), readStamp(DISPATCH_REPLY_FILE)),
+  }
+}
 function bridgeStatus(): string {
-  let li = 0, lr = 0
-  try { li = Number(readFileSync(LAST_INBOUND_FILE, 'utf8')) || 0 } catch {}
-  try { lr = Number(readFileSync(LAST_REPLY_FILE, 'utf8')) || 0 } catch {}
+  const { li, lr } = activityStamps()
   return li > lr ? '🟡 working' : '🟢 listening'
 }
 
@@ -1113,9 +1130,7 @@ function agentWorkdir(): string | undefined {
 
 // Most recent bridge activity (inbound or reply), epoch ms, or null.
 function lastActivityMs(): number | null {
-  let li = 0, lr = 0
-  try { li = Number(readFileSync(LAST_INBOUND_FILE, 'utf8')) || 0 } catch {}
-  try { lr = Number(readFileSync(LAST_REPLY_FILE, 'utf8')) || 0 } catch {}
+  const { li, lr } = activityStamps()
   const m = Math.max(li, lr)
   return m > 0 ? m : null
 }

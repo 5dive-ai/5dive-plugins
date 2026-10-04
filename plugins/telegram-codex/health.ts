@@ -320,6 +320,9 @@ export function modelStatusLines(
   const live = health?.schema === HEALTH_SCHEMA && Number.isFinite(updated)
     && now - updated <= staleAfterMs(health)
   if (!live || !health?.threadModel) return lines
+  // DIVE-5505: no model in config.toml (after `agent switch`) means Codex's
+  // default, and there is nothing for the conversation to differ from.
+  if (!configured.model) return [`model: ${fmt(health.threadModel, health.threadEffort ?? configured.effort)} (default)`]
   const sameModel = health.threadModel === configured.model
   const sameEffort = !configured.effort || !health.threadEffort || health.threadEffort === configured.effort
   if (sameModel && sameEffort) return lines

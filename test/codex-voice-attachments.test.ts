@@ -165,3 +165,35 @@ describe('server.ts wiring', () => {
     expect(pkg.files).toContain('inbound-media.ts')
   })
 })
+
+// DIVE-5505 item 4: /status said "last activity: (none this session)" on a
+// dispatcher seat mid-answer, because only the MCP tool handlers (pane path)
+// wrote the stamps. The dispatcher path writes its OWN pair: the Stop hook reads
+// last-inbound/last-reply, and a dispatcher turn can end before its answer has
+// left the outbox, which would read as "unanswered" and ping every turn.
+describe('dispatcher-path activity stamps', () => {
+  const src = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram-codex', 'server.ts'), 'utf8')
+  const fn = (name: string) => src.slice(src.indexOf(`function ${name}(`), src.indexOf('\n}\n', src.indexOf(`function ${name}(`)))
+
+  test('the dispatcher enqueue stamps dispatch-inbound once the inbox file is in place', () => {
+    const branch = fn('enqueueInbound').split('if (!PANE_IS_THE_MODEL) {')[1].split('\n    return\n')[0]
+    expect(branch).toMatch(/renameSync\(tmp, dest\)\n\s*try \{ writeFileSync\(DISPATCH_INBOUND_FILE, String\(Date\.now\(\)\)\) \} catch \{\}/)
+  })
+
+  test('the outbox stamps dispatch-reply after a sent answer, not after silent commentary', () => {
+    const body = fn('ingestDispatcherOutbox')
+    const sent = body.indexOf('await bot.api.sendMessage(')
+    const stamp = body.indexOf("if (obj.notify !== false) try { writeFileSync(DISPATCH_REPLY_FILE, String(Date.now())) } catch {}")
+    expect(sent).toBeGreaterThan(0)
+    expect(stamp).toBeGreaterThan(sent)
+  })
+
+  test('/status reads both pairs; the Stop hook still reads only the pane pair', () => {
+    expect(fn('activityStamps')).toContain('Math.max(readStamp(LAST_INBOUND_FILE), readStamp(DISPATCH_INBOUND_FILE))')
+    expect(fn('activityStamps')).toContain('Math.max(readStamp(LAST_REPLY_FILE), readStamp(DISPATCH_REPLY_FILE))')
+    expect(fn('lastActivityMs')).toContain('activityStamps()')
+    expect(fn('bridgeStatus')).toContain('activityStamps()')
+    const hook = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram-codex', 'hooks', 'notify-stop.ts'), 'utf8')
+    expect(hook).not.toContain('dispatch-')
+  })
+})
