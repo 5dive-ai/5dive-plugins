@@ -30,6 +30,13 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.24 — DIVE-5502: context controls on the dispatcher path. `/context`
+  shows the session's size (from app-server token accounting), the last model
+  call's input/cached/output and the call count, with Compact and Fresh session
+  buttons; `/clear` starts a fresh session. Controls travel as an inbox
+  `control` verb (`compact`, `new-session`) advertised in `health.json`
+  `controls`, run at the turn boundary, and every model call appends one line
+  to `usage.jsonl`.
 - v0.5.23 — DIVE-5490: a reply whose text is emoji-only (a lone 🎙)
   with only audio files attached sends the files alone, and an empty text
   with files is a files-only send instead of a refusal.

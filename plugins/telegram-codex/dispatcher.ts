@@ -1,13 +1,13 @@
 #!/usr/bin/env bun
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import {
-  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync,
+  appendFileSync, chmodSync, existsSync, statSync, mkdirSync, readFileSync, readdirSync, renameSync,
   unlinkSync, watch, writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
-  ChannelDispatcher, parseOutboundMessage, type DispatchMessage, type DispatchRoute,
+  CONTROL_OPS, ChannelDispatcher, parseOutboundMessage, type DispatchMessage, type DispatchRoute, type UsageSample,
 } from './dispatcher-core.ts'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import {
@@ -132,6 +132,13 @@ function publishHealth(): void {
     health.threadEffort = snap.threadModel?.effort
     health.configuredModel = dispatcher.configuredModel().model
     health.queueDepth = snap.pending.length
+    health.controls = [...dispatcher.controls()]
+    const ctx = snap.context?.threadId === snap.threadId ? snap.context : undefined
+    health.context = ctx
+      ? { inContext: ctx.inContext, ...(ctx.window ? { window: ctx.window } : {}), lastInput: ctx.lastInput,
+          lastCached: ctx.lastCached, lastOutput: ctx.lastOutput, calls: ctx.calls, at: ctx.at }
+      : undefined
+    health.lastSession = snap.sessions?.at(-1)
     health.active = snap.active
       ? { turnId: snap.active.turnId, source: snap.active.route.source, startedAt: health.active?.turnId === snap.active.turnId ? health.active.startedAt : new Date().toISOString() }
       : undefined
@@ -254,6 +261,17 @@ function stateStore() {
   }
 }
 
+// One JSONL line per model call (DIVE-5502): the before/after instrument for
+// context controls. Rotated at a fixed size, never unbounded, never fatal.
+const USAGE_LOG = join(STATE_DIR, 'usage.jsonl')
+const USAGE_LOG_MAX_BYTES = 512_000
+function recordUsageSample(sample: UsageSample): void {
+  try {
+    try { if (statSync(USAGE_LOG).size > USAGE_LOG_MAX_BYTES) renameSync(USAGE_LOG, `${USAGE_LOG}.1`) } catch {}
+    appendFileSync(USAGE_LOG, JSON.stringify(sample) + '\n', { mode: 0o600 })
+  } catch {}
+}
+
 let outSeq = 0
 async function publish(route: DispatchRoute, text: string, meta: Record<string, unknown>): Promise<void> {
   const outbound = parseOutboundMessage(text)
@@ -275,7 +293,7 @@ async function configuredModel() {
   return { model: read?.config?.model ?? undefined, effort: read?.config?.model_reasoning_effort ?? undefined }
 }
 
-const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish }, WORKDIR, configuredModel)
+const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, usage: recordUsageSample }, WORKDIR, configuredModel)
 rpc.onNotification = (method, params) => {
   void dispatcher.notification(method, params).catch(err => fatal(`event ${method} failed: ${err}`))
 }
@@ -313,7 +331,12 @@ function ingest(name: string): void {
     try { unlinkSync(full) } catch {}
     return
   }
-  if (!msg?.id || !msg?.text?.trim() || !msg?.route?.source || !msg?.route?.chat_id) {
+  if (msg?.control !== undefined && !CONTROL_OPS.includes(msg.control)) {
+    process.stderr.write(`codex-dispatcher: unknown control verb in ${name}\n`)
+    try { unlinkSync(full) } catch {}
+    return
+  }
+  if (!msg?.id || (!msg?.text?.trim() && !msg?.control) || !msg?.route?.source || !msg?.route?.chat_id) {
     process.stderr.write(`codex-dispatcher: incomplete inbox message ${name}\n`)
     try { unlinkSync(full) } catch {}
     return
@@ -341,6 +364,11 @@ function startInbox(): void {
   drain()
   watch(INBOX_DIR, (_event, name) => { if (name) ingest(String(name)) })
   setInterval(drain, 15_000).unref?.()
+  // A queued message must not wait for the next inbound to notice that a
+  // compaction it sits behind was lost. A failed start stays queued for the next tick.
+  setInterval(() => {
+    void dispatcher.tick().then(publishHealth, err => process.stderr.write(`codex-dispatcher: queue tick failed: ${err}\n`))
+  }, 15_000).unref?.()
 }
 
 const children: ChildProcessWithoutNullStreams[] = []

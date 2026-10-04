@@ -39,6 +39,7 @@ import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSyn
 import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { modelStatusLines, readHealth } from './health.ts'
+import { fmtTokens } from './dispatcher-core.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 
 const PLUGIN_VERSION = (() => {
@@ -499,6 +500,61 @@ function enqueueInbound(msg: InboundMsg) {
 
 let dispatcherInboxSeq = 0
 
+// DIVE-5502: a context control goes to the dispatcher as a CONTROL VERB, never
+// as the text "/clear" — the dispatcher would submit that as a user turn and
+// reset nothing. Only meaningful when the dispatcher owns the thread; the pane
+// path has its own /compact and /new typed into the TUI.
+function postDispatcherControl(op: 'compact' | 'new-session', chat_id: string, message_thread_id?: string): void {
+  const seq = `${Date.now()}-${process.pid}-${dispatcherInboxSeq++}`
+  const tmp = join(DISPATCHER_INBOX_DIR, `.${seq}.tmp`)
+  writeFileSync(tmp, JSON.stringify({
+    id: `telegram-control:${op}:${seq}`,
+    text: op === 'compact' ? '/context compact' : '/clear',
+    control: op,
+    route: { source: 'telegram', chat_id, ...(message_thread_id ? { message_thread_id } : {}) },
+    received_at: new Date().toISOString(),
+  }) + '\n', { mode: 0o600 })
+  renameSync(tmp, join(DISPATCHER_INBOX_DIR, `${seq}.json`))
+}
+
+/** Why a context control cannot run here, or null when it can. */
+function contextControlRefusal(): string | null {
+  if (PANE_IS_THE_MODEL) {
+    return 'This seat runs Codex in its terminal session, so context is managed there (/compact, /new). Telegram context controls need the dispatcher bridge.'
+  }
+  const h = readHealth(DISPATCHER_STATE_DIR)
+  if (!h?.controls?.includes('new-session')) {
+    return 'The Codex bridge on this seat is too old for context controls. Restart it (/restart) after the plugin updates.'
+  }
+  return null
+}
+
+function contextText(): string {
+  const h = readHealth(DISPATCHER_STATE_DIR)
+  const lines = ['*context* — Codex session', '']
+  const c = h?.context
+  if (!c) {
+    lines.push('No model call on this session yet, so there is no size to show.')
+  } else {
+    const pct = c.window ? Math.round((c.inContext / c.window) * 100) : null
+    lines.push(`in context: ~${fmtTokens(c.inContext)}${c.window ? ` of ${fmtTokens(c.window)} (${pct}%)` : ''}`)
+    const cachePct = c.lastInput > 0 ? Math.round((c.lastCached / c.lastInput) * 100) : 0
+    lines.push(`last call: ${fmtTokens(c.lastInput)} in (${cachePct}% cached) · ${fmtTokens(c.lastOutput)} out`)
+    lines.push(`model calls this session: ${c.calls}`)
+  }
+  if (h?.active) lines.push('', 'A turn is running; a control waits for it to finish.')
+  if (h?.lastSession) {
+    const s = h.lastSession
+    lines.push('', `previous session: ${s.threadId.slice(0, 8)}, ended ${s.endedAt.slice(0, 16).replace('T', ' ')}Z (${s.reason})`)
+  }
+  lines.push('', 'Compact keeps this session and summarises it. Fresh session starts a new one and carries a short note of your last requests.')
+  return lines.join('\n')
+}
+
+const CONTEXT_KEYBOARD = () => new InlineKeyboard()
+  .text('🗜 Compact', 'ctx:compact')
+  .text('🆕 Fresh session', 'ctx:new')
+
 // A message queued with no waiter parked means the agent is out of its listen
 // loop. Without this, delivery waits for the re-arm watchdog to see
 // REARM_IDLE_MS (default 180s) of measured idle — minutes of dead air on a
@@ -805,8 +861,10 @@ let lastInboundTs: string | null = null
 const BOT_COMMANDS: Array<{ command: string; description: string; menuHidden?: boolean }> = [
   { command: 'help',    description: 'Show commands' },
   { command: 'status',  description: 'Pairing, usage, model' },
+  { command: 'context', description: 'Context size · compact · fresh session' },
   { command: 'stop',    description: 'Interrupt task' },
   { command: 'restart', description: 'Respawn codex' },
+  { command: 'clear',   description: 'Start a fresh session' },
   { command: 'agents',  description: 'Team' },
   { command: 'team',    description: 'Team (alias for /agents)', menuHidden: true },
   { command: 'tasks',   description: 'List open tasks' },
@@ -1568,6 +1626,29 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
           ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
         }).catch(() => {})
         await restartAgent(name, updateId)
+        return true
+      }
+      case 'context':
+      case 'clear': {
+        const refusal = contextControlRefusal()
+        if (refusal) { await md(refusal); return true }
+        const sub = cmd === 'clear' ? 'new' : cmdArg.toLowerCase()
+        const thread = ctx.message && 'is_topic_message' in ctx.message && ctx.message.is_topic_message
+          && ctx.message.message_thread_id != null ? String(ctx.message.message_thread_id) : undefined
+        if (sub === 'compact' || sub === 'new') {
+          postDispatcherControl(sub === 'compact' ? 'compact' : 'new-session', chat_id, thread)
+          // The dispatcher answers when it runs the control. Only say something
+          // now when that answer will be late: a busy turn holds the queue.
+          if (readHealth(DISPATCHER_STATE_DIR)?.active) {
+            await md(sub === 'compact' ? '⏳ Compacting after the current turn finishes.' : '⏳ Starting a fresh session after the current turn finishes.')
+          }
+          return true
+        }
+        await bot.api.sendMessage(chat_id, contextText(), {
+          parse_mode: 'Markdown',
+          reply_markup: CONTEXT_KEYBOARD(),
+          ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+        })
         return true
       }
       case 'model': {
@@ -2343,6 +2424,30 @@ bot.on('callback_query:data', async ctx => {
   // path a typed reply takes (enqueueInbound) — so the agent's next
   // wait_for_message just sees the answer. Re-gate the tapper (a leaked button
   // could otherwise let a stranger answer); drop the keyboard after.
+  // DIVE-5502: the /context buttons. Same re-gate as every other tap.
+  const ctxM = /^ctx:(compact|new)$/.exec(data)
+  if (ctxM) {
+    if (!loadAccess().allowFrom.includes(String(ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const refusal = contextControlRefusal()
+    if (refusal) {
+      await ctx.answerCallbackQuery({ text: refusal.slice(0, 190), show_alert: true }).catch(() => {})
+      return
+    }
+    const msg = ctx.callbackQuery.message
+    const thread = msg && 'is_topic_message' in msg && msg.is_topic_message && msg.message_thread_id != null
+      ? String(msg.message_thread_id) : undefined
+    postDispatcherControl(ctxM[1] === 'compact' ? 'compact' : 'new-session', String(msg?.chat.id ?? ctx.from.id), thread)
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    const busy = Boolean(readHealth(DISPATCHER_STATE_DIR)?.active)
+    await ctx.answerCallbackQuery({
+      text: (ctxM[1] === 'compact' ? '🗜 Compacting' : '🆕 Starting a fresh session') + (busy ? ' after the current turn' : '…'),
+    }).catch(() => {})
+    return
+  }
+
   const ynM = /^yn:(yes|no)$/.exec(data)
   if (ynM) {
     const senderId = String(ctx.from.id)
