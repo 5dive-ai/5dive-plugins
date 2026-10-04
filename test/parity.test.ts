@@ -88,6 +88,18 @@ const has = (src: string, sym: string) => new RegExp(`\\b${sym}\\b`).test(src)
 const GOLDEN_FORK_COMMANDS = [
   'help', 'status', 'stop', 'restart', 'agents', 'team', 'tasks', 'inbox', 'task', 'org', 'model', 'ping', 'start',
 ]
+// DIVE-5502: codex alone runs behind the app-server dispatcher, which owns the
+// thread, so it alone can compact it or start a fresh one from the phone. The
+// pane forks (grok/agy) would have to type into a TUI they do not own. A
+// documented, per-fork delta — the rest of the menu stays in lockstep.
+const FORK_EXTRA_COMMANDS: Record<string, string[]> = {
+  'telegram-codex': ['context', 'clear'],
+}
+const GOLDEN_CODEX_COMMANDS = [
+  'help', 'status', 'context', 'stop', 'restart', 'clear', 'agents', 'team', 'tasks', 'inbox', 'task', 'org', 'model', 'ping', 'start',
+]
+const withoutExtras = (plugin: string, cmds: string[]) =>
+  cmds.filter(c => !(FORK_EXTRA_COMMANDS[plugin] ?? []).includes(c))
 const GOLDEN_FORK_MCP_TOOLS = ['wait_for_message', 'reply', 'edit_message', 'react', 'download_attachment']
 // DIVE-1028: recent_messages (rolling message-log recovery) is a baseline-only
 // addition — the wait_for_message forks have a different inbound path and are a
@@ -115,7 +127,8 @@ describe.each(FORKS)('%s matches golden fork spec', plugin => {
   const src = read(plugin)
 
   test('command menu set + ordering', () => {
-    expect(forkCommands(src)).toEqual(GOLDEN_FORK_COMMANDS)
+    expect(forkCommands(src)).toEqual(plugin === 'telegram-codex' ? GOLDEN_CODEX_COMMANDS : GOLDEN_FORK_COMMANDS)
+    expect(withoutExtras(plugin, forkCommands(src))).toEqual(GOLDEN_FORK_COMMANDS)
   })
 
   test('registers commands for BOTH default + all_private_chats scopes', () => {
@@ -145,7 +158,7 @@ describe('cross-fork consistency', () => {
   const byFork = Object.fromEntries(FORKS.map(f => [f, read(f)]))
 
   test('identical command menu (set + order)', () => {
-    const lists = FORKS.map(f => forkCommands(byFork[f]))
+    const lists = FORKS.map(f => withoutExtras(f, forkCommands(byFork[f])))
     for (const l of lists) expect(l).toEqual(lists[0])
   })
 

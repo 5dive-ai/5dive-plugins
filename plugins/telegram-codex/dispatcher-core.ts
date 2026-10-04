@@ -14,6 +14,63 @@ export type DispatchMessage = {
   route: DispatchRoute
   image_path?: string
   received_at?: string
+  /**
+   * A control verb instead of a user turn (DIVE-5502). The text is kept so an
+   * older dispatcher that does not know the field has something to log, but
+   * this one never submits it to the model: "/clear" arriving as a user message
+   * burns a turn and resets nothing (the residual 5dive's CLI names on DIVE-4036).
+   */
+  control?: ControlOp
+}
+
+/**
+ * `compact` summarises the live thread in place (the app-server runs it as a
+ * turn). `new-session` saves a receipt for the current thread and starts a
+ * bounded new one, carrying a one-paragraph handoff into its first turn.
+ */
+export type ControlOp = 'compact' | 'new-session'
+export const CONTROL_OPS: readonly ControlOp[] = ['compact', 'new-session']
+
+/**
+ * The thread's token accounting, as `thread/tokenUsage/updated` last reported
+ * it. `last*` is ONE model call, the number the audit measured (134-146k input
+ * per call at 96% cache). `inContext` is what the next call starts from.
+ */
+export type ContextUsage = {
+  threadId: string
+  inContext: number
+  window?: number
+  lastInput: number
+  lastCached: number
+  lastOutput: number
+  /** Model calls seen on this thread since this dispatcher bound it. */
+  calls: number
+  /** The thread's running token total: an unchanged total is a replayed
+   *  snapshot, not another call. */
+  total: number
+  at: string
+}
+
+/** One sample per model call, for the before/after measurement. */
+export type UsageSample = {
+  at: string
+  threadId: string
+  turnId: string
+  input: number
+  cached: number
+  output: number
+  reasoning: number
+  inContext: number
+  window?: number
+}
+
+/** What a `new-session` left behind, so the old thread can be found again. */
+export type SessionReceipt = {
+  threadId: string
+  endedAt: string
+  reason: string
+  calls?: number
+  inContext?: number
 }
 
 export type DispatcherState = {
@@ -44,6 +101,16 @@ export type DispatcherState = {
    * will answer" must read this, not the seat config.
    */
   threadModel?: ThreadModel
+  context?: ContextUsage
+  /** Newest last, bounded by MAX_RECEIPTS. */
+  sessions?: SessionReceipt[]
+  /** Short snippets of the last few user requests: the continuity a new
+   *  session carries, without a model call to summarise. */
+  recent?: string[]
+  /** Rides the next real turn, exactly like `recovery`. */
+  handoff?: string
+  /** A compaction was requested and its turn has not started yet. */
+  compacting?: { message: DispatchMessage; at: string; before?: number }
 }
 
 /** A model choice. `effort` is a Codex reasoning effort (`low`, `high`, …). */
@@ -82,10 +149,16 @@ export interface StateStore {
 }
 
 export interface DispatchSink {
-  publish(route: DispatchRoute, text: string, meta: { turnId: string; itemId?: string; kind: 'message' | 'error' }): Promise<void>
+  publish(route: DispatchRoute, text: string, meta: { turnId: string; itemId?: string; kind: 'message' | 'error' | 'control' }): Promise<void>
+  /** Best-effort; a sink that cannot record a sample must not fail the turn. */
+  usage?(sample: UsageSample): void
 }
 
 const MAX_SEEN = 512
+const MAX_RECEIPTS = 10
+const MAX_RECENT = 3
+/** A compaction whose turn never started stops holding the queue after this. */
+const COMPACT_START_TIMEOUT_MS = 120_000
 const ATTACHMENT_LINE = /^\[\[5dive-attachment:(\/[^\]\r\n]+)\]\]$/
 
 export function parseOutboundMessage(raw: string): { text: string; files: string[] } {
@@ -112,9 +185,30 @@ export function recoveryLine(recovery: RecoveryContext): string {
     + 'do not replay the interrupted work unless the user asks for it.'
 }
 
-function inputFor(message: DispatchMessage, recovery?: RecoveryContext): Array<Record<string, unknown>> {
+/**
+ * The continuity a new session starts with: what the person had been asking,
+ * marked as background so the model does not redo it. Snippets, not a
+ * transcript: a handoff that re-sends the old context defeats the reset.
+ */
+export function handoffLine(previousThreadId: string, recent: string[]): string {
+  const asks = recent.length ? ` Their most recent requests, oldest first: ${recent.map(r => `"${r}"`).join('; ')}.` : ''
+  return `[5dive new session] The owner started a fresh session; the previous thread (${previousThreadId}) is saved.${asks} `
+    + 'Treat that as background, not as work to redo; ask if you need more of it.'
+}
+
+/** `146k`, `1.2k`, `850` — one width for the chat. */
+export function fmtTokens(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '?'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
+function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?: string): Array<Record<string, unknown>> {
   const input: Array<Record<string, unknown>> = []
   if (recovery) input.push({ type: 'text', text: recoveryLine(recovery), text_elements: [] })
+  if (handoff) input.push({ type: 'text', text: handoff, text_elements: [] })
   input.push({ type: 'text', text: message.text, text_elements: [] })
   if (message.image_path?.startsWith('/')) input.push({ type: 'localImage', path: message.image_path })
   return input
@@ -124,6 +218,15 @@ function inputFor(message: DispatchMessage, recovery?: RecoveryContext): Array<R
 function snippet(text: string): string {
   const flat = text.replace(/\s+/g, ' ').trim()
   return flat.length > 80 ? `${flat.slice(0, 79)}…` : flat
+}
+
+function errText(err: unknown): string {
+  return String((err as { message?: string })?.message ?? err).replace(/\s+/g, ' ').trim().slice(0, 160) || 'unknown error'
+}
+
+function count(value: unknown): number {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= 0 ? n : 0
 }
 
 /**
@@ -189,6 +292,9 @@ export class ChannelDispatcher {
       const wasClean = this.state.cleanExit === true
       this.state.active = undefined
       this.state.cleanExit = undefined
+      // A compaction that never started died with the old app-server; one that
+      // did start is the `interrupted` turn above. Either way it is not pending.
+      this.state.compacting = undefined
       let threadLost = ''
       this.configured = await this.loadConfigured()
       if (this.state.threadId) {
@@ -212,18 +318,7 @@ export class ChannelDispatcher {
           this.state.threadId = undefined
         }
       }
-      if (!this.state.threadId) {
-        const started = await this.rpc.request('thread/start', {
-          cwd: this.cwd,
-          serviceName: '5dive-channel-dispatcher',
-          developerInstructions:
-            'Messages arrive from 5dive channels. Respond normally in assistant messages; the dispatcher routes those messages back to the originating channel. Do not call wait_for_message or channel reply tools. To attach a local file, include a separate [[5dive-attachment:/absolute/path]] line after a non-empty caption; the dispatcher removes the directive and sends the file only to the originating channel.',
-        })
-        const id = started?.thread?.id
-        if (typeof id !== 'string' || !id) throw new Error('thread/start returned no thread id')
-        this.state.threadId = id
-        this.recordModel('thread/start', started?.model, started?.reasoningEffort)
-      }
+      if (!this.state.threadId) await this.startThread()
 
       const facts: string[] = []
       if (interrupted) {
@@ -262,29 +357,126 @@ export class ChannelDispatcher {
       if (this.state.seen.includes(message.id) || this.state.pending.some(m => m.id === message.id)
         || this.state.active?.message.id === message.id) return 'duplicate'
 
-      if (this.state.active) {
-        if (this.state.active.routeKey !== routeKey(message.route)) {
+      this.expireCompaction()
+      // A control verb, or anything arriving while a compaction runs, waits for
+      // the turn boundary: a reset cannot steer a turn, and a message steered
+      // into a compaction would be summarised away rather than answered.
+      if (this.state.active || this.state.compacting) {
+        // Order is the contract: "/clear" then "do X" means X belongs to the new
+        // session, so nothing steers past a control still waiting in the queue.
+        if (message.control || this.state.compacting || this.state.active?.message.control
+          || this.state.pending.some(m => m.control)
+          || this.state.active!.routeKey !== routeKey(message.route)) {
           this.state.pending.push(message)
           this.persist()
           return 'queued'
         }
+        const active = this.state.active!
         const result = await this.rpc.request('turn/steer', {
           threadId: this.requireThread(),
-          expectedTurnId: this.state.active.turnId,
+          expectedTurnId: active.turnId,
           clientUserMessageId: message.id,
           input: inputFor(message),
         })
-        if (result?.turnId !== this.state.active.turnId) {
+        if (result?.turnId !== active.turnId) {
           throw new Error('turn/steer did not confirm the active turn')
         }
+        this.remember(message)
         this.markSeen(message.id)
         this.persist()
         return 'steered'
       }
 
       await this.startMessage(message)
+      if (!this.state.active && !this.state.compacting) await this.startNext()
       return 'started'
     })
+  }
+
+  /** Control verbs this dispatcher executes; advertised in health. */
+  controls(): readonly ControlOp[] {
+    return CONTROL_OPS
+  }
+
+  private async runControl(message: DispatchMessage): Promise<void> {
+    const op = message.control!
+    const route = message.route
+    this.markSeen(message.id)
+    if (op === 'compact') {
+      const before = this.state.context?.threadId === this.state.threadId ? this.state.context?.inContext : undefined
+      try {
+        await this.rpc.request('thread/compact/start', { threadId: this.requireThread() })
+      } catch (err) {
+        this.persist()
+        await this.sink.publish(route, `Could not compact this session: ${errText(err)}`, { turnId: '', kind: 'error' })
+        return
+      }
+      // The app-server runs the compaction as a turn of its own (measured on
+      // codex 0.153.3: turn/started → contextCompaction item → turn/completed).
+      // `turn/started` adopts it as the active turn so the queue waits for it.
+      this.state.compacting = { message, at: new Date().toISOString(), ...(before ? { before } : {}) }
+      this.persist()
+      return
+    }
+    // new-session
+    const previous = this.state.threadId
+    const usage = this.state.context?.threadId === previous ? this.state.context : undefined
+    if (previous) {
+      const receipt: SessionReceipt = {
+        threadId: previous,
+        endedAt: new Date().toISOString(),
+        reason: route.source === 'agent' ? 'a new task (5dive)' : `requested from ${route.source}`,
+        ...(usage ? { calls: usage.calls, inContext: usage.inContext } : {}),
+      }
+      this.state.sessions = [...(this.state.sessions ?? []), receipt].slice(-MAX_RECEIPTS)
+    }
+    try {
+      await this.startThread()
+    } catch (err) {
+      // Keep the old thread rather than strand the seat with none.
+      if (previous) {
+        this.state.threadId = previous
+        this.state.sessions = this.state.sessions?.slice(0, -1)
+      }
+      this.persist()
+      await this.sink.publish(route, `Could not start a new session: ${errText(err)}. Still on the current one.`, { turnId: '', kind: 'error' })
+      return
+    }
+    this.state.context = undefined
+    this.state.handoff = previous ? handoffLine(previous, this.state.recent ?? []) : undefined
+    this.state.recent = []
+    this.persist()
+    const was = usage ? ` The previous one carried ~${fmtTokens(usage.inContext)} tokens over ${usage.calls} model call${usage.calls === 1 ? '' : 's'}.` : ''
+    const saved = previous ? ` It is saved as ${previous.slice(0, 8)}; your next message starts the new one with a short note of what you last asked.` : ''
+    // An agent-sourced reset (a new 5dive task) goes to the dispatcher log only;
+    // `publish` drops the agent route before it reaches any chat.
+    await this.sink.publish(route, `🆕 Fresh session.${was}${saved}`, { turnId: '', kind: 'control' })
+  }
+
+  /** A compaction whose turn never arrived must not hold the queue forever. */
+  private expireCompaction(): void {
+    const c = this.state.compacting
+    if (!c || this.state.active) return
+    if (Date.now() - Date.parse(c.at) > COMPACT_START_TIMEOUT_MS) this.state.compacting = undefined
+  }
+
+  private async startThread(): Promise<void> {
+    const started = await this.rpc.request('thread/start', {
+      cwd: this.cwd,
+      serviceName: '5dive-channel-dispatcher',
+      developerInstructions:
+        'Messages arrive from 5dive channels. Respond normally in assistant messages; the dispatcher routes those messages back to the originating channel. Do not call wait_for_message or channel reply tools. To attach a local file, include a separate [[5dive-attachment:/absolute/path]] line after a non-empty caption; the dispatcher removes the directive and sends the file only to the originating channel.',
+    })
+    const id = started?.thread?.id
+    if (typeof id !== 'string' || !id) throw new Error('thread/start returned no thread id')
+    this.state.threadId = id
+    this.recordModel('thread/start', started?.model, started?.reasoningEffort)
+  }
+
+  private remember(message: DispatchMessage): void {
+    const s = snippet(message.text).replace(/"/g, "'")
+    if (!s) return
+    this.state.recent = [...(this.state.recent ?? []), s].slice(-MAX_RECENT)
   }
 
   async notification(method: string, params: any): Promise<void> {
@@ -297,6 +489,19 @@ export class ChannelDispatcher {
       if (method === 'model/rerouted' && params?.threadId === this.state.threadId) {
         // The app-server swapped the model mid-turn; effort is unchanged by it.
         this.recordModel('model/rerouted', params?.toModel, this.state.threadModel?.effort)
+        this.persist()
+        return
+      }
+      if (method === 'thread/tokenUsage/updated' && params?.threadId === this.state.threadId) {
+        this.recordUsage(String(params?.turnId ?? ''), params?.tokenUsage)
+        return
+      }
+      if (method === 'turn/started' && params?.threadId === this.state.threadId
+        && this.state.compacting && !this.state.active) {
+        const turnId = String(params?.turn?.id ?? '')
+        if (!turnId) return
+        const { message } = this.state.compacting
+        this.state.active = { turnId, routeKey: routeKey(message.route), route: message.route, message }
         this.persist()
         return
       }
@@ -320,11 +525,19 @@ export class ChannelDispatcher {
         if (!this.state.active || this.state.active.turnId !== turnId) return
         const completed = this.state.active
         this.state.active = undefined
+        const compaction = completed.message.control === 'compact' ? this.state.compacting : undefined
+        if (compaction) this.state.compacting = undefined
         if (params?.turn?.status !== 'completed') {
           const detail = String(params?.turn?.error?.message ?? params?.turn?.status ?? 'unknown app-server error')
-          await this.sink.publish(completed.route, `Codex could not complete this turn: ${detail}`, {
+          await this.sink.publish(completed.route, compaction
+            ? `Could not compact this session: ${detail}`
+            : `Codex could not complete this turn: ${detail}`, {
             turnId, kind: 'error',
           })
+        } else if (compaction) {
+          const was = compaction.before ? ` It carried ~${fmtTokens(compaction.before)} tokens;` : ''
+          await this.sink.publish(completed.route,
+            `🗜 Session compacted.${was} the next reply shows the new size in /context.`, { turnId, kind: 'control' })
         }
         for (const key of this.itemText.keys()) {
           if (key.startsWith(`${turnId}:`)) this.itemText.delete(key)
@@ -336,12 +549,17 @@ export class ChannelDispatcher {
   }
 
   private async startMessage(message: DispatchMessage): Promise<void> {
+    if (message.control) {
+      await this.runControl(message)
+      return
+    }
     const recovery = this.state.recovery
+    const handoff = this.state.handoff
     const result = await this.rpc.request('turn/start', {
       threadId: this.requireThread(),
       clientUserMessageId: message.id,
       turnTrigger: `5dive:${message.route.source}`,
-      input: inputFor(message, recovery),
+      input: inputFor(message, recovery, handoff),
       // Every turn re-asserts the seat's choice. The resume override already
       // sets it; this makes the TURN the guarantee rather than one handshake.
       ...(this.configured.model ? { model: this.configured.model } : {}),
@@ -359,21 +577,65 @@ export class ChannelDispatcher {
     // Consumed only once the turn it rode on actually exists: a `turn/start`
     // that threw leaves the context in state for the retry.
     if (recovery) this.state.recovery = undefined
+    if (handoff) this.state.handoff = undefined
+    this.remember(message)
     this.markSeen(message.id)
     this.persist()
   }
 
   private async startNext(): Promise<void> {
-    if (this.state.active || this.state.pending.length === 0) return
-    const next = this.state.pending.shift()!
-    this.persist()
-    try {
-      await this.startMessage(next)
-    } catch (err) {
-      this.state.pending.unshift(next)
+    // A control verb runs without leaving a turn behind (a new session), so
+    // keep draining until something actually holds the thread.
+    while (!this.state.active && !this.state.compacting && this.state.pending.length > 0) {
+      const next = this.state.pending.shift()!
       this.persist()
-      throw err
+      try {
+        await this.startMessage(next)
+      } catch (err) {
+        this.state.pending.unshift(next)
+        this.persist()
+        throw err
+      }
     }
+  }
+
+  private recordUsage(turnId: string, usage: any): void {
+    const last = usage?.last
+    if (!last || typeof last !== 'object') return
+    const threadId = this.state.threadId!
+    const prior = this.state.context?.threadId === threadId ? this.state.context : undefined
+    const total = count(usage?.total?.totalTokens)
+    // One update per model call; a repeat of the same totals (a resume replays
+    // the last snapshot) is not another call.
+    const isNewCall = !prior || total !== prior.total
+    const window = count(usage?.modelContextWindow) || undefined
+    const inContext = count(last.totalTokens) || count(last.inputTokens) + count(last.outputTokens)
+    this.state.context = {
+      threadId,
+      inContext,
+      ...(window ? { window } : {}),
+      lastInput: count(last.inputTokens),
+      lastCached: count(last.cachedInputTokens),
+      lastOutput: count(last.outputTokens),
+      calls: (prior?.calls ?? 0) + (isNewCall ? 1 : 0),
+      total,
+      at: new Date().toISOString(),
+    }
+    this.persist()
+    if (!isNewCall) return
+    try {
+      this.sink.usage?.({
+        at: this.state.context.at,
+        threadId,
+        turnId,
+        input: count(last.inputTokens),
+        cached: count(last.cachedInputTokens),
+        output: count(last.outputTokens),
+        reasoning: count(last.reasoningOutputTokens),
+        inContext,
+        ...(window ? { window } : {}),
+      })
+    } catch {}
   }
 
   private async loadConfigured(): Promise<ModelSelection> {

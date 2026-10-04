@@ -39,6 +39,21 @@ restart switches the EXISTING conversation, history intact. `health.json`
 records `threadModel`/`threadEffort` as the app-server reports them, and
 `/status` prints a `conversation:` line whenever that differs from the config.
 
+Context controls (DIVE-5502). `/context` shows how much the live thread
+carries, the last model call's input (and how much of it was cached) and the
+number of calls, as `thread/tokenUsage/updated` reported them, with two buttons:
+Compact (app-server `thread/compact/start`, which runs as its own turn) and
+Fresh session. `/clear` is Fresh session directly. A fresh session saves a
+receipt for the old thread in `state.json` (`sessions`, last ten) and starts a
+new thread; its first turn carries one line with the last three requests as
+background. Controls travel as an inbox message with a `control` field
+(`compact` or `new-session`), wait for the turn boundary, and are never
+submitted to the model as text. `health.json` lists the verbs this bridge runs
+in `controls`, so a sender (the 5dive CLI at a task boundary) can check before
+posting one. Every model call appends a line to
+`~/.codex/channels/dispatcher/usage.jsonl` (input, cached, output, reasoning,
+context size): the before/after record for these controls.
+
 Dashboard delivery keeps using `~/.claude/channels/dashboard/` as a runtime-
 neutral compatibility path because shelld writes durable inbound drops there.
 To attach a local file in dispatcher mode, Codex emits a non-empty caption plus
@@ -280,7 +295,7 @@ Rolling back the whole fleet means reverting on `main`.
 | --------------------- | -------------------------------------- | -------------------------------- |
 | Inbound delivery      | `claude/channel` JSON-RPC notification | app-server `turn/start` / `turn/steer` (MCP polling fallback retained) |
 | Permission relay      | `claude/channel/permission` protocol   | `PermissionRequest` hook + buttons |
-| Slash commands        | `/telegram:configure`, `:access`, …    | bot-side menu (`/help` `/status` `/stop` `/restart` `/agents` `/tasks` `/task` `/org` `/model` `/ping` `/start`) |
+| Slash commands        | `/telegram:configure`, `:access`, …    | bot-side menu (`/help` `/status` `/context` `/stop` `/restart` `/clear` `/agents` `/tasks` `/task` `/org` `/model` `/ping` `/start`) |
 | Lifecycle hooks       | PreToolUse, Stop, etc.                 | `Stop` hook ships in `hooks/`    |
 | State dir             | `~/.claude/channels/telegram/`         | `~/.codex/channels/telegram/`    |
 | Pairing flow          | code via DM → `/telegram:access pair`  | `bun pair.ts` standalone CLI     |
@@ -318,3 +333,4 @@ relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
 - v0.5.21 — DIVE-4924: a model switch applies to the EXISTING conversation. The dispatcher reads the seat model/effort via app-server `config/read` and passes them to `thread/resume` and every `turn/start`; `health.json` records the thread's actual model and `/status` prints a `conversation:` line when it differs from the config.
 - v0.5.22 — DIVE-5447: the pinned needs-you banner is off unless the seat sets `TELEGRAM_NEEDS_BANNER=1`. With it off, the bridge unpins and relabels every banner it pinned earlier (from `needs-banner.json`) once at startup and empties the store; gate alerts and `/inbox` are unchanged.
 - v0.5.23 — DIVE-5490: no lone 🎙 before a voice note. When every attached file is audio and the text is emoji-only, the reply sends the files alone; `text` may be empty when files are attached (a files-only send, which the transport guard used to refuse).
+- v0.5.24 — DIVE-5502: `/context` (size, last call's cached share, Compact and Fresh session buttons) and `/clear` on the dispatcher path. Inbox `control` verbs `compact` and `new-session`, advertised in `health.json`; one `usage.jsonl` line per model call.

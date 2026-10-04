@@ -86,6 +86,21 @@ export type ChannelHealth = {
   /** The Codex half of the pair (DIVE-3969, compat.ts). Optional, so it is not
    *  a schema bump: a reader that predates it simply does not show it. */
   codex?: { version: string | null; minimum: string; testedMax: string; tested: boolean }
+  /** Inbox control verbs this bridge executes (DIVE-5502). A sender checks
+   *  this before posting one: an older bridge would run "/clear" as a turn. */
+  controls?: string[]
+  /** The live thread's context, from the app-server's own token accounting. */
+  context?: {
+    inContext: number
+    window?: number
+    lastInput: number
+    lastCached: number
+    lastOutput: number
+    calls: number
+    at: string
+  }
+  /** The newest saved session receipt, if a new session was ever started. */
+  lastSession?: { threadId: string; endedAt: string; reason: string; calls?: number; inContext?: number }
 }
 
 export type HealthState =
