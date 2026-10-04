@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.90: an agent's Connect/captcha button works on a standard-tier agent that holds the grant (DIVE-5495)
+
+On chill-gorge, lodar tapped an agent's "Open productradar.ru" button three times and nothing opened. The agent was standard tier, and the bot's sudo gate let a standard seat run exactly one verb, `agent _self_restart`. So the tap stopped before sudo with the admin-tier text, even though main had added the agent's `5dive browser _connect` line by hand. Now the gate asks `sudo -n -l` for that exact line, once per ten minutes, and only on a seat whose measured grant is the scoped standard one, the same way the `_self_account` line is asked (DIVE-5367). If the seat holds the line, the tap runs as on an admin seat. If not, the owner gets the same admin-tier message as before, and sudo runs only the listing, never the verb. 5dive-cli now writes the line for every standard seat (same row).
+
 ### Fixed — telegram 0.5.89 (+ agy/codex/grok 0.5.23): a voice reply sends no lone 🎙 before the voice note (DIVE-5490)
 
 An agent's voice reply showed as the text, then a lone "🎙" that Telegram draws as a large animated sticker, then the voice note (lodar, 2026-10-04: "just noise"). The voice note goes out as a second reply call, the tool required `text`, and nothing said it could be empty, so the model put the emoji there. Now, when every attached file is audio (.ogg .oga .opus .mp3 .m4a .wav) and the text is only emoji, the reply sends the file alone. A sentence with an emoji in it, or any text sent with a photo or document, is unchanged. The `files` description now says `text` may be empty with files attached, and the three forks gained the files-only send the main plugin already had (DIVE-1674): before, an empty text with a file was refused. opencode and pi send no files, so they are untouched.

@@ -43,7 +43,7 @@ import { createVersionReader } from './fivediveversion.ts'
 import {
   seatCanAdmin, classifyAccountUsage, accountReadOnlyText, accountSwitchPendingText,
   accountSwitchDoneText, accountSwitchFailedText, USAGE_READ_FAILED_TEXT,
-  adminTierText, isAdminTierRequired, createSudoGate, standardSeatRoute, ownUsageText,
+  adminTierText, isAdminTierRequired, createSudoGate, mayProbeStandardGrant, standardSeatRoute, ownUsageText,
   selfAccountGranted,
   type SeatAdmin, type SeatSudo, type SudoGate, type StatuslineLimits,
 } from './seatpriv.ts'
@@ -2654,7 +2654,16 @@ async function seatHasSelfAccount(agents?: FiveDiveAgentEntry[] | null): Promise
 // Built lazily for the same temporal-dead-zone reason as fiveRunner().
 let SUDO_GATE: SudoGate | null = null
 function sudoGate(): SudoGate {
-  return SUDO_GATE ??= createSudoGate({ execFile: execFileP as any, sudoBin: SUDO, fiveBin: FIVEDIVE, seat: seatTier })
+  return SUDO_GATE ??= createSudoGate({
+    execFile: execFileP as any, sudoBin: SUDO, fiveBin: FIVEDIVE, seat: seatTier,
+    // DIVE-5495: a line the seat may hold (browser _connect) is asked for, once
+    // per ten minutes, only on a seat whose grant is the scoped standard one.
+    mayProbe: async () => {
+      const me = thisAgentName()
+      const list = me ? await read5diveAgentList() : null
+      return mayProbeStandardGrant(list?.find(a => a.name === me) ?? null)
+    },
+  })
 }
 function sudo5dive(
   argv: string[],
@@ -5307,8 +5316,10 @@ function notifyAgentOfConnect(ctx: Context, content: string): void {
 }
 
 async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: string): Promise<void> {
-  // DIVE-5331: `browser _connect` is not in a standard seat's grant. Say so once,
-  // in the owner's language, instead of a refused sudo behind a failure line.
+  // DIVE-5331: `browser _connect` is not in every standard seat's grant. The gate
+  // lets it through on a seat that holds the line (DIVE-5495, asked with
+  // `sudo -n -l`); on one that does not, say so once, in the owner's language,
+  // instead of a refused sudo behind a failure line.
   try {
     await sudoGateCheck(['5dive', 'browser', '_connect'])
   } catch (e) {

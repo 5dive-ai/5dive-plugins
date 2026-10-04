@@ -160,8 +160,26 @@ export function isAdminTierRequired(e: unknown): e is AdminTierRequired {
 const STANDARD_SUDO_GRANT: string[][] = [
   ['5dive', 'agent', '_self_restart'],
 ]
+const sameArgv = (g: string[], argv: string[]) => g.length === argv.length && g.every((w, i) => w === argv[i])
 export function standardSeatMaySudo(argv: string[]): boolean {
-  return STANDARD_SUDO_GRANT.some(g => g.length === argv.length && g.every((w, i) => w === argv[i]))
+  return STANDARD_SUDO_GRANT.some(g => sameArgv(g, argv))
+}
+
+// DIVE-5495: lines a standard seat MAY hold, depending on which CLI rendered its
+// sudoers (and on a hand-added line, as on chill-gorge before the CLI wrote it).
+// The plugin itself spawns these, so a static entry above would spawn a refused
+// sudo on a seat without the line (DIVE-4397: that mails root). Instead the gate
+// asks `sudo -n -l` for the exact line once per TTL, and only on a seat whose
+// grant is the scoped standard one (mayProbe), and spawns only on a yes.
+//   browser _connect: the privileged half of an agent's Connect/captcha tap.
+//     Root re-checks the one-time code, that the tap came through this seat's
+//     bot and that the tapper is its paired owner (5dive-cli browser _connect).
+export const BROWSER_CONNECT_PROBE_ARGV = ['-n', '-l', '/usr/local/bin/5dive', 'browser', '_connect']
+const PROBED_STANDARD_GRANTS: { argv: string[]; probe: string[] }[] = [
+  { argv: ['5dive', 'browser', '_connect'], probe: BROWSER_CONNECT_PROBE_ARGV },
+]
+export function standardSeatMayHold(argv: string[]): boolean {
+  return PROBED_STANDARD_GRANTS.some(g => sameArgv(g.argv, argv))
 }
 
 // Verbs the CLI serves to an UNPRIVILEGED caller (5dive-cli origin/main,
@@ -217,6 +235,8 @@ export async function selfAccountGranted(
   if (!mayProbeSelfAccount(entry)) return false
   try { return await probe() } catch { return false }
 }
+// The same "who may be asked" rule serves every probed line (DIVE-5495).
+export const mayProbeStandardGrant = mayProbeSelfAccount
 
 export type SudoExecFn = (file: string, args: string[], opts?: unknown) => Promise<{ stdout: string; stderr: string }>
 
@@ -238,18 +258,42 @@ export type SudoGate = {
   probeSelfAccount(): Promise<boolean>
 }
 
+// How long a probed line's answer stands. The line lands at the nightly
+// update's sudoers reconcile (or by hand), not mid-conversation.
+export const GRANT_PROBE_TTL_MS = 10 * 60 * 1000
+
 export function createSudoGate(o: {
   execFile: SudoExecFn
   sudoBin: string
   /** absolute path of the bare binary, for the unprivileged path */
   fiveBin: string
   seat: () => Promise<SeatAdmin>
+  /** DIVE-5495: may this seat be asked `sudo -n -l` at all (mayProbeStandardGrant
+   *  of its agent-list entry)? Absent → a probed line is never asked, so refused. */
+  mayProbe?: () => Promise<boolean>
+  now?: () => number
 }): SudoGate {
+  const now = o.now ?? Date.now
+  const held = new Map<string, { v: boolean; at: number }>()
+  const holds = async (argv: string[]): Promise<boolean> => {
+    const g = PROBED_STANDARD_GRANTS.find(x => sameArgv(x.argv, argv))
+    if (!g || !o.mayProbe) return false
+    const key = g.argv.join(' ')
+    const c = held.get(key)
+    if (c && now() - c.at < GRANT_PROBE_TTL_MS) return c.v
+    let v = false
+    try {
+      if (await o.mayProbe()) v = await o.execFile(o.sudoBin, g.probe, { timeout: 5000 }).then(() => true, () => false)
+    } catch { v = false }
+    held.set(key, { v, at: now() })
+    return v
+  }
   const allowed = async (argv: string[], standard: 'plain' | 'refuse'): Promise<'sudo' | 'plain'> => {
     // The seat's own grant needs no lookup: it is the same on every tier.
     if (standardSeatMaySudo(argv)) return 'sudo'
     if ((await o.seat()) !== 'no') return 'sudo'
     if (standard === 'plain' && standardSeatMayRunPlain(argv)) return 'plain'
+    if (await holds(argv)) return 'sudo'
     throw new AdminTierRequired(argv)
   }
   return {
