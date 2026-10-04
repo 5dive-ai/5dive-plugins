@@ -1508,7 +1508,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           chat_id: { type: 'string' },
-          text: { type: 'string' },
+          text: { type: 'string', description: 'May be empty when files are attached (for example a voice note): then only the files are sent.' },
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
@@ -1520,7 +1520,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
+            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each. With files attached, `text` may be empty (for example a voice note): then only the files are sent.',
           },
           format: {
             type: 'string',
@@ -1601,6 +1601,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 // Opt-out: an agent can append `<!-- no-buttons -->` (or `<!-- no-yn -->`) to
 // suppress; the marker is stripped from the outgoing text either way.
 const YN_SUPPRESS = /\s*<!--\s*no-?(?:yn|buttons)\s*-->\s*$/i
+// DIVE-5490: a voice reply is the text, then the voice note as a second reply
+// call. The tool required `text`, so models filled that second call with a lone
+// "🎙", which Telegram draws as a big animated sticker between the two (lodar,
+// 2026-10-04: "just noise"). When every attached file is audio and the text is
+// emoji-only, the reply sends the files alone. A sentence with an emoji in it,
+// or any text sent with a photo or document, is sent as before.
+function isVoiceCaptionNoise(text: string, files: string[]): boolean {
+  if (files.length === 0) return false
+  if (!files.every(f => /\.(ogg|oga|opus|mp3|m4a|wav)$/i.test(f))) return false
+  if (!/\p{Extended_Pictographic}/u.test(text)) return false
+  return text.replace(/[\p{Extended_Pictographic}\p{Emoji_Modifier}\uFE0F\u200D\s]/gu, '') === ''
+}
+
 function yesNoButtons(text: string, lang: Lang): { stripped: string; keyboard?: InlineKeyboard } {
   if (YN_SUPPRESS.test(text)) return { stripped: text.replace(YN_SUPPRESS, '') }
   // DIVE-1429: pure polar-question detection lives in tna.ts (yesNoChoice); it
@@ -1675,8 +1688,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // (the agent) so it sees what went wrong — UNLESS files are attached,
         // where a text-less reply is a legitimate files-only send (the text
         // message is then skipped entirely below).
+        // DIVE-5490: an emoji-only caption on audio files is no text either.
         const textMissing =
-          text == null || text.trim() === '' || text.trim() === 'undefined'
+          text == null || text.trim() === '' || text.trim() === 'undefined' ||
+          isVoiceCaptionNoise(text, files)
         if (textMissing) {
           if (files.length === 0) {
             throw new Error(
