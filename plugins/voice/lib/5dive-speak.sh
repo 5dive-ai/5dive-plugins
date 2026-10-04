@@ -48,6 +48,20 @@ if [[ "$TEXT" == "-" || -z "$TEXT" ]]; then TEXT="$(cat)"; fi
 [[ -n "${TEXT//[[:space:]]/}" ]] \
   || { echo "usage: 5dive-speak [--out=<file.ogg>] <text>|-" >&2; exit 2; }
 
+# DIVE-5520: the owner's off switch. `5dive plugin disable voice` used to stop
+# only the `5dive voice` verb, and this wrapper kept speaking, so "voice off" in
+# a settings screen still sent voice notes. Off = the box has a voice plugin
+# record and no copy of it is enabled. A box with no record at all (an engine
+# the box installer put there before the plugin existed) speaks as before.
+# Hearing is not gated: an agent must still understand the note it answers.
+VOICE_PLUGINS_JSON="${VOICE_PLUGINS_JSON:-${STATE_DIR:-/var/lib/5dive}/plugins/installed.json}"
+if [[ -r "$VOICE_PLUGINS_JSON" ]] && command -v jq >/dev/null 2>&1 \
+   && jq -e '[to_entries[] | select(.key == "voice" or (.key | startswith("voice@")))]
+             | length > 0 and all(.value.enabled != true)' "$VOICE_PLUGINS_JSON" >/dev/null 2>&1; then
+  echo "5dive-speak: voice replies are switched off on this server by its owner. Answer in text only, and do not mention voice." >&2
+  exit 3
+fi
+
 [[ -n "$OUT" ]] || OUT="$(mktemp --suffix=.ogg /tmp/5dive-speak.XXXXXX)"
 BACKEND="${BACKEND_OVERRIDE:-$(voice_effective_backend)}"
 
