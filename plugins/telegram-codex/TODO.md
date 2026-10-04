@@ -34,6 +34,9 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.27 — DIVE-5504: auto-attach of named files on the dispatcher outbox and
+  the MCP `reply` tool (`autoattach.ts` fork + `outbox-attach.ts`), with
+  `.codex` denied and explicit directives checked too.
 - v0.5.26 — DIVE-5504: Codex approval requests on the dispatcher path go to
   Telegram buttons instead of an unseen decline (`approvals.ts`); timeout and
   no-adapter stay explicit declines; the seat's approval policy is untouched.

@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Added — telegram-codex 0.5.27: a Codex reply attaches the files it names (DIVE-5504)
+
+A Codex agent's reply sent a file only when it wrote an explicit `[[5dive-attachment:/path]]` line, so a report it named by path reached the phone as a dead link. Now a reply that names a report, image, PDF, log or other eligible file by absolute path attaches it, on the dispatcher path and in the MCP `reply` tool, with Claude's rules: the same denylist and allowed folders, at most five files, a footer for anything skipped or too large. On the dispatcher path a file goes at most once per turn, however many messages name it. Credential files are never sent: the Codex copy of the rules also blocks `~/.codex` (its `auth.json` holds the ChatGPT tokens), and an explicit directive to a protected or missing file is now refused with a note instead of sent unchecked. The `reply` result and the bridge log name what was attached.
+
 ### Added — telegram-codex 0.5.26: Codex approvals as Telegram buttons on the dispatcher path (DIVE-5504)
 
 A Codex agent run by the dispatcher declined every command or file change its approval policy asked about, unseen, so a seat on an asking policy could not run a command from the phone. Now the dispatcher asks on Telegram with ✅/❌ buttons, in the chat the turn came from (else the owner's DM), using the same request/answer files as the approval hook. A tap resumes the waiting request and names who answered; no answer within 2 minutes (`CODEX_TG_APPROVAL_TIMEOUT_MS`) or no Telegram channel declines it and tells Codex why, and the prompt then says it expired. A late tap is refused. The seat's approval policy still decides whether Codex asks at all. Covers `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `execCommandApproval` and `applyPatchApproval`; other server requests keep their old answer.

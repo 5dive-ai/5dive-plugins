@@ -718,7 +718,7 @@ export class ChannelDispatcher {
       cwd: this.cwd,
       serviceName: '5dive-channel-dispatcher',
       developerInstructions:
-        'Messages arrive from 5dive channels. Respond normally in assistant messages; the dispatcher routes those messages back to the originating channel. Do not call wait_for_message or channel reply tools. To attach a local file, include a separate [[5dive-attachment:/absolute/path]] line after a non-empty caption; the dispatcher removes the directive and sends the file only to the originating channel.',
+        'Messages arrive from 5dive channels. Respond normally in assistant messages; the dispatcher routes those messages back to the originating channel. Do not call wait_for_message or channel reply tools. A report, image, PDF or log you name by absolute path in a reply is attached automatically (once per turn; credential files never). For any other file, include a separate [[5dive-attachment:/absolute/path]] line after a non-empty caption; the dispatcher removes the directive and sends the file only to the originating channel.',
     })
     const id = started?.thread?.id
     if (typeof id !== 'string' || !id) throw new Error('thread/start returned no thread id')

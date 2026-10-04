@@ -41,6 +41,8 @@ import { installLifecycle } from './lifecycle.ts'
 import { HEALTH_SCHEMA, modelStatusLines, readHealth, staleAfterMs } from './health.ts'
 import { EFFORT_LEVELS, fmtTokens, type ControlOp } from './dispatcher-core.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { TurnAttachMemo, planOutboxAttachments, type OutboxAttachPlan } from './outbox-attach.ts'
+import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -724,6 +726,11 @@ function ingestInboxFile(name: string): void {
 }
 
 const dispatcherOutboxBusy = new Set<string>()
+// DIVE-5504: auto-attach on the dispatcher path. A plan is made ONCE per outbox
+// file and kept across its retries: re-planning a retry would find its own
+// files in the per-turn memo and send none of them.
+const outboxAttachMemo = new TurnAttachMemo()
+const outboxAttachPlans = new Map<string, OutboxAttachPlan>()
 function ingestDispatcherOutbox(name: string): void {
   if (!name.endsWith('.json') || dispatcherOutboxBusy.has(name)) return
   const full = join(DISPATCHER_OUTBOX_DIR, name)
@@ -738,11 +745,18 @@ function ingestDispatcherOutbox(name: string): void {
   const options = obj.message_thread_id
     ? { message_thread_id: Number(obj.message_thread_id) }
     : undefined
-  const files = Array.isArray(obj.files)
+  const explicit = Array.isArray(obj.files)
     ? obj.files.filter((f: unknown): f is string => typeof f === 'string' && f.startsWith('/')).slice(0, 10)
     : []
+  let plan = outboxAttachPlans.get(name)
+  if (!plan) {
+    plan = planOutboxAttachments(String(obj.text), explicit, `${obj.chat_id}:${obj.turnId ?? name}`, outboxAttachMemo)
+    outboxAttachPlans.set(name, plan)
+  }
+  const files = plan.send
+  const text = plan.footer ? `${String(obj.text)}\n\n${plan.footer}` : String(obj.text)
   void (async () => {
-    await bot.api.sendMessage(String(obj.chat_id), String(obj.text), options)
+    await bot.api.sendMessage(String(obj.chat_id), text, options)
     for (const file of files) {
       const input = new InputFile(file)
       if (PHOTO_EXTS.has(extname(file).toLowerCase())) {
@@ -752,6 +766,8 @@ function ingestDispatcherOutbox(name: string): void {
       }
     }
     try { unlinkSync(full) } catch {}
+    outboxAttachPlans.delete(name)
+    if (plan!.receipt) process.stderr.write(`telegram-codex: dispatcher reply ${name} ${plan!.receipt}\n`)
   })().catch(err => {
     process.stderr.write(`telegram-codex: dispatcher reply failed for ${name}: ${err}\n`)
     setTimeout(() => ingestDispatcherOutbox(name), 1_000).unref?.()
@@ -3177,11 +3193,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // DIVE-5504 (Claude's DIVE-4280): a file the reply NAMES is attached even
+        // without files=, through autoattach.ts's denylist (which also denies
+        // ~/.codex here) and 5-file cap. Explicit files win; nothing goes twice.
+        const autoPlan = planAutoAttach(text, { already: files })
+        const autoFooter = autoAttachFooter(autoPlan)
+
         const accessForReply = loadAccess()
         // DIVE-332/335: auto-render a Yes/No keyboard when the reply ends in a
         // single yes/no question (opt-out marker stripped either way). The tap
         // rides the callback path below, injecting a clean 'yes'/'no' inbound.
-        const { stripped: ynText, keyboard: ynKeyboard } = yesNoButtons(text)
+        const { stripped: ynRaw, keyboard: ynKeyboard } = yesNoButtons(text)
+        const ynText = autoFooter
+          ? `${ynRaw}\n\n${parseMode ? autoFooter.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1') : autoFooter}`
+          : ynRaw
         const chunks = textMissing ? [] : chunkForTelegram(ynText, accessForReply.textChunkLimit ?? TG_MAX_MESSAGE_CHARS)
         // DIVE-708/717: a choice-list keyboard takes precedence over Yes/No, but
         // only when the whole reply is a single chunk — the tap resolves the
@@ -3214,7 +3239,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
         }
 
-        for (const f of files) {
+        for (const f of [...files, ...autoPlan.attach]) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
           const opts = {
@@ -3230,9 +3255,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Stamp for the Stop hook's duplicate-suppression check.
         try { writeFileSync(LAST_REPLY_FILE, String(Date.now())) } catch {}
 
-        const result = sentIds.length === 1
+        const autoNames = attachedNames(autoPlan)
+        const result = (sentIds.length === 1
           ? `sent (id: ${sentIds[0]})`
-          : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+          : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`) + (autoNames ? `; ${autoNames}` : '')
         return { content: [{ type: 'text', text: result }] }
       }
 
