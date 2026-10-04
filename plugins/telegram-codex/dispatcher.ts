@@ -364,6 +364,11 @@ function startInbox(): void {
   drain()
   watch(INBOX_DIR, (_event, name) => { if (name) ingest(String(name)) })
   setInterval(drain, 15_000).unref?.()
+  // A queued message must not wait for the next inbound to notice that a
+  // compaction it sits behind was lost. A failed start stays queued for the next tick.
+  setInterval(() => {
+    void dispatcher.tick().then(publishHealth, err => process.stderr.write(`codex-dispatcher: queue tick failed: ${err}\n`))
+  }, 15_000).unref?.()
 }
 
 const children: ChildProcessWithoutNullStreams[] = []
