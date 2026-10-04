@@ -245,4 +245,14 @@ describe('/status model line (DIVE-4924)', () => {
     expect(modelStatusLines(cfg, record(), now)).toEqual(['model: gpt-6-astra · high'])
     expect(modelStatusLines({ model: null, effort: null }, null, now)).toEqual([])
   })
+
+  // DIVE-5505: after `agent switch` config.toml has no model key; olivia's
+  // /status read "differs from the configured model" with nothing configured.
+  test('no configured model: the live model is shown as the default, with no mismatch line', () => {
+    expect(modelStatusLines({ model: null, effort: null }, record({ threadModel: 'gpt-6.1-sol', threadEffort: 'high' }), now))
+      .toEqual(['model: gpt-6.1-sol · high (default)'])
+    expect(modelStatusLines({ model: null, effort: 'medium' }, record({ threadModel: 'gpt-6.1-sol' }), now))
+      .toEqual(['model: gpt-6.1-sol · medium (default)'])
+    expect(modelStatusLines({ model: null, effort: null }, record({ threadModel: 'gpt-6.1-sol', updatedAt: ago(3_600_000) }), now)).toEqual([])
+  })
 })

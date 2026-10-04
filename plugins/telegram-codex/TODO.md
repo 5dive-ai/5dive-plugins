@@ -34,6 +34,8 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.30 — DIVE-5505: dispatcher-path attachments are downloaded by the
+  bridge (meta + local path in the turn); voice/audio are transcribed in it.
 - v0.5.29 — DIVE-5504: one silent, edited acknowledgement per Telegram turn on
   the dispatcher path and one notification (the last answer).
 - v0.5.28 — DIVE-5504: `recent_messages` and the per-chat message log; a

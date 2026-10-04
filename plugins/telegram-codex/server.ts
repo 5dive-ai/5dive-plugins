@@ -44,6 +44,7 @@ import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { TurnAttachMemo, planOutboxAttachments, type OutboxAttachPlan } from './outbox-attach.ts'
 import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts'
 import { ProgressAcks } from './progress.ts'
+import { dispatcherTurnText, execTranscriber, type AttachmentMeta } from './inbound-media.ts'
 import {
   appendMessage as msglogAppend, formatRecent as msglogFormat, mostRecentChatId as msglogMostRecent,
   readMessages as msglogRead, MSGLOG_MAX_PER_CHAT,
@@ -147,6 +148,12 @@ const LAST_REPLY_FILE = join(STATE_DIR, 'last-reply.stamp')
 // when an inbound arrived that wasn't replied to, so the idle wait_for_message
 // loop (which finishes a turn every few minutes with no real work) stays silent.
 const LAST_INBOUND_FILE = join(STATE_DIR, 'last-inbound.stamp')
+// DIVE-5505: the dispatcher path's own pair, so /status sees its activity.
+// Kept apart from the two above on purpose: the Stop hook (notify-stop.ts)
+// reads those, and a dispatcher turn can end before its answer leaves the
+// outbox, which would read as "inbound left unanswered" and ping every turn.
+const DISPATCH_INBOUND_FILE = join(STATE_DIR, 'dispatch-inbound.stamp')
+const DISPATCH_REPLY_FILE = join(STATE_DIR, 'dispatch-reply.stamp')
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
@@ -431,14 +438,6 @@ function assertAllowedChat(chatId: string) {
 // Inbound queue + waiters
 // ============================================================================
 
-type AttachmentMeta = {
-  kind: string
-  file_id: string
-  size?: number
-  mime?: string
-  name?: string
-}
-
 type InboundMsg = {
   chat_id: string
   message_id: string
@@ -486,6 +485,7 @@ function enqueueInbound(msg: InboundMsg) {
       received_at: msg.ts,
     }) + '\n', { mode: 0o600 })
     renameSync(tmp, dest)
+    try { writeFileSync(DISPATCH_INBOUND_FILE, String(Date.now())) } catch {}
     return
   }
   // While the agent is in a detected stall (quota/auth/wedge) it can't run a
@@ -803,6 +803,8 @@ function ingestDispatcherOutbox(name: string): void {
     }
     try { unlinkSync(full) } catch {}
     outboxAttachPlans.delete(name)
+    // The turn's answer, not its silent commentary, is what makes it "replied".
+    if (obj.notify !== false) try { writeFileSync(DISPATCH_REPLY_FILE, String(Date.now())) } catch {}
     logMessage(String(obj.chat_id), 'out', agentName(), plan!.receipt ? `${text}\n[${plan!.receipt}]` : text,
       obj.message_thread_id ? { thread_id: String(obj.message_thread_id) } : {})
     if (plan!.receipt) process.stderr.write(`telegram-codex: dispatcher reply ${name} ${plan!.receipt}\n`)
@@ -1071,10 +1073,18 @@ function fmtVer(raw: string): string {
 // Listening vs working, from the inbound/reply stamps (same signal the Stop
 // hook uses): "working" only when the latest inbound hasn't been replied to
 // yet. Avoids the racy wait_for_message-waiter check.
+function readStamp(file: string): number {
+  try { return Number(readFileSync(file, 'utf8')) || 0 } catch { return 0 }
+}
+/** Latest inbound and reply, over the pane and dispatcher stamps (DIVE-5505). */
+function activityStamps(): { li: number; lr: number } {
+  return {
+    li: Math.max(readStamp(LAST_INBOUND_FILE), readStamp(DISPATCH_INBOUND_FILE)),
+    lr: Math.max(readStamp(LAST_REPLY_FILE), readStamp(DISPATCH_REPLY_FILE)),
+  }
+}
 function bridgeStatus(): string {
-  let li = 0, lr = 0
-  try { li = Number(readFileSync(LAST_INBOUND_FILE, 'utf8')) || 0 } catch {}
-  try { lr = Number(readFileSync(LAST_REPLY_FILE, 'utf8')) || 0 } catch {}
+  const { li, lr } = activityStamps()
   return li > lr ? '🟡 working' : '🟢 listening'
 }
 
@@ -1120,9 +1130,7 @@ function agentWorkdir(): string | undefined {
 
 // Most recent bridge activity (inbound or reply), epoch ms, or null.
 function lastActivityMs(): number | null {
-  let li = 0, lr = 0
-  try { li = Number(readFileSync(LAST_INBOUND_FILE, 'utf8')) || 0 } catch {}
-  try { lr = Number(readFileSync(LAST_REPLY_FILE, 'utf8')) || 0 } catch {}
+  const { li, lr } = activityStamps()
   const m = Math.max(li, lr)
   return m > 0 ? m : null
 }
@@ -1985,6 +1993,29 @@ function safeName(name: string | undefined): string | undefined {
   return name.replace(/[\x00\/\\]/g, '_').slice(0, 200) || undefined
 }
 
+/** Fetch a Telegram file into INBOX_DIR; resolves the local path. */
+async function downloadToInbox(file_id: string): Promise<string> {
+  const file = await bot.api.getFile(file_id)
+  if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
+  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
+  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+  const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+  writeFileSync(path, buf)
+  return path
+}
+
+// DIVE-5505: the box's transcriber (local whisper by default). Absent or
+// failing, dispatcherTurnText falls back to the attachment's meta and path.
+const transcribeFile = execTranscriber(
+  process.env.TELEGRAM_CODEX_TRANSCRIBE_BIN ?? '/usr/local/bin/5dive-transcribe',
+  Number(process.env.TELEGRAM_CODEX_TRANSCRIBE_TIMEOUT_MS ?? 120_000),
+)
+
 async function ingest(
   ctx: Context,
   text: string,
@@ -2032,7 +2063,14 @@ async function ingest(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  logMessage(String(chat.id), 'in', from.username ?? String(from.id), text, {
+  // DIVE-5505: the dispatcher's model has no MCP tools, so it cannot call
+  // download_attachment. The bridge fetches the file (and transcribes voice and
+  // audio) here, and the turn text carries the result.
+  const turn = attachment && !PANE_IS_THE_MODEL
+    ? await dispatcherTurnText(text, attachment, { download: downloadToInbox, transcribe: transcribeFile })
+    : { text }
+
+  logMessage(String(chat.id), 'in', from.username ?? String(from.id), turn.transcript ? `${text} ${turn.transcript}` : text, {
     ...(msgId != null ? { message_id: String(msgId) } : {}),
     ...(threadId != null ? { thread_id: String(threadId) } : {}),
   })
@@ -2042,7 +2080,7 @@ async function ingest(
     ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
     user: from.username ?? String(from.id),
     user_id: String(from.id),
-    text,
+    text: turn.text,
     ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
     ...(imagePath ? { image_path: imagePath } : {}),
     ...(attachment ? { attachment } : {}),
@@ -3355,18 +3393,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       case 'download_attachment': {
-        const file_id = String(args.file_id)
-        const file = await bot.api.getFile(file_id)
-        if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url)
-        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-        const buf = Buffer.from(await res.arrayBuffer())
-        const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-        const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
-        const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
-        const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
-        writeFileSync(path, buf)
+        const path = await downloadToInbox(String(args.file_id))
         return { content: [{ type: 'text', text: path }] }
       }
 
