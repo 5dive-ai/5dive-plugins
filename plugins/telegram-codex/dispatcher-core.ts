@@ -573,6 +573,14 @@ export class ChannelDispatcher {
         || this.state.active?.message.id === message.id) return 'duplicate'
 
       this.expireCompaction()
+      // Nothing holds the thread but work is still queued (a lost compaction just
+      // timed out, or a start failed): that work goes first, this joins the back.
+      if (!this.state.active && !this.state.compacting && this.state.pending.length > 0) {
+        this.state.pending.push(message)
+        this.persist()
+        await this.startNext()
+        return this.state.pending.some(m => m.id === message.id) ? 'queued' : 'started'
+      }
       // A control verb, or anything arriving while a compaction runs, waits for
       // the turn boundary: a reset cannot steer a turn, and a message steered
       // into a compaction would be summarised away rather than answered.
@@ -741,11 +749,26 @@ export class ChannelDispatcher {
     await this.sink.publish(route, `🆕 Fresh session.${was}${saved}`, { turnId: '', kind: 'control' })
   }
 
-  /** A compaction whose turn never arrived must not hold the queue forever. */
+  /** A compaction whose turn never arrived must not hold the queue forever;
+   *  the caller drains what queued behind it, in order. */
   private expireCompaction(): void {
     const c = this.state.compacting
     if (!c || this.state.active) return
-    if (Date.now() - Date.parse(c.at) > COMPACT_START_TIMEOUT_MS) this.state.compacting = undefined
+    if (Date.now() - Date.parse(c.at) <= COMPACT_START_TIMEOUT_MS) return
+    this.state.compacting = undefined
+    this.persist()
+  }
+
+  /**
+   * The clock half of `expireCompaction`: called on an interval by the host so
+   * a message queued behind a lost compaction (or a failed start) is answered
+   * without waiting for another inbound to arrive. A no-op while a turn runs.
+   */
+  async tick(): Promise<void> {
+    await this.enqueueSerial(async () => {
+      this.expireCompaction()
+      await this.startNext()
+    })
   }
 
   private async startThread(): Promise<void> {
