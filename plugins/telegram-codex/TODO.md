@@ -30,6 +30,9 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.23 — DIVE-5490: a reply whose text is emoji-only (a lone 🎙)
+  with only audio files attached sends the files alone, and an empty text
+  with files is a files-only send instead of a refusal.
 - v0.5.22 — DIVE-5447: the pinned needs-you banner is opt-in
   (`TELEGRAM_NEEDS_BANNER=1`). Off, one boot task unpins and relabels the
   pins `needs-banner.json` remembers and empties it; gate alerts and

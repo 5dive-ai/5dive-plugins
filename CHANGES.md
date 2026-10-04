@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.89 (+ agy/codex/grok 0.5.23): a voice reply sends no lone 🎙 before the voice note (DIVE-5490)
+
+An agent's voice reply showed as the text, then a lone "🎙" that Telegram draws as a large animated sticker, then the voice note (lodar, 2026-10-04: "just noise"). The voice note goes out as a second reply call, the tool required `text`, and nothing said it could be empty, so the model put the emoji there. Now, when every attached file is audio (.ogg .oga .opus .mp3 .m4a .wav) and the text is only emoji, the reply sends the file alone. A sentence with an emoji in it, or any text sent with a photo or document, is unchanged. The `files` description now says `text` may be empty with files attached, and the three forks gained the files-only send the main plugin already had (DIVE-1674): before, an empty text with a file was refused. opencode and pi send no files, so they are untouched.
+
 ### Fixed — telegram 0.5.88: a group join no longer promises that a mention works (DIVE-5454)
 
 lodar added his hired Cue to a group, mentioned it, and got no answer. Measured with a test account: Telegram never passes a non-admin bot with Group Privacy on (every agent bot) an @mention, in a forum topic, General or a plain group. It passes only replies to the bot's own messages and `/cmd@bot`. Made an admin, even with only the "manage chat" right, the bot gets the mention. So when the bot joins as a plain member, its hello now says "Reply to one of my messages to ask something", and the privacy line says that mentions need it to be an admin. A bot added as an admin keeps "Mention me". The Mini App's Add to a group now adds it as an admin (5dive-frontend, same row).
