@@ -44,6 +44,7 @@ import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { TurnAttachMemo, planOutboxAttachments, type OutboxAttachPlan } from './outbox-attach.ts'
 import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts'
 import { ProgressAcks } from './progress.ts'
+import { dispatcherTurnText, execTranscriber, type AttachmentMeta } from './inbound-media.ts'
 import {
   appendMessage as msglogAppend, formatRecent as msglogFormat, mostRecentChatId as msglogMostRecent,
   readMessages as msglogRead, MSGLOG_MAX_PER_CHAT,
@@ -430,14 +431,6 @@ function assertAllowedChat(chatId: string) {
 // ============================================================================
 // Inbound queue + waiters
 // ============================================================================
-
-type AttachmentMeta = {
-  kind: string
-  file_id: string
-  size?: number
-  mime?: string
-  name?: string
-}
 
 type InboundMsg = {
   chat_id: string
@@ -1985,6 +1978,29 @@ function safeName(name: string | undefined): string | undefined {
   return name.replace(/[\x00\/\\]/g, '_').slice(0, 200) || undefined
 }
 
+/** Fetch a Telegram file into INBOX_DIR; resolves the local path. */
+async function downloadToInbox(file_id: string): Promise<string> {
+  const file = await bot.api.getFile(file_id)
+  if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
+  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
+  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+  const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+  writeFileSync(path, buf)
+  return path
+}
+
+// DIVE-5505: the box's transcriber (local whisper by default). Absent or
+// failing, dispatcherTurnText falls back to the attachment's meta and path.
+const transcribeFile = execTranscriber(
+  process.env.TELEGRAM_CODEX_TRANSCRIBE_BIN ?? '/usr/local/bin/5dive-transcribe',
+  Number(process.env.TELEGRAM_CODEX_TRANSCRIBE_TIMEOUT_MS ?? 120_000),
+)
+
 async function ingest(
   ctx: Context,
   text: string,
@@ -2032,7 +2048,14 @@ async function ingest(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  logMessage(String(chat.id), 'in', from.username ?? String(from.id), text, {
+  // DIVE-5505: the dispatcher's model has no MCP tools, so it cannot call
+  // download_attachment. The bridge fetches the file (and transcribes voice and
+  // audio) here, and the turn text carries the result.
+  const turn = attachment && !PANE_IS_THE_MODEL
+    ? await dispatcherTurnText(text, attachment, { download: downloadToInbox, transcribe: transcribeFile })
+    : { text }
+
+  logMessage(String(chat.id), 'in', from.username ?? String(from.id), turn.transcript ? `${text} ${turn.transcript}` : text, {
     ...(msgId != null ? { message_id: String(msgId) } : {}),
     ...(threadId != null ? { thread_id: String(threadId) } : {}),
   })
@@ -2042,7 +2065,7 @@ async function ingest(
     ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
     user: from.username ?? String(from.id),
     user_id: String(from.id),
-    text,
+    text: turn.text,
     ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
     ...(imagePath ? { image_path: imagePath } : {}),
     ...(attachment ? { attachment } : {}),
@@ -3355,18 +3378,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       case 'download_attachment': {
-        const file_id = String(args.file_id)
-        const file = await bot.api.getFile(file_id)
-        if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url)
-        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-        const buf = Buffer.from(await res.arrayBuffer())
-        const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-        const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
-        const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
-        const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
-        writeFileSync(path, buf)
+        const path = await downloadToInbox(String(args.file_id))
         return { content: [{ type: 'text', text: path }] }
       }
 
