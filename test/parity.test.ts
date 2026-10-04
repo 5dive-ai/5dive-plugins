@@ -104,6 +104,13 @@ const GOLDEN_CODEX_COMMANDS = [
 ]
 const withoutExtras = (plugin: string, cmds: string[]) =>
   cmds.filter(c => !(FORK_EXTRA_COMMANDS[plugin] ?? []).includes(c))
+// DIVE-5504: codex ports the baseline's recent_messages (DIVE-1028), the
+// follow-up the note on GOLDEN_BASELINE_MCP_TOOLS names. grok/agy still lack it.
+const FORK_EXTRA_TOOLS: Record<string, string[]> = {
+  'telegram-codex': ['recent_messages'],
+}
+const withoutExtraTools = (plugin: string, tools: string[]) =>
+  tools.filter(t => !(FORK_EXTRA_TOOLS[plugin] ?? []).includes(t))
 const GOLDEN_FORK_MCP_TOOLS = ['wait_for_message', 'reply', 'edit_message', 'react', 'download_attachment']
 // DIVE-1028: recent_messages (rolling message-log recovery) is a baseline-only
 // addition — the wait_for_message forks have a different inbound path and are a
@@ -148,7 +155,8 @@ describe.each(FORKS)('%s matches golden fork spec', plugin => {
   })
 
   test('MCP tool set', () => {
-    expect(sorted(mcpTools(src))).toEqual(sorted(GOLDEN_FORK_MCP_TOOLS))
+    expect(sorted(mcpTools(src))).toEqual(sorted([...GOLDEN_FORK_MCP_TOOLS, ...(FORK_EXTRA_TOOLS[plugin] ?? [])]))
+    expect(sorted(withoutExtraTools(plugin, mcpTools(src)))).toEqual(sorted(GOLDEN_FORK_MCP_TOOLS))
   })
 
   test('re-arm watchdog present', () => {
@@ -172,7 +180,7 @@ describe('cross-fork consistency', () => {
   })
 
   test('identical MCP tool set', () => {
-    const sets = FORKS.map(f => sorted(mcpTools(byFork[f])))
+    const sets = FORKS.map(f => sorted(withoutExtraTools(f, mcpTools(byFork[f]))))
     for (const s of sets) expect(s).toEqual(sets[0])
   })
 

@@ -1,6 +1,6 @@
 {
   "name": "@5dive/telegram-codex-mcp",
-  "version": "0.5.27",
+  "version": "0.5.28",
   "description": "Telegram bridge for OpenAI Codex CLI, delivered as a stdio MCP server: wait for messages, reply, edit, react, and download attachments from a Telegram bot.",
   "license": "Apache-2.0",
   "type": "module",
@@ -29,6 +29,7 @@
     "approvals.ts",
     "autoattach.ts",
     "outbox-attach.ts",
+    "msglog.ts",
     "compat.ts",
     "health.ts",
     "lifecycle.ts",

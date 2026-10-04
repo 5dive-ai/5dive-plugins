@@ -34,6 +34,8 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.28 — DIVE-5504: `recent_messages` and the per-chat message log; a
+  lost dispatcher thread's next turn carries the chat's recent transcript.
 - v0.5.27 — DIVE-5504: auto-attach of named files on the dispatcher outbox and
   the MCP `reply` tool (`autoattach.ts` fork + `outbox-attach.ts`), with
   `.codex` denied and explicit directives checked too.

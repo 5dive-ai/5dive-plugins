@@ -183,6 +183,40 @@ export interface DispatchSink {
   publish(route: DispatchRoute, text: string, meta: { turnId: string; itemId?: string; kind: 'message' | 'error' | 'control' }): Promise<void>
   /** Best-effort; a sink that cannot record a sample must not fail the turn. */
   usage?(sample: UsageSample): void
+  /**
+   * The chat's recorded messages, oldest first (DIVE-5504). Read only when the
+   * thread was LOST: the model on this path has no MCP tools, so it cannot call
+   * recent_messages itself. Best-effort; [] when there is no log.
+   */
+  transcript?(route: DispatchRoute): TranscriptRow[]
+}
+
+export type TranscriptRow = { ts: string; dir: 'in' | 'out'; user: string; text: string }
+
+const TRANSCRIPT_ROWS = 12
+const TRANSCRIPT_CHARS = 4000
+
+/**
+ * The recovery transcript: the last few messages of the chat, newest kept when
+ * the budget runs out, the message being answered left out (it is the turn's
+ * own input). Background, so the model does not redo what it finds there.
+ */
+export function recoveryTranscript(rows: TranscriptRow[], current: string): string {
+  const prior = [...rows]
+  const last = prior.at(-1)
+  if (last && last.dir === 'in' && last.text.trim() === current.trim()) prior.pop()
+  const lines: string[] = []
+  let used = 0
+  for (const r of prior.slice(-TRANSCRIPT_ROWS).reverse()) {
+    const flat = r.text.replace(/\s+/g, ' ').trim()
+    const line = `${r.dir === 'out' ? 'you' : r.user}: ${flat.length > 600 ? `${flat.slice(0, 599)}…` : flat}`
+    if (used + line.length > TRANSCRIPT_CHARS) break
+    lines.unshift(line)
+    used += line.length + 1
+  }
+  if (!lines.length) return ''
+  return '[5dive recovery] The earlier conversation is not in this thread. The last messages in this chat, oldest first, '
+    + `as background only (do not redo them):\n${lines.join('\n')}`
 }
 
 const MAX_SEEN = 512
@@ -377,9 +411,10 @@ function mergeSnapshot(prev: RateLimitSnapshot | undefined, next: RateLimitSnaps
   return out
 }
 
-function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?: string): Array<Record<string, unknown>> {
+function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?: string, transcript?: string): Array<Record<string, unknown>> {
   const input: Array<Record<string, unknown>> = []
   if (recovery) input.push({ type: 'text', text: recoveryLine(recovery), text_elements: [] })
+  if (transcript) input.push({ type: 'text', text: transcript, text_elements: [] })
   if (handoff) input.push({ type: 'text', text: handoff, text_elements: [] })
   input.push({ type: 'text', text: message.text, text_elements: [] })
   if (message.image_path?.startsWith('/')) input.push({ type: 'localImage', path: message.image_path })
@@ -818,11 +853,18 @@ export class ChannelDispatcher {
     }
     const recovery = this.state.recovery
     const handoff = this.state.handoff
+    // Only a LOST thread gets the transcript: an interrupted turn still has its
+    // history, and a fresh session is bounded on purpose (its handoff line is
+    // the continuity it asked for).
+    let transcript = ''
+    if (recovery?.kind === 'thread-lost' && this.sink.transcript) {
+      try { transcript = recoveryTranscript(this.sink.transcript(message.route), message.text) } catch {}
+    }
     const result = await this.rpc.request('turn/start', {
       threadId: this.requireThread(),
       clientUserMessageId: message.id,
       turnTrigger: `5dive:${message.route.source}`,
-      input: inputFor(message, recovery, handoff),
+      input: inputFor(message, recovery, handoff, transcript),
       // Every turn re-asserts the seat's choice. The resume override already
       // sets it; this makes the TURN the guarantee rather than one handshake.
       ...(this.configured.model ? { model: this.configured.model } : {}),

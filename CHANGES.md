@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Added — telegram-codex 0.5.28: recent_messages, and a lost Codex thread recovers the chat (DIVE-5504)
+
+A Codex agent that lost its thread, or started without one, could not see what the owner had just said and had to ask them to repeat it. The bridge now keeps Claude's bounded rolling log of each chat (the last 200 inbound messages and replies, local and private to the seat) and offers it as the `recent_messages` tool, as Claude's bridge does. On the dispatcher path, whose model has no tools, the first turn after a thread that could not be resumed carries the chat's last few messages (up to 12, about 4,000 characters) as background. A resumed thread, an interrupted turn and a deliberate fresh session do not, since they keep their history or chose to drop it.
+
 ### Added — telegram-codex 0.5.27: a Codex reply attaches the files it names (DIVE-5504)
 
 A Codex agent's reply sent a file only when it wrote an explicit `[[5dive-attachment:/path]]` line, so a report it named by path reached the phone as a dead link. Now a reply that names a report, image, PDF, log or other eligible file by absolute path attaches it, on the dispatcher path and in the MCP `reply` tool, with Claude's rules: the same denylist and allowed folders, at most five files, a footer for anything skipped or too large. On the dispatcher path a file goes at most once per turn, however many messages name it. Credential files are never sent: the Codex copy of the rules also blocks `~/.codex` (its `auth.json` holds the ChatGPT tokens), and an explicit directive to a protected or missing file is now refused with a note instead of sent unchecked. The `reply` result and the bridge log name what was attached.

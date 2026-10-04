@@ -10,6 +10,7 @@ import {
   CONTROL_OPS, ChannelDispatcher, isEffortLevel, parseOutboundMessage, type DispatchMessage, type DispatchRoute, type UsageSample,
 } from './dispatcher-core.ts'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
+import { readMessages } from './msglog.ts'
 import { approvalAsk, approvalResult, askOnTelegram, isApprovalMethod, verdictLine } from './approvals.ts'
 import {
   HEALTH_HEARTBEAT_MS, HEALTH_SCHEMA, writeHealth,
@@ -295,7 +296,15 @@ async function configuredModel() {
   return { model: read?.config?.model ?? undefined, effort: read?.config?.model_reasoning_effort ?? undefined }
 }
 
-const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, usage: recordUsageSample }, WORKDIR, configuredModel)
+// The Telegram adapter's rolling message log (msglog.ts), read for a lost
+// thread's recovery transcript. Telegram routes only: no other channel keeps one.
+const TELEGRAM_STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.codex', 'channels', 'telegram')
+function chatTranscript(route: DispatchRoute) {
+  if (route.source !== 'telegram') return []
+  return readMessages(join(TELEGRAM_STATE_DIR, 'msglog'), route.chat_id)
+}
+
+const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, usage: recordUsageSample, transcript: chatTranscript }, WORKDIR, configuredModel)
 
 // ── approvals (DIVE-5504) ───────────────────────────────────────────────────
 //
@@ -303,7 +312,7 @@ const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, usage: re
 // answers. With the Telegram adapter up, the owner gets ✅/❌ buttons (the same
 // handshake as hooks/request-permission.ts); without it, or with no answer in
 // time, the request is declined and the reason reaches the model.
-const TELEGRAM_PERMS_DIR = join(process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.codex', 'channels', 'telegram'), 'permissions')
+const TELEGRAM_PERMS_DIR = join(TELEGRAM_STATE_DIR, 'permissions')
 async function answerServerRequest(method: string, params: any): Promise<Record<string, unknown> | null> {
   if (!isApprovalMethod(method)) return null
   const ask = approvalAsk(method, params)

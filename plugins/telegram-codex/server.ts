@@ -43,6 +43,10 @@ import { EFFORT_LEVELS, fmtTokens, type ControlOp } from './dispatcher-core.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { TurnAttachMemo, planOutboxAttachments, type OutboxAttachPlan } from './outbox-attach.ts'
 import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts'
+import {
+  appendMessage as msglogAppend, formatRecent as msglogFormat, mostRecentChatId as msglogMostRecent,
+  readMessages as msglogRead, MSGLOG_MAX_PER_CHAT,
+} from './msglog.ts'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -117,6 +121,14 @@ const SEND_ALLOWED_DIRS = [
     .split(',').map((s) => s.trim()).filter(Boolean),
 ]
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
+// DIVE-5504 (Claude's DIVE-1028): bounded per-chat rolling log of inbound
+// messages and the replies sent, for `recent_messages` and for the
+// dispatcher's thread-lost recovery. Local, 0600, 200 per chat.
+const MSGLOG_DIR = join(STATE_DIR, 'msglog')
+function logMessage(chatId: string, dir: 'in' | 'out', user: string, text: string, extra: { message_id?: string; thread_id?: string } = {}): void {
+  if (!text.trim()) return
+  try { msglogAppend(MSGLOG_DIR, chatId, { ts: new Date().toISOString(), dir, user, text, ...extra }) } catch {}
+}
 // DIVE-1503/1558: per-DM pinned "needs-you" banner bookkeeping. Maps a paired DM
 // chat id → { messageId, fingerprint } so each reconcile edits the existing pin
 // instead of posting a fresh banner (the DIVE-1107 banner-storm lesson).
@@ -767,6 +779,8 @@ function ingestDispatcherOutbox(name: string): void {
     }
     try { unlinkSync(full) } catch {}
     outboxAttachPlans.delete(name)
+    logMessage(String(obj.chat_id), 'out', agentName(), plan!.receipt ? `${text}\n[${plan!.receipt}]` : text,
+      obj.message_thread_id ? { thread_id: String(obj.message_thread_id) } : {})
     if (plan!.receipt) process.stderr.write(`telegram-codex: dispatcher reply ${name} ${plan!.receipt}\n`)
   })().catch(err => {
     process.stderr.write(`telegram-codex: dispatcher reply failed for ${name}: ${err}\n`)
@@ -1994,6 +2008,10 @@ async function ingest(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  logMessage(String(chat.id), 'in', from.username ?? String(from.id), text, {
+    ...(msgId != null ? { message_id: String(msgId) } : {}),
+    ...(threadId != null ? { thread_id: String(threadId) } : {}),
+  })
   enqueueInbound({
     chat_id: String(chat.id),
     message_id: msgId != null ? String(msgId) : '0',
@@ -3119,6 +3137,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'recent_messages',
+      description: 'Recover recent Telegram context after a restart or a new session. Telegram\'s Bot API exposes no history, but this bridge keeps a bounded rolling log of inbound messages and your replies per chat. Returns the most recent messages as a compact transcript. Pass chat_id to target a specific chat, or omit it to use the most recently active chat. Use this instead of asking the person to repeat earlier context.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Chat to fetch. Omit to use the most recently active chat.' },
+          limit: { type: 'number', description: `How many recent messages to return (default 20, max ${MSGLOG_MAX_PER_CHAT}).` },
+        },
+      },
+    },
+    {
       name: 'download_attachment',
       description:
         'Download a file attachment from a Telegram message to the local inbox. Use when '
@@ -3256,6 +3285,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         try { writeFileSync(LAST_REPLY_FILE, String(Date.now())) } catch {}
 
         const autoNames = attachedNames(autoPlan)
+        const sentText = [textMissing ? '' : ynText, autoNames ? `[${autoNames}]` : ''].filter(Boolean).join('\n')
+        logMessage(chat_id, 'out', agentName(), sentText || `[${files.length} file(s)]`,
+          message_thread_id != null ? { thread_id: String(message_thread_id) } : {})
         const result = (sentIds.length === 1
           ? `sent (id: ${sentIds[0]})`
           : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`) + (autoNames ? `; ${autoNames}` : '')
@@ -3283,6 +3315,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           { type: 'emoji', emoji: String(args.emoji) as ReactionTypeEmoji['emoji'] },
         ])
         return { content: [{ type: 'text', text: 'reacted' }] }
+      }
+
+      case 'recent_messages': {
+        // Read-only, but scoped to an allowlisted chat when one is named so it
+        // cannot enumerate other chats' logs.
+        const rawChat = args.chat_id != null ? String(args.chat_id) : undefined
+        if (rawChat) assertAllowedChat(rawChat)
+        const chat_id = rawChat ?? msglogMostRecent(MSGLOG_DIR)
+        if (!chat_id) return { content: [{ type: 'text', text: '(no recorded Telegram messages yet)' }] }
+        const limit = Math.max(1, Math.min(Number(args.limit) || 20, MSGLOG_MAX_PER_CHAT))
+        const rows = msglogRead(MSGLOG_DIR, chat_id)
+        const header = `Recent messages for chat ${chat_id} (last ${Math.min(limit, rows.length)} of ${rows.length}):\n`
+        return { content: [{ type: 'text', text: header + msglogFormat(rows, limit) }] }
       }
 
       case 'download_attachment': {
