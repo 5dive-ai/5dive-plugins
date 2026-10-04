@@ -92,11 +92,15 @@ const GOLDEN_FORK_COMMANDS = [
 // thread, so it alone can compact it or start a fresh one from the phone. The
 // pane forks (grok/agy) would have to type into a TUI they do not own. A
 // documented, per-fork delta — the rest of the menu stays in lockstep.
+// 0.5.25 adds /effort, /usage and /account the same way: each asks the
+// app-server (a config write, the provider's rate-limit read, the signed-in
+// account), which only the dispatcher holds a connection to.
 const FORK_EXTRA_COMMANDS: Record<string, string[]> = {
-  'telegram-codex': ['context', 'clear'],
+  'telegram-codex': ['context', 'clear', 'effort', 'usage', 'account'],
 }
 const GOLDEN_CODEX_COMMANDS = [
-  'help', 'status', 'context', 'stop', 'restart', 'clear', 'agents', 'team', 'tasks', 'inbox', 'task', 'org', 'model', 'ping', 'start',
+  'help', 'status', 'context', 'stop', 'restart', 'clear', 'agents', 'team', 'tasks', 'inbox', 'task', 'org', 'model',
+  'effort', 'usage', 'account', 'ping', 'start',
 ]
 const withoutExtras = (plugin: string, cmds: string[]) =>
   cmds.filter(c => !(FORK_EXTRA_COMMANDS[plugin] ?? []).includes(c))

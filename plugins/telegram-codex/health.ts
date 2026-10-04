@@ -101,6 +101,20 @@ export type ChannelHealth = {
   }
   /** The newest saved session receipt, if a new session was ever started. */
   lastSession?: { threadId: string; endedAt: string; reason: string; calls?: number; inContext?: number }
+  /** OpenAI's own rate-limit report, as last read (`/usage`) or pushed
+   *  (`account/rateLimits/updated`), with when. Provider percentages only. */
+  rateLimits?: {
+    at: string
+    from: 'read' | 'updated'
+    buckets: Array<{
+      limitId?: string | null
+      limitName?: string | null
+      primary?: { usedPercent: number; windowDurationMins: number | null; resetsAt: number | null } | null
+      secondary?: { usedPercent: number; windowDurationMins: number | null; resetsAt: number | null } | null
+      planType?: string | null
+      rateLimitReachedType?: string | null
+    }>
+  }
 }
 
 export type HealthState =
