@@ -258,6 +258,15 @@ export function progressStatus(item: any): string | null {
 
 /** Progress events go out at most this often per turn; the rest are dropped. */
 export const PROGRESS_MIN_MS = 3_000
+/** The longest commentary the ack shows; the full text is never lost (DIVE-5508). */
+export const NOTE_MAX_CHARS = 280
+
+/** A commentary line as the ack's status: one line, clamped. */
+export function noteStatus(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > NOTE_MAX_CHARS ? `${flat.slice(0, NOTE_MAX_CHARS - 1).trimEnd()}…` : flat
+}
+
 
 function fmtElapsed(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
@@ -280,6 +289,11 @@ export function parseOutboundMessage(raw: string): { text: string; files: string
     return false
   })
   return { text: lines.join('\n').trim(), files }
+}
+
+/** Whether <text> asks for a file to be attached: the ack cannot carry one. */
+export function hasAttachmentDirective(text: string): boolean {
+  return parseOutboundMessage(text).files.length > 0
 }
 
 function routeKey(route: DispatchRoute): string {
@@ -503,7 +517,14 @@ export class ChannelDispatcher {
    * and an agent message of unknown phase held back until the next one shows it
    * was not the last, so only the turn's last answer notifies.
    */
-  private progress?: { turnId: string; steps: number; startedAt: number; lastAt: number; held?: { text: string; itemId: string } }
+  private progress?: {
+    turnId: string; steps: number; startedAt: number; lastAt: number
+    held?: { text: string; itemId: string }
+    /** A message the chat will read as the answer has gone out (DIVE-5508). */
+    answered?: boolean
+    /** The newest commentary folded into the ack, kept in case no answer follows. */
+    note?: { text: string; itemId: string }
+  }
 
   constructor(
     private readonly rpc: RpcPort,
@@ -907,12 +928,21 @@ export class ChannelDispatcher {
           await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message' })
           return
         }
-        // Commentary goes now, silently; a final answer notifies. An unknown
+        // DIVE-5508: commentary is progress, not a message. It edits the
+        // sticky ack, so the chat gets the ack plus ONE answer — before, a
+        // model that drafted its answer as commentary and then repeated it as
+        // the final answer sent it twice. A final answer notifies. An unknown
         // phase (older models) waits for the next message or the turn's end to
         // learn whether it was the last one.
         await this.flushHeld(false)
         const phase = params?.item?.phase
-        if (phase === 'commentary' || phase === 'final_answer') {
+        if (phase === 'commentary' && !hasAttachmentDirective(text)) {
+          p.note = { text, itemId }
+          await this.publishProgress(this.state.active.route, noteStatus(text), { turnId, kind: 'progress', steps: p.steps })
+        } else if (phase === 'commentary' || phase === 'final_answer') {
+          // A commentary that carries a file still goes as a (silent) message:
+          // the ack cannot hold an attachment.
+          if (phase === 'final_answer') p.answered = true
           await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message', notify: phase === 'final_answer' })
         } else {
           p.held = { text, itemId }
@@ -926,6 +956,12 @@ export class ChannelDispatcher {
         const progress = this.progress?.turnId === turnId ? this.progress : undefined
         // The held message was the turn's last: it notifies, unless an error follows.
         if (progress) await this.flushHeld(params?.turn?.status === 'completed', completed.route)
+        // A turn that only ever wrote commentary still owes the chat an answer:
+        // its last commentary becomes it, rather than vanishing with the ack.
+        if (progress && !progress.answered && progress.note) {
+          const { text, itemId } = progress.note
+          await this.sink.publish(completed.route, text, { turnId, itemId, kind: 'message', notify: params?.turn?.status === 'completed' })
+        }
         this.progress = undefined
         if (progress) {
           const took = fmtElapsed(Date.now() - progress.startedAt)
@@ -1023,6 +1059,7 @@ export class ChannelDispatcher {
     if (!p?.held || !route) return
     const { text, itemId } = p.held
     p.held = undefined
+    p.answered = true
     await this.sink.publish(route, text, { turnId: p.turnId, itemId, kind: 'message', notify })
   }
 
