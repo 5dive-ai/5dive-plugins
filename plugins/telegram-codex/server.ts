@@ -41,6 +41,13 @@ import { installLifecycle } from './lifecycle.ts'
 import { HEALTH_SCHEMA, modelStatusLines, readHealth, staleAfterMs } from './health.ts'
 import { EFFORT_LEVELS, fmtTokens, type ControlOp } from './dispatcher-core.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { TurnAttachMemo, planOutboxAttachments, type OutboxAttachPlan } from './outbox-attach.ts'
+import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts'
+import { ProgressAcks } from './progress.ts'
+import {
+  appendMessage as msglogAppend, formatRecent as msglogFormat, mostRecentChatId as msglogMostRecent,
+  readMessages as msglogRead, MSGLOG_MAX_PER_CHAT,
+} from './msglog.ts'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -115,6 +122,14 @@ const SEND_ALLOWED_DIRS = [
     .split(',').map((s) => s.trim()).filter(Boolean),
 ]
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
+// DIVE-5504 (Claude's DIVE-1028): bounded per-chat rolling log of inbound
+// messages and the replies sent, for `recent_messages` and for the
+// dispatcher's thread-lost recovery. Local, 0600, 200 per chat.
+const MSGLOG_DIR = join(STATE_DIR, 'msglog')
+function logMessage(chatId: string, dir: 'in' | 'out', user: string, text: string, extra: { message_id?: string; thread_id?: string } = {}): void {
+  if (!text.trim()) return
+  try { msglogAppend(MSGLOG_DIR, chatId, { ts: new Date().toISOString(), dir, user, text, ...extra }) } catch {}
+}
 // DIVE-1503/1558: per-DM pinned "needs-you" banner bookkeeping. Maps a paired DM
 // chat id → { messageId, fingerprint } so each reconcile edits the existing pin
 // instead of posting a fresh banner (the DIVE-1107 banner-storm lesson).
@@ -724,6 +739,20 @@ function ingestInboxFile(name: string): void {
 }
 
 const dispatcherOutboxBusy = new Set<string>()
+// DIVE-5504: auto-attach on the dispatcher path. A plan is made ONCE per outbox
+// file and kept across its retries: re-planning a retry would find its own
+// files in the per-turn memo and send none of them.
+const outboxAttachMemo = new TurnAttachMemo()
+const outboxAttachPlans = new Map<string, OutboxAttachPlan>()
+// DIVE-5504: one silent, edited ack per Codex turn (progress.ts).
+const progressAcks = new ProgressAcks({
+  send: async (chatId, threadId, text) => (await bot.api.sendMessage(chatId, text, {
+    disable_notification: true, ...(threadId ? { message_thread_id: Number(threadId) } : {}),
+  })).message_id,
+  edit: async (chatId, messageId, text) => { await bot.api.editMessageText(chatId, messageId, text) },
+  now: () => Date.now(),
+  later: (fn, ms) => { setTimeout(fn, ms).unref?.() },
+})
 function ingestDispatcherOutbox(name: string): void {
   if (!name.endsWith('.json') || dispatcherOutboxBusy.has(name)) return
   const full = join(DISPATCHER_OUTBOX_DIR, name)
@@ -734,15 +763,36 @@ function ingestDispatcherOutbox(name: string): void {
     try { unlinkSync(full) } catch {}
     return
   }
+  if (obj.kind === 'progress' || obj.kind === 'progress-done') {
+    // Decoration, never retried: a lost progress line is replaced by the next.
+    try { unlinkSync(full) } catch {}
+    const key = `${obj.chat_id}:${obj.turnId ?? ''}`
+    if (obj.kind === 'progress') {
+      progressAcks.progress(key, String(obj.chat_id), obj.message_thread_id ? String(obj.message_thread_id) : undefined, String(obj.text))
+    } else {
+      progressAcks.done(key, String(obj.text))
+    }
+    return
+  }
   dispatcherOutboxBusy.add(name)
+  // Only a turn's last answer notifies; commentary and earlier messages arrive
+  // silently (the dispatcher sets `notify: false` on those).
+  const silent = obj.notify === false ? { disable_notification: true } : {}
   const options = obj.message_thread_id
-    ? { message_thread_id: Number(obj.message_thread_id) }
-    : undefined
-  const files = Array.isArray(obj.files)
+    ? { message_thread_id: Number(obj.message_thread_id), ...silent }
+    : (obj.notify === false ? silent : undefined)
+  const explicit = Array.isArray(obj.files)
     ? obj.files.filter((f: unknown): f is string => typeof f === 'string' && f.startsWith('/')).slice(0, 10)
     : []
+  let plan = outboxAttachPlans.get(name)
+  if (!plan) {
+    plan = planOutboxAttachments(String(obj.text), explicit, `${obj.chat_id}:${obj.turnId ?? name}`, outboxAttachMemo)
+    outboxAttachPlans.set(name, plan)
+  }
+  const files = plan.send
+  const text = plan.footer ? `${String(obj.text)}\n\n${plan.footer}` : String(obj.text)
   void (async () => {
-    await bot.api.sendMessage(String(obj.chat_id), String(obj.text), options)
+    await bot.api.sendMessage(String(obj.chat_id), text, options)
     for (const file of files) {
       const input = new InputFile(file)
       if (PHOTO_EXTS.has(extname(file).toLowerCase())) {
@@ -752,6 +802,10 @@ function ingestDispatcherOutbox(name: string): void {
       }
     }
     try { unlinkSync(full) } catch {}
+    outboxAttachPlans.delete(name)
+    logMessage(String(obj.chat_id), 'out', agentName(), plan!.receipt ? `${text}\n[${plan!.receipt}]` : text,
+      obj.message_thread_id ? { thread_id: String(obj.message_thread_id) } : {})
+    if (plan!.receipt) process.stderr.write(`telegram-codex: dispatcher reply ${name} ${plan!.receipt}\n`)
   })().catch(err => {
     process.stderr.write(`telegram-codex: dispatcher reply failed for ${name}: ${err}\n`)
     setTimeout(() => ingestDispatcherOutbox(name), 1_000).unref?.()
@@ -1978,6 +2032,10 @@ async function ingest(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  logMessage(String(chat.id), 'in', from.username ?? String(from.id), text, {
+    ...(msgId != null ? { message_id: String(msgId) } : {}),
+    ...(threadId != null ? { thread_id: String(threadId) } : {}),
+  })
   enqueueInbound({
     chat_id: String(chat.id),
     message_id: msgId != null ? String(msgId) : '0',
@@ -2372,6 +2430,7 @@ type PendingApproval = {
 }
 
 const pendingApprovals = new Map<string, PendingApproval>() // key = callback prefix
+const approvalsPrompted = new Set<string>()
 
 function shortToolDesc(req: any): string {
   const tool = req.tool_name ?? 'tool'
@@ -2399,8 +2458,10 @@ async function broadcastApproval(reqPath: string) {
     return
   }
 
+  const verb = req.tool_name === 'Edit' ? 'change files' : 'run'
+  const why = typeof req.reason === 'string' && req.reason ? `\n${req.reason.slice(0, 300)}` : ''
   const body =
-    `🔐 *Codex wants to run:*\n${shortToolDesc(req)}\n\n` +
+    `🔐 *Codex wants to ${verb}:*\n${shortToolDesc(req)}${why}\n\n` +
     `_cwd: ${req.cwd ?? '?'} · model: ${req.model ?? '?'}_`
 
   const kb = new InlineKeyboard()
@@ -2408,14 +2469,37 @@ async function broadcastApproval(reqPath: string) {
     .text('❌ deny',  `tgcodex:deny:${reqId}`)
 
   // DM the first allowFrom user. (We pick one chat to avoid double-decisions
-  // from multiple recipients racing each other on the same request.)
-  const chat_id = access.allowFrom[0]
+  // from multiple recipients racing each other on the same request.) A
+  // dispatcher request names the chat its turn came from (DIVE-5504): asked
+  // there, as long as that chat is one this bot may write to.
+  let chat_id = access.allowFrom[0]!
+  let threadOpt: { message_thread_id?: number } = {}
+  if (typeof req.chat_id === 'string' && req.chat_id) {
+    try {
+      assertAllowedChat(req.chat_id)
+      chat_id = req.chat_id
+      if (req.message_thread_id) threadOpt = { message_thread_id: Number(req.message_thread_id) }
+    } catch {}
+  }
+  // fs.watch fires on create AND on write: one request, one prompt.
+  if (approvalsPrompted.has(reqId)) return
+  approvalsPrompted.add(reqId)
+  if (approvalsPrompted.size > 256) approvalsPrompted.delete(approvalsPrompted.values().next().value!)
   try {
-    const sent = await bot.api.sendMessage(chat_id, body, {
-      parse_mode: 'Markdown',
-      reply_markup: kb,
-    })
+    // A command with a backtick or an underscore breaks Markdown, and a prompt
+    // that never arrives is a silent decline two minutes later: plain text then.
+    const sent = await bot.api.sendMessage(chat_id, body, { parse_mode: 'Markdown', reply_markup: kb, ...threadOpt })
+      .catch(() => bot.api.sendMessage(chat_id, body.replace(/[*_`]/g, ''), { reply_markup: kb, ...threadOpt }))
     pendingApprovals.set(reqId, { reqId, chat_id, message_id: sent.message_id })
+    const expires = Date.parse(String(req.expires_at ?? ''))
+    if (Number.isFinite(expires)) {
+      setTimeout(() => {
+        if (!pendingApprovals.has(reqId)) return
+        pendingApprovals.delete(reqId)
+        void bot.api.editMessageText(chat_id, sent.message_id, '⌛ No answer in time, so Codex was told no.', { reply_markup: undefined })
+          .catch(() => {})
+      }, Math.max(0, expires - Date.now()) + 1_000).unref?.()
+    }
   } catch (err) {
     process.stderr.write(`telegram-codex: failed to send approval prompt for ${reqId}: ${err}\n`)
   }
@@ -2933,6 +3017,14 @@ bot.on('callback_query:data', async ctx => {
   const pending = pendingApprovals.get(reqId)
   pendingApprovals.delete(reqId)
 
+  // Nobody waits on a request whose file is gone (it timed out and was
+  // declined): say so instead of writing an answer no one will read.
+  if (!/^[A-Za-z0-9_-]+$/.test(reqId) || !existsSync(join(PERMS_DIR, `req-${reqId}.json`))) {
+    await ctx.answerCallbackQuery({ text: 'This request expired; Codex was already told no.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    return
+  }
+
   // Write the response file (the hook polls for it).
   const resPath = join(PERMS_DIR, `res-${reqId}.json`)
   const user = ctx.from.username ?? ctx.from.first_name ?? senderId
@@ -3069,6 +3161,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'recent_messages',
+      description: 'Recover recent Telegram context after a restart or a new session. Telegram\'s Bot API exposes no history, but this bridge keeps a bounded rolling log of inbound messages and your replies per chat. Returns the most recent messages as a compact transcript. Pass chat_id to target a specific chat, or omit it to use the most recently active chat. Use this instead of asking the person to repeat earlier context.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Chat to fetch. Omit to use the most recently active chat.' },
+          limit: { type: 'number', description: `How many recent messages to return (default 20, max ${MSGLOG_MAX_PER_CHAT}).` },
+        },
+      },
+    },
+    {
       name: 'download_attachment',
       description:
         'Download a file attachment from a Telegram message to the local inbox. Use when '
@@ -3143,11 +3246,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // DIVE-5504 (Claude's DIVE-4280): a file the reply NAMES is attached even
+        // without files=, through autoattach.ts's denylist (which also denies
+        // ~/.codex here) and 5-file cap. Explicit files win; nothing goes twice.
+        const autoPlan = planAutoAttach(text, { already: files })
+        const autoFooter = autoAttachFooter(autoPlan)
+
         const accessForReply = loadAccess()
         // DIVE-332/335: auto-render a Yes/No keyboard when the reply ends in a
         // single yes/no question (opt-out marker stripped either way). The tap
         // rides the callback path below, injecting a clean 'yes'/'no' inbound.
-        const { stripped: ynText, keyboard: ynKeyboard } = yesNoButtons(text)
+        const { stripped: ynRaw, keyboard: ynKeyboard } = yesNoButtons(text)
+        const ynText = autoFooter
+          ? `${ynRaw}\n\n${parseMode ? autoFooter.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1') : autoFooter}`
+          : ynRaw
         const chunks = textMissing ? [] : chunkForTelegram(ynText, accessForReply.textChunkLimit ?? TG_MAX_MESSAGE_CHARS)
         // DIVE-708/717: a choice-list keyboard takes precedence over Yes/No, but
         // only when the whole reply is a single chunk — the tap resolves the
@@ -3180,7 +3292,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
         }
 
-        for (const f of files) {
+        for (const f of [...files, ...autoPlan.attach]) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
           const opts = {
@@ -3196,9 +3308,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Stamp for the Stop hook's duplicate-suppression check.
         try { writeFileSync(LAST_REPLY_FILE, String(Date.now())) } catch {}
 
-        const result = sentIds.length === 1
+        const autoNames = attachedNames(autoPlan)
+        const sentText = [textMissing ? '' : ynText, autoNames ? `[${autoNames}]` : ''].filter(Boolean).join('\n')
+        logMessage(chat_id, 'out', agentName(), sentText || `[${files.length} file(s)]`,
+          message_thread_id != null ? { thread_id: String(message_thread_id) } : {})
+        const result = (sentIds.length === 1
           ? `sent (id: ${sentIds[0]})`
-          : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+          : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`) + (autoNames ? `; ${autoNames}` : '')
         return { content: [{ type: 'text', text: result }] }
       }
 
@@ -3223,6 +3339,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           { type: 'emoji', emoji: String(args.emoji) as ReactionTypeEmoji['emoji'] },
         ])
         return { content: [{ type: 'text', text: 'reacted' }] }
+      }
+
+      case 'recent_messages': {
+        // Read-only, but scoped to an allowlisted chat when one is named so it
+        // cannot enumerate other chats' logs.
+        const rawChat = args.chat_id != null ? String(args.chat_id) : undefined
+        if (rawChat) assertAllowedChat(rawChat)
+        const chat_id = rawChat ?? msglogMostRecent(MSGLOG_DIR)
+        if (!chat_id) return { content: [{ type: 'text', text: '(no recorded Telegram messages yet)' }] }
+        const limit = Math.max(1, Math.min(Number(args.limit) || 20, MSGLOG_MAX_PER_CHAT))
+        const rows = msglogRead(MSGLOG_DIR, chat_id)
+        const header = `Recent messages for chat ${chat_id} (last ${Math.min(limit, rows.length)} of ${rows.length}):\n`
+        return { content: [{ type: 'text', text: header + msglogFormat(rows, limit) }] }
       }
 
       case 'download_attachment': {

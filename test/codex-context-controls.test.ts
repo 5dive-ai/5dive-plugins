@@ -147,7 +147,7 @@ describe('Codex context controls (DIVE-5502)', () => {
     expect(h.requests.some(r => r.method === 'turn/steer')).toBe(false)
 
     await h.dispatcher.notification('turn/completed', { turn: { id: 'compact-turn', status: 'completed' } })
-    expect(h.published.at(-1)!.text).toBe('🗜 Session compacted. It carried ~146k tokens; the next reply shows the new size in /context.')
+    expect(h.published.filter(p => !String(p.meta.kind).startsWith('progress')).at(-1)!.text).toBe('🗜 Session compacted. It carried ~146k tokens; the next reply shows the new size in /context.')
     expect(h.persisted().compacting).toBeUndefined()
     expect(h.persisted().threadId).toBe('thread-1')
     expect(inputTexts(turnStarts(h).at(-1)!)).toEqual(['while compacting'])

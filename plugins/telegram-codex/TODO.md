@@ -34,6 +34,16 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.29 — DIVE-5504: one silent, edited acknowledgement per Telegram turn on
+  the dispatcher path and one notification (the last answer).
+- v0.5.28 — DIVE-5504: `recent_messages` and the per-chat message log; a
+  lost dispatcher thread's next turn carries the chat's recent transcript.
+- v0.5.27 — DIVE-5504: auto-attach of named files on the dispatcher outbox and
+  the MCP `reply` tool (`autoattach.ts` fork + `outbox-attach.ts`), with
+  `.codex` denied and explicit directives checked too.
+- v0.5.26 — DIVE-5504: Codex approval requests on the dispatcher path go to
+  Telegram buttons instead of an unseen decline (`approvals.ts`); timeout and
+  no-adapter stay explicit declines; the seat's approval policy is untouched.
 - v0.5.25 — DIVE-5502: `/effort`, `/usage` and `/account` on the dispatcher
   path. Inbox verbs `set-effort`, `usage` and `account` run at once, even
   mid-turn: an effort change is written with `config/value/write` and applies

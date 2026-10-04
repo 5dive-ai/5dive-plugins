@@ -179,10 +179,89 @@ export interface StateStore {
   quarantine?(reason: string): void
 }
 
+export type PublishMeta = {
+  turnId: string
+  itemId?: string
+  /** `progress`/`progress-done` drive the adapter's one silent ack (DIVE-5504). */
+  kind: 'message' | 'error' | 'control' | 'progress' | 'progress-done'
+  /** false: deliver silently. Only a turn's last answer notifies (DIVE-5504). */
+  notify?: boolean
+  /** Tool steps so far, on progress events. */
+  steps?: number
+}
+
 export interface DispatchSink {
-  publish(route: DispatchRoute, text: string, meta: { turnId: string; itemId?: string; kind: 'message' | 'error' | 'control' }): Promise<void>
+  publish(route: DispatchRoute, text: string, meta: PublishMeta): Promise<void>
   /** Best-effort; a sink that cannot record a sample must not fail the turn. */
   usage?(sample: UsageSample): void
+  /**
+   * The chat's recorded messages, oldest first (DIVE-5504). Read only when the
+   * thread was LOST: the model on this path has no MCP tools, so it cannot call
+   * recent_messages itself. Best-effort; [] when there is no log.
+   */
+  transcript?(route: DispatchRoute): TranscriptRow[]
+}
+
+export type TranscriptRow = { ts: string; dir: 'in' | 'out'; user: string; text: string }
+
+const TRANSCRIPT_ROWS = 12
+const TRANSCRIPT_CHARS = 4000
+
+/**
+ * The recovery transcript: the last few messages of the chat, newest kept when
+ * the budget runs out, the message being answered left out (it is the turn's
+ * own input). Background, so the model does not redo what it finds there.
+ */
+export function recoveryTranscript(rows: TranscriptRow[], current: string): string {
+  const prior = [...rows]
+  const last = prior.at(-1)
+  if (last && last.dir === 'in' && last.text.trim() === current.trim()) prior.pop()
+  const lines: string[] = []
+  let used = 0
+  for (const r of prior.slice(-TRANSCRIPT_ROWS).reverse()) {
+    const flat = r.text.replace(/\s+/g, ' ').trim()
+    const line = `${r.dir === 'out' ? 'you' : r.user}: ${flat.length > 600 ? `${flat.slice(0, 599)}…` : flat}`
+    if (used + line.length > TRANSCRIPT_CHARS) break
+    lines.unshift(line)
+    used += line.length + 1
+  }
+  if (!lines.length) return ''
+  return '[5dive recovery] The earlier conversation is not in this thread. The last messages in this chat, oldest first, '
+    + `as background only (do not redo them):\n${lines.join('\n')}`
+}
+
+/**
+ * One short status for a tool step, or null for items that are not one
+ * (DIVE-5504): this is what the sticky ack shows, not a transcript.
+ */
+export function progressStatus(item: any): string | null {
+  const clip = (t: unknown, n = 60) => {
+    const flat = String(t ?? '').replace(/\s+/g, ' ').trim()
+    return flat.length > n ? `${flat.slice(0, n - 1)}…` : flat
+  }
+  switch (item?.type) {
+    case 'commandExecution': return item.command ? `running \`${clip(item.command)}\`` : 'running a command'
+    case 'fileChange': {
+      const n = Array.isArray(item.changes) ? item.changes.length : 0
+      return n ? `editing ${n} file${n === 1 ? '' : 's'}` : 'editing files'
+    }
+    case 'webSearch': return item.query ? `searching the web for "${clip(item.query, 40)}"` : 'searching the web'
+    case 'mcpToolCall': return `using ${clip([item.server, item.tool].filter(Boolean).join('.'), 40) || 'a tool'}`
+    case 'dynamicToolCall': return 'using a tool'
+    case 'imageGeneration': return 'making an image'
+    case 'imageView': return 'looking at an image'
+    case 'plan': return 'planning'
+    case 'collabAgentToolCall': case 'subAgentActivity': return 'working with a helper agent'
+    default: return null
+  }
+}
+
+/** Progress events go out at most this often per turn; the rest are dropped. */
+export const PROGRESS_MIN_MS = 3_000
+
+function fmtElapsed(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000))
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
 }
 
 const MAX_SEEN = 512
@@ -377,9 +456,10 @@ function mergeSnapshot(prev: RateLimitSnapshot | undefined, next: RateLimitSnaps
   return out
 }
 
-function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?: string): Array<Record<string, unknown>> {
+function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?: string, transcript?: string): Array<Record<string, unknown>> {
   const input: Array<Record<string, unknown>> = []
   if (recovery) input.push({ type: 'text', text: recoveryLine(recovery), text_elements: [] })
+  if (transcript) input.push({ type: 'text', text: transcript, text_elements: [] })
   if (handoff) input.push({ type: 'text', text: handoff, text_elements: [] })
   input.push({ type: 'text', text: message.text, text_elements: [] })
   if (message.image_path?.startsWith('/')) input.push({ type: 'localImage', path: message.image_path })
@@ -418,6 +498,12 @@ export class ChannelDispatcher {
   private configured: ModelSelection = {}
   /** The last provider rate-limit report (in memory; a restart re-reads). */
   private limits?: RateLimitRecord
+  /**
+   * The running Telegram turn's progress (DIVE-5504): steps for the sticky ack,
+   * and an agent message of unknown phase held back until the next one shows it
+   * was not the last, so only the turn's last answer notifies.
+   */
+  private progress?: { turnId: string; steps: number; startedAt: number; lastAt: number; held?: { text: string; itemId: string } }
 
   constructor(
     private readonly rpc: RpcPort,
@@ -741,7 +827,7 @@ export class ChannelDispatcher {
       cwd: this.cwd,
       serviceName: '5dive-channel-dispatcher',
       developerInstructions:
-        'Messages arrive from 5dive channels. Respond normally in assistant messages; the dispatcher routes those messages back to the originating channel. Do not call wait_for_message or channel reply tools. To attach a local file, include a separate [[5dive-attachment:/absolute/path]] line after a non-empty caption; the dispatcher removes the directive and sends the file only to the originating channel.',
+        'Messages arrive from 5dive channels. Respond normally in assistant messages; the dispatcher routes those messages back to the originating channel. Do not call wait_for_message or channel reply tools. A report, image, PDF or log you name by absolute path in a reply is attached automatically (once per turn; credential files never). For any other file, include a separate [[5dive-attachment:/absolute/path]] line after a non-empty caption; the dispatcher removes the directive and sends the file only to the originating channel.',
     })
     const id = started?.thread?.id
     if (typeof id !== 'string' || !id) throw new Error('thread/start returned no thread id')
@@ -791,6 +877,18 @@ export class ChannelDispatcher {
         this.persist()
         return
       }
+      if (method === 'item/started' && this.progress && params?.turnId === this.progress.turnId
+        && this.state.active?.turnId === this.progress.turnId) {
+        const status = progressStatus(params?.item)
+        if (!status) return
+        const p = this.progress
+        p.steps++
+        const now = Date.now()
+        if (now - p.lastAt < PROGRESS_MIN_MS) return
+        p.lastAt = now
+        await this.publishProgress(this.state.active.route, status, { turnId: p.turnId, kind: 'progress', steps: p.steps })
+        return
+      }
       if (method === 'item/agentMessage/delta') {
         const key = `${params?.turnId ?? ''}:${params?.itemId ?? ''}`
         this.itemText.set(key, (this.itemText.get(key) ?? '') + String(params?.delta ?? ''))
@@ -803,13 +901,38 @@ export class ChannelDispatcher {
         const key = `${turnId}:${itemId}`
         const text = String(params.item.text ?? this.itemText.get(key) ?? '').trim()
         this.itemText.delete(key)
-        if (text) await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message' })
+        if (!text) return
+        const p = this.progress?.turnId === turnId ? this.progress : undefined
+        if (!p) {
+          await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message' })
+          return
+        }
+        // Commentary goes now, silently; a final answer notifies. An unknown
+        // phase (older models) waits for the next message or the turn's end to
+        // learn whether it was the last one.
+        await this.flushHeld(false)
+        const phase = params?.item?.phase
+        if (phase === 'commentary' || phase === 'final_answer') {
+          await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message', notify: phase === 'final_answer' })
+        } else {
+          p.held = { text, itemId }
+        }
         return
       }
       if (method === 'turn/completed') {
         const turnId = String(params?.turn?.id ?? '')
         if (!this.state.active || this.state.active.turnId !== turnId) return
         const completed = this.state.active
+        const progress = this.progress?.turnId === turnId ? this.progress : undefined
+        // The held message was the turn's last: it notifies, unless an error follows.
+        if (progress) await this.flushHeld(params?.turn?.status === 'completed', completed.route)
+        this.progress = undefined
+        if (progress) {
+          const took = fmtElapsed(Date.now() - progress.startedAt)
+          const steps = progress.steps ? ` · ${progress.steps} step${progress.steps === 1 ? '' : 's'}` : ''
+          await this.publishProgress(completed.route, params?.turn?.status === 'completed'
+            ? `✅ Done in ${took}${steps}` : `⚠️ Stopped after ${took}${steps}`, { turnId, kind: 'progress-done', steps: progress.steps })
+        }
         this.state.active = undefined
         const compaction = completed.message.control === 'compact' ? this.state.compacting : undefined
         if (compaction) this.state.compacting = undefined
@@ -841,11 +964,18 @@ export class ChannelDispatcher {
     }
     const recovery = this.state.recovery
     const handoff = this.state.handoff
+    // Only a LOST thread gets the transcript: an interrupted turn still has its
+    // history, and a fresh session is bounded on purpose (its handoff line is
+    // the continuity it asked for).
+    let transcript = ''
+    if (recovery?.kind === 'thread-lost' && this.sink.transcript) {
+      try { transcript = recoveryTranscript(this.sink.transcript(message.route), message.text) } catch {}
+    }
     const result = await this.rpc.request('turn/start', {
       threadId: this.requireThread(),
       clientUserMessageId: message.id,
       turnTrigger: `5dive:${message.route.source}`,
-      input: inputFor(message, recovery, handoff),
+      input: inputFor(message, recovery, handoff, transcript),
       // Every turn re-asserts the seat's choice. The resume override already
       // sets it; this makes the TURN the guarantee rather than one handshake.
       ...(this.configured.model ? { model: this.configured.model } : {}),
@@ -854,6 +984,15 @@ export class ChannelDispatcher {
     const turnId = result?.turn?.id
     if (typeof turnId !== 'string' || !turnId) throw new Error('turn/start returned no turn id')
     this.state.active = { turnId, routeKey: routeKey(message.route), route: message.route, message }
+    // A Telegram turn gets the sticky ack: the first progress event opens it
+    // (the adapter waits a few seconds before showing it, so a quick answer
+    // arrives alone). Other channels keep their plain replies.
+    if (message.route.source === 'telegram') {
+      this.progress = { turnId, steps: 0, startedAt: Date.now(), lastAt: Date.now() }
+      await this.publishProgress(message.route, 'starting', { turnId, kind: 'progress', steps: 0 })
+    } else {
+      this.progress = undefined
+    }
     // An accepted turn override IS the thread's model from here on (measured on
     // codex 0.153.3: the rollout's turn_context follows it even when the resume
     // reported the old one), and the app-server sends no settings event for it.
@@ -871,6 +1010,20 @@ export class ChannelDispatcher {
     this.remember(message)
     this.markSeen(message.id)
     this.persist()
+  }
+
+  /** Progress is decoration: a failed write must never fail the turn. */
+  private async publishProgress(route: DispatchRoute, text: string, meta: PublishMeta): Promise<void> {
+    try { await this.sink.publish(route, text, meta) } catch {}
+  }
+
+  /** Send the held message, if any: notify only when it proved to be the last. */
+  private async flushHeld(notify: boolean, route = this.state.active?.route): Promise<void> {
+    const p = this.progress
+    if (!p?.held || !route) return
+    const { text, itemId } = p.held
+    p.held = undefined
+    await this.sink.publish(route, text, { turnId: p.turnId, itemId, kind: 'message', notify })
   }
 
   private async startNext(): Promise<void> {

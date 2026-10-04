@@ -116,12 +116,16 @@ describe('Codex app-server channel dispatcher', () => {
     await h.dispatcher.notification('item/completed', {
       turnId: 'turn-1', item: { id: 'item-1', type: 'agentMessage' },
     })
+    // DIVE-5504: a message of unknown phase is the turn's answer only once the
+    // turn ends, so it is sent then, and it is the one that notifies.
+    await h.dispatcher.notification('turn/completed', { turn: { id: 'turn-1', status: 'completed' } })
 
-    expect(h.published).toEqual([{
+    expect(h.published.filter(p => p.meta.kind === 'message')).toEqual([{
       route: { source: 'telegram', chat_id: '42' },
       text: 'hello there',
-      meta: { turnId: 'turn-1', itemId: 'item-1', kind: 'message' },
+      meta: { turnId: 'turn-1', itemId: 'item-1', kind: 'message', notify: true },
     }])
+    expect(h.published.every(p => p.route.chat_id === '42')).toBe(true)
   })
 
   const interruptedState = (): DispatcherState => ({

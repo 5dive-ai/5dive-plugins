@@ -217,7 +217,10 @@ describe('dispatcher.ts --check and the startup refusal', () => {
 function tree(root: string, name: string, version: string): string {
   const t = join(root, name)
   mkdirSync(t, { recursive: true })
-  for (const f of ['dispatcher.ts', 'dispatcher-core.ts', 'compat.ts', 'health.ts', 'lifecycle.ts', 'release.sh']) {
+  // Every module the dispatcher loads (DIVE-5504 added approvals.ts and
+  // msglog.ts): `--check` imports them all before it reports anything.
+  const mods = readdirSync(PLUGIN).filter(f => f.endsWith('.ts') && !['server.ts'].includes(f))
+  for (const f of [...mods, 'release.sh']) {
     cpSync(join(PLUGIN, f), join(t, f))
   }
   writeFileSync(join(t, 'package.json'), JSON.stringify({ name: 'x', version }))
