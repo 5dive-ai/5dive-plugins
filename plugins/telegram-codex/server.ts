@@ -486,6 +486,10 @@ function enqueueInbound(msg: InboundMsg) {
     }) + '\n', { mode: 0o600 })
     renameSync(tmp, dest)
     try { writeFileSync(DISPATCH_INBOUND_FILE, String(Date.now())) } catch {}
+    // DIVE-5508: a dispatcher seat never calls wait_for_message, which is
+    // where the pane path starts "typing…", so it showed nothing until the
+    // ack. Start it here; the turn's answer or its end stops it.
+    if ((msg.dispatch_source ?? 'telegram') === 'telegram') startTypingLoop(msg.chat_id, msg.message_thread_id)
     return
   }
   // While the agent is in a detected stall (quota/auth/wedge) it can't run a
@@ -768,9 +772,15 @@ function ingestDispatcherOutbox(name: string): void {
     try { unlinkSync(full) } catch {}
     const key = `${obj.chat_id}:${obj.turnId ?? ''}`
     if (obj.kind === 'progress') {
+      // A turn queued behind another starts after that one's answer stopped
+      // "typing…": its first event brings the indicator back (DIVE-5508).
+      if (obj.text === 'starting' && !typingLoops.has(String(obj.chat_id))) {
+        startTypingLoop(String(obj.chat_id), obj.message_thread_id ? String(obj.message_thread_id) : undefined)
+      }
       progressAcks.progress(key, String(obj.chat_id), obj.message_thread_id ? String(obj.message_thread_id) : undefined, String(obj.text))
     } else {
       progressAcks.done(key, String(obj.text))
+      stopTypingLoop(String(obj.chat_id))
     }
     return
   }
@@ -792,15 +802,11 @@ function ingestDispatcherOutbox(name: string): void {
   const files = plan.send
   const text = plan.footer ? `${String(obj.text)}\n\n${plan.footer}` : String(obj.text)
   void (async () => {
+    // The answer is in (DIVE-5508): stop "typing…" as it lands, so the
+    // indicator never outlives the reply. Silent commentary keeps it going.
+    if (obj.notify !== false) stopTypingLoop(String(obj.chat_id))
     await bot.api.sendMessage(String(obj.chat_id), text, options)
-    for (const file of files) {
-      const input = new InputFile(file)
-      if (PHOTO_EXTS.has(extname(file).toLowerCase())) {
-        await bot.api.sendPhoto(String(obj.chat_id), input, options)
-      } else {
-        await bot.api.sendDocument(String(obj.chat_id), input, options)
-      }
-    }
+    for (const file of files) await sendFile(String(obj.chat_id), file, options)
     try { unlinkSync(full) } catch {}
     outboxAttachPlans.delete(name)
     // The turn's answer, not its silent commentary, is what makes it "replied".
@@ -910,6 +916,27 @@ let botUsername = ''
 let shuttingDown = false
 
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'])
+// DIVE-5508: 5dive-speak writes OGG/Opus, which Telegram plays as a voice note
+// only through sendVoice; sendDocument leaves it a file to download.
+const VOICE_EXTS = new Set(['.ogg', '.oga', '.opus'])
+
+/**
+ * Send one file the way Telegram shows it best: a photo inline, an OGG as a
+ * voice note, anything else as a document. A voice upload Telegram refuses
+ * (not Opus inside) falls back to a document rather than losing the file.
+ */
+async function sendFile(chat_id: string, file: string, opts?: Record<string, unknown>): Promise<{ message_id: number }> {
+  const ext = extname(file).toLowerCase()
+  if (PHOTO_EXTS.has(ext)) return bot.api.sendPhoto(chat_id, new InputFile(file), opts)
+  if (VOICE_EXTS.has(ext)) {
+    try {
+      return await bot.api.sendVoice(chat_id, new InputFile(file), opts)
+    } catch (err) {
+      process.stderr.write(`telegram-codex: sendVoice refused ${file}, sending as a document: ${err}\n`)
+    }
+  }
+  return bot.api.sendDocument(chat_id, new InputFile(file), opts)
+}
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 // Telegram clears the "typing…" indicator ~5s after each sendChatAction.
@@ -921,11 +948,13 @@ const TYPING_INTERVAL_MS = 4_000
 const TYPING_CEILING_MS = 5 * 60 * 1000
 const typingLoops = new Map<string, ReturnType<typeof setInterval>>()
 const typingCeilings = new Map<string, ReturnType<typeof setTimeout>>()
-function startTypingLoop(chat_id: string) {
+function startTypingLoop(chat_id: string, message_thread_id?: string) {
   stopTypingLoop(chat_id)
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // In a forum topic the indicator belongs to the topic the message came from.
+  const opts = message_thread_id ? { message_thread_id: Number(message_thread_id) } : undefined
+  void bot.api.sendChatAction(chat_id, 'typing', opts).catch(() => {})
   const handle = setInterval(() => {
-    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+    void bot.api.sendChatAction(chat_id, 'typing', opts).catch(() => {})
   }, TYPING_INTERVAL_MS)
   typingLoops.set(chat_id, handle)
   typingCeilings.set(chat_id, setTimeout(() => stopTypingLoop(chat_id), TYPING_CEILING_MS))
@@ -3331,16 +3360,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         for (const f of [...files, ...autoPlan.attach]) {
-          const ext = extname(f).toLowerCase()
-          const input = new InputFile(f)
           const opts = {
             ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
             ...(message_thread_id != null ? { message_thread_id } : {}),
           }
-          const out = PHOTO_EXTS.has(ext)
-            ? await bot.api.sendPhoto(chat_id, input, opts)
-            : await bot.api.sendDocument(chat_id, input, opts)
-          sentIds.push(out.message_id)
+          sentIds.push((await sendFile(chat_id, f, opts)).message_id)
         }
 
         // Stamp for the Stop hook's duplicate-suppression check.

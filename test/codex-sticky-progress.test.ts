@@ -31,7 +31,7 @@ const msg = (turnId: string, id: string, text: string, phase?: string) =>
   ({ turnId, item: { id, type: 'agentMessage', text, ...(phase ? { phase } : {}) } })
 
 describe('dispatcher: which messages notify', () => {
-  test('commentary is silent, the final answer notifies, and progress is reported per step', async () => {
+  test('commentary edits the ack (DIVE-5508), the final answer notifies, and progress is reported per step', async () => {
     const h = harness()
     await h.dispatcher.initialize()
     await h.dispatcher.submit(tg('m1'))
@@ -45,7 +45,7 @@ describe('dispatcher: which messages notify', () => {
 
     expect(h.published.map(p => [p.meta.kind, p.text, p.meta.notify])).toEqual([
       ['progress', 'starting', undefined],
-      ['message', 'Looking at the tests.', false],
+      ['progress', 'Looking at the tests.', undefined],
       ['progress', 'editing 2 files', undefined],
       ['message', 'Fixed: two files.', true],
       ['progress-done', expect.stringMatching(/^✅ Done in \d+s · 2 steps$/), undefined],
