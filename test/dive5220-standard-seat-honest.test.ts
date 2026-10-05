@@ -14,8 +14,8 @@ import {
 } from '../plugins/telegram/seatpriv'
 
 // Entries as `5dive agent list --json` returns them, read unprivileged as
-// agent-oinoa on poke-two, 2026-09-29.
-const OINOA = { name: 'oinoa', isolation: 'standard', sudo: { grant: 'cli-scoped', runas: 'root', impliedIsolation: 'standard', measured: true } }
+// a partner's standard seat on poke-two, 2026-09-29.
+const PARTNER = { name: 'partner', isolation: 'standard', sudo: { grant: 'cli-scoped', runas: 'root', impliedIsolation: 'standard', measured: true } }
 const MARKETING = { name: 'marketing', isolation: 'admin', sudo: { grant: 'cli-root', runas: 'root', impliedIsolation: 'admin', measured: true } }
 const MAIN = { name: 'main', isolation: 'admin', sudo: { grant: 'root-all', runas: 'any', impliedIsolation: 'beyond-admin', measured: true } }
 // The CLI's own answer to an unprivileged `5dive account usage --json`.
@@ -31,15 +31,15 @@ function body(startMarker: string, endMarker: string): string {
 }
 
 describe('which seats may switch accounts', () => {
-  test('a standard seat (the oinoa entry) may not', () => {
-    expect(seatCanAdmin(OINOA, false)).toBe('no')
+  test('a standard seat (the partner entry) may not', () => {
+    expect(seatCanAdmin(PARTNER, false)).toBe('no')
   })
   test('admin and beyond-admin seats may — the full-seat path is unchanged', () => {
     expect(seatCanAdmin(MARKETING, false)).toBe('yes')
     expect(seatCanAdmin(MAIN, false)).toBe('yes')
   })
   test('the measured grant beats the stored label', () => {
-    expect(seatCanAdmin({ ...OINOA, isolation: 'admin' }, false)).toBe('no')
+    expect(seatCanAdmin({ ...PARTNER, isolation: 'admin' }, false)).toBe('no')
     expect(seatCanAdmin({ ...MARKETING, isolation: 'standard' }, false)).toBe('yes')
   })
   test('an unmeasured grant falls back to the label', () => {

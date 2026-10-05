@@ -12,7 +12,7 @@
 //              then "❌ Failed to switch account: sudo: a password is required".
 //   /usage   → the refusal came back as null and was rendered as "your 5dive
 //              CLI may be out of date", which was false.
-// (lodar, 2026-09-29 15:35Z, on agent oinoa.)
+// (lodar, 2026-09-29 15:35Z, on a partner's agent.)
 //
 // DIVE-5367 (lodar, 2026-10-02: "slash account … cannot work") reverses the
 // "must not be" above ON PURPOSE and narrowly: the CLI now writes ONE more

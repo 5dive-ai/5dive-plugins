@@ -173,7 +173,7 @@ voice_edge_for_base() {
 }
 
 # voice_edge_locale <text> — en|ru|uk from the reply itself: whichever script
-# carries more letters. A Russian client's agent replies in Russian, and an
+# carries more letters. A client who writes Russian gets replies in Russian, and an
 # English voice reading Cyrillic is worse than any voice reading its own
 # language. і ї є ґ exist in Ukrainian and not in Russian.
 voice_edge_locale() {

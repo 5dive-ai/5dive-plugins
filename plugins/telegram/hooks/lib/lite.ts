@@ -1,7 +1,7 @@
 /**
  * DIVE-5121: the `lite` profile — the same bridge, for a partner's CLIENT.
  *
- * A partner client (OINOA's end users) chats with ONE agent through its own
+ * A partner client (its end users) chats with ONE agent through its own
  * bot. They never operate anything, so the profile keeps the bridge (polling,
  * attachments, the five reply tools, restarts) and drops everything that is a
  * 5dive org's: 19 of the 25 commands, the operator comms rules in the MCP
