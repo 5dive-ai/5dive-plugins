@@ -44,6 +44,7 @@ import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { TurnAttachMemo, planOutboxAttachments, type OutboxAttachPlan } from './outbox-attach.ts'
 import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts'
 import { ProgressAcks } from './progress.ts'
+import { stripMarkdown } from './plain-text.ts'
 import { dispatcherTurnText, execTranscriber, type AttachmentMeta } from './inbound-media.ts'
 import {
   appendMessage as msglogAppend, formatRecent as msglogFormat, mostRecentChatId as msglogMostRecent,
@@ -800,7 +801,9 @@ function ingestDispatcherOutbox(name: string): void {
     outboxAttachPlans.set(name, plan)
   }
   const files = plan.send
-  const text = plan.footer ? `${String(obj.text)}\n\n${plan.footer}` : String(obj.text)
+  // Sent with no parse_mode, so Codex's Markdown would show literally.
+  const body = stripMarkdown(String(obj.text))
+  const text = plan.footer ? `${body}\n\n${plan.footer}` : body
   void (async () => {
     // The answer is in (DIVE-5508): stop "typing…" as it lands, so the
     // indicator never outlives the reply. Silent commentary keeps it going.
@@ -3324,9 +3327,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // single yes/no question (opt-out marker stripped either way). The tap
         // rides the callback path below, injecting a clean 'yes'/'no' inbound.
         const { stripped: ynRaw, keyboard: ynKeyboard } = yesNoButtons(text)
+        // Plain text shows Markdown literally, so a 'text' reply sends the words only.
+        const ynBody = parseMode ? ynRaw : stripMarkdown(ynRaw)
         const ynText = autoFooter
-          ? `${ynRaw}\n\n${parseMode ? autoFooter.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1') : autoFooter}`
-          : ynRaw
+          ? `${ynBody}\n\n${parseMode ? autoFooter.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1') : autoFooter}`
+          : ynBody
         const chunks = textMissing ? [] : chunkForTelegram(ynText, accessForReply.textChunkLimit ?? TG_MAX_MESSAGE_CHARS)
         // DIVE-708/717: a choice-list keyboard takes precedence over Yes/No, but
         // only when the whole reply is a single chunk — the tap resolves the
@@ -3387,7 +3392,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const editFormat = (args.format as string | undefined) ?? 'text'
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
         const edited = await bot.api.editMessageText(
-          chat_id, message_id, String(args.text),
+          chat_id, message_id, editParseMode ? String(args.text) : stripMarkdown(String(args.text)),
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
         const id = typeof edited === 'object' ? edited.message_id : message_id

@@ -34,6 +34,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.32 — plain-text replies drop Markdown (lodar 2026-10-05: "it just uses markdown, but he doesn't realize that telegram doesn't support it")
 - v0.5.31 — DIVE-5508: "typing…" on dispatcher seats; commentary edits the ack
   instead of arriving as a second answer; OGG replies go as voice notes.
 - v0.5.30 — DIVE-5505: dispatcher-path attachments are downloaded by the
