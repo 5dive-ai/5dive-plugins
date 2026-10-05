@@ -26,7 +26,7 @@ A Codex agent on Telegram kept one thread forever: every unrelated job piled int
 
 ### Fixed — telegram 0.5.90: an agent's Connect/captcha button works on a standard-tier agent that holds the grant (DIVE-5495)
 
-On chill-gorge, lodar tapped an agent's "Open productradar.ru" button three times and nothing opened. The agent was standard tier, and the bot's sudo gate let a standard seat run exactly one verb, `agent _self_restart`. So the tap stopped before sudo with the admin-tier text, even though main had added the agent's `5dive browser _connect` line by hand. Now the gate asks `sudo -n -l` for that exact line, once per ten minutes, and only on a seat whose measured grant is the scoped standard one, the same way the `_self_account` line is asked (DIVE-5367). If the seat holds the line, the tap runs as on an admin seat. If not, the owner gets the same admin-tier message as before, and sudo runs only the listing, never the verb. 5dive-cli now writes the line for every standard seat (same row).
+On chill-gorge, lodar tapped an agent's "Open <site>" button three times and nothing opened. The agent was standard tier, and the bot's sudo gate let a standard seat run exactly one verb, `agent _self_restart`. So the tap stopped before sudo with the admin-tier text, even though main had added the agent's `5dive browser _connect` line by hand. Now the gate asks `sudo -n -l` for that exact line, once per ten minutes, and only on a seat whose measured grant is the scoped standard one, the same way the `_self_account` line is asked (DIVE-5367). If the seat holds the line, the tap runs as on an admin seat. If not, the owner gets the same admin-tier message as before, and sudo runs only the listing, never the verb. 5dive-cli now writes the line for every standard seat (same row).
 
 ### Fixed — telegram 0.5.89 (+ agy/codex/grok 0.5.23): a voice reply sends no lone 🎙 before the voice note (DIVE-5490)
 
@@ -188,7 +188,7 @@ The inbox banner and /status read the same cache, so they no longer drop out und
 
 ### Added — Telegram buttons follow the user's language, and lite gains /stop /status /restart /clear (DIVE-5306), telegram 0.5.79
 
-OINOA's users are mostly Russian speakers, and an agent's yes/no question came with English buttons
+A partner's users mostly write in Russian, and an agent's yes/no question came with English buttons
 (lodar, 2026-10-01). The buttons the bridge writes under an agent's question are now in the human's
 Telegram language on both profiles: Yes/No, the permission prompt's See more / Allow / Deny and their
 outcome line, and the replies to a tap (also for the question picker). A `ru` or `ru-*` app language gets
@@ -527,7 +527,7 @@ amount and a screenshot; publish, send and delete run and are logged to `allowed
 
 ### Added — a `lite` profile for a partner's clients: six commands, a consumer voice, no org machinery (DIVE-5121), telegram 0.5.65
 
-A partner's client (OINOA's end users) chats with one agent through its own bot and operates nothing.
+A partner's client (its end users) chats with one agent through its own bot and operates nothing.
 `TELEGRAM_PROFILE=lite` in the channel's `.env` (or the process env) selects a profile of the same
 bridge, not a fork, so every bridge fix still reaches it. **With nothing set, nothing changes:** any
 value but `lite` is the default profile, and every lite branch is a guard on that one flag.

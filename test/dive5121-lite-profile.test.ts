@@ -9,7 +9,7 @@
 //      hook registrations are pinned to the 0.5.64 release's bytes; every place the code
 //      reads the profile is a guard of a known shape; and the one shared send
 //      helper that grew a parameter posts the same body when it is not passed.
-//   2. LITE = THE AGREED SURFACE (oinoa's list on the row): four localized
+//   2. LITE = THE AGREED SURFACE (the partner's list on the row): four localized
 //      commands, org commands unreachable, consumer instructions, and no
 //      client-visible string that names the platform or carries an emoji.
 //
@@ -66,7 +66,7 @@ describe('no profile set = the plugin as it is today', () => {
     const none = stateDir()
     expect(resolveProfile({ TELEGRAM_STATE_DIR: none })).toBe('default')
     expect(resolveProfile({ TELEGRAM_STATE_DIR: stateDir('TELEGRAM_BOT_TOKEN=1:abc\n') })).toBe('default')
-    for (const v of ['', 'default', 'full', 'light', 'lite2', 'li te', 'oinoa']) {
+    for (const v of ['', 'default', 'full', 'light', 'lite2', 'li te', 'partner']) {
       expect(resolveProfile({ TELEGRAM_STATE_DIR: none, TELEGRAM_PROFILE: v })).toBe('default')
       expect(resolveProfile({ TELEGRAM_STATE_DIR: stateDir(`TELEGRAM_PROFILE=${v}\n`) })).toBe('default')
     }
@@ -217,7 +217,7 @@ const LEAK = /5dive|claude|anthropic|openrouter|\bmodel|token|context|server|\bb
 const EMOJI = /\p{Extended_Pictographic}/u
 const leaks = (strings: string[]) => strings.filter(t => LEAK.test(t) || EMOJI.test(t))
 
-describe('lite = the surface oinoa agreed', () => {
+describe('lite = the surface the partner agreed', () => {
   test('the / menu is exactly the eight commands, in both languages (DIVE-5306 added stop/status/restart/clear; /new stays out)', () => {
     for (const lang of ['ru', 'en'] as const) {
       expect(liteMenu(lang, { account: true }).map(c => c.command)).toEqual(['start', 'usage', 'account', 'help', 'stop', 'status', 'restart', 'clear'])
@@ -254,7 +254,7 @@ describe('lite = the surface oinoa agreed', () => {
     expect(leaks(['Работает на 5dive', 'Stopped ✅', 'your model is busy', 'Остановлено.'])).toEqual(['Работает на 5dive', 'Stopped ✅', 'your model is busy'])
   })
 
-  test('/usage and the limit line read the way oinoa wrote them', () => {
+  test('/usage and the limit line read the way the partner wrote them', () => {
     const weekly = SAMPLE_ALLOWANCES[3]!
     expect(liteUsageText('ru', weekly)).toBe('Осталось на неделе 62%, обновится в понедельник.')
     expect(liteUsageText('ru', { kind: 'own' })).toBe('Работает на вашей подписке.')

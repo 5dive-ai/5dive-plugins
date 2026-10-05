@@ -1,4 +1,4 @@
-// DIVE-5173: three lite changes, one release (owner asks, OINOA, 2026-09-29).
+// DIVE-5173: three lite changes, one release (owner asks, a partner, 2026-09-29).
 //
 //   1. /new is gone: it gets the /help reply. (Its /clear alias came back as a
 //      command of its own in DIVE-5306.)

@@ -1,6 +1,6 @@
 // DIVE-5306: the buttons the bridge writes under an agent's question, and the
-// acks for a tap, follow the human's Telegram language (en + ru). OINOA is a
-// Russian market and its owners were tapping English Yes/No buttons.
+// acks for a tap, follow the human's Telegram language (en + ru). A partner's
+// owners write in Russian and were tapping English Yes/No buttons.
 //
 // Pins:
 //   1. en is byte-identical to the literals server.ts printed before the table.
@@ -38,7 +38,7 @@ describe('en is what the plugin printed before (byte-identical)', () => {
   })
 })
 
-describe('a Russian-speaking user', () => {
+describe('a user whose Telegram language is ru', () => {
   const ru = TAP_STRINGS.ru
   test('gets Да / Нет on the yes/no keyboard and a Russian ack', () => {
     expect([ru.yes, ru.no]).toEqual(['✅ Да', '❌ Нет'])

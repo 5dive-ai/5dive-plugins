@@ -141,7 +141,7 @@ describe('what the group is told', () => {
   test('added as an admin (privacy does not apply): the mention hello stays', () => {
     expect(groupJoinLines({ ...base, approved: true, privacyOn: false })).toEqual(["Hi, I'm Olivia. Mention me (@olivia_x1_bot) to ask something."])
   })
-  test('Russian for a Russian adder', () => {
+  test('Russian for an adder whose Telegram language is ru', () => {
     expect(groupJoinLines({ ...base, lang: 'ru', approved: true })[0]).toStartWith('Привет, я Olivia.')
   })
   test('no lite line names the platform or carries an emoji', () => {

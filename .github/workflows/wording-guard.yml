@@ -1,0 +1,17 @@
+name: wording-guard
+
+# DIVE-5627. Public repos name no country, city, partner or region-only service
+# as a market or a place we run; a language is fine. The check and its word list
+# live in one place, 5dive-ai/5dive, and every public repo calls it.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  wording:
+    uses: 5dive-ai/5dive/.github/workflows/wording-guard.yml@main
