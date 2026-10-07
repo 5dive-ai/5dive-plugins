@@ -60,6 +60,23 @@ BACKEND="${BACKEND_OVERRIDE:-$(voice_effective_stt_backend)}"
 WHISPER_URL="${VOICE_WHISPER_URL:-http://127.0.0.1:8765}"
 # Why local hearing failed, in one line; set by transcribe_local.
 LOCAL_FAIL=""
+# Set by transcribe_local when whisper-service was still working at the wait's
+# end: the note was too long for this box, not unheard (DIVE-5750).
+LOCAL_TIMED_OUT=0
+# The wait for whisper-service, before the audio's own length is added
+# (DIVE-5750). Overridable so the offline harness can time out in a second.
+WHISPER_BASE_WAIT="${VOICE_WHISPER_BASE_WAIT:-120}"
+[[ "$WHISPER_BASE_WAIT" =~ ^[0-9]+$ ]] || WHISPER_BASE_WAIT=120
+
+# audio_seconds — the note's length in whole seconds, or 0 when ffprobe is
+# missing or cannot read it (the wait then falls back to the base alone).
+audio_seconds() {
+  local d
+  command -v ffprobe >/dev/null 2>&1 || { echo 0; return; }
+  d=$(timeout 15 ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$SRC" 2>/dev/null | head -n1)
+  d="${d%%.*}"
+  [[ "$d" =~ ^[0-9]+$ ]] && echo "$d" || echo 0
+}
 
 transcribe_openrouter() {
   voice_require_cmd ffmpeg || return 1
@@ -82,20 +99,33 @@ transcribe_openrouter() {
 
 transcribe_local() {
   voice_require_cmd jq || { LOCAL_FAIL="jq is missing"; return 1; }
-  local ext staged payload resp code
+  local ext staged payload resp code rc secs limit
   ext="${SRC##*.}"; [[ "$ext" == "$SRC" ]] && ext="bin"
   staged="$(mktemp --suffix=".${ext}" /tmp/5dive-transcribe.XXXXXX)"
   chmod 644 "$staged"
   cp -- "$SRC" "$staged" || { rm -f "$staged"; LOCAL_FAIL="could not stage the file for whisper-service"; return 1; }
   payload=$(jq -nc --arg p "$staged" '{path:$p}')
+  # The wait scales with the note (DIVE-5750). CPU whisper runs at about 0.4x
+  # real time, so a fixed 120s cut off every note over ~5 minutes while the
+  # service was still working on it, and threw the finished transcript away.
+  # Base plus the audio's own length leaves ~2.5x headroom; a dead service
+  # still fails at once on the connect, whatever the length.
+  secs=$(audio_seconds)
+  limit=$(( WHISPER_BASE_WAIT + secs ))
   # No -f: a 500 carries the service's own reason in its JSON body, and curl -f
   # throws that away, which is how a dependency break read as "500" and nothing
   # more (DIVE-5398).
-  resp=$(curl -sS --max-time 120 -w '\n%{http_code}' \
+  resp=$(curl -sS --connect-timeout 5 --max-time "$limit" -w '\n%{http_code}' \
     -H "Content-Type: application/json" \
     -X POST "${WHISPER_URL}/transcribe" \
-    --data "$payload" 2>/dev/null) || { rm -f "$staged"; LOCAL_FAIL="whisper-service did not answer"; return 1; }
+    --data "$payload" 2>/dev/null); rc=$?
   rm -f "$staged"
+  if (( rc == 28 )); then
+    LOCAL_TIMED_OUT=1
+    LOCAL_FAIL="timed out after ${limit}s while whisper-service was still working on a $((secs / 60))m$((secs % 60))s note"
+    return 1
+  fi
+  (( rc == 0 )) || { LOCAL_FAIL="whisper-service did not answer"; return 1; }
   code="${resp##*$'\n'}"; resp="${resp%$'\n'*}"
   if [[ "$code" != 2* ]]; then
     LOCAL_FAIL="whisper-service answered HTTP ${code}: $(printf '%s' "$resp" | jq -r '.error // empty' 2>/dev/null | head -c 300)"
@@ -113,6 +143,30 @@ hearing_failed() {
   exit 1
 }
 
+# hearing_timed_out — whisper-service was healthy and still transcribing when
+# the wait ran out. That is not "could not hear": the note is longer than this
+# box can transcribe in time, so the fix the agent can relay is shorter notes.
+hearing_timed_out() {
+  echo "5dive voice: ${LOCAL_FAIL}." >&2
+  echo "5dive voice: this voice note is too long for this box to transcribe in time. Ask the user to send it again as a few shorter voice notes, or to type it. Do not ask them to run a command or restart anything." >&2
+  exit 1
+}
+
+# DIVE-5597: the box's one-time voice setup (5dive-voice-setup.service, queued
+# at build and by the nightly) is still running — the first install, or a retry
+# waiting out its restart delay — so the local engine is not there YET. Saying
+# so is what stops an agent from spending minutes building a transcriber of its
+# own (prime-plover, 2026-10-05). A box without the unit is never "installing".
+VOICE_SETUP_UNIT="${VOICE_SETUP_UNIT:-5dive-voice-setup.service}"
+setup_installing() {
+  [[ "$(systemctl show -p ActiveState --value "$VOICE_SETUP_UNIT" 2>/dev/null)" == activating ]]
+}
+transcriber_installing() {
+  echo "5dive voice: the transcriber is still installing on this box (first setup, a few minutes)." >&2
+  echo "5dive voice: tell the user \"transcriber is installing, one minute\", then run 5dive-transcribe on this same file again in a minute. Do not install a transcriber yourself." >&2
+  exit 75
+}
+
 # may_fall_back — local hearing failed: may this note go to OpenRouter? Only on
 # a box that already speaks there, with a key, and never on a call that forced
 # --backend=local (that is someone testing the local engine on purpose).
@@ -126,9 +180,16 @@ case "$BACKEND" in
   openrouter) transcribe_openrouter || hearing_failed ;;
   local)
     transcribe_local && exit 0
-    may_fall_back || hearing_failed "$LOCAL_FAIL"
+    if ! may_fall_back; then
+      (( LOCAL_TIMED_OUT )) && hearing_timed_out
+      setup_installing && transcriber_installing
+      hearing_failed "$LOCAL_FAIL"
+    fi
     echo "5dive voice: local hearing failed (${LOCAL_FAIL}); heard this note on OpenRouter instead." >&2
-    transcribe_openrouter || hearing_failed "$LOCAL_FAIL; OpenRouter failed too"
+    transcribe_openrouter && exit 0
+    (( LOCAL_TIMED_OUT )) && hearing_timed_out
+    setup_installing && transcriber_installing
+    hearing_failed "$LOCAL_FAIL; OpenRouter failed too"
     ;;
   *)          echo "5dive voice: unknown backend '$BACKEND'" >&2; exit 2 ;;
 esac
