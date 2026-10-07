@@ -124,6 +124,42 @@ describe('voice on the dispatcher path', () => {
   })
 })
 
+// DIVE-5779: the bridge killed 5dive-transcribe at a fixed 120s, so a voice
+// note over ~5 min failed on a dispatcher seat however long the binary itself
+// would wait (DIVE-5750: 120s plus the note's length). The kill is now a base
+// plus the note's length. Scaled down: base 150ms, a stub that takes 400ms.
+describe('the transcriber timeout scales with the note (DIVE-5779)', () => {
+  const slow = 'sleep 0.4; echo "a long note, heard in full"'
+
+  test('a transcriber slower than the base still reaches the dispatched turn text', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dive5779-'))
+    try {
+      const long: AttachmentMeta = { ...voice, duration: 2 }
+      const turn = await dispatcherTurnText('(voice message)', long, ports(dir, execTranscriber(stubBin(dir, slow), 150)))
+      expect(turn.transcript).toBe('a long note, heard in full')
+      expect((await dispatched(turn.text)).at(-1)).toContain('(voice message) a long note, heard in full')
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  test('without the note\'s length the same stub is killed at the base, so the length is what saved it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dive5779-'))
+    try {
+      const turn = await dispatcherTurnText('(voice message)', voice, ports(dir, execTranscriber(stubBin(dir, slow), 150)))
+      expect(turn.transcript).toBeUndefined()
+      expect(turn.text).toContain('transcription failed')
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  test('the port is handed the duration Telegram reported', async () => {
+    let got: number | undefined
+    const dir = mkdtempSync(join(tmpdir(), 'dive5779-'))
+    try {
+      await dispatcherTurnText('(voice message)', { ...voice, duration: 361 }, ports(dir, async (_p, d) => { got = d; return 'ok' }))
+      expect(got).toBe(361)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+})
+
 describe('other attachments on the dispatcher path', () => {
   test('a document carries its file_id, name and local path, and is not transcribed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dive5505-'))
@@ -158,6 +194,12 @@ describe('server.ts wiring', () => {
 
   test('the transcriber defaults to the box binary', () => {
     expect(src).toContain("process.env.TELEGRAM_CODEX_TRANSCRIBE_BIN ?? '/usr/local/bin/5dive-transcribe'")
+  })
+
+  test('the base timeout clears the binary\'s own worst case, and voice and audio carry their duration (DIVE-5779)', () => {
+    expect(src).toContain('Number(process.env.TELEGRAM_CODEX_TRANSCRIBE_TIMEOUT_MS ?? 600_000)')
+    expect(src).toContain("kind: 'voice', file_id: v.file_id, size: v.file_size, mime: v.mime_type, duration: v.duration,")
+    expect(src).toContain("kind: 'audio', file_id: a.file_id, size: a.file_size, mime: a.mime_type, name, duration: a.duration,")
   })
 
   test('the new module ships in the package', () => {

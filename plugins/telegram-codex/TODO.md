@@ -34,6 +34,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.33 — DIVE-5779: the transcriber's kill is a 600s base plus the voice note's length, not a fixed 120s.
 - v0.5.32 — plain-text replies drop Markdown (lodar 2026-10-05: "it just uses markdown, but he doesn't realize that telegram doesn't support it")
 - v0.5.31 — DIVE-5508: "typing…" on dispatcher seats; commentary edits the ack
   instead of arriving as a second answer; OGG replies go as voice notes.

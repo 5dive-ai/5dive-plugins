@@ -19,19 +19,30 @@ export type AttachmentMeta = {
   size?: number
   mime?: string
   name?: string
+  /** Seconds, as Telegram reports it on a voice note or an audio file. */
+  duration?: number
 }
 
 export type MediaPorts = {
   /** Fetch the Telegram file into the inbox; resolves its local path. */
   download: (fileId: string) => Promise<string>
   /** The transcript of a local audio file (5dive-transcribe's stdout). */
-  transcribe: (path: string) => Promise<string>
+  transcribe: (path: string, durationSec?: number) => Promise<string>
 }
 
-/** A `transcribe` port that runs `bin <path>` and resolves its stdout. */
-export function execTranscriber(bin: string, timeoutMs: number): (path: string) => Promise<string> {
-  return path => new Promise((resolve, reject) => {
-    execFile(bin, [path], { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (err, out, errOut) => {
+/**
+ * A `transcribe` port that runs `bin <path>` and resolves its stdout.
+ *
+ * DIVE-5779: the kill is `baseMs` plus the note's own length. A fixed 120s
+ * killed every note over ~5 min, although 5dive-transcribe (DIVE-5750) waits
+ * 120s plus the note's length on local whisper and then may fall back to
+ * OpenRouter. The binary bounds its own wait; this is only the net for a hung
+ * binary, so it has to sit above the binary's worst case, never below it.
+ */
+export function execTranscriber(bin: string, baseMs: number): (path: string, durationSec?: number) => Promise<string> {
+  return (path, durationSec) => new Promise((resolve, reject) => {
+    const timeout = baseMs + Math.max(0, durationSec ?? 0) * 1000
+    execFile(bin, [path], { timeout, maxBuffer: 1024 * 1024 }, (err, out, errOut) => {
       if (err) reject(new Error(String(errOut || err.message).trim()))
       else resolve(String(out))
     })
@@ -77,7 +88,7 @@ export async function dispatcherTurnText(
   }
   if (path && TRANSCRIBED.has(attachment.kind)) {
     try {
-      const transcript = (await ports.transcribe(path)).replace(/\s+/g, ' ').trim()
+      const transcript = (await ports.transcribe(path, attachment.duration)).replace(/\s+/g, ' ').trim()
       if (transcript) {
         const label = attachment.kind === 'voice' ? '(voice message)' : '(audio)'
         // A caption replaces the "(voice message)" label, so say what follows.
