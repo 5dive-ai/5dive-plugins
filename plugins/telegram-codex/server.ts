@@ -2043,9 +2043,11 @@ async function downloadToInbox(file_id: string): Promise<string> {
 
 // DIVE-5505: the box's transcriber (local whisper by default). Absent or
 // failing, dispatcherTurnText falls back to the attachment's meta and path.
+// DIVE-5779: the timeout is a BASE, plus the note's length. 600s clears the
+// binary's own worst case (whisper 120s + length, then OpenRouter's 180s).
 const transcribeFile = execTranscriber(
   process.env.TELEGRAM_CODEX_TRANSCRIBE_BIN ?? '/usr/local/bin/5dive-transcribe',
-  Number(process.env.TELEGRAM_CODEX_TRANSCRIBE_TIMEOUT_MS ?? 120_000),
+  Number(process.env.TELEGRAM_CODEX_TRANSCRIBE_TIMEOUT_MS ?? 600_000),
 )
 
 async function ingest(
@@ -2447,7 +2449,7 @@ bot.on('message:document', async ctx => {
 bot.on('message:voice', async ctx => {
   const v = ctx.message.voice
   await ingest(ctx, ctx.message.caption ?? '(voice message)', undefined, {
-    kind: 'voice', file_id: v.file_id, size: v.file_size, mime: v.mime_type,
+    kind: 'voice', file_id: v.file_id, size: v.file_size, mime: v.mime_type, duration: v.duration,
   })
 })
 
@@ -2455,7 +2457,7 @@ bot.on('message:audio', async ctx => {
   const a = ctx.message.audio
   const name = safeName(a.file_name)
   await ingest(ctx, ctx.message.caption ?? `(audio: ${safeName(a.title) ?? name ?? 'audio'})`, undefined, {
-    kind: 'audio', file_id: a.file_id, size: a.file_size, mime: a.mime_type, name,
+    kind: 'audio', file_id: a.file_id, size: a.file_size, mime: a.mime_type, name, duration: a.duration,
   })
 })
 
