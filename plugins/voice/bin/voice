@@ -63,6 +63,15 @@ BACKENDS
   Hearing alone can run elsewhere:  sudo 5dive voice config set stt_backend local
   (a 5dive box is built that way: it hears on this box and speaks on OpenRouter).
 
+HEARING ON THIS BOX (local only; sudo 5dive voice config set <key> <value>)
+
+  stt_language  default auto — whisper detects the language of every note.
+                A code such as ru or en pins it: detection is skipped, and a
+                short note is never heard as the wrong language. Back with auto.
+  stt_fast      default 0. 1 decodes greedily (one candidate instead of five):
+                a 20s Russian note went from ~5.2s to ~3.4s with both set,
+                slightly less accurate on unclear speech.
+
 MODELS (openrouter only; sudo 5dive voice config set <key> <value>)
 
   stt_model   default openai/whisper-large-v3-turbo — 99+ languages, Russian
@@ -191,11 +200,14 @@ config_field() { jq -c --arg k "$1" '(.fivedive.settings.fields // [])[] | selec
 
 # config_value <key> — the value the engine will use, defaults applied.
 config_value() {
+  local l
   case "$1" in
     backend)   voice_backend_configured ;;
     stt_backend) voice_stt_backend_configured ;;
     stt_model) voice_stt_model ;;
     tts_model) voice_tts_model ;;
+    stt_language) l=$(voice_stt_language); printf '%s\n' "${l:-auto}" ;;
+    stt_fast)  voice_stt_fast ;;
     *)         voice_config_get "$1" "$(config_field "$1" | jq -r '.default // empty')" ;;
   esac
 }
@@ -233,6 +245,20 @@ config_validate() {
       ;;
     *) die "the manifest declares $key with type '$type', which this verb does not know how to set" 2 ;;
   esac
+  # A language whisper is pinned to is a code, not a name: `russian` would be
+  # sent as-is and every note would fall back to detection (DIVE-5869).
+  if [[ "$key" == stt_language && ! "$value" =~ ^(auto|[a-z]{2,3})$ ]]; then
+    die "'$value' is not a language code — use a code such as ru, en or uk, or auto to detect it on every note" 2
+  fi
+}
+
+# service_accepts <field> — fails only when the RUNNING whisper-service answers
+# /health without that request field: it was started on older code and ignores
+# it until it restarts. Says nothing when the service is down or unreachable.
+service_accepts() {
+  local h
+  h=$(curl -fsS --max-time 2 "http://127.0.0.1:${VOICE_SERVICE_PORT}/health" 2>/dev/null) || return 0
+  jq -e --arg f "$1" '(.accepts // []) | index($f) != null' <<<"$h" >/dev/null 2>&1
 }
 
 # ---- config init: a box's FIRST config, never a second (DIVE-5189) ------
@@ -336,6 +362,12 @@ cmd_config() {
       fi
       config_write_key "$key" "$value"
       printf '%s: %s\n' "$key" "$value"
+      # DIVE-5869: fast mode needs a whisper-service that reads beam_size. One
+      # started before it keeps its old code until it restarts; say so rather
+      # than let the owner time a setting that is not on yet.
+      if [[ "$key" == stt_fast && "$value" == 1 ]] && ! service_accepts beam_size; then
+        printf '\nThe hearing service on this box was started before fast mode existed, so it is not on yet.\nIt turns on after:  sudo 5dive voice setup\n' >&2
+      fi
       ;;
     *) die "unknown: 5dive voice config $sub (want: config [--json] | config get <key> | config set <key> <value> | config init <key>=<value>...)" 64 ;;
   esac

@@ -2,8 +2,12 @@
 # Warm faster-whisper HTTP server. Loads the model once at startup and handles
 # transcribe requests over HTTP — much faster than spawning the CLI per call.
 #
-# POST /transcribe   {"path": "/abs/path", "language": "en"?}
-# GET  /health       {"ok": true, "model": "..."}
+# POST /transcribe   {"path": "/abs/path", "language": "en"?, "beam_size": 1?}
+# GET  /health       {"ok": true, "model": "...", "accepts": [...]}
+#
+# `language` skips detection and `beam_size` 1 is greedy decoding; both are the
+# owner's opt-in (stt_language / stt_fast, DIVE-5869). Unset, whisper detects
+# the language and searches 5 beams, as it always has.
 import json
 import os
 import sys
@@ -22,6 +26,16 @@ print(f"[whisper] loading model={MODEL_NAME} compute={COMPUTE_TYPE} device={DEVI
 model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
 print(f"[whisper] ready on {HOST}:{PORT}", flush=True)
 
+# The request fields this build honours. `5dive voice` reads it from /health to
+# tell an owner whose running service predates them that fast mode is not on
+# until the service restarts onto new code.
+ACCEPTS = ["path", "language", "beam_size"]
+DEFAULT_BEAM_SIZE = 5
+try:
+    from faster_whisper.tokenizer import _LANGUAGE_CODES as LANGUAGES
+except Exception:  # a faster-whisper that moved the table: skip the check
+    LANGUAGES = None
+
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self, status, payload):
@@ -37,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            return self._json(200, {"ok": True, "model": MODEL_NAME})
+            return self._json(200, {"ok": True, "model": MODEL_NAME, "accepts": ACCEPTS})
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -53,10 +67,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "path must be absolute"})
         if not os.path.isfile(path):
             return self._json(404, {"error": "file not found"})
+        beam_size = data.get("beam_size", DEFAULT_BEAM_SIZE)
+        if isinstance(beam_size, bool) or not isinstance(beam_size, int) or not 1 <= beam_size <= 10:
+            return self._json(400, {"error": "beam_size must be an integer from 1 to 10"})
+        language = data.get("language") or None
+        if language is not None and LANGUAGES is not None and language not in LANGUAGES:
+            # A pinned code whisper does not know would fail every note. Hear it
+            # with detection instead, and leave the reason in the journal.
+            sys.stderr.write(f"[whisper] unknown language {language!r}: detecting instead\n")
+            language = None
         try:
             segments, info = model.transcribe(
                 path,
-                language=data.get("language"),
+                language=language,
+                beam_size=beam_size,
                 vad_filter=True,
             )
             out_segments = []
