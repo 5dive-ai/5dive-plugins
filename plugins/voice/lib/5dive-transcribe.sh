@@ -104,7 +104,10 @@ transcribe_local() {
   staged="$(mktemp --suffix=".${ext}" /tmp/5dive-transcribe.XXXXXX)"
   chmod 644 "$staged"
   cp -- "$SRC" "$staged" || { rm -f "$staged"; LOCAL_FAIL="could not stage the file for whisper-service"; return 1; }
-  payload=$(jq -nc --arg p "$staged" '{path:$p}')
+  # A pinned language and greedy decoding ride the request only when the owner
+  # set them (DIVE-5869); with neither, the body is `{path}` exactly as before.
+  payload=$(jq -nc --arg p "$staged" --arg l "$(voice_stt_language)" --arg f "$(voice_stt_fast)" \
+    '{path:$p} + (if $l != "" then {language:$l} else {} end) + (if $f == "1" then {beam_size:1} else {} end)')
   # The wait scales with the note (DIVE-5750). CPU whisper runs at about 0.4x
   # real time, so a fixed 120s cut off every note over ~5 minutes while the
   # service was still working on it, and threw the finished transcript away.

@@ -78,6 +78,24 @@ voice_tts_model() { voice_config_get tts_model "$VOICE_DEFAULT_TTS_MODEL"; }
 voice_tts_voice() { voice_config_get tts_voice "$VOICE_DEFAULT_TTS_VOICE"; }
 voice_persona_tts_model() { voice_config_get persona_tts_model "$VOICE_DEFAULT_PERSONA_TTS_MODEL"; }
 
+# DIVE-5869: two opt-in knobs for LOCAL hearing. Left unset, whisper detects the
+# language on every note and decodes with beam 5, which is what every box does
+# today. An owner whose notes are always in one language can pin it, and can
+# trade a little accuracy for speed with greedy decoding (beam 1). A 20 s
+# Russian note took ~5.2 s on the defaults and ~3.4 s pinned and greedy.
+#
+# voice_stt_language — the language code hearing is pinned to, or nothing
+# (auto-detect). `auto` and anything that is not a 2–3 letter code read as unset.
+voice_stt_language() {
+  local l; l=$(voice_config_get stt_language)
+  [[ "$l" =~ ^[a-z]{2,3}$ ]] && printf '%s\n' "$l"
+  return 0
+}
+# voice_stt_fast — 1 when greedy decoding is on, else 0.
+voice_stt_fast() {
+  [[ "$(voice_config_get stt_fast)" == 1 ]] && printf '1\n' || printf '0\n'
+}
+
 # voice_tts_format <model> — the response_format a speaking model accepts.
 # Gemini TTS answers ONLY raw PCM (16-bit little-endian, 24 kHz, mono) and
 # rejects "mp3" with a 400, measured on OpenRouter 2026-09-29. Every other

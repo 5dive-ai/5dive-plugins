@@ -1,6 +1,6 @@
 {
   "name": "voice",
-  "version": "1.7.2",
+  "version": "1.8.0",
   "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box, or on OpenRouter if you choose.",
   "author": {
     "name": "5dive",
@@ -76,6 +76,30 @@
           ],
           "default": "local",
           "help": "Hearing alone. On this server, your voice notes never leave it. Unset, hearing follows the setting above."
+        },
+        {
+          "key": "stt_language",
+          "label": "Language of your voice notes (this server)",
+          "type": "string",
+          "default": "auto",
+          "help": "Used only when hearing runs on this server. auto detects the language of every note. A two-letter code such as ru or en skips that step: faster, and never mistakes a short note for another language."
+        },
+        {
+          "key": "stt_fast",
+          "label": "Hearing speed (this server)",
+          "type": "enum",
+          "options": [
+            {
+              "value": "0",
+              "label": "Most accurate"
+            },
+            {
+              "value": "1",
+              "label": "Fast"
+            }
+          ],
+          "default": "0",
+          "help": "Used only when hearing runs on this server. Fast checks one reading of each note instead of five: about a third quicker, and slightly less accurate on unclear speech."
         },
         {
           "key": "stt_model",

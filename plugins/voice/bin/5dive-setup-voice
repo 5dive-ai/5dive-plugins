@@ -56,7 +56,11 @@ MARKER_V4="<!-- 5dive-setup-voice: voice section v4 -->"
 # v5 (DIVE-5397): a voice reply only when the user spoke. v4 said "ALWAYS send
 # the text reply first, then ... the voice attachment", which agents read as a
 # voice note after every reply, typed messages included.
-MARKER="<!-- 5dive-setup-voice: voice section v5 -->"
+MARKER_V5="<!-- 5dive-setup-voice: voice section v5 -->"
+# v6 (DIVE-5869): where hearing's speed and language are set, so an agent whose
+# owner finds hearing slow points at the setting instead of patching the plugin,
+# which the next update overwrites.
+MARKER="<!-- 5dive-setup-voice: voice section v6 -->"
 # v4 is the first version with a CLOSING marker (DIVE-5189). Every section a
 # later release appends below this one (human-messaging, agent-sites) would be
 # eaten by the old "marker to end of file" strip, so a strip is now bounded.
@@ -72,6 +76,7 @@ WHISPER_MODEL="${WHISPER_MODEL:-small}"
 # a-plugin-config-file-does-not-live-in-the-version-keyed-cache.
 VOICE_STATE_DIR="${VOICE_STATE_DIR:-${STATE_DIR:-/var/lib/5dive}/voice}"
 VOICE_LIB="/usr/local/lib/5dive/voice-backend.sh"
+WHISPER_SERVICE_BIN="${WHISPER_SERVICE_BIN:-/usr/local/bin/whisper-service}"
 
 # The payloads this installer writes onto the box. In 5dive-api these were
 # @-include directives spliced by the provisioning preprocessor before the
@@ -199,10 +204,27 @@ step_pip() {
   ok "faster-whisper + edge-tts installed"
 }
 
+# whisper_service_py — the service program this installer ships, on stdout.
+whisper_service_py() {
+  cat "$(payload whisper-service.py)"
+}
+
+# install_whisper_service — write it to $WHISPER_SERVICE_BIN. Succeeds only when
+# the installed bytes CHANGED, which is how a caller knows that a running
+# service is still on the old code (DIVE-5869).
+install_whisper_service() {
+  if [[ -f "$WHISPER_SERVICE_BIN" ]] && cmp -s "$WHISPER_SERVICE_BIN" <(whisper_service_py); then
+    return 1
+  fi
+  whisper_service_py | write_atomic "$WHISPER_SERVICE_BIN" 755
+}
+
 step_service() {
   say "Step 3/6 — whisper-service (warm HTTP, port 8765, model=$WHISPER_MODEL)"
 
-  write_atomic /usr/local/bin/whisper-service 755 < "$(payload whisper-service.py)"
+  local was_active=0 changed=0
+  systemctl is-active --quiet whisper-service 2>/dev/null && was_active=1
+  install_whisper_service && changed=1
 
   cat > /etc/systemd/system/whisper-service.service <<EOF
 [Unit]
@@ -225,6 +247,12 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now whisper-service
+  # `enable --now` leaves a running service alone, so new code needs a restart.
+  # Only then: a first start may still be downloading the model (DIVE-5869).
+  if (( was_active && changed )); then
+    systemctl restart whisper-service || warn "whisper-service did not restart — check: journalctl -u whisper-service"
+    ok "whisper-service restarted onto the new code"
+  fi
 
   # First start downloads the model (~100MB–1.5GB depending on size) and loads
   # it into memory. Poll /health until it's ready so first transcribe is fast.
@@ -255,6 +283,16 @@ step_wrapper() {
 
   write_atomic /usr/local/bin/5dive-speak 755 < "$(payload 5dive-speak.sh)"
   ok "5dive-speak installed at /usr/local/bin/5dive-speak"
+
+  # DIVE-5869: the nightly runs this step and never step_service, so without
+  # this a running whisper-service kept the code it was first installed with,
+  # and a request field it does not read (beam_size) was silently ignored.
+  # Only a box that already has the service; only when the code changed, so
+  # an unchanged nightly costs one cmp and no restart.
+  if [[ -f "$WHISPER_SERVICE_BIN" ]] && install_whisper_service; then
+    systemctl try-restart whisper-service 2>/dev/null || true
+    ok "whisper-service updated (restarted if it was running)"
+  fi
 }
 
 step_state() {
@@ -286,6 +324,11 @@ backend=local
 # stt_backend=local|openrouter moves HEARING alone; unset, it follows backend.
 # A 5dive box is built with stt_backend=local and backend=openrouter.
 
+# Only read when hearing runs on this box (DIVE-5869). Unset, whisper detects
+# the language of every note and weighs five candidate readings.
+# stt_language=ru   pin the language (a code such as ru or en; auto detects)
+# stt_fast=1        one reading instead of five: faster, a little less accurate
+
 # Only read when backend=openrouter.
 # stt_model: openai/whisper-large-v3-turbo is the default — 99+ languages
 #   including Russian. meta/muse-voice-transcribe-1.0 is more accurate in
@@ -310,25 +353,29 @@ step_claudemd() {
   fi
 
   if grep -qF "$MARKER" "$CLAUDE_MD"; then
-    ok "Voice section already present (v5) — not re-appending."
+    ok "Voice section already present (v6) — not re-appending."
     return
   fi
 
-  # v4 has a closing marker, so it is replaced by its own lines only: whatever a
-  # later release appended below it stays (DIVE-5397).
-  if grep -qF "$MARKER_V4" "$CLAUDE_MD" \
-     && sed -n "\|${MARKER_V4}|,\$p" "$CLAUDE_MD" | grep -qF "$MARKER_END"; then
-    cp -a "$CLAUDE_MD" "${CLAUDE_MD}.bak"
-    sed -i "\|${MARKER_V4}|,\|${MARKER_END}|d" "$CLAUDE_MD"
-    warn "Removed the v4 voice section. Backup at ${CLAUDE_MD}.bak."
-  fi
+  # v4 and v5 have a closing marker, so each is replaced by its own lines only:
+  # whatever a later release appended below it stays (DIVE-5397).
+  local closed
+  for closed in "$MARKER_V5" "$MARKER_V4"; do
+    if grep -qF "$closed" "$CLAUDE_MD" \
+       && sed -n "\|${closed}|,\$p" "$CLAUDE_MD" | grep -qF "$MARKER_END"; then
+      cp -a "$CLAUDE_MD" "${CLAUDE_MD}.bak"
+      sed -i "\|${closed}|,\|${MARKER_END}|d" "$CLAUDE_MD"
+      warn "Removed the previous voice section. Backup at ${CLAUDE_MD}.bak."
+    fi
+  done
 
   # v1 marker present from an earlier setup run — strip the old block (marker
   # to end of file; voice section is appended last by design) before writing
   # the v2 block. If the user has manually added content after the v1 marker,
   # they'll need to restore it from the .bak we leave behind.
   local old_marker=""
-  if   grep -qF "$MARKER_V4"  "$CLAUDE_MD"; then old_marker="$MARKER_V4"
+  if   grep -qF "$MARKER_V5"  "$CLAUDE_MD"; then old_marker="$MARKER_V5"
+  elif grep -qF "$MARKER_V4"  "$CLAUDE_MD"; then old_marker="$MARKER_V4"
   elif grep -qF "$MARKER_V3"  "$CLAUDE_MD"; then old_marker="$MARKER_V3"
   elif grep -qF "$MARKER_V2"  "$CLAUDE_MD"; then old_marker="$MARKER_V2"
   elif grep -qF "$MARKER_OLD" "$CLAUDE_MD"; then old_marker="$MARKER_OLD"; fi
@@ -352,6 +399,7 @@ $MARKER
 - Voice replies: \`5dive-speak "<text>"\` prints the path to a Telegram-ready OGG/Opus file. Use it instead of calling edge-tts directly — it is the only thing that honours the backend switch.
 - Which backend: \`5dive voice\` prints it; \`sudo 5dive voice backend local|openrouter\` changes it, and \`stt_backend\` in \`5dive voice config\` moves hearing alone. On \`local\`, hearing runs on this box (warm whisper-service at http://127.0.0.1:8765, unit \`whisper-service.service\`) but SPEAKING still sends the reply text to Microsoft, because edge-tts is an online voice service. On \`openrouter\`, speaking uses your character's own voice when your persona has one.
 - When receiving a Telegram voice message, always transcribe it before responding.
+- **If the owner finds hearing slow**, and their notes are always in one language, tell them it can be pinned and sped up: \`sudo 5dive voice config set stt_language ru\` (their language code) and \`sudo 5dive voice config set stt_fast 1\`. Change it only when they ask. Never edit the voice plugin's own files: the next update replaces them.
 - **Answer in the way the user wrote**: a typed message gets a text reply only — no voice note. Send a voice reply only when the user's own message was a voice note, or when they ask you for one. A voice reply spends credit, so never add one nobody asked for.
 - **Reply order for speed** (voice replies only): send the text reply first (so the user sees it immediately), then generate and send the voice attachment as a follow-up message. Never bundle them together — text first, voice second.
 - **When a voice reply fails** (for example OpenRouter answers HTTP 402 because this box's voice credit is used up), your text reply is the answer: say in one line that the voice reply did not work this time. Do not retry it in a loop, do not change voice settings, and never ask the user for a key.
