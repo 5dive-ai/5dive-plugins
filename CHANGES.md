@@ -1,5 +1,18 @@
 ## Unreleased
 
+### Added — telegram 0.5.92: the first job picked at hire is the agent's first message (DIVE-5874)
+
+At hire the owner picks a small first job; the box runs it on the agent's own AI and writes the
+answer to the plugin's state dir as `first-reply.json`, and FiveDiveBot sends the owner one notice whose button opens
+the agent's bot (`/start fj-<token>`), or creates it first. The owner's /start, on either profile, now sends that answer in place of the
+greeting (split at Telegram's 4096-character limit when longer), to an owner's private chat only,
+under the same one-per-chat claim as the greeting. The boot greeting sends it instead too, and
+while it waits, a poll (every 20 s) sends it unasked if the owner already has the bot open. The
+file is dropped only after a send succeeds; a failed send (a 403 when the bot was never opened or
+is blocked) keeps it for the next /start, and the poll rests 10 minutes after a failure. Success
+writes `first-reply.state.json` with `startAt`, and the owner's next message adds `secondAt` once,
+which the box's first-job watcher reports to 5dive. On lite, an `fj-` payload never goes to the model.
+
 ### Fixed — telegram 0.5.91: a client the owner let in is no longer an owner (DIVE-5867)
 
 The owners record that DIVE-5368 added seeded itself with every user allowed to DM the agent, so on a box set up before it, a client became an owner and could add the agent to any group they chose, where anyone could mention it. Now the owner is the first user ever paired. A record the old seed wrote is trimmed once to that first user, and a later pairing (the open-source `/telegram:access pair`) lets someone DM the agent without making them an owner. Each decision is logged with the ids it left out. A second owner is added on purpose with the new `/telegram:access owner add <id>`. Also: a message id passed as `chat_id` is now refused with "looks like a message_id" instead of a pointer to access control.
