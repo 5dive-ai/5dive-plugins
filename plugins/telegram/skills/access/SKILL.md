@@ -69,7 +69,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### No args — status
 
 1. Read `~/.claude/channels/telegram/access.json` (handle missing file).
-2. Show: dmPolicy, allowFrom count and list, pending count with codes +
+2. Show: dmPolicy, allowFrom count and list, owners (from `owners`), pending count with codes +
    sender IDs + age, groups count, and any discovered groups (title + id)
    that are not yet in `groups` and have no `removedAt` — these are groups
    the bot sits in awaiting `group add <groupId>`.
@@ -102,6 +102,20 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `remove <senderId>`
 
 1. Read, filter `allowFrom` to exclude `<senderId>`, write.
+
+### `owner add <senderId>` / `owner rm <senderId>`
+
+Owners are the users whose group adds are approved at once (mention-only);
+everyone else in `allowFrom` can DM the agent, but a group they add waits for
+`group add`. Only the FIRST user ever paired becomes an owner by pairing
+(DIVE-5867); anyone else is made one here, on purpose.
+
+1. Read access.json (create default if missing).
+2. `owner add`: `<senderId>` must already be in `allowFrom` (pair or `allow`
+   them first); add it to `owners` (dedupe). `owner rm`: filter it out of
+   `owners`. Either way set `ownersSeed` to `2` — without it the channel server
+   treats the record as an old migration seed and trims it to one owner.
+3. Write back.
 
 ### `policy <mode>`
 

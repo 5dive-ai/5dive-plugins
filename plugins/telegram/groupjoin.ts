@@ -11,9 +11,11 @@
 // Owner is NOT "in allowFrom": the app approves guests into allowFrom so they can
 // DM the agent, and a guest must not be able to put the agent, on the owner's
 // account, into a group of people the owner never saw (quinn, DIVE-5368 iter 1).
-// `access.owners` is the plugin's own record: ids paired through the owner-level
-// paths (`agent pair`, the /telegram:access skill), which both drop
-// approved/<id>; the app's guest approve never does. `telegram-access set`
+// `access.owners` is the plugin's own record: the FIRST id paired through an
+// owner-level path (`agent pair`, the /telegram:access skill), which both drop
+// approved/<id> (the app's guest approve never does), plus any id added with
+// `/telegram:access owner add` (DIVE-5867: a later pairing is a DM user, since
+// on an OSS box clients are paired the same way). `telegram-access set`
 // rewrites only dmPolicy/allowFrom/groups, so the record survives the app.
 
 import type { Lang } from './hooks/lib/lite.ts'
@@ -43,17 +45,74 @@ export function admitOnJoin(
   return approved
 }
 
+/** DIVE-5867: the owners record's format, stored beside it as `ownersSeed`.
+ *  A record without it was written by the DIVE-5368 migration, which seeded
+ *  EVERY allowFrom id, so it is trimmed once (nextOwners). */
+export const OWNERS_SEED = 2
+
+/** One pass over the owners record: the new list, the format to stamp, and a
+ *  line for the operator when the pass decided who is (not) an owner. */
+export type OwnersPass = { owners: string[]; seed: number; note: string | null }
+
 /**
- * The owners record after one pass, or null when it is unchanged.
- * First sight seeds it from allowFrom: every id there came in through an
- * owner-level pairing, because the app refuses a guest approve until this
- * record exists (it is the app's proof the plugin can tell the two apart).
- * Then each id paired since (an approved/<id> file) is added.
+ * The owners record after one pass, or null when there is nothing to write.
+ *
+ * DIVE-5867: being in allowFrom, or being paired, is not an owner signal.
+ * Before DIVE-5368 there was one pairing level, and on an OSS box there still
+ * is (the /telegram:access skill), so a client the owner lets DM the agent is
+ * paired exactly like the owner. Seeding or growing the record from that handed
+ * every client the right to put the agent in a group of their choosing
+ * (admitOnJoin). So:
+ *
+ *  - the owner is the FIRST paired user: the person who set the agent up pairs
+ *    before anyone else, and allowFrom keeps pairing order (the skill and
+ *    `agent pair` both append). A record with no owner takes the first one
+ *    paired; a record with an owner takes no more by pairing. A second owner is
+ *    added on purpose (`/telegram:access owner add <id>`).
+ *  - a record from the old all-of-allowFrom seed (no `ownersSeed`) is trimmed
+ *    ONCE to the first paired user it held. It never gains someone it did not
+ *    hold. Narrowing is the safe direction: an owner it drops loses group
+ *    auto-approve (their groups wait for approval) until added back.
+ *  - each decision that leaves someone out says who, and how to undo it.
+ *
+ * The 5dive human registry was not used: it is empty on most boxes (adopted by
+ * presence) and absent on an OSS install, which is where this was reported.
  */
-export function nextOwners(cur: readonly string[] | undefined, allowFrom: readonly string[], paired: readonly string[]): string[] | null {
-  const next = cur ? [...cur] : allowFrom.filter((id) => USER_ID.test(id))
-  for (const id of paired) if (USER_ID.test(id) && !next.includes(id)) next.push(id)
-  return cur && next.length === cur.length ? null : next
+export function nextOwners(
+  cur: readonly string[] | undefined,
+  seed: number | undefined,
+  allowFrom: readonly string[],
+  paired: readonly string[],
+): OwnersPass | null {
+  const users = allowFrom.filter((id) => USER_ID.test(id))
+  const current = seed === OWNERS_SEED && cur
+  const next = current ? [...cur] : users.filter((id) => !cur || cur.includes(id)).slice(0, 1)
+  const notes: string[] = []
+  if (!current) {
+    const left = (cur ?? users).filter((id) => !next.includes(id) && users.includes(id))
+    notes.push(
+      `${cur ? 'owners record trimmed' : 'owners record seeded'}: owner = ` +
+        (next.length ? `${next[0]} (the first paired user)` : 'nobody yet (the next pairing)') +
+        '.' +
+        (left.length ? ` NOT owners: ${left.join(', ')}.` : ''),
+    )
+  }
+  const extra: string[] = []
+  for (const id of paired) {
+    if (!USER_ID.test(id) || next.includes(id)) continue
+    if (next.length === 0) next.push(id)
+    else extra.push(id)
+  }
+  if (extra.length) notes.push(`paired ${extra.join(', ')} as DM users, not owners (owner: ${next.join(', ')}).`)
+  const anyLeftOut = extra.length > 0 || notes.some((n) => n.includes('NOT owners'))
+  if (anyLeftOut) {
+    notes.push(
+      'They can DM the agent, but a group they add waits for approval.' +
+        ' To make one an owner: /telegram:access owner add <id>.',
+    )
+  }
+  if (current && next.length === cur.length && notes.length === 0) return null
+  return { owners: next, seed: OWNERS_SEED, note: notes.length ? notes.join(' ') : null }
 }
 
 export const GROUP_STRINGS = {
