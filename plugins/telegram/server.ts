@@ -65,6 +65,7 @@ import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
 import { admitOnJoin, nextOwners, groupJoinLines, ASK_OWNER } from './groupjoin.ts'
 import { notAllowlistedMessage } from './chatguard.ts'
 import { makeGreetClaims, botIdOf, bootGreetTargets, BOOT_GREET_DELAY_MS, WIRED_RECENTLY_MS } from './bootgreet.ts'
+import { makeFirstReplier, firstReplyOwners, isFirstJobPayload, lastHumanChatId, FIRST_REPLY_FILE, FIRST_REPLY_POLL_MS } from './firstreply.ts'
 import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, startGreeting, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
   appendMessage as msglogAppend,
@@ -3508,6 +3509,8 @@ const commandHandlers: Record<string, CommandHandler> = {
       // DIVE-5411: one greeting per chat, so the /starts queued while the seat
       // was being wired (or the boot greeting) do not each send one.
       const chat = String(ctx.chat!.id)
+      // DIVE-5874: a waiting first-job result goes out in place of the greeting.
+      if (await firstReplier.deliver(chat) !== 'none') return
       if (!greetClaims.claim(chat)) return
       await ctx.reply(await startGreetingFor(ctx, liteLang(ctx.from?.language_code))).catch(err => { greetClaims.release(chat); throw err })
       return
@@ -5046,6 +5049,24 @@ const greetClaims = makeGreetClaims()
 // The bot id this state dir already greeted its owner for (bootgreet.ts).
 const BOOT_GREETED_FILE = join(STATE_DIR, 'boot-greeted')
 
+// DIVE-5874: the first job's result (firstreply.ts), sent under the same claims as
+// a greeting, to an owner's DM only, and logged like a reply so recent_messages
+// shows the agent already said it.
+const firstReplier = makeFirstReplier({
+  dir: STATE_DIR,
+  claims: greetClaims,
+  owners: () => firstReplyOwners(loadAccess()),
+  send: async (chat, text) => {
+    const sent = await bot.api.sendMessage(Number(chat), text)
+    try {
+      const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'
+      msglogAppend(MSGLOG_DIR, chat, { ts: new Date().toISOString(), dir: 'out', user: me, text, message_id: String(sent.message_id) })
+    } catch {}
+  },
+  log: line => process.stderr.write(line + '\n'),
+})
+let firstReplyTimer: ReturnType<typeof setInterval> | undefined
+
 // DIVE-5411: the manager bot tells the owner the agent "greets you in a moment"
 // before this poller exists, so a freshly wired bot greets its owner itself, once,
 // with no /start needed. It runs BOOT_GREET_DELAY_MS after polling starts, so a
@@ -5070,6 +5091,8 @@ async function bootGreet(): Promise<void> {
     try { writeFileSync(BOOT_GREETED_FILE, `${botId}\n`, { mode: 0o600 }) } catch {}
   }
   for (const owner of plan.greet) {
+    // DIVE-5874: the first job finished before the poller came up: its result is the hello.
+    if (await firstReplier.deliver(owner) !== 'none') continue
     if (!greetClaims.claim(owner)) continue
     const lang = langOfChat(owner)
     const text = startGreeting(lang, { name: bot.botInfo.first_name, about: await liteAboutText(lang) })
@@ -5099,7 +5122,12 @@ async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: str
     // answers one, so /start was silence).
     // DIVE-5411: one greeting per chat; a repeat inside the window (a queued
     // /start, or the boot greeting already went out) is not greeted again.
+    // DIVE-5874: a waiting first-job result IS the greeting (one message, not
+    // two), and the "Open <Name>" button's fj- payload never reaches the model.
     const chatId = String(ctx.chat!.id)
+    if (await firstReplier.deliver(chatId) !== 'none') return
+    const firstJob = isFirstJobPayload(liteStartPayload(text))
+    if (firstJob) text = '/start' // nothing waiting (sent already, or not done): a bare /start
     const greet = greetClaims.claim(chatId)
     if (!greet && !liteStartPayload(text)) return
     const welcome = await startGreetingFor(ctx, lang)
@@ -5117,6 +5145,7 @@ async function liteCommand(ctx: Context, cmd: LiteCommand, lang: Lang, text: str
         if (!liteStartPayload(text)) return
       }
     }
+    if (firstJob) return
     await handleInbound(ctx, text, undefined)
     return
   }
@@ -6769,6 +6798,8 @@ async function handleInbound(
   // send targeting that as a topic would fail. DMs record null.
   if (!from.is_bot) {
     recordLastHumanChat(chat_id, ctx.message?.is_topic_message ? threadId ?? null : null)
+    // DIVE-5874: the owner's first message after the first-job result (secondAt).
+    firstReplier.noteInbound(chat_id)
   }
   // DIVE-5256: the first message after the demo key runs out gets the notice
   // at once; the message still goes to the model as before.
@@ -7136,6 +7167,12 @@ if (SEND_ONLY) {
           recordGroupPrivacy(info.can_read_all_group_messages)
           // DIVE-5411: a freshly wired bot says hello without waiting for /start.
           setTimeout(() => { void bootGreet().catch(err => process.stderr.write(`telegram channel: boot greeting failed: ${err}\n`)) }, BOOT_GREET_DELAY_MS).unref?.()
+          // DIVE-5874: a first-job result that lands while the owner already has the
+          // bot open goes out unasked. A stat per beat while nothing waits.
+          firstReplyTimer ??= setInterval(() => {
+            if (existsSync(join(STATE_DIR, FIRST_REPLY_FILE))) void firstReplier.poll(lastHumanChatId(LAST_HUMAN_CHAT_FILE)).catch(() => {})
+          }, FIRST_REPLY_POLL_MS)
+          firstReplyTimer.unref?.()
           // DIVE-1883: resolve the /model picker against the CLI's model
           // catalogue so it can't drift a version behind agent-create again.
           void refreshModelAliases()
