@@ -63,6 +63,7 @@ import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, 
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
 import { admitOnJoin, nextOwners, groupJoinLines, ASK_OWNER } from './groupjoin.ts'
+import { notAllowlistedMessage } from './chatguard.ts'
 import { makeGreetClaims, botIdOf, bootGreetTargets, BOOT_GREET_DELAY_MS, WIRED_RECENTLY_MS } from './bootgreet.ts'
 import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, startGreeting, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
@@ -513,6 +514,8 @@ type Access = {
   canReadAllGroupMessages?: boolean
   /** DIVE-5368: who paired as an owner (not a guest the app let in); see groupjoin.ts */
   owners?: string[]
+  /** DIVE-5867: the owners record's format (groupjoin.ts OWNERS_SEED); absent = the old all-of-allowFrom seed */
+  ownersSeed?: number
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
   /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
@@ -575,6 +578,7 @@ function normalizeAccess(raw: unknown): Access {
     discovered: parsed.discovered,
     canReadAllGroupMessages: parsed.canReadAllGroupMessages,
     owners: parsed.owners,
+    ownersSeed: parsed.ownersSeed,
     mentionPatterns: parsed.mentionPatterns,
     ackReaction: parsed.ackReaction,
     replyToMode: parsed.replyToMode,
@@ -616,11 +620,13 @@ function loadAccess(): Access {
 
 // Outbound gate — reply/react/edit can only target chats the inbound gate
 // would deliver from. Telegram DM chat_id == user_id, so allowFrom covers DMs.
-function assertAllowedChat(chat_id: string): void {
+// DIVE-5867: `messageId` (the call's message_id / reply_to) only shapes the
+// refusal's text, so a message id passed as chat_id is named as that.
+function assertAllowedChat(chat_id: string, messageId?: string | number): void {
   const access = loadAccess()
   if (access.allowFrom.includes(chat_id)) return
   if (chat_id in access.groups) return
-  throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
+  throw new Error(notAllowlistedMessage(chat_id, messageId))
 }
 
 function saveAccess(a: Access): void {
@@ -1255,14 +1261,19 @@ if (!STATIC && !SEND_ONLY) setInterval(checkApprovals, 5000).unref()
 // DIVE-5368: the owners record (groupjoin.ts). Seeded once on a box that already
 // has an access file, then grown by each owner-level pairing seen above. No file
 // yet: nothing to record; the first pairing writes one and drops approved/<id>.
+// DIVE-5867: the seed is the first paired user only, a record from the old
+// all-of-allowFrom seed is trimmed once, and either decision is logged with the
+// ids it left out, so an operator can see and undo it.
 function recordOwners(paired: string[] = []): void {
   if (STATIC || !existsSync(ACCESS_FILE)) return
   try {
     const a = readAccessFile()
-    const next = nextOwners(a.owners, a.allowFrom, paired)
+    const next = nextOwners(a.owners, a.ownersSeed, a.allowFrom, paired)
     if (!next) return
-    a.owners = next
+    a.owners = next.owners
+    a.ownersSeed = next.seed
     saveAccess(a)
+    if (next.note) process.stderr.write(`telegram channel: ${next.note} (${ACCESS_FILE})\n`)
   } catch (err) {
     process.stderr.write(`telegram channel: owners record not written: ${err}\n`)
   }
@@ -1701,7 +1712,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           text = ''
         }
 
-        assertAllowedChat(chat_id)
+        assertAllowedChat(chat_id, args.reply_to as string | undefined)
         // DIVE-5419: a reply no longer stops "typing…" — the turn's end does.
         typingQuietUntil.set(chat_id, Date.now() + TYPING_INTERVAL_MS + 1_000)
 
@@ -1873,7 +1884,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
-        assertAllowedChat(args.chat_id as string)
+        assertAllowedChat(args.chat_id as string, args.message_id as string | undefined)
         await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
         ])
@@ -1924,7 +1935,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'edit_message': {
         const chat_id = args.chat_id as string
         const message_id = Number(args.message_id)
-        assertAllowedChat(chat_id)
+        assertAllowedChat(chat_id, args.message_id as string | undefined)
         const editFormat = (args.format as string | undefined) ?? 'text'
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
         const anchor = getAnchor(chat_id, message_id)

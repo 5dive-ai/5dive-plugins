@@ -144,8 +144,11 @@ describe('divergences that must NOT converge', () => {
   // The forks say "is not on the allowlist"; the baseline's string is quoted in
   // operator docs and in /telegram:access. Converging it would be a silent UX break.
   test('the Claude baseline keeps its own refusal string', () => {
-    const src = readFileSync(join(PLUGINS, 'telegram', 'server.ts'), 'utf8')
+    // DIVE-5867 moved the text into chatguard.ts (it now names a message id
+    // passed as chat_id); server.ts must still throw it.
+    const src = readFileSync(join(PLUGINS, 'telegram', 'chatguard.ts'), 'utf8')
     expect(src).toContain('is not allowlisted — add via /telegram:access')
+    expect(readFileSync(join(PLUGINS, 'telegram', 'server.ts'), 'utf8')).toContain('throw new Error(notAllowlistedMessage(')
   })
 
   test('the baseline keeps dmPolicy "disabled"; the forks keep "static"', () => {

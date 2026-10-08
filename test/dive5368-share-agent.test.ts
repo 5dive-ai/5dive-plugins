@@ -16,7 +16,7 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { addedByOwner, admitOnJoin, nextOwners, groupJoinLines, ASK_OWNER, GROUP_STRINGS, type JoinInput } from '../plugins/telegram/groupjoin'
+import { addedByOwner, admitOnJoin, nextOwners, OWNERS_SEED, groupJoinLines, ASK_OWNER, GROUP_STRINGS, type JoinInput } from '../plugins/telegram/groupjoin'
 
 const SERVER = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram', 'server.ts'), 'utf8')
 const LEAK = /5dive|claude|anthropic|openrouter|\bmodel|token|context|server|\bbox\b|\bcost|\$|сервер|токен|модел|контекст/i
@@ -90,23 +90,30 @@ describe('who added the bot decides whether the group is approved', () => {
 })
 
 describe('the owners record: seeded once, grown only by an owner-level pairing', () => {
+  // DIVE-5867 narrowed the seed to the first paired user; the full matrix is in
+  // dive5867-owners-seed.test.ts. These are the DIVE-5368 contracts on the new shape.
+  const S = OWNERS_SEED
   test('first sight seeds from allowFrom (numeric user ids only)', () => {
-    expect(nextOwners(undefined, ['111', '-100500', 'x'], [])).toEqual(['111'])
-    expect(nextOwners(undefined, [], [])).toEqual([])
+    expect(nextOwners(undefined, undefined, ['111', '-100500', 'x'], [])?.owners).toEqual(['111'])
+    expect(nextOwners(undefined, undefined, [], [])?.owners).toEqual([])
   })
-  test('an approved/<id> pairing adds that id; a guest the app adds to allowFrom later is NOT added', () => {
-    expect(nextOwners(['111'], ['111', '222'], [])).toBeNull()
-    expect(nextOwners(['111'], ['111', '333'], ['333'])).toEqual(['111', '333'])
-    expect(nextOwners(['111'], ['111'], ['111'])).toBeNull()
-    expect(nextOwners(['111'], ['111'], ['../x', '-5'])).toBeNull()
+  test('a guest the app adds to allowFrom later is NOT added; a pairing makes an owner only while there is none', () => {
+    expect(nextOwners(['111'], S, ['111', '222'], [])).toBeNull()
+    // DIVE-5867: a second pairing is a DM user (said in the note), not an owner.
+    expect(nextOwners(['111'], S, ['111', '333'], ['333'])?.owners).toEqual(['111'])
+    expect(nextOwners([], S, ['333'], ['333'])?.owners).toEqual(['333'])
+    expect(nextOwners(['111'], S, ['111'], ['111'])).toBeNull()
+    expect(nextOwners(['111'], S, ['111'], ['../x', '-5'])).toBeNull()
   })
   test('server keeps the record: typed, carried by the loader, written at boot and on each pairing', () => {
     expect(SERVER).toContain('owners?: string[]')
     expect(SERVER).toContain('owners: parsed.owners,')
+    expect(SERVER).toContain('ownersSeed: parsed.ownersSeed,')
     const c = between('function checkApprovals(): void {', 'for (const senderId of files)')
     expect(c).toContain('recordOwners(files)')
     const r = between('function recordOwners(', '\nrecordOwners()\n')
-    expect(r).toContain('nextOwners(a.owners, a.allowFrom, paired)')
+    expect(r).toContain('nextOwners(a.owners, a.ownersSeed, a.allowFrom, paired)')
+    expect(r).toContain('a.ownersSeed = next.seed')
     expect(r).toContain('!existsSync(ACCESS_FILE)')
   })
 })

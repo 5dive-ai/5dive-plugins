@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.91: a client the owner let in is no longer an owner (DIVE-5867)
+
+The owners record that DIVE-5368 added seeded itself with every user allowed to DM the agent, so on a box set up before it, a client became an owner and could add the agent to any group they chose, where anyone could mention it. Now the owner is the first user ever paired. A record the old seed wrote is trimmed once to that first user, and a later pairing (the open-source `/telegram:access pair`) lets someone DM the agent without making them an owner. Each decision is logged with the ids it left out. A second owner is added on purpose with the new `/telegram:access owner add <id>`. Also: a message id passed as `chat_id` is now refused with "looks like a message_id" instead of a pointer to access control.
+
 ### Added — telegram-codex 0.5.29: one quiet progress message per Codex turn, one notification (DIVE-5504)
 
 A Codex agent on Telegram showed only "typing…" during a long job, then sent every message the model wrote, and each one buzzed the phone. Now a turn that runs longer than 8 seconds gets one silent message, "⏳ Working on it · running `npm test` · 40s", edited in place as Codex works (running a command, editing files, searching the web), and closed with "✅ Done in 2m 10s · 6 steps" or "⚠️ Stopped after …". A quick answer arrives alone, with no progress message. Only the turn's last answer notifies: Codex's in-between commentary arrives silently, and on models that do not say which message is final, each message waits until the next one shows it was not the last. Dashboard turns are unchanged.
