@@ -423,8 +423,24 @@ function startInbox(): void {
   }, 15_000).unref?.()
 }
 
+// DIVE-5894: an adapter that exits is respawned with a backoff; it no longer
+// takes the dispatcher down. A fatal exit here meant one dead channel stopped
+// every other channel AND the inbox: when DIVE-5690 closed the box token to
+// standard seats the dashboard adapter exited 1 at boot, the run-loop restarted
+// the whole dispatcher every 5 minutes, and nothing a seat was sent ever ran.
+// The base delay doubles per quick exit up to 10 minutes; a run that lasted
+// 10 minutes starts the count over. The health record keeps saying which
+// channel is down (listening drops it, failure names it).
+const ADAPTER_RESPAWN_BASE_MS = (() => {
+  const raw = Number(process.env.CODEX_DISPATCHER_ADAPTER_RESPAWN_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 5_000
+})()
+const ADAPTER_RESPAWN_MAX_MS = 10 * 60_000
+const ADAPTER_STABLE_MS = 10 * 60_000
+
 const children: ChildProcessWithoutNullStreams[] = []
-function startAdapter(file: string, channel: string, extraEnv: Record<string, string>): void {
+function startAdapter(file: string, channel: string, extraEnv: Record<string, string>, quickExits = 0): void {
+  const startedAt = Date.now()
   const child = spawn(BUN_BIN, [file], {
     cwd: WORKDIR,
     env: { ...process.env, CODEX_DISPATCHER_STATE_DIR: STATE_DIR, ...extraEnv },
@@ -438,10 +454,19 @@ function startAdapter(file: string, channel: string, extraEnv: Record<string, st
   if (!health.listening.includes(channel)) health.listening.push(channel)
   publishHealth()
   child.once('exit', (code, signal) => {
+    const at = children.indexOf(child)
+    if (at >= 0) children.splice(at, 1)
     health.listening = health.listening.filter(c => c !== channel)
     const why = `adapter exited code=${code ?? 'null'} signal=${signal ?? 'none'}`
     markFailure(channel, why)
-    if (!shuttingDown) fatal(`channel adapter ${file} exited code=${code ?? 'null'} signal=${signal ?? 'none'}`)
+    if (shuttingDown) return
+    const n = Date.now() - startedAt >= ADAPTER_STABLE_MS ? 0 : quickExits + 1
+    const delay = Math.min(ADAPTER_RESPAWN_BASE_MS * 2 ** Math.max(0, n - 1), ADAPTER_RESPAWN_MAX_MS)
+    const message = `channel adapter ${file} exited code=${code ?? 'null'} signal=${signal ?? 'none'}; ` +
+      `respawning in ${Math.round(delay / 1000)}s, the dispatcher keeps serving the inbox`
+    process.stderr.write(`codex-dispatcher: ${message}\n`)
+    recordLifecycle(STATE_DIR, 'crash', channel, message)
+    setTimeout(() => { if (!shuttingDown) startAdapter(file, channel, extraEnv, n) }, delay)
   })
 }
 

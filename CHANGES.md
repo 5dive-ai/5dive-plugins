@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — dashboard 0.4.5 · telegram-codex 0.5.34: dashboard chat works again on a standard seat (DIVE-5894)
+
+Since CLI 0.78 (DIVE-5690) a standard seat cannot read the box token in `/etc/5dive/connectord.env`, and the dashboard chat adapter runs as the seat. It exited at boot with "connectord token not found" on every standard seat. Claude seats kept running with dashboard chat silently dead, and a Codex seat with the dashboard channel never took a turn, because its dispatcher died with the adapter and was restarted every five minutes.
+
+Now, when the token file is there and the seat cannot read it, the adapter sends its three control-plane calls (collect, acknowledge, reply) through the CLI's root relay, `sudo -n 5dive _dashboard_relay`. Root reads the token, names the seat as the agent and makes the call, so the token never reaches the seat. A reply attachment must be the copy in the shared downloads folder; one whose copy failed is left off the reply instead of failing it. With no relay (a CLI older than the one that adds it) the adapter still exits, and now says why. Admin seats and `claude` read the token as before.
+
+The Codex dispatcher no longer exits when a channel adapter does. It records the exit, keeps serving its inbox and other channels, and respawns the adapter after 5 seconds, doubling up to 10 minutes. The health record still names the channel that is down.
+
+Needs the 5dive CLI release that adds `_dashboard_relay`.
+
 ### Added — telegram 0.5.92: the first job picked at hire is the agent's first message (DIVE-5874)
 
 At hire the owner picks a small first job; the box runs it on the agent's own AI and writes the
