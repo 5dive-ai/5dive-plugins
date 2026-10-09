@@ -98,8 +98,10 @@ const API_BASE = (process.env.DASHBOARD_API_BASE ?? 'https://api.5dive.com').rep
 const OUTBOX_DIR = process.env.DASHBOARD_OUTBOX ?? '/home/claude/chat-downloads'
 
 // The box's connectord token authenticates outbound replies to the control
-// plane. Standard location is /etc/5dive/connectord.env (root:claude 640;
-// agent users are in the claude group). Env/.env override for tests.
+// plane. Standard location is /etc/5dive/connectord.env. Since DIVE-5690 it is
+// root:claude-keys 640, readable by `claude` and admin seats only; a standard
+// seat reaches the control plane through the root relay below (DIVE-5894).
+// Env/.env override for tests.
 //
 // DIVE-3810: this file is REWRITTEN UNDER US while the agent runs — pairing a
 // phone rotates the box token (shelld's /shell/rotate-token does the line
@@ -135,12 +137,94 @@ function loadConnectordToken(): string {
   return ''
 }
 let TOKEN = loadConnectordToken()
+
+// --- DIVE-5894: a standard seat cannot read the token, so root makes the call --
+//
+// DIVE-5690 closed the token file to standard seats, and this server runs AS
+// the seat. It exited 1 here on every standard seat from that nightly on:
+// claude seats lost dashboard chat with no visible sign, and a Codex dispatcher
+// died with its adapter. Handing this process the token would hand the seat
+// the token, so the three control-plane calls cross the CLI's exact-path sudo
+// rail instead (`5dive _dashboard_relay`, ops on stdin, seat from SUDO_UID).
+// Root builds each body, names this seat as the agent, and prints the
+// control plane's status and body, which become a Response here, so the
+// retry, ack and lifecycle logic below is the same on both paths.
+// DASHBOARD_RELAY_ARGV (a JSON argv) is the test seam.
+const RELAY_ARGV: string[] = (() => {
+  try {
+    const v = JSON.parse(process.env.DASHBOARD_RELAY_ARGV ?? 'null')
+    if (Array.isArray(v) && v.length > 0 && v.every(x => typeof x === 'string')) return v
+  } catch {}
+  return ['sudo', '-n', '/usr/local/bin/5dive', '_dashboard_relay']
+})()
+const RELAY_TIMEOUT_MS = 45_000
+
+function relayParse(code: number | null, out: string, err: string): Response {
+  const nl = out.indexOf('\n')
+  const status = Number(nl >= 0 ? out.slice(0, nl) : out)
+  if (code !== 0 || !Number.isInteger(status) || status < 100 || status > 599) {
+    throw new Error(`relay failed (exit ${code ?? 'null'}): ${(err || out).trim().slice(0, 300)}`)
+  }
+  return new Response(nl >= 0 ? out.slice(nl + 1) : '', { status })
+}
+
+function relayWire(op: string[]): Uint8Array {
+  return new TextEncoder().encode(op.map(a => `${a}\0`).join(''))
+}
+
+async function relayCall(op: string[]): Promise<Response> {
+  const proc = Bun.spawn(RELAY_ARGV, { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' })
+  const timer = setTimeout(() => proc.kill(), RELAY_TIMEOUT_MS)
+  try {
+    proc.stdin.write(relayWire(op))
+    await proc.stdin.end()
+    const [out, err, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    return relayParse(code, out, err)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+let RELAY = false
 if (!TOKEN) {
-  process.stderr.write(
-    `dashboard channel: connectord token not found\n` +
-    `  expected /etc/5dive/connectord.env (CONNECTORD_TOKEN=...) or CONNECTORD_TOKEN in ${ENV_FILE}\n`,
-  )
-  process.exit(1)
+  // Only when the file is THERE and unreadable: a box with no token file is not
+  // a 5dive box, and the relay would answer the same thing slower.
+  let unreadable = false
+  try { statSync(TOKEN_FILE); unreadable = true } catch {}
+  let why = ''
+  if (unreadable) {
+    try {
+      // `sudo -l` asks first, so a seat without the grant (a CLI from before
+      // the relay, a sandboxed seat) never turns into a logged sudo refusal on
+      // every Codex respawn of this adapter.
+      if (RELAY_ARGV[0] === 'sudo' && RELAY_ARGV[1] === '-n') {
+        const l = Bun.spawnSync(['sudo', '-n', '-l', ...RELAY_ARGV.slice(2)], { timeout: RELAY_TIMEOUT_MS })
+        if (l.exitCode !== 0) throw new Error('sudo does not grant it to this seat')
+      }
+      const r = Bun.spawnSync(RELAY_ARGV, { stdin: relayWire(['ping']), timeout: RELAY_TIMEOUT_MS })
+      const res = relayParse(r.exitCode, r.stdout.toString(), r.stderr.toString())
+      RELAY = res.status === 200
+      if (!RELAY) why = `relay ping answered ${res.status}`
+    } catch (err) {
+      why = String(err instanceof Error ? err.message : err)
+    }
+  }
+  if (!RELAY) {
+    process.stderr.write(
+      `dashboard channel: connectord token not found\n` +
+      `  expected /etc/5dive/connectord.env (CONNECTORD_TOKEN=...) or CONNECTORD_TOKEN in ${ENV_FILE}\n` +
+      (unreadable
+        ? `  ${TOKEN_FILE} is not readable by this seat and the root relay (${RELAY_ARGV.join(' ')}) is not available: ${why}\n` +
+          `  a CLI from before DIVE-5894 does not grant it; \`5dive self-update\` brings it\n`
+        : ''),
+    )
+    process.exit(1)
+  }
+  process.stderr.write(`dashboard channel: ${TOKEN_FILE} is not readable by this seat; using the root relay (DIVE-5894)\n`)
 }
 
 // The agent's short name — the unix user is agent-<name>. The main `claude`
@@ -189,12 +273,16 @@ function recordAuth(reason: string): void {
  * rejection and is returned to the caller unchanged — this must not turn an
  * auth failure into a retry loop.
  */
-async function authedFetch(url: string, what: string, init: RequestInit = {}): Promise<Response> {
+async function authedFetch(url: string, what: string, init: RequestInit = {}, relayOp: string[] = []): Promise<Response> {
+  // DIVE-5894: on the relay, root reads the token per call, so a rotation needs
+  // no reload here (reloadToken() finds the file unreadable and changes nothing).
   const send = () =>
-    fetch(url, {
-      ...init,
-      headers: { ...((init.headers as Record<string, string>) ?? {}), authorization: `Bearer ${TOKEN}` },
-    })
+    RELAY
+      ? relayCall(relayOp)
+      : fetch(url, {
+          ...init,
+          headers: { ...((init.headers as Record<string, string>) ?? {}), authorization: `Bearer ${TOKEN}` },
+        })
   let res = await send()
   if (res.status !== 401 && res.status !== 403) {
     if (authFailing) {
@@ -433,6 +521,8 @@ async function drainPendingOnce(): Promise<void> {
     const res = await authedFetch(
       `${API_BASE}/server/messages/pending?agent=${encodeURIComponent(AGENT)}`,
       'pending fetch',
+      {},
+      ['pending'],
     )
     if (!res.ok) throw new Error(`${res.status}`)
     items = ((await res.json()) as { pending?: typeof items }).pending ?? []
@@ -494,7 +584,7 @@ async function drainPendingOnce(): Promise<void> {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ agent: AGENT, ids: acked }),
-    })
+    }, ['ack', ...acked.map(String)])
     // DIVE-3810: a non-2xx ack must reach the catch below. Without this the
     // rows are logged as collected while the control plane still holds them
     // uncollected — the exact split this row exists to close.
@@ -572,6 +662,13 @@ async function sendDashboardReply(args: { chat_id?: unknown; text?: unknown; fil
     }
   })
 
+  // DIVE-5894: the relay attaches only a copy in the outbox (root refuses any
+  // other path), so a file whose copy failed is left off rather than failing
+  // the whole reply.
+  const sent = RELAY ? files.filter(f => f.startsWith(`${OUTBOX_DIR}/`)) : files
+  if (sent.length !== files.length) {
+    process.stderr.write(`dashboard channel: ${files.length - sent.length} file(s) not in ${OUTBOX_DIR} left off the reply\n`)
+  }
   const res = await authedFetch(`${API_BASE}/server/messages/event`, 'outbound reply', {
     method: 'POST',
     headers: {
@@ -580,9 +677,9 @@ async function sendDashboardReply(args: { chat_id?: unknown; text?: unknown; fil
     body: JSON.stringify({
       agent: AGENT,
       body: text,
-      metadata: { chat_id: chatId, ...(files.length ? { files } : {}) },
+      metadata: { chat_id: chatId, ...(sent.length ? { files: sent } : {}) },
     }),
-  })
+  }, ['event', chatId, text, ...sent])
   if (!res.ok) {
     const detail = await res.text().catch(() => '')
     throw new Error(`dashboard reply failed: control plane returned ${res.status} ${detail.slice(0, 200)}`)
