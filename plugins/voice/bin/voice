@@ -65,6 +65,11 @@ BACKENDS
 
 HEARING ON THIS BOX (local only; sudo 5dive voice config set <key> <value>)
 
+  whisper_model default auto — base on a box with 2 CPUs or under 6 GB of
+                memory, small on a bigger one. small is more accurate (mixed-
+                language notes above all) and hears about 2-3x slower; base is
+                the fast one. Setting it restarts hearing on the new model and
+                waits until it answers. small needs ~3 GB of memory.
   stt_language  default auto — whisper detects the language of every note.
                 A code such as ru or en pins it: detection is skipped, and a
                 short note is never heard as the wrong language. Back with auto.
@@ -208,6 +213,7 @@ config_value() {
     tts_model) voice_tts_model ;;
     stt_language) l=$(voice_stt_language); printf '%s\n' "${l:-auto}" ;;
     stt_fast)  voice_stt_fast ;;
+    whisper_model) l=$(voice_whisper_model_configured); printf '%s\n' "${l:-auto}" ;;
     *)         voice_config_get "$1" "$(config_field "$1" | jq -r '.default // empty')" ;;
   esac
 }
@@ -360,8 +366,14 @@ cmd_config() {
         printf '5dive voice: refusing to move hearing to openrouter — %s' "$(voice_key_fix_line)" >&2
         exit 1
       fi
+      # DIVE-5897: small peaks at ~0.8 GB while it hears; on a box without the
+      # memory it would starve the agents, so it is refused here, with why.
+      if [[ "$key" == whisper_model && "$value" == small ]] && ! voice_small_fits; then
+        die "refusing whisper_model small: this box has $(( $(voice_box_mem_kb) / 1024 )) MB of memory and small needs about $(( VOICE_SMALL_MIN_MEM_KB / 1024 )) MB. base stays." 1
+      fi
       config_write_key "$key" "$value"
       printf '%s: %s\n' "$key" "$value"
+      if [[ "$key" == whisper_model ]]; then cmd_apply_model; return; fi
       # DIVE-5869: fast mode needs a whisper-service that reads beam_size. One
       # started before it keeps its old code until it restarts; say so rather
       # than let the owner time a setting that is not on yet.
@@ -371,6 +383,19 @@ cmd_config() {
       ;;
     *) die "unknown: 5dive voice config $sub (want: config [--json] | config get <key> | config set <key> <value> | config init <key>=<value>...)" 64 ;;
   esac
+}
+
+# cmd_apply_model — load the chosen whisper model now: the installer's `model`
+# step rewrites whisper-service's unit, restarts it, and waits until /health
+# answers with the new model (DIVE-5897). Its exit status is this verb's. An
+# inherited WHISPER_MODEL would outrank the owner's choice there, so it is
+# dropped.
+cmd_apply_model() {
+  local installer
+  installer="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/5dive-setup-voice"
+  [[ -x "$installer" ]] \
+    || die "this voice plugin is incomplete: no $installer — reinstall it: sudo 5dive plugin upgrade voice"
+  env -u WHISPER_MODEL "$installer" model
 }
 
 # ---- setup: the host half, shipped by this plugin (DIVE-4495) ----------

@@ -60,7 +60,9 @@ MARKER_V5="<!-- 5dive-setup-voice: voice section v5 -->"
 # v6 (DIVE-5869): where hearing's speed and language are set, so an agent whose
 # owner finds hearing slow points at the setting instead of patching the plugin,
 # which the next update overwrites.
-MARKER="<!-- 5dive-setup-voice: voice section v6 -->"
+MARKER_V6="<!-- 5dive-setup-voice: voice section v6 -->"
+# v7 (DIVE-5897): which whisper model hears, and when to offer the other one.
+MARKER="<!-- 5dive-setup-voice: voice section v7 -->"
 # v4 is the first version with a CLOSING marker (DIVE-5189). Every section a
 # later release appends below this one (human-messaging, agent-sites) would be
 # eaten by the old "marker to end of file" strip, so a strip is now bounded.
@@ -69,7 +71,10 @@ MARKER_END="<!-- /5dive-setup-voice: voice section -->"
 # stripping it.
 V3_LAST_LINE='^- \*\*Reply order for speed\*\*'
 
-WHISPER_MODEL="${WHISPER_MODEL:-small}"
+# DIVE-5897: no constant default any more. An explicit WHISPER_MODEL for a run
+# of this installer still wins; unset, the model follows the box (see
+# whisper_model_plan).
+WHISPER_MODEL_ENV="${WHISPER_MODEL:-}"
 # DIVE-4439. The backend choice is host state, not plugin code, so it does NOT
 # live in the plugin's version-keyed cache dir — that path is keyed on version
 # and an upgrade would silently reset the box to `local`. See the wiki page
@@ -209,6 +214,12 @@ whisper_service_py() {
   cat "$(payload whisper-service.py)"
 }
 
+# engine_lib_text — the engine lib this installer ships, on stdout. Step 4
+# installs it; the model rule (DIVE-5897) is read from it before then too.
+engine_lib_text() {
+  cat "$(payload voice-backend.sh)"
+}
+
 # install_whisper_service — write it to $WHISPER_SERVICE_BIN. Succeeds only when
 # the installed bytes CHANGED, which is how a caller knows that a running
 # service is still on the old code (DIVE-5869).
@@ -219,14 +230,54 @@ install_whisper_service() {
   whisper_service_py | write_atomic "$WHISPER_SERVICE_BIN" 755
 }
 
-step_service() {
-  say "Step 3/6 — whisper-service (warm HTTP, port 8765, model=$WHISPER_MODEL)"
+# ---- which model whisper-service loads (DIVE-5897) ----------------------
+#
+# It used to be the constant `small`. On a 2-vCPU / 4 GB box (5dive's Start)
+# that hears a note in 9-12 s where base takes 3-4 s, so the model now follows
+# the box's own hardware (voice_whisper_model_for_box, in the engine lib, which
+# the verb reads too). The unit records WHY it carries the model it does, so a
+# later run can tell a model it chose from one a person chose:
+#   owner  `sudo 5dive voice config set whisper_model <m>`: the durable choice
+#   env    WHISPER_MODEL set for a run of this installer
+#   kept   a unit set by hand before this rule existed (any model but small,
+#          the only default there ever was)
+#   box    the hardware rule; re-applied on every run, so a box that is
+#          resized onto a bigger or smaller plan follows it the next night
+WHISPER_UNIT="${WHISPER_UNIT:-/etc/systemd/system/whisper-service.service}"
+WHISPER_HEALTH_URL="${WHISPER_HEALTH_URL:-http://127.0.0.1:8765/health}"
+WHISPER_WAIT_SECS="${WHISPER_WAIT_SECS:-360}"
 
-  local was_active=0 changed=0
-  systemctl is-active --quiet whisper-service 2>/dev/null && was_active=1
-  install_whisper_service && changed=1
+load_engine_lib() {
+  # shellcheck source=/dev/null
+  . <(engine_lib_text)
+}
 
-  cat > /etc/systemd/system/whisper-service.service <<EOF
+# Each answers nothing, and never fails, when there is no unit or no service.
+whisper_unit_model()  { sed -n '/^Environment=WHISPER_MODEL=/{s///;p;q;}' "$WHISPER_UNIT" 2>/dev/null || true; }
+whisper_unit_source() { sed -n '/^# whisper-model-source: /{s///;p;q;}' "$WHISPER_UNIT" 2>/dev/null || true; }
+whisper_health_model() {
+  { curl -fsS --max-time 2 "$WHISPER_HEALTH_URL" 2>/dev/null || true; } | sed -n 's/.*"model": *"\([^"]*\)".*/\1/p'
+}
+
+# whisper_model_plan — "<model> <source>": what the unit should load, and why.
+whisper_model_plan() {
+  load_engine_lib
+  local c m s
+  if [[ -n "$WHISPER_MODEL_ENV" ]]; then printf '%s env\n' "$WHISPER_MODEL_ENV"; return; fi
+  c=$(voice_whisper_model_configured)
+  if [[ -n "$c" && "$c" != auto ]]; then printf '%s owner\n' "$c"; return; fi
+  # `auto` written by the owner means follow the box, whatever the unit says.
+  if [[ -z "$c" ]]; then
+    m=$(whisper_unit_model); s=$(whisper_unit_source)
+    if [[ -n "$m" ]] && { [[ -n "$s" && "$s" != box ]] || [[ -z "$s" && "$m" != small ]]; }; then
+      printf '%s kept\n' "$m"; return
+    fi
+  fi
+  printf '%s box\n' "$(voice_whisper_model_for_box)"
+}
+
+write_whisper_unit() {  # write_whisper_unit <model> <source>
+  write_atomic "$WHISPER_UNIT" 644 <<EOF
 [Unit]
 Description=Warm faster-whisper transcription service (port 8765)
 After=network.target
@@ -234,7 +285,8 @@ After=network.target
 [Service]
 Type=simple
 User=claude
-Environment=WHISPER_MODEL=${WHISPER_MODEL}
+# whisper-model-source: $2
+Environment=WHISPER_MODEL=$1
 Environment=WHISPER_COMPUTE_TYPE=int8
 Environment=WHISPER_DEVICE=cpu
 ExecStart=${VENV}/bin/python /usr/local/bin/whisper-service
@@ -244,21 +296,50 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+# whisper_model_apply — bring an installed unit to the plan. Succeeds only when
+# the MODEL changed: that is when a running service must restart to load it. A
+# unit that only gains its source line is rewritten without a restart.
+whisper_model_apply() {
+  local want src have
+  read -r want src < <(whisper_model_plan)
+  [[ -n "$want" ]] || die "could not work out which whisper model this box should load"
+  have=$(whisper_unit_model)
+  [[ "$have" == "$want" && "$(whisper_unit_source)" == "$src" ]] && return 1
+  write_whisper_unit "$want" "$src"
+  systemctl daemon-reload
+  [[ "$have" != "$want" ]] || return 1
+  ok "whisper model: $want (was ${have:-unset}; $src)"
+}
+
+step_service() {
+  local want src
+  read -r want src < <(whisper_model_plan)
+  [[ -n "$want" ]] || die "could not work out which whisper model this box should load"
+  say "Step 3/6 — whisper-service (warm HTTP, port 8765, model=$want)"
+
+  local was_active=0 changed=0
+  systemctl is-active --quiet whisper-service 2>/dev/null && was_active=1
+  install_whisper_service && changed=1
+  [[ "$(whisper_unit_model)" == "$want" ]] || changed=1
+  write_whisper_unit "$want" "$src"
 
   systemctl daemon-reload
   systemctl enable --now whisper-service
-  # `enable --now` leaves a running service alone, so new code needs a restart.
-  # Only then: a first start may still be downloading the model (DIVE-5869).
+  # `enable --now` leaves a running service alone, so new code or a new model
+  # needs a restart. Only then: a first start may still be downloading the
+  # model (DIVE-5869).
   if (( was_active && changed )); then
     systemctl restart whisper-service || warn "whisper-service did not restart — check: journalctl -u whisper-service"
-    ok "whisper-service restarted onto the new code"
+    ok "whisper-service restarted onto the new code or model"
   fi
 
   # First start downloads the model (~100MB–1.5GB depending on size) and loads
   # it into memory. Poll /health until it's ready so first transcribe is fast.
-  printf 'Warming up (downloading + loading "%s" model)...\n' "$WHISPER_MODEL"
+  printf 'Warming up (downloading + loading "%s" model)...\n' "$want"
   for _ in $(seq 1 180); do
-    if curl -fsS --max-time 2 http://127.0.0.1:8765/health >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 "$WHISPER_HEALTH_URL" >/dev/null 2>&1; then
       ok "whisper-service ready at http://127.0.0.1:8765"
       return
     fi
@@ -275,7 +356,7 @@ step_wrapper() {
   # per wrapper is how hearing and speaking end up disagreeing about where the
   # audio goes; the whole point of DIVE-4439's switch is that they cannot.
   mkdir -p /usr/local/lib/5dive
-  write_atomic /usr/local/lib/5dive/voice-backend.sh 644 < "$(payload voice-backend.sh)"
+  engine_lib_text | write_atomic /usr/local/lib/5dive/voice-backend.sh 644
   ok "voice-backend lib installed at $VOICE_LIB"
 
   write_atomic /usr/local/bin/5dive-transcribe 755 < "$(payload 5dive-transcribe.sh)"
@@ -289,10 +370,51 @@ step_wrapper() {
   # and a request field it does not read (beam_size) was silently ignored.
   # Only a box that already has the service; only when the code changed, so
   # an unchanged nightly costs one cmp and no restart.
+  local restart=0
   if [[ -f "$WHISPER_SERVICE_BIN" ]] && install_whisper_service; then
-    systemctl try-restart whisper-service 2>/dev/null || true
-    ok "whisper-service updated (restarted if it was running)"
+    restart=1
+    ok "whisper-service code updated"
   fi
+  # DIVE-5897: the same path re-applies the model rule, so a Start box leaves
+  # small for base on its next nightly, and a box resized since its setup
+  # follows its new size. A model the owner chose is left as it is.
+  if [[ -f "$WHISPER_UNIT" ]] && whisper_model_apply; then restart=1; fi
+  if (( restart )); then
+    systemctl try-restart whisper-service 2>/dev/null || true
+    ok "whisper-service restarted if it was running"
+  fi
+}
+
+# step_model — apply the owner's choice NOW (`5dive voice config set
+# whisper_model` runs this): rewrite the unit, restart a running service, and
+# wait until /health answers with the new model. Fails when it does not.
+step_model() {
+  say "Hearing model"
+  if [[ ! -f "$WHISPER_UNIT" ]]; then
+    ok "whisper-service is not installed on this box; it loads the chosen model when it is"
+    return 0
+  fi
+  local want src
+  read -r want src < <(whisper_model_plan)
+  [[ -n "$want" ]] || die "could not work out which whisper model this box should load"
+  whisper_model_apply || true
+  if ! systemctl is-active --quiet whisper-service 2>/dev/null; then
+    ok "whisper-service is not running; it loads $want when it starts"
+    return 0
+  fi
+  if [[ "$(whisper_health_model)" != "$want" ]]; then
+    systemctl restart whisper-service || die "whisper-service did not restart — check: journalctl -u whisper-service"
+  fi
+  printf 'Loading "%s" (the first switch to a model downloads it)...\n' "$want"
+  local waited=0
+  while (( waited < WHISPER_WAIT_SECS )); do
+    if [[ "$(whisper_health_model)" == "$want" ]]; then
+      ok "whisper-service hears on $want"
+      return 0
+    fi
+    sleep 2; waited=$((waited + 2))
+  done
+  die "whisper-service did not come back on $want within ${WHISPER_WAIT_SECS}s — check: journalctl -u whisper-service"
 }
 
 step_state() {
@@ -353,14 +475,14 @@ step_claudemd() {
   fi
 
   if grep -qF "$MARKER" "$CLAUDE_MD"; then
-    ok "Voice section already present (v6) — not re-appending."
+    ok "Voice section already present (v7) — not re-appending."
     return
   fi
 
-  # v4 and v5 have a closing marker, so each is replaced by its own lines only:
+  # v4 to v6 have a closing marker, so each is replaced by its own lines only:
   # whatever a later release appended below it stays (DIVE-5397).
   local closed
-  for closed in "$MARKER_V5" "$MARKER_V4"; do
+  for closed in "$MARKER_V6" "$MARKER_V5" "$MARKER_V4"; do
     if grep -qF "$closed" "$CLAUDE_MD" \
        && sed -n "\|${closed}|,\$p" "$CLAUDE_MD" | grep -qF "$MARKER_END"; then
       cp -a "$CLAUDE_MD" "${CLAUDE_MD}.bak"
@@ -374,7 +496,8 @@ step_claudemd() {
   # the v2 block. If the user has manually added content after the v1 marker,
   # they'll need to restore it from the .bak we leave behind.
   local old_marker=""
-  if   grep -qF "$MARKER_V5"  "$CLAUDE_MD"; then old_marker="$MARKER_V5"
+  if   grep -qF "$MARKER_V6"  "$CLAUDE_MD"; then old_marker="$MARKER_V6"
+  elif grep -qF "$MARKER_V5"  "$CLAUDE_MD"; then old_marker="$MARKER_V5"
   elif grep -qF "$MARKER_V4"  "$CLAUDE_MD"; then old_marker="$MARKER_V4"
   elif grep -qF "$MARKER_V3"  "$CLAUDE_MD"; then old_marker="$MARKER_V3"
   elif grep -qF "$MARKER_V2"  "$CLAUDE_MD"; then old_marker="$MARKER_V2"
@@ -399,7 +522,8 @@ $MARKER
 - Voice replies: \`5dive-speak "<text>"\` prints the path to a Telegram-ready OGG/Opus file. Use it instead of calling edge-tts directly — it is the only thing that honours the backend switch.
 - Which backend: \`5dive voice\` prints it; \`sudo 5dive voice backend local|openrouter\` changes it, and \`stt_backend\` in \`5dive voice config\` moves hearing alone. On \`local\`, hearing runs on this box (warm whisper-service at http://127.0.0.1:8765, unit \`whisper-service.service\`) but SPEAKING still sends the reply text to Microsoft, because edge-tts is an online voice service. On \`openrouter\`, speaking uses your character's own voice when your persona has one.
 - When receiving a Telegram voice message, always transcribe it before responding.
-- **If the owner finds hearing slow**, and their notes are always in one language, tell them it can be pinned and sped up: \`sudo 5dive voice config set stt_language ru\` (their language code) and \`sudo 5dive voice config set stt_fast 1\`. Change it only when they ask. Never edit the voice plugin's own files: the next update replaces them.
+- **Which model hears on this box**: \`5dive voice config get whisper_model\`. \`auto\` follows the box's size: base on a box with 2 CPUs or under 6 GB of memory, small on a bigger one. small is more accurate and hears about 2-3 times slower; base is the fast one.
+- **If the owner says a note was misheard**, or a transcript comes back garbled or cut off (a sentence mixing two languages is the usual case), offer the more accurate model and warn that hearing will be about 2-3 times slower: \`sudo 5dive voice config set whisper_model small\`. **If they find hearing slow**, offer the faster one (\`whisper_model base\`, a little less accurate), and if their notes are always in one language, pinning it helps too: \`sudo 5dive voice config set stt_language ru\` (their language code) and \`sudo 5dive voice config set stt_fast 1\`. Switch only after they say yes; \`whisper_model auto\` goes back to the box's default. Never edit the voice plugin's own files or the whisper unit: the next update replaces them.
 - **Answer in the way the user wrote**: a typed message gets a text reply only — no voice note. Send a voice reply only when the user's own message was a voice note, or when they ask you for one. A voice reply spends credit, so never add one nobody asked for.
 - **Reply order for speed** (voice replies only): send the text reply first (so the user sees it immediately), then generate and send the voice attachment as a follow-up message. Never bundle them together — text first, voice second.
 - **When a voice reply fails** (for example OpenRouter answers HTTP 402 because this box's voice credit is used up), your text reply is the answer: say in one line that the voice reply did not work this time. Do not retry it in a loop, do not change voice settings, and never ask the user for a key.
@@ -419,6 +543,7 @@ Usage: sudo 5dive voice setup [all|apt|pip|service|wrapper|state|claudemd]
   pip       Install faster-whisper + edge-tts into /home/claude/.venv
   service   Install whisper-service + systemd unit (warm model on port 8765)
   wrapper   Install the voice-backend lib + 5dive-transcribe + 5dive-speak
+  model     Load the hearing model the owner chose (or the box's default) now
   state     Create the backend state dir and seed it with backend=local
   claudemd  Append Voice section to /home/claude/projects/CLAUDE.md
 
@@ -427,7 +552,9 @@ The backend stays `local` unless you change it:  sudo 5dive voice backend openro
 /etc/5dive/connectors/openrouter.env.
 
 Env:
-  WHISPER_MODEL=small   (tiny|base|small|medium|large-v3)
+  WHISPER_MODEL=base    (tiny|base|small|medium|large-v3) — unset, base on a box
+                        with 2 CPUs or under 6 GB of memory, small otherwise.
+                        The durable switch: sudo 5dive voice config set whisper_model
 USAGE
 }
 
@@ -448,6 +575,7 @@ main() {
     pip)      step_pip ;;
     service)  step_service ;;
     wrapper)  step_wrapper ;;
+    model)    step_model ;;
     state)    step_state ;;
     claudemd) step_claudemd ;;
     all)      step_apt; step_pip; step_service; step_wrapper; step_state; step_claudemd ;;

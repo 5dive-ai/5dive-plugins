@@ -1,6 +1,6 @@
 {
   "name": "voice",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box, or on OpenRouter if you choose.",
   "author": {
     "name": "5dive",
@@ -76,6 +76,27 @@
           ],
           "default": "local",
           "help": "Hearing alone. On this server, your voice notes never leave it. Unset, hearing follows the setting above."
+        },
+        {
+          "key": "whisper_model",
+          "label": "Hearing model (this server)",
+          "type": "enum",
+          "options": [
+            {
+              "value": "auto",
+              "label": "Matched to this server"
+            },
+            {
+              "value": "base",
+              "label": "Fast"
+            },
+            {
+              "value": "small",
+              "label": "Most accurate"
+            }
+          ],
+          "default": "auto",
+          "help": "Used only when hearing runs on this server. Fast hears a note about 2-3 times quicker. Most accurate hears mixed-language and unclear speech better, and needs about 3 GB of memory. Matched to this server picks Fast on servers with 2 CPUs or under 6 GB of memory, and Most accurate on bigger ones."
         },
         {
           "key": "stt_language",
