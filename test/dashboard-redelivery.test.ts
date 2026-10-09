@@ -7,28 +7,44 @@ import { describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { nextPendingAttempt, pendingDeliveryMeta } from '../plugins/dashboard/pending-redelivery.ts'
+import {
+  nextPendingAttempt,
+  observePendingOffer,
+  pendingDeliveryMeta,
+  type PendingRetryState,
+} from '../plugins/dashboard/pending-redelivery.ts'
 
 const SERVER = join(import.meta.dir, '..', 'plugins', 'dashboard', 'server.ts')
 const BOOT_MS = 5_000
 
 type Delivery = { content: string; meta: Record<string, unknown> }
 
-async function start() {
+// ack 'fail': every ack answers acked=0. ack 'collect': the control plane's
+// DIVE-3809 shape — an acked row is hidden until `reoffer()` (its collect TTL
+// expiring) and then offered again under the same id.
+async function start(opts: { ack?: 'fail' | 'collect' } = {}) {
   const dir = `${tmpdir()}/dashboard-redelivery-${process.pid}-${Date.now()}`
   mkdirSync(dir, { recursive: true })
   let queue = [{ id: 41, text: 'one original ping', chat_id: '1', ts: '2026-09-09T02:06:05.111Z' }]
+  const hidden = new Set<number>()
   const deliveries: Delivery[] = []
 
   const api = Bun.serve({
     port: 0,
     async fetch(req) {
       const url = new URL(req.url)
-      if (url.pathname === '/server/messages/pending') return Response.json({ pending: queue })
-      // A 200 with acked=0 is still a failed acknowledgement. This was the
-      // deceptive live shape: transport/auth looked healthy while the row
-      // remained pending.
-      if (url.pathname === '/server/messages/pending/ack') return Response.json({ ok: true, acked: 0 })
+      if (url.pathname === '/server/messages/pending') {
+        return Response.json({ pending: queue.filter(m => !hidden.has(m.id)) })
+      }
+      if (url.pathname === '/server/messages/pending/ack') {
+        // A 200 with acked=0 is still a failed acknowledgement. This was the
+        // deceptive live shape: transport/auth looked healthy while the row
+        // remained pending.
+        if (opts.ack !== 'collect') return Response.json({ ok: true, acked: 0 })
+        const { ids } = (await req.json()) as { ids: number[] }
+        for (const id of ids) hidden.add(id)
+        return Response.json({ ok: true, acked: ids.length })
+      }
       return new Response('not found', { status: 404 })
     },
   })
@@ -99,6 +115,8 @@ async function start() {
     dir,
     deliveries,
     enqueue: (row: { id: number; text: string; chat_id: string; ts: string }) => { queue = [...queue, row] },
+    reoffer: () => hidden.clear(),
+    hiddenIds: () => [...hidden],
     nudge,
     waitFor,
     stop: () => {
@@ -170,6 +188,68 @@ describe('dashboard pending redelivery (DIVE-4125)', () => {
       h.stop()
     }
   }, 20_000)
+})
+
+// DIVE-5924 — a SUCCESSFUL ack must not end the retry record. The control
+// plane re-offers a collected row after its TTL; before this fix the ack
+// deleted the record, so every re-offer arrived as attempt 1, redelivery
+// false, and the 3-attempt park never fired (live: id 304 pushed 5 times).
+describe('dashboard retry record survives an ack (DIVE-5924)', () => {
+  test('an acked row offered again is attempt 2 with redelivery, and parks at 3', async () => {
+    const h = await start({ ack: 'collect' })
+    const pushes41 = () => h.deliveries.filter(d => d.meta.message_id === '41')
+    try {
+      expect(await h.waitFor(() => pushes41().length === 1 && h.hiddenIds().includes(41), BOOT_MS + 5_000)).toBe(true)
+
+      // Inside the collect TTL the row is absent from /pending. That absence
+      // must not forget the attempt.
+      await h.nudge()
+      expect(pushes41()).toHaveLength(1)
+
+      for (const n of [2, 3]) {
+        h.reoffer()
+        await h.nudge()
+        expect(await h.waitFor(() => pushes41().length === n && h.hiddenIds().includes(41), 2_000)).toBe(true)
+      }
+      expect(pushes41().map(d => d.meta.delivery_attempt)).toEqual(['1', '2', '3'])
+      expect(pushes41().map(d => d.meta.redelivery)).toEqual(['false', 'true', 'true'])
+
+      // The fourth offer parks: no push, no ack, one parked line.
+      h.reoffer()
+      await h.nudge()
+      await h.nudge()
+      expect(pushes41()).toHaveLength(3)
+      expect(h.hiddenIds()).not.toContain(41)
+
+      const log = readFileSync(join(h.dir, 'lifecycle.log'), 'utf8')
+      expect(log).toContain('pending message id=41 pushed attempt=2 redelivery=true')
+      expect(log).toContain('pending message id=41 parked after 3 unacknowledged attempts')
+      const state = JSON.parse(readFileSync(join(h.dir, 'pending-redelivery.json'), 'utf8'))
+      expect(state['41']).toMatchObject({ attempts: 3, parkedLogged: true })
+    } finally {
+      h.stop()
+    }
+  }, 20_000)
+
+  test('a record ends only after the control plane stops offering its id for the retention window', () => {
+    const state: PendingRetryState = {
+      '7': { attempts: 1, lastAttemptAt: 1_000, lastSeenAt: 1_000 },
+      '8': { attempts: 3, lastAttemptAt: 1_000, lastSeenAt: 1_000, parkedLogged: true },
+    }
+    // Absent but within retention (the TTL window after an ack): kept.
+    expect(observePendingOffer(state, [], 1_000 + 500, 1_000)).toBe(false)
+    expect(Object.keys(state).sort()).toEqual(['7', '8'])
+
+    // Still offered (a parked row the control plane keeps serving): stamped,
+    // never aged out, so a parked row cannot restart at attempt 1.
+    expect(observePendingOffer(state, [8], 5_000, 1_000)).toBe(true)
+    expect(state['8']).toMatchObject({ attempts: 3, lastSeenAt: 5_000, parkedLogged: true })
+    expect(state['7']).toBeUndefined()
+
+    // Gone for longer than retention: dropped.
+    expect(observePendingOffer(state, [], 6_001, 1_000)).toBe(true)
+    expect(state).toEqual({})
+  })
 })
 
 // DIVE-4841 — a pending push's channel meta must be all strings, or Claude
