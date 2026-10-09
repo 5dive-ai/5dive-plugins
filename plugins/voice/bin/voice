@@ -65,11 +65,10 @@ BACKENDS
 
 HEARING ON THIS BOX (local only; sudo 5dive voice config set <key> <value>)
 
-  whisper_model default auto — base on a box with 2 CPUs or under 6 GB of
-                memory, small on a bigger one. small is more accurate (mixed-
-                language notes above all) and hears about 2-3x slower; base is
-                the fast one. Setting it restarts hearing on the new model and
-                waits until it answers. small needs ~3 GB of memory.
+  whisper_model default auto, which is base: the fast one. small is more
+                accurate (mixed-language notes above all) and hears about 2-3x
+                slower. Setting it restarts hearing on the new model and waits
+                until it answers. small needs ~3 GB of memory.
   stt_language  default auto — whisper detects the language of every note.
                 A code such as ru or en pins it: detection is skipped, and a
                 short note is never heard as the wrong language. Back with auto.

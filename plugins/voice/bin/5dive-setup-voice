@@ -71,9 +71,8 @@ MARKER_END="<!-- /5dive-setup-voice: voice section -->"
 # stripping it.
 V3_LAST_LINE='^- \*\*Reply order for speed\*\*'
 
-# DIVE-5897: no constant default any more. An explicit WHISPER_MODEL for a run
-# of this installer still wins; unset, the model follows the box (see
-# whisper_model_plan).
+# DIVE-5897: an explicit WHISPER_MODEL for a run of this installer wins; unset,
+# whisper_model_plan decides (base unless a person chose otherwise).
 WHISPER_MODEL_ENV="${WHISPER_MODEL:-}"
 # DIVE-4439. The backend choice is host state, not plugin code, so it does NOT
 # live in the plugin's version-keyed cache dir — that path is keyed on version
@@ -232,17 +231,17 @@ install_whisper_service() {
 
 # ---- which model whisper-service loads (DIVE-5897) ----------------------
 #
-# It used to be the constant `small`. On a 2-vCPU / 4 GB box (5dive's Start)
-# that hears a note in 9-12 s where base takes 3-4 s, so the model now follows
-# the box's own hardware (voice_whisper_model_for_box, in the engine lib, which
-# the verb reads too). The unit records WHY it carries the model it does, so a
-# later run can tell a model it chose from one a person chose:
-#   owner  `sudo 5dive voice config set whisper_model <m>`: the durable choice
-#   env    WHISPER_MODEL set for a run of this installer
-#   kept   a unit set by hand before this rule existed (any model but small,
-#          the only default there ever was)
-#   box    the hardware rule; re-applied on every run, so a box that is
-#          resized onto a bigger or smaller plan follows it the next night
+# It used to be `small`, which hears a note in 9-12 s on a Start box and still
+# 6-8 s on a Pro Plus one; base takes 3-4 s. So the default is now base on every
+# box (VOICE_DEFAULT_WHISPER_MODEL, in the engine lib), and small is the owner's
+# opt-in. The unit records WHY it carries the model it does, so a later run can
+# tell a model it chose from one a person chose:
+#   owner    `sudo 5dive voice config set whisper_model <m>`: the durable choice
+#   env      WHISPER_MODEL set for a run of this installer
+#   kept     a unit set by hand before this rule existed (any model but small,
+#            the only default there ever was)
+#   default  5dive's default; re-applied on every run, so every box still on
+#            the old default small moves to base at its next nightly
 WHISPER_UNIT="${WHISPER_UNIT:-/etc/systemd/system/whisper-service.service}"
 WHISPER_HEALTH_URL="${WHISPER_HEALTH_URL:-http://127.0.0.1:8765/health}"
 WHISPER_WAIT_SECS="${WHISPER_WAIT_SECS:-360}"
@@ -266,14 +265,14 @@ whisper_model_plan() {
   if [[ -n "$WHISPER_MODEL_ENV" ]]; then printf '%s env\n' "$WHISPER_MODEL_ENV"; return; fi
   c=$(voice_whisper_model_configured)
   if [[ -n "$c" && "$c" != auto ]]; then printf '%s owner\n' "$c"; return; fi
-  # `auto` written by the owner means follow the box, whatever the unit says.
+  # `auto` written by the owner means 5dive's default, whatever the unit says.
   if [[ -z "$c" ]]; then
     m=$(whisper_unit_model); s=$(whisper_unit_source)
-    if [[ -n "$m" ]] && { [[ -n "$s" && "$s" != box ]] || [[ -z "$s" && "$m" != small ]]; }; then
+    if [[ -n "$m" ]] && { [[ -n "$s" && "$s" != default ]] || [[ -z "$s" && "$m" != small ]]; }; then
       printf '%s kept\n' "$m"; return
     fi
   fi
-  printf '%s box\n' "$(voice_whisper_model_for_box)"
+  printf '%s default\n' "$VOICE_DEFAULT_WHISPER_MODEL"
 }
 
 write_whisper_unit() {  # write_whisper_unit <model> <source>
@@ -375,9 +374,9 @@ step_wrapper() {
     restart=1
     ok "whisper-service code updated"
   fi
-  # DIVE-5897: the same path re-applies the model rule, so a Start box leaves
-  # small for base on its next nightly, and a box resized since its setup
-  # follows its new size. A model the owner chose is left as it is.
+  # DIVE-5897: the same path re-applies the default, so a box still on the old
+  # default small leaves it for base on its next nightly. A model a person
+  # chose is left as it is.
   if [[ -f "$WHISPER_UNIT" ]] && whisper_model_apply; then restart=1; fi
   if (( restart )); then
     systemctl try-restart whisper-service 2>/dev/null || true
@@ -522,7 +521,7 @@ $MARKER
 - Voice replies: \`5dive-speak "<text>"\` prints the path to a Telegram-ready OGG/Opus file. Use it instead of calling edge-tts directly — it is the only thing that honours the backend switch.
 - Which backend: \`5dive voice\` prints it; \`sudo 5dive voice backend local|openrouter\` changes it, and \`stt_backend\` in \`5dive voice config\` moves hearing alone. On \`local\`, hearing runs on this box (warm whisper-service at http://127.0.0.1:8765, unit \`whisper-service.service\`) but SPEAKING still sends the reply text to Microsoft, because edge-tts is an online voice service. On \`openrouter\`, speaking uses your character's own voice when your persona has one.
 - When receiving a Telegram voice message, always transcribe it before responding.
-- **Which model hears on this box**: \`5dive voice config get whisper_model\`. \`auto\` follows the box's size: base on a box with 2 CPUs or under 6 GB of memory, small on a bigger one. small is more accurate and hears about 2-3 times slower; base is the fast one.
+- **Which model hears on this box**: \`5dive voice config get whisper_model\`. \`auto\` is the default, base: the fast one. small is more accurate (mixed-language notes above all) and hears about 2-3 times slower.
 - **If the owner says a note was misheard**, or a transcript comes back garbled or cut off (a sentence mixing two languages is the usual case), offer the more accurate model and warn that hearing will be about 2-3 times slower: \`sudo 5dive voice config set whisper_model small\`. **If they find hearing slow**, offer the faster one (\`whisper_model base\`, a little less accurate), and if their notes are always in one language, pinning it helps too: \`sudo 5dive voice config set stt_language ru\` (their language code) and \`sudo 5dive voice config set stt_fast 1\`. Switch only after they say yes; \`whisper_model auto\` goes back to the box's default. Never edit the voice plugin's own files or the whisper unit: the next update replaces them.
 - **Answer in the way the user wrote**: a typed message gets a text reply only — no voice note. Send a voice reply only when the user's own message was a voice note, or when they ask you for one. A voice reply spends credit, so never add one nobody asked for.
 - **Reply order for speed** (voice replies only): send the text reply first (so the user sees it immediately), then generate and send the voice attachment as a follow-up message. Never bundle them together — text first, voice second.
@@ -552,9 +551,8 @@ The backend stays `local` unless you change it:  sudo 5dive voice backend openro
 /etc/5dive/connectors/openrouter.env.
 
 Env:
-  WHISPER_MODEL=base    (tiny|base|small|medium|large-v3) — unset, base on a box
-                        with 2 CPUs or under 6 GB of memory, small otherwise.
-                        The durable switch: sudo 5dive voice config set whisper_model
+  WHISPER_MODEL=base    (tiny|base|small|medium|large-v3) — unset, base, unless
+                        the owner chose: sudo 5dive voice config set whisper_model
 USAGE
 }
 

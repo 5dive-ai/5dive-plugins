@@ -1,8 +1,8 @@
 ## Unreleased
 
-### Changed — voice 1.9.0: the hearing model follows the box, and the owner can switch it (DIVE-5897)
+### Changed — voice 1.9.0: hearing loads whisper base by default, and the owner can switch it (DIVE-5897)
 
-Mirror of 5dive-voice 1.9.0. Hearing on the box loaded whisper `small` everywhere, which takes 9-12 s for a note on a 2-vCPU / 4 GB box where `base` takes 3-4 s. Unset, the model is now `base` on a box with 2 CPUs or under 6 GB of memory and `small` on a bigger one, read from the box itself. Setup, the nightly and a resize re-apply it unless a person chose the model. `sudo 5dive voice config set whisper_model auto|base|small` (also a field in the dashboard's voice settings) switches it now and waits until the service answers on the new model; `small` is refused under ~3 GB of memory. The agent's Voice section tells it to offer the more accurate model when a note was misheard, warning that it is slower, and the faster one when hearing is slow.
+Mirror of 5dive-voice 1.9.0. Hearing on the box loaded whisper `small`, which takes 9-12 s for a note on a 2-vCPU / 4 GB box and still 6-8 s on a much bigger one, where `base` takes 3-4 s. `base` is now the default on every box; setup and the nightly move a box still on the old default to it, unless a person chose the model. `sudo 5dive voice config set whisper_model auto|base|small` (also a field in the dashboard's voice settings) switches it now and waits until the service answers on the new model; `small` is refused under ~3 GB of memory. The agent's Voice section tells it to offer the more accurate model when a note was misheard, warning that it is slower, and the faster one when hearing is slow.
 
 ### Fixed — dashboard 0.4.5 · telegram-codex 0.5.34: dashboard chat works again on a standard seat (DIVE-5894)
 

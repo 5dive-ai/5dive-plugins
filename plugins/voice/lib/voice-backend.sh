@@ -96,36 +96,21 @@ voice_stt_fast() {
   [[ "$(voice_config_get stt_fast)" == 1 ]] && printf '1\n' || printf '0\n'
 }
 
-# DIVE-5897: WHICH whisper model hearing on this box loads. small hears mixed
-# and accented speech better; base hears a note 2-3x faster. On a 2-vCPU / 4 GB
-# box (5dive's Start) small took 9-12 s on the owner's real Russian notes and
-# base 3-4 s, so the default follows the box's own hardware, never a plan name:
-# self-hosted and partner boxes get it right without knowing 5dive's plans.
-# The owner's `whisper_model` key overrides it in either direction.
+# DIVE-5897: WHICH whisper model hearing on this box loads. base is the
+# default on every box, whatever its size: small took 9-12 s for a note on a
+# Start box (2 vCPU / 4 GB), where base took 3-4 s, and still 6-8 s on a Pro
+# Plus box (lodar, 2026-10-09). small hears mixed-language and unclear speech
+# better, so it is the owner's opt-in (`whisper_model`), and the agent offers
+# it when a note was misheard.
+VOICE_DEFAULT_WHISPER_MODEL="${VOICE_DEFAULT_WHISPER_MODEL:-base}"
 VOICE_MEMINFO="${VOICE_MEMINFO:-/proc/meminfo}"
-# Under this much RAM the default is base (a 4 GB box reports ~3.8M kB, 8 GB ~7.6M).
-VOICE_SMALL_DEFAULT_MIN_MEM_KB="${VOICE_SMALL_DEFAULT_MIN_MEM_KB:-6000000}"
 # Under this much RAM small is refused outright: it peaks at ~0.8 GB per note.
 VOICE_SMALL_MIN_MEM_KB="${VOICE_SMALL_MIN_MEM_KB:-3000000}"
 
 voice_box_mem_kb() { awk '/^MemTotal:/ { print $2; exit }' "$VOICE_MEMINFO" 2>/dev/null; }
-voice_box_cpus() { printf '%s\n' "${VOICE_NPROC:-$(nproc 2>/dev/null)}"; }
-
-# voice_whisper_model_for_box — base on 2 vCPU or fewer, or under 6 GB of RAM;
-# small otherwise. A box it cannot read gets base, the one that cannot be slow.
-voice_whisper_model_for_box() {
-  local cpus mem
-  cpus=$(voice_box_cpus); mem=$(voice_box_mem_kb)
-  if [[ "$cpus" =~ ^[0-9]+$ && "$mem" =~ ^[0-9]+$ ]] \
-     && (( cpus > 2 && mem >= VOICE_SMALL_DEFAULT_MIN_MEM_KB )); then
-    printf 'small\n'
-  else
-    printf 'base\n'
-  fi
-}
 
 # voice_whisper_model_configured — the owner's choice: a model name, `auto`
-# (follow the box), or nothing when the key is unset or not a whisper model.
+# (5dive's default), or nothing when the key is unset or not a whisper model.
 voice_whisper_model_configured() {
   local m; m=$(voice_config_get whisper_model)
   [[ "$m" =~ ^(auto|(tiny|base|small|medium)(\.en)?|large-v[123]|large-v3-turbo)$ ]] && printf '%s\n' "$m"

@@ -84,7 +84,7 @@
           "options": [
             {
               "value": "auto",
-              "label": "Matched to this server"
+              "label": "Default (fast)"
             },
             {
               "value": "base",
@@ -96,7 +96,7 @@
             }
           ],
           "default": "auto",
-          "help": "Used only when hearing runs on this server. Fast hears a note about 2-3 times quicker. Most accurate hears mixed-language and unclear speech better, and needs about 3 GB of memory. Matched to this server picks Fast on servers with 2 CPUs or under 6 GB of memory, and Most accurate on bigger ones."
+          "help": "Used only when hearing runs on this server. Fast hears a note about 2-3 times quicker and is the default. Most accurate hears mixed-language and unclear speech better, and needs about 3 GB of memory."
         },
         {
           "key": "stt_language",
