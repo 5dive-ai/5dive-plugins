@@ -142,6 +142,11 @@ export type DispatcherState = {
   handoff?: string
   /** A compaction was requested and its turn has not started yet. */
   compacting?: { message: DispatchMessage; at: string; before?: number }
+  /**
+   * Why the dispatcher (not the person) rotated the thread, owed to the person
+   * as one message on the next chat route that has one (DIVE-5918).
+   */
+  notice?: string
 }
 
 /** A model choice. `effort` is a Codex reasoning effort (`low`, `high`, …). */
@@ -159,6 +164,12 @@ export type ThreadModel = ModelSelection & {
  * the pre-DIVE-4924 behaviour, never a guess.
  */
 export type ConfiguredModel = () => Promise<ModelSelection | null>
+
+/**
+ * The on-disk size, in bytes, of a thread's rollout; null when it cannot be
+ * found. Injected so the core never guesses Codex's file layout (DIVE-5918).
+ */
+export type RolloutSize = (threadId: string) => number | null
 
 export type RecoveryContext = {
   /** `thread-lost` is the stronger fact: no earlier conversation is in context. */
@@ -278,6 +289,16 @@ const MAX_RECEIPTS = 10
 const MAX_RECENT = 3
 /** A compaction whose turn never started stops holding the queue after this. */
 const COMPACT_START_TIMEOUT_MS = 120_000
+
+/**
+ * `thread/resume` loads the whole rollout: on 2026-10-09 a 1.06 GB one grew the
+ * dispatcher to 3.1 GB and the seat's memcg OOM-killed it on every boot, before
+ * it could read the inbox `new-session` that would have fixed it (DIVE-5918).
+ * Over this, boot does not resume: it rotates to a fresh thread instead.
+ */
+export const ROLLOUT_RESUME_CAP_BYTES = 200 * 1024 * 1024
+/** At a turn boundary a rollout over this rotates first, so it never grows to the boot cap. */
+export const ROLLOUT_ROTATE_BYTES = 100 * 1024 * 1024
 const ATTACHMENT_LINE = /^\[\[5dive-attachment:(\/[^\]\r\n]+)\]\]$/
 
 export function parseOutboundMessage(raw: string): { text: string; files: string[] } {
@@ -314,10 +335,16 @@ export function recoveryLine(recovery: RecoveryContext): string {
  * marked as background so the model does not redo it. Snippets, not a
  * transcript: a handoff that re-sends the old context defeats the reset.
  */
-export function handoffLine(previousThreadId: string, recent: string[]): string {
+export function handoffLine(previousThreadId: string, recent: string[], cause = 'The owner started a fresh session'): string {
   const asks = recent.length ? ` Their most recent requests, oldest first: ${recent.map(r => `"${r}"`).join('; ')}.` : ''
-  return `[5dive new session] The owner started a fresh session; the previous thread (${previousThreadId}) is saved.${asks} `
+  return `[5dive new session] ${cause}; the previous thread (${previousThreadId}) is saved.${asks} `
     + 'Treat that as background, not as work to redo; ask if you need more of it.'
+}
+
+/** `1.1 GB`, `240 MB`: a rollout's size for the chat. */
+export function fmtBytes(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`
+  return `${Math.round(n / 1024 ** 2)} MB`
 }
 
 /** `146k`, `1.2k`, `850` — one width for the chat. */
@@ -532,6 +559,7 @@ export class ChannelDispatcher {
     private readonly sink: DispatchSink,
     private readonly cwd: string,
     private readonly readConfigured?: ConfiguredModel,
+    private readonly rolloutSize?: RolloutSize,
   ) {
     const loaded = migrateState<DispatcherState>(store.load())
     this.state = loaded.state
@@ -578,7 +606,11 @@ export class ChannelDispatcher {
       this.state.compacting = undefined
       let threadLost = ''
       this.configured = await this.loadConfigured()
-      if (this.state.threadId) {
+      // Too large to resume is not tried: the attempt is what kills the process.
+      const oversized = this.state.threadId ? this.rolloutBytes(this.state.threadId) : null
+      if (this.state.threadId && oversized !== null && oversized > ROLLOUT_RESUME_CAP_BYTES) {
+        this.retireThread(oversized)
+      } else if (this.state.threadId) {
         try {
           // A resumed thread keeps the model its rollout was saved with, NOT the
           // one config.toml names now (DIVE-4924: the seat said Astra, the
@@ -617,6 +649,11 @@ export class ChannelDispatcher {
       }
       this.persist()
 
+      // The cut-off turn's chat is the one person known to be waiting: it hears
+      // why now. Otherwise the next chat message's route carries it.
+      if (interrupted && this.state.notice && interrupted.route.source !== 'agent') {
+        await this.publishNotice(interrupted.route)
+      }
       if (interrupted) {
         // Exactly once per interrupted turn: `active` is cleared and persisted
         // above, so a second restart before any new work says nothing at all.
@@ -790,13 +827,7 @@ export class ChannelDispatcher {
     const previous = this.state.threadId
     const usage = this.state.context?.threadId === previous ? this.state.context : undefined
     if (previous) {
-      const receipt: SessionReceipt = {
-        threadId: previous,
-        endedAt: new Date().toISOString(),
-        reason: route.source === 'agent' ? 'a new task (5dive)' : `requested from ${route.source}`,
-        ...(usage ? { calls: usage.calls, inContext: usage.inContext } : {}),
-      }
-      this.state.sessions = [...(this.state.sessions ?? []), receipt].slice(-MAX_RECEIPTS)
+      this.addReceipt(previous, route.source === 'agent' ? 'a new task (5dive)' : `requested from ${route.source}`)
     }
     try {
       await this.startThread()
@@ -819,6 +850,77 @@ export class ChannelDispatcher {
     // An agent-sourced reset (a new 5dive task) goes to the dispatcher log only;
     // `publish` drops the agent route before it reaches any chat.
     await this.sink.publish(route, `🆕 Fresh session.${was}${saved}`, { turnId: '', kind: 'control' })
+  }
+
+  private addReceipt(threadId: string, reason: string): void {
+    const usage = this.state.context?.threadId === threadId ? this.state.context : undefined
+    const receipt: SessionReceipt = {
+      threadId,
+      endedAt: new Date().toISOString(),
+      reason,
+      ...(usage ? { calls: usage.calls, inContext: usage.inContext } : {}),
+    }
+    this.state.sessions = [...(this.state.sessions ?? []), receipt].slice(-MAX_RECEIPTS)
+  }
+
+  /** Best-effort: a rollout that cannot be measured is resumed as before. */
+  private rolloutBytes(threadId: string): number | null {
+    try {
+      const n = this.rolloutSize?.(threadId)
+      return typeof n === 'number' && Number.isFinite(n) ? n : null
+    } catch { return null }
+  }
+
+  /**
+   * The dispatcher's own `new-session` (DIVE-5918): receipt the current thread
+   * as too large, carry the handoff, and owe the person one sentence on why.
+   * Leaves no thread; the caller starts the next one.
+   */
+  private retireThread(bytes: number): void {
+    const previous = this.state.threadId!
+    const size = fmtBytes(bytes)
+    this.addReceipt(previous, `rollout too large to resume (${size})`)
+    this.state.threadId = undefined
+    this.state.context = undefined
+    this.state.handoff = handoffLine(previous, this.state.recent ?? [],
+      `The session had grown too large to reopen (${size} on disk), so the dispatcher started a fresh one`)
+    this.state.recent = []
+    this.state.notice = `🆕 Fresh session: the previous one had grown too large to reopen (${size} on disk). `
+      + `It is saved as ${previous.slice(0, 8)}; the new one starts with a short note of what you last asked.`
+  }
+
+  /** Sends the owed rotation notice; kept for the next route if the send fails. */
+  private async publishNotice(route: DispatchRoute): Promise<void> {
+    const notice = this.state.notice
+    if (!notice) return
+    try {
+      await this.sink.publish(route, notice, { turnId: '', kind: 'control' })
+    } catch { return }
+    this.state.notice = undefined
+    this.persist()
+  }
+
+  /**
+   * At a turn boundary, a rollout past ROLLOUT_ROTATE_BYTES rotates before a
+   * restart could meet it at the boot cap. A failed start keeps the old thread.
+   */
+  private async rotateIfLarge(route: DispatchRoute): Promise<void> {
+    const threadId = this.state.threadId
+    if (!threadId) return
+    const bytes = this.rolloutBytes(threadId)
+    if (bytes === null || bytes <= ROLLOUT_ROTATE_BYTES) return
+    const before = { context: this.state.context, recent: this.state.recent, handoff: this.state.handoff, notice: this.state.notice }
+    this.retireThread(bytes)
+    try {
+      await this.startThread()
+    } catch {
+      this.state.threadId = threadId
+      this.state.sessions = this.state.sessions?.slice(0, -1)
+      Object.assign(this.state, before)
+      return
+    }
+    this.persist()
+    if (route.source !== 'agent') await this.publishNotice(route)
   }
 
   /** A compaction whose turn never arrived must not hold the queue forever;
@@ -987,6 +1089,7 @@ export class ChannelDispatcher {
         for (const key of this.itemText.keys()) {
           if (key.startsWith(`${turnId}:`)) this.itemText.delete(key)
         }
+        await this.rotateIfLarge(completed.route)
         this.persist()
         await this.startNext()
       }
@@ -998,6 +1101,7 @@ export class ChannelDispatcher {
       await this.runControl(message)
       return
     }
+    if (this.state.notice && message.route.source !== 'agent') await this.publishNotice(message.route)
     const recovery = this.state.recovery
     const handoff = this.state.handoff
     // Only a LOST thread gets the transcript: an interrupted turn still has its

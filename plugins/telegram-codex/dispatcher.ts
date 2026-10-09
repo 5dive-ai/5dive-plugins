@@ -11,6 +11,7 @@ import {
 } from './dispatcher-core.ts'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { readMessages } from './msglog.ts'
+import { rolloutSizer } from './rollout.ts'
 import { approvalAsk, approvalResult, askOnTelegram, isApprovalMethod, verdictLine } from './approvals.ts'
 import {
   HEALTH_HEARTBEAT_MS, HEALTH_SCHEMA, writeHealth,
@@ -307,7 +308,10 @@ function chatTranscript(route: DispatchRoute) {
   return readMessages(join(TELEGRAM_STATE_DIR, 'msglog'), route.chat_id)
 }
 
-const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, usage: recordUsageSample, transcript: chatTranscript }, WORKDIR, configuredModel)
+// Rollout sizes for the boot and turn-boundary caps (DIVE-5918).
+const rolloutSize = rolloutSizer(join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'sessions'))
+
+const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, usage: recordUsageSample, transcript: chatTranscript }, WORKDIR, configuredModel, rolloutSize)
 
 // ── approvals (DIVE-5504) ───────────────────────────────────────────────────
 //

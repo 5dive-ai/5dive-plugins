@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.35: a Codex seat whose session grew too large starts a fresh one instead of crash-looping (DIVE-5918)
+
+On 2026-10-09 a Codex seat that had run one session for a month had a 1.06 GB session file on disk. Reopening it at every start grew the dispatcher to 3.1 GB, the seat's memory limit killed it, and it restarted into the same reopen. For half an hour the load on the host reached 84 on 4 cores and every seat on it slowed. The documented `new-session` reset could not help, because the dispatcher never got far enough to read it.
+
+Now the dispatcher checks the session file's size first. Over 200 MB it does not reopen it: it saves the old session as a receipt ("rollout too large to resume"), starts a fresh one carrying the short note of what the person last asked, and tells the person why in one message on their chat (on the cut-off turn's chat at once, else with the next reply). Over 100 MB at the end of a turn it does the same thing early, so a session should never reach the start-up limit. A session file it cannot find is reopened as before.
+
 ### Changed — voice 1.9.0: hearing loads whisper base by default, and the owner can switch it (DIVE-5897)
 
 Mirror of 5dive-voice 1.9.0. Hearing on the box loaded whisper `small`, which takes 9-12 s for a note on a 2-vCPU / 4 GB box and still 6-8 s on a much bigger one, where `base` takes 3-4 s. `base` is now the default on every box; setup and the nightly move a box still on the old default to it, unless a person chose the model. `sudo 5dive voice config set whisper_model auto|base|small` (also a field in the dashboard's voice settings) switches it now and waits until the service answers on the new model; `small` is refused under ~3 GB of memory. whisper-service now runs `min(cores, 8)` decoding threads instead of the library's fixed 4 (`WHISPER_CPU_THREADS` overrides). Measured on a 16-vCPU box, 8 threads cut base from 4.0 s to 2.9 s on a 28 s note. The agent's Voice section tells it to offer the more accurate model when a note was misheard, warning that it is slower, and the faster one when hearing is slow.

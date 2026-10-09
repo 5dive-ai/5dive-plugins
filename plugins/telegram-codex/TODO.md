@@ -35,6 +35,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 ## Shipped
 
 - v0.5.33 — DIVE-5779: the transcriber's kill is a 600s base plus the voice note's length, not a fixed 120s.
+- v0.5.35 — DIVE-5918: a rollout over 200 MB is not resumed at boot (fresh thread + receipt + one notice); over 100 MB rotates at a turn boundary.
 - v0.5.34 — DIVE-5894: an adapter exit is respawned with a backoff instead of killing the dispatcher.
 - v0.5.32 — plain-text replies drop Markdown (lodar 2026-10-05: "it just uses markdown, but he doesn't realize that telegram doesn't support it")
 - v0.5.31 — DIVE-5508: "typing…" on dispatcher seats; commentary edits the ack
