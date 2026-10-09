@@ -96,6 +96,33 @@ voice_stt_fast() {
   [[ "$(voice_config_get stt_fast)" == 1 ]] && printf '1\n' || printf '0\n'
 }
 
+# DIVE-5897: WHICH whisper model hearing on this box loads. base is the
+# default on every box, whatever its size: small took 9-12 s for a note on a
+# Start box (2 vCPU / 4 GB), where base took 3-4 s, and still 6-8 s on a Pro
+# Plus box (lodar, 2026-10-09). small hears mixed-language and unclear speech
+# better, so it is the owner's opt-in (`whisper_model`), and the agent offers
+# it when a note was misheard.
+VOICE_DEFAULT_WHISPER_MODEL="${VOICE_DEFAULT_WHISPER_MODEL:-base}"
+VOICE_MEMINFO="${VOICE_MEMINFO:-/proc/meminfo}"
+# Under this much RAM small is refused outright: it peaks at ~0.8 GB per note.
+VOICE_SMALL_MIN_MEM_KB="${VOICE_SMALL_MIN_MEM_KB:-3000000}"
+
+voice_box_mem_kb() { awk '/^MemTotal:/ { print $2; exit }' "$VOICE_MEMINFO" 2>/dev/null; }
+
+# voice_whisper_model_configured — the owner's choice: a model name, `auto`
+# (5dive's default), or nothing when the key is unset or not a whisper model.
+voice_whisper_model_configured() {
+  local m; m=$(voice_config_get whisper_model)
+  [[ "$m" =~ ^(auto|(tiny|base|small|medium)(\.en)?|large-v[123]|large-v3-turbo)$ ]] && printf '%s\n' "$m"
+  return 0
+}
+
+# voice_small_fits — succeeds when this box has the RAM to hear on small.
+voice_small_fits() {
+  local mem; mem=$(voice_box_mem_kb)
+  [[ "$mem" =~ ^[0-9]+$ ]] && (( mem >= VOICE_SMALL_MIN_MEM_KB ))
+}
+
 # voice_tts_format <model> — the response_format a speaking model accepts.
 # Gemini TTS answers ONLY raw PCM (16-bit little-endian, 24 kHz, mono) and
 # rejects "mp3" with a 400, measured on OpenRouter 2026-09-29. Every other
