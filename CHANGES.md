@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — dashboard 0.4.6: a dashboard message the agent already got comes back marked as a repeat, at most three times (DIVE-5924)
+
+On 2026-10-09 an owner's dashboard message reached an agent five times over an hour, every 15 minutes, and each copy said `delivery_attempt=1`, `redelivery=false`. The agent could not tell the repeats from new messages. The control plane offers a collected message again after 10 minutes (DIVE-3809), but the plugin deleted its retry count for a message as soon as it acknowledged it, so each new offer started again at attempt 1 and the plugin's 3-attempt limit (DIVE-4125) never applied.
+
+The retry count now outlives the acknowledgement. A message offered again arrives as attempt 2 with `redelivery=true`, then attempt 3, and from then on it is parked instead of pushed. A count is dropped only when the control plane has not offered that message for 24 hours, because between offers an acknowledged message is normally missing from the list for about 10 minutes.
+
 ### Fixed — telegram-codex 0.5.35: a Codex seat whose session grew too large starts a fresh one instead of crash-looping (DIVE-5918)
 
 On 2026-10-09 a Codex seat that had run one session for a month had a 1.06 GB session file on disk. Reopening it at every start grew the dispatcher to 3.1 GB, the seat's memory limit killed it, and it restarted into the same reopen. For half an hour the load on the host reached 84 on 4 cores and every seat on it slowed. The documented `new-session` reset could not help, because the dispatcher never got far enough to read it.

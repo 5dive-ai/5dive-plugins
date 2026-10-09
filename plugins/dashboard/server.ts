@@ -35,6 +35,7 @@ import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import {
   loadPendingRetryState,
   nextPendingAttempt,
+  observePendingOffer,
   savePendingRetryState,
  pendingDeliveryMeta } from './pending-redelivery.ts'
 
@@ -530,8 +531,13 @@ async function drainPendingOnce(): Promise<void> {
     process.stderr.write(`dashboard channel: pending fetch failed: ${err}\n`)
     return
   }
-  if (items.length === 0) return
+  // DIVE-5924: a record ends only when the control plane stops offering its
+  // id (see observePendingOffer), so even an empty fetch is read here.
   const retryState = loadPendingRetryState(PENDING_RETRY_FILE)
+  if (observePendingOffer(retryState, items.map(m => m?.id), Date.now())) {
+    savePendingRetryState(PENDING_RETRY_FILE, retryState)
+  }
+  if (items.length === 0) return
   const acked: number[] = []
   for (const m of items) {
     if (typeof m?.text !== 'string' || !m.text.trim()) { acked.push(m.id); continue }
@@ -598,9 +604,12 @@ async function drainPendingOnce(): Promise<void> {
     // has no reject path, and a client with nothing subscribed drops the
     // notification silently — so it can never say the session displayed it.
     // The control plane now re-offers a collected row whose TTL expires.
+    // DIVE-5924: the retry record SURVIVES this ack. The control plane offers
+    // a collected row again after its TTL; deleting the record here restarted
+    // every re-offer at attempt 1, so `redelivery` was always false and the
+    // PENDING_MAX_LOCAL_ATTEMPTS park never fired (a reply-answered message
+    // came back ~5 times, each labelled a first delivery).
     process.stderr.write(`dashboard channel: collected ${acked.length} pending message(s) (collection is not display)\n`)
-    for (const id of acked) delete retryState[String(id)]
-    savePendingRetryState(PENDING_RETRY_FILE, retryState)
   } catch (err) {
     recordLifecycle(
       STATE_DIR,
