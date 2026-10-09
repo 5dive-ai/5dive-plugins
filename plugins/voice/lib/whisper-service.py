@@ -3,7 +3,7 @@
 # transcribe requests over HTTP — much faster than spawning the CLI per call.
 #
 # POST /transcribe   {"path": "/abs/path", "language": "en"?, "beam_size": 1?}
-# GET  /health       {"ok": true, "model": "...", "accepts": [...]}
+# GET  /health       {"ok": true, "model": "...", "threads": N, "accepts": [...]}
 #
 # `language` skips detection and `beam_size` 1 is greedy decoding; both are the
 # owner's opt-in (stt_language / stt_fast, DIVE-5869). Unset, whisper detects
@@ -16,14 +16,34 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from faster_whisper import WhisperModel
 
-MODEL_NAME = os.environ.get("WHISPER_MODEL", "small")
+# DIVE-5897: base unless the unit says otherwise (setup writes WHISPER_MODEL).
+MODEL_NAME = os.environ.get("WHISPER_MODEL", "base")
 COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 HOST = os.environ.get("WHISPER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("WHISPER_PORT", "8765"))
 
-print(f"[whisper] loading model={MODEL_NAME} compute={COMPUTE_TYPE} device={DEVICE}", flush=True)
-model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+# DIVE-5897: faster-whisper's cpu_threads=0 means 4 threads. Measured on a
+# 16-vCPU box (main, 2026-10-09): 8 threads beat 4 (base, 28s note: 2.9s vs
+# 4.0s) and 16 was slower than both, because shared vCPUs oversubscribe. On a
+# 2-vCPU box, 4 threads oversubscribe too. So min(cores, 8);
+# WHISPER_CPU_THREADS overrides.
+def cpu_threads():
+    raw = os.environ.get("WHISPER_CPU_THREADS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    return max(1, min(n, 8))
+
+
+CPU_THREADS = cpu_threads()
+
+print(f"[whisper] loading model={MODEL_NAME} compute={COMPUTE_TYPE} device={DEVICE} threads={CPU_THREADS}", flush=True)
+model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE, cpu_threads=CPU_THREADS)
 print(f"[whisper] ready on {HOST}:{PORT}", flush=True)
 
 # The request fields this build honours. `5dive voice` reads it from /health to
@@ -51,7 +71,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            return self._json(200, {"ok": True, "model": MODEL_NAME, "accepts": ACCEPTS})
+            return self._json(200, {"ok": True, "model": MODEL_NAME, "threads": CPU_THREADS, "accepts": ACCEPTS})
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
