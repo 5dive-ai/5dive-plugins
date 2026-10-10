@@ -49,6 +49,10 @@ jobs:
       # so test/tna-harness.test.ts -- the harness that owns the tap line -- had
       # never executed here. A test file must not be able to be absent from CI by
       # omission; `bun test` enrolls every file in test/ automatically.
+      # DIVE-6000: the channel-fallback tests drive a REAL tmux pane (the keystroke
+      # contract cannot be faked honestly) and skip where tmux is absent, which on
+      # a bare runner meant they never ran here.
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
       - run: bun test
       # Generator drift gate (DIVE-9): every runtime config must still regenerate
       # its committed fork byte-exact. Catches a fork hand-edited without updating

@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — dashboard 0.4.7: the web chat reaches an agent whose Claude Code has channels switched off (DIVE-6000)
+
+On a demo-AI seat (the OpenRouter account a new box starts on) Claude Code never switches channels on, so a my.5dive.ai web-chat message was handed to the session and dropped: the agent never saw it and the chat never answered. The web chat was hidden on 2026-10-10 for that reason (DIVE-5992).
+
+The dashboard plugin now does what the Telegram plugin has done since DIVE-5186. When the session asked for the dashboard channel and Claude Code's own log for this plugin says channels are not available, the message is typed into the agent's session as the same `<channel>` tag, behind a `[dashboard]` line, with the chat id the agent needs to answer through the dashboard reply tool. Replies were never affected. A seat that has channels keeps the normal delivery, so no message arrives twice. A Team or Enterprise org that has turned channels off is left as it is, the same as Telegram (DIVE-5993), and so is any other reason Claude Code gives.
+
 ### Fixed — dashboard 0.4.6: a dashboard message the agent already got comes back marked as a repeat, at most three times (DIVE-5924)
 
 On 2026-10-09 an owner's dashboard message reached an agent five times over an hour, every 15 minutes, and each copy said `delivery_attempt=1`, `redelivery=false`. The agent could not tell the repeats from new messages. The control plane offers a collected message again after 10 minutes (DIVE-3809), but the plugin deleted its retry count for a message as soon as it acknowledged it, so each new offer started again at attempt 1 and the plugin's 3-attempt limit (DIVE-4125) never applied.

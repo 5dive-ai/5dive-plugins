@@ -27,11 +27,14 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync, copyFileSync, openSync, closeSync, writeSync, statSync } from 'fs'
+import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync, copyFileSync, openSync, closeSync, writeSync, statSync, existsSync } from 'fs'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { homedir } from 'os'
 import { join } from 'path'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
+import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import {
   loadPendingRetryState,
   nextPendingAttempt,
@@ -327,15 +330,79 @@ const mcp = new Server(
       'Inbound arrives as <channel source="dashboard" chat_id="dashboard" user="..." ts="...">. Pass chat_id back to reply. If the tag has image_path, Read that path (an uploaded file). To share a file back, pass its absolute path in the reply files array — the dashboard serves it as a download.',
       '',
       'Replies to source="dashboard" messages must use THIS reply tool, never the telegram one — each channel routes to its own surface.',
+      '',
+      'If channels are off in this session, a dashboard message is typed into the session instead, behind a "[dashboard] Inbound 5dive dashboard chat message" line, as the same <channel> tag. Answer it the same way: this reply tool, with its chat_id.',
     ].join('\n'),
   },
 )
 
+// DIVE-6000: where a dashboard inbound goes. When this session asked Claude Code
+// for the dashboard channel and Claude Code REFUSED it (the `tengu_harbor` flag a
+// demo-AI / OpenRouter seat never gets), a `notifications/claude/channel` is
+// dropped unheard — so type the message into the seat's own pane instead, the
+// Telegram plugin's DIVE-5186 fallback. Every other case (bound, org policy,
+// any other skip, no decision) keeps the notification: one delivery, never two.
+// The refusal is read from Claude Code's own MCP log for THIS process; the
+// marker is how we find that file (Claude Code logs server stderr into it).
+// See channelroute.ts.
+const ROUTE_BOOT_MS = Date.now()
+const ROUTE_MARKER = `dashboard channel: route-marker ${process.pid}.${ROUTE_BOOT_MS}`
+if (!DISPATCHER_ADAPTER) process.stderr.write(`${ROUTE_MARKER}\n`)
+const inboundRoute = makeRouteProbe({
+  marker: ROUTE_MARKER,
+  bootPpid: process.ppid,
+  cacheRoot: join(homedir(), '.cache', 'claude-cli-nodejs'),
+  bootMs: ROUTE_BOOT_MS,
+})
+let lastRouteNoted = ''
+
+async function deliverToSession(text: string, meta: Record<string, unknown>): Promise<void> {
+  let route = inboundRoute.route()
+  // A message that beats Claude Code's gate decision at boot waits for it
+  // (bounded) rather than guessing — a wrong guess is a lost or a doubled message.
+  for (let i = 0; i < 20 && route === 'mcp' && inboundRoute.pending(); i++) {
+    await new Promise(r => setTimeout(r, 500))
+    route = inboundRoute.route()
+  }
+  const why = `${route} (${inboundRoute.describe()})`
+  if (why !== lastRouteNoted) {
+    lastRouteNoted = why
+    process.stderr.write(`dashboard channel: inbound route ${why}\n`)
+    recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `inbound route ${why}`)
+  }
+  if (route === 'inject') {
+    try {
+      const attrs: Record<string, string> = {}
+      for (const [k, v] of Object.entries(meta)) if (v != null) attrs[k] = String(v)
+      await injectIntoSession(formatInjection(text, attrs))
+      return
+    } catch (err) {
+      process.stderr.write(`dashboard channel: session inject failed, falling back to the channel notification: ${err}\n`)
+    }
+  }
+  await mcp.notification({ method: 'notifications/claude/channel', params: { content: text, meta } })
+}
+
+// Type one inbound into the seat's pane and submit it (channelroute.ts: the
+// keystroke contract). Built on first use.
+let sessionInjector: ((text: string) => Promise<void>) | null = null
+function injectIntoSession(text: string): Promise<void> {
+  if (!sessionInjector) {
+    const user = process.env.USER ?? process.env.LOGNAME ?? ''
+    const execFileP = promisify(execFile)
+    sessionInjector = makeSessionInjector({
+      tmuxBin: ['/usr/bin/tmux', '/usr/local/bin/tmux', '/bin/tmux'].find(p => existsSync(p)) ?? 'tmux',
+      socket: (process.env.TMUX ?? '').split(',')[0] ?? '',
+      target: process.env.TMUX_PANE || (user.startsWith('agent-') ? `${user}:0` : ''),
+      exec: (bin, args) => execFileP(bin, args),
+    })
+  }
+  return sessionInjector(text)
+}
+
 let dispatcherInboxSeq = 0
 async function deliverInbound(id: string, text: string, meta: Record<string, unknown>): Promise<void> {
-  if (!DISPATCHER_ADAPTER) {
-    return mcp.notification({ method: 'notifications/claude/channel', params: { content: text, meta } })
-  }
+  if (!DISPATCHER_ADAPTER) return deliverToSession(text, meta)
   const seq = `${Date.now()}-${process.pid}-${dispatcherInboxSeq++}`
   const tmp = join(DISPATCHER_INBOX_DIR, `.${seq}.tmp`)
   const dest = join(DISPATCHER_INBOX_DIR, `${seq}.json`)
