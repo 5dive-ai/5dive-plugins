@@ -59,6 +59,7 @@ import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, r
 import { relayOwnerAskTap } from './owner-ask.ts'
 import { tapContent, tapMeta, tapLogEntry } from './buttontap.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
+import { makeOrgPolicyNotifier, orgPolicyText, ORG_SETTINGS_URL, ORG_POLICY_FAQ_URL } from './orgpolicy.ts'
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
@@ -5067,6 +5068,30 @@ const firstReplier = makeFirstReplier({
 })
 let firstReplyTimer: ReturnType<typeof setInterval> | undefined
 
+// DIVE-5993: a Claude Team/Enterprise org with channels off (or an org allowlist
+// without this plugin) drops every inbound unheard; the owner is told, once, what
+// an admin switches on. Read from the same per-process gate log as the router.
+// Never typed into the session: that is the org's own choice (orgpolicy.ts).
+const ORG_POLICY_POLL_MS = 60_000
+const orgPolicyNotice = makeOrgPolicyNotifier({
+  dir: STATE_DIR,
+  owners: () => firstReplyOwners(loadAccess()),
+  send: async chat => {
+    const text = orgPolicyText(bot.botInfo?.first_name ?? '')
+    const sent = await bot.api.sendMessage(Number(chat), text, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard().url('Open claude.ai', ORG_SETTINGS_URL).url('Step by step', ORG_POLICY_FAQ_URL),
+    })
+    try {
+      const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'
+      msglogAppend(MSGLOG_DIR, chat, { ts: new Date().toISOString(), dir: 'out', user: me, text, message_id: String(sent.message_id) })
+    } catch {}
+  },
+  log: line => process.stderr.write(line + '\n'),
+})
+let orgPolicyTimer: ReturnType<typeof setInterval> | undefined
+
 // DIVE-5411: the manager bot tells the owner the agent "greets you in a moment"
 // before this poller exists, so a freshly wired bot greets its owner itself, once,
 // with no /start needed. It runs BOOT_GREET_DELAY_MS after polling starts, so a
@@ -7173,6 +7198,12 @@ if (SEND_ONLY) {
             if (existsSync(join(STATE_DIR, FIRST_REPLY_FILE))) void firstReplier.poll(lastHumanChatId(LAST_HUMAN_CHAT_FILE)).catch(() => {})
           }, FIRST_REPLY_POLL_MS)
           firstReplyTimer.unref?.()
+          // DIVE-5993: re-read on every beat, so the notice clears itself once the
+          // admin switches channels on and the restarted session logs "registered".
+          orgPolicyTimer ??= setInterval(() => {
+            void orgPolicyNotice(inboundRoute.decision()).catch(() => {})
+          }, ORG_POLICY_POLL_MS)
+          orgPolicyTimer.unref?.()
           // DIVE-1883: resolve the /model picker against the CLI's model
           // catalogue so it can't drift a version behind agent-create again.
           void refreshModelAliases()
