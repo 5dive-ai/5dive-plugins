@@ -21,6 +21,8 @@
 //   "Channel notifications re-registered after reconnect"    → bound
 //   "Channel gate says skip:<kind> but was previously registered — preserving handler" → bound
 //   "Channel notifications skipped: channels feature is not currently available" → REFUSED (the flag)
+//   "Channel notifications skipped: channels not enabled by org policy …" → ORG_POLICY (DIVE-5993)
+//   "Channel notifications skipped: plugin … is not on your org's approved channels list …" → ORG_POLICY
 //   "Channel notifications skipped: <any other reason>"      → not ours to route around
 // The gate is re-evaluated (and re-logged) during the session, so the LAST
 // decision wins. Our own file is the one holding the marker line this server
@@ -34,9 +36,15 @@
 import { readFileSync, readdirSync, readlinkSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
-export type ChannelDecision = 'bound' | 'refused' | 'other' | 'unknown'
+export type ChannelDecision = 'bound' | 'refused' | 'org_policy' | 'other' | 'unknown'
 
 const REFUSED_REASON = 'channels feature is not currently available'
+// DIVE-5993: a Claude Team/Enterprise org that has not switched channels on
+// (2.1.296: `kind:"policy"`), or whose own allowlist leaves this plugin out
+// (`kind:"allowlist"`). Both are the org's explicit choice, so they are NEVER
+// routed around by typing into the session; the owner is told what an admin
+// switches on instead (orgpolicy.ts).
+const ORG_POLICY_REASONS = ['not enabled by org policy', "not on your org's approved channels list"]
 
 // The last channel-gate decision logged AFTER `marker`. `unknown` when the
 // marker is absent (not our file) or no decision has been logged yet.
@@ -58,7 +66,11 @@ export function decisionFromLog(text: string, marker: string): ChannelDecision {
     } else if (msg.startsWith('Channel gate says skip:') && msg.includes('preserving handler')) {
       decision = 'bound'
     } else if (msg.startsWith('Channel notifications skipped:')) {
-      decision = msg.includes(REFUSED_REASON) ? 'refused' : 'other'
+      decision = msg.includes(REFUSED_REASON)
+        ? 'refused'
+        : ORG_POLICY_REASONS.some(r => msg.includes(r))
+          ? 'org_policy'
+          : 'other'
     }
   }
   return decision
@@ -236,6 +248,8 @@ export interface RouteProbe {
   pending(): boolean
   // Why, for the lifecycle log / diagnostics.
   describe(): string
+  // The last gate decision Claude Code logged for this process (DIVE-5993).
+  decision(): ChannelDecision
 }
 
 // Stateful, cached probe. Re-reads the log at most every `recheckMs`, and only
@@ -293,6 +307,10 @@ export function makeRouteProbe(opts: {
     },
     describe() {
       return `asked=${asked ?? '?'} decision=${decision} log=${logPath ?? 'none'} claude=${parent?.pid ?? 'none'}`
+    },
+    decision() {
+      refresh()
+      return asked ? decision : 'unknown'
     },
   }
 }
