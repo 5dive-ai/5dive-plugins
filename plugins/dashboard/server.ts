@@ -35,6 +35,7 @@ import { join } from 'path'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
+import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
 import {
   loadPendingRetryState,
   nextPendingAttempt,
@@ -356,6 +357,19 @@ const inboundRoute = makeRouteProbe({
 })
 let lastRouteNoted = ''
 
+// DIVE-6006: a Claude Team/Enterprise org with channels off (or an org allowlist
+// without this plugin) drops every web-chat message unheard. Never typed around
+// (the org's own choice); the owner is told ONCE, in the chat they just wrote in,
+// through the reply path, which is not gated. See orgpolicy.ts.
+const orgPolicyNotice = makeOrgPolicyNotifier({
+  dir: STATE_DIR,
+  send: async chat => { await sendDashboardReply({ chat_id: chat, text: orgPolicyText() }) },
+  log: line => {
+    process.stderr.write(line + '\n')
+    recordLifecycle(STATE_DIR, 'delivery', 'dashboard', line.replace(/^dashboard channel: /, ''))
+  },
+})
+
 async function deliverToSession(text: string, meta: Record<string, unknown>): Promise<void> {
   let route = inboundRoute.route()
   // A message that beats Claude Code's gate decision at boot waits for it
@@ -370,6 +384,7 @@ async function deliverToSession(text: string, meta: Record<string, unknown>): Pr
     process.stderr.write(`dashboard channel: inbound route ${why}\n`)
     recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `inbound route ${why}`)
   }
+  void orgPolicyNotice(inboundRoute.decision(), String(meta.chat_id ?? 'dashboard')).catch(() => {})
   if (route === 'inject') {
     try {
       const attrs: Record<string, string> = {}
