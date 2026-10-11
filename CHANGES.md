@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Added — dashboard 0.4.8: the web chat tells a Claude Team or Enterprise owner once when their company keeps chat off (DIVE-6006)
+
+On a Claude Team or Enterprise login whose organization has not switched agent channels on, or whose approved list leaves the dashboard plugin out, Claude Code drops every web-chat message. The agent looked healthy and the chat never answered or said why, while the Telegram plugin has told the owner since DIVE-5993.
+
+The dashboard plugin now does the same. On the first web-chat message after Claude Code logs the org-policy refusal, it posts one message into that chat: the agent can't hear messages there yet, an admin turns it on in claude.ai under Organization settings → Claude Code → Managed settings, then restarts the agent, with the FAQ link for the steps. It is posted once per seat, and posted again only if channels were let through in between and later switched off. The message itself is still not typed into the session, because that is the organization's own choice. No test organization has this plan with channels off, so the evidence is the plugin run against Claude Code's verbatim log line.
+
 ### Fixed — dashboard 0.4.7: the web chat reaches an agent whose Claude Code has channels switched off (DIVE-6000)
 
 On a demo-AI seat (the OpenRouter account a new box starts on) Claude Code never switches channels on, so a my.5dive.ai web-chat message was handed to the session and dropped: the agent never saw it and the chat never answered. The web chat was hidden on 2026-10-10 for that reason (DIVE-5992).
