@@ -14,7 +14,6 @@ import {
   ORG_POLICY_JSON,
   ORG_POLICY_NOTIFIED_FILE,
   ORG_SETTINGS_URL,
-  ORG_POLICY_FAQ_URL,
 } from '../plugins/telegram/orgpolicy'
 
 const MARKER = 'telegram channel: route-marker 4242.1760100000000'
@@ -135,18 +134,30 @@ describe('the owner is told once', () => {
 })
 
 describe('the words', () => {
-  test('names the agent, the claude.ai path and the FAQ JSON, escaped for HTML', () => {
+  test('names the agent and carries the JSON, escaped for HTML', () => {
     const t = orgPolicyText('Ceo <b>')
     expect(t).toContain("Ceo &lt;b&gt; can't hear your messages yet")
-    expect(t).toContain('claude.ai → Organization settings → Claude Code → Managed settings')
-    expect(t).toContain('then restart Ceo &lt;b&gt;')
-    expect(t).toContain('<pre><code class="language-json">')
+    expect(t).toContain('Restart Ceo &lt;b&gt;: send /restart here.')
+    expect(t).toContain(`<pre><code class="language-json">${ORG_POLICY_JSON.replace(/</g, '&lt;')}</code></pre>`)
     const json = JSON.parse(ORG_POLICY_JSON)
     expect(json.channelsEnabled).toBe(true)
     expect(json.allowedChannelPlugins).toContainEqual({ plugin: 'telegram', marketplace: '5dive-plugins' })
     expect(json.allowedChannelPlugins).toContainEqual({ plugin: 'dashboard', marketplace: '5dive-plugins' })
     expect(ORG_SETTINGS_URL).toBe('https://claude.ai/admin-settings/claude-code')
-    expect(ORG_POLICY_FAQ_URL).toContain('/docs/faq?q=channelsEnabled')
+  })
+  // DIVE-6057 (lodar, 2026-10-12): "give full guide in chat - no links. also
+  // suggest to switch to personal account type".
+  test('the whole guide in the message, no link, and the personal-account way out', () => {
+    const t = orgPolicyText('Ceo')
+    expect(t).not.toContain('http')
+    expect(t).not.toContain('<a ')
+    expect(t).toContain('Open Organization settings, then Claude Code, then Managed settings.')
+    expect(t).toContain('Click Manage.')
+    expect(t).toContain('"channelsEnabled": true')
+    const json = JSON.parse(t.match(/<pre><code class="language-json">([\s\S]*?)<\/code><\/pre>/)![1]!)
+    for (const e of JSON.parse(ORG_POLICY_JSON).allowedChannelPlugins) expect(json.allowedChannelPlugins).toContainEqual(e)
+    expect(t).toContain('Switch Ceo to a personal Claude account (Pro or Max)')
+    expect(t).toContain('agent chat is on by default')
   })
   test('the FAQ JSON in this plugin matches the FAQ answer (the one source)', () => {
     // 5dive-frontend src/data/faqs.ts:137 lists exactly these four entries.
@@ -161,9 +172,11 @@ describe('server wiring', () => {
     expect(src).toContain('orgPolicyNotice(inboundRoute.decision())')
     expect(src).toMatch(/orgPolicyTimer \?\?= setInterval/)
   })
-  test('the notice goes out as HTML with the claude.ai and FAQ buttons', () => {
+  test('the notice goes out as HTML with the claude.ai button and no FAQ button', () => {
     expect(src).toContain("parse_mode: 'HTML'")
-    expect(src).toContain('.url(\'Open claude.ai\', ORG_SETTINGS_URL)')
+    expect(src).toContain("reply_markup: new InlineKeyboard().url('Open claude.ai', ORG_SETTINGS_URL),")
+    expect(src).not.toContain('Step by step')
+    expect(src).not.toContain('docs/faq?q=channelsEnabled')
   })
   test('the session injector still fires only on refused', () => {
     expect(src).toContain("if (route === 'inject')")

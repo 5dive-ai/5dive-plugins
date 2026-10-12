@@ -22,8 +22,7 @@ import {
   makeOrgPolicyNotifier,
   orgPolicyText,
   ORG_POLICY_NOTIFIED_FILE,
-  ORG_SETTINGS_URL,
-  ORG_POLICY_FAQ_URL,
+  ORG_POLICY_JSON,
 } from '../plugins/dashboard/orgpolicy'
 import * as tg from '../plugins/telegram/orgpolicy'
 
@@ -91,21 +90,41 @@ describe('the notice is posted once', () => {
 })
 
 describe('the words', () => {
-  test('plain English for the owner: why, where an admin turns it on, the FAQ link', () => {
+  // DIVE-6057 (lodar, 2026-10-12): "give full guide in chat - no links. also
+  // suggest to switch to personal account type".
+  test('plain English for the owner: why, every step an admin takes, no link', () => {
     const t = orgPolicyText()
     expect(t).toContain("I can't hear your messages here yet")
     expect(t).toContain("Your company's Claude plan has agent chat turned off")
-    expect(t).toContain('claude.ai → Organization settings → Claude Code → Managed settings')
-    expect(t).toContain(`Step by step: ${ORG_POLICY_FAQ_URL}`)
-    // The admin's JSON lives in the FAQ, not in the owner's chat.
-    expect(t).not.toContain('channelsEnabled":')
-    expect(t).not.toContain('<')
+    expect(t).not.toContain('http')
+    expect(t).not.toContain('→')
+    expect(t).toContain('Sign in to claude.ai with the admin account.')
+    expect(t).toContain('Open Organization settings, then Claude Code, then Managed settings.')
+    expect(t).toContain('Click Manage.')
+    expect(t).toContain('Paste the settings below into the box and save.')
+    expect(t).toContain('Restart me')
   })
-  test('the same targets as the Telegram notice', () => {
-    expect(ORG_SETTINGS_URL).toBe(tg.ORG_SETTINGS_URL)
-    expect(ORG_POLICY_FAQ_URL).toBe(tg.ORG_POLICY_FAQ_URL)
+  test('the JSON is in the message, as plain indented text (the web chat draws no markdown)', () => {
+    const t = orgPolicyText()
+    expect(t).not.toContain('<')
+    expect(t).not.toContain('```')
+    const block = t.split('\n\n').find(p => p.trimStart().startsWith('{'))!
+    expect(block.split('\n').every(l => l.startsWith('    '))).toBe(true)
+    const json = JSON.parse(block)
+    expect(json.channelsEnabled).toBe(true)
+    expect(json).toEqual(JSON.parse(ORG_POLICY_JSON))
+    for (const e of JSON.parse(ORG_POLICY_JSON).allowedChannelPlugins) expect(json.allowedChannelPlugins).toContainEqual(e)
+  })
+  test('the way out when the company setting cannot change: a personal Claude account', () => {
+    const t = orgPolicyText()
+    expect(t).toContain('Switch me to a personal Claude account (Pro or Max)')
+    expect(t).toContain('agent chat is on by default')
+    expect(t).toContain('Account, then Switch account')
+  })
+  test('the same JSON and marker as the Telegram notice', () => {
+    expect(ORG_POLICY_JSON).toBe(tg.ORG_POLICY_JSON)
     expect(ORG_POLICY_NOTIFIED_FILE).toBe(tg.ORG_POLICY_NOTIFIED_FILE)
-    expect(JSON.parse(tg.ORG_POLICY_JSON).allowedChannelPlugins).toContainEqual({ plugin: 'dashboard', marketplace: '5dive-plugins' })
+    expect(JSON.parse(ORG_POLICY_JSON).allowedChannelPlugins).toContainEqual({ plugin: 'dashboard', marketplace: '5dive-plugins' })
   })
 })
 
