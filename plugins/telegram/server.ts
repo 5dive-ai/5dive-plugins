@@ -59,7 +59,7 @@ import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, r
 import { relayOwnerAskTap } from './owner-ask.ts'
 import { tapContent, tapMeta, tapLogEntry } from './buttontap.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
-import { makeOrgPolicyNotifier, orgPolicyText, ORG_SETTINGS_URL, ORG_POLICY_FAQ_URL } from './orgpolicy.ts'
+import { makeOrgPolicyNotifier, orgPolicyText, ORG_SETTINGS_URL } from './orgpolicy.ts'
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
@@ -5081,7 +5081,7 @@ const orgPolicyNotice = makeOrgPolicyNotifier({
     const sent = await bot.api.sendMessage(Number(chat), text, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
-      reply_markup: new InlineKeyboard().url('Open claude.ai', ORG_SETTINGS_URL).url('Step by step', ORG_POLICY_FAQ_URL),
+      reply_markup: new InlineKeyboard().url('Open claude.ai', ORG_SETTINGS_URL),
     })
     try {
       const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'

@@ -11,21 +11,50 @@
 // message into the web chat saying why and where the admin switches it on.
 //
 // Differences from Telegram's: the owner is whoever just wrote in the web chat
-// (the inbound's chat_id), not an access list, and the words are plain text with
-// the FAQ link, not an HTML code block — the steps and the JSON live in the FAQ.
+// (the inbound's chat_id), not an access list, and the words are plain text: the
+// web chat draws a reply as-is with its line breaks kept (AgentChat,
+// whitespace-pre-wrap, no markdown), so the JSON is plain indented text.
+//
+// DIVE-6057: the whole guide is in the message and there is no link (lodar,
+// 2026-10-12: "give full guide in chat - no links. also suggest to switch to
+// personal account type"). The steps are the 5dive FAQ's channelsEnabled answer.
 
 import { existsSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ChannelDecision } from './channelroute.ts'
 
-// Same targets as plugins/telegram/orgpolicy.ts (held equal by the test).
-export const ORG_SETTINGS_URL = 'https://claude.ai/admin-settings/claude-code'
-export const ORG_POLICY_FAQ_URL = 'https://5dive.ai/docs/faq?q=channelsEnabled'
+// The same JSON as plugins/telegram/orgpolicy.ts (held equal by the test):
+// channels on, and every channel plugin listed, because an org allowlist drops
+// anything it does not name.
+export const ORG_POLICY_JSON = JSON.stringify(
+  {
+    channelsEnabled: true,
+    allowedChannelPlugins: [
+      { plugin: 'dashboard', marketplace: '5dive-plugins' },
+      { plugin: 'telegram', marketplace: '5dive-plugins' },
+      { plugin: 'telegram', marketplace: 'claude-plugins-official' },
+      { plugin: 'discord', marketplace: 'claude-plugins-official' },
+    ],
+  },
+  null,
+  2,
+)
+
+const indent = (v: string) => v.split('\n').map(l => `    ${l}`).join('\n')
 
 export function orgPolicyText(): string {
   return [
     "I can't hear your messages here yet. Your company's Claude plan has agent chat turned off, so what you type in this chat never reaches me.",
-    `An admin of your Claude organization can turn it on in claude.ai → Organization settings → Claude Code → Managed settings, then restart me. Step by step: ${ORG_POLICY_FAQ_URL}`,
+    [
+      'An admin of your Claude organization can turn it on:',
+      '1. Sign in to claude.ai with the admin account.',
+      '2. Open Organization settings, then Claude Code, then Managed settings.',
+      '3. Click Manage.',
+      '4. Paste the settings below into the box and save. They switch agent chat on and list every chat plugin, because the company list blocks any plugin it leaves out.',
+      '5. Restart me with the Restart button on my page in the 5dive dashboard.',
+    ].join('\n'),
+    indent(ORG_POLICY_JSON),
+    "Can't change the company setting? Switch me to a personal Claude account (Pro or Max) instead, where agent chat is on by default: on my page in the 5dive dashboard, Account, then Switch account.",
   ].join('\n\n')
 }
 

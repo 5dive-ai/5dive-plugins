@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Changed — dashboard 0.4.9, telegram 0.5.94: the channels-off notice carries the whole guide, with no link, and offers a personal Claude account (DIVE-6057)
+
+When a Claude Team or Enterprise company keeps agent chat off, the notice an owner got in the web chat ended with a link to the FAQ, and the steps and the settings to paste were only behind it. The owner was quoted the notice on 2026-10-12 and asked for the full guide in the chat, with no links, and for the option of a personal account.
+
+Both notices now spell out every step in words: sign in to claude.ai as an admin, open Organization settings, then Claude Code, then Managed settings, click Manage, paste the settings, save, and restart the agent. The settings are in the message (plain indented text in the web chat, which draws no formatting; a copyable code block in Telegram) and list every chat plugin, because a company list blocks any plugin it leaves out. A last line says that if the company setting cannot change, the agent can be switched to a personal Claude account (Pro or Max), where agent chat is on by default, under Account, then Switch account on its 5dive dashboard page. Neither message contains a link. Telegram drops its "Step by step" button and keeps "Open claude.ai", which opens the same settings page the steps name.
+
 ### Added — dashboard 0.4.8: the web chat tells a Claude Team or Enterprise owner once when their company keeps chat off (DIVE-6006)
 
 On a Claude Team or Enterprise login whose organization has not switched agent channels on, or whose approved list leaves the dashboard plugin out, Claude Code drops every web-chat message. The agent looked healthy and the chat never answered or said why, while the Telegram plugin has told the owner since DIVE-5993.

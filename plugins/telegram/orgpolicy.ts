@@ -9,8 +9,12 @@
 // route around it (channelroute.ts never injects for `org_policy`); outbound is
 // not gated, so the bot tells the owner, ONCE, what an admin switches on.
 //
-// The steps are the 5dive FAQ's ("Logs say '--channels blocked by org policy'"),
-// which stays the one source: this message is the short version plus a link to it.
+// The steps are the 5dive FAQ's ("Logs say '--channels blocked by org policy'").
+// DIVE-6057: the message carries all of them and links to nothing (lodar,
+// 2026-10-12: "give full guide in chat - no links. also suggest to switch to
+// personal account type"); the "Step by step" FAQ button is gone too. The one
+// button left, "Open claude.ai", opens the very page step 2 names: it is the
+// admin's shortcut, not a guide the owner has to leave the chat to read.
 
 import { existsSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -19,8 +23,6 @@ import type { ChannelDecision } from './channelroute.ts'
 // Verified 2026-10-10 against code.claude.com/docs/en/server-managed-settings:
 // "Organization settings > Claude Code > Managed settings", linked to this URL.
 export const ORG_SETTINGS_URL = 'https://claude.ai/admin-settings/claude-code'
-// The FAQ answer, filtered to itself (docs/faq reads ?q=).
-export const ORG_POLICY_FAQ_URL = 'https://5dive.ai/docs/faq?q=channelsEnabled'
 
 // The JSON the FAQ tells the admin to paste: channels on, and every channel
 // plugin listed, because an org allowlist drops anything it does not name.
@@ -47,8 +49,16 @@ export function orgPolicyText(name: string): string {
   const n = html(name.trim() || 'Your agent')
   return [
     `${n} can't hear your messages yet. Your company's Claude plan has agent chat channels turned off.`,
-    `An admin of your Claude organization can turn them on: claude.ai → Organization settings → Claude Code → Managed settings. Paste this, save, then restart ${n}:`,
+    [
+      'An admin of your Claude organization can turn them on:',
+      '1. Sign in to claude.ai with the admin account.',
+      '2. Open Organization settings, then Claude Code, then Managed settings.',
+      '3. Click Manage.',
+      '4. Paste the settings below into the box and save. They switch agent chat on and list every chat plugin, because the company list blocks any plugin it leaves out.',
+      `5. Restart ${n}: send /restart here.`,
+    ].join('\n'),
     `<pre><code class="language-json">${html(ORG_POLICY_JSON)}</code></pre>`,
+    `Can't change the company setting? Switch ${n} to a personal Claude account (Pro or Max) instead, where agent chat is on by default: on ${n}'s page in the 5dive dashboard, Account, then Switch account.`,
   ].join('\n\n')
 }
 
