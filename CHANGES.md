@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.95: a seat that hits its account's usage limit moves to an account with room, including a standard seat (DIVE-6121)
+
+When a Claude seat hits its usage limit, this plugin's stop-failure hook asks the 5dive CLI to move the seat to another account in its pool and resume the same conversation there. It asked through sudo, and a standard seat's sudo does not allow that command, so the request was refused and the seat waited for its limit to reset. On 2026-10-13 a chat seat with rotation on went quiet on Telegram for almost two hours while its pool held an account at 4%.
+
+The hook now runs the CLI's new wall move on the seat's own user first (`agent rotation rotate <seat> --wall=<reset>`, 5dive CLI from the DIVE-6121 release). It moves only to an account with measured room, parks the walled account until its reset, and does not move the seat again within 30 minutes. As before, the restarted seat resumes the conversation and answers the message that hit the limit. If no account has room, the seat waits and says so once. sudo is only a fallback for an older CLI.
+
 ### Changed — dashboard 0.4.9, telegram 0.5.94: the channels-off notice carries the whole guide, with no link, and offers a personal Claude account (DIVE-6057)
 
 When a Claude Team or Enterprise company keeps agent chat off, the notice an owner got in the web chat ended with a link to the FAQ, and the steps and the settings to paste were only behind it. The owner was quoted the notice on 2026-10-12 and asked for the full guide in the chat, with no links, and for the option of a personal account.

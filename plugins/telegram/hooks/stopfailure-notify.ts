@@ -25,6 +25,7 @@ import { resumePrompt } from './lib/resume-prompt'
 import { parseResetEpoch } from './lib/time'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
+import { wallRotate, readActiveAccount, type Run } from './lib/wall-rotate'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
 import { onDemoAccount, readDemoKey, isKeyLimitText, claimDemoNotice, releaseDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
 
@@ -520,26 +521,20 @@ function deriveAgentName(target: string): string | null {
 // uncertainty (no tmux, CLI failure, non-ok JSON, unknown active). The
 // _activeAccount memo it uses is declared at module top (see the note there) to
 // avoid a temporal-dead-zone error from the top-level callers.
+const runCli: Run = (cmd, args, timeoutMs) => spawnSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs })
+
 function resolveActiveAccount(): string | null {
   if (_activeAccount !== undefined) return _activeAccount
   _activeAccount = null
   if (!tmuxCtx) return _activeAccount
   const agentName = deriveAgentName(tmuxCtx.target)
   if (!agentName) return _activeAccount
-  try {
-    const rg = spawnSync('sudo', ['-n', '5dive', '--json', 'agent', 'rotation', 'get', agentName], {
-      encoding: 'utf8',
-      // Short timeout: this runs sequentially BEFORE the DM/rotate, and a killed
-      // hook (10s budget) recovers nothing. It fires under the same high-load
-      // condition that can slow the CLI, so keep the worst case well under
-      // budget; a timeout just leaves the account null (fail-safe).
-      timeout: 3500,
-    })
-    const j = JSON.parse((rg.stdout || '').trim())
-    if (j?.ok) _activeAccount = String(j.data?.active ?? '') || null
-  } catch {
-    /* keep null */
-  }
+  // Short timeout: this runs sequentially BEFORE the DM/rotate, and a killed
+  // hook (10s budget) recovers nothing. It fires under the same high-load
+  // condition that can slow the CLI, so keep the worst case well under budget;
+  // a timeout just leaves the account null (fail-safe). DIVE-6121: the bare
+  // read first — a standard seat's sudo was refused here, every time.
+  _activeAccount = readActiveAccount(agentName, runCli, 3500)
   return _activeAccount
 }
 
@@ -617,19 +612,12 @@ function tryRotate(resetEpoch: number | null): { from: string; to: string } | nu
   // reset time was unreadable) so we don't bounce straight back to it.
   const cooldownUntil =
     resetEpoch && resetEpoch > 0 ? resetEpoch : Math.floor(Date.now() / 1000) + 5 * 3600
-  const r = spawnSync(
-    'sudo',
-    ['-n', '5dive', '--json', 'agent', 'rotation', 'rotate', agentName, `--cooldown-current=${cooldownUntil}`],
-    { encoding: 'utf8', timeout: 8000 },
-  )
-  let parsed: any = null
-  try {
-    parsed = JSON.parse((r.stdout || '').trim())
-  } catch {
-    /* non-JSON / CLI failure → treat as no rotation */
-  }
-  if (parsed?.ok && parsed.data?.rotated && parsed.data?.to) {
-    return { from: parsed.data.from ?? '?', to: String(parsed.data.to) }
+  // DIVE-6121: the wall move, on the seat's own uid first (lib/wall-rotate.ts):
+  // headroom-only, parks the walled account, never chains. A declined move
+  // falls through to the wait-for-reset helper below, exactly as before.
+  const v = wallRotate(agentName, cooldownUntil, runCli, 8000)
+  if (v.kind === 'rotated') {
+    return { from: v.from, to: v.to }
   }
   // No rotation — drop the marker we armed.
   try {
