@@ -159,7 +159,9 @@ describe('cross-process drain lock (DIVE-3809)', () => {
       expect(got).toBe(true)
       expect(delivered[0]).toBe('after a crash')
       // And the drain cleaned up after itself, so the next pass is not blocked.
-      expect(existsSync(lock)).toBe(false)
+      // The push lands before the ack and the release, so wait for the unlink
+      // rather than reading the file the instant the message shows up.
+      expect(await waitFor(() => !existsSync(lock), 5_000)).toBe(true)
     } finally {
       p.kill(); api.stop(true)
       rmSync(dir, { recursive: true, force: true })
