@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Changed — telegram 0.5.97: no 👀 on every message unless the box asks for one
+
+A lite (partner) box put 👀 on every inbound message since DIVE-5194. On 2026-10-17 lodar said he found it annoying and tapped yes to removing it. The "typing…" indicator already shows the agent is working. Now neither profile reacts unless the box's `access.json` names an `ackReaction`, which still wins as before (an empty string still turns it off).
+
 ### Fixed — telegram 0.5.96: a seat that hits its usage limit says so again, and moves to an account with room
 
 From 0.5.95 (2026-10-13) the stop-failure hook crashed on every usage limit hit by a real seat. The 0.5.95 change put a new `const` next to the function that reads the active account, and code at the top of the hook calls that function before the line that declares the `const`, so it threw "Cannot access 'runCli' before initialization". The seat sent no "usage limit, resets at X" message, did not move to another account, and started no resume helper. On 2026-10-17 the owner moved a chat seat to an account with no weekly allowance left, sent two messages and got no reply. The fleet's resume logs show no hook run anywhere after the 0.5.95 install.

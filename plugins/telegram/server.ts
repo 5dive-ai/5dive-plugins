@@ -7062,9 +7062,9 @@ async function handleInbound(
   // something outside that set the API rejects it and we swallow.
   // DIVE-5194: lite reacts too. DIVE-5121 had dropped the reaction on a partner
   // no-emoji rule, and lodar: "no emoji rule was for his dashboard ui". Same
-  // path as the default profile; a lite box that names no reaction gets 👀
-  // (ackReactionFor), because no lite box writes one and the model cannot be
-  // relied on to react.
+  // path as the default profile. Since 2026-10-17 neither profile reacts unless
+  // the box names a reaction (ackReactionFor): lodar found 👀 on every message
+  // annoying, and the typing loop above already shows the agent is on it.
   // Remember the human's language: for the hooks, which answer out of process
   // with no update to read it from, and (DIVE-5306) for the buttons the bridge
   // writes. Lite only, until DIVE-5306 made it every profile's.

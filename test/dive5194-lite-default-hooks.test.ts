@@ -36,8 +36,8 @@ afterEach(() => {
 })
 
 describe('the ack reaction', () => {
-  test('lite reacts 👀 when the box names no reaction; the box setting still wins, and "" still turns it off', () => {
-    expect(ackReactionFor(undefined, true)).toBe('👀')
+  test('lite: no reaction when the box names none (lodar 2026-10-17); the box setting still wins, and "" still turns it off', () => {
+    expect(ackReactionFor(undefined, true)).toBeUndefined()
     expect(ackReactionFor('🔥', true)).toBe('🔥')
     expect(ackReactionFor('', true)).toBe('')
   })
