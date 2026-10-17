@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.96: a seat that hits its usage limit says so again, and moves to an account with room
+
+From 0.5.95 (2026-10-13) the stop-failure hook crashed on every usage limit hit by a real seat. The 0.5.95 change put a new `const` next to the function that reads the active account, and code at the top of the hook calls that function before the line that declares the `const`, so it threw "Cannot access 'runCli' before initialization". The seat sent no "usage limit, resets at X" message, did not move to another account, and started no resume helper. On 2026-10-17 the owner moved a chat seat to an account with no weekly allowance left, sent two messages and got no reply. The fleet's resume logs show no hook run anywhere after the 0.5.95 install.
+
+The runner and the resume-lock TTL now sit at the top of the hook with the account cache. The TTL had the same fault, from before 0.5.95: the lock check threw inside its own `catch`, so a fresh lock never held and every repeat failure took it over. The existing smoke ran with no tmux pane, which skips both paths. A new case stubs a pane, `5dive` and `sudo` and checks that the hook runs clean, reads the account, and stops at a held lock.
+
 ### Fixed — telegram 0.5.95: a seat that hits its account's usage limit moves to an account with room, including a standard seat (DIVE-6121)
 
 When a Claude seat hits its usage limit, this plugin's stop-failure hook asks the 5dive CLI to move the seat to another account in its pool and resume the same conversation there. It asked through sudo, and a standard seat's sudo does not allow that command, so the request was refused and the seat waited for its limit to reset. On 2026-10-13 a chat seat with rotation on went quiet on Telegram for almost two hours while its pool held an account at 4%.

@@ -95,6 +95,15 @@ let isTransientApiError =
 // would be in the temporal dead zone at call time (ReferenceError). undefined =
 // not yet fetched; null = fetched-but-unknown; string = the account name.
 let _activeAccount: string | null | undefined
+// The CLI runner resolveActiveAccount and tryRotate pass to lib/wall-rotate.ts.
+// Same rule as the memo above: a `const` beside those functions is still in the
+// TDZ when the top-level headroom check calls them, which threw on every usage
+// limit with a tmux pane from 0.5.95 on (DIVE-6121's move never ran, no DM sent).
+const runCli: Run = (cmd, args, timeoutMs) => spawnSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs })
+// The resume-lock TTL, read by tryAcquireResumeLock from top-level code. Beside
+// that function it was in the TDZ too: the throw landed in the function's own
+// catch, so a fresh lock never held and every StopFailure reclaimed it.
+const RESUME_LOCK_TTL_MS = 10 * 60 * 1000 // 10 min; helper heartbeats well under this
 
 // Resolve an unlock/reset epoch. Order: payload → transcript → message text → pane.
 let resetEpoch: number | null = null
@@ -519,10 +528,8 @@ function deriveAgentName(target: string): string | null {
 // (one `sudo -n 5dive agent rotation get` per hook run) because both the
 // headroom check and the DIVE-122 notify-dedup key need it. Returns null on any
 // uncertainty (no tmux, CLI failure, non-ok JSON, unknown active). The
-// _activeAccount memo it uses is declared at module top (see the note there) to
-// avoid a temporal-dead-zone error from the top-level callers.
-const runCli: Run = (cmd, args, timeoutMs) => spawnSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs })
-
+// _activeAccount memo and the runCli runner it uses are declared at module top
+// (see the note there) to avoid a temporal-dead-zone error from the top-level callers.
 function resolveActiveAccount(): string | null {
   if (_activeAccount !== undefined) return _activeAccount
   _activeAccount = null
@@ -645,8 +652,7 @@ function tryRotate(resetEpoch: number | null): { from: string; to: string } | nu
 // StopFailure. A fast claude-restart-while-limited loop turned that into 700+
 // identical "usage limit" DMs in ~20s. mtime + heartbeat is immune: the very
 // first acquire stamps a fresh mtime, so a same-instant second StopFailure
-// already sees the lock held.
-const RESUME_LOCK_TTL_MS = 10 * 60 * 1000 // 10 min; helper heartbeats well under this
+// already sees the lock held. RESUME_LOCK_TTL_MS is declared at module top.
 function tryAcquireResumeLock(lockPath: string): boolean {
   try {
     const fd = openSync(lockPath, 'wx')
