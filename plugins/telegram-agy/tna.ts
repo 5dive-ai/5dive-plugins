@@ -86,7 +86,15 @@ export function settledDetail(at?: string | null, by?: string | null): string {
 // need_answered_at); manual answers --value=done; a decision resolves the option
 // by index into need_options; approval takes approved/denied. Anything else is
 // 'invalid'. Pure: same inputs -> same output, no I/O — the unit the harness pins.
-export function resolveTnaAnswer(task: TnaGate | null | undefined, token: string): TnaResolution {
+// DIVE-6433: the owner's language for the copy a human reads. `en` (the default)
+// is byte-identical to before; `ru` translates the copy and the ack, never the
+// value `task answer` records — callback_data and --value stay language-neutral.
+const TNA_ACK_RU: Record<string, string> = { approved: 'одобрено', denied: 'отклонено', done: 'готово', provided: 'передано' }
+export function tnaAck(ack: string, lang: 'en' | 'ru' = 'en'): string {
+  return lang === 'ru' ? (TNA_ACK_RU[ack] ?? ack) : ack
+}
+
+export function resolveTnaAnswer(task: TnaGate | null | undefined, token: string, lang: 'en' | 'ru' = 'en'): TnaResolution {
   // DIVE-2467: 'nogate' deliberately stays generic. It fires when the task is gone
   // or the gate was WITHDRAWN, and withdraw NULLs need_answer/at/by together (one
   // UPDATE in the CLI) — so on this branch there is no when/who to name. Measured
@@ -95,6 +103,16 @@ export function resolveTnaAnswer(task: TnaGate | null | undefined, token: string
   if (task.need_answered_at) {
     const prior = task.need_type === 'secret' ? '(provided)' : (task.need_answer ?? '—')
     const detail = settledDetail(task.need_answered_at, task.need_answered_by)
+    if (lang === 'ru') {
+      const p = task.need_type === 'secret' ? '(передано)' : tnaAck(prior, 'ru')
+      const d = detail.replace(' by ', ', ').replace(/^by /, '')
+      return {
+        kind: 'already',
+        prior,
+        toast: d ? `Ответ уже получен: ${d}.` : 'Ответ уже получен.',
+        edit: d ? `✅ ответ уже получен: ${p} (${d})` : `✅ ответ уже получен: ${p}`,
+      }
+    }
     return {
       kind: 'already',
       prior,

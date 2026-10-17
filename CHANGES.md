@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Changed — telegram 0.5.98: a human gate's tap confirmations follow the owner's language (DIVE-6433)
+
+The 5dive CLI now writes a human gate's header and buttons in the owner's language (the `lite-lang` file this plugin keeps from the sender's Telegram language). After a tap, though, this plugin still answered in English: "Answered: approved", "✅ answered: approved", "This task no longer has a gate.", "Already answered …". Those now follow the tapper's language like the other buttons the plugin answers (DIVE-5306): a Russian tap reads "Ответ принят: одобрено". English is unchanged.
+
+The value recorded on the gate does not change with the language: `task answer` still gets `approved`, `denied`, `done` or the option itself, so a tap on a Russian button answers the gate exactly like the English one. `tna.ts` takes an optional language and stays byte-identical across every fork; the forks keep calling it without one. `test/dive6433-gate-language.test.ts` pins the English copy, the Russian copy and the language-neutral answer.
+
 ### Changed — telegram 0.5.97: no 👀 on every message unless the box asks for one
 
 A lite (partner) box put 👀 on every inbound message since DIVE-5194. On 2026-10-17 lodar said he found it annoying and tapped yes to removing it. The "typing…" indicator already shows the agent is working. Now neither profile reacts unless the box's `access.json` names an `ackReaction`, which still wins as before (an empty string still turns it off).

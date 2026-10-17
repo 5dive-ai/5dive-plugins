@@ -209,6 +209,10 @@ const TAP_EN = {
   alreadyAnswered: 'Already answered.',
   optionInvalid: 'That option is no longer valid.',
   expired: 'This prompt has expired.',
+  // DIVE-6433: the human-gate (tna:) tap copy.
+  gateGone: 'This task no longer has a gate.',
+  gateAnswered: (ack: string) => `Answered: ${ack}`,
+  gateAnsweredEdit: (ack: string) => `✅ answered: ${ack}`,
   // DIVE-5331: the ONE answer a standard-tier agent gives for anything that
   // needs root (the commands stay in the menu; lodar wants a reason, not a
   // hidden command). Short enough for a tap toast (Telegram caps those at 200).
@@ -243,6 +247,9 @@ export const TAP_STRINGS: Record<Lang, typeof TAP_EN> = {
     alreadyAnswered: 'Ответ уже получен.',
     optionInvalid: 'Этот вариант больше не действует.',
     expired: 'Этот вопрос уже неактуален.',
+    gateGone: 'У этой задачи больше нет вопроса к вам.',
+    gateAnswered: (ack: string) => `Ответ принят: ${ack}`,
+    gateAnsweredEdit: (ack: string) => `✅ ответ: ${ack}`,
     adminTier: 'Для этого нужен агент уровня admin. Попросите администратора сервера или переключите этого агента на admin в панели управления.',
     currentAccount: (name: string) => `Текущий аккаунт: ${name}`,
     ownUsageTitle: 'Расход этого агента',
