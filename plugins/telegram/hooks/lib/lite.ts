@@ -52,11 +52,12 @@ export function isLite(env: NodeJS.ProcessEnv = process.env): boolean {
   return resolveProfile(env) === 'lite'
 }
 
-/** DIVE-5194: the reaction put on each inbound message. The box's own setting
- *  wins, and "" still turns it off; a lite box that names none gets 👀, since
- *  no lite box writes one. Default profile: exactly the setting, as before. */
-export function ackReactionFor(configured: string | undefined, lite: boolean): string | undefined {
-  return configured ?? (lite ? '👀' : undefined)
+/** The reaction put on each inbound message: exactly the box's own setting, on
+ *  both profiles. DIVE-5194 gave a lite box that names none 👀; lodar 2026-10-17
+ *  ("I feel it's annoying sometimes", yes to removing it): the typing indicator
+ *  already says the agent is working, so no setting means no reaction. */
+export function ackReactionFor(configured: string | undefined, _lite: boolean): string | undefined {
+  return configured
 }
 
 /** The client's Telegram language → the strings table. Russian, else English. */
