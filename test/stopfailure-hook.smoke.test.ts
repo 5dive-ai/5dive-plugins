@@ -8,7 +8,7 @@
 // failed send) and asserts it runs clean AND the storm collapses to one SEND.
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -111,6 +111,47 @@ describe('DIVE-122 stopfailure-notify executes on a usage limit (TDZ regression)
     }
     expect(sends).toBe(1)
     expect(suppress).toBe(4)
+  })
+
+  // DIVE-6121 regression: every case above runs with TMUX='' so tmuxCtx is null,
+  // and the headroom check + account read (`isRateLimit && tmuxCtx && ...`) never
+  // run. A real seat always has a pane, and there the 0.5.95 `const runCli` beside
+  // resolveActiveAccount was still in the TDZ — the hook threw before any DM or
+  // rotation on every usage limit. Stub tmux/5dive/sudo on PATH so the seat path
+  // runs without touching anything real, and pre-hold a fresh resume.lock so the
+  // hook stops at the lock instead of spawning a resume helper.
+  test('with a tmux pane, the account read runs clean — no ReferenceError/TDZ', () => {
+    const bin = join(home, 'bin')
+    const calls = join(home, 'calls.log')
+    mkdirSync(bin)
+    const stub = (name: string, body: string) => {
+      writeFileSync(join(bin, name), `#!/bin/sh\necho "${name} $*" >> '${calls}'\n${body}\n`)
+      chmodSync(join(bin, name), 0o755)
+    }
+    stub('tmux', 'case "$*" in *display*) echo "agent-fake:0.0";; esac')
+    stub('5dive', 'echo \'{"ok":false}\'')
+    stub('sudo', 'echo \'{"ok":false}\'')
+    const lockDir = join(home, '.cache', '5dive-telegram', 'resume')
+    mkdirSync(lockDir, { recursive: true })
+    writeFileSync(join(lockDir, 'resume.lock'), `1 ${Date.now()}`)
+
+    const r = spawnSync(process.execPath, [HOOK], {
+      input: JSON.stringify({
+        message: 'usage limit reached',
+        reason: 'usage_limit',
+        stopReason: 'rate_limit',
+        resetsAt: 1_999_999_999,
+        transcript_path: writeTranscript(),
+      }),
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home, TELEGRAM_BOT_TOKEN: '000:FAKE', TMUX: '/tmp/fake-sock,1,0', PATH: `${bin}:${process.env.PATH}` },
+      timeout: 20000,
+    })
+    expect(r.stderr ?? '').not.toMatch(/ReferenceError|SyntaxError|TypeError|before initialization/)
+    expect(r.status).toBe(0)
+    expect(readFileSync(calls, 'utf8')).toContain('5dive --json agent rotation get fake')
+    // The fresh lock held: no resume helper (each one opens a resume-*.log here).
+    expect(readdirSync(lockDir).filter(f => f.startsWith('resume-'))).toEqual([])
   })
 
   // A different failure KIND within the same window must still notify — the
