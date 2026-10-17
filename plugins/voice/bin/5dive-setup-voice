@@ -199,7 +199,11 @@ step_pip() {
   # 1.2.1 still passes: every transcribe 500s. Hold av below 19 until a
   # faster-whisper release stops passing it. Re-running this step on a box that
   # already got av 19 downgrades it.
-  as_claude "$VENV/bin/pip" install --quiet --upgrade faster-whisper edge-tts 'av<19'
+  # edge-tts talks to an unofficial Microsoft endpoint whose client token
+  # Microsoft rotates; 7.2.8 got a 403 on 2026-10-17 and 7.3.1 works. The floor
+  # keeps a cached older wheel off a fresh install. The box's nightly upgrades
+  # edge-tts past it from then on (5dive-setup-voice tts, DIVE-6436).
+  as_claude "$VENV/bin/pip" install --quiet --upgrade faster-whisper 'edge-tts>=7.3.1' 'av<19'
   # edge-tts is used directly by agents; whisper is called via the HTTP service
   # below, so no need to symlink faster-whisper.
   if [[ -x "$VENV/bin/edge-tts" ]]; then
