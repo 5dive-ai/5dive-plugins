@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.99: a voice reply that was never made no longer takes the text answer with it (DIVE-6440)
+
+On 2026-10-17 a client sent a voice note and got nothing back, while the agent insisted it had answered. edge-tts was refused by Microsoft (DIVE-6436), so `5dive-speak` made no OGG. The reply that carried the answer and that OGG path failed on the missing file before the text was sent, because the attachment check ran first.
+
+Now an attached audio file that is missing, has no audio in it (under 512 bytes) or is refused by Telegram is a failed voice note. The text in the same call still goes, and the tool result adds a line starting `VOICE NOTE NOT SENT` that names the reason and tells the agent to say the voice reply did not work this time. A call with no text and nothing else to send fails with that advice, so the agent sends the answer as text. The rolling log marks the reply `[voice note not sent]`. A voice note that works sends exactly as before. `test/dive6440-voice-fallback.test.ts` covers it.
+
 ### Fixed — voice 1.9.1: a fresh voice setup installs an edge-tts Microsoft still accepts (DIVE-6436)
 
 Mirror of 5dive-voice 1.9.1. On 2026-10-17 Microsoft changed the client token its online voices check, and edge-tts 7.2.8 got a 403 on every box; 7.3.1 works. Setup now asks pip for `edge-tts>=7.3.1`, so a cached older wheel cannot land on a fresh install. Keeping existing boxes current is the box's nightly job: 5dive-api's update now runs `5dive-setup-voice tts` every night, which upgrades edge-tts alone wherever the claude venv already has it.
