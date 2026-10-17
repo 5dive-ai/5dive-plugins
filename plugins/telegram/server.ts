@@ -48,6 +48,7 @@ import {
   type SeatAdmin, type SeatSudo, type SudoGate, type StatuslineLimits,
 } from './seatpriv.ts'
 import { planAutoAttach, autoAttachFooter, attachedNames, AUTO_PHOTO_EXTS, type AutoAttachPlan } from './autoattach'
+import { unsendableAudio, isAudioFile, voiceFailedNote, voiceFailedError } from './voicefail.ts'
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { questionLabel } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
@@ -1533,7 +1534,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each. With files attached, `text` may be empty (for example a voice note): then only the files are sent.',
+            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each. With files attached, `text` may be empty (for example a voice note): then only the files are sent. A voice note that is missing, empty or refused is not sent, the text still is, and the result starts a line with VOICE NOTE NOT SENT.',
           },
           format: {
             type: 'string',
@@ -1718,7 +1719,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // DIVE-5419: a reply no longer stops "typing…" — the turn's end does.
         typingQuietUntil.set(chat_id, Date.now() + TYPING_INTERVAL_MS + 1_000)
 
-        for (const f of files) {
+        // DIVE-6440: a voice note that was never made (missing or empty file)
+        // is dropped here instead of throwing, so the text still goes.
+        const voiceFailed: string[] = []
+        const sendFiles = files.filter(f => {
+          const why = unsendableAudio(f)
+          if (why) voiceFailed.push(why)
+          return !why
+        })
+        if (voiceFailed.length > 0 && textMissing && sendFiles.length === 0) {
+          throw new Error(voiceFailedError(voiceFailed))
+        }
+
+        for (const f of sendFiles) {
           assertSendable(f)
           const st = statSync(f)
           if (st.size > MAX_ATTACHMENT_BYTES) {
@@ -1813,7 +1826,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present, and into the
         // same forum topic when message_thread_id was passed.
-        for (const f of files) {
+        for (const f of sendFiles) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
           const opts = {
@@ -1825,10 +1838,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
+          } else if (isAudioFile(f)) {
+            // DIVE-6440: Telegram refusing the voice note is a failed voice
+            // reply, reported below, not an error that hides the sent text.
+            try {
+              const sent = await bot.api.sendDocument(chat_id, input, opts)
+              sentIds.push(sent.message_id)
+            } catch (err) {
+              voiceFailed.push(`Telegram refused ${f}: ${err instanceof Error ? err.message : String(err)}`)
+            }
           } else {
             const sent = await bot.api.sendDocument(chat_id, input, opts)
             sentIds.push(sent.message_id)
           }
+        }
+        if (voiceFailed.length > 0 && sentIds.length === 0) {
+          throw new Error(voiceFailedError(voiceFailed))
         }
 
         // DIVE-4280: then the auto-attached ones, threaded the same way.
@@ -1863,7 +1888,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         try {
           // The names left the human's message, not the record: `recent_messages`
           // reads this log back as text and cannot see an attachment.
-          const loggedText = autoNames ? `${stripped}\n\n${autoNames}` : stripped
+          // DIVE-6440: and a voice note that did not go, so a recovered
+          // transcript never reads as a voice reply that was sent.
+          const voiceMark = voiceFailed.length ? '\n\n[voice note not sent]' : ''
+          const loggedText = autoNames ? `${stripped}\n\n${autoNames}${voiceMark}` : `${stripped}${voiceMark}`.trim()
           if (loggedText && loggedText.trim()) {
             const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'
             msglogAppend(MSGLOG_DIR, chat_id, {
@@ -1883,6 +1911,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Where the caller now learns which files rode along, since the
         // human's message no longer says.
         const result = autoNames ? `${sentLine} · ${autoNames}` : sentLine
+        if (voiceFailed.length > 0) {
+          return { content: [{ type: 'text', text: `${result}\n${voiceFailedNote(voiceFailed, chunks.length > 0)}` }] }
+        }
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
