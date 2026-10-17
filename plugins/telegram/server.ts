@@ -32,7 +32,7 @@ import {
   type SwitchKind,
 } from './liveswitch'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
-import { TNA_RE, resolveTnaAnswer, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice, describeTapError, tapLanding, tapFailureCopy, type TapLanding } from './tna'
+import { TNA_RE, resolveTnaAnswer, tnaAck, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice, describeTapError, tapLanding, tapFailureCopy, type TapLanding } from './tna'
 // DIVE-2846: aliased so the durable tap-failure record needs no surgery on
 // (or collision with) whatever each plugin already imports from 'fs'.
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
@@ -5603,9 +5603,12 @@ bot.on('callback_query:data', async ctx => {
       // DIVE-2846: the ident is what a human can look up; the callback carries
       // only the internal id. Keep it so a failure names the right task.
       if (typeof (task as any)?.ident === 'string') tnaIdent = (task as any).ident
-      const r = resolveTnaAnswer(task, token)
+      // DIVE-6433: the copy follows the tapper's language, like the other taps.
+      const lang = tapLang(ctx.from?.language_code, langOfChat(String(ctx.callbackQuery?.message?.chat.id ?? '')))
+      const s = TAP_STRINGS[lang]
+      const r = resolveTnaAnswer(task, token, lang)
       if (r.kind === 'nogate') {
-        await ctx.answerCallbackQuery({ text: 'This task no longer has a gate.' }).catch(() => {})
+        await ctx.answerCallbackQuery({ text: s.gateGone }).catch(() => {})
         await ctx.editMessageReplyMarkup().catch(() => {})
         return
       }
@@ -5616,7 +5619,7 @@ bot.on('callback_query:data', async ctx => {
         return
       }
       if (r.kind === 'invalid') {
-        await ctx.answerCallbackQuery({ text: 'That option is no longer valid.' }).catch(() => {})
+        await ctx.answerCallbackQuery({ text: s.optionInvalid }).catch(() => {})
         await ctx.editMessageReplyMarkup().catch(() => {})
         return
       }
@@ -5641,8 +5644,8 @@ bot.on('callback_query:data', async ctx => {
       })
       extraArgs.push(`--channel-proof=${senderId}`)
       await write5diveJson(['--json', 'task', 'answer', taskId, ...r.answerArgs, ...extraArgs], 8000)
-      await ctx.answerCallbackQuery({ text: `Answered: ${r.ack}` }).catch(() => {})
-      await ctx.editMessageText(`✅ answered: ${r.ack}`).catch(() => {})
+      await ctx.answerCallbackQuery({ text: s.gateAnswered(tnaAck(r.ack, lang)) }).catch(() => {})
+      await ctx.editMessageText(s.gateAnsweredEdit(tnaAck(r.ack, lang))).catch(() => {})
     } catch (err) {
       // DIVE-2846: bind the exception. The old `catch {` bound nothing, so a tap that
       // told a human it failed left NO record of why anywhere, and the cause was
