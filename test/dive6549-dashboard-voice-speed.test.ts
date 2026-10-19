@@ -257,6 +257,8 @@ describe('the dashboard adapter, made faster for voice notes (DIVE-6549)', () =>
       expect(await waitFor(() => ops(dir).some(o => o[0] === 'pending'), BOOT_MS + 8_000)).toBe(true)
       a.send({ jsonrpc: '2.0', id: 7, method: 'tools/call',
         params: { name: 'reply', arguments: { chat_id: '33', text: 'Friday at ten.', voice: true } } })
+      // Each reply spawns its own relay process, so send the second only after the first has landed.
+      expect(await waitFor(() => a.results.length >= 1, 8_000)).toBe(true)
       a.send({ jsonrpc: '2.0', id: 8, method: 'tools/call',
         params: { name: 'reply', arguments: { chat_id: '33', text: 'typed answer' } } })
       expect(await waitFor(() => a.results.length >= 2, 8_000)).toBe(true)
