@@ -27,7 +27,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync, copyFileSync, openSync, closeSync, writeSync, statSync, existsSync } from 'fs'
+import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync, copyFileSync, openSync, closeSync, writeSync, statSync, existsSync, renameSync } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { homedir } from 'os'
@@ -36,7 +36,7 @@ import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
-import { inboundAttachment, replyBody, webPlayable, type Run } from './voicenote.ts'
+import { audioSeconds, inboundAttachment, isAudioPath, replyBody, webPlayable, withLengthName, type Probe, type Run } from './voicenote.ts'
 import {
   loadPendingRetryState,
   nextPendingAttempt,
@@ -779,6 +779,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 const FFMPEG = process.env.DASHBOARD_FFMPEG ?? (['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'].find(p => existsSync(p)) ?? 'ffmpeg')
 const runFile: Run = async (bin, args, timeoutMs) => { await promisify(execFile)(bin, args, { timeout: timeoutMs }) }
+// DIVE-6550: ffprobe ships beside ffmpeg (DASHBOARD_FFPROBE is the test seam).
+const FFPROBE = process.env.DASHBOARD_FFPROBE ?? FFMPEG.replace(/ffmpeg$/, 'ffprobe')
+const probeFile: Probe = async (bin, args, timeoutMs) => (await promisify(execFile)(bin, args, { timeout: timeoutMs })).stdout
 const SPEAK = process.env.DASHBOARD_SPEAK ?? '/usr/local/bin/5dive-speak'
 
 type ReplyArgs = { chat_id?: unknown; text?: unknown; files?: unknown; voice?: unknown }
@@ -838,7 +841,12 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
     if (!f.startsWith(`${OUTBOX_DIR}/`)) return f
     const web = await webPlayable(f, runFile, FFMPEG)
     if (web !== f) { try { chmodSync(web, 0o664) } catch {} }
-    return web
+    // DIVE-6550: the length rides in the name, so the web chat shows it without downloading the note.
+    if (!isAudioPath(web)) return web
+    const seconds = await audioSeconds(web, probeFile, FFPROBE)
+    const named = seconds ? withLengthName(web, seconds) : web
+    if (named === web) return web
+    try { renameSync(web, named); return named } catch { return web }
   }))
   const text = replyBody(rawText, files)
 
