@@ -18,7 +18,7 @@ import { join, basename } from 'path'
 import { stateDir, signalTurnEnded } from './lib/paths'
 import { readPayload } from './lib/payload'
 import { readEntries, findRateLimitText } from './lib/transcript'
-import { getAllowedChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
+import { getOwnerChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
 import { resumePrompt } from './lib/resume-prompt'
@@ -263,8 +263,9 @@ if (onDemoAccount()) {
 // transcript — cron-triggered, long-running background agent, etc) fall back
 // to the agent's bound group topic(s) so the alert lands in its own thread
 // instead of buzzing every paired DM + the group's General channel. Only when
-// no group is configured at all do we fan to all allowed chats — better a
-// noisy alert than a silenced one.
+// no group is configured at all do we DM the seat's owner(s) — DIVE-6518: not
+// every allowed chat, since a guest the owner let talk to the agent is not who
+// its usage limit is for.
 let targets: CallerChat[]
 // DIVE-4401: which of the three rungs we landed on, for the route trace below.
 // Routing itself is UNCHANGED — a usage-limit notice goes exactly where a
@@ -274,15 +275,15 @@ let targets: CallerChat[]
 // different rungs (main had a telegram DM 11 minutes earlier → 'caller';
 // olivia's turn was autonomous → 'group-topics', i.e. the agent's own forum
 // topic, not the DM the operator was watching) and neither left a trace.
-let routeKind: 'caller' | 'group-topics' | 'all-allowed'
+let routeKind: 'caller' | 'group-topics' | 'owners'
 const callerChat = getCallerChat(entries)
 if (callerChat) {
   targets = [callerChat]
   routeKind = 'caller'
 } else {
   const topics = getGroupTopics()
-  targets = topics.length ? topics : getAllowedChatIds().map(chatId => ({ chatId }))
-  routeKind = topics.length ? 'group-topics' : 'all-allowed'
+  targets = topics.length ? topics : getOwnerChatIds().map(chatId => ({ chatId }))
+  routeKind = topics.length ? 'group-topics' : 'owners'
 }
 const fmtTarget = (t: CallerChat) => (t.threadId ? `${t.chatId}:${t.threadId}` : t.chatId)
 
@@ -395,7 +396,7 @@ if (shouldSend) {
   console.error(`[stopfailure-notify] route=${routeKind} targets=${targets.map(fmtTarget).join(',') || '(none)'}`)
   // DIVE-4401 (iteration 3): zero targets is the row's own symptom in its purest
   // form — the hook decided to SEND, transmitted nothing, and exited 0 looking
-  // successful. There is no fallback to reach for (the all-allowed rung IS the
+  // successful. There is no fallback to reach for (the owners rung IS the
   // fallback, and it came back empty), so the only thing left to do is say the
   // notice was lost, the way the 'nowhere to fall back to' branch does.
   if (targets.length === 0) {
@@ -412,14 +413,14 @@ if (shouldSend) {
   // the notice has no bearing on whether this turn ended.
   signalTurnEnded()
   // Last-resort fallback: if EVERY routed send failed, the notice is lost and
-  // the agent is about to go quiet for hours. Retry on the paired chats we did
+  // the agent is about to go quiet for hours. Retry on the owner DMs we did
   // not already try, so a dead topic (or a group the bot was removed from)
   // degrades to a DM instead of to silence. Deliberately gated on TOTAL
   // failure: a successful routed send must not also fan out to every paired
   // chat — that fan-out is what the caller-narrowing above exists to prevent.
   if (results.length > 0 && results.every(ok => !ok)) {
     const tried = new Set(targets.map(t => t.chatId))
-    const fallback = getAllowedChatIds().filter(id => !tried.has(id))
+    const fallback = getOwnerChatIds().filter(id => !tried.has(id))
     if (fallback.length > 0) {
       console.error(`[stopfailure-notify] all ${results.length} routed send(s) failed — falling back to ${fallback.join(',')}`)
       const fbResults = await Promise.all(fallback.map(id => sendMessage(id, text, undefined, markup)))

@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.100: a usage-limit notice on an autonomous turn goes to the seat's owner, not to every allowed chat (DIVE-6518)
+
+On 2026-10-19 lodar reported that a customer's ceo seat sent "Usage limit hit" to both people allowed to message its bot, not just to him. A turn the task engine starts has no Telegram message in it, so the stop-failure hook had no chat to answer, and on a seat with no group it sent the notice to all of `allowFrom`. The guest the owner allowed to chat with the agent got the owner's usage-limit notice, and its resume follow-up as well.
+
+The fallback is now the seat's owners: `access.owners` (the first id paired) that are still in `allowFrom`, private chats only. When a pairing is too old to have an `owners` record, all of `allowFrom` still gets it, as before. A turn that came from a Telegram chat still answers that chat, a group topic still gets an autonomous turn's notice when one is configured, and the total-failure retry now goes to the owner DMs only. The same fallback now covers the session-limit DM, the context-full nudge and the demo-key-used-up notice. `hooks/lib/owners.ts` holds the rule once. `firstReplyOwners` is the same function, and the hooks reach it through `getOwnerChatIds`, which replaces `getAllowedChatIds`. Five arms in `test/stopfailure-send-leg.test.ts` cover it, and three of them fail on 0.5.99.
+
 ### Fixed — telegram 0.5.99: a voice reply that was never made no longer takes the text answer with it (DIVE-6440)
 
 On 2026-10-17 a client sent a voice note and got nothing back, while the agent insisted it had answered. edge-tts was refused by Microsoft (DIVE-6436), so `5dive-speak` made no OGG. The reply that carried the answer and that OGG path failed on the missing file before the text was sent, because the attachment check ran first.

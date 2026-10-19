@@ -31,7 +31,7 @@ import { join } from 'path'
 import { readPayload } from './lib/payload'
 import { readEntries } from './lib/transcript'
 import { getToken } from './lib/telegram'
-import { getAllowedChatIds, getCallerChat, type CallerChat } from './lib/access'
+import { getOwnerChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { nudgeFile } from './lib/paths'
 import type { HookPayload } from './lib/types'
 import { isLite, readLiteLang, LITE_STRINGS } from './lib/lite'
@@ -112,8 +112,8 @@ try {
 if (crossed.at <= maxFired) process.exit(0)
 
 // --- Pick the target chat ---------------------------------------------------
-// Prefer the chat we're actively talking to; fall back to the allowed list so
-// an autonomous session still surfaces the nudge to whoever's paired.
+// Prefer the chat we're actively talking to; fall back to the seat's owner so
+// an autonomous session still surfaces the nudge (DIVE-6518: not a guest).
 const entries = (() => {
   try {
     return payload.transcript_path ? readEntries(payload.transcript_path) : []
@@ -122,7 +122,7 @@ const entries = (() => {
   }
 })()
 const caller = getCallerChat(entries)
-const target: CallerChat | null = caller ?? (getAllowedChatIds().map(chatId => ({ chatId }))[0] ?? null)
+const target: CallerChat | null = caller ?? (getOwnerChatIds().map(chatId => ({ chatId }))[0] ?? null)
 if (!target) process.exit(0)
 
 // --- Send the nudge with one-tap buttons -------------------------------------

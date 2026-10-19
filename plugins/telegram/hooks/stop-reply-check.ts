@@ -50,7 +50,7 @@ import { isLite, readLiteLang, readAllowance, liteLimitText, recordOpsDetail, LI
 const LITE = isLite()
 import { emitBlock } from './lib/output'
 import { TG_TOOL_PREFIX, signalTurnEnded } from './lib/paths'
-import { getAllowedChatIds, getCallerChat, getGroupTopics, type CallerChat } from './lib/access'
+import { getOwnerChatIds, getCallerChat, getGroupTopics, type CallerChat } from './lib/access'
 import { parseResetEpoch } from './lib/time'
 import type { HookPayload, TranscriptEntry, TranscriptContentBlock } from './lib/types'
 
@@ -150,12 +150,12 @@ if (sessionLimitHit && getToken()) {
   const thisUuid = (sessionLimitHit.entry as TranscriptEntry & { uuid?: string }).uuid ?? ''
   if (thisUuid && thisUuid !== lastSeenUuid) {
     // Find a chat: prefer the inbound chat from this turn (caller scoping),
-    // else fall back to every allowed chat so an autonomous-turn limit hit
-    // still pings someone.
+    // else fall back to the seat's owner(s) so an autonomous-turn limit hit
+    // still pings someone, and not every guest in allowFrom (DIVE-6518).
     const callerChat = getCallerChat(entries)
     const targets: CallerChat[] = callerChat
       ? [callerChat]
-      : getAllowedChatIds().map(chatId => ({ chatId }))
+      : getOwnerChatIds().map(chatId => ({ chatId }))
     if (targets.length > 0) {
       // Compose the DM. Add a parsed time-left when the message carries a
       // reset clue ("resets 9am" / "in 2h"), so the user knows when to expect

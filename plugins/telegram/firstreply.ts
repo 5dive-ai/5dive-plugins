@@ -18,6 +18,7 @@
 import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { GreetClaims } from './bootgreet.ts'
+import { ownerChatIds } from './hooks/lib/owners.ts'
 
 export const FIRST_REPLY_FILE = 'first-reply.json'
 export const FIRST_REPLY_STATE_FILE = 'first-reply.state.json'
@@ -118,9 +119,7 @@ export function splitForTelegram(text: string, limit = TG_TEXT_LIMIT): string[] 
 }
 
 /** Who may receive the result: owners (else the allowlist), private chats only. */
-export function firstReplyOwners(access: { owners?: string[]; allowFrom: string[] }): string[] {
-  return (access.owners ?? access.allowFrom).filter(id => access.allowFrom.includes(id) && /^[1-9]\d*$/.test(id))
-}
+export const firstReplyOwners = ownerChatIds
 
 /** The chat in last-human-chat.json (the owner has opened the bot), or null. */
 export function lastHumanChatId(path: string): string | null {

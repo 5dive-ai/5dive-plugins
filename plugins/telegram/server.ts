@@ -1323,7 +1323,7 @@ async function checkDemoKey(chatId?: string, lang?: Lang): Promise<void> {
   const l = lang ?? readLiteLang()
   const text = demoNoticeText(l)
   const markup = demoNoticeMarkup(demoNoticeButtons(l, demoAccountUrl()))
-  const targets = chatId ? [chatId] : loadAccess().allowFrom
+  const targets = chatId ? [chatId] : firstReplyOwners(loadAccess()) // DIVE-6518: the owner's key, not a guest's
   let sentAny = false
   for (const target of targets) {
     const sent = await bot.api.sendMessage(target, text, markup ? { reply_markup: markup } : {}).catch(err => {

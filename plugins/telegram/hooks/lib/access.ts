@@ -1,4 +1,5 @@
 import { readFileSync } from 'fs'
+import { ownerChatIds } from './owners'
 import { accessFile } from './paths'
 import { trustedChannelTagsForEntry } from './transcript'
 import type { AccessConfig, TranscriptEntry } from './types'
@@ -11,11 +12,10 @@ export function loadAccess(): AccessConfig {
   }
 }
 
-export function getAllowedChatIds(access?: AccessConfig): string[] {
-  const a = access ?? loadAccess()
-  const allow = a.allowFrom ?? []
-  const groups = a.groups ? Object.keys(a.groups) : []
-  return [...allow, ...groups]
+// DIVE-6518: where an owner-only notice goes when no caller chat names one (an
+// autonomous turn). Every such notice reads this, never allowFrom directly.
+export function getOwnerChatIds(access?: AccessConfig): string[] {
+  return ownerChatIds(access ?? loadAccess())
 }
 
 // A chat to notify, plus the optional forum-topic it should land in.
