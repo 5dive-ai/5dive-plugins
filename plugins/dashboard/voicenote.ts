@@ -14,6 +14,12 @@
 // which the voice engine installs), and the OGG is kept when that fails. A
 // voice note may go with no text, as on Telegram (DIVE-5490); the control plane
 // needs a body, so it gets VOICE_ONLY_BODY, which the web chat does not draw.
+//
+// DIVE-6550: the web chat drew each agent note's length by downloading the
+// note the moment the chat opened, so N notes cost N downloads through the box
+// on every open. The note's length now travels in its FILE NAME (".len-12.4s.mp3"),
+// because the root relay builds a reply's metadata itself (chat_id and files
+// only): the name is the one field that reaches the web on every seat.
 
 const AUDIO_RE = /\.(webm|ogg|oga|opus|m4a|mp4|mp3|wav|aac|flac)$/i
 const OPUS_RE = /\.(ogg|oga|opus)$/i
@@ -53,5 +59,34 @@ export async function webPlayable(path: string, run: Run, ffmpeg = 'ffmpeg'): Pr
     return mp3
   } catch {
     return path
+  }
+}
+
+const LEN_RE = /\.len-(\d{1,5}(?:\.\d)?)s(\.[a-z0-9]+)$/i
+
+/** The note's path with its length in the name, before the extension: a.mp3 -> a.len-12.4s.mp3. */
+export function withLengthName(path: string, seconds: number): string {
+  const dot = path.lastIndexOf('.')
+  if (dot <= path.lastIndexOf('/') || !(seconds > 0) || LEN_RE.test(path)) return path
+  return `${path.slice(0, dot)}.len-${Math.round(seconds * 10) / 10}s${path.slice(dot)}`
+}
+
+/** The length a note's name carries, or null (the web chat reads the same tag). */
+export function lengthFromName(path: string): number | null {
+  const m = LEN_RE.exec(path)
+  const s = m ? Number(m[1]) : NaN
+  return s > 0 ? s : null
+}
+
+export type Probe = (bin: string, args: string[], timeoutMs: number) => Promise<string>
+
+/** An audio file's length in seconds, read by `probe` (ffprobe), or null when it cannot say. */
+export async function audioSeconds(path: string, probe: Probe, ffprobe = 'ffprobe'): Promise<number | null> {
+  try {
+    const out = await probe(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path], 10_000)
+    const s = Number(out.trim())
+    return Number.isFinite(s) && s > 0 ? s : null
+  } catch {
+    return null
   }
 }
