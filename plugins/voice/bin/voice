@@ -44,6 +44,7 @@ usage() {
   sudo 5dive voice backend openrouter  # hearing and speaking run on OpenRouter
   5dive voice config [--json]          # every setting and its current value
   5dive voice config get <key>
+  5dive voice hear <path> [--json]     # transcribe a web-chat voice note (DIVE-6544)
   sudo 5dive voice config set <key> <value>
   sudo 5dive voice config init <key>=<value>...   # only on a box with no config yet
   5dive voice --help
@@ -487,11 +488,88 @@ cmd_status() {
   printf '\nReady. Send your agent a voice message and it will hear you.\n'
 }
 
+# ---- hear: the web chat's voice note, heard on this box (DIVE-6544) ------
+#
+# The web chat (my.5dive.ai) records a voice note, lands it on the box through
+# the files API under /home/claude/chat-uploads/<agent>/, and asks the box to
+# hear it over the exec route, which runs `sudo 5dive <args>`. That is the one
+# path the browser has to the box that answers with a value, and the transcript
+# has to come back: it is shown under the voice bubble and sent as the
+# message's text, so the agent reads words, not a file it must decode first.
+#
+# Hearing is 5dive-transcribe, unchanged: the same backend switch as a Telegram
+# note (local whisper by default; OpenRouter only where the owner chose it).
+# Exec runs as root, so the transcriber runs as `claude` (the user the files
+# API wrote the note as) and only on a regular file under the uploads root:
+# root never decodes an arbitrary path a browser named.
+VOICE_HEAR_ROOT="${VOICE_HEAR_ROOT:-/home/claude/chat-uploads}"
+VOICE_TRANSCRIBE_BIN="${VOICE_TRANSCRIBE_BIN:-/usr/local/bin/5dive-transcribe}"
+VOICE_HEAR_MAX_BYTES="${VOICE_HEAR_MAX_BYTES:-26214400}"
+
+hear_out() {
+  # hear_out <json 0|1> ok <text>  |  hear_out <json 0|1> err <class> <message>
+  local json="$1" kind="$2"
+  if [[ "$kind" == ok ]]; then
+    if (( json )); then jq -cn --arg t "$3" '{ok: true, data: {text: $t}}'; else printf '%s\n' "$3"; fi
+    return 0
+  fi
+  if (( json )); then jq -cn --arg c "$3" --arg m "$4" '{ok: false, error: {code: 1, class: $c, message: $m}}'
+  else printf '5dive voice: %s\n' "$4" >&2; fi
+  return 1
+}
+
+cmd_hear() {
+  local json=0 path=""
+  # Spelled as an if on purpose: the config job's negative control greps for
+  # config's own one-line spelling of this read to prove the mutation landed.
+  if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then json=1; fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --) shift; path="${1:-}"; break ;;
+      -*) hear_out "$json" err usage "unknown flag $1 (want: 5dive voice hear <path>)"; exit 64 ;;
+      *) path="$1"; shift ;;
+    esac
+  done
+  [[ -n "$path" ]] || { hear_out "$json" err usage "which note? (want: 5dive voice hear <path>)"; exit 64; }
+
+  local root real
+  root="$(realpath -e -- "$VOICE_HEAR_ROOT" 2>/dev/null)" \
+    || { hear_out "$json" err not_found "no voice notes on this box yet ($VOICE_HEAR_ROOT is missing)"; exit 1; }
+  real="$(realpath -e -- "$path" 2>/dev/null)" \
+    || { hear_out "$json" err not_found "no such note: $path"; exit 1; }
+  # Resolved, so a symlink or a ../ inside the root cannot point root at a file
+  # outside it.
+  [[ "$real" == "$root"/* && -f "$real" && ! -L "$path" ]] \
+    || { hear_out "$json" err refused "only a note under $VOICE_HEAR_ROOT is heard"; exit 1; }
+  local size
+  size="$(stat -c %s -- "$real" 2>/dev/null || echo 0)"
+  (( size > 0 )) || { hear_out "$json" err empty "the note is empty"; exit 1; }
+  (( size <= VOICE_HEAR_MAX_BYTES )) || { hear_out "$json" err too_big "the note is too long to hear"; exit 1; }
+  [[ -x "$VOICE_TRANSCRIBE_BIN" ]] \
+    || { hear_out "$json" err engine_missing "the voice engine is not installed on this box ($SETUP_CMD)"; exit 1; }
+
+  local out rc err
+  err="$(mktemp)"
+  if [[ $EUID -eq 0 ]] && id claude >/dev/null 2>&1; then
+    out="$(runuser -u claude -- "$VOICE_TRANSCRIBE_BIN" -- "$real" 2>"$err")"; rc=$?
+  else
+    out="$("$VOICE_TRANSCRIBE_BIN" -- "$real" 2>"$err")"; rc=$?
+  fi
+  local why; why="$(tail -n 3 "$err" | tr '\n' ' ')"; rm -f "$err"
+  out="$(printf '%s' "$out" | tr -s '[:space:]' ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if (( rc != 0 )) || [[ -z "$out" ]]; then
+    hear_out "$json" err unheard "the note could not be heard${why:+: $why}"; exit 1
+  fi
+  hear_out "$json" ok "$out"
+}
+
 case "${1:-}" in
   -h|--help|help) usage; exit 0 ;;
   "")             cmd_status ;;
   backend)        shift; cmd_backend "${1:-}" ;;
   setup)          shift; cmd_setup "$@" ;;
   config)         shift; cmd_config "$@" ;;
+  hear)           shift; cmd_hear "$@" ;;
   *)              printf 'unknown: 5dive voice %s (see: 5dive voice --help)\n' "$1" >&2; exit 64 ;;
 esac

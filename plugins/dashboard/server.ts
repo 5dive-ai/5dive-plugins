@@ -36,6 +36,7 @@ import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
+import { inboundAttachment, replyBody, webPlayable, type Run } from './voicenote.ts'
 import {
   loadPendingRetryState,
   nextPendingAttempt,
@@ -333,6 +334,8 @@ const mcp = new Server(
       'Replies to source="dashboard" messages must use THIS reply tool, never the telegram one — each channel routes to its own surface.',
       '',
       'If channels are off in this session, a dashboard message is typed into the session instead, behind a "[dashboard] Inbound 5dive dashboard chat message" line, as the same <channel> tag. Answer it the same way: this reply tool, with its chat_id.',
+      '',
+      'Voice notes: a message whose text starts with "[voice note]" was SPOKEN by the user in the web chat; the rest of the text is its transcript, made on this box. If the tag has attachment_kind="voice" and audio_path instead, the note was not heard yet: run `5dive-transcribe <audio_path>` and answer what it says. Either way it is a voice note, so answer it the way your Voice instructions answer a Telegram voice note: your text reply first, then a voice note made with `5dive-speak "<text>"`, sent as a second reply with that file in files (text may be empty then). A typed message gets text only.',
     ].join('\n'),
   },
 )
@@ -425,7 +428,8 @@ async function deliverInbound(id: string, text: string, meta: Record<string, unk
     id,
     text,
     route: { source: 'dashboard', chat_id: String(meta.chat_id ?? 'dashboard') },
-    ...(typeof meta.image_path === 'string' ? { image_path: meta.image_path } : {}),
+    ...(typeof meta.image_path === 'string' ? { image_path: meta.image_path }
+      : typeof meta.audio_path === 'string' ? { image_path: meta.audio_path } : {}),
     received_at: meta.ts,
   })
 }
@@ -463,8 +467,7 @@ function ingestInboxFile(name: string): void {
         user: from,
         user_id: from,
         ts: typeof obj?.ts === 'string' && obj.ts ? obj.ts : new Date().toISOString(),
-        ...(typeof obj?.image_path === 'string' && obj.image_path.startsWith('/')
-          ? { image_path: obj.image_path } : {}),
+        ...inboundAttachment(obj?.image_path),
   }).catch(err => {
     process.stderr.write(`dashboard channel: failed to deliver inbound to Claude: ${err}\n`)
   })
@@ -652,8 +655,7 @@ async function drainPendingOnce(): Promise<void> {
             user_id: m.from ?? 'dashboard',
             ts: m.ts ?? new Date().toISOString(),
             ...pendingDeliveryMeta(decision),
-            ...(typeof m.image_path === 'string' && m.image_path.startsWith('/')
-              ? { image_path: m.image_path } : {}),
+            ...inboundAttachment(m.image_path),
       })
       recordLifecycle(
         STATE_DIR,
@@ -710,7 +712,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'reply',
       description:
         'Reply in the 5dive dashboard chat. Pass chat_id from the inbound message (normally "dashboard"). ' +
-        'Optionally pass files (absolute paths on this box) to offer as downloads in the chat.',
+        'Optionally pass files (absolute paths on this box) to offer as downloads in the chat. ' +
+        'An audio file (a voice note from 5dive-speak) plays in the chat; with files attached, text may be empty.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -722,15 +725,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'Absolute file paths on this box to attach as downloadable files.',
           },
         },
-        required: ['chat_id', 'text'],
+        required: ['chat_id'],
       },
     },
   ],
 }))
 
+const FFMPEG = process.env.DASHBOARD_FFMPEG ?? (['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'].find(p => existsSync(p)) ?? 'ffmpeg')
+const runFile: Run = async (bin, args, timeoutMs) => { await promisify(execFile)(bin, args, { timeout: timeoutMs }) }
+
 async function sendDashboardReply(args: { chat_id?: unknown; text?: unknown; files?: unknown }): Promise<string> {
-  const text = typeof args.text === 'string' ? args.text : ''
-  if (!text.trim()) throw new Error('text is required')
+  const rawText = typeof args.text === 'string' ? args.text : ''
   const chatId = typeof args.chat_id === 'string' && args.chat_id ? args.chat_id : 'dashboard'
   // Attached files must be readable by the dashboard's file server, which
   // runs as the `claude` user — a path inside this agent's 0700 home dir
@@ -741,7 +746,7 @@ async function sendDashboardReply(args: { chat_id?: unknown; text?: unknown; fil
   const rawFiles = Array.isArray(args.files)
     ? args.files.filter((f): f is string => typeof f === 'string' && f.startsWith('/')).slice(0, 10)
     : []
-  const files = rawFiles.map(f => {
+  const copied = rawFiles.map(f => {
     try {
       const dest = join(OUTBOX_DIR, `${AGENT}-${Date.now()}-${f.split('/').pop() ?? 'file'}`)
       copyFileSync(f, dest)
@@ -752,6 +757,14 @@ async function sendDashboardReply(args: { chat_id?: unknown; text?: unknown; fil
       return f
     }
   })
+  // DIVE-6544: a voice note goes to the web as an MP3 a browser plays (voicenote.ts).
+  const files = await Promise.all(copied.map(async f => {
+    if (!f.startsWith(`${OUTBOX_DIR}/`)) return f
+    const web = await webPlayable(f, runFile, FFMPEG)
+    if (web !== f) { try { chmodSync(web, 0o664) } catch {} }
+    return web
+  }))
+  const text = replyBody(rawText, files)
 
   // DIVE-5894: the relay attaches only a copy in the outbox (root refuses any
   // other path), so a file whose copy failed is left off rather than failing
