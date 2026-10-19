@@ -95,13 +95,14 @@ afterEach(() => {
 
 // access.json in the isolated HOME: one paired DM plus one group with a topic —
 // the shape both measured seats actually carry.
-function writeAccess(opts: { group?: boolean; extraDm?: boolean } = {}) {
+function writeAccess(opts: { group?: boolean; extraDm?: boolean; owners?: string[] } = {}) {
   const dir = stateDirFor(home)
   mkdirSync(dir, { recursive: true })
   const access: Record<string, unknown> = {
     dmPolicy: 'pairing',
     allowFrom: opts.extraDm ? [OPERATOR_DM, SECOND_DM] : [OPERATOR_DM],
   }
+  if (opts.owners) access.owners = opts.owners
   if (opts.group !== false) {
     access.groups = { [GROUP]: { requireMention: false, allowFrom: [OPERATOR_DM], message_thread_id: Number(TOPIC) } }
   }
@@ -110,7 +111,7 @@ function writeAccess(opts: { group?: boolean; extraDm?: boolean } = {}) {
 
 // caller: a telegram inbound in the transcript (the main shape).
 // autonomous: no inbound at all (the olivia shape) — getCallerChat returns null.
-function writeTranscript(kind: 'caller' | 'autonomous'): string {
+function writeTranscript(kind: 'caller' | 'autonomous', chat: string = OPERATOR_DM): string {
   const p = join(home, `transcript-${kind}.jsonl`)
   const line =
     kind === 'caller'
@@ -118,7 +119,7 @@ function writeTranscript(kind: 'caller' | 'autonomous'): string {
           type: 'user',
           message: {
             role: 'user',
-            content: `<channel source="plugin:telegram:telegram" chat_id="${OPERATOR_DM}" message_id="1" user="op">status?</channel>`,
+            content: `<channel source="plugin:telegram:telegram" chat_id="${chat}" message_id="1" user="op">status?</channel>`,
           },
         })
       : JSON.stringify({ type: 'user', message: { role: 'user', content: 'heartbeat: continue the queue' } })
@@ -140,7 +141,7 @@ function stateDirFor(h: string): string {
 // ENV FIRST — and we spread ...process.env into the child. So any ambient
 // TELEGRAM_STATE_DIR in the parent bun process outranked the temp HOME, the
 // hook read an access.json that was not there, getGroupTopics() and
-// getAllowedChatIds() both came back empty, and it took
+// the owner DMs both came back empty, and it took
 // `route=all-allowed targets=(none)`. In CI another file in the same process
 // had set it at module scope (test/resume-prompt.test.ts) and four arms went
 // red; alone they were green. An arm whose verdict depends on what else ran is
@@ -319,7 +320,7 @@ describe('DIVE-4401 send/route leg', () => {
   // ---------------------------------------------------------------------
   test('the routing config IS read on a caller turn: a failed send falls back to the other paired DM', async () => {
     const base = await startStub('reject-first')
-    // DM-only: getAllowedChatIds() returns the group ids too, and a group in
+    // DM-only: the fallback once read the group ids too, and a group in
     // the fallback list would blur the count this arm turns on.
     writeAccess({ group: false, extraDm: true })
     const r = fireHook(TEAM_MSG, writeTranscript('caller'), base)
@@ -364,9 +365,70 @@ describe('DIVE-4401 send/route leg', () => {
     expect(r.code).toBe(0)
     expect(calls().length).toBe(0)
     expect(r.stderr).toContain('ratelimit dedup: SEND')
-    expect(r.stderr).toContain('route=all-allowed targets=(none)')
+    expect(r.stderr).toContain('route=owners targets=(none)')
     expect(r.stderr).toContain('no paired chat configured — usage-limit notice NOT sent (lost)')
     rmSync(emptyState, { recursive: true, force: true })
+  }, T)
+})
+
+// ---------------------------------------------------------------------------
+// DIVE-6518: a usage limit is the seat OWNER's notice. The measured shape is
+// exact-swallow's ceo: allowFrom = the owner plus a guest, owners = the owner,
+// no group. On an autonomous turn the notice went to both.
+// ---------------------------------------------------------------------------
+describe('DIVE-6518 owner-only routing on an autonomous turn', () => {
+  const T = 30000
+
+  test('owners set: only the owner gets the notice, the guest gets nothing', async () => {
+    const base = await startStub()
+    writeAccess({ group: false, extraDm: true, owners: [OPERATOR_DM] })
+    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    expect(r.code).toBe(0)
+    const c = calls()
+    expect(c.map(x => x.chatId)).toEqual([OPERATOR_DM])
+    expect(c[0].text).toMatch(/Usage limit hit/)
+    expect(r.stderr).toContain(`route=owners targets=${OPERATOR_DM}`)
+  }, T)
+
+  // Old pairings have no owners record: everyone in allowFrom, as before.
+  test('owners absent: every allowed DM still gets it', async () => {
+    const base = await startStub()
+    writeAccess({ group: false, extraDm: true })
+    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    expect(r.code).toBe(0)
+    expect(calls().map(x => x.chatId).sort()).toEqual([OPERATOR_DM, SECOND_DM])
+  }, T)
+
+  // An owner id the bot no longer allows is not a destination.
+  test('an owner outside allowFrom is not messaged', async () => {
+    const base = await startStub()
+    writeAccess({ group: false, owners: [SECOND_DM] })
+    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    expect(r.code).toBe(0)
+    expect(calls().length).toBe(0)
+    expect(r.stderr).toContain('route=owners targets=(none)')
+  }, T)
+
+  // A turn the guest started still answers the guest.
+  test('a turn from the guest chat still answers that chat', async () => {
+    const base = await startStub()
+    writeAccess({ group: false, extraDm: true, owners: [OPERATOR_DM] })
+    const r = fireHook(TEAM_MSG, writeTranscript('caller', SECOND_DM), base)
+    expect(r.code).toBe(0)
+    expect(calls().map(x => x.chatId)).toEqual([SECOND_DM])
+    expect(r.stderr).toContain(`route=caller targets=${SECOND_DM}`)
+  }, T)
+
+  // The total-failure fallback is owner-only too: the group topic failed, the
+  // retry goes to the owner's DM and not the guest's.
+  test('a failed topic send falls back to the owner only', async () => {
+    const base = await startStub('reject-first')
+    writeAccess({ extraDm: true, owners: [OPERATOR_DM] })
+    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    expect(r.code).toBe(0)
+    const c = calls()
+    expect(c.map(x => x.chatId)).toEqual([GROUP, OPERATOR_DM])
+    expect(r.stderr).toContain(`falling back to ${OPERATOR_DM}\n`)
   }, T)
 })
 

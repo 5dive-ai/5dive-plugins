@@ -40,6 +40,8 @@ export type TranscriptEntry = {
 
 export type AccessConfig = {
   allowFrom?: string[]
+  // DIVE-5867: the paired owner(s), first id paired. Absent on old pairings.
+  owners?: string[]
   groups?: Record<string, unknown>
   pending?: Record<string, unknown>
 }
