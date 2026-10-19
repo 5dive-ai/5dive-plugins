@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Added — dashboard 0.5.0 + voice 1.10.0: voice notes in the web chat, both ways (DIVE-6544)
+
+lodar, 2026-10-19: "our web chat doesnt support voice notes?". The front page shows a customer sending a voice note and the agent answering in voice; Telegram does that, and the web chat carried text only.
+
+The web chat records a note, lands it on the box under `/home/claude/chat-uploads/<agent>/`, and asks the box to hear it with the new `5dive voice hear <path>`, over the exec route the dashboard already uses. The verb runs `5dive-transcribe` as `claude`, only on a regular file under that root, and answers `{ok, data: {text}}`. The message then goes with its transcript as the text, behind a `[voice note]` line, so the agent reads words. A note the box could not hear (no voice engine, an older plugin) also carries its audio path, and the dashboard channel now hands an audio path to the session as `attachment_kind="voice"` with `audio_path`, never as an `image_path` to Read; the agent hears it with `5dive-transcribe`. The channel's instructions say a voice note is answered like a Telegram one: text first, then a `5dive-speak` note.
+
+A reply's OGG/Opus note goes to the web as an MP3 beside it (ffmpeg, which the voice engine installs), because Safari may not play OGG; the OGG goes when the conversion fails. A reply may now carry files and no text, as on Telegram (DIVE-5490); the control plane needs a body, so a voice note sent alone carries "🎙", which the web chat does not draw. `test/dive6544-dashboard-voice-notes.test.ts` covers both directions through the root relay; its three process arms fail on 0.4.9.
+
 ### Fixed — telegram 0.5.100: a usage-limit notice on an autonomous turn goes to the seat's owner, not to every allowed chat (DIVE-6518)
 
 On 2026-10-19 lodar reported that a customer's ceo seat sent "Usage limit hit" to both people allowed to message its bot, not just to him. A turn the task engine starts has no Telegram message in it, so the stop-failure hook had no chat to answer, and on a seat with no group it sent the notice to all of `allowFrom`. The guest the owner allowed to chat with the agent got the owner's usage-limit notice, and its resume follow-up as well.
