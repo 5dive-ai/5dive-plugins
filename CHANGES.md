@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.1: a web voice note is answered faster, and an answered message is not pushed back into the session (DIVE-6549)
+
+lodar, 2026-10-19: "with live chat every second counts". Measured on a 2-vCPU customer box, a web voice note took a median 34 s from landing to a voice reply. Three of the costs were in this plugin.
+
+Every inbound waited for the inbox sweep: none of ten notes came in on the file watch, so each sat for up to 15 s. The sweep now runs every second (`DASHBOARD_INBOX_SWEEP_MS`), a watch that errors is re-armed, and `lifecycle.log` says which path delivered each drop (`drop <file> delivered via=watch|sweep`).
+
+Every message the drop delivered live came back from `/pending` once its collect TTL ran out and was pushed into the session again, a new model turn each time (the ten notes, four times each so far). The drop and `/pending` describe a message with the same `chat_id` and `ts`, so the plugin now records each live delivery in `delivered-live.json` for a day and acks a re-offer of it without pushing it. 5dive-api's half of the same fix stops the re-offers once the agent has replied.
+
+Answering a voice note took three model rounds: the text reply, `5dive-speak`, then a second reply with the file. The reply tool now takes `voice: true`. The text goes first, then the plugin runs `5dive-speak` itself and sends the note as an MP3. If the note cannot be made, the tool result says `VOICE NOTE NOT SENT` and why, and the text has already gone. If the owner turned voice replies off, the result says so and asks the agent not to mention voice. The channel's instructions now say: answer a voice note first, before any memory, journal or Telegram lookups, in one reply with `voice: true`, in one to three spoken sentences. `test/dive6549-dashboard-voice-speed.test.ts` covers this; its four process arms fail on 0.5.0.
+
 ### Added — dashboard 0.5.0 + voice 1.10.0: voice notes in the web chat, both ways (DIVE-6544)
 
 lodar, 2026-10-19: "our web chat doesnt support voice notes?". The front page shows a customer sending a voice note and the agent answering in voice; Telegram does that, and the web chat carried text only.

@@ -43,6 +43,7 @@ import {
   observePendingOffer,
   savePendingRetryState,
  pendingDeliveryMeta } from './pending-redelivery.ts'
+import { deliveredLive, liveKey, loadLiveDeliveries, recordLiveDelivery, saveLiveDeliveries } from './livedelivery.ts'
 
 let PLUGIN_VERSION = '?'
 try {
@@ -75,6 +76,16 @@ const COLLECT_NOW_DIR = join(STATE_DIR, 'collect-now')
 // race, and it is scope 3 of this row.
 const DRAIN_LOCK = join(STATE_DIR, 'pending-drain.lock')
 const PENDING_RETRY_FILE = join(STATE_DIR, 'pending-redelivery.json')
+const LIVE_DELIVERY_FILE = join(STATE_DIR, 'delivered-live.json')
+// DIVE-6549: how often the inbox is swept besides the watch. It was 15 s, and on
+// exact-swallow (2026-10-19) all ten web-chat notes came in on the sweep and
+// none on the watch: a median 4.2 s and up to 14 s before the session saw the
+// message, in a chat where every second counts. A sweep is one readdir of a dir
+// that is nearly always empty, so 1 s costs nothing.
+const INBOX_SWEEP_MS = (() => {
+  const raw = Number(process.env.DASHBOARD_INBOX_SWEEP_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 1_000
+})()
 const PENDING_RETRY_BASE_MS = (() => {
   const raw = Number(process.env.DASHBOARD_REDELIVERY_BACKOFF_MS)
   return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60_000
@@ -335,7 +346,7 @@ const mcp = new Server(
       '',
       'If channels are off in this session, a dashboard message is typed into the session instead, behind a "[dashboard] Inbound 5dive dashboard chat message" line, as the same <channel> tag. Answer it the same way: this reply tool, with its chat_id.',
       '',
-      'Voice notes: a message whose text starts with "[voice note]" was SPOKEN by the user in the web chat; the rest of the text is its transcript, made on this box. If the tag has attachment_kind="voice" and audio_path instead, the note was not heard yet: run `5dive-transcribe <audio_path>` and answer what it says. Either way it is a voice note, so answer it the way your Voice instructions answer a Telegram voice note: your text reply first, then a voice note made with `5dive-speak "<text>"`, sent as a second reply with that file in files (text may be empty then). A typed message gets text only.',
+      'Voice notes: a message whose text starts with "[voice note]" was SPOKEN by the user in the web chat; the rest of the text is its transcript, made on this box. If the tag has attachment_kind="voice" and audio_path instead, the note was not heard yet: run `5dive-transcribe <audio_path>` and answer what it says. Either way it is a voice note and the user is waiting in a live conversation: reply FIRST, before any other tool (no memory, journal or Telegram lookups unless the note asks for them), with ONE reply call that sets voice: true. That sends your text and then speaks it as a voice note made on this box, so do not run 5dive-speak yourself. Keep that reply short and spoken: one to three sentences, no lists, links or code. A typed message gets text only.',
     ].join('\n'),
   },
 )
@@ -444,7 +455,7 @@ async function deliverInbound(id: string, text: string, meta: Record<string, unk
 //     "image_path": "/abs/path" }   // optional uploaded-file path on this box
 // Writers MUST write atomically — temp name, then rename to `*.json` — so the
 // watcher never reads a half-written file (shelld's /shell/inbox does this).
-function ingestInboxFile(name: string): void {
+function ingestInboxFile(name: string, via: 'boot' | 'watch' | 'sweep'): void {
   if (!name.endsWith('.json')) return
   const full = join(AGENT_INBOX_DIR, name)
   let raw: string
@@ -461,13 +472,25 @@ function ingestInboxFile(name: string): void {
     process.stderr.write(`dashboard channel: agent-inbox file ${name} has no text\n`); return
   }
   const from = typeof obj?.from === 'string' && obj.from ? obj.from : 'dashboard'
+  const chatId = typeof obj?.chat_id === 'string' && obj.chat_id ? obj.chat_id : 'dashboard'
+  const ts = typeof obj?.ts === 'string' && obj.ts ? obj.ts : new Date().toISOString()
   void deliverInbound(`dashboard:drop:${name}`, text, {
-        chat_id: typeof obj?.chat_id === 'string' && obj.chat_id ? obj.chat_id : 'dashboard',
+        chat_id: chatId,
         message_id: '0',
         user: from,
         user_id: from,
-        ts: typeof obj?.ts === 'string' && obj.ts ? obj.ts : new Date().toISOString(),
+        ts,
         ...inboundAttachment(obj?.image_path),
+  }).then(() => {
+    // DIVE-6549: which path picked it up, so a slow inbox is diagnosable, and
+    // the record that keeps /pending's later re-offer of it out of the session.
+    recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `drop ${name} delivered via=${via}`)
+    const key = liveKey(chatId, ts)
+    if (key) {
+      const live = loadLiveDeliveries(LIVE_DELIVERY_FILE)
+      recordLiveDelivery(live, key, Date.now())
+      saveLiveDeliveries(LIVE_DELIVERY_FILE, live)
+    }
   }).catch(err => {
     process.stderr.write(`dashboard channel: failed to deliver inbound to Claude: ${err}\n`)
   })
@@ -478,15 +501,26 @@ function ingestInboxFile(name: string): void {
 // a duplicate event is a harmless no-op and a missed event is caught by the
 // periodic sweep below (belt and braces — inotify can drop under pressure).
 function startAgentInbox(): void {
-  const drain = () => { try { for (const f of readdirSync(AGENT_INBOX_DIR)) ingestInboxFile(f) } catch {} }
-  drain()
-  try {
-    watch(AGENT_INBOX_DIR, (_evt, fname) => { if (fname) ingestInboxFile(String(fname)) })
-    process.stderr.write(`dashboard channel v${PLUGIN_VERSION}: watching agent-inbox at ${AGENT_INBOX_DIR}\n`)
-  } catch (err) {
-    process.stderr.write(`dashboard channel: agent-inbox watch failed: ${err}\n`)
+  const drain = (via: 'boot' | 'sweep') => {
+    try { for (const f of readdirSync(AGENT_INBOX_DIR)) ingestInboxFile(f, via) } catch {}
   }
-  setInterval(drain, 15_000).unref()
+  drain('boot')
+  // DIVE-6549: a watch that errors is re-armed instead of left dead.
+  const arm = () => {
+    try {
+      const w = watch(AGENT_INBOX_DIR, (_evt, fname) => { if (fname) ingestInboxFile(String(fname), 'watch') })
+      w.on('error', err => {
+        process.stderr.write(`dashboard channel: agent-inbox watch error, re-arming: ${err}\n`)
+        try { w.close() } catch {}
+        setTimeout(arm, 5_000).unref()
+      })
+      process.stderr.write(`dashboard channel v${PLUGIN_VERSION}: watching agent-inbox at ${AGENT_INBOX_DIR}\n`)
+    } catch (err) {
+      process.stderr.write(`dashboard channel: agent-inbox watch failed: ${err}\n`)
+    }
+  }
+  arm()
+  setInterval(() => drain('sweep'), INBOX_SWEEP_MS).unref()
 }
 
 // DIVE-3574: watch the collect-now dir and drain on a nudge. The marker is
@@ -624,8 +658,15 @@ async function drainPendingOnce(): Promise<void> {
   }
   if (items.length === 0) return
   const acked: number[] = []
+  const live = loadLiveDeliveries(LIVE_DELIVERY_FILE)
   for (const m of items) {
     if (typeof m?.text !== 'string' || !m.text.trim()) { acked.push(m.id); continue }
+    // DIVE-6549: the drop already put this one in front of the session.
+    if (deliveredLive(live, liveKey(m.chat_id, m.ts))) {
+      recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `pending message id=${m.id} was delivered live; acked, not pushed again`)
+      acked.push(m.id)
+      continue
+    }
     const key = String(m.id)
     const decision = nextPendingAttempt(retryState[key], Date.now(), PENDING_RETRY_BASE_MS)
     if (decision.kind === 'backoff') continue
@@ -713,7 +754,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         'Reply in the 5dive dashboard chat. Pass chat_id from the inbound message (normally "dashboard"). ' +
         'Optionally pass files (absolute paths on this box) to offer as downloads in the chat. ' +
-        'An audio file (a voice note from 5dive-speak) plays in the chat; with files attached, text may be empty.',
+        'An audio file (a voice note from 5dive-speak) plays in the chat; with files attached, text may be empty. ' +
+        'Set voice: true to answer a voice note: the text goes first, then the plugin speaks it and sends that voice note.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -724,6 +766,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: 'Absolute file paths on this box to attach as downloadable files.',
           },
+          voice: {
+            type: 'boolean',
+            description: 'Also speak text as a voice note (made on this box) and send it right after the text. Use it to answer a voice note.',
+          },
         },
         required: ['chat_id'],
       },
@@ -733,8 +779,38 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 const FFMPEG = process.env.DASHBOARD_FFMPEG ?? (['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'].find(p => existsSync(p)) ?? 'ffmpeg')
 const runFile: Run = async (bin, args, timeoutMs) => { await promisify(execFile)(bin, args, { timeout: timeoutMs }) }
+const SPEAK = process.env.DASHBOARD_SPEAK ?? '/usr/local/bin/5dive-speak'
 
-async function sendDashboardReply(args: { chat_id?: unknown; text?: unknown; files?: unknown }): Promise<string> {
+type ReplyArgs = { chat_id?: unknown; text?: unknown; files?: unknown; voice?: unknown }
+
+// DIVE-6549: `voice: true` speaks the reply here, so answering a voice note is
+// one tool call where it was three model rounds (reply, run 5dive-speak, reply
+// again with the file), each 2-3 s on a big model. The text has already gone
+// when this runs, so a voice note that fails costs the voice and never the
+// answer; the agent is told so it can say one line about it (DIVE-6440).
+async function speakReply(text: string, chatId: string): Promise<string> {
+  let ogg = ''
+  try {
+    const { stdout } = await promisify(execFile)(SPEAK, ['--', text], { timeout: 90_000 })
+    ogg = stdout.trim().split('\n').pop() ?? ''
+    if (!ogg.startsWith('/') || !existsSync(ogg)) throw new Error('5dive-speak made no file')
+  } catch (err) {
+    const e = err as { code?: unknown; stderr?: unknown; message?: unknown }
+    // Exit 3: the owner switched voice replies off. Text only, and no apology.
+    if (e.code === 3) return 'voice replies are switched off on this server: the text went, say nothing about voice.'
+    const why = String(e.stderr || e.message || err).trim().split('\n').pop()
+    return `VOICE NOTE NOT SENT (${why}). The text went; say in one line that the voice reply did not work this time.`
+  }
+  try {
+    return `voice note ${await sendDashboardReply({ chat_id: chatId, files: [ogg] })}`
+  } catch (err) {
+    return `VOICE NOTE NOT SENT (${err}). The text went; say in one line that the voice reply did not work this time.`
+  } finally {
+    try { unlinkSync(ogg) } catch {}
+  }
+}
+
+async function sendDashboardReply(args: ReplyArgs): Promise<string> {
   const rawText = typeof args.text === 'string' ? args.text : ''
   const chatId = typeof args.chat_id === 'string' && args.chat_id ? args.chat_id : 'dashboard'
   // Attached files must be readable by the dashboard's file server, which
@@ -789,14 +865,14 @@ async function sendDashboardReply(args: { chat_id?: unknown; text?: unknown; fil
     throw new Error(`dashboard reply failed: control plane returned ${res.status} ${detail.slice(0, 200)}`)
   }
   const j = (await res.json().catch(() => null)) as { id?: number } | null
-  return `sent (id: ${j?.id ?? '?'})`
+  const sentLine = `sent (id: ${j?.id ?? '?'})`
+  if (args.voice !== true || !rawText.trim()) return sentLine
+  return `${sentLine}\n${await speakReply(rawText, chatId)}`
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (req.params.name !== 'reply') throw new Error(`unknown tool: ${req.params.name}`)
-  const result = await sendDashboardReply(
-    (req.params.arguments ?? {}) as { chat_id?: unknown; text?: unknown; files?: unknown },
-  )
+  const result = await sendDashboardReply((req.params.arguments ?? {}) as ReplyArgs)
   return { content: [{ type: 'text', text: result }] }
 })
 
