@@ -36,7 +36,7 @@ import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
-import { audioSeconds, inboundAttachment, isAudioPath, replyBody, webPlayable, withLengthName, type Probe, type Run } from './voicenote.ts'
+import { audioSeconds, inboundAttachment, isAudioPath, isVoiceInbound, replyBody, voicesReply, webPlayable, withLengthName, type Probe, type Run } from './voicenote.ts'
 import {
   loadPendingRetryState,
   nextPendingAttempt,
@@ -85,6 +85,13 @@ const LIVE_DELIVERY_FILE = join(STATE_DIR, 'delivered-live.json')
 const INBOX_SWEEP_MS = (() => {
   const raw = Number(process.env.DASHBOARD_INBOX_SWEEP_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 1_000
+})()
+// DIVE-6579: how often the dispatcher outbox is swept besides the watch. A
+// coalesced or dropped fs.watch event leaves a Codex reply waiting for this
+// sweep; the knob lets a test shorten it instead of racing the watch.
+const DISPATCHER_SWEEP_MS = (() => {
+  const raw = Number(process.env.DASHBOARD_DISPATCHER_SWEEP_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 15_000
 })()
 const PENDING_RETRY_BASE_MS = (() => {
   const raw = Number(process.env.DASHBOARD_REDELIVERY_BACKOFF_MS)
@@ -438,7 +445,7 @@ async function deliverInbound(id: string, text: string, meta: Record<string, unk
   await writeDispatcherInbox(tmp, dest, {
     id,
     text,
-    route: { source: 'dashboard', chat_id: String(meta.chat_id ?? 'dashboard') },
+    route: { source: 'dashboard', chat_id: String(meta.chat_id ?? 'dashboard'), ...(isVoiceInbound(text, meta) ? { voice: true } : {}) },
     ...(typeof meta.image_path === 'string' ? { image_path: meta.image_path }
       : typeof meta.audio_path === 'string' ? { image_path: meta.audio_path } : {}),
     received_at: meta.ts,
@@ -896,7 +903,8 @@ function ingestDispatcherOutbox(name: string): void {
     return
   }
   dispatcherOutboxBusy.add(name)
-  void sendDashboardReply({ chat_id: obj.chat_id, text: obj.text, files: obj.files }).then(() => {
+  void sendDashboardReply({ chat_id: obj.chat_id, text: obj.text, files: obj.files, voice: voicesReply(obj) }).then(result => {
+    if (result.includes('VOICE NOTE NOT SENT')) process.stderr.write(`dashboard channel: dispatcher reply ${name}: ${result.split('\n').pop()}\n`)
     try { unlinkSync(full) } catch {}
   }).catch(err => {
     process.stderr.write(`dashboard channel: dispatcher reply failed for ${name}: ${err}\n`)
@@ -915,7 +923,7 @@ function startDispatcherOutbox(): void {
   } catch (err) {
     process.stderr.write(`dashboard channel: dispatcher outbox watch failed: ${err}\n`)
   }
-  setInterval(drain, 15_000).unref?.()
+  setInterval(drain, DISPATCHER_SWEEP_MS).unref?.()
 }
 
 // DIVE-3752: same gap as buzz — this server ends in long-lived timers with no

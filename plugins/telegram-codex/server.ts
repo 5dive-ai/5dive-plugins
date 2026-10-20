@@ -46,6 +46,7 @@ import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts
 import { ProgressAcks } from './progress.ts'
 import { stripMarkdown } from './plain-text.ts'
 import { dispatcherTurnText, execTranscriber, type AttachmentMeta } from './inbound-media.ts'
+import { speakToFile, voicesReply } from './voice-reply.ts'
 import {
   appendMessage as msglogAppend, formatRecent as msglogFormat, mostRecentChatId as msglogMostRecent,
   readMessages as msglogRead, MSGLOG_MAX_PER_CHAT,
@@ -481,6 +482,8 @@ function enqueueInbound(msg: InboundMsg) {
         source: msg.dispatch_source ?? 'telegram',
         chat_id: msg.chat_id,
         ...(msg.message_thread_id ? { message_thread_id: msg.message_thread_id } : {}),
+        // DIVE-6579: echoed on the answer's outbox file, which is then voiced.
+        ...(msg.attachment?.kind === 'voice' ? { voice: true } : {}),
       },
       ...(msg.image_path ? { image_path: msg.image_path } : {}),
       received_at: msg.ts,
@@ -817,10 +820,26 @@ function ingestDispatcherOutbox(name: string): void {
     logMessage(String(obj.chat_id), 'out', agentName(), plan!.receipt ? `${text}\n[${plan!.receipt}]` : text,
       obj.message_thread_id ? { thread_id: String(obj.message_thread_id) } : {})
     if (plan!.receipt) process.stderr.write(`telegram-codex: dispatcher reply ${name} ${plan!.receipt}\n`)
+    // DIVE-6579: after the text, so a voice note that fails costs the voice and
+    // never the answer, and is never retried (the outbox file is gone).
+    if (voicesReply(obj, files)) await sendSpokenReply(String(obj.chat_id), body, options, name)
   })().catch(err => {
     process.stderr.write(`telegram-codex: dispatcher reply failed for ${name}: ${err}\n`)
     setTimeout(() => ingestDispatcherOutbox(name), 1_000).unref?.()
   }).finally(() => dispatcherOutboxBusy.delete(name))
+}
+
+const SPEAK_BIN = process.env.TELEGRAM_CODEX_SPEAK ?? '/usr/local/bin/5dive-speak'
+async function sendSpokenReply(chat_id: string, text: string, options: Parameters<typeof sendFile>[2], name: string): Promise<void> {
+  let ogg: string | null = null
+  try {
+    ogg = await speakToFile(text, SPEAK_BIN)
+    if (ogg) await sendFile(chat_id, ogg, options)
+  } catch (err) {
+    process.stderr.write(`telegram-codex: dispatcher reply ${name}: voice note not sent: ${err}\n`)
+  } finally {
+    if (ogg) try { unlinkSync(ogg) } catch {}
+  }
 }
 
 function startDispatcherOutbox(): void {

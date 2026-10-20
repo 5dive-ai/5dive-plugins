@@ -38,6 +38,25 @@ export function inboundAttachment(path: unknown): Record<string, string> {
   return { image_path: path }
 }
 
+/** DIVE-6579: an inbound the user spoke: heard on the box ("[voice note]" line) or not yet (attachment_kind="voice"). */
+export function isVoiceInbound(text: string, meta: Record<string, unknown>): boolean {
+  return meta.attachment_kind === 'voice' || text.trimStart().startsWith('[voice note]')
+}
+
+/**
+ * DIVE-6579: a Codex dispatcher reply the adapter voices. Codex never sees the
+ * reply tool, so it cannot set `voice: true` itself: the dashboard puts
+ * `voice: true` on a voice note's route and the dispatcher echoes the route on
+ * every outbox file (a harness may set it explicitly too). Only the answer is
+ * voiced, never commentary (`notify: false`) or an error, and never a reply
+ * that already carries a voice note of its own.
+ */
+export function voicesReply(obj: { voice?: unknown; kind?: unknown; notify?: unknown; files?: unknown }): boolean {
+  if (obj.voice !== true || obj.notify === false) return false
+  if (obj.kind !== undefined && obj.kind !== 'message') return false
+  return !(Array.isArray(obj.files) && obj.files.some(f => typeof f === 'string' && isAudioPath(f)))
+}
+
 /** A reply's body: its text, else a stand-in when files carry the reply alone. Throws when there is neither. */
 export function replyBody(text: string, files: string[]): string {
   if (text.trim()) return text
