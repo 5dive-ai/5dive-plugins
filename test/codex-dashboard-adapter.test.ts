@@ -58,6 +58,8 @@ describe('Codex dashboard adapter end to end', () => {
         ...process.env,
         CODEX_DISPATCHER_ADAPTER: 'dashboard',
         CODEX_DISPATCHER_STATE_DIR: dispatcherState,
+        DASHBOARD_DISPATCHER_SWEEP_MS: '200',
+        DASHBOARD_INBOX_SWEEP_MS: '200',
         DASHBOARD_STATE_DIR: dashboardState,
         DASHBOARD_OUTBOX: sharedOutbox,
         DASHBOARD_API_BASE: `http://127.0.0.1:${api.port}`,
@@ -70,6 +72,8 @@ describe('Codex dashboard adapter end to end', () => {
 
     const dispatcherInbox = join(dispatcherState, 'inbox')
     await waitFor(() => existsSync(dispatcherInbox) && readdirSync(dispatcherInbox).length === 1)
+    // The ack lands after the inbox write, so wait for it rather than read it at once.
+    await waitFor(() => acknowledgements.length > 0)
     expect(acknowledgements).toEqual([[71]])
     const first = JSON.parse(readFileSync(join(dispatcherInbox, readdirSync(dispatcherInbox)[0]!), 'utf8'))
     expect(first).toMatchObject({
@@ -136,6 +140,8 @@ describe('Codex dashboard adapter end to end', () => {
         ...process.env,
         CODEX_DISPATCHER_ADAPTER: 'dashboard',
         CODEX_DISPATCHER_STATE_DIR: dispatcherState,
+        DASHBOARD_DISPATCHER_SWEEP_MS: '200',
+        DASHBOARD_INBOX_SWEEP_MS: '200',
         DASHBOARD_STATE_DIR: dashboardState,
         DASHBOARD_OUTBOX: sharedOutbox,
         DASHBOARD_API_BASE: `http://127.0.0.1:${api.port}`,
@@ -190,7 +196,7 @@ describe('Codex dashboard adapter end to end', () => {
     expect(outbound[2].metadata.files[0]).toMatch(new RegExp(`^${sharedOutbox}/codexdash-.*\\.ogg$`))
 
     // The typed message's answer: text only, nothing spoken.
-    // One at a time: fs.watch can coalesce a burst, and the sweep is 15 s.
+    // One at a time: fs.watch can coalesce a burst; the 200 ms sweep catches what it drops.
     answer('b1', typed.route, 'It is ten.', { kind: 'message', notify: true })
     await waitFor(() => outbound.length === 4)
     // An older dispatcher's answer carries no notify; an error on a voice route is not spoken.
