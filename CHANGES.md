@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.3 + telegram-codex 0.5.36: a Codex agent answers a voice note by voice (DIVE-6579)
+
+lodar, 2026-10-20: "exact-swallow codex-elm cannot send voice back - i see only text response". A Claude agent answers a voice note with one reply that sets `voice: true`. A Codex agent never sees that reply tool: the dispatcher takes its final text and writes it to the outbox, and the adapter sent it as text. So a Codex agent answered every web voice note in text, and every Telegram one too unless it thought of running `5dive-speak` itself.
+
+Now the adapter marks a voice note's route `voice: true` (web: a `[voice note]` message or one carrying a note still to hear; Telegram: a voice message). The dispatcher already echoes the route on every outbox file, and the adapter voices the turn's answer: the text goes first, then a `5dive-speak` note, as on the Claude path. A typed message still gets text only. Commentary, errors, and a reply that already carries a voice note are not spoken; an outbox file may also set `voice` itself. On the web chat, where every message of a turn goes out, the dispatcher now marks commentary `notify: false` and the final answer `notify: true`, so only the answer is spoken. `test/codex-dashboard-adapter.test.ts` runs the web half end to end (it fails on dashboard 0.5.2); `test/dive6579-codex-voice-reply.test.ts` covers the dispatcher and the Telegram bridge.
+
 ### Fixed — dashboard 0.5.1: a web voice note is answered faster, and an answered message is not pushed back into the session (DIVE-6549)
 
 lodar, 2026-10-19: "with live chat every second counts". Measured on a 2-vCPU customer box, a web voice note took a median 34 s from landing to a voice reply. Three of the costs were in this plugin.

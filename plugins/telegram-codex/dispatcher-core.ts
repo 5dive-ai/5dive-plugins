@@ -6,6 +6,12 @@ export type DispatchRoute = {
   source: DispatchSource
   chat_id: string
   message_thread_id?: string
+  /**
+   * DIVE-6579: the inbound was a voice note. The route rides back on every
+   * outbox file, so the adapter voices the answer to it (text in, text out).
+   * Not part of routeKey: a voice note and a typed message share one chat.
+   */
+  voice?: boolean
 }
 
 export type DispatchMessage = {
@@ -1027,7 +1033,11 @@ export class ChannelDispatcher {
         if (!text) return
         const p = this.progress?.turnId === turnId ? this.progress : undefined
         if (!p) {
-          await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message' })
+          // DIVE-6579: no ack to fold commentary into, so every message goes;
+          // `notify` still marks which is the answer (unknown phase: unset).
+          const phase = params?.item?.phase
+          const notify = phase === 'final_answer' ? { notify: true } : phase === 'commentary' ? { notify: false } : {}
+          await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message', ...notify })
           return
         }
         // DIVE-5508: commentary is progress, not a message. It edits the
