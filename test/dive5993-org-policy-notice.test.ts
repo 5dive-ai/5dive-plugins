@@ -14,7 +14,9 @@ import {
   ORG_POLICY_JSON,
   ORG_POLICY_NOTIFIED_FILE,
   ORG_SETTINGS_URL,
+  orgPolicyButton,
 } from '../plugins/telegram/orgpolicy'
+import { createHash } from 'node:crypto'
 
 const MARKER = 'telegram channel: route-marker 4242.1760100000000'
 const dbg = (debug: string) => JSON.stringify({ debug, timestamp: '2026-10-10T18:00:00.000Z', sessionId: 's', cwd: '/x' })
@@ -166,6 +168,33 @@ describe('the words', () => {
   })
 })
 
+// DIVE-6599 (lodar, 2026-10-20: "just make it in Russian if your app is in
+// Russian"): the owner's Telegram language picks it; the English stays as it was.
+describe('the language', () => {
+  const sha = (v: string) => createHash('sha256').update(v).digest('hex')
+  const json = (t: string) => t.match(/<pre><code class="language-json">([\s\S]*?)<\/code><\/pre>/)![1]!
+  test('the English notice is byte-equal to the one before DIVE-6599', () => {
+    expect(sha(orgPolicyText('Ceo <b>'))).toBe('27e5734c5beab62fdcdece72d22209fff1d155295f809cd9900a19187892fec7')
+    expect(sha(orgPolicyText(''))).toBe('85231789ee8e374690bf0728f05f881703b1ca6be368ec30bd644725fa0e5979')
+    expect(orgPolicyText('Ceo', 'en')).toBe(orgPolicyText('Ceo'))
+    expect(orgPolicyButton()).toBe('Open claude.ai')
+  })
+  test('Russian: the whole guide, the name escaped and in quotes, the same JSON byte for byte, no link', () => {
+    const ru = orgPolicyText('Галина <b>', 'ru')
+    expect(ru).toContain('Агент «Галина &lt;b&gt;» пока не слышит ваших сообщений.')
+    expect(ru).toContain('2. Откройте «Organization settings», затем «Claude Code», затем «Managed settings».')
+    expect(ru).toContain('3. Нажмите «Manage».')
+    expect(ru).toContain('5. Перезапустите агента «Галина &lt;b&gt;»: отправьте сюда /restart.')
+    expect(ru).toContain('личный аккаунт Claude (Pro или Max)')
+    expect(ru).toContain('откройте «Account», затем «Switch account».')
+    expect(ru).not.toContain('http')
+    expect(json(ru)).toBe(json(orgPolicyText('Ceo')))
+    expect(ru.split('\n').length).toBe(orgPolicyText('Ceo').split('\n').length)
+    expect(orgPolicyText('', 'ru')).toStartWith('Ваш агент пока не слышит')
+    expect(orgPolicyButton('ru')).toBe('Открыть claude.ai')
+  })
+})
+
 describe('server wiring', () => {
   const src = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram', 'server.ts'), 'utf8')
   test('the active poller re-reads the gate on a timer and hands the decision to the notifier', () => {
@@ -174,9 +203,13 @@ describe('server wiring', () => {
   })
   test('the notice goes out as HTML with the claude.ai button and no FAQ button', () => {
     expect(src).toContain("parse_mode: 'HTML'")
-    expect(src).toContain("reply_markup: new InlineKeyboard().url('Open claude.ai', ORG_SETTINGS_URL),")
+    expect(src).toContain('reply_markup: new InlineKeyboard().url(orgPolicyButton(lang), ORG_SETTINGS_URL),')
     expect(src).not.toContain('Step by step')
     expect(src).not.toContain('docs/faq?q=channelsEnabled')
+  })
+  test("DIVE-6599: the notice reads the owner's chat language, the one the bridge's buttons use", () => {
+    expect(src).toContain('const lang = langOfChat(chat)')
+    expect(src).toContain("orgPolicyText(bot.botInfo?.first_name ?? '', lang)")
   })
   test('the session injector still fires only on refused', () => {
     expect(src).toContain("if (route === 'inject')")

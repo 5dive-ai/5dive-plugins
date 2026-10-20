@@ -60,7 +60,7 @@ import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, r
 import { relayOwnerAskTap } from './owner-ask.ts'
 import { tapContent, tapMeta, tapLogEntry } from './buttontap.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
-import { makeOrgPolicyNotifier, orgPolicyText, ORG_SETTINGS_URL } from './orgpolicy.ts'
+import { makeOrgPolicyNotifier, orgPolicyButton, orgPolicyText, ORG_SETTINGS_URL } from './orgpolicy.ts'
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
@@ -5108,11 +5108,13 @@ const orgPolicyNotice = makeOrgPolicyNotifier({
   dir: STATE_DIR,
   owners: () => firstReplyOwners(loadAccess()),
   send: async chat => {
-    const text = orgPolicyText(bot.botInfo?.first_name ?? '')
+    // DIVE-6599: in the owner's Telegram language.
+    const lang = langOfChat(chat)
+    const text = orgPolicyText(bot.botInfo?.first_name ?? '', lang)
     const sent = await bot.api.sendMessage(Number(chat), text, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
-      reply_markup: new InlineKeyboard().url('Open claude.ai', ORG_SETTINGS_URL),
+      reply_markup: new InlineKeyboard().url(orgPolicyButton(lang), ORG_SETTINGS_URL),
     })
     try {
       const me = (process.env.USER ?? '').replace(/^agent-/, '') || botUsername || 'me'
