@@ -18,6 +18,14 @@
 // DIVE-6057: the whole guide is in the message and there is no link (lodar,
 // 2026-10-12: "give full guide in chat - no links. also suggest to switch to
 // personal account type"). The steps are the 5dive FAQ's channelsEnabled answer.
+//
+// DIVE-6599: the same notice in Russian when the owner writes in Russian (lodar,
+// 2026-10-20: "just make it in Russian if your app is in Russian"). The signal is
+// the message that set the notice off: the web chat's inbound carries no locale,
+// and a Russian UI's owner writes, or speaks into a heard voice note, in
+// Cyrillic. No Cyrillic, or an unheard voice note, reads English. claude.ai has
+// no Russian interface and the 5dive dashboard has none either, so their menu
+// names stay English, in quotes.
 
 import { existsSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -42,7 +50,31 @@ export const ORG_POLICY_JSON = JSON.stringify(
 
 const indent = (v: string) => v.split('\n').map(l => `    ${l}`).join('\n')
 
-export function orgPolicyText(): string {
+export type NoticeLang = 'en' | 'ru'
+
+/** Russian when the inbound's letters are mostly Cyrillic, else English. The
+ *  "[voice note]" tag the box puts on a heard note is not the owner's words. */
+export function noticeLang(text: string): NoticeLang {
+  const words = text.replace(/^\s*\[voice note\]/i, '')
+  const cyr = (words.match(/[\u0400-\u04FF]/g) ?? []).length
+  const lat = (words.match(/[A-Za-z]/g) ?? []).length
+  return cyr > 0 && cyr >= lat ? 'ru' : 'en'
+}
+
+export function orgPolicyText(lang: NoticeLang = 'en'): string {
+  if (lang === 'ru') return [
+    'Я пока не слышу ваших сообщений здесь. В тарифе Claude вашей компании выключен чат с агентами, поэтому то, что вы пишете в этот чат, до меня не доходит.',
+    [
+      'Включить его может администратор вашей организации в Claude:',
+      '1. Войдите в claude.ai под аккаунтом администратора.',
+      '2. Откройте «Organization settings», затем «Claude Code», затем «Managed settings».',
+      '3. Нажмите «Manage».',
+      '4. Вставьте настройки ниже в поле и сохраните. Они включают чат с агентами и перечисляют все плагины чата, потому что список компании блокирует любой плагин, которого в нём нет.',
+      '5. Перезапустите меня кнопкой «Restart» на моей странице в панели 5dive.',
+    ].join('\n'),
+    indent(ORG_POLICY_JSON),
+    'Не получается изменить настройку компании? Тогда переключите меня на личный аккаунт Claude (Pro или Max), где чат с агентами включён по умолчанию: на моей странице в панели 5dive откройте «Account», затем «Switch account».',
+  ].join('\n\n')
   return [
     "I can't hear your messages here yet. Your company's Claude plan has agent chat turned off, so what you type in this chat never reaches me.",
     [
@@ -65,12 +97,12 @@ export const ORG_POLICY_NOTIFIED_FILE = 'org-policy-notified'
 
 export function makeOrgPolicyNotifier(opts: {
   dir: string
-  send: (chat: string) => Promise<void>
+  send: (chat: string, lang: NoticeLang) => Promise<void>
   log: (line: string) => void
-}): (decision: ChannelDecision, chat: string) => Promise<'sent' | 'cleared' | 'none'> {
+}): (decision: ChannelDecision, chat: string, text?: string) => Promise<'sent' | 'cleared' | 'none'> {
   const marker = join(opts.dir, ORG_POLICY_NOTIFIED_FILE)
   let busy = false
-  return async (decision, chat) => {
+  return async (decision, chat, text = '') => {
     if (decision === 'bound') {
       if (!existsSync(marker)) return 'none'
       try { rmSync(marker, { force: true }) } catch {}
@@ -81,7 +113,7 @@ export function makeOrgPolicyNotifier(opts: {
     busy = true
     try {
       try {
-        await opts.send(chat)
+        await opts.send(chat, noticeLang(text))
       } catch (err) {
         opts.log(`dashboard channel: org-policy notice to ${chat} not sent: ${err instanceof Error ? err.message : String(err)}`)
         return 'none'

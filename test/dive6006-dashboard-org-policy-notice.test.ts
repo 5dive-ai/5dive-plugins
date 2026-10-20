@@ -23,7 +23,9 @@ import {
   orgPolicyText,
   ORG_POLICY_NOTIFIED_FILE,
   ORG_POLICY_JSON,
+  noticeLang,
 } from '../plugins/dashboard/orgpolicy'
+import { createHash } from 'node:crypto'
 import * as tg from '../plugins/telegram/orgpolicy'
 
 const MARKER = 'dashboard channel: route-marker 4242.1760150000000'
@@ -128,6 +130,54 @@ describe('the words', () => {
   })
 })
 
+// DIVE-6599 (lodar, 2026-10-20: "just make it in Russian if your app is in
+// Russian"): the language is the inbound's own; the English stays as it was.
+describe('the language', () => {
+  const sha = (v: string) => createHash('sha256').update(v).digest('hex')
+  test('the English notice is byte-equal to the one before DIVE-6599', () => {
+    expect(sha(orgPolicyText())).toBe('87d1de85818f7ce36587e8416b64f263970b0a2708526d86b4ef193a54306744')
+    expect(orgPolicyText('en')).toBe(orgPolicyText())
+  })
+  test('a Cyrillic inbound, typed or a heard voice note, reads Russian; anything else English', () => {
+    expect(noticeLang('привет, ты тут?')).toBe('ru')
+    expect(noticeLang('[voice note] привет')).toBe('ru')
+    expect(noticeLang('проверь claude.ai пожалуйста')).toBe('ru')
+    expect(noticeLang('hello?')).toBe('en')
+    expect(noticeLang('[voice note] (not heard on the box yet: the audio is attached)')).toBe('en')
+    expect(noticeLang('12345')).toBe('en')
+    expect(noticeLang('')).toBe('en')
+  })
+  test('the notifier sends in the language of the message that set it off', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dive6599-n-'))
+    try {
+      const langs: string[] = []
+      const n = makeOrgPolicyNotifier({ dir, send: async (_chat, lang) => { langs.push(lang) }, log: () => {} })
+      expect(await n('org_policy', 'dashboard', 'Галина, ответь')).toBe('sent')
+      expect(await n('bound', 'dashboard')).toBe('cleared')
+      expect(await n('org_policy', 'dashboard', 'are you there?')).toBe('sent')
+      expect(langs).toEqual(['ru', 'en'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  test('the Russian notice: the whole guide, the same JSON byte for byte, no link, the personal-account way out', () => {
+    const ru = orgPolicyText('ru')
+    expect(ru).toContain('Я пока не слышу ваших сообщений здесь.')
+    expect(ru).toContain('1. Войдите в claude.ai под аккаунтом администратора.')
+    expect(ru).toContain('2. Откройте «Organization settings», затем «Claude Code», затем «Managed settings».')
+    expect(ru).toContain('3. Нажмите «Manage».')
+    expect(ru).toContain('5. Перезапустите меня кнопкой «Restart»')
+    expect(ru).toContain('личный аккаунт Claude (Pro или Max)')
+    expect(ru).toContain('откройте «Account», затем «Switch account».')
+    expect(ru).not.toContain('http')
+    expect(ru).not.toContain("can't")
+    const block = (t: string) => t.split('\n\n').find(p => p.trimStart().startsWith('{'))!
+    expect(block(ru)).toBe(block(orgPolicyText()))
+    expect(ru.split('\n\n').length).toBe(orgPolicyText().split('\n\n').length)
+    expect(ru.split('\n').length).toBe(orgPolicyText().split('\n').length)
+  })
+})
+
 // ---- the real server process ------------------------------------------------
 
 const SERVER = join(import.meta.dir, '..', 'plugins', 'dashboard', 'server.ts')
@@ -142,7 +192,7 @@ type Run = { events: Event[]; notifications: number; typed: string; acked: numbe
 // Code "logs" after our marker ('' = no decision yet). Two inbounds: the pending
 // row 77, then a drop-file in agent-inbox once 77 is acked. Every POST to the
 // control plane's /server/messages/event is what the web chat would show.
-async function runServer(decision: string): Promise<Run> {
+async function runServer(decision: string, first = 'hello?'): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), 'dash6006-'))
   const home = join(root, 'home')
   const cwd = join(root, 'proj')
@@ -165,7 +215,7 @@ async function runServer(decision: string): Promise<Run> {
     async fetch(req) {
       const url = new URL(req.url)
       if (url.pathname === '/server/messages/pending') {
-        return Response.json({ pending: acked.includes(77) ? [] : [{ id: 77, text: 'hello?', chat_id: 'chat-owner-1', from: 'owner', ts: '2026-10-11T05:30:00.000Z' }] })
+        return Response.json({ pending: acked.includes(77) ? [] : [{ id: 77, text: first, chat_id: 'chat-owner-1', from: 'owner', ts: '2026-10-11T05:30:00.000Z' }] })
       }
       if (url.pathname === '/server/messages/pending/ack') {
         const { ids } = (await req.json()) as { ids: number[] }
@@ -273,6 +323,13 @@ describe.skipIf(!hasTmux)('the real plugin process', () => {
       expect(r.lifecycle).toContain('channels off by org policy; told the owner in chat chat-owner-1')
     }, 60_000)
   }
+
+  // DIVE-6599: the server hands the inbound's words to the notifier.
+  test('a Russian first message → the notice in Russian', async () => {
+    const r = await runServer(ORG_POLICY, 'Галина, ты меня слышишь?')
+    expect(r.events.length).toBe(1)
+    expect(r.events[0]!.body).toBe(orgPolicyText('ru'))
+  }, 60_000)
 
   for (const [name, line] of [['bound', REGISTERED], ['refused', REFUSED], ['an unknown skip', NOT_IN_LIST], ['no decision', '']] as const) {
     test(`${name} → no notice`, async () => {

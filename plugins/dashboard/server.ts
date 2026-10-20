@@ -381,10 +381,11 @@ let lastRouteNoted = ''
 // DIVE-6006: a Claude Team/Enterprise org with channels off (or an org allowlist
 // without this plugin) drops every web-chat message unheard. Never typed around
 // (the org's own choice); the owner is told ONCE, in the chat they just wrote in,
-// through the reply path, which is not gated. See orgpolicy.ts.
+// through the reply path, which is not gated, in the language they wrote in
+// (DIVE-6599). See orgpolicy.ts.
 const orgPolicyNotice = makeOrgPolicyNotifier({
   dir: STATE_DIR,
-  send: async chat => { await sendDashboardReply({ chat_id: chat, text: orgPolicyText() }) },
+  send: async (chat, lang) => { await sendDashboardReply({ chat_id: chat, text: orgPolicyText(lang) }) },
   log: line => {
     process.stderr.write(line + '\n')
     recordLifecycle(STATE_DIR, 'delivery', 'dashboard', line.replace(/^dashboard channel: /, ''))
@@ -405,7 +406,7 @@ async function deliverToSession(text: string, meta: Record<string, unknown>): Pr
     process.stderr.write(`dashboard channel: inbound route ${why}\n`)
     recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `inbound route ${why}`)
   }
-  void orgPolicyNotice(inboundRoute.decision(), String(meta.chat_id ?? 'dashboard')).catch(() => {})
+  void orgPolicyNotice(inboundRoute.decision(), String(meta.chat_id ?? 'dashboard'), text).catch(() => {})
   if (route === 'inject') {
     try {
       const attrs: Record<string, string> = {}

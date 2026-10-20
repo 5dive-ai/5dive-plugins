@@ -15,10 +15,18 @@
 // personal account type"); the "Step by step" FAQ button is gone too. The one
 // button left, "Open claude.ai", opens the very page step 2 names: it is the
 // admin's shortcut, not a guide the owner has to leave the chat to read.
+//
+// DIVE-6599: in Russian for an owner whose Telegram is in Russian (lodar,
+// 2026-10-20: "just make it in Russian if your app is in Russian"): the chat's
+// language_code, as the bridge's buttons already read it (langOfChat), English
+// when there is none. claude.ai and the 5dive dashboard have no Russian
+// interface, so their menu names stay English, in quotes. The agent's name is
+// in quotes too: Russian would decline it otherwise.
 
 import { existsSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ChannelDecision } from './channelroute.ts'
+import type { Lang } from './hooks/lib/lite.ts'
 
 // Verified 2026-10-10 against code.claude.com/docs/en/server-managed-settings:
 // "Organization settings > Claude Code > Managed settings", linked to this URL.
@@ -44,8 +52,30 @@ function html(v: string): string {
   return v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
+export function orgPolicyButton(lang: Lang = 'en'): string {
+  return lang === 'ru' ? 'Открыть claude.ai' : 'Open claude.ai'
+}
+
 // HTML (parse_mode) so the JSON sits in a code block Telegram offers to copy.
-export function orgPolicyText(name: string): string {
+export function orgPolicyText(name: string, lang: Lang = 'en'): string {
+  if (lang === 'ru') {
+    const n = html(name.trim())
+    const agent = n ? `агент «${n}»` : 'ваш агент'
+    const of = n ? `агента «${n}»` : 'агента'
+    return [
+      `${agent[0]!.toUpperCase()}${agent.slice(1)} пока не слышит ваших сообщений. В тарифе Claude вашей компании выключены каналы чата с агентами.`,
+      [
+        'Включить их может администратор вашей организации в Claude:',
+        '1. Войдите в claude.ai под аккаунтом администратора.',
+        '2. Откройте «Organization settings», затем «Claude Code», затем «Managed settings».',
+        '3. Нажмите «Manage».',
+        '4. Вставьте настройки ниже в поле и сохраните. Они включают чат с агентами и перечисляют все плагины чата, потому что список компании блокирует любой плагин, которого в нём нет.',
+        `5. Перезапустите ${of}: отправьте сюда /restart.`,
+      ].join('\n'),
+      `<pre><code class="language-json">${html(ORG_POLICY_JSON)}</code></pre>`,
+      `Не получается изменить настройку компании? Тогда переключите ${of} на личный аккаунт Claude (Pro или Max), где чат с агентами включён по умолчанию: на странице ${of} в панели 5dive откройте «Account», затем «Switch account».`,
+    ].join('\n\n')
+  }
   const n = html(name.trim() || 'Your agent')
   return [
     `${n} can't hear your messages yet. Your company's Claude plan has agent chat channels turned off.`,
