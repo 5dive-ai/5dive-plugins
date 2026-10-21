@@ -51,7 +51,7 @@ Groups are off by default. Opt each one in individually.
 
 Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`. They're not shown in the Telegram UI. To find one, either add [@RawDataBot](https://t.me/RawDataBot) to the group temporarily (it dumps a JSON blob including the chat ID), or add your bot and run `/telegram:access` to see recent dropped-from groups.
 
-With the default `requireMention: true`, the bot responds only when @mentioned or replied to. Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
+With the default `requireMention: true`, the bot responds only when @mentioned, replied to, or called by name (see Mention detection). Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
 
 ```
 /telegram:access group add -1001654782309 --no-mention
@@ -67,7 +67,10 @@ In groups with `requireMention: true`, any of the following triggers the bot:
 
 - A structured `@botusername` mention
 - A reply to one of the bot's messages
+- The bot's name as a word, case-insensitive: the first word of its display name, in Latin or Cyrillic and in its Russian case forms ("Olivia, what do you think?", "Оливия, что решили?", "спроси Оливию" for a bot called Olivia; "оливки" does not count)
 - A match against any regex in `mentionPatterns`
+
+A message that triggers none of these is not answered and starts no turn, but the bot keeps it. Every message from an allowed member of the group is written to `grouplog/<chat_id>.jsonl` under the plugin state dir: on the box only, mode 0600, never pruned (removing the group leaves the file too). An edit is its own line keyed by the original message, so a read shows the latest text marked "(edited)". Telegram reports no deletions, so a deleted message stays. When the bot is called, the last 20 untagged lines since it was last called come before the message, marked as untrusted group chat; the rest is in `recent_messages` (`since=<date>` or `all=true`, paged) or the file itself. This needs the bot to see every group message, which it does as a group admin or with privacy mode off.
 
 ```
 /telegram:access set mentionPatterns '["^hey claude\\b", "\\bassistant\\b"]'
