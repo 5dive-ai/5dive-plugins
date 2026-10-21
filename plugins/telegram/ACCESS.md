@@ -51,7 +51,7 @@ Groups are off by default. Opt each one in individually.
 
 Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`. They're not shown in the Telegram UI. To find one, either add [@RawDataBot](https://t.me/RawDataBot) to the group temporarily (it dumps a JSON blob including the chat ID), or add your bot and run `/telegram:access` to see recent dropped-from groups.
 
-With the default `requireMention: true`, the bot responds only when @mentioned or replied to. Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
+With the default `requireMention: true`, the bot responds only when @mentioned, replied to, or called by name (see Mention detection). Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
 
 ```
 /telegram:access group add -1001654782309 --no-mention
@@ -67,7 +67,10 @@ In groups with `requireMention: true`, any of the following triggers the bot:
 
 - A structured `@botusername` mention
 - A reply to one of the bot's messages
+- The bot's name as a word, case-insensitive: the first word of its display name, in the script it is written in ("Olivia, what do you think?" for a bot called Olivia)
 - A match against any regex in `mentionPatterns`
+
+A message that triggers none of these is not answered and starts no turn, but the bot keeps it as context: the last 50 such messages from the past 24 hours, stored on the box only. When the bot is next called, those lines come before the message that called it, marked as group chat that is untrusted context, and they are then cleared. This needs the bot to see every group message, which it does as a group admin or with privacy mode off.
 
 ```
 /telegram:access set mentionPatterns '["^hey claude\\b", "\\bassistant\\b"]'

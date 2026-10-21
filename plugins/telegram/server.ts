@@ -76,6 +76,7 @@ import {
   mostRecentChatId as msglogMostRecent,
   MSGLOG_MAX_PER_CHAT,
 } from './msglog'
+import { appendChatter, nameMentioned, takeChatter, withChatter } from './chatter'
 import { ackReactionFor } from './hooks/lib/lite.ts'
 import { TAP_STRINGS, tapLang, liteStatusText } from './hooks/lib/lite.ts'
 import { onDemoAccount, readDemoKey, claimDemoNotice, releaseDemoNotice, rearmDemoNotice, pruneDemoStamps, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './hooks/lib/demo-key.ts'
@@ -211,6 +212,8 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // context after a restart (the Bot API has no history/search). Bounded +
 // local-only; see msglog.ts for the privacy posture.
 const MSGLOG_DIR = join(STATE_DIR, 'msglog')
+// DIVE-6673: a requireMention group's untagged lines, held for the next call (chatter.ts).
+const CHATTER_DIR = join(STATE_DIR, 'chatter')
 
 // DIVE-5186: where a channel inbound goes. When this session asked Claude Code
 // for the telegram channel and Claude Code REFUSED it (the `tengu_harbor` flag
@@ -358,6 +361,8 @@ bot.api.config.use((prev, method, payload, signal) => {
   return prev(method, payload, signal)
 })
 let botUsername = ''
+// DIVE-6673: getMe's first_name — in a group, her name called as a word is a mention.
+let botFirstName = ''
 
 // Telegram clears the "typing…" indicator ~5s after each sendChatAction.
 // To keep it visible for long agent turns we re-send every 4s per chat
@@ -1090,6 +1095,8 @@ function pruneExpired(a: Access): boolean {
 type GateResult =
   | { action: 'deliver'; access: Access }
   | { action: 'drop' }
+  // DIVE-6673: an allowed group message that does not call her — kept as context, never a turn.
+  | { action: 'listen' }
   | { action: 'pair'; code: string; isResend: boolean }
 
 function gate(ctx: Context): GateResult {
@@ -1185,7 +1192,7 @@ function gate(ctx: Context): GateResult {
       return { action: 'drop' }
     }
     if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
-      return { action: 'drop' }
+      return { action: 'listen' }
     }
     return { action: 'deliver', access }
   }
@@ -1221,6 +1228,9 @@ function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
 
   // Reply to one of our messages counts as an implicit mention.
   if (ctx.message?.reply_to_message?.from?.username === botUsername) return true
+
+  // DIVE-6673: her name, as people say it ("Olivia, what do you think?").
+  if (nameMentioned(text, botFirstName)) return true
 
   for (const pat of extraPatterns ?? []) {
     try {
@@ -6837,6 +6847,20 @@ async function handleInbound(
 
   if (result.action === 'drop') return
 
+  // DIVE-6673: kept for the next message that calls her. No turn, no typing, no
+  // reaction, no download: a message that does not call her never wakes the seat.
+  if (result.action === 'listen') {
+    try {
+      const from = ctx.from!
+      appendChatter(CHATTER_DIR, String(ctx.chat!.id), {
+        ts: (ctx.message?.date ?? 0) * 1000 || Date.now(),
+        user: [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(from.id),
+        text,
+      })
+    } catch {}
+    return
+  }
+
   if (result.action === 'pair') {
     await replyPair(ctx, result)
     return
@@ -7142,12 +7166,25 @@ async function handleInbound(
     }
   } catch {}
 
+  // DIVE-6673: in a group, the untagged lines since she was last called ride in
+  // front of the message that calls her, marked untrusted, and are used up.
+  let chatterLines = 0
+  let content = text
+  if (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') {
+    try {
+      const rows = takeChatter(CHATTER_DIR, chat_id)
+      chatterLines = rows.length
+      content = withChatter(rows, text)
+    } catch {}
+  }
+
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   deliverInbound({
-    content: text,
+    content,
     meta: {
       chat_id,
+      ...(chatterLines ? { group_context: String(chatterLines) } : {}),
       ...(msgId != null ? { message_id: String(msgId) } : {}),
       ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
       user: from.username ?? String(from.id),
@@ -7224,6 +7261,7 @@ if (SEND_ONLY) {
         onStart: info => {
           attempt = 0
           botUsername = info.username
+          botFirstName = info.first_name ?? ''
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           recordGroupPrivacy(info.can_read_all_group_messages)
           // DIVE-5411: a freshly wired bot says hello without waiting for /start.
