@@ -119,8 +119,8 @@ describe('the owners record: seeded once, grown only by an owner-level pairing',
 })
 
 describe('what the group is told', () => {
-  test('owner add, lite: one hello that says to mention it, nothing else', () => {
-    expect(groupJoinLines({ ...base, approved: true })).toEqual(["Hi, I'm Olivia. Mention me (@olivia_x1_bot) to ask something."])
+  test('owner add, lite: one hello that says to call it by name, nothing else (DIVE-6675)', () => {
+    expect(groupJoinLines({ ...base, approved: true })).toEqual(["Hi, I'm Olivia. Call me by name when you need me."])
   })
   test('someone else adds it, lite: it waits for the owner, said once', () => {
     expect(groupJoinLines({ ...base, announce: true })).toEqual(["Hi, I'm Olivia. I'll stay quiet here until my owner lets this group in."])
@@ -137,16 +137,17 @@ describe('what the group is told', () => {
   // replies to its own messages and /cmd@bot arrive). An admin bot gets it.
   test('non-admin with privacy on: never promises that a mention works', () => {
     for (const lang of ['en', 'ru'] as const)
-      for (const lite of [true, false]) {
-        const lines = groupJoinLines({ ...base, lang, lite, approved: true, privacyOn: true })
-        expect(lines.join(' ')).not.toMatch(/Mention me|mention me or reply|Упомяните меня|где меня упомянули/)
+      for (const lite of [true, false])
+      for (const everyMessage of [true, false]) {
+        const lines = groupJoinLines({ ...base, lang, lite, approved: true, privacyOn: true, everyMessage })
+        expect(lines.join(' ')).not.toMatch(/Mention me|mention me or reply|Упомяните меня|где меня упомянули|Call me by name|по имени|I answer messages|Я отвечаю на сообщения/)
       }
     expect(groupJoinLines({ ...base, approved: true, privacyOn: true })[0]).toBe("Hi, I'm Olivia. Reply to one of my messages to ask something.")
     expect(groupJoinLines({ ...base, lite: false, approved: true, privacyOn: true })[0]).toBe("👋 Hi, I'm Olivia. Reply to one of my messages to ask something.")
     expect(GROUP_STRINGS.en.privacy).toContain('not mentions')
   })
-  test('added as an admin (privacy does not apply): the mention hello stays', () => {
-    expect(groupJoinLines({ ...base, approved: true, privacyOn: false })).toEqual(["Hi, I'm Olivia. Mention me (@olivia_x1_bot) to ask something."])
+  test('added as an admin (privacy does not apply): the call-by-name hello stays', () => {
+    expect(groupJoinLines({ ...base, approved: true, privacyOn: false })).toEqual(["Hi, I'm Olivia. Call me by name when you need me."])
   })
   test('Russian for an adder whose Telegram language is ru', () => {
     expect(groupJoinLines({ ...base, lang: 'ru', approved: true })[0]).toStartWith('Привет, я Olivia.')
@@ -169,7 +170,7 @@ describe('what the group is told', () => {
     expect(line).toContain('/telegram:access')
   })
   test('default profile, owner add: the hello', () => {
-    expect(groupJoinLines({ ...base, lite: false, approved: true })).toEqual(["👋 Hi, I'm Olivia. Mention me (@olivia_x1_bot) to ask something."])
+    expect(groupJoinLines({ ...base, lite: false, approved: true })).toEqual(["👋 Hi, I'm Olivia. Call me by name when you need me."])
   })
 })
 
