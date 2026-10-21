@@ -152,12 +152,14 @@ export const isNoSpaceName = (name: string) => NO_SPACE_SCRIPT.test(name)
 // DIVE-6684: `groupsCallNames` in access.json, the owner's "Also answers to"
 // names (`agent telegram-access groups <name> --names=`). 2-32 letters, marks,
 // spaces or hyphens each, at most 10; anything else on the list is skipped, so
-// a hand edit can never become a pattern.
+// a hand edit can never become a pattern. Every word has 2+ letters, so "a -"
+// can never wake her on each English "a".
 export const CALL_NAMES_MAX = 10
 export function isCallName(v: unknown): v is string {
   if (typeof v !== 'string' || v !== v.trim()) return false
   const n = [...v].length
-  return n >= 2 && n <= 32 && /^[\p{L}\p{M} -]+$/u.test(v) && /\p{L}/u.test(v)
+  return n >= 2 && n <= 32 && /^[\p{L}\p{M} -]+$/u.test(v)
+    && v.split(/[ -]+/).every((w) => (w.match(/\p{L}/gu)?.length ?? 0) >= 2)
 }
 export function callNames(list: unknown): string[] {
   return Array.isArray(list) ? list.filter(isCallName).slice(0, CALL_NAMES_MAX) : []

@@ -65,6 +65,8 @@ describe('extra call names', () => {
     expect(callNames(undefined)).toEqual([])
     expect(isCallName('Анна-Мария')).toBe(true)
     expect(isCallName('--')).toBe(false)
+    for (const n of ['a -', '- a', 'Liv a', 'a-Liv', '-Liv', 'Liv-']) expect(isCallName(n)).toBe(false)
+    for (const n of ['Mary Ann', 'Jo-Jo', '李明']) expect(isCallName(n)).toBe(true)
     expect(nameMentioned('anything at all', 'Olivia', callNames(['.*']))).toBe(false)
   })
 })
