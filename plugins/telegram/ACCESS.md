@@ -53,6 +53,8 @@ Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`.
 
 With the default `requireMention: true`, the bot responds only when @mentioned, replied to, or called by name (see Mention detection). Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
 
+On a 5dive box the app's **In groups, answer** setting (`5dive agent telegram-access groups <agent> --answer=name|every`) sets `requireMention` on every group at once and stores `groupsRequireMention`, which a group the owner adds later gets. Without the key a new group answers when called by name.
+
 ```
 /telegram:access group add -1001654782309 --no-mention
 /telegram:access group add -1001654782309 --allow 412587349,628194073

@@ -535,6 +535,9 @@ type Access = {
   owners?: string[]
   /** DIVE-5867: the owners record's format (groupjoin.ts OWNERS_SEED); absent = the old all-of-allowFrom seed */
   ownersSeed?: number
+  /** DIVE-6675: the app's "In groups, answer" for a group an owner adds later:
+   *  false = every message, else when called by name. `agent telegram-access groups` writes it. */
+  groupsRequireMention?: boolean
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
   /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
@@ -598,6 +601,7 @@ function normalizeAccess(raw: unknown): Access {
     canReadAllGroupMessages: parsed.canReadAllGroupMessages,
     owners: parsed.owners,
     ownersSeed: parsed.ownersSeed,
+    groupsRequireMention: parsed.groupsRequireMention,
     mentionPatterns: parsed.mentionPatterns,
     ackReaction: parsed.ackReaction,
     replyToMode: parsed.replyToMode,
@@ -6723,7 +6727,8 @@ bot.on('my_chat_member', async ctx => {
   delete entry.removedAt
 
   // DIVE-5368: the owner added it (Mini App → Add to a group): approved at once,
-  // mention-only. Anyone else's group waits for approval, as before.
+  // answering as the app's "In groups, answer" says (DIVE-6675; by name unless set
+  // to every message). Anyone else's group waits for approval, as before.
   const approved = admitOnJoin(access, chatId, ctx.from)
   const announce = !approved && !(chatId in access.groups) && entry.announcedAt === undefined
   // Saved before any network wait below, so a group is live the moment it joins
@@ -6758,6 +6763,7 @@ bot.on('my_chat_member', async ctx => {
     approved,
     announce,
     privacyOn,
+    everyMessage: access.groups[chatId]?.requireMention === false,
     fivedive: announce && !!(await read5diveVersion()),
   })
 
