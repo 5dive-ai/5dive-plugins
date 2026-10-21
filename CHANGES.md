@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.103: when Claude needs the owner to accept its updated terms, the agent says so in chat (DIVE-6678)
+
+On 2026-10-21 a partner's client moved six agents onto their own Claude login. That account had not accepted Anthropic's updated consumer terms, so every turn failed with `API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue.` The error showed only in the agent's terminal. The owner wrote five messages, heard nothing, and filed a support request (DIVE-6677). Only the owner can fix this, and it takes a minute.
+
+The StopFailure hook now recognises the copy (`hooks/lib/terms.ts`) and sends one plain line: "Claude needs you to accept its updated terms: sign in at claude.ai with the account you connected and accept, then write again." It is in Russian when the owner's last message was mostly Cyrillic, otherwise in the box's client language. It looks only at this failure's own error: the hook payload's error fields, the last assistant message when it is the `API Error:` line, and the last `API Error:` line on the pane. An agent quoting the copy, or an older error further up the pane, does not count. The failure is no longer treated as a limit or a passing error, so no retry helper starts. One notice covers the episode, using its own `terms` dedup stamp (30-minute sliding window). On a partner (lite) box the client gets this notice instead of "try again in a minute". `test/dive6678-terms-notice.test.ts` runs the real hook with a fake `tmux` serving fixture panes. On 0.5.102 four of its arms are red.
+
 ### Added — telegram 0.5.102: in a group, an agent answers when called by her name, and keeps the group's whole chat as context without answering it (DIVE-6673)
 
 A partner's client, relayed by lodar on 2026-10-21, wants his agent in his Telegram group so that she reads every message, does not answer each one, and answers only when called by name, in Russian too. In a group that requires a mention (the default), the plugin answered an @username mention, a reply to the bot, or a hand-written `mentionPatterns` match. It dropped everything else and kept none of it, so when someone did call her she knew nothing of what the group had said.
