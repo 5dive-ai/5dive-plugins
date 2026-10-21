@@ -171,13 +171,13 @@ describe('the group log keeps everything', () => {
 /** The group arm returns 'listen' where it used to return 'drop' for an unmentioned message. */
 function gateListens(src: string): boolean {
   const g = src.slice(src.indexOf('function gate(ctx: Context): GateResult {'), src.indexOf('function dmCommandGate('))
-  return /if \(requireMention && !isMentioned\(ctx, access\.mentionPatterns\)\) \{\s*return \{ action: 'listen' \}/.test(g)
+  return /if \(requireMention && !isMentioned\(ctx, access\.mentionPatterns[^{]*\) \{\s*return \{ action: 'listen' \}/.test(g)
 }
 /** isMentioned counts her name; set from getMe at polling start. */
 function nameWired(src: string): boolean {
   const m = src.slice(src.indexOf('function isMentioned('), src.indexOf('function groupLineFor('))
   const onStart = src.slice(src.indexOf('onStart: info => {'), src.indexOf('return // bot.stop() was called'))
-  return m.includes('nameMentioned(text, botFirstName)') && onStart.includes('botFirstName = info.first_name')
+  return /nameMentioned\(text, botFirstName[,)]/.test(m) && onStart.includes('botFirstName = info.first_name')
 }
 /** A listened line is logged and handling stops BEFORE anything a turn does; a group delivery carries the log and logs the call. */
 function listenNeverWakes(src: string): boolean {
@@ -219,7 +219,7 @@ describe('server.ts', () => {
   })
   test('negative control: the checks go red on the pre-fix shapes', () => {
     expect(gateListens(SERVER.replace("return { action: 'listen' }", "return { action: 'drop' }"))).toBe(false)
-    expect(nameWired(SERVER.replace('nameMentioned(text, botFirstName)', 'false'))).toBe(false)
+    expect(nameWired(SERVER.replace(/nameMentioned\(text, botFirstName[^)]*\)/, 'false'))).toBe(false)
     expect(listenNeverWakes(SERVER.replace('    content,\n    meta: {\n      chat_id,\n      ...(chatterLines', '    content: text,\n    meta: {\n      chat_id,\n      ...(chatterLines'))).toBe(false)
     expect(listenNeverWakes(SERVER.replace("appendGroupLine(GROUPLOG_DIR, String(ctx.chat!.id)", "void (GROUPLOG_DIR, String(ctx.chat!.id)"))).toBe(false)
     expect(editsLogged(SERVER.replace('    logGroupEdit(ctx)\n', '    void ctx\n'))).toBe(false)
