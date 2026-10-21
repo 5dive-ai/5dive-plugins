@@ -3,7 +3,9 @@
 //
 // The owner shares an agent from the Mini App ("Who can talk to {name}" →
 // Add to a group, t.me/<bot>?startgroup=1). A group added by an OWNER is
-// approved at once, mention-only, and the agent says hello. A group added by
+// approved at once and the agent says hello. It answers when called by name, or
+// every message when the app's "In groups, answer" says so (DIVE-6675:
+// `groupsRequireMention`, written by `agent telegram-access groups`). A group added by
 // anyone else stays in `discovered` until it is approved, as before, and its
 // join line points at the app instead of a dashboard or a terminal.
 // A lite client's lines never name the platform and carry no emoji (DIVE-5121).
@@ -33,15 +35,17 @@ export function addedByOwner(owners: readonly string[] | undefined, allowFrom: r
 }
 
 /** The join's decision, on the handler's copy of access: an owner's add puts
- *  the group in `groups` mention-only; any other add leaves it only in
- *  `discovered` (written by the handler before this), waiting for approval. */
+ *  the group in `groups`, answering when called by name unless the agent is set
+ *  to every message (`groupsRequireMention: false`, DIVE-6675); any other add
+ *  leaves it only in `discovered` (written by the handler before this), waiting
+ *  for approval. */
 export function admitOnJoin(
-  access: { owners?: string[]; allowFrom: string[]; groups: Record<string, unknown> },
+  access: { owners?: string[]; allowFrom: string[]; groups: Record<string, unknown>; groupsRequireMention?: boolean },
   chatId: string,
   from: From,
 ): boolean {
   const approved = !(chatId in access.groups) && addedByOwner(access.owners, access.allowFrom, from)
-  if (approved) access.groups[chatId] = { requireMention: true, allowFrom: [] }
+  if (approved) access.groups[chatId] = { requireMention: access.groupsRequireMention !== false, allowFrom: [] }
   return approved
 }
 
@@ -120,21 +124,27 @@ export const GROUP_STRINGS = {
     // DIVE-5454: `replyOnly` = a non-admin bot with Group Privacy on. Telegram never
     // passes it a mention (measured 2026-10-03: topic, General, plain group), only
     // replies to its own messages and /cmd@bot. So "mention me" would be a promise
-    // the bot cannot keep.
-    hello: (name: string, username: string, replyOnly = false) =>
+    // the bot cannot keep. DIVE-6675 (lodar 2026-10-21): she answers when called by
+    // name (DIVE-6673), so the hello says that; a group set to every message is told
+    // she answers its messages instead.
+    hello: (name: string, replyOnly = false, everyMessage = false) =>
       replyOnly
         ? `Hi, I'm ${name}. Reply to one of my messages to ask something.`
-        : `Hi, I'm ${name}. Mention me${username ? ` (@${username})` : ''} to ask something.`,
+        : everyMessage
+          ? `Hi, I'm ${name}. I answer messages in this group.`
+          : `Hi, I'm ${name}. Call me by name when you need me.`,
     waiting: (name: string) => `Hi, I'm ${name}. I'll stay quiet here until my owner lets this group in.`,
     privacy:
       'Heads-up: Telegram only passes me replies to my own messages here, not mentions. ' +
       'To answer when someone mentions me, make me an admin of this group.',
   },
   ru: {
-    hello: (name: string, username: string, replyOnly = false) =>
+    hello: (name: string, replyOnly = false, everyMessage = false) =>
       replyOnly
         ? `Привет, я ${name}. Чтобы задать вопрос, ответьте на одно из моих сообщений.`
-        : `Привет, я ${name}. Упомяните меня${username ? ` (@${username})` : ''}, чтобы задать вопрос.`,
+        : everyMessage
+          ? `Привет, я ${name}. Я отвечаю на сообщения в этой группе.`
+          : `Привет, я ${name}. Позовите меня по имени, когда понадоблюсь.`,
     waiting: (name: string) => `Привет, я ${name}. Я буду молчать здесь, пока владелец не разрешит эту группу.`,
     privacy:
       'Важно: Telegram передаёт мне здесь только ответы на мои сообщения, а не упоминания. ' +
@@ -163,6 +173,8 @@ export type JoinInput = {
   announce: boolean
   /** Non-admin with BotFather's Group Privacy on (DIVE-246). */
   privacyOn: boolean
+  /** DIVE-6675: the group answers every message, not only when she is called by name. */
+  everyMessage?: boolean
   /** A 5dive host (the app exists); else the OSS /telegram:access pointer. */
   fivedive: boolean
 }
@@ -171,12 +183,12 @@ export function groupJoinLines(i: JoinInput): string[] {
   const lines: string[] = []
   if (i.lite) {
     const s = GROUP_STRINGS[i.lang]
-    if (i.approved) lines.push(s.hello(i.name, i.username, i.privacyOn))
+    if (i.approved) lines.push(s.hello(i.name, i.privacyOn, i.everyMessage))
     else if (i.announce) lines.push(s.waiting(i.name))
     if (i.privacyOn) lines.push(s.privacy)
     return lines
   }
-  if (i.approved) lines.push(`👋 ${GROUP_STRINGS.en.hello(i.name, i.username, i.privacyOn)}`)
+  if (i.approved) lines.push(`👋 ${GROUP_STRINGS.en.hello(i.name, i.privacyOn, i.everyMessage)}`)
   else if (i.announce) {
     lines.push(
       `👋 Hi! I've been added to "${i.title}" — group id: ${i.chatId}. ` +
