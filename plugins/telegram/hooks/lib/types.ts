@@ -15,6 +15,10 @@ export type HookPayload = {
   reason?: string
   error?: string | { resetsAt?: number | string }
   stopReason?: string
+  // StopFailure (Claude Code 2.1.x): the API error's own text, and the
+  // harness's `API Error: …` line that ended the turn.
+  error_details?: string
+  last_assistant_message?: string
   resetsAt?: number | string
   reset_at?: number | string
   resetAt?: number | string

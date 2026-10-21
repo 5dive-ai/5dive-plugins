@@ -232,7 +232,7 @@ export function isBareAck(body: string): boolean {
 }
 
 // The text of the channel block that `tag` opens, from the same entry text.
-function channelBody(texts: string[], tag: string): string | null {
+export function channelBody(texts: string[], tag: string): string | null {
   for (const t of texts) {
     const at = t.indexOf(tag)
     if (at < 0) continue

@@ -27,6 +27,7 @@ import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLog
 import type { HookPayload } from './lib/types'
 import { wallRotate, readActiveAccount, type Run } from './lib/wall-rotate'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
+import { isTermsWall, inboundLang, TERMS_NOTICE } from './lib/terms'
 import { onDemoAccount, readDemoKey, isKeyLimitText, claimDemoNotice, releaseDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
 
 const payload = await readPayload<HookPayload>()
@@ -73,6 +74,13 @@ let entries = transcriptPath ? readEntries(transcriptPath) : []
 // (error="rate_limit", isApiErrorMessage=true) and is immune.
 const pane = capturePane()
 
+// DIVE-6678: Claude refused the turn because the account owes its updated
+// terms. Not a limit and not a blip: no reset to wait for and nothing a retry
+// fixes, only the owner can clear it at claude.ai. So it leaves both recovery
+// flows and gets its own notice, in plain words, once per episode.
+const isTermsNotAccepted = isTermsWall(payload, pane)
+if (isTermsNotAccepted) isRateLimit = false
+
 // Transient API error (NOT a usage limit): claude exhausted its built-in
 // retries on an Overloaded / 5xx response, aborted the turn, and dropped back
 // to an idle prompt — no "Stop and wait" menu, no reset epoch. The
@@ -85,6 +93,7 @@ const transientHaystack = `${raw}\n${pane}`
 // `let`: the headroom check below may add a burst 429 to this bucket.
 let isTransientApiError =
   !isRateLimit &&
+  !isTermsNotAccepted &&
   (isTransientRateLimit ||
     /overloaded|API Error:\s*(?:5(?:0[234]|29))\b|"type":\s*"(?:overloaded|api)_error"/i.test(transientHaystack))
 
@@ -190,7 +199,10 @@ if (isRateLimit && tmuxCtx && activeAccountHasHeadroom()) {
 // Build the DM text. Advertise auto-resume only when BOTH reset epoch AND
 // tmux context are present — that's when the resume fork below will run.
 let text: string
-if (isRateLimit) {
+if (isTermsNotAccepted) {
+  // The language the owner last wrote in, else the box's client language.
+  text = TERMS_NOTICE[inboundLang(entries) ?? readLiteLang()]
+} else if (isRateLimit) {
   if (timeLeft && tmuxCtx) {
     text = `Usage limit hit — resumes in ${timeLeft}. Will auto-press the menu and type 'continue' when the limit lifts.`
   } else if (tmuxCtx) {
@@ -228,7 +240,10 @@ if (isRateLimit) {
 // undefined and text is untouched, so the sends below are what they were.
 const LITE = isLite()
 let markup: unknown = undefined
-if (LITE) {
+if (LITE && isTermsNotAccepted) {
+  // The client is the one who connected the login, so the notice is theirs.
+  recordOpsDetail('stopfailure', `terms not accepted: ${msg}`)
+} else if (LITE) {
   recordOpsDetail('stopfailure', text)
   const lang = readLiteLang()
   const limitHit = isRateLimit || /key limit exceeded|insufficient credits|more credits/i.test(raw)
@@ -360,7 +375,7 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
 // respawn storm collapses to one DM per cooldown window. Kept message-independent
 // (like the usage-limit key already was): distinct errors of the same kind within
 // the window collapse — an acceptable tradeoff against a 550-message storm.
-const notifyKind = isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : 'stop'
+const notifyKind = isTermsNotAccepted ? 'terms' : isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : 'stop'
 let shouldSend = true
 {
   let dir = resumeLogDir
