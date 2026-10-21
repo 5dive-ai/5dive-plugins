@@ -10,7 +10,8 @@
 // Two halves, both pure so the gate stays testable:
 //   - nameMentioned(): the bot's display name (getMe first_name) as a whole word,
 //     case-insensitive, in Latin and in Cyrillic whichever script it is written
-//     in, with the Russian case forms (Оливия, Оливии, Оливию, Оливией).
+//     in, with the Russian case forms (Оливия, Оливии, Оливию, Оливией). DIVE-6684
+//     adds the owner's extra names and matches a Han, kana or Thai name anywhere.
 //   - the group log: every message from an allowed member, append-only JSONL,
 //     one file per group, NEVER pruned (a busy group is a few MB of text a year,
 //     and an agent asked for a total needs the old lines too). An edit is its
@@ -118,29 +119,82 @@ export function russianForms(nominative: string): string[] {
   return [n] // о, е, и, у, э, ю: does not decline
 }
 
-let keysFor = { name: '', keys: new Set<string>() }
+// The spelling-blind keys of one word as a name: `nom` for itself, `forms` for
+// its Russian case forms too (a Latin word declines as its usual Russian
+// spelling would). A word written in Latin is only ever its nominative, so the
+// forms of "Liv" ("ливе" → "live") never fire on English words.
+type NameKeys = { nom: string; forms: Set<string> }
+const formCache = new Map<string, NameKeys>()
+function formKeys(word: string): NameKeys {
+  let keys = formCache.get(word)
+  if (!keys) {
+    const cyr = CYR.test(word) ? word : toCyrillic(word)
+    const nom = nameKey(word)
+    keys = { nom, forms: new Set([nom, ...russianForms(cyr).map(nameKey)]) }
+    if (formCache.size > 64) formCache.clear()
+    formCache.set(word, keys)
+  }
+  return keys
+}
+const isForm = (word: string, k: NameKeys) => (CYR.test(word) ? k.forms : new Set([k.nom])).has(nameKey(word))
+
 export function nameKeys(firstName: string | undefined): Set<string> {
   const name = callName(firstName)
-  if (!name) return new Set()
-  if (keysFor.name === name) return keysFor.keys
-  const cyr = CYR.test(name) ? name : toCyrillic(name)
-  const keys = new Set([nameKey(name), ...russianForms(cyr).map(nameKey)])
-  keysFor = { name, keys }
-  return keys
+  return name ? formKeys(name).forms : new Set()
+}
+
+// DIVE-6684: scripts written without spaces between words. A name in one is
+// found anywhere in the text, so "奥利维亚帮我算一下" calls 奥利维亚 just like
+// "奥利维亚，…" does (the run of letters there is the whole sentence).
+const NO_SPACE_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}]/u
+export const isNoSpaceName = (name: string) => NO_SPACE_SCRIPT.test(name)
+
+// DIVE-6684: `groupsCallNames` in access.json, the owner's "Also answers to"
+// names (`agent telegram-access groups <name> --names=`). 2-32 letters, marks,
+// spaces or hyphens each, at most 10; anything else on the list is skipped, so
+// a hand edit can never become a pattern. Every word has 2+ letters, so "a -"
+// can never wake her on each English "a".
+export const CALL_NAMES_MAX = 10
+export function isCallName(v: unknown): v is string {
+  if (typeof v !== 'string' || v !== v.trim()) return false
+  const n = [...v].length
+  return n >= 2 && n <= 32 && /^[\p{L}\p{M} -]+$/u.test(v)
+    && v.split(/[ -]+/).every((w) => (w.match(/\p{L}/gu)?.length ?? 0) >= 2)
+}
+export function callNames(list: unknown): string[] {
+  return Array.isArray(list) ? list.filter(isCallName).slice(0, CALL_NAMES_MAX) : []
+}
+
+const WORD = /(?<![\p{L}\p{M}\p{N}_@])[\p{L}\p{M}]+(?![\p{L}\p{M}\p{N}_@])/gu
+
+// One name in the text. A no-space-script name anywhere; any other as whole
+// words, each in its case forms, with only spaces or hyphens
+// between the words ("Анна-Мария", "Mary Ann").
+function calledBy(text: string, words: { text: string; at: number; end: number }[], name: string): boolean {
+  if (isNoSpaceName(name)) return text.toLowerCase().normalize('NFC').includes(name.toLowerCase().normalize('NFC'))
+  const parts = name.split(/[\s-]+/).filter(Boolean).map(formKeys)
+  for (let i = 0; i + parts.length <= words.length; i++) {
+    let ok = true
+    for (let j = 0; j < parts.length && ok; j++) {
+      ok = isForm(words[i + j].text, parts[j]) && (j === 0 || /^[\s-]+$/.test(text.slice(words[i + j - 1].end, words[i + j].at)))
+    }
+    if (ok) return true
+  }
+  return false
 }
 
 // Whole word, case-insensitive, either script: "olivia," "ОЛИВИЯ?" and "Оливию"
 // match; "Olivias", "оливки", "@olivia_bot" and "olivia@example.com" do not (a
 // letter, digit, _ or @ next to it means it is part of another word, a handle or
-// an address).
-export function nameMentioned(text: string, firstName: string | undefined): boolean {
+// an address). A Han, kana or Thai name matches anywhere (DIVE-6684). `also` is
+// the owner's extra call names, matched the same way.
+export function nameMentioned(text: string, firstName: string | undefined, also: string[] = []): boolean {
   if (!text) return false
-  const keys = nameKeys(firstName)
-  if (!keys.size) return false
-  for (const m of text.matchAll(/(?<![\p{L}\p{M}\p{N}_@])[\p{L}\p{M}]+(?![\p{L}\p{M}\p{N}_@])/gu)) {
-    if (keys.has(nameKey(m[0]))) return true
-  }
-  return false
+  const own = callName(firstName)
+  const names = own ? [own, ...also] : also
+  if (!names.length) return false
+  const words = [...text.matchAll(WORD)].map(m => ({ text: m[0], at: m.index!, end: m.index! + m[0].length }))
+  return names.some(n => calledBy(text, words, n))
 }
 
 // ---------------------------------------------------------------- the log

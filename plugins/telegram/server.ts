@@ -81,6 +81,7 @@ import {
   foldEdits,
   groupHistory,
   groupLogFile,
+  callNames,
   nameMentioned,
   readGroupLog,
   sinceLastCall,
@@ -538,6 +539,9 @@ type Access = {
   /** DIVE-6675: the app's "In groups, answer" for a group an owner adds later:
    *  false = every message, else when called by name. `agent telegram-access groups` writes it. */
   groupsRequireMention?: boolean
+  /** DIVE-6684: the app's "Also answers to": extra names that call her in a group,
+   *  matched like her display name. `agent telegram-access groups --names=` writes it. */
+  groupsCallNames?: string[]
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
   /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
@@ -602,6 +606,7 @@ function normalizeAccess(raw: unknown): Access {
     owners: parsed.owners,
     ownersSeed: parsed.ownersSeed,
     groupsRequireMention: parsed.groupsRequireMention,
+    groupsCallNames: parsed.groupsCallNames,
     mentionPatterns: parsed.mentionPatterns,
     ackReaction: parsed.ackReaction,
     replyToMode: parsed.replyToMode,
@@ -1206,7 +1211,7 @@ function gate(ctx: Context): GateResult {
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
       return { action: 'drop' }
     }
-    if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
+    if (requireMention && !isMentioned(ctx, access.mentionPatterns, callNames(access.groupsCallNames))) {
       return { action: 'listen' }
     }
     return { action: 'deliver', access }
@@ -1228,7 +1233,7 @@ function dmCommandGate(ctx: Context): { access: Access; senderId: string } | nul
   return { access, senderId }
 }
 
-function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
+function isMentioned(ctx: Context, extraPatterns?: string[], alsoNames: string[] = []): boolean {
   const entities = ctx.message?.entities ?? ctx.message?.caption_entities ?? []
   const text = ctx.message?.text ?? ctx.message?.caption ?? ''
   for (const e of entities) {
@@ -1244,8 +1249,9 @@ function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
   // Reply to one of our messages counts as an implicit mention.
   if (ctx.message?.reply_to_message?.from?.username === botUsername) return true
 
-  // DIVE-6673: her name, as people say it ("Olivia, what do you think?").
-  if (nameMentioned(text, botFirstName)) return true
+  // DIVE-6673: her name, as people say it ("Olivia, what do you think?"), and
+  // DIVE-6684: the owner's "Also answers to" names.
+  if (nameMentioned(text, botFirstName, alsoNames)) return true
 
   for (const pat of extraPatterns ?? []) {
     try {
