@@ -36,6 +36,10 @@ than on the next CLI release.
 | [`voice`](./plugins/voice) | Local speech-to-text and text-to-speech. The reference implementation of the 5dive plugin contract. |
 | [`browser`](./plugins/browser) | **Moved to [`5dive-ai/5dive-browser`](https://github.com/5dive-ai/5dive-browser)** — install it with `5dive plugin add 5dive-ai/5dive-browser`. Persistent human-authenticated browser sessions; the agent is granted the session and never the credentials. The copy here still resolves so boxes provisioned before the move keep working, and goes away once no reader names it. A box already carrying `browser@5dive-plugins` migrates in two commands — `sudo 5dive plugin remove browser@5dive-plugins`, then the add above — because the CLI refuses two plugins claiming the `browser` verb. On a box that already runs the browser stack there is a **third** step: installing a plugin copies its files but does not fetch its packages, so `5dive browser run` refuses until the pinned Playwright is installed. The `add` output now names the exact `npm install --prefix …` line — run it, or wait for the nightly browser-stack converge to do it for you (up to ~24h). |
 
+## Not a plugin: the 5dive connector
+
+[`5dive-ai/5dive-connector`](https://github.com/5dive-ai/5dive-connector) links **your own server** to a 5dive.app account. It installs on the server as root, not into an agent, so it is not in this marketplace. Its README says what it opens and what 5dive.app may run there. Invite only for now.
+
 ## Install
 
 ```text
