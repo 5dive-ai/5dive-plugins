@@ -59,6 +59,11 @@ const DISPATCHER_INBOX_DIR = join(DISPATCHER_STATE_DIR, 'inbox')
 const DISPATCHER_OUTBOX_DIR = join(DISPATCHER_STATE_DIR, 'outbox', 'dashboard')
 const ENV_FILE = join(STATE_DIR, '.env')
 const AGENT_INBOX_DIR = join(STATE_DIR, 'agent-inbox')
+// DIVE-6714: notices this seat's own StopFailure hook (hooks/stopfailure-notify.ts)
+// posts into the chat — "I've hit my usage limit…". A hook is a separate process
+// with no credential, so it drops a file here and this server sends it as a
+// reply, through the same authed path as the reply tool.
+const NOTICE_OUTBOX_DIR = join(STATE_DIR, 'notice-outbox')
 // DIVE-3574: the control plane drops a zero-byte marker here (via the box's
 // shelld POST /shell/collect-now) to say "run your pending-collect now" instead
 // of waiting out the 5-minute timer below. A SEPARATE dir from agent-inbox on
@@ -99,6 +104,7 @@ const PENDING_RETRY_BASE_MS = (() => {
 })()
 mkdirSync(AGENT_INBOX_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(COLLECT_NOW_DIR, { recursive: true, mode: 0o700 })
+mkdirSync(NOTICE_OUTBOX_DIR, { recursive: true, mode: 0o700 })
 if (DISPATCHER_ADAPTER) {
   mkdirSync(DISPATCHER_INBOX_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(DISPATCHER_OUTBOX_DIR, { recursive: true, mode: 0o700 })
@@ -892,39 +898,46 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   return { content: [{ type: 'text', text: result }] }
 })
 
-const dispatcherOutboxBusy = new Set<string>()
-function ingestDispatcherOutbox(name: string): void {
-  if (!name.endsWith('.json') || dispatcherOutboxBusy.has(name)) return
-  const full = join(DISPATCHER_OUTBOX_DIR, name)
+// One outbox reader for two writers: the Codex dispatcher's replies, and
+// (DIVE-6714) this seat's StopFailure notices. Same file contract for both:
+// { source: "dashboard", chat_id, text }, written atomically (tmp + rename).
+const outboxBusy = new Set<string>()
+function ingestOutboxFile(dir: string, name: string, what: string): void {
+  const full = join(dir, name)
+  if (!name.endsWith('.json') || outboxBusy.has(full)) return
   let obj: any
   try { obj = JSON.parse(readFileSync(full, 'utf8')) } catch { return }
   if (obj?.source !== 'dashboard' || !String(obj?.text ?? '').trim()) {
-    process.stderr.write(`dashboard channel: invalid dispatcher outbox file ${name}\n`)
+    process.stderr.write(`dashboard channel: invalid ${what} outbox file ${name}\n`)
     try { unlinkSync(full) } catch {}
     return
   }
-  dispatcherOutboxBusy.add(name)
+  outboxBusy.add(full)
   void sendDashboardReply({ chat_id: obj.chat_id, text: obj.text, files: obj.files, voice: voicesReply(obj) }).then(result => {
-    if (result.includes('VOICE NOTE NOT SENT')) process.stderr.write(`dashboard channel: dispatcher reply ${name}: ${result.split('\n').pop()}\n`)
+    if (result.includes('VOICE NOTE NOT SENT')) process.stderr.write(`dashboard channel: ${what} reply ${name}: ${result.split('\n').pop()}\n`)
     try { unlinkSync(full) } catch {}
   }).catch(err => {
-    process.stderr.write(`dashboard channel: dispatcher reply failed for ${name}: ${err}\n`)
-    setTimeout(() => ingestDispatcherOutbox(name), 1_000).unref?.()
-  }).finally(() => dispatcherOutboxBusy.delete(name))
+    process.stderr.write(`dashboard channel: ${what} reply failed for ${name}: ${err}\n`)
+    setTimeout(() => ingestOutboxFile(dir, name, what), 1_000).unref?.()
+  }).finally(() => outboxBusy.delete(full))
 }
 
-function startDispatcherOutbox(): void {
+function watchOutbox(dir: string, what: string): void {
   const drain = () => {
-    try { for (const name of readdirSync(DISPATCHER_OUTBOX_DIR)) ingestDispatcherOutbox(name) } catch {}
+    try { for (const name of readdirSync(dir)) ingestOutboxFile(dir, name, what) } catch {}
   }
   drain()
   try {
-    watch(DISPATCHER_OUTBOX_DIR, (_event, name) => { if (name) ingestDispatcherOutbox(String(name)) })
-    process.stderr.write(`dashboard channel: dispatcher adapter watching ${DISPATCHER_OUTBOX_DIR}\n`)
+    watch(dir, (_event, name) => { if (name) ingestOutboxFile(dir, String(name), what) })
+    process.stderr.write(`dashboard channel: ${what} outbox watching ${dir}\n`)
   } catch (err) {
-    process.stderr.write(`dashboard channel: dispatcher outbox watch failed: ${err}\n`)
+    process.stderr.write(`dashboard channel: ${what} outbox watch failed: ${err}\n`)
   }
   setInterval(drain, DISPATCHER_SWEEP_MS).unref?.()
+}
+
+function startDispatcherOutbox(): void {
+  watchOutbox(DISPATCHER_OUTBOX_DIR, 'dispatcher')
 }
 
 // DIVE-3752: same gap as buzz — this server ends in long-lived timers with no
@@ -946,6 +959,7 @@ if (!DISPATCHER_ADAPTER) {
 // head start before the first drains. Mid-session paths (fs.watch, sweeps)
 // are unaffected.
 setTimeout(() => {
+  if (!DISPATCHER_ADAPTER) watchOutbox(NOTICE_OUTBOX_DIR, 'notice')
   startAgentInbox()
   startCollectNowWatch()
   void drainPending()

@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.5 + telegram 0.5.106: a usage limit no longer leaves the web chat silent (DIVE-6714)
+
+lodar, 2026-10-22 02:12Z: "Dashboard chat doesn't show usage limit hit." The dashboard plugin had no hooks at all. When an agent hit its usage limit, or Claude gave up on an Overloaded/5xx error, the person on the web chat got no word. On a seat without the telegram plugin nothing typed `continue` afterwards either, so the message waited until someone nudged the pane.
+
+The dashboard plugin now has a StopFailure hook. It posts ONE notice into the chat the person wrote in, in the language they wrote it in: "I've hit my usage limit — back in about 2 h 10 min. I'll pick your message up then." (or "…as soon as it resets." when no reset time can be read; "The AI service is overloaded right now…" for a blip). The reset is relative because the box cannot know the reader's time zone. The hook writes the notice to `~/.claude/channels/dashboard/notice-outbox/`, and the dashboard server sends it through the reply path it already authenticates.
+
+On a seat without Telegram, the hook then starts the same resume helper Telegram uses, under the same lock. Once the limit lifts, the helper types "continue and reply to the latest message" when the web chat is still waiting. On a seat with both plugins, Telegram's hook keeps the resume, so one helper drives the pane, and each channel gets exactly one notice (separate stamps).
+
+Nothing is hand-forked. Telegram's failure reading, reset parsing and resume lock moved into `hooks/lib/failure.ts` and `hooks/lib/resume-lock.ts`, and the telegram hook imports them with no behaviour change (61 + 86 existing StopFailure test arms pass). The dashboard runs byte-identical copies of 18 telegram hook files, listed in `plugins/dashboard/hooks/SHARED.txt` and written by `bun generator/sync-dashboard-hooks.ts`. `test/dive6714-dashboard-stopfailure.test.ts` fails on any drift, fires five usage limits in a row and gets one notice, and covers the resume and the server's send. A mutant that drops the dedup turns 3 arms red, and one that drops the Telegram hand-off turns 1 arm red.
+
 ### Added — telegram 0.5.105: a group calls an agent by extra names in any language, and a Chinese, Japanese or Thai name is heard with no space after it (DIVE-6684)
 
 lodar, 2026-10-21 09:58Z, on DIVE-6673: "or chinese names too, maybe some future chinese users". Before this, an agent answered in a group only to the first word of her display name, as a whole run of letters. Chinese, Japanese and Thai are written without spaces, so in "奥利维亚帮我算一下" the run of letters is the whole sentence, and a bot named 奥利维亚 heard her name only when a comma came after it. An owner also had no way to add a nickname ("Оля") or a name in another script, short of a regex.

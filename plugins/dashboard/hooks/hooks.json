@@ -1,0 +1,16 @@
+{
+  "description": "5dive dashboard plugin lifecycle hooks — on a usage-limit or transient-API StopFailure, post one notice into the web chat the person wrote in, and (on a seat without the telegram plugin) resume and answer once the limit lifts.",
+  "hooks": {
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stopfailure-notify.ts",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

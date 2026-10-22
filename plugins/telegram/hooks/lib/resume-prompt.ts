@@ -13,11 +13,16 @@ import { loadSilence } from './state'
 // there is a genuine unanswered message, so append the reply clause; otherwise
 // resume with a bare "continue" and let the model pick its interrupted work
 // back up without a phantom instruction.
-export function resumePrompt(): string {
+//
+// DIVE-6714: those stamps are Telegram's. The dashboard plugin's StopFailure hook
+// runs these same helpers on a seat with no Telegram, and it reads its own
+// unanswered web-chat message from the transcript; it passes that down as
+// RESUME_PENDING_REPLY=1 in the helper's env. Telegram's hook never sets it.
+export function resumePrompt(env: NodeJS.ProcessEnv = process.env): string {
   const state = loadSilence()
   const lastInbound = state.lastInboundAt ?? 0
   const lastReply = state.lastReplyAt ?? 0
-  return lastInbound > lastReply
+  return lastInbound > lastReply || env.RESUME_PENDING_REPLY === '1'
     ? 'continue and reply to the latest message'
     : 'continue'
 }
