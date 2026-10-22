@@ -15,10 +15,10 @@
 //
 // Both routing fixtures are the measured shapes:
 //   • main   — a telegram DM 11 minutes before the wall → getCallerChat resolves → DM.
-//   • olivia — an autonomous turn, no inbound → getGroupTopics → the agent's own
-//              forum topic, NOT the operator's DM.
-// Routing is asserted, not changed: a Team wall must land exactly where a
-// Pro/Max wall lands.
+//   • olivia — an autonomous turn, no inbound. It went to the agent's own forum
+//              topic until DIVE-6734; now nobody asked, so nothing is sent
+//              (test/dive6734-autonomous-silent.test.ts).
+// A Team wall must land exactly where a Pro/Max wall lands.
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, utimesSync, cpSync } from 'node:fs'
@@ -109,17 +109,19 @@ function writeAccess(opts: { group?: boolean; extraDm?: boolean; owners?: string
   writeFileSync(join(dir, 'access.json'), JSON.stringify(access))
 }
 
-// caller: a telegram inbound in the transcript (the main shape).
+// caller: a telegram inbound in the transcript (the main shape); pass a thread
+// for one written from a group's forum topic.
 // autonomous: no inbound at all (the olivia shape) — getCallerChat returns null.
-function writeTranscript(kind: 'caller' | 'autonomous', chat: string = OPERATOR_DM): string {
+function writeTranscript(kind: 'caller' | 'autonomous', chat: string = OPERATOR_DM, thread?: string): string {
   const p = join(home, `transcript-${kind}.jsonl`)
+  const topic = thread ? ` message_thread_id="${thread}"` : ''
   const line =
     kind === 'caller'
       ? JSON.stringify({
           type: 'user',
           message: {
             role: 'user',
-            content: `<channel source="plugin:telegram:telegram" chat_id="${chat}" message_id="1" user="op">status?</channel>`,
+            content: `<channel source="plugin:telegram:telegram" chat_id="${chat}" message_id="1"${topic} user="op">status?</channel>`,
           },
         })
       : JSON.stringify({ type: 'user', message: { role: 'user', content: 'heartbeat: continue the queue' } })
@@ -140,7 +142,7 @@ function stateDirFor(h: string): string {
 // paths.ts:18 is `process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ...)` —
 // ENV FIRST — and we spread ...process.env into the child. So any ambient
 // TELEGRAM_STATE_DIR in the parent bun process outranked the temp HOME, the
-// hook read an access.json that was not there, getGroupTopics() and
+// hook read an access.json that was not there, the group topics and
 // the owner DMs both came back empty, and it took
 // `route=all-allowed targets=(none)`. In CI another file in the same process
 // had set it at module scope (test/resume-prompt.test.ts) and four arms went
@@ -217,20 +219,28 @@ describe('DIVE-4401 send/route leg', () => {
   }, T)
 
   // The negative control the verifier asked for: getCallerChat EMPTY. This is
-  // the olivia shape and it explains the operator's silence — the notice went
-  // to the agent's own forum topic, the documented autonomous-turn behaviour,
-  // not the DM he was watching. Pinned so a future routing change is deliberate.
-  test('an autonomous turn routes to the bound group topic, not the DM', async () => {
+  // the olivia shape. DIVE-6734: nobody asked, so nothing goes anywhere — not
+  // the agent's forum topic (where it used to go) and not the DM.
+  test('an autonomous turn sends nothing, to the group topic or the DM', async () => {
     const base = await startStub()
     writeAccess()
     const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    expect(r.code).toBe(0)
+    expect(calls().length).toBe(0)
+    expect(r.stderr).toContain('route=autonomous-silent targets=(none)')
+  }, T)
+
+  // A caller writing from the group's forum topic is answered in that topic.
+  test('a caller in the group topic is answered in that topic', async () => {
+    const base = await startStub()
+    writeAccess()
+    const r = fireHook(TEAM_MSG, writeTranscript('caller', GROUP, TOPIC), base)
     expect(r.code).toBe(0)
     const c = calls()
     expect(c.length).toBe(1)
     expect(c[0].chatId).toBe(GROUP)
     expect(c[0].threadId).toBe(TOPIC)
-    expect(c.some(x => x.chatId === OPERATOR_DM)).toBe(false)
-    expect(r.stderr).toContain(`route=group-topics targets=${GROUP}:${TOPIC}`)
+    expect(r.stderr).toContain(`route=caller targets=${GROUP}:${TOPIC}`)
   }, T)
 
   test('five repeats of one wall episode send exactly once', async () => {
@@ -255,7 +265,7 @@ describe('DIVE-4401 send/route leg', () => {
   test('a rejected send is reported with status and reason, not swallowed', async () => {
     const base = await startStub('reject-all')
     writeAccess()
-    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    const r = fireHook(TEAM_MSG, writeTranscript('caller', GROUP, TOPIC), base)
     expect(r.code).toBe(0)
     expect(r.stderr).toContain(`REJECTED ${GROUP}:${TOPIC} — http 400 — message thread not found`)
     expect(r.stderr).toContain(`send ${GROUP}:${TOPIC}: FAILED`)
@@ -264,7 +274,7 @@ describe('DIVE-4401 send/route leg', () => {
   test('when every routed send fails the notice falls back to the paired DM', async () => {
     const base = await startStub('reject-first')
     writeAccess()
-    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    const r = fireHook(TEAM_MSG, writeTranscript('caller', GROUP, TOPIC), base)
     expect(r.code).toBe(0)
     const c = calls()
     expect(c.length).toBe(2)
@@ -280,7 +290,7 @@ describe('DIVE-4401 send/route leg', () => {
   test('a successful routed send never fans out to the other paired chats', async () => {
     const base = await startStub()
     writeAccess()
-    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    const r = fireHook(TEAM_MSG, writeTranscript('caller', GROUP, TOPIC), base)
     expect(r.code).toBe(0)
     expect(calls().length).toBe(1)
     expect(r.stderr).not.toContain('falling back')
@@ -354,27 +364,66 @@ describe('DIVE-4401 send/route leg', () => {
 
   // Iteration 3, the row's own symptom at its purest: no paired chat on any
   // rung. The hook used to log `targets=(none)`, transmit nothing and exit 0 —
-  // an operator got silence and the log did not admit it. Also a second anchor
-  // for the explicit state dir: without it this routes to the group topic and
-  // sends one message.
+  // an operator got silence and the log did not admit it. Since DIVE-6734 the
+  // only rung that can come back empty is the owners one, which only the
+  // owner-action notices take (here the terms wall, on an autonomous turn).
   test('no paired chat at all: the hook states the notice was lost instead of exiting quietly', async () => {
     const base = await startStub()
     writeAccess()
     const emptyState = mkdtempSync(join(tmpdir(), 'sf-nostate-'))
-    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base, emptyState)
+    const r = fireTerms(writeTranscript('autonomous'), base, emptyState)
     expect(r.code).toBe(0)
     expect(calls().length).toBe(0)
-    expect(r.stderr).toContain('ratelimit dedup: SEND')
+    expect(r.stderr).toContain('terms dedup: SEND')
     expect(r.stderr).toContain('route=owners targets=(none)')
     expect(r.stderr).toContain('no paired chat configured — usage-limit notice NOT sent (lost)')
     rmSync(emptyState, { recursive: true, force: true })
   }, T)
+
+  // ...and the silent rung is silence on purpose, not a lost notice.
+  test('an autonomous usage limit is not reported as a lost notice', async () => {
+    const base = await startStub()
+    writeAccess()
+    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    expect(r.stderr).toContain('ratelimit dedup: SEND')
+    expect(r.stderr).not.toContain('NOT sent (lost)')
+  }, T)
 })
 
+// The DIVE-6678 terms wall: nothing resumes until the owner accepts the terms,
+// so on an autonomous turn it is one of the two notices still sent (to owners).
+const TERMS_COPY =
+  "We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue."
+function fireTerms(transcript: string, apiBase: string, stateDir: string = stateDirFor(home)): { code: number; stderr: string } {
+  const r = spawnSync(process.execPath, [HOOK], {
+    input: JSON.stringify({
+      hook_event_name: 'StopFailure',
+      error: 'invalid_request',
+      error_details: `400 ${TERMS_COPY}`,
+      last_assistant_message: `API Error: 400 ${TERMS_COPY}`,
+      transcript_path: transcript,
+    }),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      HOME: home,
+      TELEGRAM_STATE_DIR: stateDir,
+      TELEGRAM_BOT_TOKEN: '000:FAKE',
+      TELEGRAM_API_BASE: apiBase,
+      TELEGRAM_PROFILE: '',
+      TMUX: '',
+    },
+    timeout: 20000,
+  })
+  return { code: r.status ?? -1, stderr: r.stderr ?? '' }
+}
+
 // ---------------------------------------------------------------------------
-// DIVE-6518: a usage limit is the seat OWNER's notice. The measured shape is
+// DIVE-6518: an owner-only notice is the seat OWNER's. The measured shape is
 // exact-swallow's ceo: allowFrom = the owner plus a guest, owners = the owner,
-// no group. On an autonomous turn the notice went to both.
+// no group. On an autonomous turn the notice went to both. Since DIVE-6734 the
+// usage limit itself sends nothing on an autonomous turn; the owners rung is
+// what the terms wall (and the demo key's notice) take.
 // ---------------------------------------------------------------------------
 describe('DIVE-6518 owner-only routing on an autonomous turn', () => {
   const T = 30000
@@ -382,11 +431,10 @@ describe('DIVE-6518 owner-only routing on an autonomous turn', () => {
   test('owners set: only the owner gets the notice, the guest gets nothing', async () => {
     const base = await startStub()
     writeAccess({ group: false, extraDm: true, owners: [OPERATOR_DM] })
-    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    const r = fireTerms(writeTranscript('autonomous'), base)
     expect(r.code).toBe(0)
     const c = calls()
     expect(c.map(x => x.chatId)).toEqual([OPERATOR_DM])
-    expect(c[0].text).toMatch(/Usage limit hit/)
     expect(r.stderr).toContain(`route=owners targets=${OPERATOR_DM}`)
   }, T)
 
@@ -394,16 +442,25 @@ describe('DIVE-6518 owner-only routing on an autonomous turn', () => {
   test('owners absent: every allowed DM still gets it', async () => {
     const base = await startStub()
     writeAccess({ group: false, extraDm: true })
-    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    const r = fireTerms(writeTranscript('autonomous'), base)
     expect(r.code).toBe(0)
     expect(calls().map(x => x.chatId).sort()).toEqual([OPERATOR_DM, SECOND_DM])
+  }, T)
+
+  // The owners rung never reaches a group, even one the agent is bound to.
+  test('a bound group topic is not an owner destination', async () => {
+    const base = await startStub()
+    writeAccess({ owners: [OPERATOR_DM] })
+    const r = fireTerms(writeTranscript('autonomous'), base)
+    expect(r.code).toBe(0)
+    expect(calls().map(x => x.chatId)).toEqual([OPERATOR_DM])
   }, T)
 
   // An owner id the bot no longer allows is not a destination.
   test('an owner outside allowFrom is not messaged', async () => {
     const base = await startStub()
     writeAccess({ group: false, owners: [SECOND_DM] })
-    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    const r = fireTerms(writeTranscript('autonomous'), base)
     expect(r.code).toBe(0)
     expect(calls().length).toBe(0)
     expect(r.stderr).toContain('route=owners targets=(none)')
@@ -424,7 +481,7 @@ describe('DIVE-6518 owner-only routing on an autonomous turn', () => {
   test('a failed topic send falls back to the owner only', async () => {
     const base = await startStub('reject-first')
     writeAccess({ extraDm: true, owners: [OPERATOR_DM] })
-    const r = fireHook(TEAM_MSG, writeTranscript('autonomous'), base)
+    const r = fireHook(TEAM_MSG, writeTranscript('caller', GROUP, TOPIC), base)
     expect(r.code).toBe(0)
     const c = calls()
     expect(c.map(x => x.chatId)).toEqual([GROUP, OPERATOR_DM])
