@@ -5,7 +5,7 @@
 // itself after the reset.
 //
 // Every arm EXECUTES the real hook against the local Bot API stub and counts
-// what was transmitted. The mutant is the pre-fix tree (origin/main before this
+// what was transmitted. The mutant is the pre-fix tree (the main branch before this
 // row): there, the first arm sends one message to the group topic, the late-
 // caller arms send to the group and swallow the caller, and the demo arm posts
 // in the group.
