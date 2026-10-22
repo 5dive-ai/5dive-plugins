@@ -17,37 +17,24 @@ import { homedir } from 'os'
 import { join, basename } from 'path'
 import { stateDir, signalTurnEnded } from './lib/paths'
 import { readPayload } from './lib/payload'
-import { readEntries, findRateLimitText } from './lib/transcript'
+import { readEntries } from './lib/transcript'
 import { getOwnerChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
 import { resumePrompt } from './lib/resume-prompt'
-import { parseResetEpoch } from './lib/time'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
 import { wallRotate, readActiveAccount, type Run } from './lib/wall-rotate'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
-import { isTermsWall, inboundLang, TERMS_NOTICE } from './lib/terms'
+import { inboundLang, TERMS_NOTICE } from './lib/terms'
+import { classifyFailure, failureMessage, resolveResetEpoch } from './lib/failure'
+import { RESUME_LOCK_TTL_MS, resumeLogDir as makeResumeLogDir, tryAcquireResumeLock } from './lib/resume-lock'
 import { onDemoAccount, readDemoKey, isKeyLimitText, claimDemoNotice, releaseDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
 
 const payload = await readPayload<HookPayload>()
-const msg = [payload.message, payload.reason, typeof payload.error === 'string' ? payload.error : undefined, payload.stopReason]
-  .filter(Boolean)
-  .join(' | ') || 'no details'
+const msg = failureMessage(payload)
 
 const raw = JSON.stringify(payload)
-
-// A transient server-side 429 ("Server is temporarily limiting requests · Rate
-// limited") is explicitly NOT a usage limit — but its text literally contains
-// the substring "usage limit" (in the phrase "not your usage limit"), so the
-// naive usage-limit regex below matches it and we'd report a bogus "usage limit
-// hit — couldn't read the reset time" (there's no reset epoch on a transient
-// throttle). Detect the transient phrasing first and exclude it from the
-// usage-limit branch; it's routed to the transient-API-error recovery instead.
-const isTransientRateLimit = /not your usage limit|temporarily limiting requests/i.test(raw)
-// `let`, not `const`: the confirmed-headroom check below (activeAccountHasHeadroom)
-// may reclassify a transient burst 429 out of the rate-limit branch.
-let isRateLimit = !isTransientRateLimit && /rate_limit|usage.limit/i.test(raw)
 
 // Headroom thresholds for the burst-vs-quota reclassification below. A real
 // quota exhaustion reports ~100% on the account's 5h/7d window; a transient
@@ -74,28 +61,15 @@ let entries = transcriptPath ? readEntries(transcriptPath) : []
 // (error="rate_limit", isApiErrorMessage=true) and is immune.
 const pane = capturePane()
 
-// DIVE-6678: Claude refused the turn because the account owes its updated
-// terms. Not a limit and not a blip: no reset to wait for and nothing a retry
-// fixes, only the owner can clear it at claude.ai. So it leaves both recovery
-// flows and gets its own notice, in plain words, once per episode.
-const isTermsNotAccepted = isTermsWall(payload, pane)
-if (isTermsNotAccepted) isRateLimit = false
-
-// Transient API error (NOT a usage limit): claude exhausted its built-in
-// retries on an Overloaded / 5xx response, aborted the turn, and dropped back
-// to an idle prompt — no "Stop and wait" menu, no reset epoch. The
-// `while true; claude; done` agent loop only restarts on process *exit*, so an
-// aborted-turn-but-still-running claude just sits there until a human nudges
-// it. We detect it here and fork resume-after-error.ts to type "continue" with
-// backoff. Match the API status line in the pane ("API Error: Overloaded",
-// "API Error: 529 …") and the raw payload ("overloaded_error" etc).
-const transientHaystack = `${raw}\n${pane}`
-// `let`: the headroom check below may add a burst 429 to this bucket.
-let isTransientApiError =
-  !isRateLimit &&
-  !isTermsNotAccepted &&
-  (isTransientRateLimit ||
-    /overloaded|API Error:\s*(?:5(?:0[234]|29))\b|"type":\s*"(?:overloaded|api)_error"/i.test(transientHaystack))
+// Which failure this is (lib/failure.ts, shared with the dashboard plugin's
+// hook): a usage limit, a transient Overloaded/5xx/429 blip, or DIVE-6678's
+// terms wall, which leaves both recovery flows and gets its own notice.
+// `let`: the headroom check below may reclassify a burst 429 out of the
+// rate-limit branch into the transient one.
+const kind = classifyFailure(payload, raw, pane)
+const isTermsNotAccepted = kind.isTermsNotAccepted
+let isRateLimit = kind.isRateLimit
+let isTransientApiError = kind.isTransientApiError
 
 // Memoized active-account cache for resolveActiveAccount(). Declared here at
 // module top — NOT next to its function below — because resolveActiveAccount is
@@ -109,58 +83,16 @@ let _activeAccount: string | null | undefined
 // TDZ when the top-level headroom check calls them, which threw on every usage
 // limit with a tmux pane from 0.5.95 on (DIVE-6121's move never ran, no DM sent).
 const runCli: Run = (cmd, args, timeoutMs) => spawnSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs })
-// The resume-lock TTL, read by tryAcquireResumeLock from top-level code. Beside
-// that function it was in the TDZ too: the throw landed in the function's own
-// catch, so a fresh lock never held and every StopFailure reclaimed it.
-const RESUME_LOCK_TTL_MS = 10 * 60 * 1000 // 10 min; helper heartbeats well under this
+// The resume-lock TTL now lives in lib/resume-lock.ts with the lock itself
+// (DIVE-6714). Beside that function it was once in the TDZ: the throw landed in
+// the function's own catch, so a fresh lock never held.
+void RESUME_LOCK_TTL_MS
 
-// Resolve an unlock/reset epoch. Order: payload → transcript → message text → pane.
-let resetEpoch: number | null = null
-
-const resetRaw =
-  (payload.resetsAt as number | string | undefined) ??
-  (payload.reset_at as number | string | undefined) ??
-  (payload.resetAt as number | string | undefined) ??
-  (typeof payload.error === 'object' && payload.error?.resetsAt) ??
-  payload.rateLimit?.resetsAt
-
-if (resetRaw !== undefined && resetRaw !== null) {
-  resetEpoch = parseResetEpoch(String(resetRaw))
-}
-
-if (resetEpoch === null && transcriptPath) {
-  // The synthetic rate-limit entry is written ~concurrently with this hook
-  // firing, so the first read can miss it (flush race). findRateLimitText is
-  // bounded to recent entries, so a miss returns null rather than silently
-  // reusing a stale earlier-episode reset line — which means we can safely
-  // retry: re-read the transcript a few times over ~2s to catch the write.
-  // Well within the hook's 10s budget; the slow recovery lives in the detached
-  // helper, not here. Non-rate-limit failures don't retry (no extra latency).
-  const tries = isRateLimit ? 5 : 1
-  for (let attempt = 0; attempt < tries; attempt++) {
-    if (attempt > 0) {
-      await new Promise(r => setTimeout(r, 500))
-      entries = readEntries(transcriptPath)
-    }
-    const transcriptResetText = findRateLimitText(entries)
-    if (transcriptResetText) {
-      const e = parseResetEpoch(transcriptResetText)
-      if (e !== null) {
-        resetEpoch = e
-        break
-      }
-    }
-  }
-}
-
-if (resetEpoch === null) {
-  resetEpoch = parseResetEpoch(msg)
-}
-
-if (resetEpoch === null && pane) {
-  const line = pane.split('\n').find(l => /resets?\s+\d/i.test(l))
-  if (line) resetEpoch = parseResetEpoch(line)
-}
+// Resolve an unlock/reset epoch (lib/failure.ts): payload → transcript (re-read
+// for ~2s on a usage limit, the flush race) → message text → pane.
+const resolved = await resolveResetEpoch(payload, msg, pane, isRateLimit, entries)
+const resetEpoch: number | null = resolved.resetEpoch
+entries = resolved.entries
 
 // Time-left string for the DM.
 let timeLeft = ''
@@ -316,12 +248,7 @@ const needsRecovery = (isRateLimit || isTransientApiError) && !!tmuxCtx
 let lockPath: string | null = null
 let resumeLogDir = ''
 if (needsRecovery) {
-  resumeLogDir = join(homedir(), '.cache', '5dive-telegram', 'resume')
-  try {
-    mkdirSync(resumeLogDir, { recursive: true })
-  } catch {
-    resumeLogDir = '/tmp'
-  }
+  resumeLogDir = makeResumeLogDir()
   lockPath = join(resumeLogDir, 'resume.lock')
   if (!tryAcquireResumeLock(lockPath)) {
     process.exit(0)
@@ -378,15 +305,7 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
 const notifyKind = isTermsNotAccepted ? 'terms' : isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : 'stop'
 let shouldSend = true
 {
-  let dir = resumeLogDir
-  if (!dir) {
-    dir = join(homedir(), '.cache', '5dive-telegram', 'resume')
-    try {
-      mkdirSync(dir, { recursive: true })
-    } catch {
-      dir = '/tmp'
-    }
-  }
+  const dir = resumeLogDir || makeResumeLogDir()
   const account = resolveActiveAccount() ?? (tmuxCtx ? deriveAgentName(tmuxCtx.target) : null) ?? 'unknown'
   // resetEpoch only meaningfully partitions usage-limit episodes; other kinds
   // ride the stable 'noepoch' sliding window. Fold the kind into the account
@@ -651,58 +570,5 @@ function tryRotate(resetEpoch: number | null): { from: string; to: string } | nu
   return null
 }
 
-// Best-effort cross-process lock guarding a single resume helper per agent —
-// AND the per-agent dedup that stops us re-DMing the same usage-limit episode.
-//
-// The lock is held iff its mtime is FRESH (within RESUME_LOCK_TTL_MS). The
-// detached recovery helper (resume-after-reset / resume-after-error) touches
-// the lock on a < TTL heartbeat for the whole time it's working, so a long
-// wait-for-reset keeps the lock held and every concurrent StopFailure stays
-// silent. When the helper exits it unlinks the lock; if it's killed, the
-// mtime simply goes stale and the next episode reclaims it.
-//
-// We deliberately do NOT key the decision on the recorded PID. The PID written
-// here is this StopFailure HOOK process, which spawns the detached helper and
-// then exits within milliseconds — so a PID-liveness check ALWAYS saw it dead,
-// declared the lock stale, and re-notified + re-spawned on every single
-// StopFailure. A fast claude-restart-while-limited loop turned that into 700+
-// identical "usage limit" DMs in ~20s. mtime + heartbeat is immune: the very
-// first acquire stamps a fresh mtime, so a same-instant second StopFailure
-// already sees the lock held. RESUME_LOCK_TTL_MS is declared at module top.
-function tryAcquireResumeLock(lockPath: string): boolean {
-  try {
-    const fd = openSync(lockPath, 'wx')
-    writeSync(fd, `${process.pid} ${Date.now()}`)
-    closeSync(fd)
-    return true
-  } catch {
-    // Lock exists. Honor it while its mtime is fresh (a helper is heartbeating);
-    // reclaim only once it's gone stale (helper died/finished without cleanup).
-    try {
-      const st = statSync(lockPath)
-      if (Date.now() - st.mtimeMs <= RESUME_LOCK_TTL_MS) return false
-    } catch {
-      /* lock vanished mid-check — fall through and try to (re)create it */
-    }
-    // DIVE-901: reclaim a STALE lock atomically. This path previously used a
-    // non-exclusive 'w' open, so when the lock went stale a thundering herd of
-    // queued StopFailures ALL passed the staleness check above and ALL re-created
-    // it → every one returned true → every one spawned a resume helper (observed:
-    // 520 helpers in ~4min, each firing an end-ping). Unlink-then-O_EXCL makes the
-    // reclaim single-winner: only the racer whose exclusive create succeeds owns
-    // the lock; the rest fail and stay silent.
-    try {
-      unlinkSync(lockPath)
-    } catch {
-      /* already gone — another racer reclaimed it; our wx below will lose */
-    }
-    try {
-      const fd = openSync(lockPath, 'wx')
-      writeSync(fd, `${process.pid} ${Date.now()}`)
-      closeSync(fd)
-      return true
-    } catch {
-      return false
-    }
-  }
-}
+// tryAcquireResumeLock lives in lib/resume-lock.ts (DIVE-6714), shared with the
+// dashboard plugin's hook so both take one lock at one path.

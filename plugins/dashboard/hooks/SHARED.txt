@@ -1,0 +1,27 @@
+# DIVE-6714: files under plugins/dashboard/hooks/ that are BYTE-IDENTICAL copies
+# of plugins/telegram/hooks/<same path>. Each plugin installs as its own tree on
+# a box (no import can reach ../telegram), so the dashboard's StopFailure hook
+# runs Telegram's own failure reading, dedup, resume lock and resume helpers
+# from these copies instead of a hand fork.
+#
+# Never edit a copy here. Edit the telegram file, then run
+#   bun generator/sync-dashboard-hooks.ts
+# test/dive6714-dashboard-stopfailure.test.ts fails on any drift.
+lib/failure.ts
+lib/lite.ts
+lib/live-transcript.ts
+lib/notify-dedup.ts
+lib/paths.ts
+lib/payload.ts
+lib/resume-lock.ts
+lib/resume-prompt.ts
+lib/resume-retry.ts
+lib/state.ts
+lib/telegram.ts
+lib/terms.ts
+lib/time.ts
+lib/tmux.ts
+lib/transcript.ts
+lib/types.ts
+resume-after-error.ts
+resume-after-reset.ts
