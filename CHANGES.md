@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Changed — telegram 0.5.108: "Answers to" can hold every name the agent answers to in a group, its bot name too, so the owner can remove that one (DIVE-6729)
+
+lodar, 2026-10-22: rename "Also answers to" to "Answers to" and list every name the agent already answers to, so the owner can change even the first one. In a group the agent answered to the first word of its bot's Telegram name on top of `groupsCallNames`, and nothing could turn that word off. lodar's ceo bot is "Janis's matcha assistant", so it answered to "Janis", the owner's own name.
+
+A new access.json key, `groupsCallNamesComplete: true`, makes `groupsCallNames` the whole list: the bot-name word calls the agent only when it is on it. The CLI's `agent telegram-access groups --names=` sets it. Without the key nothing changes, so an older CLI or a hand edit keeps today's behaviour. An @mention and a reply to the agent always wake it, whatever the list holds. `normalizeAccess` keeps the key. `test/dive6729-answers-to.test.ts` covers the flag on and off.
+
 ### Added — dashboard 0.5.6 + telegram 0.5.107: the web chat gets Telegram's lost-reply catch, question buttons and live progress (DIVE-6715)
 
 lodar, 2026-10-22 02:14Z: "Check the other gaps for dashboard chat comparing to telegram." Three of the four gaps that made the web chat feel broken are box-side, and this is them (the fourth, a phone push on a reply, is the api's):
