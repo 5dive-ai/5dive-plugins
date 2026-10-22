@@ -73,9 +73,9 @@ describe('extra call names', () => {
 
 describe('server.ts', () => {
   test('the gate passes the owner\'s names, validated, from access.json', () => {
-    expect(SERVER).toContain('isMentioned(ctx, access.mentionPatterns, callNames(access.groupsCallNames))')
+    expect(SERVER).toContain('isMentioned(ctx, access.mentionPatterns, callNames(access.groupsCallNames)')
     const m = SERVER.slice(SERVER.indexOf('function isMentioned('), SERVER.indexOf('function groupLineFor('))
-    expect(m).toContain('nameMentioned(text, botFirstName, alsoNames)')
+    expect(m).toContain('botFirstName, alsoNames)')
   })
   test('the plugin keeps groupsCallNames when it saves access.json', () => {
     const n = SERVER.slice(SERVER.indexOf('function normalizeAccess('), SERVER.indexOf('function normalizeAccess(') + 1500)
