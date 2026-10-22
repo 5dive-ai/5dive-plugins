@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Changed — telegram 0.5.107: "Answers to" can hold every name the agent answers to in a group, its bot name too, so the owner can remove that one (DIVE-6729)
+### Changed — telegram 0.5.108: "Answers to" can hold every name the agent answers to in a group, its bot name too, so the owner can remove that one (DIVE-6729)
 
 lodar, 2026-10-22: rename "Also answers to" to "Answers to" and list every name the agent already answers to, so the owner can change even the first one. In a group the agent answered to the first word of its bot's Telegram name on top of `groupsCallNames`, and nothing could turn that word off. lodar's ceo bot is "Janis's matcha assistant", so it answered to "Janis", the owner's own name.
 
