@@ -12,17 +12,17 @@
 // ~/.claude/channels/telegram/.env, etc).
 
 import { spawn, spawnSync } from 'child_process'
-import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync, writeFileSync, renameSync } from 'fs'
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, unlinkSync, writeFileSync, renameSync, readdirSync } from 'fs'
 import { homedir } from 'os'
 import { join, basename } from 'path'
 import { stateDir, signalTurnEnded } from './lib/paths'
 import { readPayload } from './lib/payload'
 import { readEntries } from './lib/transcript'
-import { getOwnerChatIds, getGroupTopics, getCallerChat, type CallerChat } from './lib/access'
+import { getOwnerChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
 import { resumePrompt } from './lib/resume-prompt'
-import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
+import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs, type DedupResult } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
 import { wallRotate, readActiveAccount, type Run } from './lib/wall-rotate'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
@@ -205,32 +205,30 @@ if (onDemoAccount()) {
   }
 }
 
-// Caller-only narrowing: prefer the inbound chat (and its forum topic) the
-// user actually wrote from. On an autonomous turn (no telegram inbound in the
-// transcript — cron-triggered, long-running background agent, etc) fall back
-// to the agent's bound group topic(s) so the alert lands in its own thread
-// instead of buzzing every paired DM + the group's General channel. Only when
-// no group is configured at all do we DM the seat's owner(s) — DIVE-6518: not
-// every allowed chat, since a guest the owner let talk to the agent is not who
-// its usage limit is for.
+// Caller-only narrowing: the notice goes to the chat (and forum topic) the
+// user actually wrote from. DIVE-6734: on an autonomous turn (no telegram
+// inbound in the transcript — heartbeat, task, cron) nobody asked, so nobody is
+// told: no usage-limit, throttle or rotation notice at all, and the work resumes
+// on its own after the reset. It used to post in the agent's bound group topic
+// (lodar 2026-10-22: "noone asked an agent directly yet it spams usage limit hit
+// in group"). Two notices still go out, to the seat's owner(s) by DM and never
+// to a group, because nothing resumes until the owner acts: the demo key's
+// "out of free usage" with its account buttons (DIVE-5256), and the terms wall
+// (DIVE-6678). Owners, not every allowed chat (DIVE-6518).
 let targets: CallerChat[]
-// DIVE-4401: which of the three rungs we landed on, for the route trace below.
-// Routing itself is UNCHANGED — a usage-limit notice goes exactly where a
-// Pro/Max one goes — but which rung was taken is the first thing you need to
-// know when an operator says the notice never arrived, and it was recorded
-// nowhere. On the measured 2026-09-13 04:20Z wall the two seats took two
-// different rungs (main had a telegram DM 11 minutes earlier → 'caller';
-// olivia's turn was autonomous → 'group-topics', i.e. the agent's own forum
-// topic, not the DM the operator was watching) and neither left a trace.
-let routeKind: 'caller' | 'group-topics' | 'owners'
+// DIVE-4401: which rung we landed on, for the route trace below — the first
+// thing you need to know when an operator says the notice never arrived.
+let routeKind: 'caller' | 'owners' | 'autonomous-silent'
 const callerChat = getCallerChat(entries)
 if (callerChat) {
   targets = [callerChat]
   routeKind = 'caller'
+} else if (demoFingerprint !== null || isTermsNotAccepted) {
+  targets = getOwnerChatIds().map(chatId => ({ chatId }))
+  routeKind = 'owners'
 } else {
-  const topics = getGroupTopics()
-  targets = topics.length ? topics : getOwnerChatIds().map(chatId => ({ chatId }))
-  routeKind = topics.length ? 'group-topics' : 'owners'
+  targets = []
+  routeKind = 'autonomous-silent'
 }
 const fmtTarget = (t: CallerChat) => (t.threadId ? `${t.chatId}:${t.threadId}` : t.chatId)
 
@@ -244,14 +242,27 @@ const fmtTarget = (t: CallerChat) => (t.threadId ? `${t.chatId}:${t.threadId}` :
 //
 // The same lock serializes BOTH recovery flows (usage-limit and transient
 // API error) — only one helper should drive the pane at a time.
+//
+// DIVE-6734: a held lock no longer silences a CALLER who has not been told. An
+// autonomous episode now notifies nobody, so when someone writes to the agent
+// while its helper is still waiting out the limit, that person is the first to
+// hear of it. The "already told" record is per target and lives as long as the
+// episode's lock (claimTold below), so the helper's own 'continue' bouncing in a
+// caller's session still stays silent, however long the wait was.
 const needsRecovery = (isRateLimit || isTransientApiError) && !!tmuxCtx
 let lockPath: string | null = null
 let resumeLogDir = ''
+let lateCaller = false
 if (needsRecovery) {
   resumeLogDir = makeResumeLogDir()
   lockPath = join(resumeLogDir, 'resume.lock')
-  if (!tryAcquireResumeLock(lockPath)) {
-    process.exit(0)
+  if (tryAcquireResumeLock(lockPath)) {
+    clearTold(resumeLogDir)
+  } else {
+    if (routeKind !== 'caller' || !claimTold(resumeLogDir, fmtTarget(targets[0]))) process.exit(0)
+    // Told the caller below; the running helper keeps the lock and the pane.
+    lateCaller = true
+    lockPath = null
   }
 }
 
@@ -310,11 +321,17 @@ let shouldSend = true
   // resetEpoch only meaningfully partitions usage-limit episodes; other kinds
   // ride the stable 'noepoch' sliding window. Fold the kind into the account
   // token so the three kinds get independent stamps.
-  const stamp = notifyStampPath(dir, `${account}:${notifyKind}`, isRateLimit ? resetEpoch : null)
-  const res = claimNotify(stamp, Date.now())
+  // DIVE-6734: the route is in the key too, so a silent autonomous episode
+  // cannot use up the stamp of the caller who writes in the next half hour.
+  const routeTag = routeKind === 'caller' ? fmtTarget(targets[0]) : routeKind
+  const stamp = notifyStampPath(dir, `${account}:${notifyKind}:${routeTag}`, isRateLimit ? resetEpoch : null)
+  // A late caller was already claimed, once, by claimTold above.
+  const res: DedupResult = lateCaller ? { send: true, reason: 'first' } : claimNotify(stamp, Date.now())
   // DIVE-5256: the demo notice has its own once-per-key claim, taken above;
   // a recent unrelated notice of the same kind must not swallow it.
   shouldSend = res.send || demoFingerprint !== null
+  // This episode's lock now covers whoever we are about to tell.
+  if (shouldSend && lockPath) targets.forEach(t => claimTold(dir, fmtTarget(t)))
   // One-line stderr trace (lands in the resume log) so we can see hits vs sends.
   console.error(`[stopfailure-notify] ${notifyKind} dedup: ${res.send ? 'SEND' : 'suppress'} (${res.reason}) account=${account} reset=${resetEpoch ?? 'null'}`)
   if (res.send) pruneStaleNotifyStamps(dir, Date.now())
@@ -333,7 +350,7 @@ if (shouldSend) {
   // successful. There is no fallback to reach for (the owners rung IS the
   // fallback, and it came back empty), so the only thing left to do is say the
   // notice was lost, the way the 'nowhere to fall back to' branch does.
-  if (targets.length === 0) {
+  if (targets.length === 0 && routeKind !== 'autonomous-silent') {
     console.error('[stopfailure-notify] no paired chat configured — usage-limit notice NOT sent (lost)')
   }
   const results = await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId, markup)))
@@ -568,6 +585,29 @@ function tryRotate(resetEpoch: number | null): { from: string; to: string } | nu
     /* noop */
   }
   return null
+}
+
+// claimTold / clearTold — DIVE-6734's per-target "already told" record for the
+// episode the resume lock spans: one O_EXCL marker per chat, beside the lock.
+// claimTold is true only for the call that created the marker. A fresh lock
+// (a new episode) clears the previous episode's markers.
+function toldPath(dir: string, target: string): string {
+  return join(dir, `told-${target.replace(/[^0-9:-]/g, '_')}`)
+}
+function claimTold(dir: string, target: string): boolean {
+  try {
+    closeSync(openSync(toldPath(dir, target), 'wx'))
+    return true
+  } catch {
+    return false
+  }
+}
+function clearTold(dir: string): void {
+  try {
+    for (const f of readdirSync(dir)) if (f.startsWith('told-')) unlinkSync(join(dir, f))
+  } catch {
+    /* best-effort: a leftover marker only keeps one caller quiet */
+  }
 }
 
 // tryAcquireResumeLock lives in lib/resume-lock.ts (DIVE-6714), shared with the

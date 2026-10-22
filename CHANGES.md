@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.110: an agent working on its own no longer posts "Usage limit hit" in its group; only whoever wrote to it hears (DIVE-6734)
+
+lodar, 2026-10-22: "its like noone asked an agent directly yet it spams usage limit hit in group". On a turn with no Telegram message in it (a heartbeat, a task, a cron job), the usage-limit notice went to the agent's group topic. Nobody asked, so now nobody is told; the work resumes by itself after the reset.
+
+- **A turn nobody started sends nothing.** Usage limit, throttle, account rotation and the Stop hook's session-limit line alike. The log still says `route=autonomous-silent`. Auto-resume and rotation work as before.
+- **Someone who writes still hears it,** in their own chat or topic, even while the agent is already waiting out a limit it hit on its own: the "already told" record is now per person, so the silent episode cannot use it up.
+- **Two notices still go out, to the owner's DM and never a group,** because nothing resumes until the owner acts: the demo key's "out of free usage" with its buttons, and the terms wall.
+
+`test/dive6734-autonomous-silent.test.ts`: 10 arms, 7 of them red on 0.5.109 (before this change); the other 3 pin what did not change.
+
 ### Fixed — telegram 0.5.109: the browser's captcha button says "captcha" only when the box saw one, and Done says what the page shows (DIVE-6725)
 
 On exact-swallow, an agent sent its owner three "clear the captcha" buttons for a page that was a 404 with no captcha on it. The owner answered: "it was not capture - just broken link". Browser 1.50.0 (5dive-ai/5dive-browser) now loads the page before it asks, and refuses an error page. It tells this plugin `check=0` when the page has no check on it, and at Done it reads the page back.
