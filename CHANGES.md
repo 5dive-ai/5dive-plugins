@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.109: the browser's captcha button says "captcha" only when the box saw one, and Done says what the page shows (DIVE-6725)
+
+On exact-swallow, an agent sent its owner three "clear the captcha" buttons for a page that was a 404 with no captcha on it. The owner answered: "it was not capture - just broken link". Browser 1.50.0 (5dive-ai/5dive-browser) now loads the page before it asks, and refuses an error page. It tells this plugin `check=0` when the page has no check on it, and at Done it reads the page back.
+
+- **The link message follows `check`.** With `check=0`, the owner reads "🖐 Take over on <site>" and "Do what the agent asked…", never "captcha" or "clear the check". With no `check` line (an older box), the words are the same as before.
+- **Done tells the agent what the page shows.** The note is root's read of the page: title, address, and whether a check is still detected. It no longer says "the owner cleared the check". When the box still sees a check, the owner's Done reply says so instead of "carrying on".
+- **A late tap is not a failure.** When root answers an expired button with a fresh one, the old message reads "⏰ That button had expired, so a fresh one was just sent below" instead of "❌ Could not open the login".
+
+`test/dive6725-challenge-look.test.ts`: 11 arms, 8 of them red on 0.5.108 (before this change).
+
 ### Changed — telegram 0.5.108: "Answers to" can hold every name the agent answers to in a group, its bot name too, so the owner can remove that one (DIVE-6729)
 
 lodar, 2026-10-22: rename "Also answers to" to "Answers to" and list every name the agent already answers to, so the owner can change even the first one. In a group the agent answered to the first word of its bot's Telegram name on top of `groupsCallNames`, and nothing could turn that word off. lodar's ceo bot is "Janis's matcha assistant", so it answered to "Janis", the owner's own name.
