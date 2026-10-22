@@ -28,7 +28,7 @@ import { readPayload } from './lib/payload'
 import { stateDir, questionDir, TG_TOOL_PREFIX } from './lib/paths'
 import { emitDenyTool, emitAllowTool } from './lib/output'
 import { getToken } from './lib/telegram'
-import { readEntries, analyzeTurn } from './lib/transcript'
+import { readEntries, analyzeTurn, newestInboundSource } from './lib/transcript'
 import { buildBridge, buttonText } from './lib/question-bridge'
 import type { HookPayload } from './lib/types'
 import { isLite, liteQuestionPrompt } from './lib/lite'
@@ -80,7 +80,12 @@ if (!spec) legacyDeny(tool!)
 
 // We need a chat to post into and a token to post with; else fall back.
 const token = getToken()
-const a = analyzeTurn(readEntries(payload.transcript_path ?? ''), TG_TOOL_PREFIX)
+const entries = readEntries(payload.transcript_path ?? '')
+const a = analyzeTurn(entries, TG_TOOL_PREFIX)
+// DIVE-6715: the person's newest message this turn came from the web chat. The
+// dashboard plugin's own hook puts the question there as buttons; a deny from
+// here as well would hand the model a second, contradicting answer.
+if (newestInboundSource(entries, a.turnStart) === 'dashboard') stampAndExit()
 const chatId = a.lastChatId
 const threadId = a.lastThreadId ?? undefined
 if (!token || !chatId) legacyDeny(tool!)

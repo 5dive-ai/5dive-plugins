@@ -30,12 +30,14 @@ import { capturePane, getTmuxContext } from './lib/tmux'
 import { classifyFailure, failureMessage, resolveResetEpoch } from './lib/failure'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import { resumeLogDir, tryAcquireResumeLock } from './lib/resume-lock'
-import { answeredAfter, dashboardStateDir, lastDashboardInbound, noticeLang, noticeText, writeNotice } from './lib/dashboard-chat'
+import { answeredAfter, dashboardStateDir, lastDashboardInbound, noticeLang, noticeText, signalTurnEnded, writeNotice } from './lib/dashboard-chat'
 import type { HookPayload } from './lib/types'
 
 const log = (s: string) => console.error(`[dashboard-stopfailure] ${s}`)
 
 const payload = await readPayload<HookPayload>()
+// DIVE-6715: a failed turn is still a finished one; the chat stops showing "working".
+signalTurnEnded()
 const raw = JSON.stringify(payload)
 const msg = failureMessage(payload)
 const pane = capturePane()

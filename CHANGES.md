@@ -6,6 +6,16 @@ lodar, 2026-10-22: rename "Also answers to" to "Answers to" and list every name 
 
 A new access.json key, `groupsCallNamesComplete: true`, makes `groupsCallNames` the whole list: the bot-name word calls the agent only when it is on it. The CLI's `agent telegram-access groups --names=` sets it. Without the key nothing changes, so an older CLI or a hand edit keeps today's behaviour. An @mention and a reply to the agent always wake it, whatever the list holds. `normalizeAccess` keeps the key. `test/dive6729-answers-to.test.ts` covers the flag on and off.
 
+### Added — dashboard 0.5.6 + telegram 0.5.107: the web chat gets Telegram's lost-reply catch, question buttons and live progress (DIVE-6715)
+
+lodar, 2026-10-22 02:14Z: "Check the other gaps for dashboard chat comparing to telegram." Three of the four gaps that made the web chat feel broken are box-side, and this is them (the fourth, a phone push on a reply, is the api's):
+
+- **A reply the agent wrote in its own session now reaches the chat.** New Stop hook `hooks/stop-reply-relay.ts`: when a web-chat message came in this turn and the reply tool never ran after it, the text the agent wrote goes to that chat. A turn with neither text nor any tool call is blocked once so the agent answers ("ok"/"thanks" excepted, and never twice). A Telegram, a2a or autonomous turn is left alone.
+- **AskUserQuestion becomes tap buttons.** New PreToolUse hook `hooks/pretool-question.ts` posts the question with `metadata.question` (the app draws the buttons) and waits; the server takes the person's next message in that chat — a tap sends the label, a typed number or their own words also count — as the answer, instead of typing it into the session. A standard seat posts it through the relay's new `ask` op; a relay from before it sends the question as numbered lines. Telegram's question hook now stands aside when the web chat spoke last (`newestInboundSource` in `lib/transcript.ts`), so a seat with both plugins asks where the person is.
+- **"working: <step>" for the whole turn.** New PreToolUse hook `hooks/status-label.ts` writes Telegram's leak-filtered step label; the server (`workstatus.ts`) forwards it to the api's new `/server/messages/status` (the relay's new `status` op on a standard seat) only while a web-chat message is in flight, re-sends it every minute, and turns it off when the Stop or StopFailure hook stamps the end of the turn. An api or relay without it just keeps the old guessed "typing…".
+
+`lib/output.ts`, `lib/question-bridge.ts` and `lib/status-label.ts` join the byte-identical telegram copies (SHARED.txt, 21 files). `test/dive6715-dashboard-chat-parity.test.ts` has 22 arms on the real hooks and the real server; four mutants (no relay, no tap intercept, no Telegram stand-aside, no status on inbound) each turn one arm red.
+
 ### Fixed — dashboard 0.5.5 + telegram 0.5.106: a usage limit no longer leaves the web chat silent (DIVE-6714)
 
 lodar, 2026-10-22 02:12Z: "Dashboard chat doesn't show usage limit hit." The dashboard plugin had no hooks at all. When an agent hit its usage limit, or Claude gave up on an Overloaded/5xx error, the person on the web chat got no word. On a seat without the telegram plugin nothing typed `continue` afterwards either, so the message waited until someone nudged the pane.

@@ -337,6 +337,40 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
   return { turnStart, hadInbound, hadTool, hadSend, texts, lastChatId, lastMessageId, lastThreadId, lastInboundBareAck, reactedNewest, a2aTurn }
 }
 
+// DIVE-6715: which chat the NEWEST message from a person came in on, looking
+// only at entries from `fromIndex` on (pass analyzeTurn's turnStart). A seat can
+// run the telegram and the dashboard (web chat) plugins side by side, and each
+// one's AskUserQuestion hook must put the question where the person is waiting:
+// telegram stands aside when the web chat spoke last, and the reverse. null =
+// no message from a person in that range (an autonomous or a2a turn).
+//
+// Trust is DIVE-3445's rule for both tags: inside an inter-agent envelope only a
+// text whose tag sits at offset 0 counts, so a quoted tag cannot steer it.
+const DASHBOARD_TAG_RE_G = /<channel source="(?:plugin:dashboard:dashboard|dashboard)"/g
+const DASHBOARD_ANCHORED_RE = /^\s*<channel source="(?:plugin:dashboard:dashboard|dashboard)"/
+
+export function newestInboundSource(entries: TranscriptEntry[], fromIndex = 0): 'telegram' | 'dashboard' | null {
+  for (let i = entries.length - 1; i >= Math.max(0, fromIndex); i--) {
+    const e = entries[i]
+    if (e.type !== 'user') continue
+    const texts = entryTexts(e.message?.content ?? '')
+    const inEnvelope = texts.some((t) => A2A_ENVELOPE_RE.test(t))
+    let best: { src: 'telegram' | 'dashboard'; at: number } | null = null
+    texts.forEach((t, ti) => {
+      if (inEnvelope && !ANCHORED_TAG_RE.test(t) && !DASHBOARD_ANCHORED_RE.test(t)) return
+      // Order across the entry's texts first, then within a text.
+      const seen = (src: 'telegram' | 'dashboard', idx: number) => {
+        const at = ti * 1e9 + idx
+        if (!best || at > best.at) best = { src, at }
+      }
+      for (const m of t.matchAll(CHANNEL_TAG_RE_G)) seen('telegram', m.index ?? 0)
+      for (const m of t.matchAll(DASHBOARD_TAG_RE_G)) seen('dashboard', m.index ?? 0)
+    })
+    if (best) return (best as { src: 'telegram' | 'dashboard' }).src
+  }
+  return null
+}
+
 // Scan transcript entries past a given line index for any telegram tool
 // call. Used by stop-reply-check's re-entry path to decide whether the
 // agent recovered after we blocked it.
