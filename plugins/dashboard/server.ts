@@ -27,7 +27,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync, copyFileSync, openSync, closeSync, writeSync, statSync, existsSync, renameSync } from 'fs'
+import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync, copyFileSync, openSync, closeSync, writeSync, statSync, existsSync, renameSync, writeFileSync } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { homedir } from 'os'
@@ -44,6 +44,9 @@ import {
   savePendingRetryState,
  pendingDeliveryMeta } from './pending-redelivery.ts'
 import { deliveredLive, liveKey, loadLiveDeliveries, recordLiveDelivery, saveLiveDeliveries } from './livedelivery.ts'
+import { makeWorkStatus } from './workstatus.ts'
+import { askRelayOp, numberedText, parseQuestion } from './question.ts'
+import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
 
 let PLUGIN_VERSION = '?'
 try {
@@ -443,9 +446,96 @@ function injectIntoSession(text: string): Promise<void> {
   return sessionInjector(text)
 }
 
+// --- DIVE-6715: a question waiting in the web chat ---------------------------
+// hooks/pretool-question.ts posts the buttons and waits for <id>.ans.json. The
+// person's next message in that chat — a tap sends the label — IS the answer:
+// it is written there and NOT typed into the session, which is blocked inside
+// that hook and would otherwise read the same answer twice.
+const QUESTIONS_DIR = questionsDir()
+const QUESTION_TTL_MS = 15 * 60_000
+
+function answerPendingQuestion(chatId: string, text: string): boolean {
+  let names: string[]
+  try { names = readdirSync(QUESTIONS_DIR).filter(n => n.endsWith('.req.json')) } catch { return false }
+  let best: PendingQuestion | null = null
+  for (const n of names) {
+    try {
+      const q = JSON.parse(readFileSync(join(QUESTIONS_DIR, n), 'utf8')) as PendingQuestion
+      if (q.chatId !== chatId || Date.now() - q.createdAt > QUESTION_TTL_MS) continue
+      if (existsSync(join(QUESTIONS_DIR, `${q.id}.ans.json`))) continue
+      if (!best || q.createdAt > best.createdAt) best = q
+    } catch {}
+  }
+  if (!best) return false
+  const { idx, answer } = resolveAnswer(best, text)
+  const dest = join(QUESTIONS_DIR, `${best.id}.ans.json`)
+  try {
+    writeFileSync(`${dest}.tmp`, JSON.stringify({ idx, answer }), { mode: 0o600 })
+    renameSync(`${dest}.tmp`, dest)
+  } catch (err) {
+    process.stderr.write(`dashboard channel: could not answer question ${best.id}: ${err}\n`)
+    return false
+  }
+  recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `question ${best.id} answered (${idx >= 0 ? `option ${idx + 1}` : 'own words'})`)
+  return true
+}
+
+// --- DIVE-6715: "working: <step>" in the web chat ------------------------------
+// The status-label hook writes the step, the Stop/StopFailure hooks stamp the
+// end of the turn; workstatus.ts decides what the chat shows. A relay or an api
+// from before this row refuses the call: the chat then keeps its old guessed
+// "typing…", and this process stops asking.
+let statusOff = false
+const workStatus = makeWorkStatus({
+  post: async (chatId, active, label) => {
+    if (statusOff) return
+    try {
+      const res = await authedFetch(`${API_BASE}/server/messages/status`, 'status', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ agent: AGENT, chat_id: chatId, active, label }),
+      }, ['status', chatId, active ? '1' : '0', ...(label ? [label] : [])])
+      if (res.status === 404) throw new Error('allows only (api has no status route)')
+      void res.text().catch(() => '')
+    } catch (err) {
+      if (/allows only/.test(String(err))) {
+        statusOff = true
+        recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `live status off: ${String(err).slice(0, 160)}`)
+      }
+    }
+  },
+})
+const STATUS_LABEL_FILE = statusLabelPath()
+const TURN_ENDED_FILE = turnEndedPath()
+const statusSeen = { label: 0, ended: 0 }
+function pollWorkStatus(): void {
+  try {
+    const m = statSync(STATUS_LABEL_FILE).mtimeMs
+    if (m !== statusSeen.label) {
+      statusSeen.label = m
+      const j = JSON.parse(readFileSync(STATUS_LABEL_FILE, 'utf8')) as { at?: unknown; label?: unknown }
+      if (typeof j.label === 'string' && j.label) workStatus.label(j.label, Number(j.at) || m)
+    }
+  } catch {}
+  try {
+    const m = statSync(TURN_ENDED_FILE).mtimeMs
+    if (m !== statusSeen.ended) {
+      statusSeen.ended = m
+      workStatus.ended(Number(readFileSync(TURN_ENDED_FILE, 'utf8').trim()) || m)
+    }
+  } catch {}
+  workStatus.tick()
+}
+
 let dispatcherInboxSeq = 0
 async function deliverInbound(id: string, text: string, meta: Record<string, unknown>): Promise<void> {
-  if (!DISPATCHER_ADAPTER) return deliverToSession(text, meta)
+  if (!DISPATCHER_ADAPTER) {
+    const chatId = String(meta.chat_id ?? 'dashboard')
+    if (answerPendingQuestion(chatId, text)) return
+    await deliverToSession(text, meta)
+    workStatus.inbound(chatId)
+    return
+  }
   const seq = `${Date.now()}-${process.pid}-${dispatcherInboxSeq++}`
   const tmp = join(DISPATCHER_INBOX_DIR, `.${seq}.tmp`)
   const dest = join(DISPATCHER_INBOX_DIR, `${seq}.json`)
@@ -798,7 +888,7 @@ const FFPROBE = process.env.DASHBOARD_FFPROBE ?? FFMPEG.replace(/ffmpeg$/, 'ffpr
 const probeFile: Probe = async (bin, args, timeoutMs) => (await promisify(execFile)(bin, args, { timeout: timeoutMs })).stdout
 const SPEAK = process.env.DASHBOARD_SPEAK ?? '/usr/local/bin/5dive-speak'
 
-type ReplyArgs = { chat_id?: unknown; text?: unknown; files?: unknown; voice?: unknown }
+type ReplyArgs = { chat_id?: unknown; text?: unknown; files?: unknown; voice?: unknown; question?: ChatQuestion | null }
 
 // DIVE-6549: `voice: true` speaks the reply here, so answering a voice note is
 // one tool call where it was three model rounds (reply, run 5dive-speak, reply
@@ -871,17 +961,29 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
   if (sent.length !== files.length) {
     process.stderr.write(`dashboard channel: ${files.length - sent.length} file(s) not in ${OUTBOX_DIR} left off the reply\n`)
   }
-  const res = await authedFetch(`${API_BASE}/server/messages/event`, 'outbound reply', {
+  // DIVE-6715: a question (hooks/pretool-question.ts) rides in metadata, which
+  // the app draws as buttons. A relay from before the `ask` op refuses it; the
+  // question then goes as numbered lines, which the person answers by typing.
+  const question = args.question ?? null
+  const post = (body: string, q: ChatQuestion | null) => authedFetch(`${API_BASE}/server/messages/event`, 'outbound reply', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
     },
     body: JSON.stringify({
       agent: AGENT,
-      body: text,
-      metadata: { chat_id: chatId, ...(sent.length ? { files: sent } : {}) },
+      body,
+      metadata: { chat_id: chatId, ...(sent.length ? { files: sent } : {}), ...(q ? { question: q } : {}) },
     }),
-  }, ['event', chatId, text, ...sent])
+  }, q ? askRelayOp(chatId, body, q) : ['event', chatId, body, ...sent])
+  let res: Response
+  try {
+    res = await post(text, question)
+  } catch (err) {
+    if (!question || !RELAY || !/allows only/.test(String(err))) throw err
+    process.stderr.write(`dashboard channel: this relay has no ask op (5dive self-update brings it); question sent as text\n`)
+    res = await post(numberedText(text, question), null)
+  }
   if (!res.ok) {
     const detail = await res.text().catch(() => '')
     throw new Error(`dashboard reply failed: control plane returned ${res.status} ${detail.slice(0, 200)}`)
@@ -913,7 +1015,7 @@ function ingestOutboxFile(dir: string, name: string, what: string): void {
     return
   }
   outboxBusy.add(full)
-  void sendDashboardReply({ chat_id: obj.chat_id, text: obj.text, files: obj.files, voice: voicesReply(obj) }).then(result => {
+  void sendDashboardReply({ chat_id: obj.chat_id, text: obj.text, files: obj.files, voice: voicesReply(obj), question: parseQuestion(obj.question) }).then(result => {
     if (result.includes('VOICE NOTE NOT SENT')) process.stderr.write(`dashboard channel: ${what} reply ${name}: ${result.split('\n').pop()}\n`)
     try { unlinkSync(full) } catch {}
   }).catch(err => {
@@ -959,7 +1061,10 @@ if (!DISPATCHER_ADAPTER) {
 // head start before the first drains. Mid-session paths (fs.watch, sweeps)
 // are unaffected.
 setTimeout(() => {
-  if (!DISPATCHER_ADAPTER) watchOutbox(NOTICE_OUTBOX_DIR, 'notice')
+  if (!DISPATCHER_ADAPTER) {
+    watchOutbox(NOTICE_OUTBOX_DIR, 'notice')
+    setInterval(pollWorkStatus, 1_000).unref?.()
+  }
   startAgentInbox()
   startCollectNowWatch()
   void drainPending()

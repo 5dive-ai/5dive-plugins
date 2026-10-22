@@ -1,6 +1,38 @@
 {
-  "description": "5dive dashboard plugin lifecycle hooks — on a usage-limit or transient-API StopFailure, post one notice into the web chat the person wrote in, and (on a seat without the telegram plugin) resume and answer once the limit lifts.",
+  "description": "5dive dashboard plugin lifecycle hooks — on a usage-limit or transient-API StopFailure, post one notice into the web chat the person wrote in, and (on a seat without the telegram plugin) resume and answer once the limit lifts; bridge AskUserQuestion to tap buttons in the web chat; label each step so the chat shows what the agent is working on; and relay a reply the agent wrote in its session without calling the reply tool.",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pretool-question.ts",
+            "timeout": 600
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/status-label.ts",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop-reply-relay.ts",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "StopFailure": [
       {
         "hooks": [
