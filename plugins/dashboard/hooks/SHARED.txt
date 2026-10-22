@@ -11,12 +11,15 @@ lib/failure.ts
 lib/lite.ts
 lib/live-transcript.ts
 lib/notify-dedup.ts
+lib/output.ts
 lib/paths.ts
 lib/payload.ts
+lib/question-bridge.ts
 lib/resume-lock.ts
 lib/resume-prompt.ts
 lib/resume-retry.ts
 lib/state.ts
+lib/status-label.ts
 lib/telegram.ts
 lib/terms.ts
 lib/time.ts
