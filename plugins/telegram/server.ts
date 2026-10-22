@@ -5556,7 +5556,9 @@ async function handleBrowserConnectTap(ctx: Context, tap: ConnectTap, senderId: 
     return
   }
   await ctx.editMessageText(renderConnectVerdict(v)).catch(() => {})
-  notifyAgentOfConnect(ctx, connectAgentNote('verdict', v.site, `\`5dive browser status ${v.site}\` said: ${v.status || 'nothing'}`, v.kind))
+  // DIVE-6725: a challenge Done carries root's read of the page, not a login status.
+  const said = v.kind === 'challenge' ? v.status : `\`5dive browser status ${v.site}\` said: ${v.status || 'nothing'}`
+  notifyAgentOfConnect(ctx, connectAgentNote('verdict', v.site, said, v.kind))
 }
 
 // DIVE-4982: `owner-ask tap` runs only as root (it refuses any other uid), so

@@ -18,9 +18,15 @@ export type ConnectTap = { op: 'tap' | 'done'; code: string }
 // words, and Done hands the browser back to the agent instead of probing.
 export type ConnectKind = 'login' | 'challenge'
 
-export type ConnectLink = { site: string; url: string; expires: string; done: string; kind: ConnectKind }
+// DIVE-6725: `check` is whether the box saw a check on the page before it asked.
+// false = no check there, so the owner is asked to take over, never to clear a
+// captcha. Absent (an older box) reads as true, which is what it used to say.
+export type ConnectLink = { site: string; url: string; expires: string; done: string; kind: ConnectKind; check: boolean }
 
-export type ConnectVerdict = { site: string; rc: number; status: string; kind: ConnectKind }
+// DIVE-6725: on a challenge Done, root reads the handed-back page once more:
+// `check` is still | none | unknown ('' from an older box), and `status` says
+// what the page shows. Nothing here may say the check was cleared.
+export type ConnectVerdict = { site: string; rc: number; status: string; kind: ConnectKind; check: string }
 
 function kindOf(v: string | undefined): ConnectKind {
   return v === 'challenge' ? 'challenge' : 'login'
@@ -64,7 +70,7 @@ export function parseConnectLink(stdout: string): ConnectLink | null {
   const expires = m.get('expires') ?? ''
   if (!SITE_RE.test(site) || !URL_RE.test(url) || !CODE_RE.test(done)) return null
   if (!url.includes(`/browser/viewer/${site}/`)) return null
-  return { site, url, expires, done, kind: kindOf(m.get('kind')) }
+  return { site, url, expires, done, kind: kindOf(m.get('kind')), check: m.get('check') !== '0' }
 }
 
 export function parseConnectVerdict(stdout: string): ConnectVerdict | null {
@@ -72,7 +78,14 @@ export function parseConnectVerdict(stdout: string): ConnectVerdict | null {
   const site = m.get('site') ?? ''
   if (!SITE_RE.test(site)) return null
   const rc = Number(m.get('status_rc') ?? 'NaN')
-  return { site, rc: Number.isFinite(rc) ? rc : -1, status: m.get('status') ?? '', kind: kindOf(m.get('kind')) }
+  const check = m.get('check') ?? ''
+  return {
+    site,
+    rc: Number.isFinite(rc) ? rc : -1,
+    status: m.get('status') ?? '',
+    kind: kindOf(m.get('kind')),
+    check: ['still', 'none', 'unknown'].includes(check) ? check : '',
+  }
 }
 
 /** The link message. The URL is a CODE entity and previews are off: a link
@@ -85,13 +98,18 @@ export function renderConnectLink(l: ConnectLink): {
   reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] }
 } {
   const challenge = l.kind === 'challenge'
+  const takeOver = challenge && !l.check
   const head =
-    (challenge ? `🧩 Clear the check on ${l.site}.\n\n` : `🔐 Log in to ${l.site}.\n\n`) +
+    (takeOver
+      ? `🖐 Take over on ${l.site}.\n\n`
+      : challenge ? `🧩 Clear the check on ${l.site}.\n\n` : `🔐 Log in to ${l.site}.\n\n`) +
     `Copy-paste this one-time link into your browser. Do not paste it back here. ` +
     `It works once${l.expires ? ` and expires ${l.expires}` : ''}.\n\n`
-  const tail = challenge
-    ? `\n\nClear the captcha yourself, close the tab, then tap Done so the agent carries on.`
-    : `\n\nLog in, close the tab, then tap Done so the agent can check the login.`
+  const tail = takeOver
+    ? `\n\nDo what the agent asked, close the tab, then tap Done so the agent carries on.`
+    : challenge
+      ? `\n\nClear the captcha yourself, close the tab, then tap Done so the agent carries on.`
+      : `\n\nLog in, close the tab, then tap Done so the agent can check the login.`
   const button = challenge ? `Done — carry on` : `Done — check ${l.site}`
   return {
     text: head + l.url + tail,
@@ -102,7 +120,11 @@ export function renderConnectLink(l: ConnectLink): {
 }
 
 export function renderConnectVerdict(v: ConnectVerdict): string {
-  if (v.kind === 'challenge') return `✅ Thanks. The agent is carrying on with ${v.site}.`
+  if (v.kind === 'challenge') {
+    return v.check === 'still'
+      ? `⚠️ Thanks. The box still sees a check on ${v.site}, so the agent will tell you if it cannot go on.`
+      : `✅ Thanks. The agent is carrying on with ${v.site}.`
+  }
   const ok = v.rc === 0
   return ok
     ? `✅ ${v.site} is connected. The agent can use it now.`
@@ -114,10 +136,13 @@ export function connectAgentNote(kind: 'opened' | 'verdict', site: string, detai
   if (what === 'challenge') {
     return kind === 'opened'
       ? `[browser challenge] The owner tapped Open for ${site}. The one-time link was sent to them. Wait for their Done; do not open the link, and do not touch ${site} until then.`
-      : `[browser challenge] The owner cleared the check on ${site} and tapped Done. The box browser for ${site} is back in your hands, on that page, with the check cleared. ` +
+      : // DIVE-6725: what the box shows NOW (root's read of the handed-back page),
+        // never "the owner cleared the check": on exact-swallow there was none.
+        `[browser challenge] The owner tapped Done for ${site}. The box browser for ${site} is back in your hands. ` +
+          (detail ? `What it shows now: ${detail}. ` : `The box did not say what the page shows now. `) +
           `Carry on with the task now, without asking them again: first check what already happened (did the step you were on go through?) so nothing is sent twice, ` +
           `then re-read the page you were stopped on (5dive browser snapshot <that url>) and continue from that step. ` +
-          `If the check is still there, say so once and stop; never try to solve it.`
+          `If a check is still on the page, say so once and stop; never try to solve it.`
   }
   return kind === 'opened'
     ? `[browser connect] The owner tapped Connect for ${site}. The one-time login link was sent to them. Wait for their Done; do not open the link.`
@@ -129,5 +154,7 @@ export function connectAgentNote(kind: 'opened' | 'verdict', site: string, detai
 export function connectFailureText(stderr: string): string {
   const last = stderr.trim().split('\n').filter(Boolean).pop() ?? ''
   const why = last.replace(/^[^:]*browser: /, '').slice(0, 300)
+  // DIVE-6725: a late tap is not a failure: root already sent a fresh button.
+  if (why.startsWith('that button had expired, so a fresh one was just sent')) return `⏰ T${why.slice(1)}`
   return `❌ Could not open the login: ${why || 'the box did not answer'}`
 }

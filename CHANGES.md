@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.108: the browser's captcha button says "captcha" only when the box saw one, and Done says what the page shows (DIVE-6725)
+
+On exact-swallow, an agent sent its owner three "clear the captcha" buttons for a page that was a 404 with no captcha on it. The owner answered: "it was not capture - just broken link". Browser 1.50.0 (5dive-ai/5dive-browser) now loads the page before it asks, and refuses an error page. It tells this plugin `check=0` when the page has no check on it, and at Done it reads the page back.
+
+- **The link message follows `check`.** With `check=0`, the owner reads "🖐 Take over on <site>" and "Do what the agent asked…", never "captcha" or "clear the check". With no `check` line (an older box), the words are the same as before.
+- **Done tells the agent what the page shows.** The note is root's read of the page: title, address, and whether a check is still detected. It no longer says "the owner cleared the check". When the box still sees a check, the owner's Done reply says so instead of "carrying on".
+- **A late tap is not a failure.** When root answers an expired button with a fresh one, the old message reads "⏰ That button had expired, so a fresh one was just sent below" instead of "❌ Could not open the login".
+
+`test/dive6725-challenge-look.test.ts`: 11 arms, 8 of them red on 0.5.107.
+
 ### Added — dashboard 0.5.6 + telegram 0.5.107: the web chat gets Telegram's lost-reply catch, question buttons and live progress (DIVE-6715)
 
 lodar, 2026-10-22 02:14Z: "Check the other gaps for dashboard chat comparing to telegram." Three of the four gaps that made the web chat feel broken are box-side, and this is them (the fourth, a phone push on a reply, is the api's):
