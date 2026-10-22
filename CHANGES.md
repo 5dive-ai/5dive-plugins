@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Changed — telegram 0.5.107: "Answers to" can hold every name the agent answers to in a group, its bot name too, so the owner can remove that one (DIVE-6729)
+
+lodar, 2026-10-22: rename "Also answers to" to "Answers to" and list every name the agent already answers to, so the owner can change even the first one. In a group the agent answered to the first word of its bot's Telegram name on top of `groupsCallNames`, and nothing could turn that word off. lodar's ceo bot is "Janis's matcha assistant", so it answered to "Janis", the owner's own name.
+
+A new access.json key, `groupsCallNamesComplete: true`, makes `groupsCallNames` the whole list: the bot-name word calls the agent only when it is on it. The CLI's `agent telegram-access groups --names=` sets it. Without the key nothing changes, so an older CLI or a hand edit keeps today's behaviour. An @mention and a reply to the agent always wake it, whatever the list holds. `normalizeAccess` keeps the key. `test/dive6729-answers-to.test.ts` covers the flag on and off.
+
 ### Fixed — dashboard 0.5.5 + telegram 0.5.106: a usage limit no longer leaves the web chat silent (DIVE-6714)
 
 lodar, 2026-10-22 02:12Z: "Dashboard chat doesn't show usage limit hit." The dashboard plugin had no hooks at all. When an agent hit its usage limit, or Claude gave up on an Overloaded/5xx error, the person on the web chat got no word. On a seat without the telegram plugin nothing typed `continue` afterwards either, so the message waited until someone nudged the pane.
