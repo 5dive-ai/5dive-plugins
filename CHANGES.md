@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.111: the plugin no longer bakes in Claude model ids, so `/model` and `/effort` cannot fall behind a Claude release (DIVE-6788)
+
+The `/model` picker's fallback map still pointed at Sonnet 5 and Haiku 4.5 after the 5.5 releases. On a 5dive host the map is refreshed from `5dive models --json` at boot, so only a host without the CLI ran on the stale ids, but a baked id always rots.
+
+- **The fallback map holds bare aliases** (`opus`, `sonnet`, `fable`, `haiku`). Claude Code resolves them itself. The 5dive CLI refresh still replaces them with full ids. `/model` already saved and typed the bare alias (DIVE-4860), so nothing a user taps changes.
+- **`/effort` also writes the seat's own alias key.** A seat on `model: "sonnet"` now gets `modelSettings.sonnet.effortLevel` next to the full-id keys. Claude Code maps an alias key to whatever that alias means, so the effort carries over to the next release. An exact full-id key still wins, as in Claude Code, and the picker reads it in that order.
+- **telegram-pi:** the `/model` help example is `openrouter/deepseek/deepseek-chat`, not a Claude id.
+- A seat whose settings name `constructor` or another object built-in no longer throws in the effort writer.
+
+`test/dive4865-effort-per-model.test.ts` gains 9 arms for the alias keys and the fallback map. `test/model-aliases.test.ts` now requires a baked map with no ids. `test/dive5121-lite-profile.test.ts` moves its `commands.ts` byte pin; the command registry is unchanged.
+
 ### Fixed — telegram 0.5.110: an agent working on its own no longer posts "Usage limit hit" in its group; only whoever wrote to it hears (DIVE-6734)
 
 lodar, 2026-10-22: "its like noone asked an agent directly yet it spams usage limit hit in group". On a turn with no Telegram message in it (a heartbeat, a task, a cron job), the usage-limit notice went to the agent's group topic. Nobody asked, so now nobody is told; the work resumes by itself after the reset.

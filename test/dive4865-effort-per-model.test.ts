@@ -176,6 +176,59 @@ describe('the reader prefers the per-model key', () => {
   })
 })
 
+// DIVE-6788: the baked fallback map holds bare aliases, not ids, and a seat
+// whose settings.json says `model: "sonnet"` gets its effort under the alias key
+// too. CC 2.1.309 canonicalises a modelSettings key through its own alias table
+// (an exact full-id key wins over an alias key), so `modelSettings.sonnet`
+// applies to whatever `sonnet` means after the next release.
+const FALLBACK = { opus: 'opus', sonnet: 'sonnet', fable: 'fable', haiku: 'haiku' }
+
+describe('DIVE-6788: alias keys follow the release', () => {
+  test('a seat on a bare alias gets the alias key next to the catalogue ids', () => {
+    withFile({ model: 'sonnet', effortLevel: 'high' }, f => {
+      patchEffortFile(f, 'low', CATALOGUE, true)
+      const back = read(f)
+      expect(back.modelSettings.sonnet.effortLevel).toBe('low')
+      for (const id of IDS) expect(back.modelSettings[id].effortLevel).toBe('low')
+    })
+  })
+  test('the [1m] suffix is dropped from the alias key', () => {
+    expect(effortModelIds(CATALOGUE, 'opus[1m]')).toEqual([...IDS, 'opus'].sort())
+  })
+  test('a full-id seat gets no alias key', () => {
+    expect(effortModelIds(CATALOGUE, 'claude-opus-5-5')).toEqual([...IDS].sort())
+  })
+  test('an unknown name or a prototype key is not an alias', () => {
+    expect(effortModelIds(CATALOGUE, 'default')).toEqual([...IDS].sort())
+    expect(effortModelIds(CATALOGUE, 'constructor')).toEqual([...IDS].sort())
+  })
+  test('the fallback map (no 5dive CLI) writes alias keys only — no id anywhere', () => {
+    withFile({ model: 'opus' }, f => {
+      patchEffortFile(f, 'high', FALLBACK, true)
+      const back = read(f)
+      expect(Object.keys(back.modelSettings).sort()).toEqual(['fable', 'haiku', 'opus', 'sonnet'])
+      expect(effectiveEffort(back, FALLBACK)).toBe('high')
+      expect(effectiveEffort(back, FALLBACK, 'sonnet[1m]')).toBe('high')
+    })
+  })
+  test('a fallback seat pinned to an older full id still gets that id keyed', () => {
+    expect(effortModelIds(FALLBACK, 'claude-opus-4-7')).toEqual(['claude-opus-4-7', 'fable', 'haiku', 'opus', 'sonnet'])
+  })
+  test('the reader falls back to the alias key, as CC does', () => {
+    const s = { model: 'sonnet', effortLevel: 'high', modelSettings: { sonnet: { effortLevel: 'low' } } }
+    expect(effectiveEffort(s, CATALOGUE)).toBe('low')
+    expect(effectiveEffort(s, CATALOGUE, 'claude-sonnet-5')).toBe('low')
+  })
+  test('the exact full-id key wins over the alias key, as in CC', () => {
+    const s = { model: 'sonnet', modelSettings: { sonnet: { effortLevel: 'low' }, 'claude-sonnet-5': { effortLevel: 'xhigh' } } }
+    expect(effectiveEffort(s, CATALOGUE)).toBe('xhigh')
+  })
+  test('an alias key for another family is not read', () => {
+    const s = { model: 'opus', effortLevel: 'high', modelSettings: { sonnet: { effortLevel: 'low' } } }
+    expect(effectiveEffort(s, CATALOGUE)).toBe('high')
+  })
+})
+
 describe('server.ts wiring', () => {
   test('applyEffort writes through patchEffort, not a top-level-only patch', () => {
     const b = fnBody(src(), 'applyEffort')

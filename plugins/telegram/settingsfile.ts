@@ -46,6 +46,7 @@ export function patchSettingsFile(path: string, patch: Record<string, unknown>, 
 
 type Json = Record<string, unknown>
 const isObj = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array.isArray(v)
+const hasOwn = (o: object, k: string): boolean => Object.prototype.hasOwnProperty.call(o, k)
 
 export function perModelEffort(level: string): string {
   return level === 'max' ? 'xhigh' : level
@@ -56,16 +57,37 @@ export function perModelEffort(level: string): string {
 export function canonicalModel(model: unknown, aliases: Record<string, string>): string | undefined {
   if (typeof model !== 'string' || !model) return undefined
   const bare = model.replace(/\[[^\]]*\]$/, '')
-  return aliases[bare] ?? bare
+  // Own keys only: `constructor` & co. are not aliases (a prototype hit here
+  // returned a function and threw in effortModelIds).
+  return hasOwn(aliases, bare) ? aliases[bare] : bare
+}
+
+/** The family alias `model` names (`opus`, `sonnet[1m]` → `sonnet`), if it is
+ *  one of the map's keys; undefined for a full id or anything else. */
+function familyAlias(model: unknown, aliases: Record<string, string>): string | undefined {
+  if (typeof model !== 'string' || !model) return undefined
+  const bare = model.replace(/\[[^\]]*\]$/, '')
+  return hasOwn(aliases, bare) ? bare : undefined
 }
 
 /** Ids that get a per-model effortLevel: every catalogue id — so a later /model
  *  switch keeps the level — plus the seat's own canonical model when it is a
- *  claude-* id the catalogue does not list (a seat pinned to an older model). */
+ *  claude-* id the catalogue does not list (a seat pinned to an older model).
+ *
+ *  DIVE-6788: plus the seat's own family alias when settings.json names one
+ *  (`model: "sonnet"`). Claude Code canonicalises a `modelSettings` key through
+ *  its own alias table, so an effort under `sonnet` applies to whatever `sonnet`
+ *  means in the running binary — it follows the seat across the next release,
+ *  where a key under today's full id would not. An exact full-id key still wins
+ *  over the alias key in CC, and both are written with the same level here.
+ *  With the baked fallback map (no 5dive CLI) the catalogue values ARE the bare
+ *  aliases, so every key written is an alias key. */
 export function effortModelIds(aliases: Record<string, string>, model?: unknown): string[] {
   const ids = new Set(Object.values(aliases).filter(v => typeof v === 'string' && v))
   const own = canonicalModel(model, aliases)
   if (own?.startsWith('claude-')) ids.add(own)
+  const alias = familyAlias(model, aliases)
+  if (alias) ids.add(alias)
   return [...ids].sort()
 }
 
@@ -81,11 +103,22 @@ export function withEffort(obj: Json, level: string, ids: string[]): Json {
 }
 
 /** What CC runs: the per-model key for `model` (default: the file's own
- *  `model`), else the legacy top-level key. */
+ *  `model`), else the legacy top-level key.
+ *
+ *  The per-model lookup follows CC's own order (DIVE-6788): the exact canonical
+ *  id first, then any family-alias key that resolves to it (CC canonicalises
+ *  `modelSettings.sonnet` to the id `sonnet` means). With the baked fallback map
+ *  the canonical id of an alias is the alias itself, so its key is the exact one. */
 export function effectiveEffort(obj: Json, aliases: Record<string, string>, model?: string): string | undefined {
   const k = canonicalModel(model ?? obj.model, aliases)
-  const pm = k && isObj(obj.modelSettings) && isObj(obj.modelSettings[k]) ? obj.modelSettings[k].effortLevel : undefined
-  if (typeof pm === 'string') return pm
+  const ms = obj.modelSettings
+  if (k && isObj(ms)) {
+    const keys = [k, ...Object.keys(aliases).filter(a => a !== k && aliases[a] === k)]
+    for (const key of keys) {
+      const pm = isObj(ms[key]) ? ms[key].effortLevel : undefined
+      if (typeof pm === 'string') return pm
+    }
+  }
   return typeof obj.effortLevel === 'string' ? obj.effortLevel : undefined
 }
 

@@ -30,7 +30,7 @@ import { join } from 'node:path'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { patchSettingsFile } from '../plugins/telegram/settingsfile'
-import { MODEL_ALIASES } from '../plugins/telegram/commands'
+import { MODEL_ALIASES, applyModelAliases } from '../plugins/telegram/commands'
 import {
   switchLine, paneConfirms, classifySwitch, switchAck, switchPending,
   SWITCH_POLL_MS, SWITCH_POLL_STEP_MS, SWITCH_MENU_RE,
@@ -619,7 +619,16 @@ describe('MUTANT: the full id, typed again', () => {
     expect(b).not.toContain('patchSettings({ model: alias })')
     expect(b).toMatch(/patchSettings\(\{\s*model:\s*MODEL_ALIASES/)
   })
-  test('and the value it would type is a claude-* id', () => {
-    expect(switchLine('model', MODEL_ALIASES.opus!)).toMatch(/^\/model claude-/)
+  // On a 5dive host the map holds the CLI's full ids (the baked fallback holds
+  // bare aliases since DIVE-6788), so that is where the mutant bites.
+  test('and on a 5dive host the value it would type is a claude-* id', () => {
+    const baked = { ...MODEL_ALIASES }
+    try {
+      applyModelAliases({ opus: 'claude-opus-9-9' })
+      expect(switchLine('model', MODEL_ALIASES.opus!)).toMatch(/^\/model claude-/)
+    } finally {
+      for (const k of Object.keys(MODEL_ALIASES)) delete MODEL_ALIASES[k]
+      Object.assign(MODEL_ALIASES, baked)
+    }
   })
 })
