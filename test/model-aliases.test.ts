@@ -9,6 +9,8 @@
 // server.ts is NOT imported here (it long-polls Telegram on import), which is
 // why the merge lives in commands.ts as a pure function.
 import { expect, test, describe, afterEach } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { MODEL_ALIASES, applyModelAliases } from '../plugins/telegram/commands'
 
 const BAKED = { ...MODEL_ALIASES }
@@ -19,22 +21,32 @@ const restore = () => {
 afterEach(restore)
 
 describe('baked fallback map', () => {
-  test('every alias resolves to a full id, never a bare alias', () => {
-    // A bare alias in settings.json is stripped by Claude Code's startup
-    // migration on a fresh config dir (DIVE-506), so the map must never hold one.
+  // DIVE-6788: the fallback carries no model ids. A baked id rots — this map
+  // sat on claude-sonnet-5 / claude-haiku-4-5 after the 5.5 releases. Each
+  // family maps to its own bare alias, which Claude Code resolves itself.
+  // (DIVE-506's worry, a bare alias stripped from settings.json, no longer
+  // applies to these values: /model writes the bare alias whatever the map
+  // holds (DIVE-4860), and the values only key per-model effort, which CC
+  // canonicalises through its own alias table.)
+  test('every alias maps to itself — no model id is baked in', () => {
     for (const [alias, id] of Object.entries(BAKED)) {
-      expect(id).not.toBe(alias)
-      expect(id.startsWith('claude-')).toBe(true)
+      expect(id).toBe(alias)
+      expect(id).not.toMatch(/^claude-/)
     }
   })
 
-  test('fable is selectable', () => {
-    expect(BAKED.fable).toBe('claude-fable-5')
+  test('the four families are selectable, in picker order', () => {
+    expect(Object.keys(BAKED)).toEqual(['opus', 'sonnet', 'fable', 'haiku'])
   })
 
-  test('opus and sonnet are the current generation', () => {
-    expect(BAKED.opus).toBe('claude-opus-5')
-    expect(BAKED.sonnet).toBe('claude-sonnet-5')
+  test('commands.ts names no claude-* id outside comments', () => {
+    const text = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram', 'commands.ts'), 'utf8')
+    const code = text
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map(l => l.replace(/\/\/.*$/, ''))
+      .join('\n')
+    expect(code).not.toMatch(/claude-(opus|sonnet|haiku|fable)-[0-9]/)
   })
 })
 

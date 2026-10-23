@@ -80,7 +80,9 @@ describe('no profile set = the plugin as it is today', () => {
   test('the default menu and /help are the 0.5.66 ones (the 0.5.64 commands.ts less the /council entry)', () => {
     // sha of plugins/telegram/commands.ts in 0.5.66: the 0.5.64 release (243af25) with only
     // the /council registry entry deleted (DIVE-5164, lodar). Every other command is unchanged.
-    expect(sha(readFileSync(join(TG, 'commands.ts'), 'utf8'))).toBe('37b3d0d6e5101ac5bb7512bf61bf7927cc104dd6dbc3f13af8a85db1b81ffd0a')
+    // DIVE-6788 then changed only the baked MODEL_ALIASES values (bare aliases, no model ids)
+    // and their comments; the registry below is untouched, so the pin moved with it.
+    expect(sha(readFileSync(join(TG, 'commands.ts'), 'utf8'))).toBe('24f4441be6df9938c0eab34f2160604e7e4e21b76a01e1b8dd80d898cf2f2f02')
     expect(COMMAND_REGISTRY.map(c => c.name)).toEqual([
       'start', 'help', 'status', 'context', 'stop', 'restart', 'clear', 'checkpoint', 'resume', 'agents', 'team',
       'tasks', 'inbox', 'heartbeat', 'task', 'org', 'update', 'model', 'effort', 'account', 'login', 'usage',

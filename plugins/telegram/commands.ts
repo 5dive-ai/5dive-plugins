@@ -182,21 +182,27 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
 ]
 
-/** Short model alias → full Claude Code model ID.
+/** Short model alias → what Claude Code is told to run for it.
  *  Keys here are also the picker button labels, so order is the display order.
  *
- *  DIVE-1883: these are FALLBACK defaults only. On a 5dive host the map is
- *  refreshed at boot from `5dive models --json` (see refreshModelAliases() in
- *  server.ts), which reads the CLI's single source of truth in
- *  src/lib/models.sh. Do NOT bump a model here on its own — that is exactly how
- *  this map ended up a whole version behind the CLI (opus pointed at 4.7 while
- *  the CLI pinned 4.8, so /model opus and agent-create disagreed). Change
- *  models.sh; this map only matters on upstream hosts with no 5dive CLI. */
+ *  DIVE-1883: on a 5dive host the map is refreshed at boot from
+ *  `5dive models --json` (see refreshModelAliases() in server.ts), which reads
+ *  the CLI's single source of truth in src/lib/models.sh and replaces each
+ *  value with the full model id. Change models.sh, never this map.
+ *
+ *  DIVE-6788: the baked fallback carries NO model ids — each family maps to its
+ *  own bare alias. A baked id rots: this map sat on Sonnet 5 and Haiku 4.5 after
+ *  the 5.5 releases, and before that on Opus 4.7 while the CLI pinned 4.8. A
+ *  bare alias is resolved by Claude Code itself, so it is always current. Every
+ *  consumer takes an alias-valued entry: /model persists and types the bare
+ *  alias anyway (DIVE-4860), the "current model" ✓ degenerates to an alias
+ *  match, and effort is keyed `modelSettings.<alias>`, which Claude Code
+ *  canonicalises through its own alias table (settingsfile.ts). */
 export const MODEL_ALIASES: Record<string, string> = {
-  opus: 'claude-opus-5',
-  sonnet: 'claude-sonnet-5',
-  fable: 'claude-fable-5',
-  haiku: 'claude-haiku-4-5-20251001',
+  opus: 'opus',
+  sonnet: 'sonnet',
+  fable: 'fable',
+  haiku: 'haiku',
 }
 
 /** DIVE-1883: replace MODEL_ALIASES in place from the CLI's catalogue
@@ -204,7 +210,7 @@ export const MODEL_ALIASES: Record<string, string> = {
  *  mutation, so it is unit-testable without importing server.ts (which
  *  long-polls Telegram on import). Returns true when the map was replaced.
  *
- *  Fail-closed: a null/empty/malformed payload leaves the baked defaults
+ *  Fail-closed: a null/empty/malformed payload leaves the baked aliases
  *  standing rather than emptying the picker. Non-string entries are dropped
  *  individually so one bad row can't poison the whole map. An alias the CLI
  *  knows and we don't is ADDED, so a newly mapped family shows up in the
