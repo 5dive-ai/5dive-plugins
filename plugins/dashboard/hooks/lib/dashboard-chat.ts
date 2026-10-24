@@ -8,7 +8,7 @@
 import { mkdirSync, renameSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
-import { A2A_ENVELOPE_RE, entryTexts } from './transcript'
+import { A2A_ENVELOPE_RE, entryTexts, refusedTooLongIds } from './transcript'
 import { textLang } from './terms'
 import type { Lang } from './lite'
 import type { TranscriptEntry } from './types'
@@ -43,12 +43,15 @@ export function lastDashboardInbound(entries: TranscriptEntry[]): DashboardInbou
 }
 
 /** Did the agent call the dashboard reply tool after entry `index`? */
+// DIVE-6862: a reply refused for length sent nothing, so neither of these
+// counts it: the Stop hook then relays the turn's text or blocks once.
 export function answeredAfter(entries: TranscriptEntry[], index: number): boolean {
+  const refused = refusedTooLongIds(entries.slice(index + 1))
   for (let i = index + 1; i < entries.length; i++) {
     const e = entries[i]
     if (e.type !== 'assistant' || !Array.isArray(e.message?.content)) continue
-    for (const b of e.message.content as Array<{ type?: string; name?: string }>) {
-      if (b?.type === 'tool_use' && typeof b.name === 'string' && REPLY_TOOL_RE.test(b.name)) return true
+    for (const b of e.message.content as Array<{ type?: string; name?: string; id?: string }>) {
+      if (b?.type === 'tool_use' && typeof b.name === 'string' && REPLY_TOOL_RE.test(b.name) && !(b.id && refused.has(b.id))) return true
     }
   }
   return false
@@ -161,10 +164,11 @@ export function assistantTextsAfter(entries: TranscriptEntry[], index: number): 
 
 /** Did the agent call any tool at all after entry `index`? */
 export function usedToolAfter(entries: TranscriptEntry[], index: number): boolean {
+  const refused = refusedTooLongIds(entries.slice(index + 1))
   for (let i = index + 1; i < entries.length; i++) {
     const e = entries[i]
     if (e.type !== 'assistant' || !Array.isArray(e.message?.content)) continue
-    if ((e.message.content as Array<{ type?: string }>).some(b => b?.type === 'tool_use')) return true
+    if ((e.message.content as Array<{ type?: string; id?: string }>).some(b => b?.type === 'tool_use' && !(b.id && refused.has(b.id)))) return true
   }
   return false
 }
