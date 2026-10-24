@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.113: /account no longer says «Couldn't switch» after a switch that worked, and the picker opens at once (DIVE-6867)
+
+A full seat tapped another account and got "❌ Couldn't switch account → chemmonitor: ==> Rewriting …", then /account said it was on chemmonitor.
+
+- **set-account gets 60 s, on every seat.** The plugin gave it 5 s on a full seat and killed it while the CLI was still securing logins: the account had moved, the restart never ran, and the kill landed between removing the old login link and making the new one. The "reason" shown was the CLI's progress lines.
+- **A failed run is checked before the owner hears about it.** The plugin reads the agent's account again. Moved, with the restart already scheduled: ✅. Moved, without the restart: set-account runs once more, which redoes every step. Not moved: ❌ with the CLI's own `error:` line, or "it took too long and was stopped", never progress lines, paths or the sudo command.
+- **The picker opens from its last read.** Its four CLI reads (agent list, account list, usage, rotation) took ~2.5 s on a calm poke-two and several times that under load. They now go through a short cache (fresh 30 s, served stale up to 10 min while it re-reads behind), warmed at boot. A rotation change clears its part. The switch's own check, /usage and the rotation submenu still read fresh.
+
+`test/dive6867-account-switch.test.ts`: 21 tests; on 0.5.112 the file does not load (the new helpers are missing), and with only the helpers added, the 5 wiring tests are red.
+
 ### Fixed — telegram 0.5.112: tap buttons for Russian chats and partner boxes, and agents are told how to get them (DIVE-6859)
 
 On a partner box an agent ended with «Делаем так?» and «Какой берём?» as plain text, with nothing to tap.

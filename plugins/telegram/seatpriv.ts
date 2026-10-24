@@ -112,6 +112,57 @@ export function accountSwitchFailedText(name: string, refused: boolean, detail: 
   return `❌ Couldn't switch account → ${name}: ${detail || 'unknown error'}\n\nThis agent is still on its current account.`
 }
 
+// ── DIVE-6867: a switch that worked is never reported as failed ─────────────
+//
+// olivia, 2026-10-24 12:20Z: tap chemmonitor → "❌ Couldn't switch account →
+// chemmonitor: ==> Rewriting …/olivia.env ==> Re-pointing …/olivia-auth.env",
+// and /account then said "Current account: chemmonitor". The plugin gave
+// set-account 5s on a full seat. The CLI was still securing logins (it walks
+// every vendor login and every bound seat) when execFile killed it: the registry
+// and the env file had moved, the restart never fired, and the kill landed
+// inside link_agent_profile, after the old login link was removed and before the
+// new one was made. The "detail" was the CLI's progress lines on stderr.
+
+/** set-account's budget: long enough that it is never killed mid-write. */
+export const ACCOUNT_SWITCH_TIMEOUT_MS = 60_000
+
+// The CLI's `step` line printed just before it schedules the restart. Seen on a
+// failed run, it means everything that switches the account had already run.
+const RESTART_STEP_RE = /^==> Restarting agent to apply/m
+
+/**
+ * What to do after set-account was rejected. `boundNow` is the agent's account
+ * in a fresh `agent list` read after the failure (null: could not be read).
+ *   done    — the switch is complete and its restart is scheduled; say ✅.
+ *   retry   — the registry moved but the run stopped before the restart (killed
+ *             mid-way): run set-account once more, which redoes every step.
+ *   failed  — nothing moved; say ❌ with plainSwitchReason().
+ */
+export function accountSwitchNext(err: unknown, boundNow: string | null, name: string): 'done' | 'retry' | 'failed' {
+  if (boundNow !== name) return 'failed'
+  const stderr = String((err as { stderr?: unknown } | null)?.stderr ?? '')
+  return RESTART_STEP_RE.test(stderr) ? 'done' : 'retry'
+}
+
+/**
+ * The reason a failed switch gives the owner: the CLI's own `error:` line, or a
+ * plain sentence — never its `==>` progress lines, `warn:` lines or execFile's
+ * "Command failed: sudo -n …" message.
+ */
+export function plainSwitchReason(err: unknown): string {
+  const e = (err ?? {}) as { stderr?: unknown; killed?: unknown; signal?: unknown; code?: unknown }
+  const lines = String(e.stderr ?? '').split('\n').map(l => l.trim()).filter(Boolean)
+  const error = lines.find(l => l.startsWith('error: '))
+  if (error) return error.slice('error: '.length).trim()
+  if (e.killed || e.signal || e.code === 'ETIMEDOUT') return 'it took too long and was stopped'
+  return 'unknown error'
+}
+
+/** The switch moved the account but did not finish, twice. */
+export function accountSwitchUnfinishedText(name: string, reason: string): string {
+  return `❌ The switch to ${name} didn't finish: ${reason}\n\nOpen /account and tap ${name} again to finish it.`
+}
+
 // ── DIVE-5331: the full profile on a standard-tier seat ─────────────────────
 //
 // lodar, 2026-10-01: "make it work as much as possible" and "tell proper you
