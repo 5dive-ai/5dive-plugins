@@ -244,6 +244,31 @@ export function channelBody(texts: string[], tag: string): string | null {
   return null
 }
 
+// DIVE-6862: a reply the server refused for length (replycap.ts) sent nothing,
+// so it is not an answer and not a tool call: the Stop hooks relay the turn's
+// text or block once, exactly as if the model had never called it. Same
+// pattern as replycap.ts's REPLY_TOO_LONG_RE (a test keeps the two in step;
+// a hook cannot import the plugin root on every install).
+export const REPLY_TOO_LONG_RE = /too long: \d+ words; cut to \d+/
+
+function resultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.map((b) => (b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : '')).join('\n')
+}
+
+/** Ids of the tool calls whose result is the reply word-cap refusal. */
+export function refusedTooLongIds(entries: TranscriptEntry[]): Set<string> {
+  const out = new Set<string>()
+  for (const e of entries) {
+    if (e.type !== 'user' || !Array.isArray(e.message?.content)) continue
+    for (const b of e.message!.content as TranscriptContentBlock[]) {
+      if (b?.type === 'tool_result' && typeof b.tool_use_id === 'string' && REPLY_TOO_LONG_RE.test(resultText(b.content))) out.add(b.tool_use_id)
+    }
+  }
+  return out
+}
+
 export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnAnalysis {
   // Find turn start.
   let turnStart = 0
@@ -281,6 +306,7 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
   let lastThreadId: string | null = null
   let lastInboundBareAck = false
   const reacts: Array<{ chatId: string; messageId: string }> = []
+  const refused = refusedTooLongIds(turn)
 
   for (const e of turn) {
     if (e.type === 'user') {
@@ -311,6 +337,7 @@ export function analyzeTurn(entries: TranscriptEntry[], tgPrefix: string): TurnA
       if (joined.length > 0) texts.push(joined)
       for (const block of content) {
         if (block.type === 'tool_use' && typeof block.name === 'string' && block.name.startsWith(tgPrefix)) {
+          if (block.id && refused.has(block.id)) continue
           hadTool = true
           if (block.name === `${tgPrefix}reply` || block.name === `${tgPrefix}edit_message`) {
             hadSend = true
@@ -375,6 +402,7 @@ export function newestInboundSource(entries: TranscriptEntry[], fromIndex = 0): 
 // call. Used by stop-reply-check's re-entry path to decide whether the
 // agent recovered after we blocked it.
 export function hadTelegramToolCallAfter(entries: TranscriptEntry[], startIdx: number, tgPrefix: string): boolean {
+  const refused = refusedTooLongIds(entries.slice(startIdx))
   for (let i = startIdx; i < entries.length; i++) {
     const e = entries[i]
     if (e.type !== 'assistant') continue
@@ -382,6 +410,7 @@ export function hadTelegramToolCallAfter(entries: TranscriptEntry[], startIdx: n
     if (!Array.isArray(content)) continue
     for (const block of content) {
       if (block.type === 'tool_use' && typeof block.name === 'string' && block.name.startsWith(tgPrefix)) {
+        if (block.id && refused.has(block.id)) continue
         return true
       }
     }

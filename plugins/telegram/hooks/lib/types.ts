@@ -29,6 +29,10 @@ export type TranscriptContentBlock = {
   type: string
   text?: string
   name?: string
+  // tool_use id; a tool_result block names it in tool_use_id (DIVE-6862).
+  id?: string
+  tool_use_id?: string
+  content?: unknown
   // tool_use arguments (DIVE-4889 reads a react's chat_id/message_id).
   input?: Record<string, unknown>
 }
