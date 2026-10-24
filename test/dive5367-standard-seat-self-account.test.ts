@@ -88,16 +88,16 @@ const USAGE = between('  usage: async ctx => {', '  goal: async ctx => {')
 describe('server.ts', () => {
   test('the picker: read-only only when the seat is standard AND lacks the line', () => {
     expect(MENU).toContain('if (standard && !(await seatHasSelfAccount(agents))) {')
-    expect(MENU.indexOf('seatHasSelfAccount(')).toBeLessThan(MENU.indexOf('read5diveAccountUsage()'))
+    expect(MENU.indexOf('seatHasSelfAccount(')).toBeLessThan(MENU.indexOf('menuReads.usage.get()'))
   })
   test('the picker: no auto-rotate row on a standard seat (writing rotation is root)', () => {
-    expect(MENU).toContain('standard ? Promise.resolve(null) : read5diveRotation(me)')
+    expect(MENU).toContain('standard ? Promise.resolve(null) : menuRotation(me)')
   })
   test('the switch: refused only without the line, and unprivileged with it', () => {
     expect(APPLY).toContain('if (standard && !(await seatHasSelfAccount())) {')
     expect(APPLY).toContain("standard ? 'plain' : 'refuse'")
-    // an admin seat's spawn is unchanged: sudo, 5s
-    expect(APPLY).toContain('timeout: standard ? 15000 : 5000')
+    // DIVE-6867: one budget for both (5s killed a full seat's switch mid-write)
+    expect(APPLY).toContain('timeout: ACCOUNT_SWITCH_TIMEOUT_MS')
   })
   test('/usage: the board over the line; the token-burn read (root) is skipped', () => {
     expect(USAGE).toContain("const selfAccount = seat === 'no' && await seatHasSelfAccount()")

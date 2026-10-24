@@ -125,14 +125,16 @@ describe('server.ts wiring', () => {
     // The synchronous ack is the pending text; the done text rides the .then.
     expect(apply).toContain('text: accountSwitchPendingText(name)')
     expect(apply).not.toMatch(/text: `✅/)
-    expect(apply).toMatch(/set-account'[\s\S]*\.then\(\s*\(\) => bot\.api\.sendMessage\(chatId, accountSwitchDoneText\(name\)\)/)
-    expect(apply).toContain('accountSwitchFailedText(name, isSudoDenial(err) || isAdminTierRequired(err), detail, lang)')
+    // DIVE-6867: the done text follows an awaited set-account that returned ok,
+    // or a rejection the registry shows had already switched (accountSwitchNext).
+    expect(apply).toMatch(/await setAccount\(\)\s*text = accountSwitchDoneText\(name\)/)
+    expect(apply).toMatch(/if \(isSudoDenial\(err\) \|\| isAdminTierRequired\(err\)\) \{\s*text = accountSwitchFailedText\(name, true, '', lang\)/)
   })
   test('the picker is swapped for the read-only view on a standard seat, before the root-only reads', () => {
     const gate = menu.indexOf("=== 'no'")
     expect(gate).toBeGreaterThan(-1)
     expect(menu.indexOf('accountReadOnlyText(')).toBeGreaterThan(gate)
-    expect(menu.indexOf('read5diveAccountUsage()')).toBeGreaterThan(gate)
+    expect(menu.indexOf('menuReads.usage.get()')).toBeGreaterThan(gate)
   })
   test('/usage answers a standard seat without spawning the reads, and classifies the rest', () => {
     const gate = usage.indexOf("seat === 'no'")

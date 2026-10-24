@@ -40,9 +40,11 @@ import { parseGateReply, resolveGateReply, gateAlertIdent } from './gatereply'
 import { COUNCIL_BUTTONS, parseVetoTap, parseCvoteTap } from './council'
 import { createFiveRunner, createFailureBreaker, isSudoDenial, type FiveRunner } from './cliexec.ts'
 import { createVersionReader } from './fivediveversion.ts'
+import { createSwrRead, type SwrRead } from './readcache.ts'
 import {
   seatCanAdmin, classifyAccountUsage, accountReadOnlyText, accountSwitchPendingText,
   accountSwitchDoneText, accountSwitchFailedText, USAGE_READ_FAILED_TEXT,
+  ACCOUNT_SWITCH_TIMEOUT_MS, accountSwitchNext, plainSwitchReason, accountSwitchUnfinishedText,
   adminTierText, isAdminTierRequired, createSudoGate, mayProbeStandardGrant, standardSeatRoute, ownUsageText,
   selfAccountGranted,
   type SeatAdmin, type SeatSudo, type SudoGate, type StatuslineLimits,
@@ -2895,6 +2897,26 @@ async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
   return j?.ok && j.data ? (j.data as FiveDiveRotation) : null
 }
 
+// DIVE-6867: the /account picker reads through these, so a tap is served from
+// the last answer and re-read behind it (readcache.ts has the measurements).
+// Only the picker: the switch's own check, /usage and the rotation submenu still
+// read fresh. The bound account moves only with a restart of this process, so a
+// cached `agent list` cannot show the wrong current account; a rotation write
+// clears its cache below so "‹ Back to accounts" shows the new state.
+const MENU_FRESH_MS = 30_000
+const MENU_STALE_MS = 10 * 60_000
+const menuReads = {
+  agents: createSwrRead(read5diveAgentList, { freshMs: MENU_FRESH_MS, maxStaleMs: MENU_STALE_MS }),
+  accounts: createSwrRead(read5diveAccountList, { freshMs: MENU_FRESH_MS, maxStaleMs: MENU_STALE_MS }),
+  usage: createSwrRead(read5diveAccountUsage, { freshMs: MENU_FRESH_MS, maxStaleMs: MENU_STALE_MS }),
+  rotation: new Map<string, SwrRead<FiveDiveRotation | null>>(),
+}
+function menuRotation(me: string): Promise<FiveDiveRotation | null> {
+  let r = menuReads.rotation.get(me)
+  if (!r) menuReads.rotation.set(me, r = createSwrRead(() => read5diveRotation(me), { freshMs: MENU_FRESH_MS, maxStaleMs: MENU_STALE_MS }))
+  return r.get()
+}
+
 // Write the rotation config via `agent rotation set`. accountsArg is passed to
 // --accounts verbatim: either a comma-joined explicit list or the literal
 // `all` sentinel (use every eligible same-type profile). The CLI re-validates
@@ -2905,6 +2927,7 @@ async function write5diveRotation(me: string, enabled: boolean, accountsArg: str
       ['5dive', 'agent', 'rotation', 'set', me, `--enabled=${enabled}`, `--accounts=${accountsArg}`],
       { timeout: 5000 },
     )
+    menuReads.rotation.get(me)?.clear()
     return null
   } catch (err: any) {
     const stderr = err?.stderr ? String(err.stderr).trim() : ''
@@ -3084,7 +3107,7 @@ async function buildAccountMenu(
   // read-only, and no buttons — not a picker whose every tap is refused. Read
   // the agent list first so such a seat never spawns the root-only reads below
   // (each refused sudo mails root, DIVE-4397).
-  const agents = await read5diveAgentList()
+  const agents = await menuReads.agents.get()
   // DIVE-5367: a standard seat that holds its `_self_account` line gets the
   // picker — the account list needs no root, and usage + the switch cross that
   // line. It does NOT get the auto-rotate row: writing rotation stays root.
@@ -3093,9 +3116,9 @@ async function buildAccountMenu(
     return { text: accountReadOnlyText(agents?.find(a => a.name === me)?.authProfile || 'default', lang) }
   }
   const [accounts, usage, rotation] = await Promise.all([
-    read5diveAccountList(),
-    read5diveAccountUsage(),
-    standard ? Promise.resolve(null) : read5diveRotation(me),
+    menuReads.accounts.get(),
+    menuReads.usage.get(),
+    standard ? Promise.resolve(null) : menuRotation(me),
   ])
   if (!accounts) return { error: `Failed to list accounts. Try: sudo 5dive account list` }
   if (accounts.length === 0) {
@@ -3249,17 +3272,41 @@ async function applyAccount(name: string, chatId: number, lang: Lang = 'en'): Pr
     // reply; then the owner is left with the ⏳ line and the agent comes back
     // on the new account, which is true. On a failure no restart fires, the bot
     // is alive, and exactly one message says what happened.
+    //
+    // DIVE-6867: one budget for every seat, long enough that set-account is never
+    // killed mid-write (5s killed a full seat's switch inside its login re-link:
+    // ❌ on the wire, account moved, login link gone, no restart). And a rejection
+    // is checked against the registry before anyone is told it failed.
     after: () => {
-      void sudo5dive(['5dive', 'agent', 'set-account', me, name], { timeout: standard ? 15000 : 5000 }, standard ? 'plain' : 'refuse')
-        .then(
-          () => bot.api.sendMessage(chatId, accountSwitchDoneText(name)),
-          (err: any) => {
-            const stderr = err?.stderr ? String(err.stderr).trim() : ''
-            const detail = stderr || (err instanceof Error ? err.message : String(err))
-            return bot.api.sendMessage(chatId, accountSwitchFailedText(name, isSudoDenial(err) || isAdminTierRequired(err), detail, lang))
-          },
-        )
-        .catch(() => {})
+      const setAccount = () => sudo5dive(['5dive', 'agent', 'set-account', me, name], { timeout: ACCOUNT_SWITCH_TIMEOUT_MS }, standard ? 'plain' : 'refuse')
+      void (async () => {
+        let text: string
+        try {
+          await setAccount()
+          text = accountSwitchDoneText(name)
+        } catch (err) {
+          if (isSudoDenial(err) || isAdminTierRequired(err)) {
+            text = accountSwitchFailedText(name, true, '', lang)
+          } else {
+            const list = await read5diveAgentList()
+            const boundNow = list ? (list.find(a => a.name === me)?.authProfile || 'default') : null
+            const next = accountSwitchNext(err, boundNow, name)
+            if (next === 'done') {
+              text = accountSwitchDoneText(name)
+            } else if (next === 'retry') {
+              try {
+                await setAccount()
+                text = accountSwitchDoneText(name)
+              } catch (err2) {
+                text = accountSwitchUnfinishedText(name, plainSwitchReason(err2))
+              }
+            } else {
+              text = accountSwitchFailedText(name, false, plainSwitchReason(err), lang)
+            }
+          }
+        }
+        await bot.api.sendMessage(chatId, text)
+      })().catch(() => {})
     },
   }
 }
@@ -7400,6 +7447,10 @@ if (SEND_ONLY) {
           // DIVE-1883: resolve the /model picker against the CLI's model
           // catalogue so it can't drift a version behind agent-create again.
           void refreshModelAliases()
+          // DIVE-6867: warm the /account picker's reads, so the first tap after a
+          // restart does not wait on four CLI runs. buildAccountMenu keeps its own
+          // gates (a standard seat never spawns the root-only reads).
+          { const me = thisAgentName(); if (me) void buildAccountMenu(me).catch(() => {}) }
           // BotFather menu reflects host capabilities at startup. read5diveVersion()
           // shells out to `5dive --version` — fast (<100ms) but async, so do it
           // outside the synchronous bot.api call.
