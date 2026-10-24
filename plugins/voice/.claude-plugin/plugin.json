@@ -1,6 +1,6 @@
 {
   "name": "voice",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box, or on OpenRouter if you choose. In the 5dive web chat, turn on hands-free and tap once: it keeps listening, so you just talk.",
   "author": {
     "name": "5dive",

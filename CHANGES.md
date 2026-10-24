@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — voice 1.11.0: a short Telegram voice note is heard in its chat's language (DIVE-6872)
+
+Mirror of 5dive-voice 1.11.0. Whisper guessed the language of each note, and on a 2-3 second note with a little noise it guessed English: a Russian «да, давай» came back as "That, that way." When the owner has not set `stt_language`, `5dive-transcribe` now passes the language the telegram plugin already keeps for the chat (`lite-lang`, next to the note's `inbox/`), unless it is English, and the same note is heard word for word. The owner's setting still wins, `auto` included; `--lang=<code>|auto` overrides both for one call.
+
 ### Added — telegram 0.5.113, dashboard 0.5.8: a chat reply over 70 words is refused, so the agent cuts it before the owner reads it (DIVE-6862)
 
 lodar, 2026-10-24: make the agents brief. The packs already say "60 words at most", and 27 of 30 graded replies still ran over it (median 74). An agent reads pack text as advice and a tool's error as an instruction, so the rule now lives in the reply tool.
