@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Added — dashboard 0.5.7: the web chat works on a chat-only self-hosted box, where nothing listens (DIVE-6816)
+
+A box linked from my.5dive.ai/self-host as chat only runs no file server and takes no inbound connection: it only calls out to the API with its box token, like Telegram polling. The link script marks it with `/etc/5dive/chat-only`. On such a box the dashboard plugin now:
+
+- **Holds a long poll.** One loop per agent process asks `/server/messages/pending?wait=25`, so a message reaches the session as soon as the API has it. It reuses the existing drain, ack, redelivery and cross-process drain lock: there is no second delivery path. Errors back off (up to 60 s), an API or relay that answers at once is paced (up to 8 s), and a 401/403 that survives the token re-read stops the loop (the box was unlinked). A plain poll that gets through starts it again.
+- **Fetches an upload before the message.** A message whose `image_path` or `audio_path` is not on disk gets the file from `GET /server/selfhost/files` and written at that path first, so `Read` and `5dive-transcribe` work as on any box.
+- **Posts reply files before the reply.** Every outbox copy, a voice note's OGG and its MP3 too, goes to `POST /server/selfhost/files`; `metadata.files` keeps the same paths.
+
+A seat that can read the token calls the API itself; a standard seat (or one that cannot write the uploads dir) uses the root relay's new `pending <wait>`, `fetch` and `put` ops (5dive CLI, DIVE-6816). Without the marker nothing changes. The marker is read on every use, so a link or unlink while the agent runs takes effect without a restart. `test/dive6816-dashboard-chat-only.test.ts`: 7 tests, marker on and off, direct and relay.
+
 ### Fixed — telegram 0.5.111: the plugin no longer bakes in Claude model ids, so `/model` and `/effort` cannot fall behind a Claude release (DIVE-6788)
 
 The `/model` picker's fallback map still pointed at Sonnet 5 and Haiku 4.5 after the 5.5 releases. On a 5dive host the map is refreshed from `5dive models --json` at boot, so only a host without the CLI ran on the stale ids, but a baked id always rots.

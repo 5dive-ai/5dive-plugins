@@ -46,6 +46,7 @@ import {
 import { deliveredLive, liveKey, loadLiveDeliveries, recordLiveDelivery, saveLiveDeliveries } from './livedelivery.ts'
 import { makeWorkStatus } from './workstatus.ts'
 import { askRelayOp, numberedText, parseQuestion } from './question.ts'
+import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, isChatOnly, isOwnUpload, runLongPoll, writeFileAtomic, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
 
 let PLUGIN_VERSION = '?'
@@ -129,6 +130,15 @@ const API_BASE = (process.env.DASHBOARD_API_BASE ?? 'https://api.5dive.com').rep
 // (install/update.sh create it 2775 claude:claude). Reply attachments are
 // copied here so the dashboard download always resolves.
 const OUTBOX_DIR = process.env.DASHBOARD_OUTBOX ?? '/home/claude/chat-downloads'
+// DIVE-6816: a chat-only self-hosted box (chatonly.ts). The marker is read on
+// every use, so a box linked or unlinked while this runs follows it.
+const CHAT_ONLY_MARKER = process.env.DASHBOARD_CHAT_ONLY_MARKER ?? '/etc/5dive/chat-only'
+const UPLOADS_DIR = process.env.DASHBOARD_CHAT_UPLOADS ?? '/home/claude/chat-uploads'
+const chatOnly = () => isChatOnly(CHAT_ONLY_MARKER)
+const LONG_POLL_BACKOFF_MS = (() => {
+  const raw = Number(process.env.DASHBOARD_LONGPOLL_BACKOFF_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 1_000
+})()
 
 // The box's connectord token authenticates outbound replies to the control
 // plane. Standard location is /etc/5dive/connectord.env. Since DIVE-5690 it is
@@ -191,6 +201,9 @@ const RELAY_ARGV: string[] = (() => {
   return ['sudo', '-n', '/usr/local/bin/5dive', '_dashboard_relay']
 })()
 const RELAY_TIMEOUT_MS = 45_000
+// DIVE-6816: moving a file (up to 20 MB) gets longer than a control call; the
+// root side gives curl 90 s.
+const RELAY_FILE_TIMEOUT_MS = 120_000
 
 function relayParse(code: number | null, out: string, err: string): Response {
   const nl = out.indexOf('\n')
@@ -207,7 +220,7 @@ function relayWire(op: string[]): Uint8Array {
 
 async function relayCall(op: string[]): Promise<Response> {
   const proc = Bun.spawn(RELAY_ARGV, { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' })
-  const timer = setTimeout(() => proc.kill(), RELAY_TIMEOUT_MS)
+  const timer = setTimeout(() => proc.kill(), op[0] === 'fetch' || op[0] === 'put' ? RELAY_FILE_TIMEOUT_MS : RELAY_TIMEOUT_MS)
   try {
     proc.stdin.write(relayWire(op))
     await proc.stdin.end()
@@ -717,19 +730,23 @@ function releaseDrainLock(): void {
   try { unlinkSync(DRAIN_LOCK) } catch {}
 }
 
-async function drainPending(): Promise<void> {
-  if (draining) { rerun = true; return }
+// DIVE-6816: `wait` > 0 is the chat-only long poll (the API holds the request
+// until a message lands); every other caller passes nothing and gets the plain
+// poll it always had. The outcome only steers that loop.
+async function drainPending(wait = 0): Promise<PollOutcome> {
+  if (draining) { rerun = true; return 'busy' }
   draining = true
+  let outcome: PollOutcome
   try {
     // Cross-process (DIVE-3809). Skipping is safe and NOT a lost message: the
     // holder is draining the same rows right now, and anything it misses is
     // re-offered by the control plane once the collect TTL expires.
     if (!acquireDrainLock()) {
       process.stderr.write('dashboard channel: another process holds the drain lock; skipping this pass\n')
-      return
+      return 'skipped'
     }
     try {
-      await drainPendingOnce()
+      outcome = await drainPendingOnce(wait)
     } finally {
       releaseDrainLock()
     }
@@ -737,22 +754,39 @@ async function drainPending(): Promise<void> {
     draining = false
   }
   if (rerun) { rerun = false; await drainPending() }
+  return outcome
 }
 
-async function drainPendingOnce(): Promise<void> {
-  let items: Array<{ id: number; text: string; from?: string; chat_id?: string; ts?: string; image_path?: string }>
+// A relay from before DIVE-6816 refuses `pending <wait>`; then the relay is
+// asked the plain poll, and the loop's fast-empty backoff paces it.
+let relayNoWait = false
+async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
+  let items: Array<{ id: number; text: string; from?: string; chat_id?: string; ts?: string; image_path?: string; audio_path?: string }>
+  const started = Date.now()
   try {
     const res = await authedFetch(
-      `${API_BASE}/server/messages/pending?agent=${encodeURIComponent(AGENT)}`,
+      `${API_BASE}/server/messages/pending?agent=${encodeURIComponent(AGENT)}${wait > 0 ? `&wait=${wait}` : ''}`,
       'pending fetch',
-      {},
-      ['pending'],
+      wait > 0 ? { signal: AbortSignal.timeout((wait + 20) * 1000) } : {},
+      wait > 0 && !relayNoWait ? ['pending', String(wait)] : ['pending'],
     )
+    if (res.status === 401 || res.status === 403) {
+      void res.text().catch(() => '')
+      process.stderr.write(`dashboard channel: pending fetch failed: Error: ${res.status}\n`)
+      return 'auth'
+    }
     if (!res.ok) throw new Error(`${res.status}`)
     items = ((await res.json()) as { pending?: typeof items }).pending ?? []
+    // DIVE-6816: a plain poll that got through (boot, the 5-minute timer)
+    // (re)starts the chat-only loop; a no-op on any other box.
+    if (wait === 0) ensureLongPoll()
   } catch (err) {
     process.stderr.write(`dashboard channel: pending fetch failed: ${err}\n`)
-    return
+    if (RELAY && wait > 0 && !relayNoWait && /pending takes no arguments/.test(String(err))) {
+      relayNoWait = true
+      recordLifecycle(STATE_DIR, 'delivery', 'dashboard', 'chat-only box: this relay has no long poll (5dive self-update brings it); polling instead')
+    }
+    return 'error'
   }
   // DIVE-5924: a record ends only when the control plane stops offering its
   // id (see observePendingOffer), so even an empty fetch is read here.
@@ -760,7 +794,7 @@ async function drainPendingOnce(): Promise<void> {
   if (observePendingOffer(retryState, items.map(m => m?.id), Date.now())) {
     savePendingRetryState(PENDING_RETRY_FILE, retryState)
   }
-  if (items.length === 0) return
+  if (items.length === 0) return wait > 0 && Date.now() - started < 1_000 ? 'empty-fast' : 'ok'
   const acked: number[] = []
   const live = loadLiveDeliveries(LIVE_DELIVERY_FILE)
   for (const m of items) {
@@ -792,6 +826,9 @@ async function drainPendingOnce(): Promise<void> {
     // unbounded duplicate loop after restart.
     retryState[key] = decision.next
     savePendingRetryState(PENDING_RETRY_FILE, retryState)
+    // DIVE-6816: on a chat-only box nothing put the upload on disk yet.
+    await ensureInboundFile(m.image_path)
+    await ensureInboundFile(m.audio_path)
     try {
       await deliverInbound(`dashboard:pending:${m.id}`, m.text, {
             chat_id: typeof m.chat_id === 'string' && m.chat_id ? m.chat_id : 'dashboard',
@@ -813,7 +850,7 @@ async function drainPendingOnce(): Promise<void> {
       recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `pending push failed id=${m.id} attempt=${decision.attempt}: ${err}`)
     }
   }
-  if (acked.length === 0) return
+  if (acked.length === 0) return 'ok'
   try {
     const ack = await authedFetch(`${API_BASE}/server/messages/pending/ack`, 'pending ack', {
       method: 'POST',
@@ -847,6 +884,105 @@ async function drainPendingOnce(): Promise<void> {
       `pending ack failed ids=${acked.join(',')} (retry state retained): ${err}`,
     )
   }
+  return 'ok'
+}
+
+// --- DIVE-6816: a chat-only box moves the chat's files itself ---------------
+//
+// No files API runs on this box, so an upload the owner sent is held by the API
+// until this fetches it, and a reply file is posted to the API for the web chat
+// to download. A seat that can read the token calls the API itself; a standard
+// seat (or one that cannot write the uploads dir) asks the root relay, which
+// writes and reads only this seat's own files.
+function chatFileUrl(path: string): string {
+  return `${API_BASE}/server/selfhost/files?path=${encodeURIComponent(path)}`
+}
+
+function noteChatFile(line: string): void {
+  process.stderr.write(`dashboard channel: ${line}\n`)
+  recordLifecycle(STATE_DIR, 'delivery', 'dashboard', line)
+}
+
+async function ensureInboundFile(path: unknown): Promise<void> {
+  if (typeof path !== 'string' || !path || !chatOnly() || existsSync(path)) return
+  if (!isOwnUpload(AGENT, UPLOADS_DIR, path)) {
+    noteChatFile(`chat-only: ${path} is missing and is not this agent's upload; not fetched`)
+    return
+  }
+  const viaRelay = async (): Promise<Response> =>
+    RELAY ? authedFetch(chatFileUrl(path), 'file fetch', {}, ['fetch', path]) : relayCall(['fetch', path])
+  try {
+    let res: Response
+    if (RELAY) {
+      res = await viaRelay()
+    } else {
+      res = await authedFetch(chatFileUrl(path), 'file fetch', { signal: AbortSignal.timeout(RELAY_FILE_TIMEOUT_MS) }, ['fetch', path])
+      if (res.ok) {
+        const bytes = new Uint8Array(await res.arrayBuffer())
+        if (bytes.byteLength > CHAT_FILE_MAX_BYTES) throw new Error(`over ${CHAT_FILE_MAX_BYTES} bytes`)
+        try {
+          writeFileAtomic(path, bytes)
+          noteChatFile(`chat-only: fetched ${path} (${bytes.byteLength} bytes)`)
+          return
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code
+          if (code !== 'EACCES' && code !== 'EPERM') throw err
+          // An admin seat reads the token but cannot write claude's uploads dir.
+          res = await viaRelay()
+        }
+      }
+    }
+    const detail = await res.text().catch(() => '')
+    if (!res.ok) throw new Error(`${res.status} ${detail.slice(0, 160)}`)
+    noteChatFile(`chat-only: fetched ${path} via the root relay`)
+  } catch (err) {
+    noteChatFile(`chat-only: could not fetch ${path}: ${String(err).slice(0, 200)}`)
+  }
+}
+
+async function putReplyFiles(paths: string[]): Promise<void> {
+  for (const path of paths) {
+    try {
+      let res: Response
+      if (RELAY) {
+        res = await authedFetch(chatFileUrl(path), 'file put', {}, ['put', path])
+      } else {
+        const bytes = readFileSync(path)
+        if (bytes.byteLength > CHAT_FILE_MAX_BYTES) throw new Error(`over ${CHAT_FILE_MAX_BYTES} bytes`)
+        res = await authedFetch(chatFileUrl(path), 'file put', {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: bytes,
+          signal: AbortSignal.timeout(RELAY_FILE_TIMEOUT_MS),
+        }, ['put', path])
+      }
+      const detail = await res.text().catch(() => '')
+      if (!res.ok) throw new Error(`${res.status} ${detail.slice(0, 160)}`)
+    } catch (err) {
+      noteChatFile(`chat-only: could not send ${path}: ${String(err).slice(0, 200)}`)
+    }
+  }
+}
+
+// One long-poll loop per process, started at boot on a chat-only box and again
+// by any plain poll that gets through (a box linked, or re-linked after an
+// unlink stopped the loop with a 401, while this process ran).
+let longPollRunning = false
+function ensureLongPoll(): void {
+  if (longPollRunning || !chatOnly()) return
+  longPollRunning = true
+  recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `chat-only box: long poll on (wait=${LONG_POLL_WAIT_S})`)
+  void runLongPoll({
+    poll: () => drainPending(LONG_POLL_WAIT_S),
+    active: chatOnly,
+    sleep: ms => new Promise(r => setTimeout(r, ms)),
+    baseBackoffMs: LONG_POLL_BACKOFF_MS,
+    maxBackoffMs: 60 * LONG_POLL_BACKOFF_MS,
+  }).then(why => {
+    recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `chat-only box: long poll off (${why === 'auth' ? 'the API refused the box token' : 'not chat-only any more'})`)
+  }).catch(err => {
+    recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `chat-only box: long poll died: ${String(err).slice(0, 160)}`)
+  }).finally(() => { longPollRunning = false })
 }
 
 // --- Outbound: reply tool -> control-plane messages API --------------------
@@ -953,6 +1089,13 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
     try { renameSync(web, named); return named } catch { return web }
   }))
   const text = replyBody(rawText, files)
+  // DIVE-6816: on a chat-only box the API cannot read this box's outbox, so
+  // every copy there (a voice note's OGG and its MP3 too) is posted first; the
+  // reply's metadata.files stays these same paths.
+  if (chatOnly()) {
+    const held = [...new Set([...copied, ...files])].filter(f => f.startsWith(`${OUTBOX_DIR}/`) && existsSync(f))
+    await putReplyFiles(held)
+  }
 
   // DIVE-5894: the relay attaches only a copy in the outbox (root refuses any
   // other path), so a file whose copy failed is left off rather than failing
@@ -1068,5 +1211,6 @@ setTimeout(() => {
   startAgentInbox()
   startCollectNowWatch()
   void drainPending()
+  ensureLongPoll()
 }, DISPATCHER_ADAPTER ? 0 : 5_000)
 setInterval(() => void drainPending(), 5 * 60_000).unref()
