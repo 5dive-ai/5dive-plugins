@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.112: tap buttons for Russian chats and partner boxes, and agents are told how to get them (DIVE-6859)
+
+On a partner box an agent ended with «Делаем так?» and «Какой берём?» as plain text, with nothing to tap.
+
+- **Partner (lite) boxes get the Yes/No pair.** DIVE-5121 held it back for English labels and a no-emoji rule; the labels follow the chat's language since DIVE-5306, and the no-emoji rule covers the partner's cabinet, not the chat.
+- **The Yes/No detector knows Russian.** A question opening with какой/что/кто/где/когда/куда/откуда/почему/зачем/как/сколько/чей (and their common forms), or with «или» in it, is open and gets no Yes/No. The opener is also checked at the start of the last clause, so «Два пути, какой берём?» and "Two paths, which one?" are caught. `tna.ts` stays byte-identical across the forks.
+- **Both instructions blocks say how to get choice buttons:** a question with set answers ends as a numbered list, 2 to 8 short lines, each of which becomes a button.
+
+`test/dive6859-choice-buttons.test.ts`: 32 tests, 22 of them red on 0.5.111.
+
 ### Added — dashboard 0.5.7: the web chat works on a chat-only self-hosted box, where nothing listens (DIVE-6816)
 
 A box linked from my.5dive.ai/self-host as chat only runs no file server and takes no inbound connection: it only calls out to the API with its box token, like Telegram polling. The link script marks it with `/etc/5dive/chat-only`. On such a box the dashboard plugin now:
