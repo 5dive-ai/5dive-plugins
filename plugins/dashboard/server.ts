@@ -46,6 +46,7 @@ import {
 import { deliveredLive, liveKey, loadLiveDeliveries, recordLiveDelivery, saveLiveDeliveries } from './livedelivery.ts'
 import { makeWorkStatus } from './workstatus.ts'
 import { askRelayOp, numberedText, parseQuestion } from './question.ts'
+import { replyTooLong } from './replycap.ts'
 import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, isChatOnly, isOwnUpload, runLongPoll, writeFileAtomic, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
 
@@ -995,7 +996,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         'Reply in the 5dive dashboard chat. Pass chat_id from the inbound message (normally "dashboard"). ' +
         'Optionally pass files (absolute paths on this box) to offer as downloads in the chat. ' +
         'An audio file (a voice note from 5dive-speak) plays in the chat; with files attached, text may be empty. ' +
-        'Set voice: true to answer a voice note: the text goes first, then the plugin speaks it and sends that voice note.',
+        'Set voice: true to answer a voice note: the text goes first, then the plugin speaks it and sends that voice note. ' +
+        'Text over 70 words (outside fenced code) is refused and nothing is sent: keep it to 60, or put the detail in a file and name it in one line.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1139,7 +1141,13 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (req.params.name !== 'reply') throw new Error(`unknown tool: ${req.params.name}`)
-  const result = await sendDashboardReply((req.params.arguments ?? {}) as ReplyArgs)
+  const args = (req.params.arguments ?? {}) as ReplyArgs
+  // DIVE-6862: the model's own reply only. The outbox (Codex dispatcher
+  // replies, StopFailure notices, the stop hook's relay) calls
+  // sendDashboardReply directly and is never capped.
+  const tooLong = replyTooLong(args.text)
+  if (tooLong) return { content: [{ type: 'text', text: tooLong }], isError: true }
+  const result = await sendDashboardReply(args)
   return { content: [{ type: 'text', text: result }] }
 })
 

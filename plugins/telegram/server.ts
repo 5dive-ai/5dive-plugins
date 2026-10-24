@@ -91,6 +91,7 @@ import {
   GROUP_PAGE,
 } from './grouplog'
 import { ackReactionFor } from './hooks/lib/lite.ts'
+import { replyTooLong } from './replycap.ts'
 import { TAP_STRINGS, tapLang, liteStatusText } from './hooks/lib/lite.ts'
 import { onDemoAccount, readDemoKey, claimDemoNotice, releaseDemoNotice, rearmDemoNotice, pruneDemoStamps, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './hooks/lib/demo-key.ts'
 
@@ -1597,7 +1598,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading under a specific message, message_thread_id for posting into a forum topic, and files (absolute paths) to attach images or documents. You do not have to remember files= for a file you NAME: the server auto-attaches up to 5 readable document/media paths written in the text (.md .txt .log .json .csv .yaml .html .pdf images audio video) and names the attached files in the tool result. Credential-shaped paths and anything under ~/.claude are never auto-attached; paths inside fenced code blocks are treated as examples. files= still wins and is never doubled.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading under a specific message, message_thread_id for posting into a forum topic, and files (absolute paths) to attach images or documents. You do not have to remember files= for a file you NAME: the server auto-attaches up to 5 readable document/media paths written in the text (.md .txt .log .json .csv .yaml .html .pdf images audio video) and names the attached files in the tool result. Credential-shaped paths and anything under ~/.claude are never auto-attached; paths inside fenced code blocks are treated as examples. files= still wins and is never doubled. Text over 70 words (outside fenced code) is refused and nothing is sent: keep it to 60, or put the detail in a file and name it in one line.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1798,6 +1799,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
           text = ''
         }
+        // DIVE-6862: over the word cap, nothing is sent and the error tells the
+        // model to cut it (replycap.ts). Files do not exempt the text.
+        const tooLong = replyTooLong(text)
+        if (tooLong) throw new Error(tooLong)
 
         assertAllowedChat(chat_id, args.reply_to as string | undefined)
         // DIVE-5419: a reply no longer stops "typing…" — the turn's end does.
@@ -2091,6 +2096,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (anchor && body.startsWith(anchor)) {
           body = body.slice(anchor.length).replace(/^(\s*\n)+\s*(→\s+)?/, '')
         }
+        // DIVE-6862: an edit is the same wall as a reply; only the NEW body counts.
+        const editTooLong = replyTooLong(body)
+        if (editTooLong) throw new Error(editTooLong)
         // DIVE-4280: same auto-attach on an edit — a progress update that
         // names the report it just wrote should carry it. Scan only the NEW
         // body, never the stitched anchor: the anchor is the original reply's

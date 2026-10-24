@@ -1,6 +1,19 @@
 ## Unreleased
 
-### Fixed — telegram 0.5.113: /account no longer says «Couldn't switch» after a switch that worked, and the picker opens at once (DIVE-6867)
+### Added — telegram 0.5.113, dashboard 0.5.8: a chat reply over 70 words is refused, so the agent cuts it before the owner reads it (DIVE-6862)
+
+lodar, 2026-10-24: make the agents brief. The packs already say "60 words at most", and 27 of 30 graded replies still ran over it (median 74). An agent reads pack text as advice and a tool's error as an instruction, so the rule now lives in the reply tool.
+
+- **Over 70 words, nothing is sent.** The tool answers "too long: N words; cut to 60 or attach a file and name it in one line. Nothing was sent." The agent rewrites and sends again. The tool description says the limit up front.
+- **What counts:** words with a letter or digit in them, so a link is one word and a dash is none. A closed fenced code block (a command, a pasted log) does not count. Attached files do not excuse the text; a files-only reply passes.
+- **Where:** the dashboard's `reply` tool, and Telegram's `reply` and `edit_message`. The dashboard outbox (Codex dispatcher replies, StopFailure notices, the stop hook's relay) is never capped.
+- **A box can opt out:** `FIVEDIVE_REPLY_MAX_WORDS` sets the limit, `0` turns it off.
+- **A refused reply is not an answer** to the Stop hooks. If the agent gives up after a refusal, its text is relayed or the Stop is blocked once, as when it never called `reply`, so the owner never gets silence.
+- **What stays uncapped:** that relay itself. It only runs when the agent never sent a reply, and holding it back would lose the answer.
+
+`test/dive6862-reply-word-cap.test.ts`: 11 tests; the 3 that drive the servers fail with the server change taken out.
+
+### Fixed — telegram 0.5.114: /account no longer says «Couldn't switch» after a switch that worked, and the picker opens at once (DIVE-6867)
 
 A full seat tapped another account and got "❌ Couldn't switch account → chemmonitor: ==> Rewriting …", then /account said it was on chemmonitor.
 
@@ -8,7 +21,7 @@ A full seat tapped another account and got "❌ Couldn't switch account → chem
 - **A failed run is checked before the owner hears about it.** The plugin reads the agent's account again. Moved, with the restart already scheduled: ✅. Moved, without the restart: set-account runs once more, which redoes every step. Not moved: ❌ with the CLI's own `error:` line, or "it took too long and was stopped", never progress lines, paths or the sudo command.
 - **The picker opens from its last read.** Its four CLI reads (agent list, account list, usage, rotation) took ~2.5 s on a calm poke-two and several times that under load. They now go through a short cache (fresh 30 s, served stale up to 10 min while it re-reads behind), warmed at boot. A rotation change clears its part. The switch's own check, /usage and the rotation submenu still read fresh.
 
-`test/dive6867-account-switch.test.ts`: 21 tests; on 0.5.112 the file does not load (the new helpers are missing), and with only the helpers added, the 5 wiring tests are red.
+`test/dive6867-account-switch.test.ts`: 21 tests; on 0.5.113 the file does not load (the new helpers are missing), and with only the helpers added, the 5 wiring tests are red.
 
 ### Fixed — telegram 0.5.112: tap buttons for Russian chats and partner boxes, and agents are told how to get them (DIVE-6859)
 
