@@ -195,15 +195,24 @@ export function optionChoices(text: string): ParsedOption[] {
 // OPEN — a Yes/No answer can't address them — so 'here. what's up?' must NOT get
 // buttons (DIVE-1429: lodar hit that false keyboard three times). The suppress marker
 // (<!-- no-buttons -->) is handled by the caller, which strips it around this check.
+//
+// DIVE-6859: Russian too. «Какой берём?» and «A или B?» got ✅Да/❌Нет. JS `\b` is
+// ASCII-only, so the Russian words end on a not-a-letter lookahead instead. The
+// opener is checked at the start of the question AND of its last clause, so a
+// lead-in («Два пути, какой берём?», "Two paths, which one?") is caught as well.
 const WH_OPENER_RE = /^(what|which|who|whom|whose|where|when|why|how)\b/i
+const WH_OPENER_RU_RE = /^(какой|какая|какое|какие|какую|каком|каким|какими|каких|какого|какому|что|чего|чем|кто|кого|кому|где|когда|куда|откуда|почему|зачем|как|сколько|чей|чья|чьё|чье|чьи)(?![\p{L}\p{N}])/iu
+const OR_RU_RE = /(?<![\p{L}\p{N}])или(?![\p{L}\p{N}])/iu
+const isWhOpener = (s: string): boolean => WH_OPENER_RE.test(s) || WH_OPENER_RU_RE.test(s)
 export function yesNoChoice(text: string): boolean {
   const trimmed = (text ?? '').trimEnd()
   if (!trimmed.endsWith('?')) return false
   if ((trimmed.match(/\?/g) ?? []).length !== 1) return false
   // Isolate the trailing question (last sentence/line) and skip "... or ...?".
   const lastQ = (trimmed.split(/[\n.!?]/).filter(s => s.trim()).pop() ?? '').trim()
-  if (/\bor\b/i.test(lastQ)) return false
-  if (WH_OPENER_RE.test(lastQ)) return false
+  if (/\bor\b/i.test(lastQ) || OR_RU_RE.test(lastQ)) return false
+  const lastClause = (lastQ.split(/[,;:—–]/).filter(s => s.trim()).pop() ?? '').trim()
+  if (isWhOpener(lastQ) || isWhOpener(lastClause)) return false
   return true
 }
 

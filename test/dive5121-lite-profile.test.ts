@@ -102,13 +102,16 @@ describe('no profile set = the plugin as it is today', () => {
     // bridge shows a live status, so "edit_message that same message with
     // progress" became "no progress edits". 0.5.85's block was
     // d9fcec695f9d1193ae09aaeb1fd42c13ba736b68ccb8f333340b71c5d57d322e.
+    // DIVE-6859 (0.5.112) added one sentence on purpose: a question with set
+    // answers ends as a numbered list, which becomes buttons. 0.5.111's block was
+    // 80ac9995f08d3f4d70487129fcbf5fd7122d9a75f5ddfaade16d6e4a417fcd1a.
     const lines = SERVER.split('\n')
     const start = lines.indexOf('    instructions: [')
     const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
     expect(start).toBeGreaterThan(0)
     expect(end).toBeGreaterThan(start)
     const block = lines.slice(start + 1, end).join('\n') + '\n'
-    expect(sha(block)).toBe('80ac9995f08d3f4d70487129fcbf5fd7122d9a75f5ddfaade16d6e4a417fcd1a')
+    expect(sha(block)).toBe('3bafe41a8c0a522e2e1a17bd2edfcc7fef20c91403ec0c68190cb08be4a2351b')
     // The lite block is a LATER key that only exists when LITE is true.
     expect(lines[end]).toBe("    ].join('\\n'),")
     expect(lines.slice(end + 1, end + 5).join('\n')).toContain('...(LITE ? { instructions: LITE_INSTRUCTIONS } : {}),')
@@ -136,7 +139,6 @@ describe('no profile set = the plugin as it is today', () => {
       /^\s*const liteHo = LITE && data\.startsWith\('ho:'\) \? LITE_STRINGS\[liteLang\(ctx\.from\.language_code\)\] : null$/,
       /^\s*if \(!LITE\) void \(async \(\) => \{$/,
       /^if \(!STATIC && !SEND_ONLY && !LITE\) \{$/,
-      /^\s*if \(LITE \|\| !yesNoChoice\(text\)\) return \{ stripped: text \}$/,
       /^\s*const (auto|edit)Footer = LITE \? '' : autoAttachFooter\((auto|edit)Plan\)$/,
       /^\s*const alertIdent = LITE \? null : gateAlertIdent\(/,
       /^\s*const gateReply = LITE \? null : parseGateReply\(text\)$/,
@@ -150,7 +152,8 @@ describe('no profile set = the plugin as it is today', () => {
     expect(odd).toEqual([])
     // DIVE-5368: 15 — the lite pairing reply (`if (LITE) {`) and `lite: LITE,`.
     // DIVE-5419: 16 — the status-edit guard on the reply.
-    expect(uses).toHaveLength(16)
+    // DIVE-6859: 15 — lite gets the Yes/No pair, so its guard is gone.
+    expect(uses).toHaveLength(15)
   })
 
   test('the lite front door is registered only under LITE, ahead of every other update handler', () => {
