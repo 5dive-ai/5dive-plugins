@@ -33,6 +33,21 @@
 #   5dive-transcribe <path>            # plain text on stdout
 #   5dive-transcribe --json <path>     # full backend JSON response
 #   5dive-transcribe --backend=<b> ... # override for one call (testing)
+#   5dive-transcribe --lang=<code> ... # the note's language (ru, en…), or auto
+#
+# WHICH LANGUAGE LOCAL WHISPER HEARS (DIVE-6872). whisper `base` guesses the
+# language from the note itself, and on a 2-3 s note with a little room noise it
+# guesses wrong: a Russian «да, давай» came back as "That, that way." Told the
+# language, it heard the same note word for word. So the language is, in order:
+#   1. --lang, when the caller passes it (auto = detect);
+#   2. the owner's stt_language, whenever it is set at all — a code pins it, and
+#      an explicit auto is the owner choosing detection for mixed-language notes;
+#   3. unset: the language of the chat the note came from. A Telegram note sits
+#      in <channel>/inbox/, and the telegram plugin keeps its sender's language
+#      in <channel>/lite-lang (DIVE-5306). That file only says ru or en, and en
+#      means "not Russian" (a German or Ukrainian app writes en too), so only
+#      a language other than en is passed;
+#   4. otherwise whisper detects it, as it always has.
 set -uo pipefail
 
 # shellcheck source=/dev/null
@@ -40,19 +55,26 @@ set -uo pipefail
 
 JSON_OUT=0
 BACKEND_OVERRIDE=""
+LANG_OVERRIDE=""
+USAGE="usage: 5dive-transcribe [--json] [--backend=local|openrouter] [--lang=<code>|auto] <audio-path>"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) JSON_OUT=1; shift ;;
     --backend=*) BACKEND_OVERRIDE="${1#*=}"; shift ;;
+    --lang=*)
+      LANG_OVERRIDE="${1#*=}"; shift
+      [[ "$LANG_OVERRIDE" =~ ^(auto|[a-z]{2,3})$ ]] \
+        || { echo "5dive voice: '$LANG_OVERRIDE' is not a language code — use one such as ru or en, or auto" >&2; exit 2; }
+      ;;
     --) shift; break ;;
-    -*) echo "usage: 5dive-transcribe [--json] [--backend=local|openrouter] <audio-path>" >&2; exit 2 ;;
+    -*) echo "$USAGE" >&2; exit 2 ;;
     *) break ;;
   esac
 done
 
 SRC="${1:-}"
 [[ -n "$SRC" && -f "$SRC" ]] \
-  || { echo "usage: 5dive-transcribe [--json] [--backend=local|openrouter] <audio-path>" >&2; exit 2; }
+  || { echo "$USAGE" >&2; exit 2; }
 
 BACKEND="${BACKEND_OVERRIDE:-$(voice_effective_stt_backend)}"
 # The warm whisper-service. Overridable so the offline harness can run its own
@@ -76,6 +98,25 @@ audio_seconds() {
   d=$(timeout 15 ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$SRC" 2>/dev/null | head -n1)
   d="${d%%.*}"
   [[ "$d" =~ ^[0-9]+$ ]] && echo "$d" || echo 0
+}
+
+# note_language — the language local whisper is told, or nothing to let it
+# detect one. The order is in the header (DIVE-6872).
+note_language() {
+  if [[ -n "$LANG_OVERRIDE" ]]; then
+    [[ "$LANG_OVERRIDE" != auto ]] && printf '%s\n' "$LANG_OVERRIDE"
+    return 0
+  fi
+  if [[ -n "$(voice_config_get stt_language)" ]]; then
+    voice_stt_language
+    return 0
+  fi
+  local inbox hint
+  inbox=$(dirname -- "$SRC")
+  [[ "$(basename -- "$inbox")" == inbox ]] || return 0
+  hint=$(head -c 16 -- "$(dirname -- "$inbox")/lite-lang" 2>/dev/null | tr -d '[:space:]')
+  [[ "$hint" =~ ^[a-z]{2,3}$ && "$hint" != en ]] && printf '%s\n' "$hint"
+  return 0
 }
 
 transcribe_openrouter() {
@@ -104,9 +145,10 @@ transcribe_local() {
   staged="$(mktemp --suffix=".${ext}" /tmp/5dive-transcribe.XXXXXX)"
   chmod 644 "$staged"
   cp -- "$SRC" "$staged" || { rm -f "$staged"; LOCAL_FAIL="could not stage the file for whisper-service"; return 1; }
-  # A pinned language and greedy decoding ride the request only when the owner
-  # set them (DIVE-5869); with neither, the body is `{path}` exactly as before.
-  payload=$(jq -nc --arg p "$staged" --arg l "$(voice_stt_language)" --arg f "$(voice_stt_fast)" \
+  # A language rides the request only when one is known (DIVE-6872, see
+  # note_language), and greedy decoding only when the owner turned it on
+  # (DIVE-5869); with neither, the body is `{path}` exactly as before.
+  payload=$(jq -nc --arg p "$staged" --arg l "$(note_language)" --arg f "$(voice_stt_fast)" \
     '{path:$p} + (if $l != "" then {language:$l} else {} end) + (if $f == "1" then {beam_size:1} else {} end)')
   # The wait scales with the note (DIVE-5750). CPU whisper runs at about 0.4x
   # real time, so a fixed 120s cut off every note over ~5 minutes while the
