@@ -1,4 +1,4 @@
-// DIVE-6859: on OINOA's box an agent ended with «Делаем так?» and «Какой берём?»
+// DIVE-6859: on a partner box an agent ended with «Делаем так?» and «Какой берём?»
 // as plain text. Three causes, one arm each: (b) the Yes/No detector knew only
 // English, so «Какой берём?» or «A или B?» got ✅Да/❌Нет on a 5dive box; (c) a
 // lite (partner) box never got the pair at all; (a) neither instructions block
