@@ -119,6 +119,18 @@ jobs:
       # in this repo. This arm is what notices.
       - name: telegram channel instructions carry the human-messaging rules
         run: bash tests/telegram_instructions_unit.sh
+      # DIVE-6934: the buzz verbs (`5dive buzz …`, `5dive agent buzz …`) and the
+      # buzz binary download left the core CLI for plugins/buzz, and their
+      # harnesses came with them, re-pointed at plugins/buzz/cli. Plain bash, no
+      # root, no network (file:// releases, stubbed relay).
+      - name: buzz verb harnesses
+        run: |
+          rc=0
+          for t in buzz_bridge_unit buzz_identity_registry_unit buzz_last_mile_unit \
+                   buzz_pair_unit buzz_preseed_dm_unit buzz_server_pairing_unit buzz_binaries_unit; do
+            echo "=== $t"; bash "tests/$t.sh" || rc=1
+          done
+          exit $rc
       - name: entry points parse
         run: |
           rc=0

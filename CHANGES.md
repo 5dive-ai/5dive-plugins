@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Changed — buzz 0.2.0: the buzz commands and the buzz binaries come with this plugin, not with the core CLI (DIVE-6934)
+
+lodar, 2026-10-25: *"did we kill buzz from the core? … can be a plugin?"* Every box downloaded the `buzz` and `buzz-pair` binaries and carried about 2,200 lines of buzz commands, for a channel almost no box runs.
+
+- **`5dive plugin install buzz` brings them.** The plugin now declares the `buzz` verb. `5dive buzz pair|owner` and `5dive buzz binaries` run from `bin/buzz`; core hands `5dive agent buzz <sub>` here as `5dive buzz agent <sub>`, so the channel's bridge and the seat's sudo grant keep working unchanged.
+- **The binaries land inside the plugin** (`libexec/`), pinned to the same release tag and SHA256SUMS digest core's installer used, staged on first use or with `sudo 5dive buzz binaries`. Removing the plugin removes them. A box that already has `/usr/local/bin/buzz` keeps using it.
+- **Carried verbatim** from core's `src/cmd_buzz.sh` and `src/cmd_agent_buzz*.sh` at 5dive-ai/5dive 497ec15a, apart from `PLUGIN DIVERGENCE` sites. `cli/prelude.sh` re-establishes what they used from core (errors, output, the agent registry and its lock).
+- **Not carried:** the outbound mirror that echoed a seat's `agent send` into its buzz room. A plugin cannot hook core's send path.
+
+Harnesses: the core's buzz unit harnesses moved to `tests/` (6 files, 239 arms) plus `tests/buzz_binaries_unit.sh` (15 arms), run by the new `buzz verb harnesses` CI step.
+
 ### Added — telegram 0.5.115: the owner lets someone write to the agent from chat, with one tap (DIVE-6930)
 
 lodar, 2026-10-25: *"should they be able to do it without app via chat?"* Until now only the app's «Кто может писать сотруднику» screen could, and the agent told one owner it could not be done at all.

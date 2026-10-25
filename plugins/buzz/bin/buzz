@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# `5dive buzz` — the buzz verbs, published by this plugin (DIVE-6934).
+#
+# Core finds this file by convention: plugin.json declares the `verb` capability
+# and the name `buzz`, and core runs <installed-plugin-dir>/bin/buzz. Until
+# DIVE-6934 these verbs were core's (src/cmd_buzz.sh, src/cmd_agent_buzz*.sh);
+# they moved here so a box that never runs buzz carries none of it. The modules
+# in ../cli are those files carried verbatim apart from `PLUGIN DIVERGENCE`
+# sites; ../cli/prelude.sh re-establishes what they used from core.
+#
+#   5dive buzz pair|owner …            server-level pairing (was `5dive buzz …`)
+#   5dive buzz agent <sub> …           per-agent verbs (was `5dive agent buzz …`)
+#   5dive buzz binaries                download buzz + buzz-pair into this plugin
+#
+# Core still answers `5dive agent buzz <sub>` by handing it here as
+# `5dive buzz agent <sub>`, so the channel's bridge (bridge.ts, which shells to
+# `sudo 5dive agent buzz inbound|whois`) and the seat sudoers grant for it keep
+# working unchanged.
+set -euo pipefail
+
+BUZZ_PLUGIN_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+_buzz_cli="$BUZZ_PLUGIN_ROOT/cli"
+# shellcheck source=/dev/null
+for _m in prelude binaries cmd_agent_buzz cmd_agent_buzz_join cmd_agent_buzz_whois \
+          cmd_agent_buzz_pair cmd_agent_buzz_bridge cmd_buzz; do
+  source "$_buzz_cli/$_m.sh"
+done
+unset _m
+
+# The lock policy core's main.sh applied to these verbs, unchanged:
+# status/whois are lock-free reads (whois runs AS the agent user, which cannot
+# take a root lock); inbound/pair are audited but lock-free (pair waits on a
+# human with a phone, inbound waits on a pane); everything else mutates the
+# registry and takes the lock.
+_buzz_agent_dispatch() {
+  case "${1:-}" in
+    status|whois)  cmd_agent_buzz "$@" ;;
+    inbound|pair)  buzz_audit "agent buzz" "$@"; cmd_agent_buzz "$@" ;;
+    ""|-h|--help)  cmd_agent_buzz "$@" ;;
+    *)             buzz_audit "agent buzz" "$@"; with_registry_lock cmd_agent_buzz "$@" ;;
+  esac
+}
+
+_buzz_main() {
+  case "${1:-}" in
+    agent)    shift; _buzz_agent_dispatch "$@" ;;
+    binaries) shift; _buzz_binaries "$@" ;;
+    pair|owner) buzz_audit "buzz" "$@"; cmd_buzz "$@" ;;
+    ""|-h|--help|help)
+      cat >&2 <<'USAGE'
+5dive buzz — the Buzz (Nostr) channel's commands (plugin buzz@5dive-plugins)
+
+  5dive buzz pair [--timeout=<secs>] [--agent=<name>] [--no-wire]
+  5dive buzz owner [--envelope]
+  5dive buzz binaries                       # download buzz + buzz-pair (sha256-pinned)
+
+  5dive agent buzz enable <name> [--relay=<https://…>] [--channels=<csv>] [--no-join]
+  5dive agent buzz join|owner|pair|status <name>
+  5dive agent buzz whois <pubkey|npub1…> [--role]
+  5dive agent buzz inbound --pubkey=<k> --message-file=<path>
+USAGE
+      [[ -n "${1:-}" ]] && return 0
+      return "$E_USAGE" ;;
+    *) cmd_buzz "$@" ;;
+  esac
+}
+
+# Sourced by a harness for its function bodies: define, do not run.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _buzz_main "$@"
+fi
