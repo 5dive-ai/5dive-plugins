@@ -1,0 +1,27 @@
+{
+  "name": "devteam",
+  "description": "5dive's own software-team tools: PR delivery, graders, gate evidence, proof badges, and the gh, push and deploy rails. Read into the 5dive CLI itself, so only 5dive's own boxes need it; a box that hires agents for anything else does not.",
+  "version": "0.1.0",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/devteam",
+  "keywords": [
+    "5dive",
+    "pull-requests",
+    "graders",
+    "delivery"
+  ],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": [
+      "core"
+    ],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    }
+  }
+}

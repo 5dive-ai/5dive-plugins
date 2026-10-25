@@ -112,12 +112,69 @@ const MOD_PLUGINS: ModPlugin[] = PLUGIN_DIRS
   .map(dir => ({ dir, modules: declaredHooksModules(dir) }))
   .filter(p => p.modules.length > 0)
 
-// The complement: a plugin that declares neither a TS launcher nor a hooks
-// module must be a real bash plugin, i.e. ship an executable bin/<name>.
-// Without this a TS plugin could lose its package.json and fall silently out
-// of TS_PLUGINS instead of failing.
+// DIVE-6935 — A FOURTH KIND: a CORE-MODULE plugin. `devteam` launches nothing
+// and ships no bin/: the 5dive CLI sources its core/<module>.sh files into its
+// own process, and only because .claude-plugin/plugin.json declares the `core`
+// capability. That declaration is what makes it this kind. Losing it drops the
+// plugin into the bash complement, where it fails for want of a bin/. That is
+// right, because the CLI would then never read the plugin at all.
+function declaresCore(pluginDir: string): boolean {
+  const p = join(pluginDir, '.claude-plugin', 'plugin.json')
+  if (!existsSync(p)) return false
+  const caps = JSON.parse(readFileSync(p, 'utf8'))?.fivedive?.capabilities
+  return Array.isArray(caps) && caps.includes('core')
+}
+
+// What a core-module plugin owes, as a list of problems (empty = sound): at
+// least one core/**/*.sh, a core/SOURCE naming every one of them (the CLI's
+// loader and devteam_core_unit.sh both read it), and no TypeScript.
+function coreModuleProblems(pluginDir: string): string[] {
+  const core = join(pluginDir, 'core')
+  if (!existsSync(core) || !statSync(core).isDirectory()) return ['no core/ directory']
+  const sh: string[] = []
+  const walk = (dir: string, rel: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name
+      if (e.isDirectory()) walk(join(dir, e.name), r)
+      else if (e.name.endsWith('.sh')) sh.push(r)
+    }
+  }
+  walk(core, '')
+  const problems: string[] = []
+  if (sh.length === 0) problems.push('core/ has no .sh module')
+  const src = join(core, 'SOURCE')
+  const listed = existsSync(src)
+    ? readFileSync(src, 'utf8').split('\n')
+        .map(l => l.match(/^[0-9a-f]{64}\s+(\S+)$/)?.[1])
+        .filter((x): x is string => !!x)
+    : null
+  if (listed === null) problems.push('no core/SOURCE')
+  else for (const f of sh) if (!listed.includes(f)) problems.push(`core/${f} not in core/SOURCE`)
+  const ts: string[] = []
+  const walkTs = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === 'node_modules') continue
+      if (e.isDirectory()) walkTs(join(dir, e.name))
+      else if (e.name.endsWith('.ts')) ts.push(e.name)
+    }
+  }
+  walkTs(pluginDir)
+  if (ts.length) problems.push(`ships TypeScript: ${ts.join(', ')}`)
+  return problems
+}
+
+const CORE_PLUGINS = PLUGIN_DIRS.filter(
+  d => !TS_PLUGINS.some(p => p.dir === d) && !MOD_PLUGINS.some(p => p.dir === d)
+    && declaresCore(join(PLUGINS, d)),
+)
+
+// The complement: a plugin that declares neither a TS launcher, a hooks
+// module nor the core capability must be a real bash plugin, i.e. ship an
+// executable bin/<name>. Without this a TS plugin could lose its package.json
+// and fall silently out of TS_PLUGINS instead of failing.
 const BASH_PLUGINS = PLUGIN_DIRS.filter(
-  d => !TS_PLUGINS.some(p => p.dir === d) && !MOD_PLUGINS.some(p => p.dir === d),
+  d => !TS_PLUGINS.some(p => p.dir === d) && !MOD_PLUGINS.some(p => p.dir === d)
+    && !CORE_PLUGINS.includes(d),
 )
 
 // ── the gate itself ─────────────────────────────────────────────────────────
@@ -130,7 +187,8 @@ describe('every plugin TypeScript file parses', () => {
     // FLOOR: an empty or collapsed derived set fails here rather than passing
     // by grading nothing. Every plugin dir is accounted for as TS or bash.
     expect(TS_PLUGINS.length).toBeGreaterThanOrEqual(5)
-    expect(TS_PLUGINS.length + MOD_PLUGINS.length + BASH_PLUGINS.length).toBe(PLUGIN_DIRS.length)
+    expect(TS_PLUGINS.length + MOD_PLUGINS.length + CORE_PLUGINS.length + BASH_PLUGINS.length)
+      .toBe(PLUGIN_DIRS.length)
     for (const p of TS_PLUGINS) {
       expect(files).toContain(join(PLUGINS, p.dir, 'server.ts'))
       for (const rel of p.entries) expect(files).toContain(join(PLUGINS, p.dir, rel))
@@ -146,6 +204,49 @@ describe('every plugin TypeScript file parses', () => {
         // and it is graded by the parse loop below like every other plugin .ts
         if (abs.endsWith('.ts')) expect(files).toContain(abs)
       }
+    }
+  })
+
+  test('a core-module plugin ships the modules it declares, and no TypeScript', () => {
+    expect(CORE_PLUGINS).toContain('devteam')
+    for (const d of CORE_PLUGINS) expect([d, coreModuleProblems(join(PLUGINS, d))]).toEqual([d, []])
+  })
+
+  test('the core-module check can fail (mutants)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dive6935-core-'))
+    try {
+      const mk = (name: string, files: Record<string, string>, caps = ['core']) => {
+        const dir = join(root, name)
+        Bun.spawnSync(['mkdir', '-p', join(dir, '.claude-plugin')])
+        writeFileSync(join(dir, '.claude-plugin', 'plugin.json'),
+          JSON.stringify({ name, fivedive: { capabilities: caps } }))
+        for (const [rel, body] of Object.entries(files)) {
+          Bun.spawnSync(['mkdir', '-p', join(dir, rel, '..')])
+          writeFileSync(join(dir, rel), body)
+        }
+        return dir
+      }
+      const sha = 'a'.repeat(64)
+      const good = mk('good', { 'core/x.sh': ':\n', 'core/task/y.sh': ':\n',
+        'core/SOURCE': `from x\n${sha}  x.sh\n${sha}  task/y.sh\n` })
+      expect(declaresCore(good)).toBe(true)
+      expect(coreModuleProblems(good)).toEqual([])
+      // no core/ at all
+      expect(coreModuleProblems(mk('nocore', {}))).toEqual(['no core/ directory'])
+      // core/ with only SOURCE
+      expect(coreModuleProblems(mk('empty', { 'core/SOURCE': '' }))).toContain('core/ has no .sh module')
+      // a module SOURCE does not name
+      expect(coreModuleProblems(mk('unlisted', { 'core/x.sh': ':\n', 'core/z.sh': ':\n',
+        'core/SOURCE': `${sha}  x.sh\n` }))).toEqual(['core/z.sh not in core/SOURCE'])
+      // no SOURCE
+      expect(coreModuleProblems(mk('nosource', { 'core/x.sh': ':\n' }))).toEqual(['no core/SOURCE'])
+      // TypeScript smuggled in
+      expect(coreModuleProblems(mk('ts', { 'core/x.sh': ':\n', 'core/SOURCE': `${sha}  x.sh\n`,
+        'server.ts': '' }))).toEqual(['ships TypeScript: server.ts'])
+      // without the capability it is not this kind (and falls to the bash check)
+      expect(declaresCore(mk('nocap', { 'core/x.sh': ':\n' }, ['verb']))).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
     }
   })
 

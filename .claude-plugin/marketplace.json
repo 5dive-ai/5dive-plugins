@@ -48,6 +48,13 @@
       "category": "productivity",
       "source": "./plugins/mod",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/mod"
+    },
+    {
+      "name": "devteam",
+      "description": "5dive's own software-team tools (PR delivery, graders, gate evidence, proof badges, gh/push/deploy), read into the 5dive CLI. Only 5dive's own boxes need it.",
+      "category": "development",
+      "source": "./plugins/devteam",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/devteam"
     }
   ]
 }
