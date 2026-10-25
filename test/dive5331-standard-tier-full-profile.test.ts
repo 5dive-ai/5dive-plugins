@@ -129,9 +129,10 @@ function gateFor(seat: SeatAdmin, calls: Call[], exec?: SudoExecFn) {
 
 describe('the call sites the suite grades', () => {
   test('are read off server.ts, all of them', () => {
-    // the 25 old `execFileP(SUDO, ['-n', …])` sites; a site lost from the scan
-    // would quietly drop out of every arm below.
-    expect(SITES.length).toBe(25)
+    // the 25 old `execFileP(SUDO, ['-n', …])` sites, plus DIVE-6930's lock lift
+    // (`agent _telegram_open`); a site lost from the scan would quietly drop out
+    // of every arm below.
+    expect(SITES.length).toBe(26)
     expect(SITES.every(s => s.argv.length > 0)).toBe(true)
   })
   test('cover every root-only verb the audit named', () => {

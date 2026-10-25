@@ -225,9 +225,14 @@ export function standardSeatMaySudo(argv: string[]): boolean {
 //   browser _connect: the privileged half of an agent's Connect/captcha tap.
 //     Root re-checks the one-time code, that the tap came through this seat's
 //     bot and that the tapper is its paired owner (5dive-cli browser _connect).
+//   agent _telegram_open: DIVE-6930, after the owner taps Allow on a request to
+//     let someone write; root lifts the owner-only lock on THIS seat's own bot
+//     (the agent comes from SUDO_UID, the line names no args).
 export const BROWSER_CONNECT_PROBE_ARGV = ['-n', '-l', '/usr/local/bin/5dive', 'browser', '_connect']
+export const TELEGRAM_OPEN_PROBE_ARGV = ['-n', '-l', '/usr/local/bin/5dive', 'agent', '_telegram_open']
 const PROBED_STANDARD_GRANTS: { argv: string[]; probe: string[] }[] = [
   { argv: ['5dive', 'browser', '_connect'], probe: BROWSER_CONNECT_PROBE_ARGV },
+  { argv: ['5dive', 'agent', '_telegram_open'], probe: TELEGRAM_OPEN_PROBE_ARGV },
 ]
 export function standardSeatMayHold(argv: string[]): boolean {
   return PROBED_STANDARD_GRANTS.some(g => sameArgv(g.argv, argv))

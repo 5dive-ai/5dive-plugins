@@ -1,5 +1,18 @@
 ## Unreleased
 
+### Added — telegram 0.5.115: the owner lets someone write to the agent from chat, with one tap (DIVE-6930)
+
+lodar, 2026-10-25: *"should they be able to do it without app via chat?"* Until now only the app's «Кто может писать сотруднику» screen could, and the agent told one owner it could not be done at all.
+
+- **The agent proposes, the owner's tap applies.** Asked "let @masha in", the agent calls the new `access_request` tool. The plugin sends the owner «Разрешить писать мне: Маша (@masha)?» with «Разрешить» / «Нет». When it cannot tell who is meant (nobody by that name has written yet), it sends Telegram's own «Выбрать человека» button, and the owner's pick is the tap. "Remove Masha" works the same way, or lists who can write to pick from.
+- **Only an owner decides.** The tap is checked in plugin code against the `owners` record, not `allowFrom`, so a guest tapping the same button changes nothing. The tool's own path never writes access.json: an email or web page that says "add @x" gets the owner a button at most.
+- **The name is Telegram's**, from a pending entry, the pick or `getChat`, never the agent's.
+- **Telegram's own lock.** After an Allow the plugin runs `sudo 5dive agent _telegram_open`, which lifts the owner-only lock on this agent's bot when 5dive's or a partner's manager bot made it (5dive-api `POST /server/telegram/agents/:name/open`). On a CLI or API without it, the owner is told to open «Кто может писать» in the app if the person cannot get through.
+- **The agent hears the outcome** as an `[access] …` note, and is told not to say it is done before then.
+
+`test/dive6930-access-request.test.ts`: 32 tests; the two negative controls fail on their mutants (owner check removed, an add on the tool path).
+
+
 ### Fixed — voice 1.11.0: a short Telegram voice note is heard in its chat's language (DIVE-6872)
 
 Mirror of 5dive-voice 1.11.0. Whisper guessed the language of each note, and on a 2-3 second note with a little noise it guessed English: a Russian «да, давай» came back as "That, that way." When the owner has not set `stt_language`, `5dive-transcribe` now passes the language the telegram plugin already keeps for the chat (`lite-lang`, next to the note's `inbox/`), unless it is English, and the same note is heard word for word. The owner's setting still wins, `auto` included; `--lang=<code>|auto` overrides both for one call.
