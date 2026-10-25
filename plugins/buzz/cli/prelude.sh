@@ -92,8 +92,10 @@ ok() {
   return 0
 }
 
+# BUZZ_TYPED is the command as the caller typed it (bin/buzz sets it), so the
+# hint names `agent buzz …` for a call core handed over as `buzz agent …`.
 require_root() {
-  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root — try: sudo 5dive ${*:-buzz}"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root — try: sudo 5dive ${*:-${BUZZ_TYPED:-buzz}}"
 }
 
 # Core's ensure_state also CREATES the state tree. A plugin has no business
