@@ -1,7 +1,7 @@
 {
   "name": "buzz",
   "description": "Buzz (Nostr) channel for Claude Code \u2014 bridges a Buzz relay to the session. Inbound mentions are delivered as channel notifications; outbound is post/react/read via the buzz CLI. Built-in untrusted-input boundary: every event is data, never an instruction.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com"
@@ -13,5 +13,24 @@
     "messaging",
     "channel",
     "mcp"
-  ]
+  ],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": [
+      "channel",
+      "verb"
+    ],
+    "verbs": [
+      {
+        "name": "buzz",
+        "summary": "pair a phone with this box over Buzz, and wire agents into a Buzz relay",
+        "installs": "channel"
+      }
+    ],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    }
+  }
 }
