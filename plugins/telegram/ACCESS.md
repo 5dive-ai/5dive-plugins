@@ -41,6 +41,12 @@ Pairing captures the ID automatically. To find one manually, have the person mes
 /telegram:access remove 412587349
 ```
 
+## Letting someone in from chat
+
+The owner can also do it from their own DM with the agent: "let @masha in", "let in the person who just wrote", or "remove Masha". The agent calls its `access_request` tool, which only sends the owner a message with **Allow** / **No** (or a **Choose a person** button that opens Telegram's own contact picker, when the plugin cannot tell who is meant). Only a tap or pick from a user in `owners` applies it; a guest in `allowFrom` tapping the same button changes nothing. The name on the button comes from Telegram (a pending entry, the pick, or `getChat`), never from the agent.
+
+Allow adds the id to `allowFrom` and drops their pending entry. It never pairs them as an owner. On a bot that 5dive's (or a partner's) manager bot made, the plugin then runs `sudo 5dive agent _telegram_open` to lift Telegram's owner-only lock on this agent's own bot. Remove takes the id out of `allowFrom`; an owner is never removed this way. Open requests live in `access-requests.json` next to this file and expire after a day.
+
 ## Groups
 
 Groups are off by default. Opt each one in individually.

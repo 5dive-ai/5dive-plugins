@@ -115,7 +115,7 @@ const GOLDEN_FORK_MCP_TOOLS = ['wait_for_message', 'reply', 'edit_message', 'rea
 // DIVE-1028: recent_messages (rolling message-log recovery) is a baseline-only
 // addition — the wait_for_message forks have a different inbound path and are a
 // tracked follow-up port.
-const GOLDEN_BASELINE_MCP_TOOLS = ['reply', 'react', 'download_attachment', 'edit_message', 'recent_messages']
+const GOLDEN_BASELINE_MCP_TOOLS = ['reply', 'react', 'download_attachment', 'edit_message', 'recent_messages', 'access_request']
 const GOLDEN_ACCESS_FIELDS = ['allowFrom', 'groups', 'pending', 'dmPolicy']
 // Baseline menu (non-hidden registry commands, in order) — drift here signals the forks
 // may need a new command or a description sync.
@@ -232,12 +232,13 @@ describe('fork vs Claude baseline delta', () => {
     expect(baselineMenuCommands()).toEqual(GOLDEN_BASELINE_MENU)
   })
 
-  test('baseline MCP tools = fork tools minus wait_for_message, plus baseline-only recent_messages (DIVE-1028)', () => {
+  test('baseline MCP tools = fork tools minus wait_for_message, plus baseline-only recent_messages (DIVE-1028) and access_request (DIVE-6930)', () => {
     expect(sorted(mcpTools(baseSrc))).toEqual(sorted(GOLDEN_BASELINE_MCP_TOOLS))
     // Forks add wait_for_message; baseline adds recent_messages (DIVE-1028, the
-    // rolling message-log recovery tool). Both deltas are intentional and pinned
+    // rolling message-log recovery tool) and access_request (DIVE-6930, the
+    // owner's tap lets someone write). The deltas are intentional and pinned
     // here so any OTHER drift still fails the guard.
-    expect(sorted([...GOLDEN_FORK_MCP_TOOLS.filter(t => t !== 'wait_for_message'), 'recent_messages']))
+    expect(sorted([...GOLDEN_FORK_MCP_TOOLS.filter(t => t !== 'wait_for_message'), 'recent_messages', 'access_request']))
       .toEqual(sorted(GOLDEN_BASELINE_MCP_TOOLS))
   })
 
