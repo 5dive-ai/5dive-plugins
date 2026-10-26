@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.120: a numbered choice gets its buttons when the pick line has no '?' (DIVE-6995)
+
+lodar, 2026-10-26, forwarding a partner agent's 07:00Z message: *"no buttons - to approve agents plan - so it will be lost most likely and forgotten"*. Since DIVE-6963 the line before a choice names the agent's own pick. That agent wrote it in Russian as a statement («Советую …»), with no '?' and none of the English cue words, so three numbered options went out as plain text.
+
+- **The pick line is a cue.** `optionChoices()` also counts recommend/suggest/go with, and in Russian советую, рекомендую, предлагаю/предложу, выбираем/выбрать/выбери/выбор, вариант(ы), какой/какую. Russian words end on the not-a-letter lookahead from DIVE-6859, since JS `\b` is ASCII-only.
+- **Still conservative:** a numbered step list with no cue word («Сделал так: 1. … 2. …», "Steps: 1. … 2. …") gets no buttons, and a broken sequence gets none whatever the cue.
+- **Same `tna.ts` in every bridge:** telegram-agy 0.5.26, telegram-codex 0.5.39, telegram-grok 0.5.26, telegram-opencode 0.5.15, telegram-pi 0.1.15.
+
+Harness: `test/dive6995-pick-line-cue.test.ts` (20 arms: the partner agent's message shape, 10 more pick lines in both languages, 4 negative controls, 5 bridge-parity arms; 11 arms red on the old cue).
+
 ### Fixed — telegram 0.5.119: /account opens at once, even after a quiet spell (DIVE-6985)
 
 lodar, 2026-10-26: *"slash account on this box from telegtam takes almos 10s to get the response"*. The picker's cache (0.5.113) only covered ten minutes, so the first tap after that waited for four CLI runs again.
