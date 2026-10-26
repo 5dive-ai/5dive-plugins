@@ -105,8 +105,12 @@ if [[ -n "$shard" ]]; then
   names=("${kept[@]}")
 fi
 for n in "${names[@]}"; do
-  cp "$HARNESS_DIR/$n.sh" "$TREE/tests/$n.sh" || { echo "FAIL: no harness tests/devteam/$n.sh" >&2; exit 2; }
+  [[ -f "$HARNESS_DIR/$n.sh" ]] || { echo "FAIL: no harness tests/devteam/$n.sh" >&2; exit 2; }
 done
+# Every harness goes into the tree, not only this shard's: some drive a sibling
+# (digest_window_30d_controls stages and mutates digest_window_30d_unit), and the
+# sibling can land in another shard.
+cp "$HARNESS_DIR"/*.sh "$TREE/tests/" || { echo "FAIL: could not copy the harnesses into the tree" >&2; exit 1; }
 
 printf 'core %s @ %s; modules put back: %s\n' "$core" "${graded:0:12}" "${put_back[*]:-none (the core still carries them)}"
 pass=0; fail=0; failed=()
