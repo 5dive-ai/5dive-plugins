@@ -57,6 +57,31 @@ describe('DIVE-6979 classifyFailure: an empty balance is its own kind', () => {
     expect(k.isOutOfCredit).toBe(false)
   })
 
+  // quinn, iteration 1: words on screen are conversation, not the error.
+  const PROSE = 'The client asked: OpenRouter says "insufficient credits", what do I do?'
+
+  test('negative control: a usage limit in the payload stays one when the pane only TALKS about credits', () => {
+    const payload = { error: 'rate_limit', message: "You've hit your usage limit · resets 5pm" }
+    const k = classifyFailure(payload, JSON.stringify(payload), PROSE)
+    expect(k.isRateLimit).toBe(true)
+    expect(k.isOutOfCredit).toBe(false)
+  })
+
+  test('negative control: credit words in pane prose, or a quoted 402, are not a status line', () => {
+    expect(classify({ message: 'turn failed' }, PROSE).isOutOfCredit).toBe(false)
+    expect(classify({ message: 'turn failed' }, `> why did I get ${BALANCE_402}?`).isOutOfCredit).toBe(false)
+  })
+
+  test("the 402 as Claude Code draws it on the pane (\u23bf status line)", () => {
+    expect(classify({ message: 'turn failed' }, `> hi\n  \u23bf  ${BALANCE_402}\n`).isOutOfCredit).toBe(true)
+  })
+
+  test('a pane-only 402 status line never overrides a usage limit the payload reports', () => {
+    const k = classify(USAGE_429, `  \u23bf  ${BALANCE_402}\n`)
+    expect(k.isRateLimit).toBe(true)
+    expect(k.isOutOfCredit).toBe(false)
+  })
+
   test('negative control: a 529 overload is still transient', () => {
     const k = classify({ message: 'turn failed' }, 'API Error: 529 Overloaded')
     expect(k.isTransientApiError).toBe(true)

@@ -32,6 +32,12 @@ export type FailureKind = {
 // also says rate_limit.
 const OUT_OF_CREDIT_RE =
   /API Error:\s*402\b|requires at least \$\s?[\d.]+ in balance|exceed your available credits|insufficient credits|requires more credits|credit balance is too low|"error":\s*"billing_error"/i
+// The pane is conversation as well as status: a client asking about "insufficient
+// credits" puts those words on screen. So the pane counts only through Claude
+// Code's own status line ("  ⎿  API Error: 402 …" at line start, never a quoted
+// "> …" prompt), and a pane-only hit never overrides a usage limit the payload
+// itself reports.
+const PANE_402_RE = /^[ \t⎿●⏺]*API Error:\s*402\b/m
 
 // A transient server-side 429 ("Server is temporarily limiting requests · Rate
 // limited") is explicitly NOT a usage limit — but its text literally contains
@@ -48,8 +54,10 @@ const OUT_OF_CREDIT_RE =
 export function classifyFailure(payload: HookPayload, raw: string, pane: string): FailureKind {
   const isTransientRateLimit = /not your usage limit|temporarily limiting requests/i.test(raw)
   const isTermsNotAccepted = isTermsWall(payload, pane)
-  const isOutOfCredit = !isTermsNotAccepted && OUT_OF_CREDIT_RE.test(`${raw}\n${pane}`)
-  const isRateLimit = !isTermsNotAccepted && !isOutOfCredit && !isTransientRateLimit && /rate_limit|usage.limit/i.test(raw)
+  const saysRateLimit = !isTransientRateLimit && /rate_limit|usage.limit/i.test(raw)
+  const isOutOfCredit =
+    !isTermsNotAccepted && (OUT_OF_CREDIT_RE.test(raw) || (!saysRateLimit && PANE_402_RE.test(pane)))
+  const isRateLimit = !isTermsNotAccepted && !isOutOfCredit && saysRateLimit
   const isTransientApiError =
     !isRateLimit &&
     !isTermsNotAccepted &&
