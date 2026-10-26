@@ -405,7 +405,7 @@ describe('the hooks under lite', () => {
 
   test('the kept hooks read the profile and route their text through the lite strings', () => {
     const src = (f: string) => readFileSync(join(TG, 'hooks', f), 'utf8')
-    expect(src('stopfailure-notify.ts')).toContain("text = limitHit ? liteLimitText(lang, await readAllowance()) : LITE_STRINGS[lang].failed")
+    expect(src('stopfailure-notify.ts')).toContain("text = limitHit ? liteLimitText(lang, allowance ?? (await readAllowance())) : LITE_STRINGS[lang].failed")
     expect(src('stopfailure-notify.ts')).toContain("recordOpsDetail('stopfailure', text)")
     expect(src('stop-reply-check.ts')).toContain('LITE ? joined : `(auto-relay) ${joined}`')
     for (const f of ['resume-after-reset.ts', 'resume-after-error.ts']) expect(src(f)).toMatch(/if \(isLite\(\)\) \{\n\s+recordOpsDetail\(/)

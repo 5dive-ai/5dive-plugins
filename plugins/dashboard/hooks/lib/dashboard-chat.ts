@@ -10,6 +10,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { A2A_ENVELOPE_RE, entryTexts, refusedTooLongIds } from './transcript'
 import { textLang } from './terms'
+import { CREDIT_NOTICE } from './failure'
 import type { Lang } from './lite'
 import type { TranscriptEntry } from './types'
 
@@ -67,7 +68,7 @@ function inLang(lang: Lang, secs: number): string {
   return m ? `${h} ${hu} ${m} ${mu}` : `${h} ${hu}`
 }
 
-export type NoticeKind = 'ratelimit' | 'transient'
+export type NoticeKind = 'ratelimit' | 'transient' | 'credit'
 
 /**
  * The one line the person sees. Plain words, no percentages, no raw error.
@@ -75,7 +76,9 @@ export type NoticeKind = 'ratelimit' | 'transient'
  * reader's time zone, and a clock time in the box's zone would be wrong for
  * most of them.
  */
-export function noticeText(kind: NoticeKind, resetEpoch: number | null, nowSec: number, lang: Lang): string {
+export function noticeText(kind: NoticeKind, resetEpoch: number | null, nowSec: number, lang: Lang, lite = false): string {
+  // DIVE-6979: no reset to name; who tops it up depends on who reads (failure.ts).
+  if (kind === 'credit') return CREDIT_NOTICE[lite ? 'client' : 'owner'][lang]
   if (kind === 'transient') {
     return lang === 'ru'
       ? 'Сервис ИИ сейчас перегружен, поэтому я остановился. Пробую снова и скоро отвечу.'
