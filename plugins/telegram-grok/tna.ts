@@ -204,8 +204,17 @@ const WH_OPENER_RE = /^(what|which|who|whom|whose|where|when|why|how)\b/i
 const WH_OPENER_RU_RE = /^(какой|какая|какое|какие|какую|каком|каким|какими|каких|какого|какому|что|чего|чем|кто|кого|кому|где|когда|куда|откуда|почему|зачем|как|сколько|чей|чья|чьё|чье|чьи)(?![\p{L}\p{N}])/iu
 const OR_RU_RE = /(?<![\p{L}\p{N}])или(?![\p{L}\p{N}])/iu
 const isWhOpener = (s: string): boolean => WH_OPENER_RE.test(s) || WH_OPENER_RU_RE.test(s)
+// DIVE-6988: a QUOTED question is not a question to the reader. main's 'ask "what
+// should Olivia do first?" before the card. Want dev2 to mock that order?' held two
+// '?' and got no buttons, so lodar skimmed past it. Every rule below reads the text
+// with quoted spans emptied ("…", “…”, «…», `…`, ```…```, '…'). A single quote counts
+// only when it does not touch a letter on its outer side, so the apostrophes in
+// "don't … we're" never pair up and swallow a real '?'. Spans stay on one line.
+const QUOTED_RE = /```[\s\S]*?```|`[^`\n]*`|"[^"\n]*"|“[^”\n]*”|«[^»\n]*»|(?<![\p{L}\p{N}])'[^'\n]*'(?![\p{L}\p{N}])/gu
+const unquoted = (text: string): string =>
+  text.replace(QUOTED_RE, m => m.startsWith('```') ? '``````' : m[0]! + m[m.length - 1]!)
 export function yesNoChoice(text: string): boolean {
-  const trimmed = (text ?? '').trimEnd()
+  const trimmed = unquoted(text ?? '').trimEnd()
   if (!trimmed.endsWith('?')) return false
   if ((trimmed.match(/\?/g) ?? []).length !== 1) return false
   // Isolate the trailing question (last sentence/line) and skip "... or ...?".
