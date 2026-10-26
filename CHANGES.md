@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.116: an agent's choice buttons come with its own pick (DIVE-6963)
+
+lodar, 2026-10-26: *"some of the agents dont give their recs now when they give option button to pick from"*. Since 0.5.112 told agents a numbered list becomes tap buttons, many ended a question on a bare list.
+
+- **The button rule now asks for a pick.** The line before the list names the answer the agent would choose and why, in a few words, and that answer is listed first. Only when it is purely the owner's taste does the agent say it has no preference.
+- **Same sentence everywhere an agent is told about the buttons:** the default and lite instructions blocks (dashboard 0.5.9 carries the lite copy), the notify-user skill, and the `AGENTS.md` of telegram-agy 0.5.24, telegram-codex 0.5.37 and telegram-grok 0.5.24. telegram-opencode and telegram-pi ship no agent instructions, so nothing changes there.
+- **The notify-user skill's "Presenting choices" said the opposite** (use the Bot API, not a numbered list). It now describes the numbered list the bridge actually turns into buttons.
+
+Harness: `test/dive6963-pick-first.test.ts` (12 arms: 7 surfaces, the DIVE-6859 rule kept, the stale skill advice gone, 2 negative controls).
+
 ### Changed — buzz 0.2.0: the buzz commands and the buzz binaries come with this plugin, not with the core CLI (DIVE-6934)
 
 lodar, 2026-10-25: *"did we kill buzz from the core? … can be a plugin?"* Every box downloaded the `buzz` and `buzz-pair` binaries and carried about 2,200 lines of buzz commands, for a channel almost no box runs.
