@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Changed — devteam 0.2.0: the dev-team tools live here now, the core keeps no copy (DIVE-6938)
+
+Phase 2 of DIVE-6935. 5dive 0.103 deletes its copies of PR delivery, graders, gate evidence, proof badges and the gh/push/deploy rails; this plugin's `core/` is the code.
+
+- **`core/task/grader_pool.sh` is the grader half only.** The account meter and the dispatch pace (`_pace_*`) stay in the core as `src/lib/pace.sh`, because the heartbeat paces every dispatch on every box.
+- **`core/lib/gh_config.sh` joins** (it was a core file). A core at 0.103 refuses a 0.1.x copy whole, since that one has no gh_config and still carries the old pace.
+- **The harnesses came too:** 108 files in `tests/devteam/` (102 moved, 6 copied whole from core harnesses that keep their core arms), unchanged, run by `tests/devteam_core_harnesses.sh --core=<5dive checkout>`, which puts these files back where the core kept them. New workflow `devteam-core.yml` runs them against 5dive's main; 5dive's CI runs them against each of its pull requests.
+- `tests/devteam_core_unit.sh`: `--refresh` (recopy from the core) is gone with the core copies; `--rehash` rewrites SOURCE after an edit. New arms: no `_pace_*` or meter function in grader_pool.sh, no function defined by two modules.
+
 ### Fixed — telegram 0.5.120: a numbered choice gets its buttons when the pick line has no '?' (DIVE-6995)
 
 lodar, 2026-10-26, forwarding a partner agent's 07:00Z message: *"no buttons - to approve agents plan - so it will be lost most likely and forgotten"*. Since DIVE-6963 the line before a choice names the agent's own pick. That agent wrote it in Russian as a statement («Советую …»), with no '?' and none of the English cue words, so three numbered options went out as plain text.

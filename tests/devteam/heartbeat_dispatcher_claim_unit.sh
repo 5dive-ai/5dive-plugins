@@ -1,0 +1,632 @@
+#!/usr/bin/env bash
+# TIER: nightly — the dispatcher's CLAIM is a background scheduling rail. 10.5s in the PR core to grade behaviour whose failure mode is a slow or duplicated wake, caught by the nightly sweep and visible on the live fleet long before it blocks a merge (DIVE-4465).
+# DIVE-2244 — the DISPATCHER CLAIMS. Isolated unit harness for the claim that
+# the heartbeat tick stamps at the moment it nudges an agent.
+#
+# WHY THIS HARNESS EXISTS, and why it drives the REAL tick loop rather than the
+# helper alone. The defect was not that `_hb_claim_task` was wrong — it did not
+# exist. Nothing wrote tasks.status='in_progress' / started_at, so the busy
+# guard, the runaway reaper, orphan reclaim, unwedge and the fleet-stall
+# predicate all read a field that never moved (measured: 0 of 24 tasks closed in
+# a day had started_at ever set). A harness that only exercised the helper would
+# prove the helper works while the tick never calls it — exactly the shape of
+# bug being fixed. So the real `cmd_heartbeat_tick` runs here, with only its
+# BOUNDARIES stubbed (tmux, registry lock, sibling sweeps, the wake itself).
+#
+# Asserts, in order:
+#   1  a tick that nudges an agent leaves that task in_progress with started_at
+#      set — read back from the ROW, never from a log line;
+#   2  two-sided: a tick that wakes NOBODY (not due) leaves every row byte-identical,
+#      and a tick whose wake FAILS leaves its target row untouched;
+#   3  the claim is narrow — refuses a row that is not todo, and refuses a
+#      recurring TEMPLATE (starting one silently retires it, DIVE-2055/2059);
+#   4  idempotence: an agent that later runs `task start` does not re-clock
+#      started_at (COALESCE parity with cmd_task_start);
+#   5  end-to-end reaper: a task that reached in_progress ONLY through the
+#      dispatcher claim, aged past the budget, is requeued to todo by _hb_reclaim;
+#   6  MUTATION ARM — with the claim neutered, (1) and (5) go RED. The red is
+#      graded for vacuity: the tick must still have woken the agent, so the
+#      failure is attributable to the missing claim and not to a dead harness;
+#   7  restore — un-neutering the claim returns the arm to green, so the mutation
+#      is proven to be what moved the result.
+#
+# Run: bash tests/heartbeat_dispatcher_claim_unit.sh  (no root, no network, no tmux).
+set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
+# source's stderr so bash's "No such file" does not litter the log -- also
+# swallows the helper's own stderr line, which IS the payload. That silenced all
+# 210 harnesses at once while every other check in this change stayed green.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
+cd "$(dirname "$0")/.."
+SRC=src
+
+TMP="$(mktemp -d /tmp/hb-dispatch-claim-unit.XXXXXX)"
+
+# shellcheck disable=SC1090
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_heartbeat.sh; do
+  # shellcheck source=/dev/null
+  source "$SRC/$f"
+done
+
+# DIVE-4430: `cmd_heartbeat_tick` now consults the pacing floor before it
+# dispatches, so the floor is part of this harness's world whether or not the
+# harness is about it. It is loaded and pinned OPEN (0% of the week used) rather
+# than left out: unloaded, the tick logs a packaging defect and grades nothing,
+# and this file would then be testing a tick with a disabled guard. Pinned open,
+# every arm below asks exactly the question it asked before.
+# shellcheck source=/dev/null
+source "$SRC/task/grader_pool.sh"
+_pace_open_meter(){ printf '{"agents":[{"account":"acct-dev","sevenDayPct":0,"sevenDayResetsAt":99999999999}]}'; }
+_PACE_USAGE_CMD=_pace_open_meter
+
+# DIVE-4732: `_hb_forge_merge_sweep` (DIVE-4701) polls the FORGE for every
+# graded->merge row on every tick, and this harness stubs nothing on that rail.
+# So the fixture below — a pull-request URL on the real repo with a plausible
+# number — resolved to a pull request that EXISTS and is MERGED; the sweep
+# recorded the landing, `_TASKS_TFV_SQL` subtracted the row, and the DIVE-4261
+# discount the [4261] arms grade vanished: full-pristine (1) red on every main
+# push from a7dc57dc, while the PR core (which does not run a nightly harness)
+# stayed green. Pin the forge to "not landed": the sweep still runs its code path
+# on every tick, and no arm here can reach the network. OPEN<US>OPEN is the
+# record `_merge_landed_probe` prints for an unmerged pull request; MERGED is the
+# only answer that WRITES, and it must never come from a fixture's URL.
+_merge_landed_probe(){ printf 'OPEN\x1fOPEN\n'; }
+
+STATE_DIR="$TMP"
+TASKS_DIR="$STATE_DIR/tasks"
+TASKS_DB="$TASKS_DIR/tasks.db"
+REGISTRY="$TMP/registry.json"
+HB_LOG="$TMP/heartbeat.log"
+JSON_MODE=1
+mkdir -p "$TASKS_DIR"
+set +e   # header.sh enabled `set -e`; asserts below deliberately probe states
+
+tasks_db_init
+
+PASS=0; FAIL=0
+ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
+bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+
+# --- Boundary stubs ----------------------------------------------------------
+# Everything the tick touches OUTSIDE the unit under test. The wake loop, the
+# claim, _hb_pick_task, _hb_mark_run and _hb_reclaim are all the REAL code.
+require_root()          { :; }
+registry_read()         { cat "$REGISTRY"; }
+registry_write()        { cat > "$REGISTRY"; }
+with_registry_lock()    { local fn="$1"; shift; "$fn" "$@"; }
+_hb_log()               { printf '%s\n' "$1" >> "$HB_LOG"; }
+_hb_send_line()         { return 0; }
+_hb_agent_idle()        { return 0; }          # confident idle -> falls through to the wake
+_hb_claude_started()    { echo ""; }           # no proc time -> orphan rule (a) can never fire
+_hb_pane_fingerprint()  { echo "fp"; }
+_hb_mark_active_defer() { echo 0; }
+_hb_clear_active_defer(){ :; }
+_hb_wake_budget_ok()    { return 0; }
+_hb_wake_budget_inc()   { :; }
+_hb_usage_limit_frozen(){ return 1; }
+agent_tier()            { echo admin; }
+tier_unmeasured()       { return 1; }
+cmd_send()              { :; }
+cmd_task_escalate()     { :; }
+_HB_SLEPT=0; _HB_SLEEP_ARMED=0
+# Sibling sweeps: each is independently isolated in production and none of them
+# is under test here. Neutering them keeps this harness about the claim.
+for _sweep in _hb_materialize_recurring _hb_gate_renag_sweep _hb_gate_ttl_sweep \
+              _hb_autosleep_sweep _hb_capability_reverify_sweep _hb_blocked_sweep \
+              _hb_gate_shipped_sweep _hb_council_rot_sweep _hb_stall_sweep \
+              _hb_loop_ceiling_sweep _hb_budget_sweep _hb_poller_liveness_sweep \
+              _hb_objective_reconcile; do
+  eval "${_sweep}() { :; }"
+done
+
+# The wake itself: records that it ran, and its rc is steerable so we can drive
+# the wake-FAILED branch. This is the seam the claim hangs off in production.
+WAKE_RC=0; WAKE_CALLS=0
+_hb_wake() { WAKE_CALLS=$((WAKE_CALLS + 1)); return "$WAKE_RC"; }
+
+# --- Fixtures ----------------------------------------------------------------
+mk() {  # mk <title> [status] [kind] [assignee]
+  db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, status)
+      VALUES ($(sqlq "$1"), '', 'high', $(sqlq "${4:-dev}"), 'dev', $(sqlq "${3:-standard}"), $(sqlq "${2:-todo}"));
+      SELECT last_insert_rowid();"
+}
+row()      { db "SELECT status||'|'||COALESCE(started_at,'NULL') FROM tasks WHERE id=$1;"; }
+started()  { db "SELECT COALESCE(started_at,'NULL') FROM tasks WHERE id=$1;"; }
+snapshot() { db "SELECT id||'|'||status||'|'||COALESCE(started_at,'')||'|'||COALESCE(updated_at,'') FROM tasks ORDER BY id;"; }
+
+# Registry: one enrolled agent, never woken (lastRunAt 0 => due).
+seed_reg() { # seed_reg <lastRunAt>
+  jq -n --argjson t "${1:-0}" \
+    '{agents:{dev:{authProfile:"acct-dev",heartbeat:{enabled:true,everyMin:30,fresh:false,lastRunAt:$t}}}}' \
+    > "$REGISTRY"
+}
+
+# --- 1) The claim lands, asserted from the ROW -------------------------------
+T1=$(mk "dispatcher claims this")
+seed_reg 0; WAKE_RC=0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+[[ "$(row "$T1")" == in_progress\|* && "$(started "$T1")" != "NULL" ]] \
+  && ok_t "tick that nudges leaves the ROW in_progress with started_at set" \
+  || bad_t "tick that nudges leaves the ROW in_progress with started_at set" "got $(row "$T1")"
+(( WAKE_CALLS == 1 )) && ok_t "the tick actually woke the agent (1 wake)" \
+  || bad_t "the tick actually woke the agent (1 wake)" "WAKE_CALLS=$WAKE_CALLS"
+
+# --- 4) Idempotent with the agent's own `task start` -------------------------
+# Ordered here, while T1 is the freshly-claimed row: an agent that obeys the
+# /goal text must be a no-op, not a re-clock, or every claimed task's age (and
+# therefore the reaper budget) restarts the moment the agent complies.
+CLAIM_TS=$(started "$T1")
+db "UPDATE tasks SET started_at=datetime('now','-33 minutes') WHERE id=${T1};"
+CLAIM_TS=$(started "$T1")
+cmd_task_start "$T1" >/dev/null 2>&1
+[[ "$(started "$T1")" == "$CLAIM_TS" ]] \
+  && ok_t "a later 'task start' does NOT re-clock started_at (COALESCE parity)" \
+  || bad_t "a later 'task start' does NOT re-clock started_at" "was $CLAIM_TS, now $(started "$T1")"
+
+# --- 2) Two-sided: a tick that wakes nobody claims nothing -------------------
+# The ticket phrased this as "a tick that wakes nobody must leave every row
+# untouched". Written literally that is FALSE, and the first draft of this
+# harness failed on it: _hb_reclaim runs on EVERY tick and is deliberately NOT
+# gated by everyMin (an orphaned or runaway task must clear promptly or it
+# blocks the agent's whole queue via the busy guard). So a not-due tick may
+# still move an in_progress row BACK to todo. That is the recovery layer doing
+# its job, and after DIVE-2244 it finally has input.
+#
+# The invariant that actually holds, and the one the fix must satisfy, is
+# directional: a tick that wakes nobody never CLAIMS — no row goes todo ->
+# in_progress. Both halves are asserted below rather than papered over.
+#
+# Arm A — NOT DUE, no in_progress row in play, so the whole-db snapshot is exact.
+db "UPDATE tasks SET status='todo', started_at=NULL WHERE id=${T1};"
+T2=$(mk "must not be touched")
+BEFORE=$(snapshot); WAKE_CALLS=0
+seed_reg "$(date +%s)"
+cmd_heartbeat_tick >/dev/null 2>&1
+[[ "$(snapshot)" == "$BEFORE" ]] \
+  && ok_t "not-due tick leaves EVERY row byte-identical (status/started_at/updated_at)" \
+  || bad_t "not-due tick leaves EVERY row byte-identical" "before=[$BEFORE] after=[$(snapshot)]"
+(( WAKE_CALLS == 0 )) && ok_t "not-due tick woke nobody" || bad_t "not-due tick woke nobody" "WAKE_CALLS=$WAKE_CALLS"
+(( $(db "SELECT COUNT(*) FROM tasks WHERE status='in_progress';") == 0 )) \
+  && ok_t "not-due tick claimed nothing (no row moved todo -> in_progress)" \
+  || bad_t "not-due tick claimed nothing" "an in_progress row appeared with no wake"
+
+# Arm B — WAKE FAILED. Due, picks T2, but the wake returns nonzero: the claim
+# must sit inside the success branch, so the row stays exactly as it was.
+db "UPDATE tasks SET status='todo', started_at=NULL WHERE id=${T1};"   # unblock the busy guard
+seed_reg 0; WAKE_RC=1; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+[[ "$(row "$T2")" == "todo|NULL" ]] \
+  && ok_t "wake FAILED => target row untouched (claim is inside the success branch)" \
+  || bad_t "wake FAILED => target row untouched" "got $(row "$T2")"
+(( WAKE_CALLS >= 1 )) && ok_t "wake-failed arm is non-vacuous (the wake was attempted)" \
+  || bad_t "wake-failed arm is non-vacuous" "WAKE_CALLS=$WAKE_CALLS"
+WAKE_RC=0
+
+# --- 3) The claim is narrow --------------------------------------------------
+T3=$(mk "already blocked" blocked)
+_hb_claim_task dev "$T3" && bad_t "claim refuses a non-todo row" "claimed a blocked row" \
+                         || ok_t "claim refuses a non-todo row"
+[[ "$(row "$T3")" == "blocked|NULL" ]] && ok_t "refused claim left the blocked row alone" \
+                                       || bad_t "refused claim left the blocked row alone" "got $(row "$T3")"
+T4=$(mk "recurring template" todo recurring)
+_hb_claim_task dev "$T4" && bad_t "claim refuses a recurring TEMPLATE (DIVE-2055/2059)" "claimed a template" \
+                         || ok_t "claim refuses a recurring TEMPLATE (DIVE-2055/2059)"
+[[ "$(row "$T4")" == "todo|NULL" ]] && ok_t "refused claim left the template firing (still todo)" \
+                                    || bad_t "refused claim left the template firing" "got $(row "$T4")"
+
+# --- 3b) DIVE-4253: a claim from todo RE-CLOCKS — the gate-return shape -------
+# A row that was in_progress, went blocked on a gate and came back to todo on the
+# answer still carries its previous attempt's started_at (`task need`, `answer`
+# and `unblock` clear nothing). Pre-fix the claim COALESCEd it, so the reaper's
+# very next tick read `age_min >= budget` and reclaimed a row claimed minutes
+# earlier — measured 2026-09-10: DIVE-4218 claimed 22:30:21Z, reaped 22:35:09Z;
+# DIVE-4214 gate answered 22:28:11Z, reaped 22:30:13Z. One wasted attempt per
+# gated row. first_started_at is the durable history (DIVE-3251) and must NOT move.
+T5=$(mk "came back from a gate")
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes'), first_started_at=datetime('now','-200 minutes') WHERE id=${T5};"
+T5_FIRST=$(db "SELECT first_started_at FROM tasks WHERE id=${T5};")
+_hb_claim_task dev "$T5" >/dev/null 2>&1
+T5_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${T5};")
+[[ "$(row "$T5")" == in_progress\|* ]] && (( ${T5_AGE:-999} < 2 )) \
+  && ok_t "[4253] a claim from todo stamps a FRESH started_at (stale clock was 200m old, now ${T5_AGE}m)" \
+  || bad_t "[4253] a claim from todo stamps a FRESH started_at" "row=$(row "$T5") age_min=${T5_AGE:-?}"
+[[ "$(db "SELECT first_started_at FROM tasks WHERE id=${T5};")" == "$T5_FIRST" ]] \
+  && ok_t "[4253] first_started_at is history and does not move on re-claim" \
+  || bad_t "[4253] first_started_at must not move" "was $T5_FIRST now $(db "SELECT first_started_at FROM tasks WHERE id=${T5};")"
+# The consequence that matters: the reaper's next tick does NOT take it back.
+# Same budget as arm 5 (everyMin 30 => 90m); a fresh clock is far under it.
+read -r T5_RC _ < <(_hb_reclaim dev 30)
+[[ "$(row "$T5")" == in_progress\|* ]] && (( ${T5_RC:-0} == 0 )) \
+  && ok_t "[4253] the re-claimed row survives the reaper's next tick (gets its full budget window)" \
+  || bad_t "[4253] re-claimed row must survive the next reap" "row=$(row "$T5") reclaimed=${T5_RC:-?}"
+# Same shape through the agent's own verb: `task start` from todo is a new attempt
+# (arm 4 above holds the other half — on an in_progress row it is still a no-op).
+T6=$(mk "came back from a gate, started by hand")
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes'), first_started_at=datetime('now','-200 minutes') WHERE id=${T6};"
+cmd_task_start "$T6" >/dev/null 2>&1
+T6_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${T6};")
+[[ "$(row "$T6")" == in_progress\|* ]] && (( ${T6_AGE:-999} < 2 )) \
+  && ok_t "[4253] 'task start' from todo also stamps a FRESH started_at" \
+  || bad_t "[4253] 'task start' from todo stamps a fresh started_at" "row=$(row "$T6") age_min=${T6_AGE:-?}"
+
+# --- 5) End-to-end reaper, reached ONLY via the dispatcher claim -------------
+# This is the assertion the ticket asked to mutation-grade. Note what is NOT
+# done: the in_progress row is never INSERTed. It is produced by running the
+# real tick, so removing the claim removes the reaper's input too. A fixture
+# that hand-wrote in_progress would stay green with the bug fully restored.
+db "DELETE FROM tasks;"
+R1=$(mk "runs away")
+seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+REACHED_INPROG=0; [[ "$(row "$R1")" == in_progress\|* ]] && REACHED_INPROG=1
+# Age the CLOCK only, never the state: everyMin 30 * _HB_STALE_MULT 3 = 90m
+# budget, so 200m is unambiguously past it. Scoped `AND status='in_progress'`
+# so this exact statement can be replayed verbatim in the mutation arm and be
+# DIFFERENTIAL — it must age a real claim, never manufacture the very state the
+# mutation is supposed to have removed.
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${R1} AND status='in_progress';"
+read -r RC_N _ < <(_hb_reclaim dev 30)
+(( REACHED_INPROG == 1 )) && [[ "$(row "$R1")" == "todo|NULL" ]] && (( ${RC_N:-0} == 1 )) \
+  && ok_t "claim -> aged past budget -> reaper requeues to todo (end-to-end, no hand-written state)" \
+  || bad_t "claim -> aged -> reaper requeues" "reachedInProgress=$REACHED_INPROG row=$(row "$R1") reclaimed=${RC_N:-?}"
+
+# --- 5b) The hard cap does NOT depend on the liveness probe ------------------
+# The claim is stamped on DELIVERY, not acceptance — _hb_wake succeeding means
+# the nudge was SENT, not that the agent began. That is only safe because the
+# net behind it is not computed from the same unreliable read. Before this
+# change an abandoned task was re-nudged every everyMin unconditionally; now it
+# is held by the busy guard until a reclaim rule fires. If BOTH reclaim rules
+# consulted _hb_agent_idle, a probe that is wrong in the busy direction (a hung
+# process that still reads alive) would leave a task neither re-nudged NOR
+# reclaimed, indefinitely, while the board shows it in_progress — a silent
+# permanent stall, introduced by a change whose purpose is stall recovery.
+#
+# So drive the hostile case: idle probe insists the agent is BUSY (rc 1, rule
+# (b) can never fire) and the pane is dead so `/goal clear` fails. Rule (c) must
+# still requeue on arithmetic alone.
+db "DELETE FROM tasks;"
+H1=$(mk "hung but looks alive")
+seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+H_CLAIMED=0; [[ "$(row "$H1")" == in_progress\|* ]] && H_CLAIMED=1
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${H1} AND status='in_progress';"
+_hb_agent_idle() { return 1; }   # confident BUSY — rule (b) is disabled
+_hb_send_line()  { return 1; }   # dead pane — the /goal clear cannot land
+read -r HRC_N _ < <(_hb_reclaim dev 30)
+(( H_CLAIMED == 1 )) && [[ "$(row "$H1")" == "todo|NULL" ]] && (( ${HRC_N:-0} == 1 )) \
+  && ok_t "hard cap (c) requeues with the idle probe saying BUSY and the pane DEAD — unconditional" \
+  || bad_t "hard cap (c) is unconditional" "claimed=$H_CLAIMED row=$(row "$H1") reclaimed=${HRC_N:-?}"
+# Differential: the same hostile stubs at the same call, but UNDER the budget.
+# If (c) were firing on something other than age the assertion above would be
+# vacuous. Note the stubs are restored for the TICK and re-applied only for the
+# _hb_reclaim call — a "busy" idle reading makes the tick active-defer, so
+# leaving them hostile across the wake would starve this arm of its claim and
+# grade a row that was never in_progress (the first draft did exactly that).
+db "DELETE FROM tasks;"
+_hb_agent_idle() { return 0; }
+_hb_send_line()  { return 0; }
+H2=$(mk "hung but young")
+seed_reg 0
+cmd_heartbeat_tick >/dev/null 2>&1
+db "UPDATE tasks SET started_at=datetime('now','-40 minutes') WHERE id=${H2} AND status='in_progress';"
+_hb_agent_idle() { return 1; }
+_hb_send_line()  { return 1; }
+read -r HRC2_N _ < <(_hb_reclaim dev 30)
+[[ "$(row "$H2")" == in_progress\|* ]] && (( ${HRC2_N:-0} == 0 )) \
+  && ok_t "same hostile stubs UNDER the 90m budget => no reclaim (the cap fires on AGE, not on the probe)" \
+  || bad_t "under-budget control" "row=$(row "$H2") reclaimed=${HRC2_N:-?}"
+_hb_agent_idle() { return 0; }   # restore
+_hb_send_line()  { return 0; }
+
+# --- 6) MUTATION ARM: neuter the claim, both arms must go RED ----------------
+_hb_claim_task_REAL() { :; }   # placeholder so the name exists before we save it
+eval "$(declare -f _hb_claim_task | sed '1s/^_hb_claim_task/_hb_claim_task_REAL/')"
+_hb_claim_task() { return 0; }  # the pre-DIVE-2244 world: nudge, never claim
+# Confirm the mutation LANDED, behaviourally — a `declare -f` diff would only
+# prove the text changed, not that the tick resolves to this definition.
+M0=$(mk "mutation probe")
+_hb_claim_task dev "$M0"
+[[ "$(row "$M0")" == "todo|NULL" ]] \
+  && ok_t "[mutation] the neutered claim is live (a direct call no longer moves the row)" \
+  || bad_t "[mutation] the neutered claim is live" "row moved to $(row "$M0")"
+
+db "DELETE FROM tasks;"
+M1=$(mk "would run away")
+seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+# RED #1 — assertion (1) inverts.
+[[ "$(row "$M1")" == "todo|NULL" ]] \
+  && ok_t "[mutation] RED as designed: nudged task never reaches in_progress" \
+  || bad_t "[mutation] RED as designed: nudged task never reaches in_progress" "got $(row "$M1")"
+# Grade that RED for vacuity: it must be caused by the missing claim, not by a
+# tick that silently did nothing. The wake still ran and still targeted M1.
+(( WAKE_CALLS == 1 )) \
+  && ok_t "[mutation] the RED is non-vacuous — the tick still woke the agent" \
+  || bad_t "[mutation] the RED is non-vacuous" "WAKE_CALLS=$WAKE_CALLS (expected 1)"
+# RED #2 — the reaper has no input at all, which is the silent half of the bug.
+# The aging statement is the SAME one the green arm ran, scope included, so the
+# two arms differ ONLY by the mutation. An unscoped backdate here would have
+# written started_at onto a never-claimed row and graded a state this arm is
+# meant to prove absent (the first draft did exactly that and failed honestly).
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${M1} AND status='in_progress';"
+read -r MRC_N _ < <(_hb_reclaim dev 30)
+(( ${MRC_N:-0} == 0 )) && [[ "$(row "$M1")" == "todo|NULL" ]] \
+  && ok_t "[mutation] RED as designed: reaper reclaims NOTHING (its input never existed)" \
+  || bad_t "[mutation] reaper reclaims nothing" "reclaimed=${MRC_N:-?} row=$(row "$M1")"
+
+# --- 7) Restore: the mutation is what moved the result -----------------------
+eval "$(declare -f _hb_claim_task_REAL | sed '1s/^_hb_claim_task_REAL/_hb_claim_task/')"
+db "DELETE FROM tasks;"
+G1=$(mk "green again")
+seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+[[ "$(row "$G1")" == in_progress\|* ]] \
+  && ok_t "[restore] claim reinstated => green again (the mutation was the cause)" \
+  || bad_t "[restore] claim reinstated => green again" "got $(row "$G1")"
+
+# --- 8) DIVE-2541: the claim must reach the LEDGER, not just the row ---------
+# DIVE-2244 moved the authoritative start from `task start` to the dispatcher and
+# the ledger emit stayed on the verb. Measured on the live board over the ledger's
+# whole life: 94 distinct tasks claimed by the dispatcher, 85 with NO task.started
+# event, against 13 emitted by the verb. Every reader of that ledger — `trace`,
+# `whoami --for` — was therefore reading a ~90% empty chain while looking healthy,
+# because a timeline cannot render an absence.
+ev_count() { db "SELECT COUNT(*) FROM lifecycle_events WHERE kind='task.started' AND task_id=$1;"; }
+ev_auth()  { db "SELECT actor||'|'||authority FROM lifecycle_events WHERE kind='task.started' AND task_id=$1;"; }
+
+# G1 was claimed by the restore arm above, so it is a REAL dispatcher claim.
+(( $(ev_count "$G1") == 1 )) \
+  && ok_t "[2541] a dispatcher claim writes a task.started event" \
+  || bad_t "[2541] a dispatcher claim writes a task.started event" "count=$(ev_count "$G1")"
+
+# THE DISCRIMINATOR, and the reason the arm above is not enough. An emit that
+# recorded authority='self' would satisfy "an event exists" while asserting the
+# agent started its own task — which it did not; the dispatcher moved the row on
+# its behalf. That is the false-claim shape v0.18 exists to delete, so the arm
+# has to pin the authority and not merely the existence.
+[[ "$(ev_auth "$G1")" == "dev|dispatcher" ]] \
+  && ok_t "[2541] the event says actor=dev authority=DISPATCHER — not a self-start" \
+  || bad_t "[2541] claim must record authority=dispatcher, never self" "got $(ev_auth "$G1")"
+
+# NEGATIVE CONTROL: without it, "an event exists" passes for an emit that fires on
+# every tick regardless of whether anything was claimed. A tick that wakes NOBODY
+# must write nothing.
+db "DELETE FROM tasks;"; db "DELETE FROM lifecycle_events;"
+N1=$(mk "never claimed")
+seed_reg "$(date +%s)"          # just ran => not due => no wake, no claim
+WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( $(ev_count "$N1") == 0 && WAKE_CALLS == 0 )) \
+  && ok_t "[2541] NEGATIVE CONTROL: a tick that claims nothing emits nothing" \
+  || bad_t "[2541] a tick that claims nothing must emit nothing" "count=$(ev_count "$N1") wakes=$WAKE_CALLS"
+
+# --- DIVE-3465: a seat behind a hard SPEND CAP must not be handed a row -------
+# This harness is the seam that FORCES the dispatch path to run, so the hold is
+# graded where it acts (the claim) and not only where it is computed. The unit
+# arms for the classifier and the release verdict live in
+# tests/heartbeat_spend_cap_unit.sh; what is asserted HERE is the wiring: a held
+# seat reaches neither the pick nor the wake, and the row it would have been
+# handed is still `todo` afterwards — untouched, not claimed-and-reclaimed, which
+# is the difference between a row that waits and DIVE-3384's fifteen blank
+# sessions.
+db "DELETE FROM tasks;"; db "DELETE FROM lifecycle_events;"
+C1=$(mk "must not be claimed while the account is capped")
+seed_cap() {  # seed_cap <spendCapAt>  — enrolled, due, and held
+  jq -n --argjson at "$1" \
+    '{agents:{dev:{authProfile:"acct-dev",heartbeat:{enabled:true,everyMin:30,fresh:false,lastRunAt:0,spendCap:{at:$at,lastSeenAt:$at,n:1,probedAt:$at}}}}}' \
+    > "$REGISTRY"
+}
+# Both live instruments stubbed: no tmux, no sudo, no systemctl in a harness.
+_hb_account_has_headroom() { return 1; }
+_hb_pane_capture()         { printf '%s' "$CAP_PANE"; return "${CAP_PANE_RC:-0}"; }
+systemctl()                { return 0; }
+CAP_PANE=$'You\'ve hit your monthly spend limit\n  1. Stop and wait for limit to reset\n  2. Upgrade your plan'
+CAP_PANE_RC=0
+
+seed_cap "$(date +%s)"; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) \
+  && ok_t "[3465] a spend-capped seat is not woken" \
+  || bad_t "[3465] a spend-capped seat must not be woken" "wakes=$WAKE_CALLS"
+[[ "$(db "SELECT status FROM tasks WHERE id=$C1;")" == "todo" ]] \
+  && ok_t "[3465] the row it would have been handed is left todo, unclaimed" \
+  || bad_t "[3465] row must stay todo under a spend-cap hold" "got $(db "SELECT status FROM tasks WHERE id=$C1;")"
+(( $(ev_count "$C1") == 0 )) \
+  && ok_t "[3465] no task.started event under a hold — the claim never happens" \
+  || bad_t "[3465] a held seat must claim nothing" "count=$(ev_count "$C1")"
+
+# An unreadable seat is COULD-NOT-DETERMINE, and it must HOLD, not dispatch.
+CAP_PANE=""; CAP_PANE_RC=1
+seed_cap "$(date +%s)"; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) \
+  && ok_t "[3465] COULD-NOT-DETERMINE holds — an unreadable seat is not headroom" \
+  || bad_t "[3465] unreadable seat must hold, not dispatch" "wakes=$WAKE_CALLS"
+
+# RELEASE: the wall is gone from the seat's screen -> the hold lifts, the seat is
+# dispatched again, AND the hold is cleared from the registry (not left to rot).
+CAP_PANE=$'agent-dev $ '; CAP_PANE_RC=0
+seed_cap "$(date +%s)"; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 1 )) \
+  && ok_t "[3465] a measured release re-enables dispatch on the same tick" \
+  || bad_t "[3465] release must dispatch" "wakes=$WAKE_CALLS"
+[[ "$(jq -r '.agents.dev.heartbeat.spendCap // "gone"' "$REGISTRY")" == "gone" ]] \
+  && ok_t "[3465] the released hold is removed from the registry" \
+  || bad_t "[3465] release must clear the hold" "got $(jq -c '.agents.dev.heartbeat.spendCap' "$REGISTRY")"
+
+# NEGATIVE CONTROL for the whole block: with NO hold recorded, the identical
+# fixture dispatches. Without this, every assertion above would also pass if the
+# tick had simply stopped working.
+db "UPDATE tasks SET status='todo', started_at=NULL WHERE id=$C1;"; db "DELETE FROM lifecycle_events;"
+seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 1 )) \
+  && ok_t "[3465] NEGATIVE CONTROL: same fixture with no hold IS dispatched" \
+  || bad_t "[3465] un-held seat must still be dispatched" "wakes=$WAKE_CALLS"
+
+
+# --- DIVE-4261: A GRADE THIS SEAT CANNOT MERGE IS NOT WORK IN PROGRESS -------
+# The busy guard counted EVERY in_progress row for the seat. After `task verify`
+# PASS the row stays in_progress assigned to the GRADER while the merge is owed
+# by another seat, so a grader holding one such row was busy-skipped on every
+# tick — measured 2026-09-11 00:55-01:05Z: quinn logged "busy — 1 in_progress,
+# skip" each tick while sitting at an empty prompt with 4 graded->merge rows and
+# nothing it could act on. This is DIVE-4206's maker-side wedge arriving from the
+# grader side; there the claim is stale and gets reclaimed, here it is the record
+# of who graded and must NOT be — only discounted by the busy count.
+#
+# Note what these arms do NOT do: they never hand-write the busy count. Each one
+# runs the real tick and reads the WAKE and the ROW, so a fix that only changed
+# the log line would leave them red.
+db "UPDATE tasks SET status='cancelled' WHERE status NOT IN ('done','cancelled');"
+db "DELETE FROM lifecycle_events;"
+
+# gm <merge_owner> -> id of a graded->merge row held by dev, merge owed by <owner>.
+# Satisfies _TASKS_TFV_SQL exactly: graded, bound to a delivery, passed, and not
+# bounced. started_at is FRESH so the reaper cannot be what moves it.
+gm() {
+  local id; id=$(mk "graded, merge owed by ${1}" in_progress standard dev)
+  db "UPDATE tasks SET maker_agent='dev2', verifier='dev', graded_by='dev',
+             graded_at=datetime('now','-5 minutes'), graded_verdict='pass',
+             delivery_ref='https://github.com/fixture.invalid/harness/pull/9$id',
+             merge_owner=$(sqlq "$1"), handoff_rejected_at=NULL,
+             started_at=datetime('now','-5 minutes')
+       WHERE id=${id};"
+  printf '%s' "$id"
+}
+
+# Arm A — THE DEFECT. One graded->merge row owed by ANOTHER seat plus one todo
+# row: the seat must be dispatched onto the todo row, not busy-skipped.
+G1=$(gm quinn)
+TG=$(mk "the row dev can actually do")
+: > "$HB_LOG"; seed_reg 0; WAKE_RC=0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 1 )) \
+  && ok_t "[4261] a seat holding a graded->merge row owed by ANOTHER seat is still dispatched" \
+  || bad_t "[4261] graded->merge row owed elsewhere must not make the seat busy" "wakes=$WAKE_CALLS log=[$(grep -c busy "$HB_LOG") busy lines]"
+[[ "$(row "$TG")" == in_progress\|* ]] \
+  && ok_t "[4261] and it is dispatched onto the TODO row (claimed in_progress)" \
+  || bad_t "[4261] the todo row must be claimed" "got $(row "$TG")"
+grep -q "busy —" "$HB_LOG" \
+  && bad_t "[4261] no busy-skip is logged for that seat" "log: $(grep 'busy —' "$HB_LOG")" \
+  || ok_t "[4261] no busy-skip is logged for that seat"
+# The grade itself is untouched: the claim is the record of who graded it, so
+# nothing here may reclaim, reassign or re-open the graded row.
+[[ "$(db "SELECT status||'|'||COALESCE(assignee,'')||'|'||COALESCE(graded_by,'') FROM tasks WHERE id=${G1};")" == "in_progress|dev|dev" ]] \
+  && ok_t "[4261] the graded row itself is untouched (still in_progress, still dev's grade)" \
+  || bad_t "[4261] graded row must not be reclaimed or reassigned" "got $(db "SELECT status||'|'||COALESCE(assignee,'')||'|'||COALESCE(graded_by,'') FROM tasks WHERE id=${G1};")"
+
+# Arm B — SCOPE. The same row with the merge owed by THIS seat is its next move,
+# so the seat is correctly busy and must NOT be dispatched onto anything else.
+db "UPDATE tasks SET status='cancelled' WHERE id=${TG};"
+db "UPDATE tasks SET merge_owner='dev' WHERE id=${G1};"
+TG2=$(mk "must not be picked while dev owes a merge")
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && [[ "$(row "$TG2")" == "todo|NULL" ]] \
+  && ok_t "[4261] SCOPE: when the merge is owed by THIS seat the row still counts busy" \
+  || bad_t "[4261] a merge this seat owes must still read busy" "wakes=$WAKE_CALLS row=$(row "$TG2")"
+grep -q "busy —" "$HB_LOG" \
+  && ok_t "[4261] and the busy-skip is logged for it" \
+  || bad_t "[4261] busy-skip must still be logged" "log=[$(cat "$HB_LOG")]"
+
+# Arm C — NEGATIVE CONTROL for arm A: an ORDINARY in_progress row (not graded,
+# no delivery bound) on the same seat with the same fixture shape still reads
+# busy. Without this, arm A would also pass if the busy guard had simply been
+# deleted.
+db "UPDATE tasks SET status='cancelled' WHERE id=${G1};"
+P1=$(mk "ordinary work in flight" in_progress standard dev)
+db "UPDATE tasks SET started_at=datetime('now','-5 minutes') WHERE id=${P1};"
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && [[ "$(row "$TG2")" == "todo|NULL" ]] \
+  && ok_t "[4261] NEGATIVE CONTROL: a plain in_progress row still busy-skips the seat" \
+  || bad_t "[4261] the busy guard must survive for ordinary work" "wakes=$WAKE_CALLS row=$(row "$TG2")"
+
+# Arm D — a graded row owed elsewhere that is ALSO the seat's only row leaves it
+# dispatchable but with nothing to pick: no wake, and specifically NOT a busy
+# skip. This separates "discounted" from "hidden" — the seat is simply idle.
+db "UPDATE tasks SET status='cancelled' WHERE id IN (${P1}, ${TG2});"
+db "UPDATE tasks SET status='in_progress', merge_owner='quinn' WHERE id=${G1};"
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && ! grep -q "busy —" "$HB_LOG" \
+  && ok_t "[4261] with only that row the seat is idle, not busy (no wake, no busy line)" \
+  || bad_t "[4261] seat must read idle, not busy" "wakes=$WAKE_CALLS log=[$(cat "$HB_LOG")]"
+
+# --- [6040] a grade whose session ended without a verdict --------------------
+# DIVE-6013, quinn, 2026-10-11 09:04Z: the grader left a background CI watch to
+# wake it, the turn ended, the shell died, and the row stayed in_progress with no
+# verdict. 749 ticks of `busy — 1 in_progress, skip` over 17h. The REAL tick runs
+# here: the claim is the verifier's (dev), delivered by a maker and unacked.
+db "UPDATE tasks SET status='cancelled' WHERE status NOT IN ('done','cancelled');"
+mk_grade() {  # a delivery routed through the real verb, claimed by the verifier dev
+  local id
+  id=$( ( cmd_task_add --assignee=maker1 --verifier=dev --verify -- "grade me" ) 2>/dev/null | jq -r '.data.id')
+  ( cmd_task_done "$id" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
+  _hb_claim_task dev "$id" >/dev/null 2>&1
+  db "UPDATE tasks SET started_at=datetime('now','-$2 minutes') WHERE id=${id};"
+  printf '%s' "$id"
+}
+grow() { db "SELECT status||'|'||COALESCE(assignee,'')||'|'||COALESCE(handoff_delivered_at,'NULL') FROM tasks WHERE id=$1;"; }
+
+# Arm G1 — session gone (seat at rest), no verdict, past N: the tick dispatches it
+# back to the grader on that same tick, and the delivery is still bound.
+GO1=$(mk_grade x 70)
+[[ "$(grow "$GO1")" == in_progress\|dev\|* ]] \
+  && ok_t "[6040] fixture: verifier-held, delivered, in_progress" \
+  || bad_t "[6040] fixture did not land" "got $(grow "$GO1")"
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+G1_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${GO1};")
+(( WAKE_CALLS == 1 )) && [[ "$(grow "$GO1")" == in_progress\|dev\|2* ]] && (( ${G1_AGE:-99} < 5 )) \
+  && ok_t "[6040] G1 no verdict, seat at rest, 70m in: the tick re-dispatches the grade to its grader (fresh claim, delivery kept)" \
+  || bad_t "[6040] G1 the orphaned grade was not re-dispatched" "wakes=$WAKE_CALLS row=$(grow "$GO1") age=${G1_AGE:-?} log=[$(cat "$HB_LOG")]"
+grep -q "busy —" "$HB_LOG" \
+  && bad_t "[6040] G1b the seat must not busy-skip on the orphaned claim" "log=[$(cat "$HB_LOG")]" \
+  || ok_t "[6040] G1b no busy-skip on the orphaned claim"
+
+# Arm G2 — CONTROL: same row, but the seat is mid-turn (a live session). Busy.
+db "UPDATE tasks SET status='cancelled' WHERE id=${GO1};"
+GO2=$(mk_grade x 70)
+_hb_agent_idle() { return 1; }
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+_hb_agent_idle() { return 0; }
+G2_AGE=$(db "SELECT CAST((julianday('now') - julianday(started_at)) * 1440 AS INTEGER) FROM tasks WHERE id=${GO2};")
+(( WAKE_CALLS == 0 )) && [[ "$(grow "$GO2")" == in_progress\|dev\|* ]] && (( ${G2_AGE:-0} >= 69 )) \
+  && ok_t "[6040] G2 CONTROL: a grader with a live session keeps its claim — no wake, clock untouched" \
+  || bad_t "[6040] G2 a live grading session was reclaimed" "wakes=$WAKE_CALLS row=$(grow "$GO2") age=${G2_AGE:-?}"
+
+# Arm G3 — CONTROL: inside N (seat at rest) the grader keeps its think-time.
+db "UPDATE tasks SET status='cancelled' WHERE id=${GO2};"
+GO3=$(mk_grade x 40)
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && [[ "$(grow "$GO3")" == in_progress\|dev\|* ]] \
+  && ok_t "[6040] G3 CONTROL: 40m in, under N=${_HB_GRADE_ORPHAN_MIN:-60}m — not reclaimed, not woken" \
+  || bad_t "[6040] G3 the grade was raced inside N" "wakes=$WAKE_CALLS row=$(grow "$GO3")"
+
+# Arm G4 — CONTROL: a verdict is already recorded for this iteration. Past N but
+# inside the DIVE-4724 budget: never re-graded, never re-dispatched.
+db "UPDATE tasks SET status='cancelled' WHERE id=${GO3};"
+GO4=$(mk_grade x 70)
+db "UPDATE tasks SET graded_at=datetime('now'), graded_verdict='pass', graded_verdict_at=datetime('now'), graded_by='dev' WHERE id=${GO4};"
+: > "$HB_LOG"; seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( WAKE_CALLS == 0 )) && [[ "$(grow "$GO4")" == in_progress\|dev\|* ]] \
+  && ok_t "[6040] G4 CONTROL: a recorded verdict is not an orphaned grade — not reclaimed, not re-dispatched" \
+  || bad_t "[6040] G4 a graded row was re-dispatched" "wakes=$WAKE_CALLS row=$(grow "$GO4")"
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[[ "$FAIL" -eq 0 ]]

@@ -1,0 +1,48 @@
+name: devteam core harnesses
+
+# DIVE-6938: the devteam plugin's files are read into the 5dive CLI, and their
+# harnesses (tests/devteam/) grade a 5dive tree with these files put back in it.
+# 5dive's own CI runs them against each 5dive pull request at its pinned
+# PLUGINS_REF; this runs them against 5dive's main whenever the plugin or its
+# harnesses change here, and nightly, so a 5dive change that breaks the plugin
+# is seen within a day even before 5dive bumps its pin.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'plugins/devteam/**'
+      - 'tests/devteam/**'
+      - 'tests/devteam_core_harnesses.sh'
+      - '.github/workflows/devteam-core.yml'
+  pull_request:
+    paths:
+      - 'plugins/devteam/**'
+      - 'tests/devteam/**'
+      - 'tests/devteam_core_harnesses.sh'
+      - '.github/workflows/devteam-core.yml'
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: '5dive-ai/5dive ref to grade against'
+        default: main
+
+jobs:
+  harnesses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: { shard: [1, 2, 3, 4] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: 5dive-ai/5dive
+          ref: ${{ inputs.core_ref || 'main' }}
+          path: core
+          fetch-depth: 0
+      - name: Run the devteam harnesses against 5dive (shard ${{ matrix.shard }})
+        run: bash tests/devteam_core_harnesses.sh --core="$GITHUB_WORKSPACE/core" --shard=${{ matrix.shard }}/${{ strategy.job-total }}

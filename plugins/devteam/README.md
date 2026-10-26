@@ -3,7 +3,7 @@
 The tools 5dive's own team uses to build 5dive: PR delivery (`task deliver --pr`),
 graders, gate evidence, proof badges, and the `gh`, `push` and `deploy` rails.
 
-They are leaving the core CLI (DIVE-6935). A box that hires agents for anything
+They left the core CLI (DIVE-6935, DIVE-6938). A box that hires agents for anything
 else never needs them.
 
 ```
@@ -21,15 +21,40 @@ is refused at install.
 
 `sudo 5dive doctor --category=plugins` says whether this box runs them from here.
 
-## Phase 1 (now)
+## Since 0.2.0 these files are the code
 
-The core still carries its own copy of every file. A copy here is read only while
-it is byte-for-byte the file the installed core was built from, so a fix that lands
-in the core is never undone by an older copy here. `core/SOURCE` names the core
-commit these are copies of. Refresh after a core change:
+5dive 0.103 and later carry no copy of them (DIVE-6938). On a box without this
+plugin, `proof`, `gh`, `push`, `deploy` and `task deliver|reject|merge…` each
+answer with one line, `<verb> is in the devteam plugin: 5dive plugin install
+devteam`. A row with no bound pull request still closes on `task done`; a row
+with one refuses until the plugin is installed. Older copies (0.1.x) are refused
+by a 0.103 core, so upgrade the plugin before or with the CLI:
 
 ```
-bash tests/devteam_core_unit.sh --refresh=/path/to/5dive
+sudo 5dive plugin upgrade devteam@5dive-plugins
 ```
 
-Phase 2 deletes the core copies; from then on these files are the code.
+The CLI reads `core/` on first use in a run, not at every start: it defines one
+stub per function here and reads all nine files the first time one is called. A
+file here that defines a function the core also defines is refused whole.
+
+`core/SOURCE` is the manifest (sha256 per file). After editing a file:
+
+```
+bash tests/devteam_core_unit.sh --rehash
+```
+
+and bump the version in `.claude-plugin/plugin.json`.
+
+## Tests
+
+The harnesses for these files moved here with them, unchanged, in
+`tests/devteam/`. They still grade a 5dive tree, so the runner clones one, puts
+these files back where the core used to keep them, and runs them:
+
+```
+bash tests/devteam_core_harnesses.sh --core=/path/to/5dive [name ...]
+```
+
+5dive's own CI runs the same runner against every 5dive pull request, and this
+repo's CI runs it against 5dive's main.
