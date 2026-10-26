@@ -27,7 +27,7 @@ import type { HookPayload } from './lib/types'
 import { wallRotate, readActiveAccount, type Run } from './lib/wall-rotate'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
 import { inboundLang, TERMS_NOTICE } from './lib/terms'
-import { classifyFailure, failureMessage, resolveResetEpoch } from './lib/failure'
+import { classifyFailure, failureMessage, resolveResetEpoch, CREDIT_NOTICE } from './lib/failure'
 import { RESUME_LOCK_TTL_MS, resumeLogDir as makeResumeLogDir, tryAcquireResumeLock } from './lib/resume-lock'
 import { onDemoAccount, readDemoKey, isKeyLimitText, claimDemoNotice, releaseDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
 
@@ -68,6 +68,7 @@ const pane = capturePane()
 // rate-limit branch into the transient one.
 const kind = classifyFailure(payload, raw, pane)
 const isTermsNotAccepted = kind.isTermsNotAccepted
+const isOutOfCredit = kind.isOutOfCredit
 let isRateLimit = kind.isRateLimit
 let isTransientApiError = kind.isTransientApiError
 
@@ -134,6 +135,9 @@ let text: string
 if (isTermsNotAccepted) {
   // The language the owner last wrote in, else the box's client language.
   text = TERMS_NOTICE[inboundLang(entries) ?? readLiteLang()]
+} else if (isOutOfCredit) {
+  // DIVE-6979: the owner pays for the account (a lite client's text is set below).
+  text = CREDIT_NOTICE.owner[inboundLang(entries) ?? readLiteLang()]
 } else if (isRateLimit) {
   if (timeLeft && tmuxCtx) {
     text = `Usage limit hit — resumes in ${timeLeft}. Will auto-press the menu and type 'continue' when the limit lifts.`
@@ -172,14 +176,27 @@ if (isTermsNotAccepted) {
 // undefined and text is untouched, so the sends below are what they were.
 const LITE = isLite()
 let markup: unknown = undefined
+// DIVE-6979: a 402 on a partner box can also be the box key's own cap, the
+// client's allowance (DIVE-5111), which is theirs, with its reset day, and keeps
+// the limit line. Only a positive read of a used-up cap says so; anything else
+// is the funder's empty account. Read once: each read may take its 4s timeout.
+const allowance = LITE && isOutOfCredit ? await readAllowance() : null
+const ownCapUsedUp = allowance?.kind === 'capped' && allowance.pctLeft === 0
 if (LITE && isTermsNotAccepted) {
   // The client is the one who connected the login, so the notice is theirs.
   recordOpsDetail('stopfailure', `terms not accepted: ${msg}`)
+} else if (LITE && isOutOfCredit && !ownCapUsedUp) {
+  // DIVE-6979: the partner's account is empty, not the client's allowance. The
+  // client hears that the funder was told (the API's balance watch tells them);
+  // the raw 402 stays in the ops log.
+  recordOpsDetail('stopfailure', `out of AI credit: ${msg}`)
+  text = CREDIT_NOTICE.client[readLiteLang()]
 } else if (LITE) {
   recordOpsDetail('stopfailure', text)
   const lang = readLiteLang()
-  const limitHit = isRateLimit || /key limit exceeded|insufficient credits|more credits/i.test(raw)
-  text = limitHit ? liteLimitText(lang, await readAllowance()) : LITE_STRINGS[lang].failed
+  // DIVE-6979: an out-of-credit that reached here is the client's own used-up cap.
+  const limitHit = isRateLimit || isOutOfCredit || /key limit exceeded|insufficient credits|more credits/i.test(raw)
+  text = limitHit ? liteLimitText(lang, allowance ?? (await readAllowance())) : LITE_STRINGS[lang].failed
   const accountUrl = liteAccountUrl(readChannelEnv('TELEGRAM_ACCOUNT_URL'))
   if (limitHit && accountUrl) markup = { inline_keyboard: [[{ text: LITE_STRINGS[lang].accountButton, url: accountUrl }]] }
 }
@@ -223,7 +240,9 @@ const callerChat = getCallerChat(entries)
 if (callerChat) {
   targets = [callerChat]
   routeKind = 'caller'
-} else if (demoFingerprint !== null || isTermsNotAccepted) {
+} else if (demoFingerprint !== null || isTermsNotAccepted || (isOutOfCredit && !LITE)) {
+  // DIVE-6979: an owner's empty balance is theirs to top up, and nothing
+  // resumes until they do, so an autonomous turn tells them too.
   targets = getOwnerChatIds().map(chatId => ({ chatId }))
   routeKind = 'owners'
 } else {
@@ -313,7 +332,7 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
 // respawn storm collapses to one DM per cooldown window. Kept message-independent
 // (like the usage-limit key already was): distinct errors of the same kind within
 // the window collapse — an acceptable tradeoff against a 550-message storm.
-const notifyKind = isTermsNotAccepted ? 'terms' : isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : 'stop'
+const notifyKind = isTermsNotAccepted ? 'terms' : isOutOfCredit ? 'credit' : isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : 'stop'
 let shouldSend = true
 {
   const dir = resumeLogDir || makeResumeLogDir()
