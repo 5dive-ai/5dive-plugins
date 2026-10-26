@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.117: /account opens at once, even after a quiet spell (DIVE-6985)
+
+lodar, 2026-10-26: *"slash account on this box from telegtam takes almos 10s to get the response"*. The picker's cache (0.5.113) only covered ten minutes, so the first tap after that waited for four CLI runs again.
+
+- **The picker shows the last menu it built straight away**, whatever its age, and re-reads behind it.
+- **When the re-read lands with something different** (a usage dot, a new account), the bot edits the same message. A tap on the menu before then cancels that edit, so a switch in progress is never overwritten.
+
+Harness: `test/dive6867-account-switch.test.ts` (+5 arms: settle() with and without a re-read, a failing re-read, a days-old value served at once, the follow-up wiring and its tap guard).
+
 ### Fixed — telegram 0.5.116: an agent's choice buttons come with its own pick (DIVE-6963)
 
 lodar, 2026-10-26: *"some of the agents dont give their recs now when they give option button to pick from"*. Since 0.5.112 told agents a numbered list becomes tap buttons, many ended a question on a bare list.

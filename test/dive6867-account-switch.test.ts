@@ -115,6 +115,22 @@ describe('server.ts wiring', () => {
     const start = body('onStart: info => {', 'BotFather menu reflects')
     expect(start).toContain('buildAccountMenu(me)')
   })
+  test('/account shows the last menu at once and edits it when the reads land (DIVE-6985)', () => {
+    expect(SERVER).toContain('const MENU_STALE_MS = Number.POSITIVE_INFINITY')
+    const cmd = body('  account: async ctx => {', '\n  },\n')
+    expect(cmd).toContain('accountMenuFollowUp(me, lang, sent.chat.id, sent.message_id, menu)')
+    const follow = body('async function accountMenuFollowUp(', '\n}\n')
+    expect(follow).toContain('await menuSettled(me)')
+    expect(follow).toContain('render(next) === render(shown)')
+    expect(follow).toContain('!MENU_FOLLOW_UPS.has(key)')
+    const settled = body('async function menuSettled(', '\n}\n')
+    for (const r of ['agents', 'accounts', 'usage']) expect(settled).toContain(`menuReads.${r}.settle()`)
+    expect(settled).toContain('menuReads.rotation.get(me)?.settle()')
+  })
+  test('a tap on the picker cancels its pending follow-up edit', () => {
+    const tap = body("bot.on('callback_query:data', async ctx => {", 'const access = loadAccess()')
+    expect(tap).toContain('MENU_FOLLOW_UPS.delete(`${tapped.chat.id}:${tapped.message_id}`)')
+  })
   test('a rotation write clears the picker cache', () => {
     const w = body('async function write5diveRotation(', '\n}\n')
     expect(w).toContain('menuReads.rotation.get(me)?.clear()')
@@ -163,6 +179,36 @@ describe('the picker read cache', () => {
     const x = rig()
     await Promise.all([x.r.get(), x.r.get(), x.r.get()])
     expect(x.calls()).toBe(1)
+  })
+  test('settle() is false with nothing in flight, true once a background re-read lands (DIVE-6985)', async () => {
+    const x = rig()
+    expect(await x.r.settle()).toBe(false)
+    await x.r.get()
+    expect(await x.r.settle()).toBe(false)
+    x.set('v2'); x.tick(100)
+    expect(await x.r.get()).toBe('v1')
+    expect(await x.r.settle()).toBe(true)
+    expect(await x.r.get()).toBe('v2')
+  })
+  test('settle() never rejects when the re-read throws', async () => {
+    let t = 0
+    let calls = 0
+    const r = createSwrRead(async () => { if (++calls > 1) throw new Error('cli down'); return 'v1' }, { freshMs: 30, maxStaleMs: Number.POSITIVE_INFINITY, now: () => t })
+    await r.get()
+    t += 100
+    expect(await r.get()).toBe('v1')
+    expect(await r.settle()).toBe(true)
+    expect(await r.get()).toBe('v1')
+  })
+  test('with no age limit, a value days old is still served at once (DIVE-6985)', async () => {
+    let t = 0
+    let calls = 0
+    const r = createSwrRead(async () => `v${++calls}`, { freshMs: 30, maxStaleMs: Number.POSITIVE_INFINITY, now: () => t })
+    expect(await r.get()).toBe('v1')
+    t += 3 * 24 * 3_600_000
+    expect(await r.get()).toBe('v1')
+    expect(await r.settle()).toBe(true)
+    expect(await r.get()).toBe('v2')
   })
   test('clear() makes the next get read again, and a read in flight does not land after it', async () => {
     let release!: (v: string) => void
