@@ -94,6 +94,12 @@ PY
     || { echo "FAIL: could not commit the harness tree" >&2; exit 1; }
 fi
 
+# Build the bundle once, before any harness: about a third of these grade ./5dive
+# end to end and refuse to run without it. Leaving it to whichever harness happens
+# to run ./build.sh first made a shard order-dependent (core CI's DIVE-2525).
+( cd "$TREE" && ./build.sh >/dev/null 2>"$TREE.build.err" ) \
+  || { echo "FAIL: ./build.sh in the harness tree: $(tail -3 "$TREE.build.err")" >&2; exit 1; }
+
 if (( ${#names[@]} == 0 )); then
   while IFS= read -r h; do names+=("$(basename "$h" .sh)"); done < <(ls "$HARNESS_DIR"/*.sh | sort)
 fi
