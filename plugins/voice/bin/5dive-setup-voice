@@ -90,10 +90,73 @@ WHISPER_SERVICE_BIN="${WHISPER_SERVICE_BIN:-/usr/local/bin/whisper-service}"
 PAYLOAD_DIR="${PAYLOAD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)}"
 
 B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; X=$'\e[0m'
-say()  { printf '\n%s== %s ==%s\n\n' "$B" "$*" "$X"; }
-ok()   { printf '%s✓ %s%s\n' "$G" "$*" "$X"; }
-warn() { printf '%s! %s%s\n' "$Y" "$*" "$X"; }
-die()  { printf '%s✗ %s%s\n' "$R" "$*" "$X" >&2; exit 1; }
+say()  { printf '\n%s== %s ==%s\n\n' "$B" "$*" "$X"; [[ -z "${QUIET:-}" ]] || quiet_step "$*"; }
+ok()   { printf '%s✓ %s%s\n' "$G" "$*" "$X"; [[ -z "${QUIET:-}" ]] || LAST_OK="$*"; }
+warn() { printf '%s! %s%s\n' "$Y" "$*" "$X"; [[ -z "${QUIET:-}" ]] || quiet_line 3 "${TY}!" "$*"; }
+die()  { printf '%s✗ %s%s\n' "$R" "$*" "$X" >&2; [[ -z "${QUIET:-}" ]] || { DIED=1; quiet_line 4 "${TR}✗" "$*"; }; exit 1; }
+
+# ---- quiet by default (DIVE-7034) ------------------------------------------
+#
+# A full run printed ~950 lines (apt's and dpkg's own output, mostly) for what
+# is six steps to the person who pasted the line. So the terminal gets one line
+# per step and the result; every byte the steps and the programs they run print
+# goes to $VOICE_SETUP_LOG instead, and --verbose (or VOICE_SETUP_VERBOSE=1)
+# prints all of it as before. A failure is never quiet: the error, and the last
+# lines of the log that led to it, go to the terminal in full.
+#
+# fd 3 and 4 are the terminal's stdout and stderr once stdout/stderr point at
+# the log. The one-line helpers above only reach for them when QUIET is set, so
+# a test that evals them on their own runs exactly as before.
+VOICE_SETUP_LOG="${VOICE_SETUP_LOG:-/var/log/5dive-voice-setup.log}"
+QUIET=""; STEP=""; LAST_OK=""; OPEN=0; DIED=0
+TG=""; TY=""; TR=""; TX=""
+
+# quiet_step <title> — end the previous step's line and start this one's.
+quiet_step() {
+  quiet_close
+  STEP="$1"; LAST_OK=""
+  printf '%s … ' "$1" >&3
+  OPEN=1
+}
+# quiet_close — finish the open step line with what the step reported. A step
+# that warned has already said how it ended, on its own line.
+quiet_close() {
+  (( OPEN )) || return 0
+  printf '%s✓%s %s\n' "$TG" "$TX" "${LAST_OK:-done}" >&3
+  OPEN=0
+}
+# quiet_line <fd> <mark> <text> — a warning or an error, on its own line.
+quiet_line() {
+  if (( OPEN )); then printf '\n' >&3; OPEN=0; fi
+  printf '%s%s %s\n' "$2" "$TX" "$3" >&"$1"
+}
+quiet_start() {
+  local cmd="$1"
+  mkdir -p "$(dirname "$VOICE_SETUP_LOG")" 2>/dev/null || true
+  # No log to write to is no reason to fail the install: print it all instead.
+  { touch "$VOICE_SETUP_LOG" && chmod 640 "$VOICE_SETUP_LOG"; } 2>/dev/null || return 0
+  exec 3>&1 4>&2
+  if [[ -t 3 && -z "${NO_COLOR:-}" ]]; then TG="$G"; TY="$Y"; TR="$R"; TX="$X"; fi
+  exec >>"$VOICE_SETUP_LOG" 2>&1
+  B=""; G=""; Y=""; R=""; X=""
+  printf '\n===== %s  5dive voice setup %s =====\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$cmd"
+  QUIET=1
+  trap quiet_exit EXIT
+  if [[ "$cmd" == all ]]; then
+    printf 'Setting up voice. This takes a few minutes; the details go to %s\n' "$VOICE_SETUP_LOG" >&3
+  fi
+}
+quiet_exit() {
+  local rc=$?
+  # A trap runs under set -e too, so no `a && b` here: a false `a` would end it.
+  if (( rc == 0 )); then quiet_close; return 0; fi
+  if (( OPEN )); then printf '\n' >&3; OPEN=0; fi
+  if (( ! DIED )); then
+    printf '%s✗%s %s failed (exit %s). The end of its log:\n' "$TR" "$TX" "${STEP:-voice setup}" "$rc" >&4
+    tail -n 25 "$VOICE_SETUP_LOG" | sed 's/^/    /' >&4
+  fi
+  printf 'Full log: %s   (or run it again with --verbose)\n' "$VOICE_SETUP_LOG" >&4
+}
 
 # payload <name> — the path of a shipped payload, or a refusal that names it.
 #
@@ -539,7 +602,7 @@ EOF
 
 usage() {
   cat <<'USAGE'
-Usage: sudo 5dive voice setup [all|apt|pip|service|wrapper|state|claudemd]
+Usage: sudo 5dive voice setup [all|apt|pip|service|wrapper|state|claudemd] [--verbose]
 
   all       (default) Run all six steps in order
   apt       Install ffmpeg
@@ -549,6 +612,9 @@ Usage: sudo 5dive voice setup [all|apt|pip|service|wrapper|state|claudemd]
   model     Load the hearing model the owner chose (or the box's default) now
   state     Create the backend state dir and seed it with backend=local
   claudemd  Append Voice section to /home/claude/projects/CLAUDE.md
+
+Prints one line per step. Everything else goes to /var/log/5dive-voice-setup.log;
+--verbose prints all of it here instead. An error is always printed in full.
 
 The backend stays `local` unless you change it:  sudo 5dive voice backend openrouter
 `openrouter` sends audio AND reply text off the box, and needs a key in
@@ -561,11 +627,21 @@ USAGE
 }
 
 main() {
-  local cmd="${1:-all}"
+  local cmd="" verbose="${VOICE_SETUP_VERBOSE:-}" a
+  for a in "$@"; do
+    case "$a" in
+      -h|--help|help) usage; return ;;
+      -v|--verbose)   verbose=1 ;;
+      *)              [[ -n "$cmd" ]] || cmd="$a" ;;
+    esac
+  done
+  cmd="${cmd:-all}"
   case "$cmd" in
-    -h|--help|help) usage; return ;;
+    all|apt|pip|service|wrapper|model|state|claudemd) ;;
+    *) usage; exit 1 ;;
   esac
   require_root
+  [[ -n "$verbose" ]] || quiet_start "$cmd"
   # Fail on an incomplete plugin tree BEFORE the first apt install, not in the
   # middle of step 4 with a service already enabled.
   local p
@@ -581,8 +657,11 @@ main() {
     state)    step_state ;;
     claudemd) step_claudemd ;;
     all)      step_apt; step_pip; step_service; step_wrapper; step_state; step_claudemd ;;
-    *)        usage; exit 1 ;;
   esac
+  if [[ -n "$QUIET" ]]; then
+    quiet_close
+    [[ "$cmd" != all ]] || printf 'Voice is set up. Check it any time:  5dive voice\n' >&3
+  fi
 }
 
 main "$@"
