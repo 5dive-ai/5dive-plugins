@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Changed — voice 1.11.1: setup prints one line per step; no Telegram token on the consent screen (DIVE-7034)
+
+On a fresh self-host box `sudo 5dive voice setup` ran 104 s and printed 956 lines, and `plugin add` listed "your Telegram bot token" on a box with no Telegram.
+
+- **One line per step and the result.** Everything apt, pip and systemd print goes to `/var/log/5dive-voice-setup.log`; `--verbose` (or `VOICE_SETUP_VERBOSE=1`) prints it all as before. A failing step prints its error and the end of the log; no colour codes off a terminal.
+- **The `telegram-token` grant is gone.** Voice never read one: the telegram plugin downloads the note.
+
+Mirror of 5dive-ai/5dive-voice `voice/`, byte for byte. Harness: that repo's `tests/quiet-setup.test.sh`.
+
 ### Changed — devteam 0.2.0: the dev-team tools live here now, the core keeps no copy (DIVE-6938)
 
 Phase 2 of DIVE-6935. 5dive 0.103 deletes its copies of PR delivery, graders, gate evidence, proof badges and the gh/push/deploy rails; this plugin's `core/` is the code.
