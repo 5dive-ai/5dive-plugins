@@ -9,6 +9,16 @@ Phase 2 of DIVE-6935. 5dive 0.103 deletes its copies of PR delivery, graders, ga
 - **The harnesses came too:** 108 files in `tests/devteam/` (102 moved, 6 copied whole from core harnesses that keep their core arms), unchanged, run by `tests/devteam_core_harnesses.sh --core=<5dive checkout>`, which puts these files back where the core kept them. New workflow `devteam-core.yml` runs them against 5dive's main; 5dive's CI runs them against each of its pull requests.
 - `tests/devteam_core_unit.sh`: `--refresh` (recopy from the core) is gone with the core copies; `--rehash` rewrites SOURCE after an edit. New arms: no `_pace_*` or meter function in grader_pool.sh, no function defined by two modules.
 
+### Changed — telegram 0.5.121: the agent's pick carries a ⭐ on its button (DIVE-7032)
+
+lodar, 2026-10-26 14:48Z: *"(my pick) should we marked in the options just like we do for human gates"* … *"put same star?"*. Since DIVE-6963 the line before a choice names the agent's pick, but the buttons themselves carried no mark, so on the keyboard alone he could not tell which one was the recommendation. Gate keyboards already star theirs.
+
+- **The rule asks for the star.** The pick's line starts with ⭐ (`1. ⭐ Your own 5dive server`); with no preference, no star. Same text in the default and lite blocks (+ dashboard 0.5.11 copy), the notify-user skill and the agy/codex/grok AGENTS.md.
+- **The bridge keeps it on that button** (`1) ⭐ Your own 5dive server`). `parseOptions()` cuts the star from the label, so the tapped answer comes back without it and the star never counts toward the 90-character limit. A star before the marker (`⭐ 1. …`) counts too. At most one per keyboard: a second star is dropped.
+- **Same `tna.ts` and keyboard line in every bridge:** telegram-agy 0.5.27, telegram-codex 0.5.40, telegram-grok 0.5.27, telegram-opencode 0.5.16, telegram-pi 0.1.16.
+
+Harness: `test/dive7032-pick-star.test.ts`.
+
 ### Fixed — telegram 0.5.120: a numbered choice gets its buttons when the pick line has no '?' (DIVE-6995)
 
 lodar, 2026-10-26, forwarding a partner agent's 07:00Z message: *"no buttons - to approve agents plan - so it will be lost most likely and forgotten"*. Since DIVE-6963 the line before a choice names the agent's own pick. That agent wrote it in Russian as a statement («Советую …»), with no '?' and none of the English cue words, so three numbered options went out as plain text.

@@ -111,13 +111,16 @@ describe('no profile set = the plugin as it is today', () => {
     // DIVE-6963 (0.5.116) added one sentence on purpose: the line before a
     // choice list names the agent's pick, listed first. 0.5.115's block was
     // 12d86bc2ac5b7d15f86fb253ea4d5e7f1da2d66ab6bf38cb59f5250e695e1caa.
+    // DIVE-7032 (0.5.121) changed that sentence on purpose: the pick's line
+    // starts with ⭐ so its button carries the star. 0.5.120's block was
+    // f139fdec3ad1314b4abc4a5dfc12abbf7956dacd4db3dbcb1c828f10df0fdcdd.
     const lines = SERVER.split('\n')
     const start = lines.indexOf('    instructions: [')
     const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
     expect(start).toBeGreaterThan(0)
     expect(end).toBeGreaterThan(start)
     const block = lines.slice(start + 1, end).join('\n') + '\n'
-    expect(sha(block)).toBe('f139fdec3ad1314b4abc4a5dfc12abbf7956dacd4db3dbcb1c828f10df0fdcdd')
+    expect(sha(block)).toBe('0bf939d16ec0cfe418e21a72216fd1974ab204d85db221b8e90ac4384d1d35e1')
     // The lite block is a LATER key that only exists when LITE is true.
     expect(lines[end]).toBe("    ].join('\\n'),")
     expect(lines.slice(end + 1, end + 5).join('\n')).toContain('...(LITE ? { instructions: LITE_INSTRUCTIONS } : {}),')
