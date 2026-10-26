@@ -37,7 +37,10 @@ bad_()  { FAIL=$((FAIL+1)); printf 'FAIL %s — %s\n' "$1" "${2:-}"; }
 # ── ARM 1 (structural): the ONLY call site is the system funnel ───────────────
 # Body of _task_route_to_verifier = from its definition to the next line that is
 # a bare `}` in column 1.
-fn_body=$(awk '/^_task_route_to_verifier\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$SRC/task/delivery.sh")
+# The hand-off is in task/delivery.sh on a core before DIVE-6938 and in the
+# core's task/status.sh after it; read whichever carries it.
+fn_body=$(cat "$SRC/task/delivery.sh" "$SRC/task/status.sh" 2>/dev/null \
+  | awk '/^_task_route_to_verifier\(\) \{/{f=1} f{print} f&&/^\}$/{exit}')
 if [[ -z "$fn_body" ]]; then
   bad_ 'arm1: located _task_route_to_verifier' 'could not extract the function body'
 else

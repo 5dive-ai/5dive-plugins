@@ -194,9 +194,11 @@ r=$(sq "SELECT status||'|'||COALESCE(outcome,'')||'|'||CASE WHEN ended_at IS NUL
 # than to this author's memory of it. If the reject rail ever stops closing
 # `completed verifier_rejected`, this arm says so instead of R1 passing against a
 # fixture that no longer describes the product.
-grep -q '_run_close_for_task "\$id" completed verifier_rejected' src/task/delivery.sh \
+# `task reject` is in task/delivery.sh on a core before DIVE-6938 and in the core's
+# task/status.sh after it.
+grep -qs '_run_close_for_task "\$id" completed verifier_rejected' src/task/delivery.sh src/task/status.sh \
   && ok_ 'R2: the reject rail this fixture models still closes the run completed/verifier_rejected' \
-  || bad_ 'R2 reject rail contract' 'src/task/delivery.sh no longer closes a rejection completed/verifier_rejected'
+  || bad_ 'R2 reject rail contract' 'neither src/task/delivery.sh nor src/task/status.sh closes a rejection completed/verifier_rejected'
 
 # ══ THE READER. The arms above assert what was WRITTEN; this is the question the
 # row was filed on — does the fleet's own metric COUNT it? ══
