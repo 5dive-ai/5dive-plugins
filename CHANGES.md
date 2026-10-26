@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Fixed — telegram 0.5.117: /account opens at once, even after a quiet spell (DIVE-6985)
+### Fixed — telegram 0.5.118: /account opens at once, even after a quiet spell (DIVE-6985)
 
 lodar, 2026-10-26: *"slash account on this box from telegtam takes almos 10s to get the response"*. The picker's cache (0.5.113) only covered ten minutes, so the first tap after that waited for four CLI runs again.
 
@@ -8,6 +8,16 @@ lodar, 2026-10-26: *"slash account on this box from telegtam takes almos 10s to 
 - **When the re-read lands with something different** (a usage dot, a new account), the bot edits the same message. A tap on the menu before then cancels that edit, so a switch in progress is never overwritten.
 
 Harness: `test/dive6867-account-switch.test.ts` (+5 arms: settle() with and without a re-read, a failing re-read, a days-old value served at once, the follow-up wiring and its tap guard).
+
+### Fixed — telegram 0.5.117, dashboard 0.5.10: an agent whose AI credit ran out says so instead of going silent (DIVE-6979)
+
+lodar, 2026-10-26: *"did the oino ai pack return error for client on the chats when it openrouter balance is empty or agent stays silent without a reason?"* Silent: neither StopFailure hook had a class for an empty balance, so the OpenRouter 402s seen on 2026-10-24 fell through. The web chat only stopped showing "typing"; a partner client on Telegram was told "try again in a minute".
+
+- **An empty balance is its own kind** (`classifyFailure().isOutOfCredit`): a 402, "requires at least $0.50 in balance", "exceed your available credits", "requires more credits", "credit balance is too low", Claude Code's `billing_error`. It wins over a `rate_limit` word in the same payload, so it is never read as a usage limit with a reset time, and no resume helper starts: only a top-up clears it. Those phrases count only in the hook payload; the pane is conversation too, so it counts only through Claude Code's own `API Error: 402` status line at line start, and a pane-only hit never overrides a usage limit the payload reports.
+- **One plain line per episode**, in the chat's language. A partner client (lite): «У меня закончился баланс ИИ. Команде уже сообщили — отвечу, как только его пополнят.» Anyone else is the box owner, who pays for the account: "Top up the AI account I run on and I'll answer." On Telegram the owner is told on an autonomous turn too, since nothing resumes until they act. The raw 402 goes to the box's ops log, not the chat.
+- **A partner client's own used-up allowance keeps its limit line.** A 402 on a partner box can be the box key's own cap; a positive read of a used-up cap (`GET /api/v1/key`) still sends the allowance text with its reset day and account button.
+
+Harness: `test/dive6979-out-of-credit.test.ts` (17 arms: each live text, `billing_error`, the 402 as drawn on the pane, 4 negative controls on the class incl. credit words in pane prose beside a real usage limit; both real hooks, with dedup, no-helper and a usage-limit control on each).
 
 ### Fixed — telegram 0.5.116: an agent's choice buttons come with its own pick (DIVE-6963)
 

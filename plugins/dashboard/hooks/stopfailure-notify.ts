@@ -13,6 +13,8 @@
 //      this session → ONE notice in that chat per episode (own stamp, so Telegram
 //      and the dashboard each get exactly one), sent by the dashboard server
 //      from the notice outbox.
+//      DIVE-6979: an empty AI balance gets its own notice the same way, and no
+//      recovery: retrying cannot clear it, only a top-up does.
 //   2. Recovery: when the seat ALSO runs the telegram plugin, its hook owns the
 //      resume (one helper per pane, one lock). Otherwise this hook takes the same
 //      lock and runs the same helper, telling it to answer the waiting message.
@@ -31,6 +33,8 @@ import { classifyFailure, failureMessage, resolveResetEpoch } from './lib/failur
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import { resumeLogDir, tryAcquireResumeLock } from './lib/resume-lock'
 import { answeredAfter, dashboardStateDir, lastDashboardInbound, noticeLang, noticeText, signalTurnEnded, writeNotice } from './lib/dashboard-chat'
+import { textLang } from './lib/terms'
+import { isLite, liteLimitText, readAllowance, readLiteLang, recordOpsDetail } from './lib/lite'
 import type { HookPayload } from './lib/types'
 
 const log = (s: string) => console.error(`[dashboard-stopfailure] ${s}`)
@@ -42,11 +46,17 @@ const raw = JSON.stringify(payload)
 const msg = failureMessage(payload)
 const pane = capturePane()
 const kind = classifyFailure(payload, raw, pane)
-if (!kind.isRateLimit && !kind.isTransientApiError) {
-  log('not a usage limit or a transient error — nothing to do here')
+if (!kind.isRateLimit && !kind.isTransientApiError && !kind.isOutOfCredit) {
+  log('not a usage limit, a transient error or an empty balance — nothing to do here')
   process.exit(0)
 }
-const noticeKind = kind.isRateLimit ? 'ratelimit' : 'transient'
+const noticeKind = kind.isOutOfCredit ? 'credit' : kind.isRateLimit ? 'ratelimit' : 'transient'
+// DIVE-6979: on a partner box a 402 can be the client's own used-up allowance
+// (the box key's cap, DIVE-5111); that one keeps the limit line, as Telegram's does.
+const lite = isLite()
+const allowance = lite && kind.isOutOfCredit ? await readAllowance() : null
+const ownCapUsedUp = allowance?.kind === 'capped' && allowance.pctLeft === 0
+if (lite && kind.isOutOfCredit) recordOpsDetail('stopfailure', `out of AI credit: ${msg}`)
 
 const transcriptPath = payload.transcript_path
 const first = transcriptPath ? readEntries(transcriptPath) : []
@@ -73,7 +83,12 @@ log(`${noticeKind} dedup: ${claim.send ? 'SEND' : 'suppress'} (${claim.reason}) 
 if (claim.send) {
   pruneStaleNotifyStamps(stampDir, Date.now())
   if (inbound) {
-    const file = writeNotice(inbound.chatId, noticeText(noticeKind, resetEpoch, Math.floor(Date.now() / 1000), noticeLang(inbound)))
+    // The language they wrote in; else, on a partner box, the client's.
+    const lang = lite ? (textLang(inbound.text) ?? readLiteLang()) : noticeLang(inbound)
+    const text = ownCapUsedUp && allowance
+      ? liteLimitText(lang, allowance)
+      : noticeText(noticeKind, resetEpoch, Math.floor(Date.now() / 1000), lang, lite)
+    const file = writeNotice(inbound.chatId, text)
     log(`notice queued ${file}`)
   } else {
     log('no web-chat message this session — no notice')
@@ -81,6 +96,10 @@ if (claim.send) {
 }
 
 // --- 2. recovery --------------------------------------------------------------
+if (kind.isOutOfCredit) {
+  log('out of AI credit — nothing to resume until it is topped up')
+  process.exit(0)
+}
 if (!tmuxCtx) {
   log('no tmux pane — nothing to resume')
   process.exit(0)
