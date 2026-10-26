@@ -15,6 +15,12 @@
 // something `keep` refuses (null: the CLI could not be read) is never cached, so
 // a failure is retried on the next tap instead of being remembered.
 //
+// DIVE-6985: past maxStaleMs the tap still waited, so the first /account after
+// ten idle minutes paid the whole cold path (~3s calm, ~10s loaded). The picker
+// now passes maxStaleMs: Infinity — any last answer is shown at once — and
+// settle() tells it when the re-read behind that answer has landed, so it can
+// edit the message it sent.
+//
 // Pure (takes its clock), so the suite drives it without importing server.ts,
 // which long-polls Telegram on import.
 
@@ -23,6 +29,8 @@ export type SwrRead<T> = {
   get(): Promise<T>
   /** Drop the cached value: the next get() waits for a fresh read. */
   clear(): void
+  /** Resolves once the read in flight (if any) is done: true if there was one. Never rejects. */
+  settle(): Promise<boolean>
 }
 
 export function createSwrRead<T>(
@@ -63,6 +71,9 @@ export function createSwrRead<T>(
       cached = null
       inflight = null
       gen++
+    },
+    settle() {
+      return inflight ? inflight.then(() => true, () => true) : Promise.resolve(false)
     },
   }
 }

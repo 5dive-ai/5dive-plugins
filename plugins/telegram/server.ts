@@ -2922,8 +2922,12 @@ async function read5diveRotation(me: string): Promise<FiveDiveRotation | null> {
 // read fresh. The bound account moves only with a restart of this process, so a
 // cached `agent list` cannot show the wrong current account; a rotation write
 // clears its cache below so "‹ Back to accounts" shows the new state.
+// DIVE-6985: no age limit on what the picker shows first. A tap after ten idle
+// minutes used to wait for all four reads (~3s on a calm box, ~10s loaded);
+// now it shows the last menu at once and accountMenuFollowUp edits the message
+// when the re-read lands with something different.
 const MENU_FRESH_MS = 30_000
-const MENU_STALE_MS = 10 * 60_000
+const MENU_STALE_MS = Number.POSITIVE_INFINITY
 const menuReads = {
   agents: createSwrRead(read5diveAgentList, { freshMs: MENU_FRESH_MS, maxStaleMs: MENU_STALE_MS }),
   accounts: createSwrRead(read5diveAccountList, { freshMs: MENU_FRESH_MS, maxStaleMs: MENU_STALE_MS }),
@@ -2934,6 +2938,47 @@ function menuRotation(me: string): Promise<FiveDiveRotation | null> {
   let r = menuReads.rotation.get(me)
   if (!r) menuReads.rotation.set(me, r = createSwrRead(() => read5diveRotation(me), { freshMs: MENU_FRESH_MS, maxStaleMs: MENU_STALE_MS }))
   return r.get()
+}
+
+// DIVE-6985: true once every picker read that was re-reading has landed, and at
+// least one was (so the menu just shown may be out of date).
+async function menuSettled(me: string): Promise<boolean> {
+  const done = await Promise.all([
+    menuReads.agents.settle(),
+    menuReads.accounts.settle(),
+    menuReads.usage.settle(),
+    menuReads.rotation.get(me)?.settle() ?? Promise.resolve(false),
+  ])
+  return done.some(Boolean)
+}
+
+// Picker messages still waiting for their follow-up edit, by "<chat>:<message>".
+// Any tap on one removes it: the tap's own edit (a switch, the rotation
+// submenu) must never be overwritten by the menu it replaced.
+const MENU_FOLLOW_UPS = new Set<string>()
+
+// DIVE-6985: /account answered from the last known menu. When the reads behind
+// it land, render again and edit the sent message if anything changed.
+async function accountMenuFollowUp(
+  me: string,
+  lang: Lang,
+  chatId: number | string,
+  messageId: number,
+  shown: Awaited<ReturnType<typeof buildAccountMenu>>,
+): Promise<void> {
+  const key = `${chatId}:${messageId}`
+  MENU_FOLLOW_UPS.add(key)
+  try {
+    if (!(await menuSettled(me))) return
+    const next = await buildAccountMenu(me, lang)
+    const render = (m: typeof next): string =>
+      'error' in m ? m.error : JSON.stringify([m.text, m.keyboard?.inline_keyboard ?? null])
+    if (render(next) === render(shown) || !MENU_FOLLOW_UPS.has(key)) return
+    if ('error' in next) await bot.api.editMessageText(chatId, messageId, next.error)
+    else await bot.api.editMessageText(chatId, messageId, next.text, next.keyboard ? { reply_markup: next.keyboard } : {})
+  } finally {
+    MENU_FOLLOW_UPS.delete(key)
+  }
 }
 
 // Write the rotation config via `agent rotation set`. accountsArg is passed to
@@ -4535,12 +4580,12 @@ const commandHandlers: Record<string, CommandHandler> = {
       await ctx.reply(`Can't determine this agent's name (not running as agent-* user).`)
       return
     }
-    const menu = await buildAccountMenu(me, liteLang(ctx.from?.language_code))
-    if ('error' in menu) {
-      await ctx.reply(menu.error)
-      return
-    }
-    await ctx.reply(menu.text, menu.keyboard ? { reply_markup: menu.keyboard } : {})
+    const lang = liteLang(ctx.from?.language_code)
+    const menu = await buildAccountMenu(me, lang)
+    const sent = 'error' in menu
+      ? await ctx.reply(menu.error)
+      : await ctx.reply(menu.text, menu.keyboard ? { reply_markup: menu.keyboard } : {})
+    void accountMenuFollowUp(me, lang, sent.chat.id, sent.message_id, menu).catch(() => {})
   },
 
   // /usage — the full Anthropic 5h/1w limit board across every account (the
@@ -5894,6 +5939,8 @@ function relayButtonTap(ctx: Context, value: string, fallbackButton: string, wha
 
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+  const tapped = ctx.callbackQuery.message
+  if (tapped) MENU_FOLLOW_UPS.delete(`${tapped.chat.id}:${tapped.message_id}`)
   const access = loadAccess()
   const senderId = String(ctx.from.id)
   if (!access.allowFrom.includes(senderId)) {

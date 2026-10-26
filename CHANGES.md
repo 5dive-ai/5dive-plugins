@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.119: /account opens at once, even after a quiet spell (DIVE-6985)
+
+lodar, 2026-10-26: *"slash account on this box from telegtam takes almos 10s to get the response"*. The picker's cache (0.5.113) only covered ten minutes, so the first tap after that waited for four CLI runs again.
+
+- **The picker shows the last menu it built straight away**, whatever its age, and re-reads behind it.
+- **When the re-read lands with something different** (a usage dot, a new account), the bot edits the same message. A tap on the menu before then cancels that edit, so a switch in progress is never overwritten.
+
+Harness: `test/dive6867-account-switch.test.ts` (+5 arms: settle() with and without a re-read, a failing re-read, a days-old value served at once, the follow-up wiring and its tap guard).
+
 ### Fixed — telegram 0.5.118: a yes/no question that quotes another question gets its buttons (DIVE-6988)
 
 lodar, 2026-10-26: *"why no buttons on telegram if there was a question?"* main's 05:38Z reply quoted "what should Olivia do first?" and ended on "Want dev2 to mock that order?". The Yes/No detector needed exactly one '?' in the whole message, so it saw two questions and sent no buttons; lodar skimmed past it and the mock started 40 minutes late.
