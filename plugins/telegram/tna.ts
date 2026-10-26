@@ -158,7 +158,15 @@ export interface ParsedOption { marker: string; label: string }
 export const OPT_RE = /^opt:(\d+)$/
 
 const OPTION_LINE_RE = /^\s*(?:[-*>•]\s*)?([a-zA-Z]|\d{1,2})[).]\s+(\S.*?)\s*$/
-const CHOICE_CUE_RE = /\?|\b(choose|choices?|pick|select|which|option|options|prefer|either)\b/i
+const CHOICE_CUE_RE = /\?|\b(choose|choices?|pick|select|which|option|options|prefer|either|recommend\w*|suggest\w*|go with)\b/i
+// DIVE-6995: the pick line counts as a cue, in Russian too. Since DIVE-6963 the
+// line before the list names the agent's own pick, often a statement with no '?'
+// («Советую первый.» / "I recommend the first."), and a partner agent's 3-option choice to
+// lodar went out as plain text. Russian words end on the not-a-letter lookahead
+// DIVE-6859 uses, because JS `\b` is ASCII-only. A step list with none of these
+// words still gets no buttons.
+const CHOICE_CUE_RU_RE = /(?<![\p{L}\p{N}])(совет\p{L}*|рекоменд\p{L}*|предлага\p{L}*|предлож\p{L}*|выб[иое]р\p{L}*|выбра\p{L}*|вариант\p{L}*|какой|какая|какое|какие|какую)(?![\p{L}\p{N}])/iu
+const hasChoiceCue = (text: string): boolean => CHOICE_CUE_RE.test(text) || CHOICE_CUE_RU_RE.test(text)
 const MAX_OPTION_LABEL = 90
 
 // Parse the raw option lines (no cue gate) — exported for the tap-side resolve.
@@ -185,7 +193,7 @@ export function parseOptions(text: string): ParsedOption[] {
 export function optionChoices(text: string): ParsedOption[] {
   const opts = parseOptions(text)
   if (!opts.length) return []
-  return CHOICE_CUE_RE.test(text ?? '') ? opts : []
+  return hasChoiceCue(text ?? '') ? opts : []
 }
 
 // DIVE-332 / DIVE-1429: pure core of the Yes/No detector (sibling of optionChoices).
