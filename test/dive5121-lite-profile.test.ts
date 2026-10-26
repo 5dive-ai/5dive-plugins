@@ -108,13 +108,16 @@ describe('no profile set = the plugin as it is today', () => {
     // DIVE-6930 (0.5.115) added one sentence on purpose: the owner asks to let
     // someone write, the agent calls access_request, and only the tap applies.
     // 0.5.114's block was 3bafe41a8c0a522e2e1a17bd2edfcc7fef20c91403ec0c68190cb08be4a2351b.
+    // DIVE-6963 (0.5.116) added one sentence on purpose: the line before a
+    // choice list names the agent's pick, listed first. 0.5.115's block was
+    // 12d86bc2ac5b7d15f86fb253ea4d5e7f1da2d66ab6bf38cb59f5250e695e1caa.
     const lines = SERVER.split('\n')
     const start = lines.indexOf('    instructions: [')
     const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
     expect(start).toBeGreaterThan(0)
     expect(end).toBeGreaterThan(start)
     const block = lines.slice(start + 1, end).join('\n') + '\n'
-    expect(sha(block)).toBe('12d86bc2ac5b7d15f86fb253ea4d5e7f1da2d66ab6bf38cb59f5250e695e1caa')
+    expect(sha(block)).toBe('f139fdec3ad1314b4abc4a5dfc12abbf7956dacd4db3dbcb1c828f10df0fdcdd')
     // The lite block is a LATER key that only exists when LITE is true.
     expect(lines[end]).toBe("    ].join('\\n'),")
     expect(lines.slice(end + 1, end + 5).join('\n')).toContain('...(LITE ? { instructions: LITE_INSTRUCTIONS } : {}),')

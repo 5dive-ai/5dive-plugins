@@ -54,20 +54,20 @@ haven't read (attaching distributes it).
 
 ## Presenting choices
 
-Use Telegram inline-keyboard buttons, not a numbered list. The `reply`
-MCP tool sends text and file attachments (see above) but **not** inline
-keyboards — for buttons, hit the Bot API directly:
+End the message with a numbered list, one short line per answer (2 to 8,
+each under 90 characters): the bridge turns each line into a tap button.
+**Name your pick first.** The line before the list says which answer you
+would choose and why, in a few words, and that answer is listed first.
+Only when it is purely their taste, say you have no preference. A bare
+list of buttons leaves them to decide alone.
 
-```bash
-CHAT_ID=$(jq -r '.allowFrom[0]' ~/.claude/channels/telegram/access.json)
-curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-  -d chat_id="${CHAT_ID}" \
-  -d text="Pick one:" \
-  --data-urlencode reply_markup='{"inline_keyboard":[[{"text":"Option A","callback_data":"a"},{"text":"Option B","callback_data":"b"}]]}'
+```
+I'd go with the landing page: it is live in a day.
+1. Landing page
+2. Telegram bot
 ```
 
-`TELEGRAM_BOT_TOKEN` is in the systemd unit's env; `CHAT_ID` is the first
-entry of `allowFrom` in `access.json`.
+A single yes/no question at the end gets Yes/No buttons by itself.
 
 ## Delegating to another agent
 

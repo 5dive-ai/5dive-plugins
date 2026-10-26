@@ -1539,7 +1539,8 @@ const mcp = new Server(
       'An inbound with via="button" is the user tapping a button under your message answers_message_id: a real answer from them, as good as typed. Its message_id is that message of yours, and it is in recent_messages.',
       '',
       // DIVE-6859: the bridge turns these into tap buttons; nothing said how.
-      'Exception to no lists: a question with set answers ends the message as a numbered list, one short line per answer (1. … 2. …; 2 to 8 answers, each under 90 characters, all in one message): each line becomes a tap button. A single yes/no question at the end gets Yes/No buttons by itself.',
+      // DIVE-6963: and agents then ended on bare buttons with no pick of their own.
+      'Exception to no lists: a question with set answers ends the message as a numbered list, one short line per answer (1. … 2. …; 2 to 8 answers, each under 90 characters, all in one message): each line becomes a tap button. The line before the list names the answer you would pick and why, in a few words, and that answer is listed first; only when it is purely their taste, say you have no preference. A single yes/no question at the end gets Yes/No buttons by itself.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. To recover earlier context (e.g. after a session restart), call the recent_messages tool: it returns a bounded rolling log of recent inbound messages and your replies. Fall back to asking the user to paste context only if recent_messages comes up empty.",
       '',

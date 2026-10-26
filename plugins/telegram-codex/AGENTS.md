@@ -55,6 +55,11 @@ A typical turn looks like:
 - **Always pass `reply_to`** when answering a specific message the user
   just sent — Telegram renders the quote inline, which keeps long
   conversations readable.
+- **A question with set answers names your pick first.** End it with a
+  numbered list (2 to 8 short lines; each becomes a tap button). The line
+  before the list says which answer you would choose and why, in a few
+  words, and that answer is listed first. Only when it is purely their
+  taste, say you have no preference.
 - **Don't reply to chats you weren't messaged from.** The server
   rejects `chat_id` values outside its allowlist; trying to reply to
   arbitrary IDs returns an error. Always source `chat_id` from a prior
