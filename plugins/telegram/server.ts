@@ -1540,7 +1540,8 @@ const mcp = new Server(
       '',
       // DIVE-6859: the bridge turns these into tap buttons; nothing said how.
       // DIVE-6963: and agents then ended on bare buttons with no pick of their own.
-      'Exception to no lists: a question with set answers ends the message as a numbered list, one short line per answer (1. … 2. …; 2 to 8 answers, each under 90 characters, all in one message): each line becomes a tap button. The line before the list names the answer you would pick and why, in a few words, and that answer is listed first; only when it is purely their taste, say you have no preference. A single yes/no question at the end gets Yes/No buttons by itself.',
+      // DIVE-7032: the pick's line starts with ⭐, so its button carries the star too.
+      'Exception to no lists: a question with set answers ends the message as a numbered list, one short line per answer (1. … 2. …; 2 to 8 answers, each under 90 characters, all in one message): each line becomes a tap button. The line before the list names the answer you would pick and why, in a few words, and that answer is listed first, with a ⭐ at the start of its line (1. ⭐ …); only when it is purely their taste, say you have no preference and star none. A single yes/no question at the end gets Yes/No buttons by itself.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. To recover earlier context (e.g. after a session restart), call the recent_messages tool: it returns a bounded rolling log of recent inbound messages and your replies. Fall back to asking the user to paste context only if recent_messages comes up empty.",
       '',
@@ -1760,7 +1761,7 @@ function optionButtons(text: string): { keyboard?: InlineKeyboard; labels?: stri
   const kb = new InlineKeyboard()
   opts.forEach((o, i) => {
     const label = o.label.length > OPT_BTN_MAX ? o.label.slice(0, OPT_BTN_MAX - 1).trimEnd() + '…' : o.label
-    kb.text(`${o.marker.toUpperCase()}) ${label}`, `opt:${i}`).row()
+    kb.text(`${o.marker.toUpperCase()}) ${o.pick ? '⭐ ' : ''}${label}`, `opt:${i}`).row()
   })
   // Inject the FULL label (not the truncated button text) on tap.
   return { keyboard: kb, labels: opts.map(o => o.label) }

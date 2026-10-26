@@ -151,13 +151,19 @@ export function resolveTnaAnswer(task: TnaGate | null | undefined, token: string
 // AND only when the message carries a choice cue (a '?' or a word like
 // choose/pick/which/option), which plain instructions almost never do.
 
-export interface ParsedOption { marker: string; label: string }
+// DIVE-7032: `pick` is the agent's own recommendation, marked with a leading ⭐
+// ("1. ⭐ Your own server", or "⭐ 1. …"). The star is cut from the label, so the
+// tapped answer comes back clean and the star never counts toward the 90-char
+// limit; the keyboard puts it back on that one button, the way gate keyboards
+// star their recommendation. At most one pick: a second star is dropped.
+export interface ParsedOption { marker: string; label: string; pick: boolean }
 
 // callback_data stays tiny (`opt:<index>`); the label is re-resolved from the
 // tapped message at tap time, so it never has to fit Telegram's 64-byte cap.
 export const OPT_RE = /^opt:(\d+)$/
 
-const OPTION_LINE_RE = /^\s*(?:[-*>•]\s*)?([a-zA-Z]|\d{1,2})[).]\s+(\S.*?)\s*$/
+const OPTION_LINE_RE = /^\s*(?:[-*>•]\s*)?(⭐\uFE0F?\s*)?([a-zA-Z]|\d{1,2})[).]\s+(\S.*?)\s*$/
+const PICK_STAR_RE = /^⭐\uFE0F?\s*/
 const CHOICE_CUE_RE = /\?|\b(choose|choices?|pick|select|which|option|options|prefer|either|recommend\w*|suggest\w*|go with)\b/i
 // DIVE-6995: the pick line counts as a cue, in Russian too. Since DIVE-6963 the
 // line before the list names the agent's own pick, often a statement with no '?'
@@ -174,9 +180,15 @@ const MAX_OPTION_LABEL = 90
 // entries, each a single short line. Letters are lowercased; order = display order.
 export function parseOptions(text: string): ParsedOption[] {
   const opts: ParsedOption[] = []
+  let picked = false
   for (const line of (text ?? '').split('\n')) {
     const m = OPTION_LINE_RE.exec(line)
-    if (m) opts.push({ marker: m[1]!.toLowerCase(), label: m[2]! })
+    if (!m) continue
+    const star = !!m[1] || PICK_STAR_RE.test(m[3]!)
+    const label = m[3]!.replace(PICK_STAR_RE, '')
+    if (!label) continue
+    opts.push({ marker: m[2]!.toLowerCase(), label, pick: star && !picked })
+    picked ||= star
   }
   if (opts.length < 2 || opts.length > 8) return []
   if (opts.some(o => o.label.length > MAX_OPTION_LABEL)) return []

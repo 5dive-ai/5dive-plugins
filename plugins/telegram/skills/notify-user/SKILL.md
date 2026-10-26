@@ -57,13 +57,15 @@ haven't read (attaching distributes it).
 End the message with a numbered list, one short line per answer (2 to 8,
 each under 90 characters): the bridge turns each line into a tap button.
 **Name your pick first.** The line before the list says which answer you
-would choose and why, in a few words, and that answer is listed first.
-Only when it is purely their taste, say you have no preference. A bare
-list of buttons leaves them to decide alone.
+would choose and why, in a few words, and that answer is listed first,
+with a ⭐ at the start of its line: its button carries the star, so the
+pick shows on the keyboard too. Only when it is purely their taste, say
+you have no preference and star none. A bare list of buttons leaves them
+to decide alone.
 
 ```
 I'd go with the landing page: it is live in a day.
-1. Landing page
+1. ⭐ Landing page
 2. Telegram bot
 ```
 

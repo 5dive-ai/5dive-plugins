@@ -513,7 +513,7 @@ function optionButtons(text: string): { keyboard?: InlineKeyboard; labels?: stri
   const kb = new InlineKeyboard()
   opts.forEach((o, i) => {
     const label = o.label.length > OPT_BTN_MAX ? o.label.slice(0, OPT_BTN_MAX - 1).trimEnd() + '…' : o.label
-    kb.text(`${o.marker.toUpperCase()}) ${label}`, `opt:${i}`).row()
+    kb.text(`${o.marker.toUpperCase()}) ${o.pick ? '⭐ ' : ''}${label}`, `opt:${i}`).row()
   })
   // Inject the FULL label (not the truncated button text) on tap.
   return { keyboard: kb, labels: opts.map(o => o.label) }
