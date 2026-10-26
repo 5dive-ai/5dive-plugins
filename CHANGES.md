@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.118: a yes/no question that quotes another question gets its buttons (DIVE-6988)
+
+lodar, 2026-10-26: *"why no buttons on telegram if there was a question?"* main's 05:38Z reply quoted "what should Olivia do first?" and ended on "Want dev2 to mock that order?". The Yes/No detector needed exactly one '?' in the whole message, so it saw two questions and sent no buttons; lodar skimmed past it and the mock started 40 minutes late.
+
+- **A '?' inside quotes no longer counts.** `yesNoChoice()` reads the message with quoted spans emptied: "…", “…”, «…», `…`, ```…``` and '…'. A single quote counts only when no letter touches it from outside, so apostrophes ("don't … we're") never pair up and hide a real second question. A quote never runs across lines.
+- **Every other rule stays:** two real questions, a wh-question (DIVE-1429), "A or B?" and «A или B?» (DIVE-6859) still get no buttons.
+- **Same `tna.ts` in every bridge:** telegram-agy 0.5.25, telegram-codex 0.5.38, telegram-grok 0.5.25, telegram-opencode 0.5.14, telegram-pi 0.1.14.
+
+Harness: `test/dive6988-quoted-question.test.ts` (17 arms: main's real 05:38Z text, 6 quote shapes, 10 negative controls incl. apostrophes, an unclosed quote and a quote across lines; 6 arms red on the old detector).
+
 ### Fixed — telegram 0.5.117, dashboard 0.5.10: an agent whose AI credit ran out says so instead of going silent (DIVE-6979)
 
 lodar, 2026-10-26: *"did the oino ai pack return error for client on the chats when it openrouter balance is empty or agent stays silent without a reason?"* Silent: neither StopFailure hook had a class for an empty balance, so the OpenRouter 402s seen on 2026-10-24 fell through. The web chat only stopped showing "typing"; a partner client on Telegram was told "try again in a minute".

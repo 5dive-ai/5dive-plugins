@@ -34,6 +34,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 
 ## Shipped
 
+- v0.5.38 — DIVE-6988: a '?' inside quotes no longer costs a yes/no question its buttons (shared `tna.ts`).
 - v0.5.37 — DIVE-6963: `AGENTS.md`: a set-answer question names the agent's pick first and lists it first ("no preference" only for taste).
 - v0.5.33 — DIVE-5779: the transcriber's kill is a 600s base plus the voice note's length, not a fixed 120s.
 - v0.5.36 — DIVE-6579: a voice note's answer is spoken by the bridge (route `voice: true` echoed on the outbox); dashboard messages carry `notify` by phase.
