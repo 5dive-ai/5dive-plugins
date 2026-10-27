@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.123: an installed telegram fix is live on a busy seat within a minute, no restart (DIVE-7085)
+
+lodar, 2026-10-27 06:08Z: *"again forgot button choice"*. DIVE-7061's fix (0.5.122) was installed on main's seat at 05:59Z, but main's bridge was still the 0.5.121 process started at 04:11Z. The restart that loads a new version waits until the seat is idle, and the seat the owner talks to is almost never idle.
+
+- **The button and choice logic reloads in place.** Every 60 s the bridge reads the seat's `installed_plugins.json`. When it names a newer version folder next to the running one, `tna.ts` (choice and Yes/No buttons, tap answers) is loaded from there and used for the next reply. Same process, same session, background work untouched.
+- **A new version that fails to load is not used.** If it does not parse, is missing an export or fails a test call, the bridge keeps the old copy and logs `hot reload: tna.ts from <ver> FAILED, still serving <old>: <why>`. A success logs `hot reload: tna.ts now from <ver>`.
+- `TELEGRAM_HOT_RELOAD=0` turns it off. MCP instructions, tools and everything else in `server.ts` still need the restart, which stays deferred as before.
+- **The first rollout still needs that restart:** a 0.5.122 bridge has no reloader. Fixes after 0.5.123 land within a minute. The five other bridges (agy, codex, grok, opencode, pi) do not get it in this change.
+
+Harness: `test/dive7085-hot-reload.test.ts`.
+
 ### Fixed — telegram 0.5.122: a ⭐-marked option gets its buttons even when the pick line has no cue word (DIVE-7061)
 
 lodar, 2026-10-27 02:12Z, on marketing's "Keep 22" / "Say over 30" choice: *"no buttons"*. The pick line was a statement ("I'd keep 22, because …") with none of DIVE-6995's cue words, so the list went out as plain text although option 1 carried the ⭐ DIVE-7032 parses as the agent's pick.
