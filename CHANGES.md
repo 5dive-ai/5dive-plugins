@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Added — dashboard 0.5.12: hands-free voice on a chat-only self-hosted box (DIVE-7098)
+
+lodar, 2026-10-27: *"check why self-hosted 5dive app doesn't have voice hands-free mode"*. Hands-free sends a clip only when the box heard words in it, and the API never calls a chat-only box, so the app hid the toggle there.
+
+- **The box hears the clip on its own long poll.** A poll that says `hear=1` (this box is chat-only and has the voice add-on's `5dive-transcribe`) can be handed `hear: [{id, path}]`. The adapter fetches the clip, hears it with the local engine and posts the words to `/server/selfhost/heard`: `""` for noise, `null` when it could not hear. Nothing reaches the session, so noise costs no model turn; the app sends the words as an ordinary voice note.
+- Only jobs for this agent's own uploads dir are fetched or heard. A relayed (standard) seat does not say `hear=1` yet: the root relay builds its poll URL.
+
+Needs 5dive-api's broker (same row). Harness: `test/dive7098-dashboard-hands-free.test.ts`.
+
 ### Fixed — telegram 0.5.122: a ⭐-marked option gets its buttons even when the pick line has no cue word (DIVE-7061)
 
 lodar, 2026-10-27 02:12Z, on marketing's "Keep 22" / "Say over 30" choice: *"no buttons"*. The pick line was a statement ("I'd keep 22, because …") with none of DIVE-6995's cue words, so the list went out as plain text although option 1 carried the ⭐ DIVE-7032 parses as the agent's pick.
