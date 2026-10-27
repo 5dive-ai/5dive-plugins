@@ -149,6 +149,30 @@
         }
       ],
       "deny": "{found}. This seat's GitHub token writes under an identity that is not yours, so the comment is published in someone else's name on a project we do not own — it cannot be unsent. Put the text on the row and get the one-line approval first. [{rule}]"
+    },
+    {
+      "id": "openrouter-key-mint",
+      "rule": "Tests never get a new OpenRouter key: a Claude plan, or lodar's Anthropic test key (main's rule from lodar, 10-16 / 10-25 / 10-27)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT",
+      "checks": [
+        {
+          "id": "mint-by-url",
+          "find": "openrouter\\.ai/api/v1/keys\\b",
+          "flags": "",
+          "require_all": ["(?:-X\\s*['\\\"]?(?:POST|PATCH)\\b|--request[=\\s]+['\\\"]?(?:POST|PATCH)\\b|\\s(?:-d|--data(?:-raw|-binary|-urlencode)?|--json)[=\\s]|method\\s*:\\s*['\\\"](?:POST|PATCH)|\\.(?:post|patch)\\()"],
+          "say": "creating or raising an OpenRouter key"
+        },
+        {
+          "id": "mint-by-master-key",
+          "find": "/api/v1/keys\\b",
+          "flags": "",
+          "require_all": ["OPENROUTER_MASTER_KEY", "(?:-X\\s*['\\\"]?(?:POST|PATCH)\\b|--request[=\\s]+['\\\"]?(?:POST|PATCH)\\b|\\s(?:-d|--data(?:-raw|-binary|-urlencode)?|--json)[=\\s]|method\\s*:\\s*['\\\"](?:POST|PATCH)|\\.(?:post|patch)\\()"],
+          "say": "creating or raising an OpenRouter key with the master key"
+        }
+      ],
+      "deny": "{found}. Every such key draws on lodar's own OpenRouter balance, and test and bench keys emptied it after he had said no twice. Put Claude Code seats on a Claude plan profile and every other harness on the Anthropic test key (auth profile `emergency-api`). A product test of the OpenRouter option itself uses the existing TEST_OPENROUTER_API_KEY. Reading /credits, listing keys and deleting a key stay open. Only lodar's own word opens this, through the seat's FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT setting. [{rule}]"
     }
   ]
 }

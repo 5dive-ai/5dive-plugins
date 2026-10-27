@@ -32,7 +32,34 @@ import {
   type SwitchKind,
 } from './liveswitch'
 import { botGuardShouldDrop, type BotToBotConfig } from './botguard'
-import { TNA_RE, resolveTnaAnswer, tnaAck, OPT_RE, optionChoices, parseOptions, tapEvidenceArgs, yesNoChoice, describeTapError, tapLanding, tapFailureCopy, type TapLanding } from './tna'
+import * as tnaBoot from './tna'
+import type { TapLanding } from './tna'
+import { createHotModule } from './hotreload.ts'
+// DIVE-7085: the button/choice logic is read from the INSTALLED tna.ts, not the
+// one this process started with, so a fix lands on a busy seat within a minute
+// (hotreload.ts). Callback-data shapes (TNA_RE, OPT_RE) stay the boot copy's:
+// the buttons already sent were made with them.
+const tnaHot = createHotModule({
+  file: 'tna.ts',
+  boot: tnaBoot,
+  runningDir: import.meta.dir,
+  probe: m => { m.optionChoices('Which one?\n1. ⭐ a\n2. b'); m.yesNoChoice('Ship it?') },
+  disabled: process.env.TELEGRAM_HOT_RELOAD === '0',
+})
+tnaHot.start()
+const { TNA_RE, OPT_RE } = tnaBoot
+// Each call reads the live copy; a function bound at import would pin the boot one.
+const liveTna = <K extends keyof typeof tnaBoot>(k: K) =>
+  ((...a: unknown[]) => (tnaHot.live[k] as (...x: unknown[]) => unknown)(...a)) as (typeof tnaBoot)[K]
+const resolveTnaAnswer = liveTna('resolveTnaAnswer')
+const tnaAck = liveTna('tnaAck')
+const optionChoices = liveTna('optionChoices')
+const parseOptions = liveTna('parseOptions')
+const tapEvidenceArgs = liveTna('tapEvidenceArgs')
+const yesNoChoice = liveTna('yesNoChoice')
+const describeTapError = liveTna('describeTapError')
+const tapLanding = liveTna('tapLanding')
+const tapFailureCopy = liveTna('tapFailureCopy')
 // DIVE-2846: aliased so the durable tap-failure record needs no surgery on
 // (or collision with) whatever each plugin already imports from 'fs'.
 import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSync as tapStatSync, renameSync as tapRenameSync } from 'fs'
