@@ -103,3 +103,37 @@ export async function runLongPoll(o: LongPollOpts): Promise<'auth' | 'off'> {
   }
   return 'off'
 }
+
+// --- DIVE-7098: hands-free voice on a chat-only box --------------------------
+//
+// Hands-free sends a clip only when the box heard words in it, so noise costs
+// no message and no model turn. The API cannot call this box to hear, so it
+// hands the clip over on this agent's own long poll (`hear: [{id, path}]`,
+// only to a poll that said `hear=1`); the adapter hears it with the local
+// engine and posts the words back (/server/selfhost/heard). Nothing reaches
+// the session: the app sends the words as an ordinary voice note when there
+// are some, and drops the clip when there are none.
+
+export type HearJob = { id: string; path: string }
+
+/** The `hear` list of a pending answer, each job well formed and in this agent's own uploads dir. */
+export function hearJobs(raw: unknown, agent: string, uploadsRoot: string): HearJob[] {
+  if (!Array.isArray(raw)) return []
+  return raw.flatMap(j => {
+    const id = (j as { id?: unknown })?.id
+    const path = (j as { path?: unknown })?.path
+    return typeof id === 'string' && id.length > 0 && id.length <= 64 && isOwnUpload(agent, uploadsRoot, path) ? [{ id, path }] : []
+  })
+}
+
+export type Hear = (bin: string, args: string[], timeoutMs: number) => Promise<{ code: number; out: string }>
+
+/** What the engine heard in `path`, whitespace folded ("" for no words); null when it could not hear. */
+export async function hearText(path: string, run: Hear, bin: string, timeoutMs = 40_000): Promise<string | null> {
+  try {
+    const { code, out } = await run(bin, ['--', path], timeoutMs)
+    return code === 0 ? out.replace(/\s+/g, ' ').trim() : null
+  } catch {
+    return null
+  }
+}

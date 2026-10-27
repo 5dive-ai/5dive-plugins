@@ -47,7 +47,7 @@ import { deliveredLive, liveKey, loadLiveDeliveries, recordLiveDelivery, saveLiv
 import { makeWorkStatus } from './workstatus.ts'
 import { askRelayOp, numberedText, parseQuestion } from './question.ts'
 import { replyTooLong } from './replycap.ts'
-import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, isChatOnly, isOwnUpload, runLongPoll, writeFileAtomic, type PollOutcome } from './chatonly.ts'
+import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
 
 let PLUGIN_VERSION = '?'
@@ -136,6 +136,12 @@ const OUTBOX_DIR = process.env.DASHBOARD_OUTBOX ?? '/home/claude/chat-downloads'
 const CHAT_ONLY_MARKER = process.env.DASHBOARD_CHAT_ONLY_MARKER ?? '/etc/5dive/chat-only'
 const UPLOADS_DIR = process.env.DASHBOARD_CHAT_UPLOADS ?? '/home/claude/chat-uploads'
 const chatOnly = () => isChatOnly(CHAT_ONLY_MARKER)
+// DIVE-7098: the voice add-on's engine (5dive-transcribe); its presence is what
+// this poll tells the API (`hear=1`), read on every poll so an add-on installed
+// later is picked up. A relayed seat cannot say it: the root relay builds that
+// URL, so its app keeps saying hands-free is not here yet.
+const TRANSCRIBE = process.env.DASHBOARD_TRANSCRIBE ?? '/usr/local/bin/5dive-transcribe'
+const hearsHere = () => !RELAY && chatOnly() && existsSync(TRANSCRIBE)
 const LONG_POLL_BACKOFF_MS = (() => {
   const raw = Number(process.env.DASHBOARD_LONGPOLL_BACKOFF_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 1_000
@@ -763,10 +769,11 @@ async function drainPending(wait = 0): Promise<PollOutcome> {
 let relayNoWait = false
 async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
   let items: Array<{ id: number; text: string; from?: string; chat_id?: string; ts?: string; image_path?: string; audio_path?: string }>
+  let hear: HearJob[] = []
   const started = Date.now()
   try {
     const res = await authedFetch(
-      `${API_BASE}/server/messages/pending?agent=${encodeURIComponent(AGENT)}${wait > 0 ? `&wait=${wait}` : ''}`,
+      `${API_BASE}/server/messages/pending?agent=${encodeURIComponent(AGENT)}${wait > 0 ? `&wait=${wait}` : ''}${hearsHere() ? '&hear=1' : ''}`,
       'pending fetch',
       wait > 0 ? { signal: AbortSignal.timeout((wait + 20) * 1000) } : {},
       wait > 0 && !relayNoWait ? ['pending', String(wait)] : ['pending'],
@@ -777,7 +784,9 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
       return 'auth'
     }
     if (!res.ok) throw new Error(`${res.status}`)
-    items = ((await res.json()) as { pending?: typeof items }).pending ?? []
+    const body = (await res.json()) as { pending?: typeof items; hear?: unknown }
+    items = body.pending ?? []
+    hear = hearJobs(body.hear, AGENT, UPLOADS_DIR)
     // DIVE-6816: a plain poll that got through (boot, the 5-minute timer)
     // (re)starts the chat-only loop; a no-op on any other box.
     if (wait === 0) ensureLongPoll()
@@ -795,7 +804,9 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
   if (observePendingOffer(retryState, items.map(m => m?.id), Date.now())) {
     savePendingRetryState(PENDING_RETRY_FILE, retryState)
   }
-  if (items.length === 0) return wait > 0 && Date.now() - started < 1_000 ? 'empty-fast' : 'ok'
+  // DIVE-7098: heard beside the poll, which goes straight back to waiting.
+  for (const job of hear) void hearClip(job)
+  if (items.length === 0) return hear.length === 0 && wait > 0 && Date.now() - started < 1_000 ? 'empty-fast' : 'ok'
   const acked: number[] = []
   const live = loadLiveDeliveries(LIVE_DELIVERY_FILE)
   for (const m of items) {
@@ -938,6 +949,33 @@ async function ensureInboundFile(path: unknown): Promise<void> {
     noteChatFile(`chat-only: fetched ${path} via the root relay`)
   } catch (err) {
     noteChatFile(`chat-only: could not fetch ${path}: ${String(err).slice(0, 200)}`)
+  }
+}
+
+// DIVE-7098: a hands-free clip the app asked this box to hear (chatonly.ts).
+// The words go back to the API and nowhere else; null when it could not hear.
+const hearFile: Hear = async (bin, args, timeoutMs) => {
+  try {
+    return { code: 0, out: (await promisify(execFile)(bin, args, { timeout: timeoutMs })).stdout }
+  } catch (err) {
+    return { code: typeof (err as { code?: unknown }).code === 'number' ? (err as { code: number }).code : 1, out: '' }
+  }
+}
+
+async function hearClip(job: HearJob): Promise<void> {
+  const t0 = Date.now()
+  await ensureInboundFile(job.path)
+  const text = existsSync(job.path) ? await hearText(job.path, hearFile, TRANSCRIBE) : null
+  try {
+    const res = await authedFetch(`${API_BASE}/server/selfhost/heard`, 'heard', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agent: AGENT, id: job.id, text }),
+    })
+    void res.text().catch(() => '')
+    noteChatFile(`hands-free: heard ${job.path} in ${Date.now() - t0} ms (${text === null ? 'could not hear' : text ? `${text.split(' ').length} words` : 'no words'}; answer ${res.status})`)
+  } catch (err) {
+    noteChatFile(`hands-free: could not answer for ${job.path}: ${String(err).slice(0, 200)}`)
   }
 }
 
