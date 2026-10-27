@@ -155,8 +155,8 @@ mk_row() {   # <n> <repo> [need_type need_answered_at] -> id
                          maker_agent, verifier, graded_by, graded_verdict, graded_at, graded_verdict_at,
                          handoff_delivered_at, iteration, max_iterations,
                          delivery_ref, merge_owner, result, need_type, need_answered_at)
-      VALUES ('graded row $1', 'high', 'quinn', 'main', 'standard', 'todo',
-              'dev', 'quinn', 'quinn', 'pass', datetime('now','-1 hours'), datetime('now','-1 hours'),
+      VALUES ('graded row $1', 'high', 'fixture-grader', 'main', 'standard', 'todo',
+              'dev', 'fixture-grader', 'fixture-grader', 'pass', datetime('now','-1 hours'), datetime('now','-1 hours'),
               datetime('now','-2 hours'), 2, 3,
               'https://github.com/$2/pull/$1', 'ops',
               'PASS at head.
