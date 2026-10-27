@@ -4130,3 +4130,302 @@ _merge_do_at_github() {
   printf '%s merged by %s (the seat that graded it) as the machine account.\n' "$pr" "$actor" >&2
   return 0
 }
+
+# ── DIVE-7120 — THE MERGE TICK: a graded, green, clean pull request merges with no seat turn ──
+#
+# THE DEFECT, measured by main 2026-10-27 11:17Z: nine rows graded PASS sat in
+# `graded->merge:ops`, several of them lodar's own asks from that morning (lodar
+# 11:16Z: "small tasks sits forever"). ops owns the merge for every repo AND
+# builds, and merges one row per turn. Four of the nine were green and clean and
+# main merged them by hand; one had gone stale against main while it waited.
+#
+# A merge that needs no judgement needs no model turn. The heartbeat (root, no
+# LLM, every tick) calls `_merge_tick_sweep` over the graded->merge stage, and per
+# row it does exactly one of four things:
+#   merge   the head is the graded sha, GitHub reads CLEAN, every required check
+#           is green, no gate is pending, the repo is on the allowlist, and no path
+#           needs a person -> merged (or enqueued) through the SAME GitHub half
+#           `_merge_do` uses, pinned to the graded sha, then the landing recorded.
+#   reject  the branch conflicts, or a required check is red at the graded head ->
+#           `task reject` to the MAKER with FINDING/FIX/VERIFY, never to the merge
+#           seat. A conflict is a --merge-conflict bounce (not counted toward the
+#           cap, DIVE-6753); a red check is an ordinary one, as ops writes it.
+#   skip    anything else. The merge seat keeps it, exactly as today, and the
+#           reason is logged once per change, never per tick.
+#   merged  already on the forge: nothing here, the forge poll records it.
+#
+# THE POLARITY IS DIVE-4137's: every unknown is a SKIP, so a bug in here costs
+# the behaviour we had (the row waits for the merge seat), never an unreviewed
+# merge. Two things it NEVER merges, whatever else reads green: a 5dive-api pull
+# request touching the schema (the schema push stays a dispatched step) and a
+# row whose gate is pending.
+#
+# OFF SWITCH: FIVEDIVE_MERGE_TICK=off. Default on.
+_MERGE_TICK="${FIVEDIVE_MERGE_TICK:-on}"
+# The repos the tick may merge in. A LIST, for _MERGE_HOLD_SEAT_OWNERS_RX's
+# reason: the answer must not depend on what a probe could reach this tick.
+_MERGE_TICK_REPOS_RX="${FIVEDIVE_MERGE_TICK_REPOS_RX:-^(lodar/5dive-frontend|lodar/5dive-api|5dive-ai/5dive-marketplace|5dive-ai/5dive-plugins|5dive-ai/5dive-browser|5dive-ai/5dive)$}"
+# 5dive-ai/5dive: the nightly cut refuses a squash whose title is not
+# conventional, so the tick merges only a title its pr-title-lint would pass.
+readonly _MERGE_TICK_TITLE_RX='^(feat|fix|test|chore|docs|refactor|ci|perf)(\([^)]*\))?!?: '
+_MERGE_TICK_ACTOR="merge-tick"
+
+# _merge_tick_decide — PURE. Every argument is a fact already read; nothing here
+# talks to GitHub or the store, so every branch is gradeable from a fixture.
+#   <repo> <title> <files, one per line> <mergeable> <merge_state> <head> <graded>
+#   <pr_state> <gate_pending 0|1> <red required checks, comma-joined>
+#   <pending required checks 0|1> <surface_seen 0|1>
+# -> merge | merged | reject:conflict | reject:red:<names> | skip:<why>
+_merge_tick_decide() {
+  local repo="${1:-}" title="${2:-}" files="${3:-}" mergeable="${4^^}" state="${5^^}"
+  local head="${6,,}" graded="${7,,}" prstate="${8^^}" gate="${9:-0}" red="${10:-}"
+  local pending="${11:-0}" seen="${12:-0}"
+  [[ "$prstate" == "MERGED" ]] && { printf 'merged'; return 0; }
+  [[ "$prstate" == "OPEN" ]] || { printf 'skip:pr-%s' "${prstate:-unreadable}"; return 0; }
+  [[ "$gate" == "1" ]] && { printf 'skip:gate-pending'; return 0; }
+  [[ -n "$repo" ]] || { printf 'skip:repo-unresolved'; return 0; }
+  grep -qE "$_MERGE_TICK_REPOS_RX" <<<"$repo" || { printf 'skip:repo-not-on-allowlist'; return 0; }
+  # A grade is bound to a sha. A head that moved is not what was graded, and
+  # whose move it is (re-grade or re-deliver) is a seat's call.
+  [[ -n "$graded" ]] || { printf 'skip:no-graded-sha'; return 0; }
+  [[ -n "$head" ]] || { printf 'skip:head-unreadable'; return 0; }
+  if [[ "$head" != "$graded"* && "$graded" != "$head"* ]]; then
+    printf 'skip:head-is-not-the-graded-sha'; return 0
+  fi
+  # THE MAKER'S TWO CASES. Both are facts about the graded head, so both go back
+  # to the one seat that can change it.
+  if [[ "$mergeable" == "CONFLICTING" || "$state" == "DIRTY" ]]; then
+    printf 'reject:conflict'; return 0
+  fi
+  if [[ -n "$red" ]]; then
+    printf 'reject:red:%s' "$red"; return 0
+  fi
+  # Paths where a person's look is the rule. The herestrings are DIVE-4108's:
+  # a `printf | grep -q` pipeline can read a match as no match and fail OPEN.
+  [[ -n "$files" ]] || { printf 'skip:file-list-unreadable'; return 0; }
+  if grep -qE "$_MERGE_DISP_SCHEMA_RX" <<<"$files" \
+     || { [[ "$repo" == */5dive-api ]] && grep -qE '(^|/)src/(db|lib/schema)' <<<"$files"; }; then
+    printf 'skip:schema-path'; return 0
+  fi
+  grep -qE "$_MERGE_DISP_LOOK_RX" <<<"$files" && { printf 'skip:codeowners-path'; return 0; }
+  # A user-facing surface merges only when a grading seat looked at it. A command
+  # or CI grade read the tests, not the page.
+  if grep -qE "$_MERGE_DISP_SURFACE_RX" <<<"$files" && [[ "$seen" != "1" ]]; then
+    printf 'skip:user-facing-surface-unseen'; return 0
+  fi
+  if [[ "$repo" == "5dive-ai/5dive" ]] && ! [[ "$title" =~ $_MERGE_TICK_TITLE_RX ]]; then
+    printf 'skip:title-not-conventional'; return 0
+  fi
+  [[ "$mergeable" == "MERGEABLE" ]] || { printf 'skip:mergeable-%s' "${mergeable:-unknown}"; return 0; }
+  [[ "$pending" == "1" ]] && { printf 'skip:required-checks-pending'; return 0; }
+  case "$state" in
+    CLEAN|HAS_HOOKS) printf 'merge' ;;
+    *) printf 'skip:merge-state-%s' "${state:-unknown}" ;;
+  esac
+}
+
+# _merge_tick_read <pr> -> one US-separated record, or nothing when GitHub could
+# not be asked: mergeable, state, head, url, prstate, title, red, pending, files.
+# red is the failing REQUIRED checks (comma-joined), pending is 0|1. The file
+# list is LAST so its newlines survive (DIVE-4137 arm E13). A required-checks read
+# that fails returns nothing at all: an unread check is not a green one.
+_merge_tick_read() {
+  local pr="$1" tok raw checks red pending seps
+  tok=$(_gate_gh_token 2>/dev/null || printf '')
+  raw=$(_gate_gh "$tok" 20 pr view "$pr" \
+          --json mergeable,mergeStateStatus,headRefOid,url,state,title,files \
+          -q '[ (.mergeable // ""), (.mergeStateStatus // ""), (.headRefOid // ""),
+                (.url // ""), (.state // ""), ((.title // "") | gsub("[\u001f\n]"; " ")),
+                ([ (.files // [])[]?.path ] | join("\n")) ] | join("\u001f")' \
+          2>/dev/null) || raw=""
+  [[ -n "$raw" ]] || return 1
+  seps="${raw//[^$'\x1f']/}"
+  (( ${#seps} >= 6 )) || return 1
+  # `gh pr checks` exits non-zero when a check failed or is pending, with the
+  # JSON still on stdout, so its exit status is not the read's. An EMPTY answer is
+  # the read failing; `[]` is a pull request with no required checks.
+  checks=$(_gate_gh "$tok" 20 pr checks "$pr" --required --json name,bucket 2>/dev/null) || true
+  jq -e 'type == "array"' <<<"$checks" >/dev/null 2>&1 || return 1
+  red=$(jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name' <<<"$checks" 2>/dev/null | sort -u | paste -sd, -)
+  pending=$(jq -r 'if any(.[]; .bucket == "pending") then 1 else 0 end' <<<"$checks" 2>/dev/null) || return 1
+  local mergeable state head url prstate title files rest
+  mergeable="${raw%%$'\x1f'*}"; rest="${raw#*$'\x1f'}"
+  state="${rest%%$'\x1f'*}";    rest="${rest#*$'\x1f'}"
+  head="${rest%%$'\x1f'*}";     rest="${rest#*$'\x1f'}"
+  url="${rest%%$'\x1f'*}";      rest="${rest#*$'\x1f'}"
+  prstate="${rest%%$'\x1f'*}";  rest="${rest#*$'\x1f'}"
+  title="${rest%%$'\x1f'*}";    files="${rest#*$'\x1f'}"
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' \
+    "$mergeable" "$state" "$head" "$url" "$prstate" "$title" "$red" "$pending" "$files"
+}
+
+# _merge_tick_feedback <decision> <pr> <head> <base> -> the FINDING/FIX/VERIFY a
+# maker reads. Written the way ops writes them by hand, so a tick bounce and a
+# seat bounce read the same.
+_merge_tick_feedback() {
+  local d="$1" pr="$2" head="${3:0:12}" base="${4:-main}"
+  case "$d" in
+    reject:conflict)
+      printf 'FINDING: %s @%s was graded PASS but now CONFLICTS with %s, so it cannot merge. The work is fine; the branch is behind. FIX: merge origin/%s into the PR branch (a merge, not a rebase: the push rail refuses force pushes), resolve the conflict keeping both sides, re-run the harness the grade named, push, re-deliver. VERIFY: gh pr view %s --json mergeable reads MERGEABLE and the required checks are green at the new head. (merge tick, DIVE-7120: no seat read this, the heartbeat did)' \
+        "$pr" "$head" "$base" "$base" "$pr" ;;
+    reject:red:*)
+      printf 'FINDING: %s @%s was graded PASS but a required check is RED at that head: %s. It cannot merge. FIX: open the failing job, fix what it names (or merge origin/%s if main already fixed it), push, re-deliver. VERIFY: gh pr checks %s --required reads every check green at the new head. (merge tick, DIVE-7120: no seat read this, the heartbeat did)' \
+        "$pr" "$head" "${d#reject:red:}" "$base" "$pr" ;;
+  esac
+}
+
+# _merge_tick_reject <ident> <decision> <feedback> — the bounce, through the ONE
+# reject verb (no second writer of a rejection). A subshell: `fail` exits, and a
+# refusal must cost this row its bounce, never the tick.
+_merge_tick_reject() {
+  local ident="$1" d="$2" fb="$3"
+  local -a extra=()
+  [[ "$d" == "reject:conflict" ]] && extra=(--merge-conflict)
+  # A plain, NOT exported, variable: the reject verb honours it only when no
+  # environment carries it, so `sudo VAR=… 5dive task reject` cannot claim it.
+  ( _TASK_MERGE_TICK_ACTOR="$_MERGE_TICK_ACTOR"; JSON_MODE=1
+    cmd_task_reject "$ident" --feedback="$fb" "${extra[@]}" ) >/dev/null 2>&1
+}
+
+# _merge_tick_merge <id> <ident> <pr> <graded> — the merge, through `_merge_do`'s
+# GitHub half (pinned to the graded sha, queue-aware). Prints the disposition:
+# merged | enqueued | already-merged. Non-zero on any refusal.
+_merge_tick_merge() {
+  local id="$1" ident="$2" pr="$3" graded="$4" tok out rc=0
+  _MERGE_TICK_LAST_OUT="no machine-account credential (${_GH_BOT_ENV:-the github-bot connector})"
+  tok=$(_merge_bot_token) || return 1
+  out=$(_merge_do_at_github "$ident" "$pr" "$_MERGE_TICK_ACTOR" "$tok" "$(gh_config_dir)" "$graded" 2>&1) || rc=$?
+  _MERGE_TICK_LAST_OUT="$out"
+  (( rc == 0 )) || return "$rc"
+  _merge_disp_read 0 "$out"
+}
+
+# _merge_tick_note <id> <decision> — log a SKIP only when it changed, so the tick
+# log carries "why is this still waiting" once instead of once per five minutes.
+_merge_tick_note() {
+  local id="$1" d="$2" key prev
+  key="merge_tick_last_${id}"
+  prev=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "$key");" 2>/dev/null || printf '')
+  [[ "$prev" == "$d" ]] && return 1
+  db "INSERT INTO task_prefs (key,value) VALUES ($(sqlq "$key"), $(sqlq "$d"))
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null || true
+  return 0
+}
+
+_merge_tick_is_root() { [[ $EUID -eq 0 ]]; }
+
+# _merge_tick_sweep [--dry-run] — one pass over the graded->merge stage. Called by
+# the heartbeat as root; `5dive task merge-tick` runs the same pass by hand.
+# --dry-run reads and decides and writes NOTHING (no merge, no reject, no note).
+_merge_tick_sweep() {
+  local dry=0 a
+  for a in "$@"; do [[ "$a" == "--dry-run" ]] && dry=1; done
+  [[ "$_MERGE_TICK" == "on" || "$_MERGE_TICK" == "1" ]] || return 0
+  if (( ! dry )) && ! _merge_tick_is_root; then
+    printf 'merge-tick: a live pass merges with the machine account and runs as root (the heartbeat). Use --dry-run to see what it would do.\n' >&2
+    return 1
+  fi
+  local row id ident dref result maker vfier gby need ans comp rec d
+  local mergeable state head url prstate title red pending files repo graded seen fb disp
+  local n_rows=0 n_merged=0 n_rejected=0 n_skipped=0
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\x1f' read -r id ident dref maker vfier gby need ans <<<"$row"
+    [[ -n "$id" && -n "$dref" ]] || continue
+    n_rows=$((n_rows+1))
+    result=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    graded=$(_gate_graded_sha "$result")
+    # A row binding companions merges in an order only a seat knows (DIVE-7080:
+    # CLI, then a release, then the marketplace) — the merge seat keeps it.
+    comp=""
+    declare -F _task_companion_refs >/dev/null 2>&1 && comp=$(_task_companion_refs "$id" 2>/dev/null || printf '')
+    if [[ -n "$comp" ]]; then
+      d="skip:binds-companion-prs"
+    elif ! rec=$(_merge_tick_read "$dref"); then
+      d="skip:github-unreadable"
+    else
+      # Eight single-line fields, then the file list, which is the only field
+      # that carries newlines and so the only one `read` must not see.
+      IFS=$'\x1f' read -r mergeable state head url prstate title red pending _ <<<"$rec"
+      files="$rec"; for _ in 1 2 3 4 5 6 7 8; do files="${files#*$'\x1f'}"; done
+      repo=$(sed -nE 's#^https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#p' <<<"$url")
+      seen=0
+      [[ -n "$gby" && "$gby" != ci:* && -n "$vfier" && "$gby" == "$vfier" ]] && seen=1
+      d=$(_merge_tick_decide "$repo" "$title" "$files" "$mergeable" "$state" "$head" \
+            "$graded" "$prstate" "$([[ -n "$need" && -z "$ans" ]] && printf 1 || printf 0)" \
+            "$red" "$pending" "$seen")
+      # The bounce needs a maker to bounce to. A row with none stays with the
+      # merge seat, which can route it by hand.
+      [[ "$d" == reject:* && -z "$maker" ]] && d="skip:${d#reject:}-but-no-maker"
+    fi
+    if (( dry )); then
+      printf '%s\t%s\t%s\n' "$ident" "$d" "$dref"
+      continue
+    fi
+    case "$d" in
+      merge)
+        if disp=$(_merge_tick_merge "$id" "$ident" "$dref" "$graded"); then
+          n_merged=$((n_merged+1))
+          if [[ "$disp" == "merged" || "$disp" == "already-merged" ]]; then
+            local _ml _sha="" _at=""
+            _ml=$(_merge_landed_read "$dref" "$(_gate_slug_from_url "$dref")" 2>/dev/null) || _ml=""
+            [[ -n "$_ml" ]] && { _sha="${_ml%%|*}"; _at="${_ml#*|}"; }
+            if _task_merge_landed_record "$id" "${_sha:-$graded}" "$_at" "$_MERGE_TICK_ACTOR" "$dref"; then
+              local moved="" asgn
+              asgn=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+              moved=$(_task_merge_landed_handoff "$id" "$ident" "$asgn" "$vfier" 2>/dev/null || printf '')
+              _hb_log "[merge-tick] ${ident} — MERGED ${dref} at the graded sha ${graded:0:12} with no seat turn; landing recorded. NOT closed — the close stays a seat's (DIVE-4520).${moved}" 2>/dev/null || true
+            fi
+          else
+            # Enqueued: the queue lands it or ejects it, and the forge poll
+            # records the landing when it happens.
+            _hb_log "[merge-tick] ${ident} — ENQUEUED ${dref} at the graded sha ${graded:0:12}; the forge poll records the landing" 2>/dev/null || true
+          fi
+          _task_store_audit_log "task.merge-tick" ok 0 -- "task=${ident}" "ref=${dref}" "sha=${graded}" "disposition=${disp}" "actor=${_MERGE_TICK_ACTOR}" 2>/dev/null || true
+        else
+          n_skipped=$((n_skipped+1))
+          _merge_tick_note "$id" "merge-refused" \
+            && _hb_log "[merge-tick] ${ident} — read as mergeable but the merge was REFUSED; left to the merge seat. $(tail -n 2 <<<"${_MERGE_TICK_LAST_OUT:-}" | tr '\n' ' ')" 2>/dev/null || true
+        fi ;;
+      reject:*)
+        fb=$(_merge_tick_feedback "$d" "$dref" "$head" "main")
+        if _merge_tick_reject "$ident" "$d" "$fb"; then
+          n_rejected=$((n_rejected+1))
+          _task_store_audit_log "task.merge-tick" ok 0 -- "task=${ident}" "ref=${dref}" "disposition=${d}" "actor=${_MERGE_TICK_ACTOR}" 2>/dev/null || true
+          _hb_log "[merge-tick] ${ident} — ${d#reject:} at the graded head; REJECTED to the maker ${maker}" 2>/dev/null || true
+        else
+          n_skipped=$((n_skipped+1))
+          _merge_tick_note "$id" "${d}-reject-refused" \
+            && _hb_log "[merge-tick] ${ident} — ${d#reject:}, but the reject was refused; left to the merge seat" 2>/dev/null || true
+        fi ;;
+      merged) : ;;
+      *)
+        n_skipped=$((n_skipped+1))
+        _merge_tick_note "$id" "$d" \
+          && _hb_log "[merge-tick] ${ident} — left to the merge seat: ${d#skip:}" 2>/dev/null || true ;;
+    esac
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(delivery_ref,'')||x'1f'||
+                      COALESCE(maker_agent,'')||x'1f'||COALESCE(verifier,'')||x'1f'||COALESCE(graded_by,'')||x'1f'||
+                      COALESCE(need_type,'')||x'1f'||COALESCE(need_answered_at,'')
+                 FROM tasks WHERE (${_TASKS_TFV_SQL});" 2>/dev/null)
+  (( dry )) || (( n_merged + n_rejected == 0 )) \
+    || _hb_log "[merge-tick] pass done — ${n_rows} graded row(s) read, ${n_merged} merged, ${n_rejected} rejected to the maker, ${n_skipped} left to the merge seat" 2>/dev/null || true
+  return 0
+}
+
+# `5dive task merge-tick [--dry-run]` — the heartbeat's pass, by hand. --dry-run
+# prints one line per graded row (ident, decision, pull request) and writes nothing.
+cmd_task_merge_tick() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) : ;;
+      -h|--help)
+        printf 'usage: 5dive task merge-tick [--dry-run]\n\n  Merge every graded, green, clean pull request in graded->merge, and send a conflict\n  or a red required check back to the maker. The heartbeat runs it every tick as root;\n  --dry-run prints what it would do and writes nothing (DIVE-7120).\n'
+        return 0 ;;
+      *) fail "$E_VALIDATION" "task merge-tick: unknown argument '$a' — usage: 5dive task merge-tick [--dry-run]" ;;
+    esac
+  done
+  tasks_db_init
+  _merge_tick_sweep "$@"
+}

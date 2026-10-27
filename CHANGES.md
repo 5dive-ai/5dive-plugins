@@ -1,5 +1,18 @@
 ## Unreleased
 
+### Added — devteam 0.3.0: the merge tick merges graded, green, clean pull requests with no seat turn (DIVE-7120)
+
+lodar, 2026-10-27 11:16Z: *"small tasks sits forever"*. Nine rows graded PASS waited on one merge seat that merges one row per turn.
+
+- **The heartbeat merges what needs no judgement.** Every tick, each row in graded->merge whose pull request is open, at the graded sha, CLEAN, with every required check green, no pending gate, and in an allowlisted repo (5dive-frontend, 5dive-api, marketplace, plugins, browser, and 5dive itself with a conventional title) is merged or enqueued through the same pinned GitHub step `task merge` uses, and the landing is recorded. The row is not closed.
+- **A conflict or a red required check goes back to the maker**, with FINDING/FIX/VERIFY. A conflict is a `--merge-conflict` bounce, so it does not spend an iteration.
+- **Never merged by the tick:** a 5dive-api schema change, a row with a pending gate, install.sh/CODEOWNERS/workflow paths, a page no grading seat looked at, a row that binds companion pull requests. Those stay with the merge seat, and the tick log says why, once.
+- **A merged row is closed by the seat that would close it.** After the merge the tick records the landing and hands the row to its verifier, the same hand-off `task merge-landed` makes. It does not close the row itself: a PASS can carry an owed clause, and the close stays a judgement (DIVE-4520).
+- `5dive task merge-tick --dry-run` prints what the tick would do and writes nothing. Off switch: `FIVEDIVE_MERGE_TICK=off`. Needs 5dive with the heartbeat hook and the reject actor (DIVE-7120's core change). Either merges first safely: an older core never calls the tick, and an older reject refuses its bounce, so the row stays with the merge seat.
+- **Core side, same row:** `task done` on a graded->merge row now names `task merge-landed` first and tells a hand-merged row not to re-deliver.
+
+Harness: `tests/devteam/merge_tick_unit.sh` (47 arms, 6 hand-driven mutants).
+
 ### Added — dashboard 0.5.12: hands-free voice on a chat-only self-hosted box (DIVE-7098)
 
 lodar, 2026-10-27: *"check why self-hosted 5dive app doesn't have voice hands-free mode"*. Hands-free sends a clip only when the box heard words in it, and the API never calls a chat-only box, so the app hid the toggle there.
