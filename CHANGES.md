@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.122: a ⭐-marked option gets its buttons even when the pick line has no cue word (DIVE-7061)
+
+lodar, 2026-10-27 02:12Z, on marketing's "Keep 22" / "Say over 30" choice: *"no buttons"*. The pick line was a statement ("I'd keep 22, because …") with none of DIVE-6995's cue words, so the list went out as plain text although option 1 carried the ⭐ DIVE-7032 parses as the agent's pick.
+
+- **A parsed ⭐ pick is a choice cue.** `optionChoices()` now gives buttons when the text has a cue word OR one option is starred. A step list never carries the agent's star, and the star needs no word list in any language.
+- A list with no cue and no ⭐ ("Steps:\n1. pull\n2. restart") still gets none.
+
+Same `tna.ts` in all six bridges; agy/grok 0.5.28, codex 0.5.41, opencode 0.5.17, pi 0.1.17. Harness: `test/dive7061-star-is-cue.test.ts`.
+
 ### Changed — voice 1.11.1: setup prints one line per step; no Telegram token on the consent screen (DIVE-7034)
 
 On a fresh self-host box `sudo 5dive voice setup` ran 104 s and printed 956 lines, and `plugin add` listed "your Telegram bot token" on a box with no Telegram.

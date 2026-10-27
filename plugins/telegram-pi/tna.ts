@@ -202,10 +202,14 @@ export function parseOptions(text: string): ParsedOption[] {
 
 // Send-side: the option list IF the message also reads as a choice (cue gate).
 // [] → no option buttons (caller falls back to the Yes/No detector).
+// DIVE-7061: a ⭐ on an option IS the cue. marketing's pick line "I'd keep 22,
+// because …" matched no cue word, so its starred choice to lodar went out as
+// plain text. A step list never carries the agent's ⭐, and the star needs no
+// word list in any language.
 export function optionChoices(text: string): ParsedOption[] {
   const opts = parseOptions(text)
   if (!opts.length) return []
-  return hasChoiceCue(text ?? '') ? opts : []
+  return hasChoiceCue(text ?? '') || opts.some(o => o.pick) ? opts : []
 }
 
 // DIVE-332 / DIVE-1429: pure core of the Yes/No detector (sibling of optionChoices).
