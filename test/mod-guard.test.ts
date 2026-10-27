@@ -320,6 +320,45 @@ describe('policy: external-reply — publishing under an identity that is not yo
   })
 })
 
+describe('policy: openrouter-key-mint — a new OpenRouter key for a test run', () => {
+  const MINT = `ssh -p 26220 root@host 'set -a; . /etc/5dive/api.env; curl -s -X POST https://openrouter.ai/api/v1/keys -H "Authorization: Bearer $OPENROUTER_MASTER_KEY_5DIVE" -d "{\\"name\\":\\"qa\\",\\"limit\\":3}"'`
+
+  test('minting a key against the OpenRouter keys API is refused', () => {
+    expect(verdict(bash(MINT))).toBe('openrouter-key-mint')
+    expect(verdict(bash('curl https://openrouter.ai/api/v1/keys --json \'{"name":"bench"}\''))).toBe('openrouter-key-mint')
+    expect(verdict(bash(`node -e "fetch('https://openrouter.ai/api/v1/keys',{method:'POST'})"`))).toBe('openrouter-key-mint')
+  })
+
+  test('raising an existing key is refused too: it spends the same balance', () => {
+    expect(verdict(bash('curl -X PATCH https://openrouter.ai/api/v1/keys/abc -d \'{"limit":6}\''))).toBe('openrouter-key-mint')
+  })
+
+  test('the master key with a base-URL variable is still a mint', () => {
+    expect(verdict(bash('curl -X POST "$OR_BASE/api/v1/keys" -H "Authorization: Bearer $OPENROUTER_MASTER_KEY_X"'))).toBe('openrouter-key-mint')
+  })
+
+  test('MUTANT: reading the balance, listing keys and deleting a key stay open', () => {
+    expect(verdict(bash('curl -s https://openrouter.ai/api/v1/credits -H "Authorization: Bearer $OPENROUTER_MASTER_KEY_5DIVE"'))).toBeNull()
+    expect(verdict(bash('curl -s https://openrouter.ai/api/v1/keys -H "Authorization: Bearer $OPENROUTER_MASTER_KEY_5DIVE" | jq .data'))).toBeNull()
+    expect(verdict(bash('curl -s -X DELETE https://openrouter.ai/api/v1/keys/abc -H "Authorization: Bearer $OPENROUTER_MASTER_KEY_5DIVE"'))).toBeNull()
+  })
+
+  test('MUTANT: a chat call on an existing key is not a mint', () => {
+    expect(verdict(bash('curl https://openrouter.ai/api/v1/chat/completions -d \'{"model":"x"}\''))).toBeNull()
+  })
+
+  test('the seat can open it deliberately, and only deliberately', () => {
+    expect(verdict(bash(MINT), { FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT: '1' })).toBeNull()
+    expect(verdict(bash(MINT), { FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT: '0' })).toBe('openrouter-key-mint')
+  })
+
+  test('the reason names what to use instead', () => {
+    const r = evaluate(SHIPPED, bash(MINT), NO_ENV)?.reason ?? ''
+    expect(r).toContain('Claude plan')
+    expect(r).toContain('emergency-api')
+  })
+})
+
 describe('the evaluator itself', () => {
   test('the guard reads the event the engine actually sends', () => {
     // The observed Bash payload, verbatim from a 2.1.278 debug log, with nothing

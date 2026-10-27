@@ -86,7 +86,7 @@ import { compile, envSet, evaluate, type Compiled, type Verdict } from './guard'
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.6.0'
+const VERSION = '0.6.1'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
