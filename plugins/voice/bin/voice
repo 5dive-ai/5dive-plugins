@@ -93,6 +93,52 @@ USAGE
 
 die() { printf '5dive voice: %s\n' "$1" >&2; exit "${2:-1}"; }
 
+# as_root <voice args...> — a CHANGE to this box's voice settings is a root act,
+# and returns here only when the caller already is root. A seat that holds the
+# grant (an admin seat holds sudo over the whole 5dive CLI) gets the same command
+# re-run through `sudo -n`, so its agent never has to know the word sudo. A seat
+# without it is told which colleague on this box can make the change, and never
+# to hand its owner a command (DIVE-7172: a fresh Marcus on DeepSeek Flash read
+# "needs root", stopped, and asked his owner, who has no terminal, to find root).
+#
+# `sudo -n -l <exact command>` asks without running anything and without a
+# password prompt, so a seat that lacks the line costs no refused sudo (each of
+# those mails root). Already root means the probe is never reached, so the
+# re-run cannot loop.
+VOICE_SUDO="${VOICE_SUDO:-sudo}"
+FIVEDIVE_BIN="${FIVEDIVE_BIN:-/usr/local/bin/5dive}"
+as_root() {
+  [[ $EUID -eq 0 ]] && return 0
+  if "$VOICE_SUDO" -n -l "$FIVEDIVE_BIN" voice "$@" >/dev/null 2>&1; then
+    exec "$VOICE_SUDO" -n "$FIVEDIVE_BIN" voice "$@"
+  fi
+  no_root "$@"
+  exit 1
+}
+
+# no_root <voice args...> — the refusal for a seat that cannot get root, written
+# for the agent that will act on it: who can make the change, and the message to
+# send them. The colleagues are read from `5dive agent list --json`, which any
+# seat may run, by their measured grant rather than their label.
+no_root() {
+  local me="${USER:-$(id -un 2>/dev/null)}" admins=""
+  me="${me#agent-}"
+  admins=$("$FIVEDIVE_BIN" agent list --json 2>/dev/null | jq -r --arg me "$me" '
+    (.data // [])[] | select(.name != $me and .active != false)
+    | select(.sudo.impliedIsolation == "admin" or .sudo.impliedIsolation == "beyond-admin")
+    | .name' 2>/dev/null | head -3 | paste -sd' ' -)
+  {
+    printf '5dive voice: changing voice settings needs root, and this agent does not have it.\n'
+    printf 'Do not ask your owner to run anything: they have no terminal.\n'
+    if [[ -n "$admins" ]]; then
+      printf 'Ask a colleague on this box who has it (%s), for example:\n' "${admins// /, }"
+      printf '  5dive agent send %s "My owner asked to change a voice setting. Please run: sudo 5dive voice %s"\n' "${admins%% *}" "$*"
+    else
+      printf 'No other agent on this box has it either. Tell your owner they can change it in the voice settings of the 5dive app.\n'
+    fi
+  } >&2
+}
+
 engine_missing() {
   printf 'The voice engine is not installed on this box. 5dive does not install it behind your back:\n  %s\n' "$SETUP_CMD"
 }
@@ -144,11 +190,10 @@ cmd_backend() {
 
   # CHANGING the backend decides whether this box's audio leaves the box, so it
   # is a root act — the same shape as `sudo 5dive voice setup`. READING it is
-  # not, which is why the branch above runs unprivileged. A non-root seat gets
-  # the sudo line, never a half-applied change.
-  if [[ $EUID -ne 0 ]]; then
-    die "changing the backend needs root (it decides whether this box's audio leaves it). Run: sudo 5dive voice backend $want"
-  fi
+  # not, which is why the branch above runs unprivileged. A non-root seat that
+  # holds the grant is re-run through sudo; one without it is told who can, and
+  # never gets a half-applied change.
+  as_root backend "$want"
 
   # Refusing here rather than at the first voice note is the whole reason this
   # is a command and not a config edit: the user finds out now, with the fix in
@@ -359,7 +404,7 @@ cmd_config() {
       # backend decides whether audio leaves the box, and already has its own
       # verb with the keyless refusal and the plain-words notice. One path.
       if [[ "$key" == backend ]]; then cmd_backend "$value"; return; fi
-      [[ $EUID -eq 0 ]] || die "changing voice settings needs root. Run: sudo 5dive voice config set $key $value"
+      as_root config set "$key" "$value"
       # stt_backend moves hearing alone (DIVE-5189); moving it to OpenRouter gets
       # the same keyless refusal the backend verb gives.
       if [[ "$key" == stt_backend && "$value" == openrouter ]] && ! voice_openrouter_key >/dev/null 2>&1; then
