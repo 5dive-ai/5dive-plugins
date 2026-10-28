@@ -92,10 +92,57 @@ ok() {
   return 0
 }
 
-# BUZZ_TYPED is the command as the caller typed it (bin/buzz sets it), so the
-# hint names `agent buzz …` for a call core handed over as `buzz agent …`.
+# require_root — DIVE-7183, core's shared root check carried here (DIVE-7172's
+# voice fix). The reader of a refusal is an AGENT whose owner has no terminal, and
+# "try: sudo …" made a weak model stop and ask its owner for root. So a seat whose
+# sudo allows the exact command (asked with `sudo -n -l`: runs nothing, never
+# prompts, mails no refusal) gets the command as the caller typed it re-run through
+# `sudo -n`; already root never reaches the probe, so it cannot loop. A seat
+# without the grant is told which running admin colleague can, never to hand its
+# owner a command. Only the copy core dispatched (FIVEDIVE_PLUGIN_DIR) re-runs, and
+# only from its top-level shell: inside the registry lock's subshell the exec would
+# run the verb a second time, and a harness sourcing this file never sudo-runs. A
+# command given its input as `-` from a pipe is not re-run: it may already have
+# read it.
+#
+# BUZZ_ARGV is the command as the caller typed it (bin/buzz sets it), so the
+# re-run and the hint name `agent buzz …` for a call core handed over as
+# `buzz agent …` — the form the seat sudoers grant names.
+BUZZ_SUDO="${FIVEDIVE_SUDO:-sudo}"
+BUZZ_ROOT_BIN="${FIVEDIVE_BIN:-/usr/local/bin/5dive}"
 require_root() {
-  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root — try: sudo 5dive ${*:-${BUZZ_TYPED:-buzz}}"
+  [[ $EUID -eq 0 ]] && return 0
+  local -a typed=(${BUZZ_ARGV+"${BUZZ_ARGV[@]}"}) cmd=("$BUZZ_ROOT_BIN")
+  (( ${#typed[@]} )) || typed=(buzz)
+  (( JSON_MODE )) && cmd+=(--json)
+  cmd+=("${typed[@]}")
+  local a stdin_arg=0
+  for a in "${typed[@]}"; do [[ "$a" == - || "$a" == *=- ]] && stdin_arg=1; done
+  if [[ -n "${FIVEDIVE_PLUGIN_DIR:-}" && -n "${BUZZ_PLUGIN_ROOT:-}" && "$BUZZ_PLUGIN_ROOT/" == "$(readlink -f "$FIVEDIVE_PLUGIN_DIR" 2>/dev/null)/"* ]] \
+     && (( BASH_SUBSHELL == 0 )) && "$BUZZ_SUDO" -n -l "${cmd[@]}" >/dev/null 2>&1; then
+    (( stdin_arg )) && [[ ! -t 0 ]] && fail "$E_PERMISSION" "must run as root. This agent may, but this command reads its input from stdin, so it was not re-run for you. Run it again with sudo -n in front and pipe the input again: sudo -n 5dive ${typed[*]}"
+    exec "$BUZZ_SUDO" -n "${cmd[@]}"
+  fi
+  fail "$E_PERMISSION" "$(_buzz_root_refusal "${typed[*]}")"
+}
+
+# Who on this box can, by their MEASURED grant in `agent list --json`; `.active`
+# is the unit's systemd state as a string, so only "active" counts, the lead
+# (beyond-admin) first.
+_buzz_root_refusal() {
+  local me="${USER:-$(id -un 2>/dev/null)}" list admins
+  me="${me#agent-}"
+  list=$("${FIVEDIVE_BUZZ_CLI:-$BUZZ_ROOT_BIN}" agent list --json </dev/null 2>/dev/null) || true
+  admins=$(jq -r --arg me "$me" '[(.data // [])[] | select(.name != $me and .active == "active")
+    | select(.sudo.impliedIsolation == "admin" or .sudo.impliedIsolation == "beyond-admin")]
+    | sort_by(.sudo.impliedIsolation != "beyond-admin") | map(.name) | .[:3] | join(" ")' <<<"$list" 2>/dev/null) || true
+  printf 'must run as root, and this agent does not have it. Do not ask your owner to run anything: they have no terminal.'
+  if [[ -n "$admins" ]]; then
+    printf ' Ask a colleague on this box who has it (%s), for example:\n  5dive agent send %s "My owner asked for this and it needs root. Please run: sudo 5dive %s"' \
+      "${admins// /, }" "${admins%% *}" "$1"
+  else
+    printf ' No other agent on this box has it either: tell your owner this cannot be done from this agent (5dive %s).' "$1"
+  fi
 }
 
 # Core's ensure_state also CREATES the state tree. A plugin has no business

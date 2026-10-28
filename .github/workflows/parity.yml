@@ -130,7 +130,7 @@ jobs:
           rc=0
           for t in buzz_bridge_unit buzz_identity_registry_unit buzz_last_mile_unit \
                    buzz_pair_unit buzz_preseed_dm_unit buzz_server_pairing_unit buzz_binaries_unit \
-                   buzz_onboarding_unit; do
+                   buzz_onboarding_unit buzz_root_reexec_unit; do
             echo "=== $t"; bash "tests/$t.sh" || rc=1
           done
           exit $rc
