@@ -119,12 +119,14 @@ as_root() {
 # no_root <voice args...> — the refusal for a seat that cannot get root, written
 # for the agent that will act on it: who can make the change, and the message to
 # send them. The colleagues are read from `5dive agent list --json`, which any
-# seat may run, by their measured grant rather than their label.
+# seat may run, by their measured grant rather than their label. `.active` there
+# is the unit's systemd state as a STRING ('active'/'inactive'/'failed'), so
+# only "active" counts: a stopped admin cannot make the change.
 no_root() {
   local me="${USER:-$(id -un 2>/dev/null)}" admins=""
   me="${me#agent-}"
   admins=$("$FIVEDIVE_BIN" agent list --json 2>/dev/null | jq -r --arg me "$me" '
-    (.data // [])[] | select(.name != $me and .active != false)
+    (.data // [])[] | select(.name != $me and .active == "active")
     | select(.sudo.impliedIsolation == "admin" or .sudo.impliedIsolation == "beyond-admin")
     | .name' 2>/dev/null | head -3 | paste -sd' ' -)
   {
@@ -324,7 +326,7 @@ service_accepts() {
 cmd_config_init() {
   local json="$1"; shift
   [[ $# -gt 0 ]] || die "usage: sudo 5dive voice config init <key>=<value>..." 64
-  [[ $EUID -eq 0 ]] || die "writing the voice config needs root. Run: sudo 5dive voice config init $*"
+  as_root config init "$@"
   config_need_manifest
   local dir="${VOICE_STATE_DIR:-${STATE_DIR:-/var/lib/5dive}/voice}"
   local cfg="${VOICE_CONFIG:-$dir/config}"
