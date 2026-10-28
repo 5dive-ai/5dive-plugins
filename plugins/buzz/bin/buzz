@@ -42,7 +42,7 @@ _buzz_agent_dispatch() {
 }
 
 _buzz_main() {
-  if [[ "${1:-}" == agent ]]; then BUZZ_TYPED="agent buzz ${*:2}"; else BUZZ_TYPED="buzz $*"; fi
+  if [[ "${1:-}" == agent ]]; then BUZZ_ARGV=(agent buzz "${@:2}"); else BUZZ_ARGV=(buzz "$@"); fi
   case "${1:-}" in
     agent)    shift; _buzz_agent_dispatch "$@" ;;
     binaries) shift; _buzz_binaries "$@" ;;

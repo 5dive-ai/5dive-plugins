@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — buzz 0.2.1: a root-only buzz command run without sudo just works for an agent that may, or names who can (DIVE-7183)
+
+A buzz command run without sudo stopped with "must run as root — try: sudo 5dive …". The agent reading it has an owner with no terminal, and a weaker model stopped and asked the owner for root (DIVE-7172, fixed then for voice only; the core CLI and the browser plugin get the same fix in this row).
+
+- **A seat whose sudo allows the exact command gets the result:** asked with `sudo -n -l` (runs nothing, never prompts), then re-run through `sudo -n` in the form the caller typed (`5dive agent buzz …`, which the seat grant names), `--json` kept. Root never reaches the question, so it cannot loop. Only the copy core dispatched re-runs, and never from inside the registry lock's subshell.
+- **A seat without it is told who can:** up to three running admin colleagues, the lead first, with a ready `5dive agent send` line, and never to hand its owner a command.
+- A command given its input as `-` from a pipe is not re-run, since it may already have read it.
+
+`tests/buzz_root_reexec_unit.sh` 10/10; the eight buzz verb harnesses pass unchanged.
+
 ### Added — devteam 0.3.0: the merge tick merges graded, green, clean pull requests with no seat turn (DIVE-7120)
 
 lodar, 2026-10-27 11:16Z: *"small tasks sits forever"*. Nine rows graded PASS waited on one merge seat that merges one row per turn.
