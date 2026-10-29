@@ -34,18 +34,39 @@ export function addedByOwner(owners: readonly string[] | undefined, allowFrom: r
   return owners.includes(id) && allowFrom.includes(id)
 }
 
+/** DIVE-7250: the ids that may wake the agent in a group set to "When I call
+ *  it by name" (`groupsOwnerOnly`): the recorded owners the bot still answers. */
+export function groupOwnerIds(access: { owners?: string[]; allowFrom: readonly string[] }): string[] {
+  return (access.owners ?? []).filter((id) => USER_ID.test(id) && access.allowFrom.includes(id))
+}
+
+/** DIVE-7250 (lodar 2026-10-29: add his agent to a shared group without anyone
+ *  getting into his account through it): with `groupsOwnerOnly`, a group message
+ *  from anyone but an owner is dropped, so it never reaches the agent, not even
+ *  its group log, and cannot steer it when the owner does call it. */
+export function ownerOnlyDrops(
+  access: { owners?: string[]; allowFrom: readonly string[]; groupsOwnerOnly?: boolean },
+  senderId: string,
+): boolean {
+  return access.groupsOwnerOnly === true && !groupOwnerIds(access).includes(senderId)
+}
+
 /** The join's decision, on the handler's copy of access: an owner's add puts
  *  the group in `groups`, answering when called by name unless the agent is set
  *  to every message (`groupsRequireMention: false`, DIVE-6675); any other add
  *  leaves it only in `discovered` (written by the handler before this), waiting
- *  for approval. */
+ *  for approval. Set to owner only (DIVE-7250), it answers its owners by name. */
 export function admitOnJoin(
-  access: { owners?: string[]; allowFrom: string[]; groups: Record<string, unknown>; groupsRequireMention?: boolean },
+  access: { owners?: string[]; allowFrom: string[]; groups: Record<string, unknown>; groupsRequireMention?: boolean; groupsOwnerOnly?: boolean },
   chatId: string,
   from: From,
 ): boolean {
   const approved = !(chatId in access.groups) && addedByOwner(access.owners, access.allowFrom, from)
-  if (approved) access.groups[chatId] = { requireMention: access.groupsRequireMention !== false, allowFrom: [] }
+  // DIVE-7250: set to "When I call it by name", the group lets in its owners only.
+  if (approved)
+    access.groups[chatId] = access.groupsOwnerOnly === true
+      ? { requireMention: true, allowFrom: groupOwnerIds(access) }
+      : { requireMention: access.groupsRequireMention !== false, allowFrom: [] }
   return approved
 }
 
@@ -127,10 +148,13 @@ export const GROUP_STRINGS = {
     // the bot cannot keep. DIVE-6675 (lodar 2026-10-21): she answers when called by
     // name (DIVE-6673), so the hello says that; a group set to every message is told
     // she answers its messages instead.
-    hello: (name: string, replyOnly = false, everyMessage = false) =>
+    // DIVE-7250: set to owner only, nobody else is told to call her.
+    hello: (name: string, replyOnly = false, everyMessage = false, ownerOnly = false) =>
       replyOnly
         ? `Hi, I'm ${name}. Reply to one of my messages to ask something.`
-        : everyMessage
+        : ownerOnly
+          ? `Hi, I'm ${name}. I answer only the person who added me.`
+          : everyMessage
           ? `Hi, I'm ${name}. I answer messages in this group.`
           : `Hi, I'm ${name}. Call me by name when you need me.`,
     waiting: (name: string) => `Hi, I'm ${name}. I'll stay quiet here until my owner lets this group in.`,
@@ -139,10 +163,12 @@ export const GROUP_STRINGS = {
       'To answer when someone mentions me, make me an admin of this group.',
   },
   ru: {
-    hello: (name: string, replyOnly = false, everyMessage = false) =>
+    hello: (name: string, replyOnly = false, everyMessage = false, ownerOnly = false) =>
       replyOnly
         ? `Привет, я ${name}. Чтобы задать вопрос, ответьте на одно из моих сообщений.`
-        : everyMessage
+        : ownerOnly
+          ? `Привет, я ${name}. Я отвечаю только тому, кто меня добавил.`
+          : everyMessage
           ? `Привет, я ${name}. Я отвечаю на сообщения в этой группе.`
           : `Привет, я ${name}. Позовите меня по имени, когда понадоблюсь.`,
     waiting: (name: string) => `Привет, я ${name}. Я буду молчать здесь, пока владелец не разрешит эту группу.`,
@@ -175,6 +201,8 @@ export type JoinInput = {
   privacyOn: boolean
   /** DIVE-6675: the group answers every message, not only when she is called by name. */
   everyMessage?: boolean
+  /** DIVE-7250: the group answers its owners only. */
+  ownerOnly?: boolean
   /** A 5dive host (the app exists); else the OSS /telegram:access pointer. */
   fivedive: boolean
 }
@@ -183,12 +211,12 @@ export function groupJoinLines(i: JoinInput): string[] {
   const lines: string[] = []
   if (i.lite) {
     const s = GROUP_STRINGS[i.lang]
-    if (i.approved) lines.push(s.hello(i.name, i.privacyOn, i.everyMessage))
+    if (i.approved) lines.push(s.hello(i.name, i.privacyOn, i.everyMessage, i.ownerOnly))
     else if (i.announce) lines.push(s.waiting(i.name))
     if (i.privacyOn) lines.push(s.privacy)
     return lines
   }
-  if (i.approved) lines.push(`👋 ${GROUP_STRINGS.en.hello(i.name, i.privacyOn, i.everyMessage)}`)
+  if (i.approved) lines.push(`👋 ${GROUP_STRINGS.en.hello(i.name, i.privacyOn, i.everyMessage, i.ownerOnly)}`)
   else if (i.announce) {
     lines.push(
       `👋 Hi! I've been added to "${i.title}" — group id: ${i.chatId}. ` +

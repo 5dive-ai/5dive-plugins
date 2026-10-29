@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Added — telegram 0.5.124: "In groups, answer: When I call it by name", the agent answers only its owner in a group (DIVE-7250)
+
+lodar, 2026-10-29: *"например я бы хотел добавить в общую группу своего агента но не хочу чтобы через него влезли в мой аккаунт"*. He wants to add his agent to a shared group without anyone else making it work on his account.
+
+- **`groupsOwnerOnly: true` in access.json** (written by `5dive agent telegram-access groups <a> --answer=owner`): in any group, a message from anyone but a recorded owner the bot still answers is dropped. That covers a guest let into DMs, a stranger and another bot. The drop runs before the 'listen' branch, so the text never reaches the agent or the group log it reads when the owner calls it. A non-owner's edit is not logged either. With no owners record yet, nobody gets through.
+- **A group the owner adds later** lets in its owners only, by name (`allowFrom: [owners]`), and its hello says "I answer only the person who added me." It does not tell everyone to call it by name.
+- The key survives the plugin's own saves. Off or unset changes nothing.
+
+Harness: `test/dive7250-group-owner-only.test.ts`.
+
 ### Fixed — buzz 0.2.1: a root-only buzz command run without sudo just works for an agent that may, or names who can (DIVE-7183)
 
 A buzz command run without sudo stopped with "must run as root — try: sudo 5dive …". The agent reading it has an owner with no terminal, and a weaker model stopped and asked the owner for root (DIVE-7172, fixed then for voice only; the core CLI and the browser plugin get the same fix in this row).
