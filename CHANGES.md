@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.13: a standard seat on a self-hosted box holds its long poll instead of flooding the API (DIVE-7271)
+
+A self-hosted server's whole chat died once it ran a standard seat (DIVE-7269: `team import` of four seats, then ~415 rate-limited calls a minute and the lead's reply never landed).
+
+- **The long poll waits out a running drain, then polls with its own wait.** It used to answer "busy", ask for a rerun and retry after 250 ms. A standard seat's calls go through the root relay and take longer than that, so each retry landed inside the plain rerun it had asked for and asked again: the long poll never ran and plain polls went out back to back, about two a second per seat.
+- A collect-now nudge that arrives mid-drain still gets its one extra plain drain.
+
+Harness: `test/dive7271-dashboard-relay-longpoll.test.ts` (relay stand-in at 400 ms a call: 16 plain polls and no long poll in 10 s on 0.5.12; 1 plain and 2 long polls now).
+
 ### Added — telegram 0.5.124: "In groups, answer: When I call it by name", the agent answers only its owner in a group (DIVE-7250)
 
 lodar, 2026-10-29: *"например я бы хотел добавить в общую группу своего агента но не хочу чтобы через него влезли в мой аккаунт"*. He wants to add his agent to a shared group without anyone else making it work on his account.
