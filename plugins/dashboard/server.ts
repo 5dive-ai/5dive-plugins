@@ -696,6 +696,8 @@ function startCollectNowWatch(): void {
 // landed after the fetch from waiting out the full timer.
 let draining = false
 let rerun = false
+// DIVE-7271: settles when the running drain ends, its rerun included.
+let drainEnded: Promise<unknown> = Promise.resolve()
 
 // A drain that dies mid-flight (SIGKILL, box reboot) leaves the lock file
 // behind, and a stale lock that nothing clears would wedge the collect path
@@ -740,8 +742,20 @@ function releaseDrainLock(): void {
 // DIVE-6816: `wait` > 0 is the chat-only long poll (the API holds the request
 // until a message lands); every other caller passes nothing and gets the plain
 // poll it always had. The outcome only steers that loop.
+// DIVE-7271: a long poll that finds a drain running waits for it and then
+// polls with its own wait. It must not set `rerun` (that is for a nudge): on a
+// relay seat each call outlasts the 250 ms busy retry, so every retry landed
+// inside the plain rerun it had asked for and asked again, and the long poll
+// never ran while plain polls went out back to back.
 async function drainPending(wait = 0): Promise<PollOutcome> {
+  while (wait > 0 && draining) await drainEnded
   if (draining) { rerun = true; return 'busy' }
+  const run = drainSerial(wait)
+  drainEnded = run.catch(() => {})
+  return run
+}
+
+async function drainSerial(wait: number): Promise<PollOutcome> {
   draining = true
   let outcome: PollOutcome
   try {
