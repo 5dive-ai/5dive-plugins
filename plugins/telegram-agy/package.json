@@ -1,6 +1,6 @@
 {
   "name": "@5dive/telegram-agy-mcp",
-  "version": "0.5.28",
+  "version": "0.5.29",
   "license": "Apache-2.0",
   "type": "module",
   "bin": "./server.ts",

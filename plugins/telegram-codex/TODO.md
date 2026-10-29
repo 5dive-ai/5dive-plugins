@@ -37,6 +37,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 - v0.5.39 — DIVE-6995: the pick line («Советую…», "I recommend…") is a choice cue, so the numbered list gets its buttons (shared `tna.ts`).
 - v0.5.40 — DIVE-7032: a choice line that starts with ⭐ is the agent's pick; its button keeps the star, at most one per keyboard (shared `tna.ts`).
 - v0.5.41 — DIVE-7061: a ⭐-marked option counts as the choice cue, so a pick line with no cue word still gets buttons (shared `tna.ts`).
+- v0.5.42 — DIVE-7286: a long option gets a cut button instead of killing the keyboard; the tap sends the full line (shared `tna.ts`).
 - v0.5.38 — DIVE-6988: a '?' inside quotes no longer costs a yes/no question its buttons (shared `tna.ts`).
 - v0.5.37 — DIVE-6963: `AGENTS.md`: a set-answer question names the agent's pick first and lists it first ("no preference" only for taste).
 - v0.5.33 — DIVE-5779: the transcriber's kill is a 600s base plus the voice note's length, not a fixed 120s.

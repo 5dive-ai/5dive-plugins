@@ -3,7 +3,7 @@
 // "put same star?". Since DIVE-6963 the line before a choice names the pick, but
 // the keyboard alone did not show it; gate keyboards star their recommendation.
 // The rule now asks for "1. ⭐ …"; parseOptions() lifts the star off the label
-// (so the tapped answer and the 90-char check never see it) and marks `pick`;
+// (so the tapped answer never sees it) and marks `pick`;
 // each bridge's optionButtons() puts it back on that one button.
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
@@ -56,10 +56,9 @@ describe('parseOptions — the ⭐ marks the pick (DIVE-7032)', () => {
     expect(optionChoices('Which one?\n1. ⭐️ Landing\n2. Bot')[0]).toEqual({ marker: '1', label: 'Landing', pick: true }))
   test('7. letters work the same', () =>
     expect(optionChoices('Which one?\na) Landing\nb) ⭐ Bot').map(o => [o.marker, o.label, o.pick])).toEqual([['a', 'Landing', false], ['b', 'Bot', true]]))
-  test('8. the star does not count toward the 90-character limit', () => {
+  test('8. the star is not part of the label', () => {
     const ninety = 'x'.repeat(90)
     expect(parseOptions(`1. ⭐ ${ninety}\n2. y`).map(o => o.label)).toEqual([ninety, 'y'])
-    expect(parseOptions(`1. ${'x'.repeat(91)}\n2. y`)).toEqual([]) // the limit itself is unchanged
   })
   test('9. a star later in the line is text, not a pick', () =>
     expect(optionChoices('Which one?\n1. Landing ⭐\n2. Bot')[0]).toEqual({ marker: '1', label: 'Landing ⭐', pick: false }))

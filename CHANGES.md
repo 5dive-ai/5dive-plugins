@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.125: a long answer gets a cut button instead of killing every button (DIVE-7286)
+
+lodar, 2026-10-29, forwarding creative's choice of two reply drafts: *"telegram buttons didn't work here. only plain text"*. Draft 1 was 119 characters, and any option over 90 characters dropped the whole keyboard.
+
+- **A long option keeps its button.** The button shows its number and the start of the line, cut with "…"; a tap still sends the full line back, from the send-time cache or by re-reading the message after a restart.
+- The ⭐ already counts as the choice cue (DIVE-7061), so creative's pick line "I'd send …" needed no cue word. A numbered step list with no ⭐ and no cue still gets no buttons, and 2–8 options in a clean 1,2,3 or a,b,c run still holds.
+- Same `tna.ts` in all six bridges; agy/grok 0.5.29, codex 0.5.42, opencode 0.5.18, pi 0.1.18.
+
+Harness: `test/dive7286-long-option.test.ts` (creative's exact message on every bridge's real keyboard; 15 of its arms red on 0.5.124).
+
 ### Fixed — dashboard 0.5.13: a standard seat on a self-hosted box holds its long poll instead of flooding the API (DIVE-7271)
 
 A self-hosted server's whole chat died once it ran a standard seat (DIVE-7269: `team import` of four seats, then ~415 rate-limited calls a minute and the lead's reply never landed).

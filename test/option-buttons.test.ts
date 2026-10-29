@@ -33,9 +33,10 @@ describe('parseOptions — raw sequence detection', () => {
     expect(parseOptions('a) one\nc) three')).toEqual([])
     expect(parseOptions('1. one\n3. three')).toEqual([])
   })
-  test('a long, paragraph-style label is not an option', () => {
+  // DIVE-7286: a long line no longer kills the list; the button text is cut instead.
+  test('a long label is kept whole (the button cuts it, the tap sends it all)', () => {
     const long = 'x'.repeat(120)
-    expect(parseOptions(`1. ${long}\n2. short`)).toEqual([])
+    expect(parseOptions(`1. ${long}\n2. short`).map(o => o.label)).toEqual([long, 'short'])
   })
   test('more than 8 rejected', () => {
     const many = Array.from({ length: 9 }, (_, i) => `${i + 1}. opt`).join('\n')
