@@ -153,7 +153,7 @@ export function resolveTnaAnswer(task: TnaGate | null | undefined, token: string
 
 // DIVE-7032: `pick` is the agent's own recommendation, marked with a leading ⭐
 // ("1. ⭐ Your own server", or "⭐ 1. …"). The star is cut from the label, so the
-// tapped answer comes back clean and the star never counts toward the 90-char
+// tapped answer comes back clean and the star never counted toward the old 90-char
 // limit; the keyboard puts it back on that one button, the way gate keyboards
 // star their recommendation. At most one pick: a second star is dropped.
 export interface ParsedOption { marker: string; label: string; pick: boolean }
@@ -173,11 +173,18 @@ const CHOICE_CUE_RE = /\?|\b(choose|choices?|pick|select|which|option|options|pr
 // words still gets no buttons.
 const CHOICE_CUE_RU_RE = /(?<![\p{L}\p{N}])(совет\p{L}*|рекоменд\p{L}*|предлага\p{L}*|предлож\p{L}*|выб[иое]р\p{L}*|выбра\p{L}*|вариант\p{L}*|какой|какая|какое|какие|какую)(?![\p{L}\p{N}])/iu
 const hasChoiceCue = (text: string): boolean => CHOICE_CUE_RE.test(text) || CHOICE_CUE_RU_RE.test(text)
-const MAX_OPTION_LABEL = 90
 
 // Parse the raw option lines (no cue gate) — exported for the tap-side resolve.
 // Returns [] unless the markers form a clean a,b,c… OR 1,2,3… sequence of 2–8
-// entries, each a single short line. Letters are lowercased; order = display order.
+// entries, each a single line. Letters are lowercased; order = display order.
+//
+// DIVE-7286: a long line no longer kills the keyboard. creative's two reply drafts
+// to lodar (one 119 characters) went out as plain text because one label passed
+// MAX_OPTION_LABEL. Choosing between drafts is the normal case for creative and
+// marketing, and drafts run long. Each bridge's optionButtons() already cuts the
+// BUTTON text, and the tap brings back the full label from here, so the length
+// check only ever cost the buttons. A step list is still kept out by the cue gate
+// in optionChoices(), not by length.
 export function parseOptions(text: string): ParsedOption[] {
   const opts: ParsedOption[] = []
   let picked = false
@@ -191,7 +198,6 @@ export function parseOptions(text: string): ParsedOption[] {
     picked ||= star
   }
   if (opts.length < 2 || opts.length > 8) return []
-  if (opts.some(o => o.label.length > MAX_OPTION_LABEL)) return []
   const numeric = /^\d+$/.test(opts[0]!.marker)
   for (let i = 0; i < opts.length; i++) {
     const expected = numeric ? String(i + 1) : String.fromCharCode(97 + i)
