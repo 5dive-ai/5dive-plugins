@@ -61,6 +61,8 @@ With the default `requireMention: true`, the bot responds only when @mentioned, 
 
 On a 5dive box the app's **In groups, answer** setting (`5dive agent telegram-access groups <agent> --answer=name|every`) sets `requireMention` on every group at once and stores `groupsRequireMention`, which a group the owner adds later gets. Without the key a new group answers when called by name.
 
+`--answer=owner` ("When I call it by name") also stores `groupsOwnerOnly: true` and lets each group's owners in alone (`allowFrom`). Then a group message from anyone but an owner is dropped before the agent or its group log sees it, and a group the owner adds later gets the same.
+
 ```
 /telegram:access group add -1001654782309 --no-mention
 /telegram:access group add -1001654782309 --allow 412587349,628194073

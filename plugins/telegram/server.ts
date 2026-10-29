@@ -94,7 +94,7 @@ import { makeOrgPolicyNotifier, orgPolicyButton, orgPolicyText, ORG_SETTINGS_URL
 import { taskStateLines, cardGateAction, resolveCardTap, deliveryUrl, isParked, resultSummary, stripMarkdown, fitCard, DASHBOARD_TASKS_URL, GANS_RE, GRESEND_RE, TWAKE_RE } from './taskcard.ts'
 import { patchSettingsFile } from './settingsfile.ts'
 import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
-import { admitOnJoin, nextOwners, groupJoinLines, ASK_OWNER } from './groupjoin.ts'
+import { admitOnJoin, nextOwners, groupJoinLines, ownerOnlyDrops, ASK_OWNER } from './groupjoin.ts'
 import { notAllowlistedMessage } from './chatguard.ts'
 import { makeGreetClaims, botIdOf, bootGreetTargets, BOOT_GREET_DELAY_MS, WIRED_RECENTLY_MS } from './bootgreet.ts'
 import { makeFirstReplier, firstReplyOwners, isFirstJobPayload, lastHumanChatId, FIRST_REPLY_FILE, FIRST_REPLY_POLL_MS } from './firstreply.ts'
@@ -577,6 +577,10 @@ type Access = {
    *  word from her bot's display name calls her only when it is on it. Absent = the
    *  list is extras on top of that word, as before. `--names=` sets it. */
   groupsCallNamesComplete?: boolean
+  /** DIVE-7250: the app's "In groups, answer: When I call it by name": a group
+   *  message from anyone but an owner is dropped (groupjoin.ts ownerOnlyDrops).
+   *  `agent telegram-access groups --answer=owner` writes it. */
+  groupsOwnerOnly?: boolean
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
   /** Emoji to react with on receipt. Empty string disables. Telegram only accepts its fixed whitelist. */
@@ -643,6 +647,7 @@ function normalizeAccess(raw: unknown): Access {
     groupsRequireMention: parsed.groupsRequireMention,
     groupsCallNames: parsed.groupsCallNames,
     groupsCallNamesComplete: parsed.groupsCallNamesComplete,
+    groupsOwnerOnly: parsed.groupsOwnerOnly,
     mentionPatterns: parsed.mentionPatterns,
     ackReaction: parsed.ackReaction,
     replyToMode: parsed.replyToMode,
@@ -1189,6 +1194,7 @@ function gate(ctx: Context): GateResult {
       }
       const groupAllowFrom = policy.allowFrom ?? []
       if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return { action: 'drop' }
+      if (ownerOnlyDrops(access, senderId)) return { action: 'drop' }
       return { action: 'deliver', access }
     }
     return { action: 'drop' }
@@ -1247,6 +1253,9 @@ function gate(ctx: Context): GateResult {
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
       return { action: 'drop' }
     }
+    // DIVE-7250: owner only drops everyone else BEFORE 'listen', so their text
+    // never reaches the group log the agent reads when the owner calls it.
+    if (ownerOnlyDrops(access, senderId)) return { action: 'drop' }
     if (requireMention && !isMentioned(ctx, access.mentionPatterns, callNames(access.groupsCallNames), access.groupsCallNamesComplete === true)) {
       return { action: 'listen' }
     }
@@ -1321,8 +1330,10 @@ function groupLineFor(ctx: Context, text: string, called: boolean) {
 function logGroupEdit(ctx: Context): void {
   const m = ctx.editedMessage
   if (!m || (m.chat.type !== 'group' && m.chat.type !== 'supergroup') || !m.from || m.from.is_bot) return
-  const policy = loadAccess().groups[String(m.chat.id)]
+  const access = loadAccess()
+  const policy = access.groups[String(m.chat.id)]
   if (!policy) return
+  if (ownerOnlyDrops(access, String(m.from.id))) return
   if (typeof policy.message_thread_id === 'number' && m.message_thread_id !== policy.message_thread_id) return
   if ((policy.allowFrom ?? []).length > 0 && !policy.allowFrom!.includes(String(m.from.id))) return
   const text = m.text ?? m.caption ?? ''
@@ -7129,6 +7140,7 @@ bot.on('my_chat_member', async ctx => {
     announce,
     privacyOn,
     everyMessage: access.groups[chatId]?.requireMention === false,
+    ownerOnly: access.groupsOwnerOnly === true,
     fivedive: announce && !!(await read5diveVersion()),
   })
 
