@@ -30,10 +30,11 @@ import {
 import { readFileSync, mkdirSync, readdirSync, unlinkSync, watch, chmodSync, copyFileSync, openSync, closeSync, writeSync, statSync, existsSync, renameSync, writeFileSync } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { homedir } from 'os'
+import { homedir, userInfo } from 'os'
 import { join } from 'path'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
+import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
 import { audioSeconds, inboundAttachment, isAudioPath, isVoiceInbound, replyBody, voicesReply, webPlayable, withLengthName, type Probe, type Run } from './voicenote.ts'
@@ -57,9 +58,15 @@ try {
 } catch {}
 
 const STATE_DIR = process.env.DASHBOARD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'dashboard')
-const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'dashboard'
+// DIVE-7347: a Grok seat. Grok spawns this server from ~/.grok/config.toml, and
+// it runs the Codex adapter shape with grokdispatch.ts as the dispatcher: the
+// message is typed into Grok's pane, the answer read from its session file.
+const GROK = process.env.DASHBOARD_RUNTIME === 'grok' || process.argv.includes('--runtime=grok')
+// Grok may hand an MCP server a trimmed environment; the seat name comes from USER.
+if (GROK && !process.env.USER) process.env.USER = userInfo().username
+const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'dashboard' || GROK
 const DISPATCHER_STATE_DIR = process.env.CODEX_DISPATCHER_STATE_DIR
-  ?? join(homedir(), '.codex', 'channels', 'dispatcher')
+  ?? (GROK ? join(homedir(), '.grok', 'channels', 'dashboard-dispatcher') : join(homedir(), '.codex', 'channels', 'dispatcher'))
 const DISPATCHER_INBOX_DIR = join(DISPATCHER_STATE_DIR, 'inbox')
 const DISPATCHER_OUTBOX_DIR = join(DISPATCHER_STATE_DIR, 'outbox', 'dashboard')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -373,7 +380,13 @@ const mcp = new Server(
         'claude/channel': {},
       },
     },
-    instructions: [
+    // DIVE-7347: Grok answers in plain text (grokdispatch.ts reads it), so the
+    // reply-tool contract below would only mislead it.
+    instructions: GROK ? [
+      'A message that starts with "[5dive web chat" was typed by a person in the 5dive web chat. Your plain-text answer in this session is sent back to that chat as it is; do not use a Telegram tool for it.',
+      '',
+      'Voice notes: a message whose text starts with "[voice note]" was SPOKEN by the person; the rest is its transcript. If it carries a "[Voice note: <path>]" line instead, run `5dive-transcribe <path>` first and answer what it says. Answer a voice note FIRST, before any other tool, in one to three short spoken sentences with no lists, links or code: your answer is spoken back to them, so do not run 5dive-speak yourself.',
+    ].join('\n') : [
       'The sender reads the 5dive dashboard chat (web/mobile app), not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
       'Inbound arrives as <channel source="dashboard" chat_id="dashboard" user="..." ts="...">. Pass chat_id back to reply. If the tag has image_path, Read that path (an uploaded file). To share a file back, pass its absolute path in the reply files array — the dashboard serves it as a download.',
@@ -1040,7 +1053,9 @@ function ensureLongPoll(): void {
 
 // --- Outbound: reply tool -> control-plane messages API --------------------
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+// DIVE-7347: Grok gets no tools here. Its plain-text answer IS the reply, so a
+// reply tool would only let it answer twice.
+mcp.setRequestHandler(ListToolsRequestSchema, async () => GROK ? { tools: [] } : ({
   tools: [
     {
       name: 'reply',
@@ -1251,6 +1266,24 @@ function startDispatcherOutbox(): void {
 // the MCP stdio transport holds stdin open and keeps the loop alive.
 if (!DISPATCHER_ADAPTER) {
   installLifecycle({ channel: 'dashboard', stateDir: STATE_DIR })
+  await mcp.connect(new StdioServerTransport())
+} else if (GROK) {
+  // Grok supervises this server like its Telegram one: it lives as long as the
+  // Grok session that spawned it, over the MCP stdio it holds open.
+  installLifecycle({ channel: 'dashboard', stateDir: STATE_DIR })
+  process.stderr.write('dashboard channel: Grok web chat bridge active (DIVE-7347)\n')
+  startDispatcherOutbox()
+  startGrokDispatcher({
+    inboxDir: DISPATCHER_INBOX_DIR,
+    outboxDir: DISPATCHER_OUTBOX_DIR,
+    sessionsRoot: process.env.DASHBOARD_GROK_SESSIONS ?? join(homedir(), '.grok', 'sessions'),
+    pane: tmuxPane(process.env.DASHBOARD_GROK_SESSION ?? `agent-${AGENT}`),
+    hears: () => existsSync(TRANSCRIBE),
+    // Test seam: a JSON object of TurnTimings fields to shorten.
+    timings: (() => {
+      try { return { ...DEFAULT_TIMINGS, ...JSON.parse(process.env.DASHBOARD_GROK_TIMINGS ?? '{}') } } catch { return DEFAULT_TIMINGS }
+    })(),
+  })
   await mcp.connect(new StdioServerTransport())
 } else {
   process.stderr.write('dashboard channel: app-server dispatcher adapter active; native MCP delivery is not running\n')
