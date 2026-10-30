@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.126: a numbered draft inside a code block no longer gets option buttons (DIVE-7321)
+
+lodar, 2026-10-30, on main's Reddit reply draft: *"our telegram plugin added buttons to your reply. can file fix?"* The draft sat in a ``` code block as "1. … 2. …", and its own "which agent is asking" counted as the choice cue, so it went out with two buttons.
+
+- **Lines inside a ``` block are never options**, and a "?" or cue word inside the block no longer counts as the cue. Yes/No buttons already skipped code blocks (DIVE-6988).
+- A real numbered choice outside the block still gets its buttons, also when a fenced draft sits above it.
+- Same `tna.ts` in all six bridges; agy/grok 0.5.30, codex 0.5.43, opencode 0.5.19, pi 0.1.19.
+
+Harness: `test/dive7321-fenced-draft.test.ts` (main's message on every bridge's real keyboard; 20 of its 29 arms red on 0.5.125).
+
 ### Fixed — telegram 0.5.125: a long answer gets a cut button instead of killing every button (DIVE-7286)
 
 lodar, 2026-10-29, forwarding creative's choice of two reply drafts: *"telegram buttons didn't work here. only plain text"*. Draft 1 was 119 characters, and any option over 90 characters dropped the whole keyboard.

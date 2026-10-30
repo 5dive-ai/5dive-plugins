@@ -185,10 +185,22 @@ const hasChoiceCue = (text: string): boolean => CHOICE_CUE_RE.test(text) || CHOI
 // BUTTON text, and the tap brings back the full label from here, so the length
 // check only ever cost the buttons. A step list is still kept out by the cue gate
 // in optionChoices(), not by length.
+//
+// DIVE-7321: a ```fenced``` block is text to copy, not a choice. main sent lodar a
+// numbered Reddit reply draft inside a code block, and the draft's own "which agent
+// is asking" passed the cue gate, so it went out with two option buttons. Lines in
+// a fence are dropped here (so a real list below a fenced draft still parses), and
+// optionChoices() reads its cue from the same unfenced text. An unclosed fence runs
+// to the end. yesNoChoice() empties fences the same way (DIVE-6988).
+// After a restart the tap re-parses Telegram's rendered text, where a MarkdownV2
+// fence is already gone: a draft list plus a real list then reads 1,2,1,2, which
+// is not a clean sequence, so the tap says the option is gone instead of guessing.
+const FENCE_RE = /```[\s\S]*?(?:```|$)/g
+const unfenced = (text: string): string => text.replace(FENCE_RE, '\n')
 export function parseOptions(text: string): ParsedOption[] {
   const opts: ParsedOption[] = []
   let picked = false
-  for (const line of (text ?? '').split('\n')) {
+  for (const line of unfenced(text ?? '').split('\n')) {
     const m = OPTION_LINE_RE.exec(line)
     if (!m) continue
     const star = !!m[1] || PICK_STAR_RE.test(m[3]!)
@@ -215,7 +227,7 @@ export function parseOptions(text: string): ParsedOption[] {
 export function optionChoices(text: string): ParsedOption[] {
   const opts = parseOptions(text)
   if (!opts.length) return []
-  return hasChoiceCue(text ?? '') || opts.some(o => o.pick) ? opts : []
+  return hasChoiceCue(unfenced(text ?? '')) || opts.some(o => o.pick) ? opts : []
 }
 
 // DIVE-332 / DIVE-1429: pure core of the Yes/No detector (sibling of optionChoices).
