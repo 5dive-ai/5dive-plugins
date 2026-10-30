@@ -35,6 +35,7 @@ import { join } from 'path'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
+import { openclawTurn, startOpenclawDispatcher } from './openclawdispatch.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
 import { audioSeconds, inboundAttachment, isAudioPath, isVoiceInbound, replyBody, voicesReply, webPlayable, withLengthName, type Probe, type Run } from './voicenote.ts'
@@ -61,12 +62,23 @@ const STATE_DIR = process.env.DASHBOARD_STATE_DIR ?? join(homedir(), '.claude', 
 // DIVE-7347: a Grok seat. Grok spawns this server from ~/.grok/config.toml, and
 // it runs the Codex adapter shape with grokdispatch.ts as the dispatcher: the
 // message is typed into Grok's pane, the answer read from its session file.
-const GROK = process.env.DASHBOARD_RUNTIME === 'grok' || process.argv.includes('--runtime=grok')
+const RUNTIME = process.env.DASHBOARD_RUNTIME
+  || process.argv.find(a => a.startsWith('--runtime='))?.slice('--runtime='.length) || ''
+const GROK = RUNTIME === 'grok'
+// DIVE-7349: a Hermes or OpenClaw seat. The seat's start script runs this
+// server on its own (no MCP parent), in the same adapter shape, with a local
+// spool as the dispatcher: on Hermes the 5dive channel plugin inside its
+// gateway reads it (hermes/adapter.py), on OpenClaw openclawdispatch.ts does.
+const HERMES = RUNTIME === 'hermes'
+const OPENCLAW = RUNTIME === 'openclaw'
 // Grok may hand an MCP server a trimmed environment; the seat name comes from USER.
-if (GROK && !process.env.USER) process.env.USER = userInfo().username
-const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'dashboard' || GROK
+if ((GROK || HERMES || OPENCLAW) && !process.env.USER) process.env.USER = userInfo().username
+const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'dashboard' || GROK || HERMES || OPENCLAW
 const DISPATCHER_STATE_DIR = process.env.CODEX_DISPATCHER_STATE_DIR
-  ?? (GROK ? join(homedir(), '.grok', 'channels', 'dashboard-dispatcher') : join(homedir(), '.codex', 'channels', 'dispatcher'))
+  ?? (GROK ? join(homedir(), '.grok', 'channels', 'dashboard-dispatcher')
+    : HERMES ? join(homedir(), '.hermes', 'channels', '5dive')
+    : OPENCLAW ? join(homedir(), '.openclaw', 'channels', '5dive')
+    : join(homedir(), '.codex', 'channels', 'dispatcher'))
 const DISPATCHER_INBOX_DIR = join(DISPATCHER_STATE_DIR, 'inbox')
 const DISPATCHER_OUTBOX_DIR = join(DISPATCHER_STATE_DIR, 'outbox', 'dashboard')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -1285,6 +1297,20 @@ if (!DISPATCHER_ADAPTER) {
     })(),
   })
   await mcp.connect(new StdioServerTransport())
+} else if (HERMES || OPENCLAW) {
+  // No MCP parent to outlive: the seat's start script supervises this process
+  // and the unit's stop takes it down with the seat.
+  process.stderr.write(`dashboard channel: ${RUNTIME} web chat bridge active (DIVE-7349), spool ${DISPATCHER_STATE_DIR}\n`)
+  startDispatcherOutbox()
+  if (OPENCLAW) {
+    startOpenclawDispatcher({
+      inboxDir: DISPATCHER_INBOX_DIR,
+      outboxDir: DISPATCHER_OUTBOX_DIR,
+      run: openclawTurn(process.env.DASHBOARD_OPENCLAW_BIN ?? '/home/claude/.local/bin/openclaw', join(DISPATCHER_STATE_DIR, 'turns')),
+      // Test seam: shorten the boot-time retry.
+      ...(process.env.DASHBOARD_OPENCLAW_RETRY_MS ? { retryMs: Number(process.env.DASHBOARD_OPENCLAW_RETRY_MS) } : {}),
+    })
+  }
 } else {
   process.stderr.write('dashboard channel: app-server dispatcher adapter active; native MCP delivery is not running\n')
   startDispatcherOutbox()
