@@ -17,8 +17,8 @@ import type * as Tna from '../plugins/telegram/tna'
 
 const TG = join(import.meta.dir, '..', 'plugins', 'telegram')
 const TNA_NEW = readFileSync(join(TG, 'tna.ts'), 'utf8')
-const FIX = "return hasChoiceCue(text ?? '') || opts.some(o => o.pick) ? opts : []"
-const TNA_OLD = TNA_NEW.replace(FIX, "return hasChoiceCue(text ?? '') ? opts : []")
+const FIX = "return hasChoiceCue(unfenced(text ?? '')) || opts.some(o => o.pick) ? opts : []"
+const TNA_OLD = TNA_NEW.replace(FIX, "return hasChoiceCue(unfenced(text ?? '')) ? opts : []")
 const MSG = "I'd do one fresh sign-in.\n1. ⭐ Sign in again with the same account\n2. Wait for the old login to come back"
 
 let tick = Date.now() / 1000
