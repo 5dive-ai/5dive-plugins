@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram-agy / telegram-grok 0.5.32: an Antigravity agent tells you when a turn fails (DIVE-7427)
+
+Antigravity has no `Notification` hook event, so 5dive now wires the error relay on `Stop`. agy's Stop payload names why the turn ended, next to your last message.
+
+- **A failed turn is relayed:** an error posts its text, a hit limit posts `turn stopped: <reason>`.
+- **A normal or canceled turn is not.** The old relay posted any payload it could not read as JSON when an error word appeared anywhere in it, so "fix the failing test" would have come back as an error after every turn.
+- 5dive wires the relay on Stop only once a box has this version (it looks for `terminationReason` in the relay), so the old relay never sees a Stop payload. Grok's Notification relay is unchanged; the new branch lives in the generator base.
+
+Harness: `test/dive7427-agy-stop-relay.test.ts` (9 tests; the 5 Stop arms are red on the old tree).
+
 ### Fixed — telegram-grok / telegram-agy 0.5.31: a Grok agent hears you mid-turn and shows "typing…" while it works (DIVE-7422)
 
 Box report 598 (chill-gorge, 2026-10-31): the agent asked a question, kept working, and the owner's "so?" and "what the plan?" waited until the turn ended. Nothing showed on the phone in between.
