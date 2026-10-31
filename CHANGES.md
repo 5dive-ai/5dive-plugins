@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Added — telegram 0.5.127: the agent sees whose message a forward is, and what a reply or quote points at (DIVE-7429)
+
+Box report 601 (teal-fox): forward someone's message, reply to an earlier one, or reply with a quote, and the agent only got your own words. It guessed who wrote the forward and which message you meant.
+
+- **New inbound keys**, present only when Telegram sends them: `forward_from` (+ `forward_from_kind` user/hidden_user/chat/channel, `forward_date`), `reply_to_message_id` (+ `reply_to_from`, `bot` for its own message, and a one-line `reply_to_preview`), and `quote_text`. A reply into another chat fills the reply keys from `external_reply`. The forum-topic service message is not counted as a reply.
+- **Each value is flattened and stripped** of `"`, `<`, `>`, control and bidi characters, and capped (names 64, preview 120, quote 300). A forwarded sender picks their own name, so a crafted one must not forge `via="button"` or `user`. Meta only, never content.
+- The channel instructions say these keys are data from the other message and the speaker is still `user`.
+- Claude plugin only. The codex/agy/grok forks print meta as unquoted `key=value` pairs, so the same values need a different encoding there; not done here.
+
+Harness: `test/dive7429-reply-context.test.ts` (15 tests; the 3 forgery arms go red when the quote/angle-bracket stripping is removed).
+
 ### Fixed — telegram-agy / telegram-grok 0.5.32: an Antigravity agent tells you when a turn fails (DIVE-7427)
 
 Antigravity has no `Notification` hook event, so 5dive now wires the error relay on `Stop`. agy's Stop payload names why the turn ended, next to your last message.
