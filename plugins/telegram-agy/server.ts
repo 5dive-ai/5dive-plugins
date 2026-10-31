@@ -21,6 +21,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  type CallToolRequest,
 } from '@modelcontextprotocol/sdk/types.js'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
@@ -39,6 +40,7 @@ import { appendFileSync as tapAppendFileSync, mkdirSync as tapMkdirSync, statSyn
 import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { writePending, previewOf, pendingNotice } from './pending-inbound.ts'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -390,6 +392,27 @@ const inboxQueue: InboundMsg[] = []
 type Waiter = { resolve: (m: InboundMsg) => void; timer: ReturnType<typeof setTimeout> | null }
 const waiters: Waiter[] = []
 
+// DIVE-7422: mirror the queue to pending-inbound.json so the PreToolUse hook
+// (hooks/inbound-surface.ts) can tell a busy model a message arrived mid-turn —
+// without it a message sent during tool calls is invisible until the turn ends
+// (box report 598). inboundSeq numbers each queued message, so the hook can deny
+// once per NEW batch. Call syncPending() after every change to inboxQueue.
+// Seeded from the clock so it keeps rising across a restart — the hook's
+// surfaced mark outlives this process, and a seq that restarted at 0 would
+// stay below it.
+let inboundSeq = Date.now()
+function syncPending(): void {
+  const newest = inboxQueue[inboxQueue.length - 1]
+  writePending(STATE_DIR, newest ? {
+    pid: process.pid,
+    count: inboxQueue.length,
+    seq: inboundSeq,
+    oldest_ts: inboxQueue[0]!.ts,
+    preview: previewOf(newest.text),
+  } : null)
+}
+syncPending()   // a file left by a previous server describes a queue that no longer exists
+
 function enqueueInbound(msg: InboundMsg) {
   // While the agent is in a detected stall (quota/auth/wedge) it can't run a
   // model turn to answer, so a queued message would just sit there silently —
@@ -411,7 +434,15 @@ function enqueueInbound(msg: InboundMsg) {
     if (next.timer) clearTimeout(next.timer)
     next.resolve(msg)
   } else {
+    inboundSeq++
     inboxQueue.push(msg)
+    syncPending()
+    // DIVE-7422: queued mid-turn → show "typing…" now, so the owner sees the
+    // agent is busy rather than lost; it stops when the turn ends.
+    if (msg.chat_id !== 'agent-send' && turnInFlightCached(0)) {
+      startTypingLoop(msg.chat_id, msg.message_thread_id)
+      releaseTypingToTurnEnd(msg.chat_id)
+    }
     kickOnEnqueue()
   }
 }
@@ -532,7 +563,11 @@ function startAgentInbox(): void {
 }
 
 function dequeueOrWait(timeoutMs: number): Promise<InboundMsg | null> {
-  if (inboxQueue.length > 0) return Promise.resolve(inboxQueue.shift()!)
+  if (inboxQueue.length > 0) {
+    const m = inboxQueue.shift()!
+    syncPending()
+    return Promise.resolve(m)
+  }
   return new Promise(resolve => {
     const waiter: Waiter = { resolve: m => resolve(m), timer: null }
     waiter.timer = setTimeout(() => {
@@ -604,23 +639,42 @@ const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 // Telegram clears the "typing…" indicator ~5s after each sendChatAction.
 // Re-send every 4s per chat from when Antigravity picks up an inbound (via
-// wait_for_message) until the next reply lands, with a 5min ceiling so a
-// crashed turn never loops forever. Without this, a thinking Antigravity looks
-// identical to a hung one from the user's phone.
+// wait_for_message), with a 5min ceiling so a crashed turn never loops forever.
+// Without this, a thinking Antigravity looks identical to a hung one from the user's
+// phone.
+//
+// DIVE-7422: a reply no longer ends the loop while the turn runs on. The first
+// reply is often an ack or a question, and report 598's agent then worked for
+// minutes with nothing showing. After a reply the loop is released to the turn:
+// it stops when Antigravity parks in wait_for_message again (idle) or the turn closes.
 const TYPING_INTERVAL_MS = 4_000
 const TYPING_CEILING_MS = 5 * 60 * 1000
 const typingLoops = new Map<string, ReturnType<typeof setInterval>>()
 const typingCeilings = new Map<string, ReturnType<typeof setTimeout>>()
-function startTypingLoop(chat_id: string) {
+const typingToTurnEnd = new Set<string>()
+function startTypingLoop(chat_id: string, message_thread_id?: string) {
   stopTypingLoop(chat_id)
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // In a forum topic the indicator belongs to the topic the message came from.
+  const opts = message_thread_id ? { message_thread_id: Number(message_thread_id) } : undefined
+  void bot.api.sendChatAction(chat_id, 'typing', opts).catch(() => {})
   const handle = setInterval(() => {
-    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+    if (waiters.length > 0 || (typingToTurnEnd.has(chat_id) && !turnInFlightCached())) {
+      if (typingLoops.get(chat_id) === handle) stopTypingLoop(chat_id)
+      return
+    }
+    void bot.api.sendChatAction(chat_id, 'typing', opts).catch(() => {})
   }, TYPING_INTERVAL_MS)
   typingLoops.set(chat_id, handle)
-  typingCeilings.set(chat_id, setTimeout(() => stopTypingLoop(chat_id), TYPING_CEILING_MS))
+  typingCeilings.set(chat_id, setTimeout(() => {
+    if (typingLoops.get(chat_id) === handle) stopTypingLoop(chat_id)
+  }, TYPING_CEILING_MS))
+}
+// Keep "typing…" up until the turn ends instead of stopping it now.
+function releaseTypingToTurnEnd(chat_id: string) {
+  if (typingLoops.has(chat_id)) typingToTurnEnd.add(chat_id)
 }
 function stopTypingLoop(chat_id: string) {
+  typingToTurnEnd.delete(chat_id)
   const handle = typingLoops.get(chat_id)
   if (handle) {
     clearInterval(handle)
@@ -2528,7 +2582,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
+// DIVE-7422 fallback surface: if the runtime does not show the PreToolUse deny
+// reason to the model, a telegram tool result still says messages are waiting.
+// wait_for_message is the call that drains them, so it never carries the notice.
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  const res: any = await callTool(req)
+  if (req.params.name !== 'wait_for_message' && inboxQueue.length > 0 && Array.isArray(res?.content)) {
+    res.content.push({ type: 'text', text: pendingNotice(inboxQueue.length) })
+  }
+  return res
+})
+
+async function callTool(req: CallToolRequest) {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   markActivity()
   try {
@@ -2549,9 +2614,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         while (inboxQueue.length > 0 && batch.length < BATCH_DRAIN_MAX) {
           batch.push(inboxQueue.shift()!)
         }
-        // Antigravity now has a message to work on — keep "typing…" visible until
-        // it sends `reply` (or the 5min ceiling).
-        startTypingLoop(msg.chat_id)
+        syncPending()
+        // Antigravity now has a message to work on — keep "typing…" visible while it
+        // works (see startTypingLoop for when it stops).
+        startTypingLoop(msg.chat_id, msg.message_thread_id)
         try { writeFileSync(LAST_INBOUND_FILE, String(Date.now())) } catch {}
         if (batch.length === 1) {
           return { content: [{ type: 'text', text: formatInbound(msg) }] }
@@ -2577,7 +2643,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           text.trim() === '' || text.trim() === 'undefined' || isVoiceCaptionNoise(text, files))
 
         assertAllowedChat(chat_id)
-        stopTypingLoop(chat_id)
+        releaseTypingToTurnEnd(chat_id)
         for (const f of files) {
           assertInStateDir(f)
           const st = statSync(f)
@@ -2691,7 +2757,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const msg = err instanceof Error ? err.message : String(err)
     return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true }
   }
-})
+}
 
 // ============================================================================
 // Listen-loop self-heal
@@ -2974,6 +3040,15 @@ function newestTurnMtimeMs(): number {
 // keeps the newestTurnMtimeMs() + idle-threshold heuristic — DIVE-14 tracks giving
 // agy a real in-flight signal (decode the protobuf, or a process/connection probe).
 function turnInFlight(): boolean { return false }
+
+// turnInFlight() runs `find` and reads a log tail; the typing loop asks every
+// 4s per chat, so share one answer for a few seconds.
+let turnInFlightMemo = { at: 0, v: false }
+function turnInFlightCached(maxAgeMs = 8_000): boolean {
+  const now = Date.now()
+  if (now - turnInFlightMemo.at > maxAgeMs) turnInFlightMemo = { at: now, v: turnInFlight() }
+  return turnInFlightMemo.v
+}
 
 function startRearmWatchdog(): void {
   if (REARM_DISABLED) return
