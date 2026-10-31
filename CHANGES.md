@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.128 / dashboard 0.5.18: a hook no longer reads the whole session and wedges the seat (DIVE-7434)
+
+Box report 607 (smoky-canyon): both plugins' StopFailure hooks sat ~3 h at ~350 MB each. The seat ran out of memory headroom, everything in it stalled, and the Telegram poller died until a manual restart. Third time on that box.
+
+- **Hooks read the end of the transcript, not all of it.** They start with the last 1 MB and widen only until the current turn's start (or, for the notice routing, the newest inbound) is in view, never past 16 MB. On a 60 MB transcript a hook now peaks at 62–86 MB; before, 185–330 MB.
+- **The waits that compared entry counts compare the file size** (stop-reply-check, stop-reply-relay), and the resume helpers and the Stop re-entry lock remember a byte offset instead of a line number, so none of them parses the whole file either.
+- **Every Bot API call from a hook gives up after 4 s.** Before, a stalled connection held the StopFailure hook open indefinitely.
+- **Each Stop/StopFailure/PostToolUse hook ends itself** just under its hooks.json timeout, since Claude Code's timeout did not reap the throttled ones.
+
+Harness: `test/dive7434-bounded-transcript.test.ts` (7 tests; the 4 hook arms are red on the old tree — 330 MB, and the telegram StopFailure hook hung the full 30 s on a Bot API that never answers).
+
 ### Added — telegram 0.5.127: the agent sees whose message a forward is, and what a reply or quote points at (DIVE-7429)
 
 Box report 601 (teal-fox): forward someone's message, reply to an earlier one, or reply with a quote, and the agent only got your own words. It guessed who wrote the forward and which message you meant.

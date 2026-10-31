@@ -476,7 +476,9 @@ describe('(D) the Stop hook', () => {
   })
 
   test('D4 the signal comes before the hook\'s first exit', () => {
-    const src = readFileSync(HOOK, 'utf8')
+    // DIVE-7434's deadline timer is not an exit on the hook's path: it fires
+    // only after the synchronous run has long passed the signal.
+    const src = readFileSync(HOOK, 'utf8').replace(/^setTimeout\(\(\) => process\.exit\(0\), [\d_]+\)\.unref\(\)$/m, '')
     expect(src.indexOf('signalTurnEnded()\n')).toBeGreaterThan(-1)
     expect(src.indexOf('signalTurnEnded()\n')).toBeLessThan(src.indexOf('process.exit('))
   })

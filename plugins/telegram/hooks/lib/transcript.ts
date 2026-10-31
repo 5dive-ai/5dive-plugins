@@ -1,18 +1,81 @@
-import { readFileSync } from 'fs'
+import { closeSync, fstatSync, openSync, readSync, statSync } from 'fs'
 import type { TranscriptContentBlock, TranscriptEntry } from './types'
 
-// Read a JSONL transcript file into entries. Malformed lines are silently
-// dropped — claude occasionally writes a partial line that we'll see again
-// on the next read. Returns [] on file-not-found.
-export function readEntries(transcriptPath: string): TranscriptEntry[] {
-  let raw: string
+// DIVE-7434: hooks read the TAIL of the transcript, never the whole file.
+//
+// A long-lived seat's session JSONL reaches tens of MB, and JSON.parse of all
+// of it costs ~8x the file in RSS (25.6 MB → 195 MB, measured). Two StopFailure
+// hooks doing that together pushed a customer seat's cgroup past memory.high:
+// the kernel throttled every task in it, the hooks crawled for 3 h (Claude
+// Code's hook timeout never reaped them) and the Telegram poller starved.
+//
+// Everything a hook asks of the transcript is near the end — the current turn,
+// the last RATE_LIMIT_LOOKBACK entries, the newest inbound — so read the last
+// TAIL_START_BYTES and widen x4 only while `enough` says the window is short,
+// never past TAIL_MAX_BYTES. A turn (or an inbound) older than that cap is
+// read as if absent: the cost of that is a missed relay, the cost of reading
+// on is the wedged seat.
+export const TAIL_START_BYTES = 1 << 20
+export const TAIL_MAX_BYTES = 16 << 20
+
+// The turn-opening prompt: type=user with STRING content (see analyzeTurn).
+export function hasTurnStart(entries: TranscriptEntry[]): boolean {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]
+    if (e.type === 'user' && typeof e.message?.content === 'string') return true
+  }
+  return false
+}
+
+// Any user entry carrying a channel tag (telegram or dashboard). Only a stop
+// condition for the window, so quoted tags over-satisfy it harmlessly; who
+// may be TRUSTED as the caller is still decided by trustedChannelTags.
+export function hasChannelInbound(entries: TranscriptEntry[]): boolean {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]
+    if (e.type === 'user' && entryTexts(e.message?.content ?? '').some((t) => t.includes('<channel source="'))) return true
+  }
+  return false
+}
+
+export type WindowCheck = (entries: TranscriptEntry[]) => boolean
+
+// The default window: the current turn's start and the rate-limit lookback.
+export const turnWindow: WindowCheck = (entries) => entries.length >= RATE_LIMIT_LOOKBACK && hasTurnStart(entries)
+
+// The turn window, widened until it also holds the newest inbound (routing).
+export const inboundWindow: WindowCheck = (entries) => turnWindow(entries) && hasChannelInbound(entries)
+
+// The transcript's size in bytes, -1 when it cannot be read. Callers that
+// wait for the tail to settle compare this, not an entry count: a fixed-size
+// tail window can gain an entry at the end and lose one at the front.
+export function transcriptSize(transcriptPath: string): number {
   try {
-    raw = readFileSync(transcriptPath, 'utf8')
+    return statSync(transcriptPath).size
   } catch {
-    return []
+    return -1
+  }
+}
+
+// Parse bytes [from, to) of the file. `dropFirst`: the slice starts mid-file,
+// so its first line is (probably) partial — cut it at the byte level, before
+// decoding, so a split UTF-8 sequence never reaches the decoder.
+function parseRange(fd: number, from: number, to: number, dropFirst: boolean): TranscriptEntry[] {
+  const buf = Buffer.allocUnsafe(Math.max(0, to - from))
+  let got = 0
+  while (got < buf.length) {
+    const n = readSync(fd, buf, got, buf.length - got, from + got)
+    if (n <= 0) break
+    got += n
+  }
+  let start = 0
+  if (dropFirst) {
+    const nl = buf.indexOf(0x0a)
+    if (nl < 0 || nl >= got) return []
+    start = nl + 1
   }
   const out: TranscriptEntry[] = []
-  for (const line of raw.split('\n')) {
+  for (const line of buf.toString('utf8', start, got).split('\n')) {
     if (!line) continue
     try {
       out.push(JSON.parse(line))
@@ -21,6 +84,55 @@ export function readEntries(transcriptPath: string): TranscriptEntry[] {
     }
   }
   return out
+}
+
+// Read the transcript's tail into entries (see above). Malformed lines are
+// silently dropped — claude occasionally writes a partial line that we'll see
+// again on the next read. Returns [] on file-not-found.
+export function readEntries(transcriptPath: string, enough: WindowCheck = turnWindow): TranscriptEntry[] {
+  let fd: number
+  try {
+    fd = openSync(transcriptPath, 'r')
+  } catch {
+    return []
+  }
+  try {
+    const size = fstatSync(fd).size
+    let window = Math.min(size, TAIL_START_BYTES)
+    for (;;) {
+      const entries = parseRange(fd, size - window, size, window < size)
+      if (window >= size || window >= TAIL_MAX_BYTES || enough(entries)) return entries
+      window = Math.min(size, window * 4, TAIL_MAX_BYTES)
+    }
+  } catch {
+    return []
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// The entries written at or after byte `offset` (a transcriptSize() taken
+// earlier), capped to the last TAIL_MAX_BYTES. An offset past the end means
+// the file was replaced: nothing new is readable from it.
+export function readEntriesFrom(transcriptPath: string, offset: number): TranscriptEntry[] {
+  let fd: number
+  try {
+    fd = openSync(transcriptPath, 'r')
+  } catch {
+    return []
+  }
+  try {
+    const size = fstatSync(fd).size
+    if (offset > size) return []
+    const from = Math.max(offset, size - TAIL_MAX_BYTES)
+    // A partial line at `offset` (the baseline caught a write mid-flush) fails
+    // JSON.parse and is skipped; only a cap cut needs the explicit drop.
+    return parseRange(fd, from, size, from > offset)
+  } catch {
+    return []
+  } finally {
+    closeSync(fd)
+  }
 }
 
 // Find the most-recent rate-limit notice text. claude logs it as a

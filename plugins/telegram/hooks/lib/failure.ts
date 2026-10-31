@@ -4,7 +4,7 @@
 // of this file (plugins/dashboard/hooks/SHARED.txt), so the two channels cannot
 // disagree about whether an agent hit its limit or a server blip.
 
-import { readEntries, findRateLimitText } from './transcript'
+import { readEntries, findRateLimitText, turnWindow, type WindowCheck } from './transcript'
 import { parseResetEpoch } from './time'
 import { isTermsWall } from './terms'
 import type { HookPayload, TranscriptEntry } from './types'
@@ -110,6 +110,7 @@ export async function resolveResetEpoch(
   pane: string,
   isRateLimit: boolean,
   entries: TranscriptEntry[],
+  enough: WindowCheck = turnWindow,
 ): Promise<{ resetEpoch: number | null; entries: TranscriptEntry[] }> {
   let resetEpoch: number | null = null
   const resetRaw =
@@ -126,7 +127,7 @@ export async function resolveResetEpoch(
     for (let attempt = 0; attempt < tries; attempt++) {
       if (attempt > 0) {
         await new Promise(r => setTimeout(r, 500))
-        entries = readEntries(transcriptPath)
+        entries = readEntries(transcriptPath, enough)
       }
       const transcriptResetText = findRateLimitText(entries)
       if (transcriptResetText) {

@@ -17,7 +17,7 @@ import { homedir } from 'os'
 import { join, basename } from 'path'
 import { stateDir, signalTurnEnded } from './lib/paths'
 import { readPayload } from './lib/payload'
-import { readEntries } from './lib/transcript'
+import { readEntries, inboundWindow } from './lib/transcript'
 import { getOwnerChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { sendMessage } from './lib/telegram'
 import { capturePane, getTmuxContext } from './lib/tmux'
@@ -30,6 +30,11 @@ import { inboundLang, TERMS_NOTICE } from './lib/terms'
 import { classifyFailure, failureMessage, resolveResetEpoch, CREDIT_NOTICE } from './lib/failure'
 import { RESUME_LOCK_TTL_MS, resumeLogDir as makeResumeLogDir, tryAcquireResumeLock } from './lib/resume-lock'
 import { onDemoAccount, readDemoKey, isKeyLimitText, claimDemoNotice, releaseDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
+
+// DIVE-7434: this hook's own deadline, under hooks.json's 10s. Claude Code's
+// timeout did not reap a hook the kernel was throttling (one lived 2:56 h),
+// so the hook ends itself; bounded transcript reads keep the loop free to fire.
+setTimeout(() => process.exit(0), 9_000).unref()
 
 const payload = await readPayload<HookPayload>()
 const msg = failureMessage(payload)
@@ -46,7 +51,9 @@ const HEADROOM_PCT = 90
 const FRESH_USAGE_MAX_AGE_S = 15 * 60
 
 const transcriptPath = payload.transcript_path
-let entries = transcriptPath ? readEntries(transcriptPath) : []
+// inboundWindow: getCallerChat below routes on the newest inbound, which may
+// predate the current turn (DIVE-7434).
+let entries = transcriptPath ? readEntries(transcriptPath, inboundWindow) : []
 
 // Capture the pane up front. Two uses:
 //   1. Scrape "API Error: 529 ..." for non-rate-limit failures (payload only
@@ -91,7 +98,7 @@ void RESUME_LOCK_TTL_MS
 
 // Resolve an unlock/reset epoch (lib/failure.ts): payload → transcript (re-read
 // for ~2s on a usage limit, the flush race) → message text → pane.
-const resolved = await resolveResetEpoch(payload, msg, pane, isRateLimit, entries)
+const resolved = await resolveResetEpoch(payload, msg, pane, isRateLimit, entries, inboundWindow)
 const resetEpoch: number | null = resolved.resetEpoch
 entries = resolved.entries
 

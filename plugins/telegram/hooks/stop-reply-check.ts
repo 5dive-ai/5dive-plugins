@@ -40,7 +40,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { setTimeout as sleep } from 'timers/promises'
 import { readPayload } from './lib/payload'
-import { readEntries, analyzeTurn, hadTelegramToolCallAfter } from './lib/transcript'
+import { readEntries, readEntriesFrom, transcriptSize, analyzeTurn, hadTelegramToolCallAfter } from './lib/transcript'
 import { sendMessage, getToken } from './lib/telegram'
 import { isLite, readLiteLang, readAllowance, liteLimitText, recordOpsDetail, LITE_STRINGS } from './lib/lite'
 
@@ -53,6 +53,11 @@ import { TG_TOOL_PREFIX, signalTurnEnded } from './lib/paths'
 import { getCallerChat, type CallerChat } from './lib/access'
 import { parseResetEpoch } from './lib/time'
 import type { HookPayload, TranscriptEntry, TranscriptContentBlock } from './lib/types'
+
+// DIVE-7434: this hook's own deadline, under hooks.json's 10s. Claude Code's
+// timeout did not reap a hook the kernel was throttling (one lived 2:56 h),
+// so the hook ends itself; bounded transcript reads keep the loop free to fire.
+setTimeout(() => process.exit(0), 9_000).unref()
 
 const payload = await readPayload<HookPayload>()
 
@@ -74,23 +79,25 @@ if (!transcriptPath || !existsSync(transcriptPath)) process.exit(0)
 // the cause of a real miss: the agent answered in transcript text (no reply
 // tool), but only the earlier pre-tool narration was on disk when the hook
 // read — so the auto-relay sent the narration and dropped the actual answer.
-// Poll until the line count stops growing (one quiet interval) or we hit the
+// Poll until the file size stops growing (one quiet interval) or we hit the
 // ceiling, so `texts` always includes the genuine final answer. Bounded well
-// under the hook's 10s timeout.
+// under the hook's 10s timeout. The size, not the entry count (DIVE-7434):
+// readEntries is a tail window, which can gain an entry at the end and drop
+// one at the front in the same read.
 async function readStableEntries(path: string): Promise<TranscriptEntry[]> {
   const SETTLE_MS = 120
   const MAX_WAIT_MS = 1500
   const deadline = Date.now() + MAX_WAIT_MS
-  let prevLen = -1
-  let entries = readEntries(path)
+  let size = transcriptSize(path)
+  let prevSize = -1
   // Always pay at least one settle interval — the Stop-triggering message is
   // the one most likely to be mid-flush right now.
   do {
-    prevLen = entries.length
+    prevSize = size
     await sleep(SETTLE_MS)
-    entries = readEntries(path)
-  } while (entries.length !== prevLen && Date.now() < deadline)
-  return entries
+    size = transcriptSize(path)
+  } while (size !== prevSize && Date.now() < deadline)
+  return readEntries(path)
 }
 
 const lockKey = createHash('sha1').update(transcriptPath).digest('hex')
@@ -198,20 +205,24 @@ if (payload.stop_hook_active === true) {
   if (existsSync(lockFile)) {
     let cachedChat = ''
     let cachedMsg = ''
-    let cachedLine = 0
+    let cachedOffset = -1
     let cachedThread = ''
     try {
       const parts = readFileSync(lockFile, 'utf8').split('|')
       cachedChat = parts[0] ?? ''
       cachedMsg = parts[1] ?? ''
-      cachedLine = parseInt(parts[2] ?? '0', 10) || 0
+      // DIVE-7434: a byte offset, written `b<n>`. A bare number is a line
+      // count from a pre-0.5.128 lock — unusable as an offset, so it reads as
+      // "not recovered" and the diagnostic goes out (once, at the upgrade).
+      const m = /^b(\d+)$/.exec(parts[2] ?? '')
+      if (m) cachedOffset = parseInt(m[1], 10)
       cachedThread = parts[3] ?? ''
       unlinkSync(lockFile)
     } catch {
       // ignore
     }
-    const recovered = cachedLine > 0
-      ? hadTelegramToolCallAfter(entries, cachedLine, TG_TOOL_PREFIX)
+    const recovered = cachedOffset >= 0
+      ? hadTelegramToolCallAfter(readEntriesFrom(transcriptPath, cachedOffset), 0, TG_TOOL_PREFIX)
       : false
     if (recovered) process.exit(0)
     if (cachedChat && getToken()) {
@@ -310,10 +321,10 @@ if (existsSync(lockFile)) {
   process.exit(0)
 }
 
-// Write lock with line-count anchor + block the Stop.
-const lineCount = readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean).length
+// Write lock with a byte-offset anchor + block the Stop.
+const offset = Math.max(0, transcriptSize(transcriptPath))
 try {
-  writeFileSync(lockFile, `${chatId}|${a.lastMessageId ?? ''}|${lineCount}|${threadId ?? ''}`)
+  writeFileSync(lockFile, `${chatId}|${a.lastMessageId ?? ''}|b${offset}|${threadId ?? ''}`)
 } catch {
   // ignore
 }

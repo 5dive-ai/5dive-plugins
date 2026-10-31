@@ -126,6 +126,7 @@ async function post(): Promise<boolean> {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(4000),
     })
     return r.ok
   } catch {
