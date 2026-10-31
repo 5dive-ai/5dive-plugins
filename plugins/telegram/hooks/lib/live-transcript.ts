@@ -1,6 +1,6 @@
 import { readdirSync, statSync } from 'fs'
 import { dirname, join } from 'path'
-import { readEntries } from './transcript'
+import { readEntriesFrom, transcriptSize } from './transcript'
 import type { TranscriptEntry } from './types'
 
 // DIVE-4628: resolve the transcript that is LIVE **now**, not the one that was
@@ -57,13 +57,15 @@ function mtimeOf(path: string): number {
   }
 }
 
-// Where the live transcript stood at the moment we typed. `len < 0` means we
-// have no transcript to watch at all — the caller falls back to the pane.
+// Where the live transcript stood at the moment we typed, as its size in
+// BYTES (DIVE-7434: an entry index needed the whole file parsed on every poll).
+// `len < 0` means we have no transcript to watch at all — the caller falls
+// back to the pane.
 export type ResumeBaseline = { path: string; len: number }
 
 export function captureBaseline(initialPath: string): ResumeBaseline {
   const path = resolveLiveTranscript(initialPath)
-  return { path, len: path ? readEntries(path).length : -1 }
+  return { path, len: path ? Math.max(0, transcriptSize(path)) : -1 }
 }
 
 // Did the agent pick up since `baseline`? `accept` decides what counts as a
@@ -71,10 +73,11 @@ export function captureBaseline(initialPath: string): ResumeBaseline {
 // non-rate_limit assistant entry, the transient-error one demands no error at
 // all), and that difference must not be flattened by sharing this code.
 //
-// On a rotation the baseline INDEX is meaningless against the new file — index
-// 40 of the old session is not index 40 of the new one — so the whole new file
-// is in scope. That is correct for the case this exists for: the rotated-to
-// file is where the reply we are waiting for actually lands.
+// On a rotation the baseline OFFSET is meaningless against the new file — byte
+// 4000 of the old session is not byte 4000 of the new one — so the whole new
+// file (up to readEntriesFrom's cap) is in scope. That is correct for the case
+// this exists for: the rotated-to file is where the reply we are waiting for
+// actually lands.
 export function resumedSinceBaseline(
   initialPath: string,
   baseline: ResumeBaseline,
@@ -83,11 +86,7 @@ export function resumedSinceBaseline(
   if (!initialPath || baseline.len < 0) return false
   const live = resolveLiveTranscript(initialPath)
   const from = live === baseline.path ? baseline.len : 0
-  const entries = readEntries(live)
-  for (let i = from; i < entries.length; i++) {
-    if (entries[i].type === 'assistant' && accept(entries[i])) return true
-  }
-  return false
+  return readEntriesFrom(live, from).some((e) => e.type === 'assistant' && accept(e))
 }
 
 // True when the live transcript is no longer the one the baseline measured.

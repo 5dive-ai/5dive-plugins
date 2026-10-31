@@ -27,7 +27,7 @@ import { existsSync, mkdirSync, openSync, readFileSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { readPayload } from './lib/payload'
-import { readEntries } from './lib/transcript'
+import { readEntries, inboundWindow } from './lib/transcript'
 import { capturePane, getTmuxContext } from './lib/tmux'
 import { classifyFailure, failureMessage, resolveResetEpoch } from './lib/failure'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
@@ -36,6 +36,11 @@ import { answeredAfter, dashboardStateDir, lastDashboardInbound, noticeLang, not
 import { textLang } from './lib/terms'
 import { isLite, liteLimitText, readAllowance, readLiteLang, recordOpsDetail } from './lib/lite'
 import type { HookPayload } from './lib/types'
+
+// DIVE-7434: this hook's own deadline, under hooks.json's 10s. Claude Code's
+// timeout did not reap a hook the kernel was throttling (one lived 2:56 h),
+// so the hook ends itself; bounded transcript reads keep the loop free to fire.
+setTimeout(() => process.exit(0), 9_000).unref()
 
 const log = (s: string) => console.error(`[dashboard-stopfailure] ${s}`)
 
@@ -59,8 +64,10 @@ const ownCapUsedUp = allowance?.kind === 'capped' && allowance.pctLeft === 0
 if (lite && kind.isOutOfCredit) recordOpsDetail('stopfailure', `out of AI credit: ${msg}`)
 
 const transcriptPath = payload.transcript_path
-const first = transcriptPath ? readEntries(transcriptPath) : []
-const { resetEpoch, entries } = await resolveResetEpoch(payload, msg, pane, kind.isRateLimit, first)
+// inboundWindow: the notice goes to the newest web-chat message, which may
+// predate the current turn (DIVE-7434).
+const first = transcriptPath ? readEntries(transcriptPath, inboundWindow) : []
+const { resetEpoch, entries } = await resolveResetEpoch(payload, msg, pane, kind.isRateLimit, first, inboundWindow)
 
 const inbound = lastDashboardInbound(entries)
 const pending = inbound !== null && !answeredAfter(entries, inbound.index)

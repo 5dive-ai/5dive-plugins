@@ -75,7 +75,7 @@ describe('DIVE-4628 live transcript resolution', () => {
     const p = session('a.jsonl', userEntry + assistantEntry, 60)
     const baseline = captureBaseline(p)
     expect(baseline.path).toBe(p)
-    expect(baseline.len).toBe(2)
+    expect(baseline.len).toBe(Buffer.byteLength(userEntry + assistantEntry)) // DIVE-7434: bytes, not entries
     expect(resumedSinceBaseline(p, baseline, NOT_RATE_LIMIT)).toBe(false) // nothing new yet
     appendFileSync(p, assistantEntry)
     expect(resumedSinceBaseline(p, baseline, NOT_RATE_LIMIT)).toBe(true)

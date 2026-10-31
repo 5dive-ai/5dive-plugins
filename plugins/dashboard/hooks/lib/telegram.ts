@@ -117,6 +117,8 @@ export async function sendMessage(chatId: string, text: string, threadId?: strin
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
+      // DIVE-7434: a stalled connection must not hold the hook open.
+      signal: AbortSignal.timeout(4000),
     })
     if (!res.ok) {
       // Telegram puts the actual reason in the body's `description`

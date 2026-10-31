@@ -29,12 +29,17 @@ import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { readPayload } from './lib/payload'
-import { readEntries } from './lib/transcript'
+import { readEntries, inboundWindow } from './lib/transcript'
 import { getToken } from './lib/telegram'
 import { getOwnerChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { nudgeFile } from './lib/paths'
 import type { HookPayload } from './lib/types'
 import { isLite, readLiteLang, LITE_STRINGS } from './lib/lite'
+
+// DIVE-7434: this hook's own deadline, under hooks.json's 8s. Claude Code's
+// timeout did not reap a hook the kernel was throttling (one lived 2:56 h),
+// so the hook ends itself; bounded transcript reads keep the loop free to fire.
+setTimeout(() => process.exit(0), 7_000).unref()
 
 // Opt-in gate: the carry-over nudge is OFF by default and only fires once the
 // user has turned it on for this agent with `/context on` (writes
@@ -116,7 +121,7 @@ if (crossed.at <= maxFired) process.exit(0)
 // an autonomous session still surfaces the nudge (DIVE-6518: not a guest).
 const entries = (() => {
   try {
-    return payload.transcript_path ? readEntries(payload.transcript_path) : []
+    return payload.transcript_path ? readEntries(payload.transcript_path, inboundWindow) : []
   } catch {
     return []
   }
@@ -156,6 +161,7 @@ try {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: params.toString(),
+    signal: AbortSignal.timeout(4000),
   })
   // Only burn the tier if Telegram accepted it — a transient network failure
   // shouldn't permanently swallow the nudge for this session.

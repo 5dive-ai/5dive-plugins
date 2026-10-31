@@ -10,6 +10,8 @@
 //   ok           — 200 {ok:true} for everything
 //   reject-all   — $STUB_STATUS (default 400) + $STUB_DESC for everything
 //   reject-first — the first call is rejected, the rest accepted
+//   hang         — records the call and never answers (DIVE-7434: a stalled
+//                  connection must not hold a hook open)
 import { appendFileSync } from 'fs'
 
 const log = process.env.STUB_LOG ?? '/dev/null'
@@ -35,6 +37,7 @@ const server = Bun.serve({
         markup: body.get('reply_markup') ?? undefined,
       }) + '\n',
     )
+    if (mode === 'hang') return new Promise<Response>(() => {})
     const reject = mode === 'reject-all' || (mode === 'reject-first' && n === 1)
     return reject
       ? new Response(JSON.stringify({ ok: false, error_code: status, description: desc }), { status })

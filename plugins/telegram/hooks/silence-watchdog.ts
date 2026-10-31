@@ -31,6 +31,11 @@ import { emitPostToolContext } from './lib/output'
 import { readEntries, analyzeTurn } from './lib/transcript'
 import { TG_TOOL_PREFIX } from './lib/paths'
 
+// DIVE-7434: this hook's own deadline, under hooks.json's 5s. Claude Code's
+// timeout did not reap a hook the kernel was throttling (one lived 2:56 h),
+// so the hook ends itself; bounded transcript reads keep the loop free to fire.
+setTimeout(() => process.exit(0), 4_500).unref()
+
 // Drain stdin. We only need transcript_path (for the DIVE-1323 a2a-turn
 // check below); the rest is unused.
 const payload = await readPayload<{ transcript_path?: string }>()
