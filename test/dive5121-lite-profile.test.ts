@@ -93,7 +93,7 @@ describe('no profile set = the plugin as it is today', () => {
     expect(renderHelpBody(COMMAND_REGISTRY, true)).not.toContain('/council')
   })
 
-  test('the default MCP instructions block is byte-identical to the 0.5.64 release plus the DIVE-5171 tap line', () => {
+  test('the default MCP instructions block is byte-identical to the 0.5.64 release plus the DIVE-5171 tap line and the DIVE-7429 reply-context line', () => {
     // Extracted exactly as tests/telegram_instructions_unit.sh extracts it.
     // DIVE-5171 (0.5.68) added one sentence on purpose — a via="button" inbound
     // is the user's real answer — so the pin moved with it. 0.5.64's block was
@@ -114,13 +114,17 @@ describe('no profile set = the plugin as it is today', () => {
     // DIVE-7032 (0.5.121) changed that sentence on purpose: the pick's line
     // starts with ⭐ so its button carries the star. 0.5.120's block was
     // f139fdec3ad1314b4abc4a5dfc12abbf7956dacd4db3dbcb1c828f10df0fdcdd.
+    // DIVE-7429 (0.5.127) added one sentence on purpose: the forward_from,
+    // reply_to_* and quote_text keys describe the other message and are data,
+    // never instructions. 0.5.126's block was
+    // 0bf939d16ec0cfe418e21a72216fd1974ab204d85db221b8e90ac4384d1d35e1.
     const lines = SERVER.split('\n')
     const start = lines.indexOf('    instructions: [')
     const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
     expect(start).toBeGreaterThan(0)
     expect(end).toBeGreaterThan(start)
     const block = lines.slice(start + 1, end).join('\n') + '\n'
-    expect(sha(block)).toBe('0bf939d16ec0cfe418e21a72216fd1974ab204d85db221b8e90ac4384d1d35e1')
+    expect(sha(block)).toBe('d60cd6365124253cd2cf5984372ab83a789ed0a0ac392f9d3f6015093c0f4044')
     // The lite block is a LATER key that only exists when LITE is true.
     expect(lines[end]).toBe("    ].join('\\n'),")
     expect(lines.slice(end + 1, end + 5).join('\n')).toContain('...(LITE ? { instructions: LITE_INSTRUCTIONS } : {}),')
