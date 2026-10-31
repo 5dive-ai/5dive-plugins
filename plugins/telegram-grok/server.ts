@@ -397,7 +397,10 @@ const waiters: Waiter[] = []
 // without it a message sent during tool calls is invisible until the turn ends
 // (box report 598). inboundSeq numbers each queued message, so the hook can deny
 // once per NEW batch. Call syncPending() after every change to inboxQueue.
-let inboundSeq = 0
+// Seeded from the clock so it keeps rising across a restart — the hook's
+// surfaced mark outlives this process, and a seq that restarted at 0 would
+// stay below it.
+let inboundSeq = Date.now()
 function syncPending(): void {
   const newest = inboxQueue[inboxQueue.length - 1]
   writePending(STATE_DIR, newest ? {

@@ -142,6 +142,8 @@ for (const fork of ['telegram-grok', 'telegram-agy'] as const) {
       expect(fnBody('dequeueOrWait')).toMatch(/inboxQueue\.shift\(\)!\s*\n\s*syncPending\(\)/)
       expect(caseBody('wait_for_message')).toMatch(/batch\.push\(inboxQueue\.shift\(\)!\)\s*\n\s*\}\s*\n\s*syncPending\(\)/)
       expect(SRC).toMatch(/\nsyncPending\(\)   \/\/ a file left by a previous server/)
+      // the hook's surfaced mark survives a restart, so the seq must not restart at 0
+      expect(SRC).toContain('let inboundSeq = Date.now()')
     })
     test('C2 a reply releases "typing…" to the turn instead of stopping it', () => {
       expect(caseBody('reply')).not.toContain('stopTypingLoop(')
