@@ -31,6 +31,19 @@ if (process.env.GROK_NOTIFY_RELAY_DISABLED === '1') exitContinue()
 let payload: any = {}
 try { payload = JSON.parse(readFileSync(0, 'utf8')) } catch {}
 
+// A runtime with no Notification event (Antigravity) wires this relay on Stop
+// instead (DIVE-7427). Its Stop payload names `terminationReason`, plus `error`
+// when the turn died on one. A turn that ended normally or was canceled is not
+// news; an error or a hit limit is relayed as is, past the ERROR_RE filter.
+const STOP_OK = new Set(['NO_TOOL_CALL', 'USER_CANCELED', 'TERMINAL_STEP_TYPE', 'TERMINAL_CUSTOM_HOOK', 'INJECTED_RESPONSE'])
+let stopFailure = false
+if (payload && typeof payload.terminationReason === 'string') {
+  const err = typeof payload.error === 'string' ? payload.error.trim() : ''
+  if (!err && STOP_OK.has(payload.terminationReason)) exitContinue()
+  payload = { message: err || `turn stopped: ${payload.terminationReason}` }
+  stopFailure = true
+}
+
 // Pull a meaningful text out of whatever shape Grok hands us. Grok's
 // Notification hook payload isn't strictly documented, so be generous:
 // check common field names, fall back to JSON.stringify.
@@ -80,7 +93,7 @@ const rawText = extractText(payload)
 const relayAll = process.env.GROK_NOTIFY_RELAY_ALL === '1'
 if (!relayAll && isTransientRetry(rawText)) exitContinue()
 const text = cleanRustDebug(rawText)
-if (!relayAll && !ERROR_RE.test(text)) exitContinue()
+if (!relayAll && !stopFailure && !ERROR_RE.test(text)) exitContinue()
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
   ?? join(process.env.GROK_HOME ?? join(homedir(), '.grok'), 'channels', 'telegram')
