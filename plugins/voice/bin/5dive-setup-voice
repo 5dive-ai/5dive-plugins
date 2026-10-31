@@ -414,6 +414,29 @@ step_service() {
   warn "whisper-service not healthy after 6min — check: journalctl -u whisper-service"
 }
 
+# DIVE-7409: 5dive-speak upgrades edge-tts itself when Microsoft refuses the
+# old one, and a seat cannot write the venv. One sudoers line lets every seat
+# run edge-tts-heal, as root, with NO arguments ("" in sudoers), so all a seat
+# can make it do is upgrade one package, at most once an hour. Checked by
+# visudo before it goes live: a bad file in sudoers.d breaks sudo box-wide.
+EDGE_HEAL_BIN="${EDGE_HEAL_BIN:-/usr/local/lib/5dive/edge-tts-heal}"
+EDGE_HEAL_SUDOERS="${EDGE_HEAL_SUDOERS:-/etc/sudoers.d/5dive-edge-tts-heal}"
+install_edge_heal_sudoers() {
+  local tmp
+  tmp="$(mktemp "$(dirname "$EDGE_HEAL_SUDOERS")/.5dive-edge-tts-heal.XXXXXX")" || { warn "could not write $EDGE_HEAL_SUDOERS"; return 0; }
+  printf '%s\n' \
+    "# Managed by 5dive voice setup. Do not edit by hand; setup rewrites it." \
+    "# Any seat may upgrade edge-tts after Microsoft refuses the old one: one exact" \
+    "# command, no arguments, rate-limited inside to once an hour." \
+    "%claude ALL=(root) NOPASSWD: $EDGE_HEAL_BIN \"\"" > "$tmp"
+  chmod 440 "$tmp"
+  if visudo -cqf "$tmp" >/dev/null 2>&1 && mv -f "$tmp" "$EDGE_HEAL_SUDOERS"; then
+    ok "edge-tts self-repair installed at $EDGE_HEAL_BIN"
+  else
+    rm -f "$tmp"; warn "edge-tts self-repair: the sudoers line did not validate, left out"
+  fi
+}
+
 step_wrapper() {
   say "Step 4/6 — voice-backend lib + 5dive-transcribe / 5dive-speak wrappers"
 
@@ -430,6 +453,9 @@ step_wrapper() {
 
   write_atomic /usr/local/bin/5dive-speak 755 < "$(payload 5dive-speak.sh)"
   ok "5dive-speak installed at /usr/local/bin/5dive-speak"
+
+  write_atomic "$EDGE_HEAL_BIN" 755 < "$(payload edge-tts-heal.sh)"
+  install_edge_heal_sudoers
 
   # DIVE-5869: the nightly runs this step and never step_service, so without
   # this a running whisper-service kept the code it was first installed with,
@@ -645,7 +671,7 @@ main() {
   # Fail on an incomplete plugin tree BEFORE the first apt install, not in the
   # middle of step 4 with a service already enabled.
   local p
-  for p in whisper-service.py voice-backend.sh 5dive-transcribe.sh 5dive-speak.sh; do
+  for p in whisper-service.py voice-backend.sh 5dive-transcribe.sh 5dive-speak.sh edge-tts-heal.sh; do
     payload "$p" >/dev/null
   done
   case "$cmd" in

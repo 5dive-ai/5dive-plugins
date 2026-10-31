@@ -24,7 +24,7 @@
 set -uo pipefail
 
 # shellcheck source=/dev/null
-. /usr/local/lib/5dive/voice-backend.sh
+. "${VOICE_LIB:-/usr/local/lib/5dive/voice-backend.sh}"
 
 OUT=""
 VOICE_OVERRIDE=""
@@ -77,6 +77,17 @@ to_ogg() {  # to_ogg <src> [<ffmpeg input options>...]
   [[ -s "$OUT" ]] || { echo "5dive voice: the audio could not be converted to a voice note" >&2; return 1; }
 }
 
+# edge_heal — run edge-tts-heal; succeeds only when edge-tts changed version.
+# A seat cannot write the venv, so it goes through `sudo -n`, which the sudoers
+# line setup writes allows for this one command with no arguments. No helper,
+# or no sudo line: nothing to heal with, and the reply fails as before.
+edge_heal() {
+  local heal="${VOICE_EDGE_HEAL:-/usr/local/lib/5dive/edge-tts-heal}"
+  [[ -x "$heal" ]] || return 1
+  if [[ $EUID -eq 0 ]]; then "$heal" 2>/dev/null
+  else "${VOICE_SUDO:-sudo}" -n "$heal" 2>/dev/null; fi
+}
+
 speak_local() {
   local voice mp3
   # DIVE-5443: --voice, then an `edge_voice=` line the owner wrote, then this
@@ -87,11 +98,38 @@ speak_local() {
   [[ -n "$voice" ]] || voice="$VOICE_DEFAULT_EDGE_VOICE"
   voice_require_cmd edge-tts || return 1
   mp3="$(mktemp --suffix=.mp3 /tmp/5dive-speak.XXXXXX)"
-  if ! edge-tts --voice "$voice" --text "$TEXT" --write-media "$mp3" >/dev/null 2>&1; then
-    rm -f "$mp3"
-    echo "5dive voice: edge-tts failed. It is an unofficial client for Microsoft's online voices and breaks when Microsoft rotates its tokens; 'sudo 5dive voice backend openrouter' is the supported path." >&2
+  # DIVE-7247: Microsoft's service drops calls in bursts (NoAudioReceived on 1
+  # of 8 back-to-back runs, then every reply for three minutes), and one try
+  # lost the voice note. Try 6 times, 1, 2, 4, 8 and 8 s apart (VOICE_EDGE_BACKOFF):
+  # live runs of 4 and 5 failures lasted ~18 s, and 3 tries covered only ~13 s.
+  # Keep the error.
+  local err tries=0 ok=0 wait last
+  err="$(mktemp /tmp/5dive-speak.XXXXXX)"
+  for wait in ${VOICE_EDGE_BACKOFF-1 2 4 8 8} stop; do
+    tries=$((tries + 1))
+    edge-tts --voice "$voice" --text "$TEXT" --write-media "$mp3" >/dev/null 2>"$err" && [[ -s "$mp3" ]] && { ok=1; break; }
+    [[ "$wait" == stop ]] && break
+    # A refused handshake is Microsoft rejecting this edge-tts's token, not a
+    # burst: waiting does not fix it, a newer edge-tts does (below).
+    grep -qE 'WSServerHandshakeError|Invalid response status' "$err" && break
+    sleep "$wait"
+  done
+  # DIVE-7409: Microsoft rotates the token edge-tts sends, and each rotation
+  # needs a newer edge-tts. The nightly upgrade left every reply failing until
+  # 03:00, and a self-hosted box with auto-update off never got it. So after a
+  # failure, upgrade edge-tts once (edge-tts-heal: at most once an hour per box)
+  # and, only if its version changed, try this reply once more.
+  if (( ! ok )) && edge_heal; then
+    tries=$((tries + 1))
+    edge-tts --voice "$voice" --text "$TEXT" --write-media "$mp3" >/dev/null 2>"$err" && [[ -s "$mp3" ]] && ok=1
+  fi
+  if (( ! ok )); then
+    last=$(grep -v '^[[:space:]]*$' "$err" | tail -n1)
+    rm -f "$mp3" "$err"
+    echo "5dive voice: edge-tts failed $tries times${last:+ ($last)}. Microsoft's free voice service is failing for now, not broken for good: send this reply as text and try voice again shortly. If it keeps failing, the paid OpenRouter voice is an option: sudo 5dive voice backend openrouter." >&2
     return 1
   fi
+  rm -f "$err"
   to_ogg "$mp3"; local rc=$?; rm -f "$mp3"; return $rc
 }
 
