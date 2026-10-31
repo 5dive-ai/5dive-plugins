@@ -51,6 +51,7 @@ import { askRelayOp, numberedText, parseQuestion } from './question.ts'
 import { replyTooLong } from './replycap.ts'
 import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
+import { E2E_ARGV_DEFAULT, E2E_DIR_DEFAULT, E2E_REFUSED_TEXT, dropPlainCopies, isE2E, makeChatE2E, rootBoxCall } from './chate2e.ts'
 
 let PLUGIN_VERSION = '?'
 try {
@@ -160,7 +161,11 @@ const chatOnly = () => isChatOnly(CHAT_ONLY_MARKER)
 // later is picked up. A relayed seat cannot say it: the root relay builds that
 // URL, so its app keeps saying hands-free is not here yet.
 const TRANSCRIBE = process.env.DASHBOARD_TRANSCRIBE ?? '/usr/local/bin/5dive-transcribe'
-const hearsHere = () => !RELAY && chatOnly() && existsSync(TRANSCRIBE)
+// DIVE-6876: an encrypted chat (chate2e.ts). Hands-free is off there: the
+// words it hears go back to the API in the clear.
+const E2E_DIR = process.env.DASHBOARD_CHAT_E2E_DIR ?? E2E_DIR_DEFAULT
+const e2eOn = () => isE2E(E2E_DIR)
+const hearsHere = () => !RELAY && chatOnly() && !e2eOn() && existsSync(TRANSCRIBE)
 const LONG_POLL_BACKOFF_MS = (() => {
   const raw = Number(process.env.DASHBOARD_LONGPOLL_BACKOFF_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 1_000
@@ -535,11 +540,15 @@ const workStatus = makeWorkStatus({
   post: async (chatId, active, label) => {
     if (statusOff) return
     try {
+      // DIVE-6876: in an encrypted chat the step is sealed; one that cannot be
+      // sealed is left off, and the chat shows plain "working".
+      const e2e = e2eOn()
+      const shown = e2e && label ? await chatE2E.sealStatus(chatId, label).catch(() => '') : label
       const res = await authedFetch(`${API_BASE}/server/messages/status`, 'status', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ agent: AGENT, chat_id: chatId, active, label }),
-      }, ['status', chatId, active ? '1' : '0', ...(label ? [label] : [])])
+        body: JSON.stringify({ agent: AGENT, chat_id: chatId, active, label: shown, ...(e2e ? { e2e: { v: 1 } } : {}) }),
+      }, [e2e ? 'status-e2e' : 'status', chatId, active ? '1' : '0', ...(shown ? [shown] : [])])
       if (res.status === 404) throw new Error('allows only (api has no status route)')
       void res.text().catch(() => '')
     } catch (err) {
@@ -623,14 +632,27 @@ function ingestInboxFile(name: string, via: 'boot' | 'watch' | 'sweep'): void {
   const from = typeof obj?.from === 'string' && obj.from ? obj.from : 'dashboard'
   const chatId = typeof obj?.chat_id === 'string' && obj.chat_id ? obj.chat_id : 'dashboard'
   const ts = typeof obj?.ts === 'string' && obj.ts ? obj.ts : new Date().toISOString()
-  void deliverInbound(`dashboard:drop:${name}`, text, {
+  let e2eKey = ''
+  void (async () => {
+    let body = text
+    let attachment = inboundAttachment(obj?.image_path)
+    if (e2eOn()) {
+      const opened = await admitE2E(text, chatId, `drop ${name}`)
+      if (!opened) return false
+      ;({ text: body, attachment, key: e2eKey } = opened)
+    }
+    await deliverInbound(`dashboard:drop:${name}`, body, {
         chat_id: chatId,
         message_id: '0',
         user: from,
         user_id: from,
         ts,
-        ...inboundAttachment(obj?.image_path),
-  }).then(() => {
+        ...attachment,
+    })
+    return true
+  })().then(pushed => {
+    if (!pushed) return
+    if (e2eKey) chatE2E.delivered(e2eKey)
     // DIVE-6549: which path picked it up, so a slow inbox is diagnosable, and
     // the record that keeps /pending's later re-offer of it out of the session.
     recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `drop ${name} delivered via=${via}`)
@@ -844,6 +866,7 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
     savePendingRetryState(PENDING_RETRY_FILE, retryState)
   }
   // DIVE-7098: heard beside the poll, which goes straight back to waiting.
+  if (e2eOn()) hear = []
   for (const job of hear) void hearClip(job)
   if (items.length === 0) return hear.length === 0 && wait > 0 && Date.now() - started < 1_000 ? 'empty-fast' : 'ok'
   const acked: number[] = []
@@ -877,19 +900,31 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
     // unbounded duplicate loop after restart.
     retryState[key] = decision.next
     savePendingRetryState(PENDING_RETRY_FILE, retryState)
-    // DIVE-6816: on a chat-only box nothing put the upload on disk yet.
-    await ensureInboundFile(m.image_path)
-    await ensureInboundFile(m.audio_path)
+    const chatId = typeof m.chat_id === 'string' && m.chat_id ? m.chat_id : 'dashboard'
+    // DIVE-6876: an encrypted chat opens it first; its files ride inside.
+    let body = m.text
+    let attachment = inboundAttachment(m.image_path)
+    let e2eKey = ''
+    if (e2eOn()) {
+      const opened = await admitE2E(m.text, chatId, `pending message id=${m.id}`)
+      if (!opened) { acked.push(m.id); continue }
+      ;({ text: body, attachment, key: e2eKey } = opened)
+    } else {
+      // DIVE-6816: on a chat-only box nothing put the upload on disk yet.
+      await ensureInboundFile(m.image_path)
+      await ensureInboundFile(m.audio_path)
+    }
     try {
-      await deliverInbound(`dashboard:pending:${m.id}`, m.text, {
-            chat_id: typeof m.chat_id === 'string' && m.chat_id ? m.chat_id : 'dashboard',
+      await deliverInbound(`dashboard:pending:${m.id}`, body, {
+            chat_id: chatId,
             message_id: key,
             user: m.from ?? 'dashboard',
             user_id: m.from ?? 'dashboard',
             ts: m.ts ?? new Date().toISOString(),
             ...pendingDeliveryMeta(decision),
-            ...inboundAttachment(m.image_path),
+            ...attachment,
       })
+      if (e2eKey) chatE2E.delivered(e2eKey)
       recordLifecycle(
         STATE_DIR,
         'delivery',
@@ -989,6 +1024,55 @@ async function ensureInboundFile(path: unknown): Promise<void> {
   } catch (err) {
     noteChatFile(`chat-only: could not fetch ${path}: ${String(err).slice(0, 200)}`)
   }
+}
+
+// --- DIVE-6876: an encrypted chat (chate2e.ts) --------------------------------
+// The root verb opens and seals; DASHBOARD_E2E_ARGV (a JSON argv) is the test seam.
+const E2E_ARGV: string[] = (() => {
+  try {
+    const v = JSON.parse(process.env.DASHBOARD_E2E_ARGV ?? 'null')
+    if (Array.isArray(v) && v.length > 0 && v.every(x => typeof x === 'string')) return v
+  } catch {}
+  return E2E_ARGV_DEFAULT
+})()
+const chatE2E = makeChatE2E({
+  call: rootBoxCall(E2E_ARGV, RELAY_FILE_TIMEOUT_MS),
+  stateDir: STATE_DIR,
+  agent: AGENT,
+  uploadsDir: UPLOADS_DIR,
+  fetchFile: ensureInboundFile,
+})
+
+/**
+ * One inbound body in an encrypted chat: what the session gets, or null when
+ * it gets nothing (refused, a replay, or a device-list change, which is posted
+ * to every device here). Null is still acked: the API must stop offering it.
+ */
+async function admitE2E(text: string, chatId: string, what: string): Promise<{ text: string; attachment: Record<string, string>; key: string } | null> {
+  const a = await chatE2E.admit(text, chatId)
+  if (a.kind === 'deliver') {
+    const [first, ...rest] = a.files
+    return {
+      text: rest.length ? `${a.text}\n${rest.map(f => `[file: ${f}]`).join('\n')}` : a.text,
+      attachment: inboundAttachment(first),
+      key: a.key,
+    }
+  }
+  if (a.kind === 'roster') {
+    try {
+      await postReply(chatId, a.body, [], null, true)
+      chatE2E.delivered(a.key)
+      recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `encrypted chat: ${what} changed the device list; the new list went to every device`)
+    } catch (err) {
+      recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `encrypted chat: ${what} changed the device list, but posting it failed: ${String(err).slice(0, 160)}`)
+    }
+    return null
+  }
+  recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `encrypted chat: ${what} dropped, ${a.kind === 'replay' ? 'a replay' : 'refused'}: ${a.why}`)
+  if (a.kind === 'refuse' && chatE2E.noticeDue(chatId)) {
+    void sendDashboardReply({ chat_id: chatId, text: E2E_REFUSED_TEXT }).catch(() => {})
+  }
+  return null
 }
 
 // DIVE-7098: a hands-free clip the app asked this box to hear (chatonly.ts).
@@ -1134,6 +1218,30 @@ async function speakReply(text: string, chatId: string): Promise<string> {
   }
 }
 
+/**
+ * POST one outbound message. `e2e`: the body is an envelope (DIVE-6876), the
+ * metadata says so, and the relay gets its own op, so a relay without it
+ * refuses rather than posting the envelope as a plain message.
+ */
+async function postReply(chatId: string, body: string, files: string[], q: ChatQuestion | null, e2e: boolean): Promise<Response> {
+  const res = await authedFetch(`${API_BASE}/server/messages/event`, 'outbound reply', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      agent: AGENT,
+      body,
+      metadata: { chat_id: chatId, ...(files.length ? { files } : {}), ...(q ? { question: q } : {}), ...(e2e ? { e2e: { v: 1 } } : {}) },
+    }),
+  }, e2e ? ['event-e2e', chatId, body, ...files] : q ? askRelayOp(chatId, body, q) : ['event', chatId, body, ...files])
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(`dashboard reply failed: control plane returned ${res.status} ${detail.slice(0, 200)}`)
+  }
+  return res
+}
+
 async function sendDashboardReply(args: ReplyArgs): Promise<string> {
   const rawText = typeof args.text === 'string' ? args.text : ''
   const chatId = typeof args.chat_id === 'string' && args.chat_id ? args.chat_id : 'dashboard'
@@ -1170,6 +1278,23 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
     try { renameSync(web, named); return named } catch { return web }
   }))
   const text = replyBody(rawText, files)
+  const question = args.question ?? null
+  // DIVE-6876: an encrypted chat seals the reply, its files and its buttons;
+  // a reply that cannot be sealed fails here and nothing is sent.
+  if (e2eOn()) {
+    let sealed: { body: string; files: string[] }
+    try {
+      sealed = await chatE2E.sealReply(chatId, text, files, question, OUTBOX_DIR)
+    } finally {
+      dropPlainCopies([...copied, ...files], OUTBOX_DIR)
+    }
+    if (chatOnly()) await putReplyFiles(sealed.files)
+    const res = await postReply(chatId, sealed.body, sealed.files, null, true)
+    const j = (await res.json().catch(() => null)) as { id?: number } | null
+    const sentLine = `sent encrypted (id: ${j?.id ?? '?'})`
+    if (args.voice !== true || !rawText.trim()) return sentLine
+    return `${sentLine}\n${await speakReply(rawText, chatId)}`
+  }
   // DIVE-6816: on a chat-only box the API cannot read this box's outbox, so
   // every copy there (a voice note's OGG and its MP3 too) is posted first; the
   // reply's metadata.files stays these same paths.
@@ -1188,29 +1313,13 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
   // DIVE-6715: a question (hooks/pretool-question.ts) rides in metadata, which
   // the app draws as buttons. A relay from before the `ask` op refuses it; the
   // question then goes as numbered lines, which the person answers by typing.
-  const question = args.question ?? null
-  const post = (body: string, q: ChatQuestion | null) => authedFetch(`${API_BASE}/server/messages/event`, 'outbound reply', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      agent: AGENT,
-      body,
-      metadata: { chat_id: chatId, ...(sent.length ? { files: sent } : {}), ...(q ? { question: q } : {}) },
-    }),
-  }, q ? askRelayOp(chatId, body, q) : ['event', chatId, body, ...sent])
   let res: Response
   try {
-    res = await post(text, question)
+    res = await postReply(chatId, text, sent, question, false)
   } catch (err) {
     if (!question || !RELAY || !/allows only/.test(String(err))) throw err
     process.stderr.write(`dashboard channel: this relay has no ask op (5dive self-update brings it); question sent as text\n`)
-    res = await post(numberedText(text, question), null)
-  }
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '')
-    throw new Error(`dashboard reply failed: control plane returned ${res.status} ${detail.slice(0, 200)}`)
+    res = await postReply(chatId, numberedText(text, question), sent, null, false)
   }
   const j = (await res.json().catch(() => null)) as { id?: number } | null
   const sentLine = `sent (id: ${j?.id ?? '?'})`
