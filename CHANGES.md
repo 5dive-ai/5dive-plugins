@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Added — dashboard 0.5.15: chat with a Hermes or OpenClaw agent in the 5dive app (DIVE-7349)
+
+lodar, 2026-10-30: *"we can add pr to claw and hermes to support 5dive app channel?"* First our boxes, then the same channel offered upstream.
+
+- **`server.ts --runtime=hermes|openclaw`** runs the dashboard server on its own beside the seat (the seat's start script supervises it) and leaves each web-chat message in a local spool, `~/.hermes/channels/5dive` or `~/.openclaw/channels/5dive`. Answers that land in the spool's outbox go back to the chat, spoken for a voice note.
+- **Hermes: a real 5dive channel plugin** (`plugins/dashboard/hermes/`, platform `fivedive`): `plugin.yaml` + `adapter.py` on Hermes' own `BasePlatformAdapter`, registered with `ctx.register_platform()`, so the Hermes gateway runs the conversation with its own sessions, tools and platform hint. It is written in Hermes' plugin layout so the same files can go upstream.
+- **OpenClaw: `openclawdispatch.ts`** answers each message with one `openclaw agent --session-key 5dive-webchat --json` turn through the seat's running gateway, one turn at a time, always in the same session. A turn the gateway never took (still booting) is retried; anything else that fails ends in a plain notice, never silence.
+
+Harness: `test/dive7349-dashboard-openclaw-hermes.test.ts` (8 tests: both runtimes end to end through a stand-in control plane — OpenClaw with a fake `openclaw` binary, Hermes with the real `adapter.py` on stubbed Hermes base types). Checked once by hand against the real Hermes install on poke-two (hermes-agent 91546b8): the loader enables the plugin, the env enables the platform, a spool message reaches `handle_message` and `send()` lands in the outbox.
+
 ### Fixed — telegram 0.5.126: a numbered draft inside a code block no longer gets option buttons (DIVE-7321)
 
 lodar, 2026-10-30, on main's Reddit reply draft: *"our telegram plugin added buttons to your reply. can file fix?"* The draft sat in a ``` code block as "1. … 2. …", and its own "which agent is asking" counted as the choice cue, so it went out with two buttons.
