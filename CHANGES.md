@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram-grok / telegram-agy 0.5.31: a Grok agent hears you mid-turn and shows "typing…" while it works (DIVE-7422)
+
+Box report 598 (chill-gorge, 2026-10-31): the agent asked a question, kept working, and the owner's "so?" and "what the plan?" waited until the turn ended. Nothing showed on the phone in between.
+
+- **"typing…" lasts the whole turn.** A reply no longer stops it. It stops when the agent goes back to waiting for messages, when the turn ends, or at the 5-minute ceiling. A message that arrives mid-turn starts it too.
+- **A message sent mid-turn reaches the model before the turn ends.** The server mirrors its queue to `pending-inbound.json`, and a new PreToolUse hook (`hooks/inbound-surface.ts`) blocks one tool call per new batch with "N new Telegram messages arrived while you were working (latest: "…"). Call wait_for_message now…". The telegram tools are never blocked. Off with `GROK_INBOUND_SURFACE_DISABLED=1`.
+- **Fallback:** every telegram tool result except `wait_for_message` ends with a `<telegram-pending count=N/>` line while messages are queued, in case a runtime does not show the block reason to the model.
+- An idle seat still starts no turns (DIVE-165): nothing added here kicks the listen loop. Generated into agy via `generator/` (both new files are in its copy list).
+
+Harness: `test/dive7422-grok-midturn.test.ts` (26 tests; the 15 server arms are red on the old tree). Not yet measured: whether grok shows the block reason to the model verbatim. No grok login on poke-two; the live arm on a grok seat is owed.
+
 ### Added — dashboard 0.5.16: encrypted web chat on a self-hosted server, the server side (DIVE-6876)
 
 For the r/selfhosted launch (DIVE-6875): once `/etc/5dive/chat-e2e/` exists on a self-hosted server, our API carries only ciphertext for its web chat.
