@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Added — dashboard 0.5.16: encrypted web chat on a self-hosted server, the server side (DIVE-6876)
+
+For the r/selfhosted launch (DIVE-6875): once `/etc/5dive/chat-e2e/` exists on a self-hosted server, our API carries only ciphertext for its web chat.
+
+- **Messages in are opened on the server, replies are sealed to every approved browser or phone.** Files (names inside), voice notes, question buttons and the "working" step ride inside the encryption.
+- **A message that arrives unencrypted, does not open or was already delivered never reaches the agent.** The person gets one encrypted notice; a reply that cannot be sealed is not sent at all.
+- An approval from a device changes the device list on the server, which sends the new list to every device. Hands-free listening is off in an encrypted chat (its words would go back in the clear).
+- The agent never touches the server key: every open and seal is a root command (built on DIVE-6878). Protocol and that command's contract: `docs/chat-e2e.md`.
+
+Harness: `test/dive6876-chat-e2e-envelope.test.ts` (the envelope, 11 arms) and `test/dive6876-dashboard-chat-e2e.test.ts` (8 box-side arms, plus a real `server.ts` where a plaintext message is refused, the encrypted one arrives, the reply the API gets is ciphertext only, and a re-offer is dropped).
+
 ### Added — dashboard 0.5.15: chat with a Hermes or OpenClaw agent in the 5dive app (DIVE-7349)
 
 lodar, 2026-10-30: *"we can add pr to claw and hermes to support 5dive app channel?"* First our boxes, then the same channel offered upstream.
