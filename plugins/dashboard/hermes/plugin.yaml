@@ -1,0 +1,29 @@
+name: fivedive
+label: 5dive app
+kind: platform
+version: 1.0.0
+description: >
+  5dive app chat for Hermes Agent. On a 5dive box the dashboard bridge
+  (plugins/dashboard/server.ts) receives every message typed in the 5dive
+  web and mobile chat and drops it in a local spool directory; this adapter
+  hands each one to the gateway and writes the agent's answer back to the
+  same spool, which the bridge sends to the chat.
+
+  The spool directory is the trust boundary: it is created mode 0700 for
+  the agent's own user, so only that user (or root) can write a message
+  into it. No network listener, no token.
+author: 5dive
+requires_env:
+  - name: FIVEDIVE_SPOOL_DIR
+    description: "The 5dive web chat spool directory (inbox/ and outbox/dashboard/ inside it)"
+    prompt: "5dive spool directory"
+    password: false
+optional_env:
+  - name: FIVEDIVE_ALLOWED_USERS
+    description: "Senders allowed to talk to the agent (the 5dive bridge sends as 5dive-app)"
+    prompt: "Allowed senders (comma-separated)"
+    password: false
+  - name: FIVEDIVE_ALLOW_ALL_USERS
+    description: "Allow every sender in the spool (true/false)"
+    prompt: "Allow all senders? (true/false)"
+    password: false

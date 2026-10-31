@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Added — dashboard 0.5.15: encrypted web chat on a self-hosted server, the server side (DIVE-6876)
+### Added — dashboard 0.5.16: encrypted web chat on a self-hosted server, the server side (DIVE-6876)
 
 For the r/selfhosted launch (DIVE-6875): once `/etc/5dive/chat-e2e/` exists on a self-hosted server, our API carries only ciphertext for its web chat.
 
@@ -10,6 +10,16 @@ For the r/selfhosted launch (DIVE-6875): once `/etc/5dive/chat-e2e/` exists on a
 - The agent never touches the server key: every open and seal is a root command (built on DIVE-6878). Protocol and that command's contract: `docs/chat-e2e.md`.
 
 Harness: `test/dive6876-chat-e2e-envelope.test.ts` (the envelope, 11 arms) and `test/dive6876-dashboard-chat-e2e.test.ts` (8 box-side arms, plus a real `server.ts` where a plaintext message is refused, the encrypted one arrives, the reply the API gets is ciphertext only, and a re-offer is dropped).
+
+### Added — dashboard 0.5.15: chat with a Hermes or OpenClaw agent in the 5dive app (DIVE-7349)
+
+lodar, 2026-10-30: *"we can add pr to claw and hermes to support 5dive app channel?"* First our boxes, then the same channel offered upstream.
+
+- **`server.ts --runtime=hermes|openclaw`** runs the dashboard server on its own beside the seat (the seat's start script supervises it) and leaves each web-chat message in a local spool, `~/.hermes/channels/5dive` or `~/.openclaw/channels/5dive`. Answers that land in the spool's outbox go back to the chat, spoken for a voice note.
+- **Hermes: a real 5dive channel plugin** (`plugins/dashboard/hermes/`, platform `fivedive`): `plugin.yaml` + `adapter.py` on Hermes' own `BasePlatformAdapter`, registered with `ctx.register_platform()`, so the Hermes gateway runs the conversation with its own sessions, tools and platform hint. It is written in Hermes' plugin layout so the same files can go upstream.
+- **OpenClaw: `openclawdispatch.ts`** answers each message with one `openclaw agent --session-key 5dive-webchat --json` turn through the seat's running gateway, one turn at a time, always in the same session. A turn the gateway never took (still booting) is retried; anything else that fails ends in a plain notice, never silence.
+
+Harness: `test/dive7349-dashboard-openclaw-hermes.test.ts` (8 tests: both runtimes end to end through a stand-in control plane — OpenClaw with a fake `openclaw` binary, Hermes with the real `adapter.py` on stubbed Hermes base types). Checked once by hand against the real Hermes install on poke-two (hermes-agent 91546b8): the loader enables the plugin, the env enables the platform, a spool message reaches `handle_message` and `send()` lands in the outbox.
 
 ### Fixed — telegram 0.5.126: a numbered draft inside a code block no longer gets option buttons (DIVE-7321)
 

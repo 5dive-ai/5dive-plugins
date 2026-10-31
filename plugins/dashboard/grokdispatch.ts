@@ -29,7 +29,7 @@ export type GrokUpdate = { kind: string; text: string; raw: string }
 
 export type Route = { source: 'dashboard'; chat_id: string; voice?: true }
 
-export type OutboxReply = Route & { text: string; kind: 'message' | 'error' }
+export type OutboxReply = Route & { text: string; kind: 'message' | 'error'; files?: string[] }
 
 // The ACP update carrying `sessionUpdate`, wherever the line nests it (the
 // `agent ask` reader's find_update, same depth bound).
