@@ -53,12 +53,14 @@ const COPY_FILES = [
   'banner.ts', // DIVE-1558: pure banner decision module — no tokens, copied byte-exact
   'lifecycle.ts', // DIVE-3752: orphan watchdog + start/exit record — copied byte-exact
   'viewer-link.ts', // DIVE-4493: one-time viewer-link transport guard — copied byte-exact
+  'pending-inbound.ts', // DIVE-7422: mid-turn inbound state + surface decision — copied byte-exact
   'pair.ts',
   'package.json',
   'AGENTS.md',
   'hooks/hooks.json',
   'hooks/notify-stop.ts',
   'hooks/silence-watchdog.ts',
+  'hooks/inbound-surface.ts',
   'hooks/notification-relay.ts',
   'skills/notify-user/SKILL.md',
 ]
