@@ -21,11 +21,17 @@
 // (a later web-chat message, the Telegram bridge's re-arm kick) or Grok goes
 // back to its Telegram wait. A message Grok never takes, or never answers, ends
 // in a visible notice in the chat, never in silence.
+//
+// DIVE-7351: what Grok writes right before a tool call is narration ("I'll
+// transcribe the voice note and answer from what it says."), not the answer.
+// It is held, and sent only when the turn ends with nothing else to send; and
+// only a turn's first message is spoken, so one voice question gets one voice
+// note.
 
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, watch, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 
-export type GrokUpdate = { kind: string; text: string; raw: string }
+export type GrokUpdate = { kind: string; text: string; raw: string; status?: string }
 
 export type Route = { source: 'dashboard'; chat_id: string; voice?: true }
 
@@ -62,7 +68,7 @@ export function parseUpdateLine(line: string): GrokUpdate | null {
   let u: Record<string, unknown> | null
   try { u = findUpdate(JSON.parse(line)) } catch { return null }   // a cut or half-written line
   if (!u) return null
-  return { kind: String(u.sessionUpdate), text: chunkText(u.content), raw: line }
+  return { kind: String(u.sessionUpdate), text: chunkText(u.content), raw: line, ...(typeof u.status === 'string' ? { status: u.status } : {}) }
 }
 
 // Grok 1.0.70's own sign-in screen — the same two pairs `agent ask` refuses on
@@ -107,7 +113,8 @@ export const SIGNED_OUT_TEXT = 'Grok is not signed in on this computer yet, so i
 const KICK_PREFIX = 'A Telegram message is waiting'
 
 type Expected = { id: string; needle: string; route: Route; sentAt: number }
-type Active = { id: string; route: Route; cur: string[]; posted: number; lastAt: number; warned: boolean }
+// held: narration written before a tool call; tools: tool calls still running.
+type Active = { id: string; route: Route; cur: string[]; posted: number; lastAt: number; warned: boolean; held: string; tools: number }
 
 export type TurnTimings = {
   segmentQuietMs: number   // a streamed message with no new chunk for this long is complete
@@ -115,6 +122,7 @@ export type TurnTimings = {
   noAnswerMs: number       // a taken message with no answer text and no activity for this long
   followIdleMs: number     // stop attributing text to a turn this long after its last record
   looseMatchMs: number     // an unrecognised user turn this soon after a send is taken as ours
+  heldQuietMs?: number     // held narration is the answer after this long with no tool running and nothing new
 }
 
 export const DEFAULT_TIMINGS: TurnTimings = {
@@ -123,6 +131,7 @@ export const DEFAULT_TIMINGS: TurnTimings = {
   noAnswerMs: 180_000,
   followIdleMs: 600_000,
   looseMatchMs: 30_000,
+  heldQuietMs: 10_000,
 }
 
 /**
@@ -161,9 +170,21 @@ export class GrokTurns {
       a.cur.push(u.text)
       return
     }
-    this.flush(a)
+    const listen = u.raw.includes('wait_for_message')
+    if (u.kind === 'tool_call' && !listen) {
+      this.hold(a)
+      if (u.status !== 'completed' && u.status !== 'failed') a.tools++
+      return
+    }
+    if (u.kind === 'tool_call_update' && (u.status === 'completed' || u.status === 'failed')) a.tools = Math.max(0, a.tools - 1)
+    // Any other record (a thought, a hook, a command list) neither ends nor
+    // splits a message: the quiet timer sends it, so narration that a hook
+    // record separates from its tool call is still held.
+    if (!listen) return
     // Grok went back to listen on Telegram: whatever it writes next answers that.
-    if (a.posted > 0 && u.raw.includes('wait_for_message')) this.finish()
+    this.flush(a)
+    if (!a.posted) this.release(a)
+    if (a.posted > 0) this.finish()
   }
 
   tick(): void {
@@ -172,6 +193,8 @@ export class GrokTurns {
     const a = this.active
     if (a) {
       if (a.cur.length && now - a.lastAt >= this.t.segmentQuietMs) this.flush(a)
+      if (a.held && !a.cur.length && !a.tools && now - a.lastAt >= (this.t.heldQuietMs ?? 10_000)) this.release(a)
+      if (!a.posted && a.held && now - a.lastAt >= this.t.noAnswerMs) this.release(a)
       if (!a.posted && !a.warned && now - a.lastAt >= this.t.noAnswerMs) {
         a.warned = true
         this.emit({ ...a.route, text: NO_ANSWER_TEXT, kind: 'error' })
@@ -208,21 +231,43 @@ export class GrokTurns {
 
   private take(e: Expected): void {
     this.finish()
-    this.active = { id: e.id, route: e.route, cur: [], posted: 0, lastAt: this.now(), warned: false }
+    this.active = { id: e.id, route: e.route, cur: [], posted: 0, lastAt: this.now(), warned: false, held: '', tools: 0 }
+  }
+
+  // Text before a tool call: kept back, and replaced by the next such text.
+  private hold(a: Active): void {
+    const text = a.cur.join('').trim()
+    a.cur = []
+    if (text) a.held = text
+  }
+
+  // The turn ended on held text: it was the answer after all.
+  private release(a: Active): void {
+    const text = a.held
+    a.held = ''
+    if (text) this.post(a, text)
   }
 
   private flush(a: Active): void {
     const text = a.cur.join('').trim()
     a.cur = []
     if (!text) return
+    a.held = ''   // an answer came, so the narration before it is dropped
+    this.post(a, text)
+  }
+
+  private post(a: Active, text: string): void {
+    // Only the first message of a turn is spoken: one voice note per answer.
+    const { voice: _voice, ...plain } = a.route
+    this.emit({ ...(a.posted ? plain : a.route), text, kind: 'message' })
     a.posted++
-    this.emit({ ...a.route, text, kind: 'message' })
   }
 
   private finish(): void {
     const a = this.active
     if (!a) return
     this.flush(a)
+    if (!a.posted) this.release(a)
     if (!a.posted && !a.warned) this.emit({ ...a.route, text: NO_ANSWER_TEXT, kind: 'error' })
     this.active = null
   }

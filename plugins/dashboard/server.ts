@@ -35,6 +35,7 @@ import { join } from 'path'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
+import { AGY_DEFAULT_TIMINGS, startAgyDispatcher } from './agydispatch.ts'
 import { openclawTurn, startOpenclawDispatcher } from './openclawdispatch.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
@@ -71,11 +72,16 @@ const GROK = RUNTIME === 'grok'
 // gateway reads it (hermes/adapter.py), on OpenClaw openclawdispatch.ts does.
 const HERMES = RUNTIME === 'hermes'
 const OPENCLAW = RUNTIME === 'openclaw'
+// DIVE-7351: an Antigravity seat. agy spawns this server from
+// ~/.gemini/config/mcp_config.json and answers through the reply tool;
+// agydispatch.ts types each message into agy's pane.
+const AGY = RUNTIME === 'antigravity'
 // Grok may hand an MCP server a trimmed environment; the seat name comes from USER.
-if ((GROK || HERMES || OPENCLAW) && !process.env.USER) process.env.USER = userInfo().username
-const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'dashboard' || GROK || HERMES || OPENCLAW
+if ((GROK || HERMES || OPENCLAW || AGY) && !process.env.USER) process.env.USER = userInfo().username
+const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'dashboard' || GROK || HERMES || OPENCLAW || AGY
 const DISPATCHER_STATE_DIR = process.env.CODEX_DISPATCHER_STATE_DIR
   ?? (GROK ? join(homedir(), '.grok', 'channels', 'dashboard-dispatcher')
+    : AGY ? join(homedir(), '.gemini', 'channels', 'dashboard-dispatcher')
     : HERMES ? join(homedir(), '.hermes', 'channels', '5dive')
     : OPENCLAW ? join(homedir(), '.openclaw', 'channels', '5dive')
     : join(homedir(), '.codex', 'channels', 'dispatcher'))
@@ -398,6 +404,12 @@ const mcp = new Server(
       'A message that starts with "[5dive web chat" was typed by a person in the 5dive web chat. Your plain-text answer in this session is sent back to that chat as it is; do not use a Telegram tool for it.',
       '',
       'Voice notes: a message whose text starts with "[voice note]" was SPOKEN by the person; the rest is its transcript. If it carries a "[Voice note: <path>]" line instead, run `5dive-transcribe <path>` first and answer what it says. Answer a voice note FIRST, before any other tool, in one to three short spoken sentences with no lists, links or code: your answer is spoken back to them, so do not run 5dive-speak yourself.',
+    ].join('\n') : AGY ? [
+      'A message that starts with "[5dive web chat" was typed by a person in the 5dive web chat (web/mobile app), not in this session. They read only what you send with THIS server\'s reply tool, with the chat_id the message names; your plain text here never reaches them. Never answer it with a Telegram tool.',
+      '',
+      'If the message carries an "[Attached file: <path>]" line, read that path. To share a file back, pass its absolute path in the reply files array.',
+      '',
+      'Voice notes: a message whose text starts with "[voice note]" was SPOKEN by the person; the rest is its transcript. If it carries a "[Voice note: <path>]" line instead, run `5dive-transcribe <path>` first and answer what it says. Answer a voice note FIRST, before any other tool, with ONE reply call that sets voice: true, in one to three short spoken sentences with no lists, links or code. Do not send a reply before that one to say what you are about to do: every reply to a voice note is spoken. Do not run 5dive-speak yourself. A typed message gets text only.',
     ].join('\n') : [
       'The sender reads the 5dive dashboard chat (web/mobile app), not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
@@ -1227,6 +1239,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const tooLong = replyTooLong(args.text)
   if (tooLong) return { content: [{ type: 'text', text: tooLong }], isError: true }
   const result = await sendDashboardReply(args)
+  // DIVE-7351: an answered web-chat message needs no "did not answer" notice.
+  agyBridge?.watch.replied(String(args.chat_id ?? 'dashboard'))
   return { content: [{ type: 'text', text: result }] }
 })
 
@@ -1272,6 +1286,8 @@ function startDispatcherOutbox(): void {
   watchOutbox(DISPATCHER_OUTBOX_DIR, 'dispatcher')
 }
 
+let agyBridge: ReturnType<typeof startAgyDispatcher> | null = null
+
 // DIVE-3752: same gap as buzz — this server ends in long-lived timers with no
 // signal handler, no stdin handler and no exit path, so a severed parent chain
 // leaves it running. The interval below is `.unref()`d, which does NOT save it:
@@ -1295,6 +1311,23 @@ if (!DISPATCHER_ADAPTER) {
     timings: (() => {
       try { return { ...DEFAULT_TIMINGS, ...JSON.parse(process.env.DASHBOARD_GROK_TIMINGS ?? '{}') } } catch { return DEFAULT_TIMINGS }
     })(),
+  })
+  await mcp.connect(new StdioServerTransport())
+} else if (AGY) {
+  // agy supervises this server like its Telegram one, over the MCP stdio.
+  installLifecycle({ channel: 'dashboard', stateDir: STATE_DIR })
+  process.stderr.write('dashboard channel: Antigravity web chat bridge active (DIVE-7351)\n')
+  startDispatcherOutbox()
+  agyBridge = startAgyDispatcher({
+    inboxDir: DISPATCHER_INBOX_DIR,
+    outboxDir: DISPATCHER_OUTBOX_DIR,
+    pane: tmuxPane(process.env.DASHBOARD_AGY_SESSION ?? `agent-${AGENT}`),
+    hears: () => existsSync(TRANSCRIBE),
+    // Test seams: a JSON object of AgyTimings fields to shorten, and the poll.
+    timings: (() => {
+      try { return { ...AGY_DEFAULT_TIMINGS, ...JSON.parse(process.env.DASHBOARD_AGY_TIMINGS ?? '{}') } } catch { return AGY_DEFAULT_TIMINGS }
+    })(),
+    ...(process.env.DASHBOARD_AGY_POLL_MS ? { pollMs: Number(process.env.DASHBOARD_AGY_POLL_MS) } : {}),
   })
   await mcp.connect(new StdioServerTransport())
 } else if (HERMES || OPENCLAW) {

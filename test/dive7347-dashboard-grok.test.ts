@@ -71,8 +71,54 @@ describe('turning Grok updates into web-chat replies', () => {
     r.feed(upd('user_message_chunk', `${WEB_CHAT_HEADER}\nhello there`))
     r.feed(upd('agent_message_chunk', 'Hi! '))
     r.feed(upd('agent_message_chunk', 'How can I help?'))
-    r.feed(upd('tool_call', 'ls'))
+    r.advance(4_000)
     expect(r.out).toEqual([{ source: 'dashboard', chat_id: 'dashboard', voice: true, text: 'Hi! How can I help?', kind: 'message' }])
+  })
+
+  // DIVE-7351: the live arm's voice question got two voice notes, the narration
+  // before a tool call and then the answer.
+  test('narration before a tool call is not sent: one voice question gets one spoken answer', () => {
+    const r = rig()
+    r.turns.expect('m1', 'what is seventeen times three', { ...route, voice: true })
+    r.feed(upd('user_message_chunk', `${WEB_CHAT_HEADER}\nwhat is seventeen times three`))
+    r.feed(upd('agent_message_chunk', "I'll transcribe the voice note and answer from what it says."))
+    r.feed(upd('agent_thought_chunk', 'run it'))   // a record between the text and its tool call
+    r.feed(upd('tool_call', '5dive-transcribe'))
+    r.advance(6_000)
+    expect(r.out).toEqual([])
+    r.feed(upd('tool_call_update', 'done'))
+    r.feed(upd('agent_message_chunk', 'Fifty-one'))
+    r.advance(4_000)
+    r.advance(30_000)
+    expect(r.out).toEqual([{ source: 'dashboard', chat_id: 'dashboard', voice: true, text: 'Fifty-one', kind: 'message' }])
+  })
+
+  test('held text is sent when the turn ends on it, and only the first message is spoken', () => {
+    const r = rig()
+    r.turns.expect('m1', 'save this', { ...route, voice: true })
+    r.feed(upd('user_message_chunk', `${WEB_CHAT_HEADER}\nsave this`))
+    r.feed(upd('agent_message_chunk', 'Saved it.'))
+    r.feed(parseUpdateLine(JSON.stringify({ update: { sessionUpdate: 'tool_call', status: 'pending', title: 'memory write' } }))!)
+    r.advance(15_000)
+    expect(r.out).toEqual([])   // the tool still runs
+    r.feed(parseUpdateLine(JSON.stringify({ update: { sessionUpdate: 'tool_call_update', status: 'completed' } }))!)
+    r.advance(9_000)
+    expect(r.out).toEqual([])
+    r.advance(2_000)
+    expect(r.out).toEqual([{ ...route, voice: true, text: 'Saved it.', kind: 'message' }])
+    r.feed(upd('agent_message_chunk', 'Anything else?'))
+    r.advance(5_000)
+    expect(r.out[1]).toEqual({ ...route, text: 'Anything else?', kind: 'message' })
+  })
+
+  test('held text before the Telegram listen call is the answer', () => {
+    const r = rig()
+    r.turns.expect('m1', 'hi', route)
+    r.feed(upd('user_message_chunk', `${WEB_CHAT_HEADER}\nhi`))
+    r.feed(upd('agent_message_chunk', 'Hello!'))
+    r.feed(upd('tool_call', 'telegram__wait_for_message'))
+    expect(r.out.map(o => o.text)).toEqual(['Hello!'])
+    expect(r.turns.busy()).toBe(false)
   })
 
   test('a streamed answer with no following record is sent once it goes quiet', () => {
