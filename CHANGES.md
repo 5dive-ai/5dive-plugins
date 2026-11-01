@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.21: an encrypted self-host chat no longer goes silent when the agent cannot see the switch (DIVE-7440)
+
+lodar, on his encrypted test chat: «olivia stopped responding on my encrypt test». Turning encryption on locked the server's 5dive folder, so the agent read "not encrypted" and every reply was refused.
+
+- **The agent asks the server when it cannot see the switch itself.** If the server cannot say either, nothing goes out in the clear: messages wait, a voice clip is not heard, and the owner is told to run one command.
+- **Voice mode (0.5.20) follows the same rule**: a clip is heard only once the chat is known to be encrypted or not.
+
+Harness: `test/dive7440-dashboard-e2e-unknown.test.ts`.
+
 ### Added — dashboard 0.5.20: voice mode works inside an encrypted self-host chat (DIVE-7443)
 
 lodar, on his encrypted self-host test chat: «why cant I see voice mode in olivia chat?» Voice mode was off there because the words the server heard went back to the API in the clear.

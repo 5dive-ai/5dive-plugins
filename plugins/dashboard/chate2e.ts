@@ -38,9 +38,61 @@ const SEEN_KEEP_MS = 30 * 24 * 60 * 60_000
 const SEEN_MAX = 20_000
 const FILES_MAX = 10
 
-/** On when the box has the dir; read on every use, so turning it on needs no restart. */
+// DIVE-7440: what the person sees when this server cannot tell whether the chat
+// is encrypted, so it neither passed the message on nor answered in the clear.
+export const E2E_UNKNOWN_TEXT = 'This server could not check whether this chat is encrypted, so your message was not passed to the agent. Update the server (sudo 5dive self-update) and send it again.'
+
+export type E2EState = 'on' | 'off' | 'unknown'
+
+/**
+ * What this seat can see, read on every use (turning it on needs no restart).
+ * Only "no such dir" is off. Any other failure, EACCES above all (0.111.0's
+ * enable left /etc/5dive at 0700, DIVE-7440), is unknown, never off: off means
+ * envelopes reach the session raw and replies go out in the clear.
+ */
+export function e2eState(dir: string): E2EState {
+  try { return statSync(dir).isDirectory() ? 'on' : 'off' } catch (err) {
+    const code = (err as { code?: unknown })?.code
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 'off' : 'unknown'
+  }
+}
+
+/** On only when this seat can see the dir. Callers that act on it use makeE2EGate. */
 export function isE2E(dir: string): boolean {
-  try { return statSync(dir).isDirectory() } catch { return false }
+  return e2eState(dir) === 'on'
+}
+
+/** Thrown when neither this seat nor root can say: the caller must fail closed. */
+export class E2EUnknown extends Error {}
+
+/**
+ * On or off for a caller about to deliver or send. When the seat cannot see,
+ * root can: one `state` call through the root verb (which also puts the parent
+ * dir back). Its answer is kept for ttlMs. Root's readings:
+ *   answers               on
+ *   exit 3 / refused      on  (a CLI without the `state` op got past its "is it on" check)
+ *   exit 4 (E_NOT_FOUND)  off (the verb's "encrypted chat is not on")
+ *   anything else         E2EUnknown
+ */
+export function makeE2EGate(dir: string, call: BoxCall, ttlMs = 30_000, now: () => number = Date.now) {
+  let root: { on: boolean; at: number } | null = null
+  return async (): Promise<boolean> => {
+    const seen = e2eState(dir)
+    if (seen !== 'unknown') { root = null; return seen === 'on' }
+    if (root && now() - root.at < ttlMs) return root.on
+    let on: boolean
+    try {
+      await call({ op: 'state' })
+      on = true
+    } catch (err) {
+      const m = String(err)
+      if (/ failed \(exit 3\)/.test(m) || / refused: /.test(m)) on = true
+      else if (/ failed \(exit 4\)/.test(m)) on = false
+      else throw new E2EUnknown(`cannot tell whether encrypted chat is on: ${m.slice(0, 200)}`)
+    }
+    root = { on, at: now() }
+    return on
+  }
 }
 
 /** An envelope's shape, or null: anything else is plaintext to this side. */
