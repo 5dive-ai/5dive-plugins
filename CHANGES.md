@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram-grok / telegram-agy 0.5.33: a seat no longer goes deaf when its CLI starts a second Telegram bridge (DIVE-7460)
+
+lodar's messages to `dude` on chill-gorge got no answer while every process showed "running". Grok had started a second bridge without closing the first. The old one kept receiving the messages; Grok was listening on the new one.
+
+- **The newer bridge takes over.** Once its own session calls it, it asks the older bridge of the same session to step down, and gets the slot within a few seconds.
+- **Nothing is lost on the way.** Messages the old bridge was holding are handed to the new one.
+- **The old bridge is not killed** (that made Grok start a third one). It waits, and takes over again only if the new one dies.
+- **Unchanged for anything else:** a bridge started by another program still waits behind a healthy one, and only a newer bridge can ask.
+
+Harness: `test/dive7460-grok-slot-handoff.test.ts` (6 tests; the live one boots two real bridges under one parent against a stand-in Telegram, and is red when the takeover request is disabled).
+
 ### Fixed — dashboard 0.5.21: an encrypted self-host chat no longer goes silent when the agent cannot see the switch (DIVE-7440)
 
 lodar, on his encrypted test chat: «olivia stopped responding on my encrypt test». Turning encryption on locked the server's 5dive folder, so the agent read "not encrypted" and every reply was refused.

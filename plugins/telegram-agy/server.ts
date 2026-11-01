@@ -41,6 +41,10 @@ import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, typ
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { writePending, previewOf, pendingNotice } from './pending-inbound.ts'
+import {
+  siblingYounger, writeHandoffRequest, readHandoffRequest, clearHandoffRequest,
+  writeHandoffQueue, takeHandoffQueue,
+} from './slot-handoff.ts'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -132,6 +136,9 @@ const HEARTBEAT_FILE = join(STATE_DIR, 'bot.heartbeat')
 const HEARTBEAT_MS = 3000
 // 3 missed beats — how long a newcomer waits before deciding the incumbent died.
 const HEARTBEAT_STALE_MS = 9000
+// DIVE-7460: how long a server that handed its slot over waits for the newer
+// sibling to claim it before competing again (the sibling polls every beat).
+const HANDOFF_CLAIM_GRACE_MS = 30_000
 
 // DIVE-818: a TRANSIENT spawn running this server.ts (`claude mcp list`, or an
 // overlapping respawn) used to eagerly SIGTERM whatever PID held the slot and
@@ -429,6 +436,9 @@ function enqueueInbound(msg: InboundMsg) {
       .catch((err: any) => process.stderr.write(`telegram-agy: stall auto-reply failed: ${err?.message}\n`))
     return
   }
+  // DIVE-7460: this server handed its slot to a newer sibling — the TUI listens
+  // there, so a late arrival goes to the sibling's hand-over queue.
+  if (handedOff) { writeHandoffQueue(STATE_DIR, [msg]); return }
   const next = waiters.shift()
   if (next) {
     if (next.timer) clearTimeout(next.timer)
@@ -521,6 +531,9 @@ mkdirSync(AGENT_INBOX_DIR, { recursive: true, mode: 0o700 })
 
 function ingestInboxFile(name: string): void {
   if (!name.endsWith('.json')) return
+  // DIVE-7460: a server that handed its slot to a newer sibling is no longer the
+  // one its TUI listens on — leave the file for the slot holder's watcher.
+  if (handedOff) return
   const full = join(AGENT_INBOX_DIR, name)
   let raw: string
   try { raw = readFileSync(full, 'utf8') } catch { return }   // already consumed / mid-rename
@@ -601,7 +614,9 @@ function formatInbound(msg: InboundMsg): string {
 // Bot
 // ============================================================================
 
-const bot = new Bot(TOKEN)
+// DIVE-7460: TELEGRAM_API_ROOT points the bridge at a stand-in Bot API, so a
+// harness can boot two real servers and drive getUpdates. Unset = api.telegram.org.
+const bot = new Bot(TOKEN, process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : undefined)
 
 // Telegram rejects sendMessage/editMessageText text over 4096 chars
 // (400: message is too long). A rejected send only surfaces in bot.catch —
@@ -2793,7 +2808,12 @@ const REARM_KICK_TEXT =
 // prolonged silence with no parked waiter means "fell out of the loop".
 let lastServerActivity = Date.now()
 let rearmKicks = 0
-function markActivity(): void { lastServerActivity = Date.now() }
+function markActivity(): void { lastServerActivity = Date.now(); mcpToolCalls += 1 }
+// DIVE-7460: tool calls this server has served. A parked server with any is one
+// its TUI is really talking to — the evidence it may ask an older sibling for
+// the slot (slot-handoff.ts). Set once this server hands its slot over.
+let mcpToolCalls = 0
+let handedOff = false
 
 // ── Silent-failure self-report ──────────────────────────────────────────────
 // The re-arm watchdog above keeps a *healthy* agent in the listen loop. Some
@@ -3343,73 +3363,138 @@ if (SEND_ONLY) {
   // DIVE-818 single-flight acquisition: wait until no HEALTHY incumbent holds
   // the slot, then claim it. A transient enumeration spawn (`claude mcp list`)
   // parks here harmlessly and is killed by its parent before it ever polls.
+  // DIVE-7460: set when this server handed the slot to a newer sibling, so it
+  // gives that sibling time to claim before competing for the slot again.
+  let handedTo = 0
+  let handedAt = 0
   async function acquireSlot(): Promise<void> {
+    let asked = 0
     for (;;) {
       if (shuttingDown) return
-      if (!incumbentHolds()) {
-        try {
-          const prev = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-          if (prev > 1 && prev !== process.pid && pidAlive(prev)) {
-            process.stderr.write(`telegram-agy: reclaiming stale poller pid=${prev}\n`)
-            process.kill(prev, 'SIGTERM')
-          }
-        } catch {}
+      let holder = NaN
+      try { holder = parseInt(readFileSync(PID_FILE, 'utf8'), 10) } catch {}
+      // Just handed over: wait for the sibling to claim (or die) instead of
+      // grabbing the slot back in the gap before its next acquire pass.
+      const graceful = handedOff && holder !== handedTo && pidAlive(handedTo)
+        && Date.now() - handedAt < HANDOFF_CLAIM_GRACE_MS
+      if (!graceful && !incumbentHolds()) {
+        if (holder > 1 && holder !== process.pid && pidAlive(holder)) {
+          process.stderr.write(`telegram-agy: reclaiming stale poller pid=${holder}\n`)
+          try { process.kill(holder, 'SIGTERM') } catch {}
+        }
         writeFileSync(PID_FILE, String(process.pid))
+        if (asked) clearHandoffRequest(STATE_DIR)
         return
+      }
+      // DIVE-7460: the incumbent is healthy, but if it is an OLDER server of our
+      // own session and our TUI is calling US, it is the stale one — ask it to
+      // step down instead of waiting behind it forever. Renewed every 20s so a
+      // request that aged out (or raced a step-down) is not lost.
+      if (!graceful && !handedOff && mcpToolCalls > 0 && Date.now() - asked > 20_000
+        && siblingYounger(process.pid, holder)) {
+        process.stderr.write(`telegram-agy: older sibling pid=${holder} holds the slot while our session calls us — asking it to hand over\n`)
+        writeHandoffRequest(STATE_DIR, process.pid)
+        asked = Date.now()
       }
       await new Promise(r => setTimeout(r, HEARTBEAT_MS))
     }
   }
   const bumpHeartbeat = () => { try { writeFileSync(HEARTBEAT_FILE, String(Date.now())) } catch {} }
-  await acquireSlot()
-  if (shuttingDown) return
-  bumpHeartbeat()
-  heartbeatTimer = setInterval(bumpHeartbeat, HEARTBEAT_MS)
+  // DIVE-7460 incumbent side: a younger sibling of our own session asked for the
+  // slot. Stop polling; the tenure loop below then parks the queue for it and
+  // releases the slot files. We do NOT exit: an exit makes the TUI re-spawn us.
+  const checkHandoff = () => {
+    if (handedOff || shuttingDown) return
+    const req = readHandoffRequest(STATE_DIR)
+    if (!req || req.pid === process.pid || !pidAlive(req.pid)) return
+    if (!siblingYounger(req.pid, process.pid)) return
+    process.stderr.write(`telegram-agy: handing the poll slot to newer sibling pid=${req.pid}\n`)
+    handedOff = true
+    handedTo = req.pid
+    handedAt = Date.now()
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined }
+    void bot.stop().catch(() => {})
+  }
+  const beat = () => {
+    bumpHeartbeat()
+    // Late arrivals an older sibling handed over after we claimed (an update
+    // its middleware was still handling when it stopped).
+    for (const m of takeHandoffQueue<InboundMsg>(STATE_DIR)) enqueueInbound(m)
+    checkHandoff()
+  }
 
-  for (let attempt = 1; ; attempt++) {
-    try {
-      await bot.start({
-        // Telegram REMEMBERS the last allowed_updates passed to getUpdates and
-        // reuses it when omitted. A bridge that ran on this token before may
-        // have narrowed it to exclude callback_query — which silently kills the
-        // /tasks tappable buttons (messages arrive, taps don't). Pin it
-        // explicitly to what we handle.
-        allowed_updates: ['message', 'callback_query'],
-        onStart: info => {
-          attempt = 0
-          botUsername = info.username
-          process.stderr.write(`telegram-agy: polling as @${info.username}\n`)
-          // Register the bot command menu so the TG app surfaces /<cmd>
-          // suggestions. Failures are non-fatal — polling continues.
-          // Write the menu to BOTH the default scope (groups + fallback) and
-          // all_private_chats (DMs). A recycled bot token can carry a stale
-          // all_private_chats menu that would otherwise shadow the default one
-          // in DMs (Telegram resolves the most specific scope per chat).
-          for (const scope of [undefined, { type: 'all_private_chats' as const }]) {
-            void bot.api.setMyCommands(MENU_COMMANDS, scope ? { scope } : undefined).catch(err => {
-              process.stderr.write(`telegram-agy: setMyCommands(${scope?.type ?? 'default'}) failed: ${err}\n`)
-            })
-          }
-        },
-      })
-      return
-    } catch (err) {
-      if (shuttingDown) return
-      if (err instanceof Error && err.message === 'Aborted delay') return
-      const is409 = err instanceof GrammyError && err.error_code === 409
-      const wait = Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6))
-      process.stderr.write(
-        `telegram-agy: polling error attempt ${attempt}${is409 ? ' (409 Conflict)' : ''}: `
-        + `${err instanceof Error ? err.message : String(err)}; retrying in ${wait}ms\n`,
-      )
-      await new Promise(r => setTimeout(r, wait))
-      // DIVE-1239: a 409 means another process is already polling this bot
-      // token. Re-run single-flight acquisition so we PARK behind a HEALTHY
-      // incumbent (fresh heartbeat) instead of thrashing getUpdates against it
-      // forever. Without this, a second server.ts spawned by the heartbeat/
-      // task/session re-arm path fights the boot poller indefinitely — two live
-      // pollers on one token = permanent 409 = the plugin goes deaf.
-      if (is409) await acquireSlot()
+  // One pass per slot tenure. A server that handed its slot over parks in
+  // acquireSlot() again, so it takes the slot back only if the newer sibling dies.
+  for (;;) {
+    await acquireSlot()
+    if (shuttingDown) return
+    if (handedOff) {
+      handedOff = false
+      process.stderr.write('telegram-agy: newer sibling released the poll slot — polling again\n')
     }
+    // DIVE-7460: messages an older sibling had queued when it handed us the slot.
+    for (const m of takeHandoffQueue<InboundMsg>(STATE_DIR)) enqueueInbound(m)
+    bumpHeartbeat()
+    heartbeatTimer = setInterval(beat, HEARTBEAT_MS)
+
+    for (let attempt = 1; !handedOff; attempt++) {
+      try {
+        await bot.start({
+          // Telegram REMEMBERS the last allowed_updates passed to getUpdates and
+          // reuses it when omitted. A bridge that ran on this token before may
+          // have narrowed it to exclude callback_query — which silently kills the
+          // /tasks tappable buttons (messages arrive, taps don't). Pin it
+          // explicitly to what we handle.
+          allowed_updates: ['message', 'callback_query'],
+          onStart: info => {
+            attempt = 0
+            botUsername = info.username
+            process.stderr.write(`telegram-agy: polling as @${info.username}\n`)
+            // Register the bot command menu so the TG app surfaces /<cmd>
+            // suggestions. Failures are non-fatal — polling continues.
+            // Write the menu to BOTH the default scope (groups + fallback) and
+            // all_private_chats (DMs). A recycled bot token can carry a stale
+            // all_private_chats menu that would otherwise shadow the default one
+            // in DMs (Telegram resolves the most specific scope per chat).
+            for (const scope of [undefined, { type: 'all_private_chats' as const }]) {
+              void bot.api.setMyCommands(MENU_COMMANDS, scope ? { scope } : undefined).catch(err => {
+                process.stderr.write(`telegram-agy: setMyCommands(${scope?.type ?? 'default'}) failed: ${err}\n`)
+              })
+            }
+          },
+        })
+        break
+      } catch (err) {
+        if (shuttingDown) return
+        if (handedOff) break
+        if (err instanceof Error && err.message === 'Aborted delay') return
+        const is409 = err instanceof GrammyError && err.error_code === 409
+        const wait = Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6))
+        process.stderr.write(
+          `telegram-agy: polling error attempt ${attempt}${is409 ? ' (409 Conflict)' : ''}: `
+          + `${err instanceof Error ? err.message : String(err)}; retrying in ${wait}ms\n`,
+        )
+        await new Promise(r => setTimeout(r, wait))
+        if (handedOff) break
+        // DIVE-1239: a 409 means another process is already polling this bot
+        // token. Re-run single-flight acquisition so we PARK behind a HEALTHY
+        // incumbent (fresh heartbeat) instead of thrashing getUpdates against it
+        // forever. Without this, a second server.ts spawned by the heartbeat/
+        // task/session re-arm path fights the boot poller indefinitely — two live
+        // pollers on one token = permanent 409 = the plugin goes deaf.
+        if (is409) await acquireSlot()
+      }
+    }
+    if (shuttingDown || !handedOff) return
+    // Handed over. Polling and its middleware are done (bot.start resolved), so
+    // the queue is final. Order matters: queue first, then the PID file, then
+    // the heartbeat — the sibling claims once the heartbeat is gone, finds no
+    // PID file to SIGTERM, and finds the queue.
+    writeHandoffQueue(STATE_DIR, inboxQueue.splice(0))
+    syncPending()
+    disarmTurnEndKick()
+    try { if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) unlinkSync(PID_FILE) } catch {}
+    try { unlinkSync(HEARTBEAT_FILE) } catch {}
+    clearHandoffRequest(STATE_DIR)
   }
 })()
