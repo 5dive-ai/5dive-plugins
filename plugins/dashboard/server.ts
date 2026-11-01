@@ -52,7 +52,7 @@ import { askRelayOp, numberedText, parseQuestion } from './question.ts'
 import { replyTooLong } from './replycap.ts'
 import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
-import { E2E_ARGV_DEFAULT, E2E_DIR_DEFAULT, E2E_REFUSED_TEXT, dropPlainCopies, isE2E, makeChatE2E, rootBoxCall } from './chate2e.ts'
+import { E2E_ARGV_DEFAULT, E2E_DIR_DEFAULT, E2E_REFUSED_TEXT, E2E_UNKNOWN_TEXT, dropPlainCopies, e2eState, makeChatE2E, makeE2EGate, rootBoxCall } from './chate2e.ts'
 
 let PLUGIN_VERSION = '?'
 try {
@@ -170,8 +170,10 @@ const TRANSCRIBE = process.env.DASHBOARD_TRANSCRIBE ?? '/usr/local/bin/5dive-tra
 // DIVE-6876: an encrypted chat (chate2e.ts). Hands-free is off there: the
 // words it hears go back to the API in the clear.
 const E2E_DIR = process.env.DASHBOARD_CHAT_E2E_DIR ?? E2E_DIR_DEFAULT
-const e2eOn = () => isE2E(E2E_DIR)
-const hearsHere = () => !RELAY && chatOnly() && !e2eOn() && existsSync(TRANSCRIBE)
+// DIVE-7440: true/false, or throws when neither this seat nor root can tell
+// (every caller fails closed then). The gate itself is built with the root verb below.
+const e2eOn = (): Promise<boolean> => e2eGate()
+const hearsHere = () => !RELAY && chatOnly() && e2eState(E2E_DIR) === 'off' && existsSync(TRANSCRIBE)
 const LONG_POLL_BACKOFF_MS = (() => {
   const raw = Number(process.env.DASHBOARD_LONGPOLL_BACKOFF_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 1_000
@@ -554,7 +556,7 @@ const workStatus = makeWorkStatus({
     try {
       // DIVE-6876: in an encrypted chat the step is sealed; one that cannot be
       // sealed is left off, and the chat shows plain "working".
-      const e2e = e2eOn()
+      const e2e = await e2eOn().catch(() => true)
       const shown = e2e && label ? await chatE2E.sealStatus(chatId, label).catch(() => '') : label
       const res = await authedFetch(`${API_BASE}/server/messages/status`, 'status', {
         method: 'POST',
@@ -648,7 +650,9 @@ function ingestInboxFile(name: string, via: 'boot' | 'watch' | 'sweep'): void {
   void (async () => {
     let body = text
     let attachment = inboundAttachment(obj?.image_path)
-    if (e2eOn()) {
+    let on: boolean
+    try { on = await e2eOn() } catch (err) { refuseUnknownE2E(chatId, `drop ${name}`, err); return false }
+    if (on) {
       const opened = await admitE2E(text, chatId, `drop ${name}`)
       if (!opened) return false
       ;({ text: body, attachment, key: e2eKey } = opened)
@@ -878,7 +882,7 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
     savePendingRetryState(PENDING_RETRY_FILE, retryState)
   }
   // DIVE-7098: heard beside the poll, which goes straight back to waiting.
-  if (e2eOn()) hear = []
+  if (await e2eOn().catch(() => true)) hear = []
   for (const job of hear) void hearClip(job)
   if (items.length === 0) return hear.length === 0 && wait > 0 && Date.now() - started < 1_000 ? 'empty-fast' : 'ok'
   const acked: number[] = []
@@ -917,7 +921,10 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
     let body = m.text
     let attachment = inboundAttachment(m.image_path)
     let e2eKey = ''
-    if (e2eOn()) {
+    // DIVE-7440: unknown is not acked, so it is offered again once the box can tell.
+    let on: boolean
+    try { on = await e2eOn() } catch (err) { refuseUnknownE2E(chatId, `pending message id=${m.id}`, err); continue }
+    if (on) {
       const opened = await admitE2E(m.text, chatId, `pending message id=${m.id}`)
       if (!opened) { acked.push(m.id); continue }
       ;({ text: body, attachment, key: e2eKey } = opened)
@@ -1047,8 +1054,10 @@ const E2E_ARGV: string[] = (() => {
   } catch {}
   return E2E_ARGV_DEFAULT
 })()
+const e2eCall = rootBoxCall(E2E_ARGV, RELAY_FILE_TIMEOUT_MS)
+const e2eGate = makeE2EGate(E2E_DIR, e2eCall)
 const chatE2E = makeChatE2E({
-  call: rootBoxCall(E2E_ARGV, RELAY_FILE_TIMEOUT_MS),
+  call: e2eCall,
   stateDir: STATE_DIR,
   agent: AGENT,
   uploadsDir: UPLOADS_DIR,
@@ -1085,6 +1094,15 @@ async function admitE2E(text: string, chatId: string, what: string): Promise<{ t
     void sendDashboardReply({ chat_id: chatId, text: E2E_REFUSED_TEXT }).catch(() => {})
   }
   return null
+}
+
+// DIVE-7440: nobody could tell whether the chat is encrypted. The message is
+// not passed on (it may be ciphertext, or plaintext the API should never have
+// carried). The notice is a fixed sentence, so sending it in the clear leaks
+// nothing; in an encrypted chat the API refuses it, and the log keeps the why.
+function refuseUnknownE2E(chatId: string, what: string, err: unknown): void {
+  recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `encrypted chat: ${what} held, not delivered: ${String(err).slice(0, 200)}`)
+  if (chatE2E.noticeDue(chatId)) void postReply(chatId, E2E_UNKNOWN_TEXT, [], null, false).catch(() => {})
 }
 
 // DIVE-7098: a hands-free clip the app asked this box to hear (chatonly.ts).
@@ -1293,7 +1311,13 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
   const question = args.question ?? null
   // DIVE-6876: an encrypted chat seals the reply, its files and its buttons;
   // a reply that cannot be sealed fails here and nothing is sent.
-  if (e2eOn()) {
+  // DIVE-7440: and so does one where nobody can tell whether the chat is encrypted.
+  let on: boolean
+  try { on = await e2eOn() } catch (err) {
+    dropPlainCopies([...copied, ...files], OUTBOX_DIR)
+    throw new Error(`reply not sent: ${String(err).slice(0, 200)}. It was not sent unencrypted either.`)
+  }
+  if (on) {
     let sealed: { body: string; files: string[] }
     try {
       sealed = await chatE2E.sealReply(chatId, text, files, question, OUTBOX_DIR)

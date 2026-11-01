@@ -6,7 +6,7 @@
 // In-process: makeBoxStub(dir).call(req). As a process (DASHBOARD_E2E_ARGV):
 // `bun chat-e2e-box-stub.ts <dir>`, request JSON on stdin, answer on stdout.
 
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import * as E from '../../plugins/dashboard/e2e.ts'
 
@@ -29,6 +29,11 @@ export function makeBoxStub(dir: string) {
     E.seal({ senderId: 'box', senderPriv: await priv(), recipients: await recipients(), conv, msgId: m, dir: 'out', plaintext })
 
   async function call(req: any): Promise<Record<string, unknown>> {
+    // DIVE-7440: as the rail: on answers, off is exit 4 (E_NOT_FOUND).
+    if (req.op === 'state') {
+      if (!existsSync(join(dir, 'box.jwk'))) throw Object.assign(new Error('encrypted chat is not on on this server.'), { exit: 4 })
+      return { on: true }
+    }
     const conv = String(req.conv ?? '')
     if (req.op === 'open') {
       const env = req.env as E.Envelope
@@ -75,6 +80,6 @@ if (import.meta.main) {
     process.stdout.write(JSON.stringify(await makeBoxStub(process.argv[2]).call(req)))
   } catch (err) {
     process.stderr.write(String(err instanceof Error ? err.message : err))
-    process.exit(2)
+    process.exit((err as { exit?: number })?.exit ?? 2)
   }
 }
