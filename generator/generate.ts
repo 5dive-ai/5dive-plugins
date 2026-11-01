@@ -54,6 +54,7 @@ const COPY_FILES = [
   'lifecycle.ts', // DIVE-3752: orphan watchdog + start/exit record — copied byte-exact
   'viewer-link.ts', // DIVE-4493: one-time viewer-link transport guard — copied byte-exact
   'pending-inbound.ts', // DIVE-7422: mid-turn inbound state + surface decision — copied byte-exact
+  'slot-handoff.ts', // DIVE-7460: poll-slot handoff to a newer sibling of the same session — copied byte-exact
   'pair.ts',
   'package.json',
   'AGENTS.md',
@@ -198,7 +199,7 @@ function generate(slug: string, outDir: string): void {
     // `plugins/telegram/server.ts` by path as the place the dead ppid clause came
     // from, and a swept copy would claim that history happened in a fork it never
     // happened in. A shared module's provenance must survive being copied.
-    if (file === 'tna.ts' || file === 'banner.ts' || file === 'lifecycle.ts' || file === 'viewer-link.ts') return text
+    if (file === 'tna.ts' || file === 'banner.ts' || file === 'lifecycle.ts' || file === 'viewer-link.ts' || file === 'slot-handoff.ts') return text
     // Mechanical token subs + bare-cliBin sweep FIRST, so the text now reads as
     // the target runtime everywhere the knobs reach. Structural blocks run AFTER,
     // so their find-strings match the already-tokenized text and their replace
