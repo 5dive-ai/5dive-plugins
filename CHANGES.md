@@ -1,5 +1,24 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.21: an encrypted self-host chat no longer goes silent when the agent cannot see the switch (DIVE-7440)
+
+lodar, on his encrypted test chat: «olivia stopped responding on my encrypt test». Turning encryption on locked the server's 5dive folder, so the agent read "not encrypted" and every reply was refused.
+
+- **The agent asks the server when it cannot see the switch itself.** If the server cannot say either, nothing goes out in the clear: messages wait, a voice clip is not heard, and the owner is told to run one command.
+- **Voice mode (0.5.20) follows the same rule**: a clip is heard only once the chat is known to be encrypted or not.
+
+Harness: `test/dive7440-dashboard-e2e-unknown.test.ts`.
+
+### Added — dashboard 0.5.20: voice mode works inside an encrypted self-host chat (DIVE-7443)
+
+lodar, on his encrypted self-host test chat: «why cant I see voice mode in olivia chat?» Voice mode was off there because the words the server heard went back to the API in the clear.
+
+- **A server with speech-to-text hears encrypted clips.** The app uploads each clip sealed. The server opens it, hears it on its own engine, and sends the words back sealed to the approved devices. The API only carries ciphertext, `""` for a clip with no words, or nothing.
+- **A clip the server cannot open is not heard**: plaintext, or sealed by a device it does not know.
+- **A voice note that already carries its words** is handed to the agent as words; its audio is not opened a second time.
+
+Harness: `test/dive7443-dashboard-e2e-voice.test.ts` (3 tests; 2 red on the old tree: no `hear=1` from an encrypted box, and a heard note's audio re-opened).
+
 ### Fixed — telegram 0.5.128 / dashboard 0.5.18: a hook no longer reads the whole session and wedges the seat (DIVE-7434)
 
 Box report 607 (smoky-canyon): both plugins' StopFailure hooks sat ~3 h at ~350 MB each. The seat ran out of memory headroom, everything in it stalled, and the Telegram poller died until a manual restart. Third time on that box.
