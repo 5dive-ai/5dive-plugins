@@ -52,7 +52,7 @@ import { askRelayOp, numberedText, parseQuestion } from './question.ts'
 import { replyTooLong } from './replycap.ts'
 import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
-import { E2E_ARGV_DEFAULT, E2E_DIR_DEFAULT, E2E_REFUSED_TEXT, dropPlainCopies, isE2E, makeChatE2E, rootBoxCall } from './chate2e.ts'
+import { E2E_ARGV_DEFAULT, E2E_DIR_DEFAULT, E2E_REFUSED_TEXT, dropPlainCopies, isE2E, makeChatE2E, parseEnvelope, rootBoxCall } from './chate2e.ts'
 
 let PLUGIN_VERSION = '?'
 try {
@@ -167,11 +167,12 @@ const chatOnly = () => isChatOnly(CHAT_ONLY_MARKER)
 // later is picked up. A relayed seat cannot say it: the root relay builds that
 // URL, so its app keeps saying hands-free is not here yet.
 const TRANSCRIBE = process.env.DASHBOARD_TRANSCRIBE ?? '/usr/local/bin/5dive-transcribe'
-// DIVE-6876: an encrypted chat (chate2e.ts). Hands-free is off there: the
-// words it hears go back to the API in the clear.
+// DIVE-6876: an encrypted chat (chate2e.ts). DIVE-7443: voice mode works
+// there too: the clip comes sealed, is opened and heard here, and the words go
+// back sealed to the approved devices (hearSealedClip), never in the clear.
 const E2E_DIR = process.env.DASHBOARD_CHAT_E2E_DIR ?? E2E_DIR_DEFAULT
 const e2eOn = () => isE2E(E2E_DIR)
-const hearsHere = () => !RELAY && chatOnly() && !e2eOn() && existsSync(TRANSCRIBE)
+const hearsHere = () => !RELAY && chatOnly() && existsSync(TRANSCRIBE)
 const LONG_POLL_BACKOFF_MS = (() => {
   const raw = Number(process.env.DASHBOARD_LONGPOLL_BACKOFF_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 1_000
@@ -878,7 +879,6 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
     savePendingRetryState(PENDING_RETRY_FILE, retryState)
   }
   // DIVE-7098: heard beside the poll, which goes straight back to waiting.
-  if (e2eOn()) hear = []
   for (const job of hear) void hearClip(job)
   if (items.length === 0) return hear.length === 0 && wait > 0 && Date.now() - started < 1_000 ? 'empty-fast' : 'ok'
   const acked: number[] = []
@@ -1097,10 +1097,45 @@ const hearFile: Hear = async (bin, args, timeoutMs) => {
   }
 }
 
+/**
+ * DIVE-7443: a clip in an encrypted chat. The app uploads it as a sealed voice
+ * note (its envelope at job.path, the audio a sealed blob that envelope names),
+ * so only an approved device can have sent it. It is opened and heard here; the
+ * words go back sealed to every approved device. The API gets ciphertext, ""
+ * for a clip with no words, or null. Nothing reaches the session: the app sends
+ * the note itself once it has read the words.
+ */
+async function hearSealedClip(job: HearJob): Promise<string | null> {
+  await ensureInboundFile(job.path)
+  let raw: string
+  try { raw = readFileSync(job.path, 'utf8') } catch { return null }
+  try { unlinkSync(job.path) } catch {}
+  const env = parseEnvelope(raw)
+  if (!env) return null
+  const a = await chatE2E.admit(raw, env.h.c)
+  if (a.kind !== 'deliver') return null
+  try {
+    const audio = a.files.find(f => isAudioPath(f))
+    const text = audio ? await hearText(audio, hearFile, TRANSCRIBE) : null
+    if (!text) return text
+    return (await chatE2E.sealReply(env.h.c, text, [], null, OUTBOX_DIR)).body
+  } catch {
+    return null
+  } finally {
+    for (const f of a.files) { try { unlinkSync(f) } catch {} }
+  }
+}
+
 async function hearClip(job: HearJob): Promise<void> {
   const t0 = Date.now()
-  await ensureInboundFile(job.path)
-  const text = existsSync(job.path) ? await hearText(job.path, hearFile, TRANSCRIBE) : null
+  const sealed = e2eOn()
+  let text: string | null
+  if (sealed) {
+    text = await hearSealedClip(job)
+  } else {
+    await ensureInboundFile(job.path)
+    text = existsSync(job.path) ? await hearText(job.path, hearFile, TRANSCRIBE) : null
+  }
   try {
     const res = await authedFetch(`${API_BASE}/server/selfhost/heard`, 'heard', {
       method: 'POST',
@@ -1108,7 +1143,8 @@ async function hearClip(job: HearJob): Promise<void> {
       body: JSON.stringify({ agent: AGENT, id: job.id, text }),
     })
     void res.text().catch(() => '')
-    noteChatFile(`hands-free: heard ${job.path} in ${Date.now() - t0} ms (${text === null ? 'could not hear' : text ? `${text.split(' ').length} words` : 'no words'}; answer ${res.status})`)
+    const what = text === null ? 'could not hear' : !text ? 'no words' : sealed ? 'words, sealed' : `${text.split(' ').length} words`
+    noteChatFile(`hands-free: heard ${job.path} in ${Date.now() - t0} ms (${what}; answer ${res.status})`)
   } catch (err) {
     noteChatFile(`hands-free: could not answer for ${job.path}: ${String(err).slice(0, 200)}`)
   }

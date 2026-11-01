@@ -26,6 +26,7 @@ import { randomBytes, randomUUID } from 'crypto'
 import { basename, join } from 'path'
 import { b64u, unb64u, type Envelope } from './e2e.ts'
 import { isOwnUpload } from './chatonly.ts'
+import { isAudioPath } from './voicenote.ts'
 import type { ChatQuestion } from './hooks/lib/dashboard-chat.ts'
 
 export const E2E_DIR_DEFAULT = '/etc/5dive/chat-e2e'
@@ -170,7 +171,12 @@ export function makeChatE2E(o: ChatE2EOpts) {
       const files: string[] = []
       let body = inner.text
       const list: unknown[] = Array.isArray(inner.files) ? inner.files.slice(0, FILES_MAX) : []
+      // DIVE-7443: a voice note this box already heard carries its words; its
+      // audio is not opened again, so the agent reads the words and does not
+      // hear the note a second time.
+      const heard = /^\[voice note\][ \t]*\S/.test(body)
       for (let i = 0; i < list.length; i++) {
+        if (heard && isAudioPath(String((list[i] as { name?: unknown })?.name ?? ''))) continue
         try {
           files.push(await openFile(list[i], i, env, env.h.s, conv))
         } catch (err) {
