@@ -29,10 +29,19 @@ export type GreetClaims = {
   release(chat: string): void
 }
 
-export function makeGreetClaims(now: () => number = Date.now, windowMs = GREET_WINDOW_MS): GreetClaims {
+/**
+ * DIVE-7478: `held(chat)` true = this chat was greeted before this process polled
+ * (the box's connect greeting, connect-greeted.json), so nobody here greets it.
+ */
+export function makeGreetClaims(
+  now: () => number = Date.now,
+  windowMs = GREET_WINDOW_MS,
+  held: (chat: string) => boolean = () => false,
+): GreetClaims {
   const at = new Map<string, number>()
   return {
     claim(chat) {
+      if (held(chat)) return false
       const t = now()
       const prev = at.get(chat)
       if (prev !== undefined && t - prev < windowMs) return false
@@ -75,4 +84,29 @@ export function bootGreetTargets(o: {
   if (o.heardHuman || !o.wiredRecently) return { greet: [], record: true }
   const owners = (o.owners ?? o.allowFrom).filter(id => o.allowFrom.includes(id) && /^[1-9]\d*$/.test(id))
   return { greet: [...new Set(owners)], record: true }
+}
+
+// DIVE-7478: the box greets the owner the moment the bot is connected
+// (`5dive agent _tg_connect_greet`, in the CLI), ~40 s before this poller exists,
+// and records it in the state dir. The /starts queued meanwhile and the boot
+// greeting must not say hello a second time.
+export const CONNECT_GREETED_FILE = 'connect-greeted.json'
+/** The box's greeting stands for this long; past it a /start greets as before. */
+export const CONNECT_GREET_HOLD_MS = 10 * 60_000
+
+/**
+ * The chats the box greeted for THIS bot inside the hold. `raw` is the file's
+ * text (null = no file). A marker for another bot (a rotated token), a stale one,
+ * or garbage holds nothing.
+ */
+export function connectGreetedChats(raw: string | null, botId: string | null, now: number, holdMs = CONNECT_GREET_HOLD_MS): string[] {
+  if (!raw || !botId) return []
+  try {
+    const m = JSON.parse(raw) as { botId?: unknown; at?: unknown; chats?: unknown }
+    const at = Number(m.at)
+    if (m.botId !== botId || !Number.isFinite(at) || now - at >= holdMs || now < at - 60_000) return []
+    return Array.isArray(m.chats) ? m.chats.map(String).filter(c => /^[1-9]\d*$/.test(c)) : []
+  } catch {
+    return []
+  }
 }

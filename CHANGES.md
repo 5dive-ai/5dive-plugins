@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.129, telegram-codex 0.5.44, telegram-grok / telegram-agy 0.5.34, telegram-opencode 0.5.13, telegram-pi 0.1.13: one hello per chat when the box greets at connect (DIVE-7478)
+
+lodar: «bit confusing first 40 seconds for any new customer with new agent on telegram when it connects». A new agent's bot answered nothing until its session had booted. The 5dive CLI now greets the owner the moment the bot is connected and shows "typing" until the agent is up, and records the chats it greeted in `connect-greeted.json`.
+
+- **The bridge does not greet that chat again.** The queued /start, and the claude plugin's boot greeting, are skipped for 10 minutes for a chat the box greeted with this bot.
+- **The codex, grok, agy, opencode and pi bridges** skip their /start reply for that chat too.
+- **Anything else is unchanged:** a first-job result still goes out, a rotated token or an old marker holds nothing.
+
+Harness: `test/dive7478-connect-greeted.test.ts` (12 tests; red when the hold or a fork's /start check is removed).
+
 ### Fixed — telegram-grok / telegram-agy 0.5.33: a seat no longer goes deaf when its CLI starts a second Telegram bridge (DIVE-7460)
 
 lodar's messages to `dude` on chill-gorge got no answer while every process showed "running". Grok had started a second bridge without closing the first. The old one kept receiving the messages; Grok was listening on the new one.
