@@ -1435,6 +1435,20 @@ async function reportLoginFork(sid: string, chatId: string, s: AuthState | null,
 
 // Returns true if this message was handled as a slash command (caller
 // should NOT enqueue it for Grok).
+// DIVE-7478: `5dive agent _tg_connect_greet` greets the owner the moment the bot
+// is connected, before this bridge polls, and records each chat it greeted in
+// connect-greeted.json. The /start queued meanwhile must not get a second hello.
+const CONNECT_GREETED_FILE = join(STATE_DIR, 'connect-greeted.json')
+const CONNECT_GREET_HOLD_MS = 10 * 60_000
+function connectGreeted(chat: string): boolean {
+  try {
+    const m = JSON.parse(readFileSync(CONNECT_GREETED_FILE, 'utf8')) as { botId?: unknown; at?: unknown; chats?: unknown }
+    const botId = /^(\d+):/.exec(TOKEN ?? '')?.[1]
+    return !!botId && m.botId === botId && Date.now() - Number(m.at) < CONNECT_GREET_HOLD_MS
+      && Array.isArray(m.chats) && m.chats.map(String).includes(chat)
+  } catch { return false }
+}
+
 async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> {
   // Match /<cmd> and /<cmd>@<botname> (group disambiguation).
   const m = text.match(/^\/([a-z][a-z0-9_]*)(?:@([\w]+))?(?:\s|$)/i)
@@ -1652,6 +1666,8 @@ async function handleSlashCommand(ctx: Context, text: string): Promise<boolean> 
         await md(await orgTree(cmdArg))
         return true
       case 'start':
+        // DIVE-7478: the box already greeted this chat at connect.
+        if (connectGreeted(chat_id)) return true
         await md(
           'This bot bridges Telegram to your xAI Grok session.\n\n' +
           'Already paired? Just type. Messages here reach the Grok session.\n\n' +

@@ -97,7 +97,7 @@ import { patchEffortFile, effectiveEffort } from './settingsfile.ts'
 import { admitOnJoin, nextOwners, groupJoinLines, ownerOnlyDrops, ASK_OWNER } from './groupjoin.ts'
 import { notAllowlistedMessage } from './chatguard.ts'
 import { replyContextMeta } from './replyctx.ts'
-import { makeGreetClaims, botIdOf, bootGreetTargets, BOOT_GREET_DELAY_MS, WIRED_RECENTLY_MS } from './bootgreet.ts'
+import { makeGreetClaims, botIdOf, bootGreetTargets, connectGreetedChats, BOOT_GREET_DELAY_MS, WIRED_RECENTLY_MS, GREET_WINDOW_MS, CONNECT_GREETED_FILE } from './bootgreet.ts'
 import { makeFirstReplier, firstReplyOwners, isFirstJobPayload, lastHumanChatId, FIRST_REPLY_FILE, FIRST_REPLY_POLL_MS } from './firstreply.ts'
 import { resolveProfile, liteLang, liteRoute, liteHelpBody, liteMenu, liteAccountUrl, readAllowance, liteUsageText, writeLiteLang, readLiteLang, recordOpsDetail, startGreeting, liteStartPayload, LITE_STRINGS, LITE_INSTRUCTIONS, type Lang, type LiteCommand } from './hooks/lib/lite.ts'
 import {
@@ -5350,7 +5350,13 @@ async function startGreetingFor(ctx: Context, lang: Lang): Promise<string> {
 }
 
 // DIVE-5411: who was greeted when, shared by both /start arms and bootGreet.
-const greetClaims = makeGreetClaims()
+// DIVE-7478: a chat the box greeted at connect counts as greeted (read per claim:
+// a /start is rare and the box may record a late greeting after this boots).
+const greetClaims = makeGreetClaims(Date.now, GREET_WINDOW_MS, chat => {
+  let raw: string | null = null
+  try { raw = readFileSync(join(STATE_DIR, CONNECT_GREETED_FILE), 'utf8') } catch {}
+  return connectGreetedChats(raw, botIdOf(TOKEN), Date.now()).includes(chat)
+})
 // The bot id this state dir already greeted its owner for (bootgreet.ts).
 const BOOT_GREETED_FILE = join(STATE_DIR, 'boot-greeted')
 
