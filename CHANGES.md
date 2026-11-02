@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Changed — telegram 0.5.130, telegram-codex 0.5.45, telegram-grok / telegram-agy 0.5.35, telegram-opencode 0.5.14, telegram-pi 0.1.14: the take-over link gets a one-tap Open button (DIVE-7506)
+
+lodar on a take-over link: «why link is sent as code and not as url ?» · «i have to click to copy», then «keep the link as code» · «maybe add button too». A plain URL is unfurled by Telegram, and that preview visit spends the one-time ticket, so the link stays code.
+
+- **An "Open the browser" button now sits under every one-time viewer link**, on the Connect / take-over message and on any send the transport guard sees. Telegram never previews a URL button, so the owner's tap is the first visit. One tap instead of tap, copy, switch app, paste.
+- **The code span, previews off and "Do not paste it back here" stay** exactly as before; the line now reads "Tap Open the browser below, or copy-paste…".
+- **No button where Telegram would refuse one or cannot carry one** (a reply keyboard, a path-only link, a raw IP or http link): the code span goes alone, as before.
+
+Harness: `test/dive7506-viewer-open-button.test.ts` (66 tests across the six senders; red when the button or the code span is removed, and when a plain URL or previews come back).
+
 ### Fixed — dashboard 0.5.22: encrypted chat from a standard seat on a 5dive server (DIVE-7503)
 
 Encrypted web chat is coming to 5dive servers (DIVE-7499). A standard seat there reaches the API only through the root relay, and its server is not chat-only.

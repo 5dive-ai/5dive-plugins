@@ -71,19 +71,25 @@ describe('renderConnectLink', () => {
   test('previews are off, so a previewer cannot spend the ticket', () => {
     expect(m.link_preview_options.is_disabled).toBe(true)
   })
-  test('it tells the owner to copy-paste and not paste back', () => {
-    expect(m.text).toContain('Copy-paste this one-time link into your browser. Do not paste it back here.')
+  test('it tells the owner to tap Open or copy-paste, and not paste back', () => {
+    expect(m.text).toContain('Tap Open the browser below, or copy-paste this one-time link into your browser. Do not paste it back here.')
+  })
+  test('DIVE-7506: an Open the browser URL button sits above Done, and the code span stays', () => {
+    expect(m.reply_markup.inline_keyboard[0]).toEqual([{ text: 'Open the browser', url: URL }])
+    expect(m.entities).toEqual([{ type: 'code', offset: m.text.indexOf(URL), length: URL.length }])
   })
   test('the Done button carries the Done code, not the URL', () => {
-    const b = m.reply_markup.inline_keyboard[0]![0]!
+    const b = m.reply_markup.inline_keyboard[1]![0]! as { callback_data: string }
     expect(b.callback_data).toBe(`bdone:${DONE}`)
-    expect(JSON.stringify(m.reply_markup)).not.toContain(NONCE)
+    expect(JSON.stringify(m.reply_markup.inline_keyboard[1])).not.toContain(NONCE)
+    expect(JSON.stringify(m.reply_markup).split(NONCE)).toHaveLength(2)
   })
   test('the transport guard leaves it as it is (no double wrap, still one code entity over the URL)', () => {
-    const payload = { text: m.text, entities: [...m.entities], link_preview_options: { ...m.link_preview_options } }
+    const payload = { text: m.text, entities: [...m.entities], link_preview_options: { ...m.link_preview_options }, reply_markup: m.reply_markup }
     protectTelegramViewerLinks(payload)
     expect(payload.text).toBe(m.text)
     expect(payload.entities).toEqual(m.entities)
+    expect(payload.reply_markup).toEqual(m.reply_markup)
   })
 })
 

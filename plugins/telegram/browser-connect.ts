@@ -10,6 +10,8 @@
 // stdin, parse its answer, and render the two messages. The I/O lives in
 // server.ts.
 
+import { OPEN_BUTTON_TEXT } from './viewer-link.ts'
+
 type Entity = { type: 'code'; offset: number; length: number }
 
 export type ConnectTap = { op: 'tap' | 'done'; code: string }
@@ -90,12 +92,15 @@ export function parseConnectVerdict(stdout: string): ConnectVerdict | null {
 
 /** The link message. The URL is a CODE entity and previews are off: a link
  *  previewer spends a one-time ticket before the human taps (DIVE-4464). The
- *  transport guard would do the same, but this path does not rely on it. */
+ *  transport guard would do the same, but this path does not rely on it.
+ *  DIVE-7506: the code span stays, and an "Open the browser" URL button sits
+ *  above Done. Telegram never previews a URL button, so the owner's tap is the
+ *  first visit; one tap instead of copy, switch app, paste. */
 export function renderConnectLink(l: ConnectLink): {
   text: string
   entities: Entity[]
   link_preview_options: { is_disabled: true }
-  reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] }
+  reply_markup: { inline_keyboard: ({ text: string; url: string } | { text: string; callback_data: string })[][] }
 } {
   const challenge = l.kind === 'challenge'
   const takeOver = challenge && !l.check
@@ -103,7 +108,7 @@ export function renderConnectLink(l: ConnectLink): {
     (takeOver
       ? `🖐 Take over on ${l.site}.\n\n`
       : challenge ? `🧩 Clear the check on ${l.site}.\n\n` : `🔐 Log in to ${l.site}.\n\n`) +
-    `Copy-paste this one-time link into your browser. Do not paste it back here. ` +
+    `Tap Open the browser below, or copy-paste this one-time link into your browser. Do not paste it back here. ` +
     `It works once${l.expires ? ` and expires ${l.expires}` : ''}.\n\n`
   const tail = takeOver
     ? `\n\nDo what the agent asked, close the tab, then tap Done so the agent carries on.`
@@ -115,7 +120,9 @@ export function renderConnectLink(l: ConnectLink): {
     text: head + l.url + tail,
     entities: [{ type: 'code', offset: head.length, length: l.url.length }],
     link_preview_options: { is_disabled: true },
-    reply_markup: { inline_keyboard: [[{ text: button, callback_data: `bdone:${l.done}` }]] },
+    reply_markup: {
+      inline_keyboard: [[{ text: OPEN_BUTTON_TEXT, url: l.url }], [{ text: button, callback_data: `bdone:${l.done}` }]],
+    },
   }
 }
 
