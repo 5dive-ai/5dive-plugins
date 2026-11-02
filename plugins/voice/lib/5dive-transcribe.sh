@@ -35,10 +35,12 @@
 #   5dive-transcribe --backend=<b> ... # override for one call (testing)
 #   5dive-transcribe --lang=<code> ... # the note's language (ru, en…), or auto
 #
-# WHICH LANGUAGE LOCAL WHISPER HEARS (DIVE-6872). whisper `base` guesses the
-# language from the note itself, and on a 2-3 s note with a little room noise it
-# guesses wrong: a Russian «да, давай» came back as "That, that way." Told the
-# language, it heard the same note word for word. So the language is, in order:
+# WHICH LANGUAGE THE NOTE IS HEARD IN (DIVE-6872, DIVE-7532). whisper guesses
+# the language from the note itself, and guesses wrong: local `base` heard a
+# noisy 2-3 s Russian «да, давай» as "That, that way.", and OpenRouter's
+# whisper-large-v3-turbo heard a 43 s ENGLISH note as Korean. Told the
+# language, each heard its note word for word. Both backends are told the same
+# language, in this order:
 #   1. --lang, when the caller passes it (auto = detect);
 #   2. the owner's stt_language, whenever it is set at all — a code pins it, and
 #      an explicit auto is the owner choosing detection for mixed-language notes;
@@ -100,7 +102,7 @@ audio_seconds() {
   [[ "$d" =~ ^[0-9]+$ ]] && echo "$d" || echo 0
 }
 
-# note_language — the language local whisper is told, or nothing to let it
+# note_language — the language the backend is told, or nothing to let it
 # detect one. The order is in the header (DIVE-6872).
 note_language() {
   if [[ -n "$LANG_OVERRIDE" ]]; then
@@ -122,8 +124,9 @@ note_language() {
 transcribe_openrouter() {
   voice_require_cmd ffmpeg || return 1
   voice_require_cmd jq || return 1
-  local model wav resp
+  local model wav resp lang errf rc=1
   model=$(voice_stt_model)
+  lang=$(note_language)
   wav="$(mktemp --suffix=.wav /tmp/5dive-transcribe.XXXXXX)"
   # Mono 16-bit 16 kHz PCM: what every model on the endpoint accepts, and the
   # ONLY thing meta/muse-voice-transcribe-1.0 accepts. Converting unconditionally
@@ -131,9 +134,25 @@ transcribe_openrouter() {
   if ! ffmpeg -hide_banner -loglevel error -y -i "$SRC" -ac 1 -ar 16000 -sample_fmt s16 "$wav" </dev/null; then
     rm -f "$wav"; echo "5dive voice: ffmpeg could not decode $SRC" >&2; return 1
   fi
-  resp=$(voice_openrouter_curl /audio/transcriptions \
-    -F "model=${model}" -F "response_format=json" -F "file=@${wav};type=audio/wav") || { rm -f "$wav"; return 1; }
+  local fields=(-F "model=${model}" -F "response_format=json" -F "file=@${wav};type=audio/wav")
+  # The language rides as the standard `language` field whenever one is known
+  # (DIVE-7532; same order as local, see note_language). A model that refuses
+  # the field (HTTP 400/422) is asked once more without it, so a pin never
+  # costs the owner a note; any other failure is reported as it is.
+  if [[ -n "$lang" ]]; then
+    errf="$(mktemp /tmp/5dive-transcribe.XXXXXX)"
+    resp=$(voice_openrouter_curl /audio/transcriptions "${fields[@]}" -F "language=${lang}" 2>"$errf"); rc=$?
+    if (( rc != 0 )) && grep -qE 'returned HTTP (400|422):' "$errf"; then
+      echo "5dive voice: OpenRouter refused language=${lang} for ${model}; hearing the note again without it." >&2
+      lang=""
+    else
+      cat "$errf" >&2
+    fi
+    rm -f "$errf"
+  fi
+  [[ -z "$lang" ]] && { resp=$(voice_openrouter_curl /audio/transcriptions "${fields[@]}"); rc=$?; }
   rm -f "$wav"
+  (( rc == 0 )) || return 1
   if (( JSON_OUT )); then printf '%s\n' "$resp"
   else printf '%s' "$resp" | jq -r '.text // empty'; fi
 }
