@@ -266,6 +266,14 @@ step_pip() {
   # Microsoft rotates; 7.2.8 got a 403 on 2026-10-17 and 7.3.1 works. The floor
   # keeps a cached older wheel off a fresh install. The box's nightly upgrades
   # edge-tts past it from then on (5dive-setup-voice tts, DIVE-6436).
+  # DIVE-7559: under local-only mode edge-tts is left out. It is Microsoft's
+  # online voice and 5dive-speak is off there, so installing it only adds a
+  # client for a service the box must never call.
+  if [[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]]; then
+    as_claude "$VENV/bin/pip" install --quiet --upgrade faster-whisper 'av<19'
+    ok "faster-whisper installed (local-only mode: no edge-tts, speaking is off)"
+    return 0
+  fi
   as_claude "$VENV/bin/pip" install --quiet --upgrade faster-whisper 'edge-tts>=7.3.1' 'av<19'
   # edge-tts is used directly by agents; whisper is called via the HTTP service
   # below, so no need to symlink faster-whisper.

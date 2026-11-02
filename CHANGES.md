@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Changed — dashboard 0.5.24, telegram 0.5.131, buzz 0.2.2, telegram-grok / telegram-agy 0.5.36, telegram-codex 0.5.46, voice 1.11.6, browser 1.32.1: the plugins honour local-only mode (DIVE-7559)
+
+A law firm needs a box where nothing leaves the office (DIVE-7556). `/etc/5dive/local-only` (exists = on) is the switch every 5dive component reads; with it absent nothing here changes.
+
+- **An offline box starts its plugins.** dashboard, telegram and buzz skip `bun install` at start when the switch is on and `node_modules` is already there.
+- **The dashboard finds the office chat server.** Its control-plane address comes from `/etc/5dive/api-base` when present (`DASHBOARD_API_BASE` still wins; the default stays `https://api.5dive.com`).
+- **No Telegram notices, no OpenRouter key checks.** Every hook that called api.telegram.org or openrouter.ai stays silent: the telegram and dashboard hook library, the question and context-nudge hooks, and the agy / codex / grok stop, relay and silence hooks. The question hook stands aside so the office chat asks instead.
+- **No Microsoft voice.** `5dive-speak` refuses (text only), hearing stays on local whisper, edge-tts is neither healed nor installed, and switching to OpenRouter is refused. Mirrors 5dive-voice 1.11.6.
+- **No Telegram login link.** `5dive browser connect-request` refuses before a code is minted.
+
+Harness: `test/dive7559-local-only.test.ts` (33 tests; 26 red on the pre-fix tree), `tests/browser_connect_request_unit.sh` L1–L5, and 5dive-voice `tests/local-only.test.sh` (33 arms; 19 red on 1.11.5).
+
 ### Changed — telegram 0.5.130, telegram-codex 0.5.45, telegram-grok / telegram-agy 0.5.35, telegram-opencode 0.5.14, telegram-pi 0.1.14: the take-over link gets a one-tap Open button (DIVE-7506)
 
 lodar on a take-over link: «why link is sent as code and not as url ?» · «i have to click to copy», then «keep the link as code» · «maybe add button too». A plain URL is unfurled by Telegram, and that preview visit spends the one-time ticket, so the link stays code.

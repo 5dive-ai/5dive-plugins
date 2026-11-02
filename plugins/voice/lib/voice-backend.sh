@@ -362,11 +362,25 @@ voice_effective_stt_backend() { voice_effective_from "$(voice_stt_backend_config
 voice_effective_from() {
   local want="$1"
   if [[ "$want" != openrouter ]]; then printf 'local\n'; return 0; fi
+  # DIVE-7559: local-only mode — the audio and the text stay on the box, so a
+  # box configured for openrouter hears locally (speaking is off, 5dive-speak).
+  if voice_local_only; then
+    printf '5dive voice: backend=openrouter, but local-only mode is on: running on this box instead.\n' >&2
+    printf 'local\n'; return 0
+  fi
   if voice_openrouter_key >/dev/null 2>&1; then printf 'openrouter\n'; return 0; fi
   printf '5dive voice: backend=openrouter but %s' "$(voice_key_fix_line)" >&2
   printf '5dive voice: falling back to the local engine for this call.\n' >&2
   printf 'local\n'
 }
+
+# voice_local_only — 0 when local-only mode is on (DIVE-7556/7559):
+# /etc/5dive/local-only EXISTS, written by `sudo 5dive config local-only on`.
+# While it is on nothing may leave the office: hearing runs on local whisper
+# only, and speaking is OFF, because the "local" voice (edge-tts) is Microsoft's
+# online service and OpenRouter is a cloud. FIVE_LOCAL_ONLY_FILE is the CLI's own
+# test seam, honoured here the same way.
+voice_local_only() { [[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]]; }
 
 voice_require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { printf '5dive voice: %s is required (%s)\n' "$1" "${2:-run: sudo 5dive-setup-voice}" >&2; return 1; }

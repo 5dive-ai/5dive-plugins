@@ -27,6 +27,9 @@ EVERY="${VOICE_HEAL_EVERY:-3600}"   # seconds between upgrade attempts
 FRESH=300                           # an upgrade this recent counts for every caller
 
 [[ -x "$VENV/bin/edge-tts" && -x "$VENV/bin/pip" ]] || exit 2
+# DIVE-7559: local-only mode — no pip from the internet, and nothing speaks
+# with edge-tts anyway (5dive-speak is off). Same code as "no venv": nothing to do.
+[[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]] && exit 2
 mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
 
 # One caller upgrades; the rest wait for it and then read its result, so a

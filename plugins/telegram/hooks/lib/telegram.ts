@@ -6,6 +6,7 @@
 
 import { readFileSync } from 'fs'
 import { accessFile } from './paths'
+import { localOnly } from './local-only'
 import type { AccessConfig } from './types'
 
 const TELEGRAM_TEXT_MAX = 4000
@@ -74,6 +75,11 @@ export function apiBase(): string {
 // DIVE-5121: replyMarkup is optional and is sent ONLY when passed, so every
 // existing three-argument caller posts exactly the body it posted before.
 export async function sendMessage(chatId: string, text: string, threadId?: string, replyMarkup?: unknown): Promise<boolean> {
+  // DIVE-7559: local-only mode, nothing leaves the office (lib/local-only.ts).
+  if (localOnly()) {
+    process.stderr.write('telegram sendMessage: local-only mode is on — not sending to Telegram\n')
+    return false
+  }
   const token = getToken()
   if (!token) {
     process.stderr.write(

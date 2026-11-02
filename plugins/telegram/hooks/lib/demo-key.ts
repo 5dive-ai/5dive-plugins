@@ -34,6 +34,7 @@ import { createHash } from 'crypto'
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { liteAccountUrl, readChannelEnv, type Lang } from './lite'
+import { localOnly } from './local-only'
 
 export const DEMO_ACCOUNT = 'demo-ai'
 
@@ -82,6 +83,8 @@ export async function readDemoKey(
   if (!key) return { kind: 'unknown', fingerprint: null }
   const fingerprint = keyFingerprint(key)
   const fallback: DemoKeyState = opts.sawKeyLimit ? { kind: 'used-up', fingerprint } : { kind: 'unknown', fingerprint }
+  // DIVE-7559: local-only mode never asks openrouter.ai about the key.
+  if (localOnly(env)) return fallback
   try {
     const res = await fetchFn('https://openrouter.ai/api/v1/key', {
       headers: { authorization: `Bearer ${key}` },

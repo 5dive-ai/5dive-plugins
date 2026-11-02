@@ -57,6 +57,9 @@ If `connect-request` refuses because the seat has no paired owner, its Telegram 
 cannot relay the tap, or it has no grant, fall back to the owner's own path, the shipped
 flow below.
 
+On a box in local-only mode (`/etc/5dive/local-only` exists) `connect-request` refuses:
+nothing may go to Telegram there. Ask the owner in the office chat to log in at the box.
+
 <!-- 5dive:connect-site-flow:begin -->
 ## The shipped flow
 

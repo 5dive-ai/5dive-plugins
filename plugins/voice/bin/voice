@@ -93,6 +93,11 @@ USAGE
 
 die() { printf '5dive voice: %s\n' "$1" >&2; exit "${2:-1}"; }
 
+# DIVE-7559: local-only mode (/etc/5dive/local-only exists). Defined HERE, not
+# taken from the engine lib, so a box whose installed engine predates the
+# switch still refuses OpenRouter from this verb.
+verb_local_only() { [[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]]; }
+
 # as_root <voice args...> — a CHANGE to this box's voice settings is a root act,
 # and returns here only when the caller already is root. A seat that holds the
 # grant (an admin seat holds sudo over the whole 5dive CLI) gets the same command
@@ -196,6 +201,13 @@ cmd_backend() {
   # holds the grant is re-run through sudo; one without it is told who can, and
   # never gets a half-applied change.
   as_root backend "$want"
+
+  # DIVE-7559: local-only mode — OpenRouter is a cloud, so it is refused here,
+  # not discovered later as a silent fall-back.
+  if [[ "$want" == openrouter ]] && verb_local_only; then
+    printf '5dive voice: refusing to switch to openrouter: local-only mode is on, so nothing may leave this network. Hearing stays on this box; speaking is off.\n' >&2
+    exit 1
+  fi
 
   # Refusing here rather than at the first voice note is the whole reason this
   # is a command and not a config edit: the user finds out now, with the fix in
@@ -498,7 +510,8 @@ cmd_status() {
     . "$VOICE_LIB"
     backend=$(voice_effective_backend 2>/dev/null)
     hearing=$(voice_effective_stt_backend 2>/dev/null)
-    if [[ "$hearing" == "$backend" ]]; then report backend yes "$backend"
+    if verb_local_only; then report backend yes "hearing: local, speaking: off (local-only mode)"
+    elif [[ "$hearing" == "$backend" ]]; then report backend yes "$backend"
     else report backend yes "hearing: $hearing, speaking: $backend"; fi
   else
     report backend no "$VOICE_LIB not installed"

@@ -23,6 +23,7 @@
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import { localOnly } from './local-only'
 
 export type Profile = 'default' | 'lite'
 export type Lang = 'ru' | 'en'
@@ -447,6 +448,8 @@ export async function readAllowance(
   let host = ''
   try { host = new URL(env.ANTHROPIC_BASE_URL ?? '').hostname } catch {}
   if (!/(^|\.)openrouter\.ai$/i.test(host)) return { kind: 'own' }
+  // DIVE-7559: local-only mode never asks openrouter.ai about the key.
+  if (localOnly(env)) return { kind: 'unknown' }
   const key = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY
   if (!key) return { kind: 'unknown' }
   try {
