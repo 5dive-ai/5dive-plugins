@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.22: encrypted chat from a standard seat on a 5dive server (DIVE-7503)
+
+Encrypted web chat is coming to 5dive servers (DIVE-7499). A standard seat there reaches the API only through the root relay, and its server is not chat-only.
+
+- **Replies, files and the "working" line leave sealed** through the relay's `event-e2e` / `status-e2e` ops; the file blobs stay in the outbox for the box's file server, never `put`.
+- **A relay with no e2e ops refuses the reply** with "sudo 5dive self-update brings it", never resends it in the clear, and removes the sealed blobs.
+- **Hands-free voice stays off** on a 5dive server: a clip a poll answer carries is not heard by a seat that never asked. Chat-only boxes are unchanged.
+
+Harness: `test/dive7503-dashboard-relay-e2e.test.ts` (2 tests, real server.ts behind a relay stand-in; red when the seal branch, the e2e op, the refusal, the blob cleanup or the hands-free guard is removed).
+
 ### Fixed — telegram 0.5.129, telegram-codex 0.5.44, telegram-grok / telegram-agy 0.5.34, telegram-opencode 0.5.13, telegram-pi 0.1.13: one hello per chat when the box greets at connect (DIVE-7478)
 
 lodar: «bit confusing first 40 seconds for any new customer with new agent on telegram when it connects». A new agent's bot answered nothing until its session had booted. The 5dive CLI now greets the owner the moment the bot is connected and shows "typing" until the agent is up, and records the chats it greeted in `connect-greeted.json`.
