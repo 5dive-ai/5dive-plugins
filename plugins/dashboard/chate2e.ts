@@ -74,12 +74,34 @@ export class E2EUnknown extends Error {}
  *   exit 4 (E_NOT_FOUND)  off (the verb's "encrypted chat is not on")
  *   anything else         E2EUnknown
  */
-export function makeE2EGate(dir: string, call: BoxCall, ttlMs = 30_000, now: () => number = Date.now) {
+/**
+ * DIVE-7520: once this seat has seen encrypted chat on, it stays on. `pin` is a
+ * file in the seat's own state dir, written the first time it reads on. After
+ * that a missing key dir is not "off": it is E2EUnknown (nothing delivered,
+ * nothing sent in the clear) until the owner turns encryption off AT THE
+ * SERVER (`sudo 5dive chat e2e disable` writes `offMark`, root-owned, which no
+ * seat and no API can make).
+ */
+export type E2EPin = { file: string; offMark: string }
+const pinned = (p?: E2EPin) => !!p && existsSync(p.file)
+function pinOn(p?: E2EPin) {
+  if (!p || existsSync(p.file)) return
+  try { writeFileSync(p.file, `${new Date().toISOString()}\n`, { mode: 0o600 }) } catch {}
+}
+/** Off is only off when nothing was pinned, or the owner turned it off at the server. */
+function offOrUnknown(p?: E2EPin): false {
+  if (!pinned(p)) return false
+  if (existsSync(p!.offMark)) { try { unlinkSync(p!.file) } catch {} ; return false }
+  throw new E2EUnknown('encrypted chat was on on this server and its key folder is gone: refusing to fall back to plain chat')
+}
+
+export function makeE2EGate(dir: string, call: BoxCall, ttlMs = 30_000, now: () => number = Date.now, pin?: E2EPin) {
   let root: { on: boolean; at: number } | null = null
   return async (): Promise<boolean> => {
     const seen = e2eState(dir)
-    if (seen !== 'unknown') { root = null; return seen === 'on' }
-    if (root && now() - root.at < ttlMs) return root.on
+    if (seen === 'on') { root = null; pinOn(pin); return true }
+    if (seen === 'off') { root = null; return offOrUnknown(pin) }
+    if (root && now() - root.at < ttlMs) return root.on || offOrUnknown(pin)
     let on: boolean
     try {
       await call({ op: 'state' })
@@ -91,7 +113,8 @@ export function makeE2EGate(dir: string, call: BoxCall, ttlMs = 30_000, now: () 
       else throw new E2EUnknown(`cannot tell whether encrypted chat is on: ${m.slice(0, 200)}`)
     }
     root = { on, at: now() }
-    return on
+    if (on) pinOn(pin)
+    return on || offOrUnknown(pin)
   }
 }
 

@@ -40,10 +40,12 @@ freely (below):
 
 | `t` | From | Fields |
 | --- | --- | --- |
-| `msg` | device or box | `text`, `files?: [{path, name, size}]`, `question?: {id, options}` |
-| `status` | box | `label` (the "working: …" line) |
-| `approve` / `revoke` | device | `device`, `pub` (approve only) |
-| `roster` | box (root only) | `n`, `devices: [{id, pub}]` |
+| `msg` | device | `text`, `to: [<agent>…]` (the agents it is for), `files?: [{path, name, size}]` |
+| `msg` | box | `text`, `agent` (root writes it: the agent that sealed it), `files?`, `question?: {id, options}` |
+| `status` | box | `label` (the "working: …" line), `agent` |
+| `approve` / `revoke` | owner device | `device`, `pub` (approve only), `rev`: the list revision `n` it was made against |
+| `sync` | device | nothing: "send me the current list" |
+| `roster` | box (root only) | `n`, `devices: [{id, pub, owner?}]` |
 
 - **Files** travel as their own envelopes under a meaningless name (`*.e2e` on the
   way out). The message id of a file envelope is the parent's plus `#f<index>`,
@@ -73,8 +75,41 @@ freely (below):
   cannot be sealed fails and nothing is sent. Plaintext copies in the outbox are
   removed once sealed. The "working" step is sealed; if that fails, the chat shows
   plain "working" without the step.
-- **Device lists:** an `approve` or `revoke` from an approved device is applied by
-  root, which answers with the new list sealed to every device; this side posts it.
+- **Device lists:** an `approve`, `revoke` or `sync` from an approved device goes to
+  root, which answers with the list sealed to every device; this side posts it. If
+  that post fails the message is NOT acked: the API offers it again, root answers a
+  retry of the command that made the current list with that same list (it applies
+  nothing twice), and the post is tried again (DIVE-7520).
+- **Pinned on (DIVE-7520):** the first time this seat sees the key dir it writes
+  `e2e-pinned` in its state dir. From then on a missing key dir, or root saying
+  "not on", is *unknown*, never off: nothing is delivered and nothing is sent in
+  the clear. Only the owner's `sudo 5dive chat e2e disable` at the server, which
+  leaves the root-owned `/etc/5dive/chat-e2e.off`, turns it off.
+
+## Device-list rules (DIVE-7520, after the outside review)
+
+- **A change names its revision.** `approve`/`revoke` carry `rev`, the `n` of the
+  list the device saw. Root checks it equals the current `n` and bumps it, under one
+  root lock (so two seats cannot race). An old command is refused forever, whichever
+  seat it is handed to and however long ago it was sent.
+- **Root keeps what it applied** (`applied.json`: command id = sender + message id,
+  with the revision it made), apart from any seat's replay record and with no 30-day
+  window. A retry of the latest command gets the list again; anything older is refused.
+- **Owners.** Only an owner device may change the list. A device paired with the
+  link's secret, or approved at the server with `sudo 5dive chat devices approve
+  <code>` (the person compares the code on both screens), is an owner. A device an
+  owner let in from the app is an ordinary device: it reads and sends, and cannot let
+  anyone in or take anyone off. A list from before owners existed makes every device
+  on it an owner.
+- **A lost list is retried.** Root records the last revision every agent chat took
+  (`announced.json`) and the API's copy of each change (`mirror.json`). Every seat
+  call and every `chat devices sync` (each minute on a self-hosted server) sends what
+  is still owed. A device can also ask (`sync`) and gets the current list sealed to it.
+- **Root binds a seat to its agent.** The calling uid maps to one agent. A device's
+  `msg` opens only for an agent named in its `to`; a file opens only for the agent
+  that opened its message; root writes `agent` into everything it seals, so a seat
+  cannot speak as another agent. Incoming files are 0640 in a 0750 folder of the
+  seat's own group.
 
 ## The root verb (`5dive _chat_e2e`, built on DIVE-6878)
 
@@ -86,8 +121,8 @@ the stand-in the tests run, and the reference for the real verb.
 
 | Request | Answer | Root must |
 | --- | --- | --- |
-| `{op:"open", kind:"msg", conv, env}` | `{sender, m, pt}` (base64url) | take the sender key from its list; open with `conv`, direction `in`; refuse an id with `#`. If `pt` is `approve`/`revoke`, apply it and answer `{sender, m, roster: <env>}` instead, sealed to every device on the NEW list, id `roster-<n>`. |
-| `{op:"open", kind:"file", conv, env}` | `{sender, m, pt}` | refuse an id without `#`; never apply a device-list change. |
+| `{op:"open", kind:"msg", conv, env}` | `{sender, m, pt}` (base64url) | take the sender key from its list; open with `conv`, direction `in`; refuse an id with `#`; refuse a `msg` whose `to` does not name the calling agent. If `pt` is `approve`/`revoke`/`sync`, apply the rules above and answer `{sender, m, roster: <env>}` instead, sealed to every device on the list, id `roster-<n>`. |
+| `{op:"open", kind:"file", conv, env}` | `{sender, m, pt}` | refuse an id without `#`; refuse unless the calling agent opened the parent message; never apply a device-list change. |
 | `{op:"seal", conv, m, msg:{text, files?, question?}}` | `{env}` | write `t:"msg"` itself (a seat's `t` is ignored); refuse an id with `#` or starting `roster-`; seal to every approved device. |
 | `{op:"seal", conv, m, status:{label}}` | `{env}` | write `t:"status"`. |
 | `{op:"seal-file", conv, m, data}` | `{env}` | require an id ending `#f<n>`; seal the raw bytes. |
@@ -115,4 +150,8 @@ chat's file cap (20 MB) applies to the envelope: about 14 MB of file.
   relay kept. No healing after a compromise.
 - The web app is served by us; a changed app could leak a browser key.
 - Chats from before the switch-on stay readable to us until deleted.
+- **One owner per server.** Every message is sealed to every device on the server's
+  one list. That is right while one server has one person (5dive links a server to
+  one account), and wrong the day two people share a server: each would read the
+  other's chats. v1 is single-owner by design; per-person lists are not built.
 - The agent still sends the conversation to its AI provider.

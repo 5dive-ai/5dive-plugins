@@ -45,14 +45,24 @@ export function makeBoxStub(dir: string) {
       if (!isFile) {
         let inner: any = null
         try { inner = JSON.parse(dec.decode(pt)) } catch {}
-        if (inner?.t === 'approve' || inner?.t === 'revoke') {
-          const r = roster()
+        if (inner?.t === 'approve' || inner?.t === 'revoke' || inner?.t === 'sync') {
+          // DIVE-7520, as root: a command names the exact revision and applies
+          // once; a retry of the one that made the current list answers it again.
+          const appliedFile = join(dir, 'applied.json')
+          const applied: Record<string, number> = existsSync(appliedFile) ? JSON.parse(readFileSync(appliedFile, 'utf8')) : {}
+          const id = `${env.h.s}\u0000${env.h.m}`
+          let r = roster()
+          const answer = async () => ({ sender: env.h.s, m: env.h.m, roster: await sealOut(conv, `roster-${r.n}`, JSON.stringify({ t: 'roster', n: r.n, devices: Object.entries(r.devices).map(([i, pub]) => ({ id: i, pub })) })) })
+          if (inner.t === 'sync') return answer()
+          if (id in applied) { if (applied[id] === r.n) return answer(); throw new Error('already applied') }
+          if (inner.rev !== r.n) throw new Error(`the device list changed (it is at ${r.n})`)
           if (inner.t === 'approve') r.devices[String(inner.device)] = String(inner.pub)
           else delete r.devices[String(inner.device)]
           r.n++
           writeFileSync(join(dir, 'roster.json'), JSON.stringify(r))
-          const list = Object.entries(r.devices).map(([id, pub]) => ({ id, pub }))
-          return { sender: env.h.s, m: env.h.m, roster: await sealOut(conv, `roster-${r.n}`, JSON.stringify({ t: 'roster', n: r.n, devices: list })) }
+          applied[id] = r.n
+          writeFileSync(appliedFile, JSON.stringify(applied))
+          return answer()
         }
       }
       return { sender: env.h.s, m: env.h.m, pt: E.b64u(pt) }

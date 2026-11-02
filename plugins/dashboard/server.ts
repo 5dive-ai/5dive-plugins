@@ -655,7 +655,7 @@ function ingestInboxFile(name: string, via: 'boot' | 'watch' | 'sweep'): void {
     try { on = await e2eOn() } catch (err) { refuseUnknownE2E(chatId, `drop ${name}`, err); return false }
     if (on) {
       const opened = await admitE2E(text, chatId, `drop ${name}`)
-      if (!opened) return false
+      if (!opened || opened === 'retry') return false
       ;({ text: body, attachment, key: e2eKey } = opened)
     }
     await deliverInbound(`dashboard:drop:${name}`, body, {
@@ -929,6 +929,7 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
     try { on = await e2eOn() } catch (err) { refuseUnknownE2E(chatId, `pending message id=${m.id}`, err); continue }
     if (on) {
       const opened = await admitE2E(m.text, chatId, `pending message id=${m.id}`)
+      if (opened === 'retry') continue
       if (!opened) { acked.push(m.id); continue }
       ;({ text: body, attachment, key: e2eKey } = opened)
     } else {
@@ -1058,7 +1059,8 @@ const E2E_ARGV: string[] = (() => {
   return E2E_ARGV_DEFAULT
 })()
 const e2eCall = rootBoxCall(E2E_ARGV, RELAY_FILE_TIMEOUT_MS)
-const e2eGate = makeE2EGate(E2E_DIR, e2eCall)
+// DIVE-7520: pinned on once seen on; only the owner's `chat e2e disable` at the server turns it off.
+const e2eGate = makeE2EGate(E2E_DIR, e2eCall, undefined, undefined, { file: join(STATE_DIR, 'e2e-pinned'), offMark: `${E2E_DIR.replace(/\/+$/, '')}.off` })
 const chatE2E = makeChatE2E({
   call: e2eCall,
   stateDir: STATE_DIR,
@@ -1071,8 +1073,11 @@ const chatE2E = makeChatE2E({
  * One inbound body in an encrypted chat: what the session gets, or null when
  * it gets nothing (refused, a replay, or a device-list change, which is posted
  * to every device here). Null is still acked: the API must stop offering it.
+ * DIVE-7520: 'retry' is a device-list change whose post failed. It is NOT
+ * acked, so the API offers it again; root answers a retry of the command that
+ * made the current list with that list again, and the post is tried again.
  */
-async function admitE2E(text: string, chatId: string, what: string): Promise<{ text: string; attachment: Record<string, string>; key: string } | null> {
+async function admitE2E(text: string, chatId: string, what: string): Promise<{ text: string; attachment: Record<string, string>; key: string } | null | 'retry'> {
   const a = await chatE2E.admit(text, chatId)
   if (a.kind === 'deliver') {
     const [first, ...rest] = a.files
@@ -1088,7 +1093,8 @@ async function admitE2E(text: string, chatId: string, what: string): Promise<{ t
       chatE2E.delivered(a.key)
       recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `encrypted chat: ${what} changed the device list; the new list went to every device`)
     } catch (err) {
-      recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `encrypted chat: ${what} changed the device list, but posting it failed: ${String(err).slice(0, 160)}`)
+      recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `encrypted chat: ${what} changed the device list, but posting it failed (offered again): ${String(err).slice(0, 160)}`)
+      return 'retry'
     }
     return null
   }
