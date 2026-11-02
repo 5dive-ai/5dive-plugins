@@ -6994,6 +6994,7 @@ CONNECT_CONNECTORD_ENV=/etc/5dive/connectord.env
 CONNECT_PROVISIONING_ENV=/etc/5dive/provisioning.env
 CONNECT_SHELLD_URL=http://127.0.0.1:3101
 CONNECT_TG_API=https://api.telegram.org
+CONNECT_LOCAL_ONLY=/etc/5dive/local-only   # DIVE-7559: EXISTS = local-only mode on
 CONNECT_SELF="$0"
 CONNECT_PRIV=(sudo -n /usr/local/bin/5dive browser _connect)
 # TEST SEAMS, honoured only WITHOUT root. Unprivileged, every one of them points
@@ -7006,6 +7007,7 @@ if [[ $EUID -ne 0 ]]; then
   CONNECT_PROVISIONING_ENV="${FIVEDIVE_PROVISIONING_ENV:-$CONNECT_PROVISIONING_ENV}"
   CONNECT_SHELLD_URL="${FIVEDIVE_SHELLD_URL:-$CONNECT_SHELLD_URL}"
   CONNECT_TG_API="${FIVEDIVE_TELEGRAM_API:-$CONNECT_TG_API}"
+  CONNECT_LOCAL_ONLY="${FIVE_LOCAL_ONLY_FILE:-$CONNECT_LOCAL_ONLY}"
   CONNECT_SELF="${FIVEDIVE_BROWSER_CONNECT_SELF:-$CONNECT_SELF}"
   [[ -n "${FIVEDIVE_BROWSER_CONNECT_PRIV:-}" ]] && CONNECT_PRIV=("$FIVEDIVE_BROWSER_CONNECT_PRIV" _connect)
 fi
@@ -7053,6 +7055,9 @@ _connect_is_owner() {  # <seat> <telegram user id>
 # the process table while root holds it.
 _connect_tg() {  # <method> [curl --data-urlencode args...]
   local method="$1"; shift
+  # DIVE-7559: local-only mode — nothing reaches api.telegram.org. The request
+  # path refuses first with a sentence; this is the choke point behind it.
+  [[ -e "$CONNECT_LOCAL_ONLY" ]] && return 1
   printf 'url = "%s/bot%s/%s"\n' "$CONNECT_TG_API" "$CONNECT_TG_TOKEN" "$method" \
     | curl -sS --connect-timeout 5 --max-time 15 --config - "$@" 2>/dev/null
 }
@@ -7085,6 +7090,10 @@ _connect_request() {  # <caller> <site> <reason> [challenge <url> | handoff]
     kind=login url=""
   fi
   reason=$(printf '%s' "$reason" | tr -d '\000-\037\177' | cut -c1-"$CONNECT_REASON_MAX")
+  # DIVE-7559: the Connect button travels over Telegram, which local-only mode
+  # turns off. Refuse before a code is minted, so nothing is left half-made.
+  [[ -e "$CONNECT_LOCAL_ONLY" ]] \
+    && die "$E_UNAVAILABLE" "local-only mode is on, so the Connect button cannot be sent over Telegram. Ask the owner to log in from the office chat or at the box itself."
   _connect_channel "$caller" \
     || die "$E_UNAVAILABLE" "seat '$caller' has no paired Telegram channel, so there is nobody to ask. Ask the owner to use Connected sites in the 5dive dashboard."
   [[ "$CONNECT_TG_TYPE" == claude ]] \

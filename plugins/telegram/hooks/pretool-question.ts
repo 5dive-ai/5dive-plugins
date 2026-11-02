@@ -32,6 +32,7 @@ import { readEntries, analyzeTurn, newestInboundSource } from './lib/transcript'
 import { buildBridge, buttonText } from './lib/question-bridge'
 import type { HookPayload } from './lib/types'
 import { isLite, liteQuestionPrompt } from './lib/lite'
+import { localOnly } from './lib/local-only'
 
 const payload = await readPayload<HookPayload>()
 const tool = payload.tool_name
@@ -60,6 +61,11 @@ if (tool !== 'AskUserQuestion' && tool !== 'ExitPlanMode') {
   // other tools, but stay defensive.)
   stampAndExit()
 }
+
+// DIVE-7559: local-only mode — nothing may reach api.telegram.org, and the
+// legacy deny below would tell the agent to answer over Telegram. Stand aside:
+// the office chat (the dashboard plugin's own question hook) asks instead.
+if (localOnly()) stampAndExit()
 
 // DIVE-1027 hotfix (CC v2.1.201): plan mode was reworked — ExitPlanMode approval
 // is now a NATIVE dialog. The inline-keyboard bridge path for ExitPlanMode could

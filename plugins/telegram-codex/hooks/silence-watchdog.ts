@@ -42,7 +42,7 @@
  * notification, not a gate. A bad ping must never block tool execution.
  */
 
-import { readFileSync, writeFileSync, statSync } from 'fs'
+import { readFileSync, writeFileSync, statSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -103,6 +103,10 @@ try {
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
   }
 } catch {}
+
+// DIVE-7559: local-only mode (/etc/5dive/local-only exists) means nothing may
+// leave the office, so no Telegram notice. Absent = unchanged.
+if (existsSync(process.env.FIVE_LOCAL_ONLY_FILE ?? '/etc/5dive/local-only')) exitContinue()
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) exitContinue()

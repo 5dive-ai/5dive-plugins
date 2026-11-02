@@ -35,6 +35,7 @@ import { getOwnerChatIds, getCallerChat, type CallerChat } from './lib/access'
 import { nudgeFile } from './lib/paths'
 import type { HookPayload } from './lib/types'
 import { isLite, readLiteLang, LITE_STRINGS } from './lib/lite'
+import { localOnly } from './lib/local-only'
 
 // DIVE-7434: this hook's own deadline, under hooks.json's 8s. Claude Code's
 // timeout did not reap a hook the kernel was throttling (one lived 2:56 h),
@@ -74,6 +75,8 @@ const liteCarry = isLite() ? LITE_STRINGS[readLiteLang()].carryover : null
 // skip so the nudge only ever rides a clean turn end.
 if (payload.stop_hook_active === true) process.exit(0)
 if (!getToken()) process.exit(0)
+// DIVE-7559: local-only mode — no Telegram nudge (lib/local-only.ts).
+if (localOnly()) process.exit(0)
 
 // --- Read live context usage from the statusline cache ----------------------
 type StatuslineCache = {

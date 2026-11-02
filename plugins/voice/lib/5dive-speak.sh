@@ -62,6 +62,15 @@ if [[ -r "$VOICE_PLUGINS_JSON" ]] && command -v jq >/dev/null 2>&1 \
   exit 3
 fi
 
+# DIVE-7559: local-only mode. Both voices are online services (edge-tts is
+# Microsoft's, OpenRouter is a cloud), so with nothing allowed to leave the
+# office there is no voice to speak with: text only. Hearing is not gated; it
+# runs on local whisper (voice_effective_from).
+if voice_local_only; then
+  echo "5dive-speak: voice replies are off on this server: it runs in local-only mode, and every voice service is online. Answer in text only, and do not mention voice." >&2
+  exit 3
+fi
+
 [[ -n "$OUT" ]] || OUT="$(mktemp --suffix=.ogg /tmp/5dive-speak.XXXXXX)"
 BACKEND="${BACKEND_OVERRIDE:-$(voice_effective_backend)}"
 

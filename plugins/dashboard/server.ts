@@ -34,6 +34,7 @@ import { homedir, userInfo } from 'os'
 import { join } from 'path'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
+import { resolveApiBase } from './apibase.ts'
 import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
 import { AGY_DEFAULT_TIMINGS, startAgyDispatcher } from './agydispatch.ts'
 import { openclawTurn, startOpenclawDispatcher } from './openclawdispatch.ts'
@@ -152,7 +153,8 @@ try {
   }
 } catch {}
 
-const API_BASE = (process.env.DASHBOARD_API_BASE ?? 'https://api.5dive.com').replace(/\/+$/, '')
+// DIVE-7559: DASHBOARD_API_BASE > /etc/5dive/api-base > https://api.5dive.com (apibase.ts).
+const API_BASE = resolveApiBase()
 // Shared, claude-group-writable dir the box's file server can read back from
 // (install/update.sh create it 2775 claude:claude). Reply attachments are
 // copied here so the dashboard download always resolves.
