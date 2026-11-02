@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.26: the chat hears again right after an agent restart, not two minutes later (DIVE-7573)
+
+The DIVE-7560 run 2 proof measured the chat deaf for 80-120 s after every agent restart (79.9 s and 99.5 s), and a new agent deaf for its first two minutes, because `agent create` restarts it once. The killed adapter left its message-collection lock behind mid long-poll, and the new one waited until the lock was two minutes old. Every long-polling chat-only box had it, not only local-only ones.
+
+- **The lock names its owner.** It now records the adapter's pid and the boot it was written in. A lock whose owner no longer exists, or that was written before a reboot, is broken at once. A live owner's lock is still honoured, and the two-minute bound stays as the backstop for an unreadable one.
+- **A clean stop releases it.** An adapter stopped mid long-poll removes its lock on exit.
+
+Harness: `test/dive3809-drain-lock.test.ts`, block DIVE-7573 (4 tests; the dead-pid, earlier-boot and release-on-exit arms are red on the pre-fix adapter, the live-owner arm passes on both).
+
 ### Fixed — dashboard 0.5.25: the office chat on a local-only box answers in seconds and its files reach the agent (DIVE-7566)
 
 The DIVE-7560 end-to-end proof (main, 2026-11-02) ran a fully-local box with the office chat. Every message waited for the 5-minute timer (86 s to 4 min 38 s measured) and a file sent from the chat never reached the agent: both were only switched on by the chat-only marker, which a local-only box does not write.
