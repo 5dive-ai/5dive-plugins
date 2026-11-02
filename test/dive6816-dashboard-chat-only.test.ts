@@ -362,3 +362,72 @@ describe('dashboard adapter on a chat-only box, root relay (DIVE-6816)', () => {
     }, 30_000)
   }
 })
+
+// DIVE-7566: a LOCAL-ONLY box's office chat (`5dive local serve`) is the same
+// shape as the chat-only API, but it writes no marker: it points the box-wide
+// /etc/5dive/api-base (DASHBOARD_API_BASE_FILE here) at its loopback listener.
+// The DIVE-7560 proof measured 86 s to 4 min 38 s per message (the 5-minute
+// timer) and an upload the agent never got. With the api-base file on loopback
+// and NO marker, the adapter must long-poll and fetch; and on a box never
+// linked to 5dive.app (no token file AT ALL) a standard seat must still come up
+// on the root relay, which holds the office chat's own token.
+// Controls: the same stub reached through DASHBOARD_API_BASE (an explicit
+// override, never the file) stays on the plain poll (the marker-OFF arm above).
+describe('dashboard adapter on a local-only box with the office chat (DIVE-7566)', () => {
+  test('api-base file → loopback, no marker: long poll, upload fetched before the message', async () => {
+    const { dir, envFile, photo } = setup(false)
+    const s = startApi({ [photo]: 'PNG-office' })
+    const baseFile = join(dir, 'api-base')
+    writeFileSync(baseFile, `http://127.0.0.1:${s.api.port}\n`)
+    const a = startAdapter(dir, { DASHBOARD_API_BASE: undefined, DASHBOARD_API_BASE_FILE: baseFile, CONNECTORD_ENV_FILE: envFile })
+    try {
+      expect(await waitFor(() => s.log.some(l => l.route === 'pending' && l.query.includes('wait=25')), BOOT_MS + 5_000)).toBe(true)
+      const t0 = Date.now()
+      s.enqueue({ id: 7, text: 'the case notes', chat_id: 'dashboard', image_path: photo })
+      expect(await waitFor(() => a.seen.delivered.length > 0, 8_000)).toBe(true)
+      // seconds, not the 5-minute timer
+      expect(Date.now() - t0).toBeLessThan(5_000)
+      expect(a.seen.delivered[0].fileThere).toBe(true)
+      expect(readFileSync(photo, 'utf8')).toBe('PNG-office')
+    } finally {
+      a.proc.kill()
+      await a.proc.exited
+      s.api.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  test('never-linked box (no token file at all), standard seat: starts on the relay, long-polls, fetches', async () => {
+    const { dir, photo } = setup(false)
+    const baseFile = join(dir, 'api-base')
+    writeFileSync(baseFile, 'http://127.0.0.1:8480\n')
+    writeFileSync(join(dir, 'queue.json'), JSON.stringify([{ id: 11, text: 'file!', chat_id: 'dashboard', image_path: photo }]))
+    const a = startAdapter(dir, {
+      DASHBOARD_API_BASE: undefined,
+      DASHBOARD_API_BASE_FILE: baseFile,
+      CONNECTORD_ENV_FILE: join(dir, 'no-such-connectord.env'),
+      DASHBOARD_RELAY_ARGV: JSON.stringify(['bun', writeRelay(dir, photo)]),
+    })
+    try {
+      expect(await waitFor(() => a.seen.delivered.length > 0, BOOT_MS + 8_000)).toBe(true)
+      expect(a.proc.exitCode).toBeNull()
+      expect(a.seen.delivered[0].fileThere).toBe(true)
+      expect(await waitFor(() => ops(dir).some(o => o[0] === 'pending' && o[1] === '25'), 5_000)).toBe(true)
+      expect(ops(dir)).toContainEqual(['fetch', photo])
+    } finally {
+      a.proc.kill()
+      await a.proc.exited
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  test('a public base in the file is not the office chat (plain poll, as before)', async () => {
+    const { isOfficeChatBase } = await import('../plugins/dashboard/chatonly.ts')
+    expect(isOfficeChatBase('http://127.0.0.1:8480')).toBe(true)
+    expect(isOfficeChatBase('http://localhost:8480/')).toBe(true)
+    expect(isOfficeChatBase('https://api.5dive.com')).toBe(false)
+    expect(isOfficeChatBase('http://192.0.2.10:8480')).toBe(false)
+    expect(isOfficeChatBase('http://127.0.0.1.example.com')).toBe(false)
+    expect(isOfficeChatBase(null)).toBe(false)
+  })
+})

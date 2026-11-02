@@ -34,7 +34,7 @@ import { homedir, userInfo } from 'os'
 import { join } from 'path'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
-import { resolveApiBase } from './apibase.ts'
+import { API_BASE_FILE_DEFAULT, readApiBaseFile, resolveApiBase } from './apibase.ts'
 import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
 import { AGY_DEFAULT_TIMINGS, startAgyDispatcher } from './agydispatch.ts'
 import { openclawTurn, startOpenclawDispatcher } from './openclawdispatch.ts'
@@ -51,7 +51,7 @@ import { deliveredLive, liveKey, loadLiveDeliveries, recordLiveDelivery, saveLiv
 import { makeWorkStatus } from './workstatus.ts'
 import { askRelayOp, numberedText, parseQuestion } from './question.ts'
 import { replyTooLong } from './replycap.ts'
-import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
+import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOfficeChatBase, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
 import { E2E_ARGV_DEFAULT, E2E_DIR_DEFAULT, E2E_REFUSED_TEXT, E2E_UNKNOWN_TEXT, dropPlainCopies, makeChatE2E, makeE2EGate, parseEnvelope, rootBoxCall } from './chate2e.ts'
 
@@ -164,6 +164,12 @@ const OUTBOX_DIR = process.env.DASHBOARD_OUTBOX ?? '/home/claude/chat-downloads'
 const CHAT_ONLY_MARKER = process.env.DASHBOARD_CHAT_ONLY_MARKER ?? '/etc/5dive/chat-only'
 const UPLOADS_DIR = process.env.DASHBOARD_CHAT_UPLOADS ?? '/home/claude/chat-uploads'
 const chatOnly = () => isChatOnly(CHAT_ONLY_MARKER)
+// DIVE-7566: a local-only box's office chat (chatonly.ts isOfficeChatBase) holds
+// the poll and the uploads the same way, so it gets the same long poll and file
+// moves. Without this, each office message waited for the 5-minute timer and an
+// office upload never reached the agent. Read on every use, like the marker.
+const officeChat = () => isOfficeChatBase(readApiBaseFile(process.env.DASHBOARD_API_BASE_FILE || API_BASE_FILE_DEFAULT))
+const selfHeld = () => chatOnly() || officeChat()
 // DIVE-7098: the voice add-on's engine (5dive-transcribe); its presence is what
 // this poll tells the API (`hear=1`), read on every poll so an add-on installed
 // later is picked up. A relayed seat cannot say it: the root relay builds that
@@ -283,8 +289,12 @@ if (!TOKEN) {
   // a 5dive box, and the relay would answer the same thing slower.
   let unreadable = false
   try { statSync(TOKEN_FILE); unreadable = true } catch {}
+  // DIVE-7566: a box never linked to 5dive.app has no token file at all, and
+  // its office chat checks a token only root holds (`5dive local serve` mints
+  // it). The relay picks that token for the office chat, so ask it here too.
+  const office = !unreadable && officeChat()
   let why = ''
-  if (unreadable) {
+  if (unreadable || office) {
     try {
       // `sudo -l` asks first, so a seat without the grant (a CLI from before
       // the relay, a sandboxed seat) never turns into a logged sudo refusal on
@@ -305,14 +315,16 @@ if (!TOKEN) {
     process.stderr.write(
       `dashboard channel: connectord token not found\n` +
       `  expected /etc/5dive/connectord.env (CONNECTORD_TOKEN=...) or CONNECTORD_TOKEN in ${ENV_FILE}\n` +
-      (unreadable
+      (unreadable || office
         ? `  ${TOKEN_FILE} is not readable by this seat and the root relay (${RELAY_ARGV.join(' ')}) is not available: ${why}\n` +
           `  a CLI from before DIVE-5894 does not grant it; \`5dive self-update\` brings it\n`
         : ''),
     )
     process.exit(1)
   }
-  process.stderr.write(`dashboard channel: ${TOKEN_FILE} is not readable by this seat; using the root relay (DIVE-5894)\n`)
+  process.stderr.write(office
+    ? `dashboard channel: the office chat on this box; using the root relay (DIVE-7566)\n`
+    : `dashboard channel: ${TOKEN_FILE} is not readable by this seat; using the root relay (DIVE-5894)\n`)
 }
 
 // The agent's short name — the unix user is agent-<name>. The main `claude`
@@ -1015,7 +1027,7 @@ function noteChatFile(line: string): void {
 }
 
 async function ensureInboundFile(path: unknown): Promise<void> {
-  if (typeof path !== 'string' || !path || !chatOnly() || existsSync(path)) return
+  if (typeof path !== 'string' || !path || !selfHeld() || existsSync(path)) return
   if (!isOwnUpload(AGENT, UPLOADS_DIR, path)) {
     noteChatFile(`chat-only: ${path} is missing and is not this agent's upload; not fetched`)
     return
@@ -1214,12 +1226,12 @@ async function putReplyFiles(paths: string[]): Promise<void> {
 // unlink stopped the loop with a 401, while this process ran).
 let longPollRunning = false
 function ensureLongPoll(): void {
-  if (longPollRunning || !chatOnly()) return
+  if (longPollRunning || !selfHeld()) return
   longPollRunning = true
   recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `chat-only box: long poll on (wait=${LONG_POLL_WAIT_S})`)
   void runLongPoll({
     poll: () => drainPending(LONG_POLL_WAIT_S),
-    active: chatOnly,
+    active: selfHeld,
     sleep: ms => new Promise(r => setTimeout(r, ms)),
     baseBackoffMs: LONG_POLL_BACKOFF_MS,
     maxBackoffMs: 60 * LONG_POLL_BACKOFF_MS,
@@ -1380,7 +1392,7 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
     // DIVE-7503: a chat-only box posts the sealed blobs to the API; on a 5dive
     // server the box's file server hands them out from the outbox, as it does
     // any reply file, so a standard seat there sends them through `event-e2e`.
-    if (chatOnly()) await putReplyFiles(sealed.files)
+    if (selfHeld()) await putReplyFiles(sealed.files)
     let res: Response
     try {
       res = await postReply(chatId, sealed.body, sealed.files, null, true)
@@ -1400,7 +1412,7 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
   // DIVE-6816: on a chat-only box the API cannot read this box's outbox, so
   // every copy there (a voice note's OGG and its MP3 too) is posted first; the
   // reply's metadata.files stays these same paths.
-  if (chatOnly()) {
+  if (selfHeld()) {
     const held = [...new Set([...copied, ...files])].filter(f => f.startsWith(`${OUTBOX_DIR}/`) && existsSync(f))
     await putReplyFiles(held)
   }
