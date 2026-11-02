@@ -2,6 +2,11 @@
 // Telegram's link previewer performs that GET before the human can tap it, so
 // every outbound path must mark the URL as code and disable previews at the
 // transport choke point. Direct tests keep this behavior aligned across forks.
+//
+// DIVE-7506: the code span stays, and an inline-keyboard URL button ("Open the
+// browser") is added under the message. Telegram never previews or prefetches
+// a URL button, so the ticket is spent by the owner's tap, not by Telegram.
+// Copying a code span is tap, copy, switch app, paste; the button is one tap.
 
 type TelegramEntity = { type: string; offset: number; length: number }
 
@@ -10,11 +15,17 @@ export type TelegramTextPayload = {
   parse_mode?: string
   entities?: TelegramEntity[]
   link_preview_options?: Record<string, unknown>
+  reply_markup?: unknown
 }
+
+type InlineButton = { text: string; url?: string; [key: string]: unknown }
 
 const VIEWER_LINK_RE = /(?:https?:\/\/[^\s`<>()]+)?\/browser\/viewer\/[A-Za-z0-9._-]+\/[a-fA-F0-9]{64}/g
 const MARKDOWN_V2_RESERVED = new Set('_*[]()~`>#+-=|{}.!\\')
 const WARNING = 'Copy-paste this one-time link into your browser. Do not paste it back here.'
+const WARNING_WITH_BUTTON = 'Tap Open the browser below, or copy-paste this one-time link into your browser. Do not paste it back here.'
+export const OPEN_BUTTON_TEXT = 'Open the browser'
+const MAX_OPEN_BUTTONS = 3
 
 type ViewerLinkMatch = { index: number; raw: string; link: string }
 
@@ -58,6 +69,43 @@ function alreadyCodeWrapped(text: string, index: number, length: number, html: b
   return text[index - 1] === '`' && text[index + length] === '`'
 }
 
+// Telegram refuses a URL button it cannot resolve (BUTTON_URL_INVALID) and then
+// drops the WHOLE message, so only an absolute https link on a named host gets a
+// button. A path-only link, a raw IP or localhost keeps the code span alone.
+function buttonable(link: string): boolean {
+  let url: URL
+  try {
+    url = new URL(link)
+  } catch {
+    return false
+  }
+  const host = url.hostname
+  return url.protocol === 'https:' && host.includes('.') && !/^[0-9.]+$/.test(host) && !host.startsWith('[')
+}
+
+// Adds one "Open the browser" URL button per viewer link, as the TOP rows of the
+// inline keyboard, keeping any buttons the caller already set below it. A reply
+// keyboard, force_reply or keyboard removal cannot carry an inline button, so
+// those sends keep the code span alone. Idempotent: a link that already has a
+// URL button is not given a second one.
+function addOpenButtons(payload: TelegramTextPayload, links: string[]): boolean {
+  const wanted = [...new Set(links.filter(buttonable))].slice(0, MAX_OPEN_BUTTONS)
+  if (wanted.length === 0) return false
+  const markup = payload.reply_markup as { inline_keyboard?: unknown } | null | undefined
+  if (markup != null && (typeof markup !== 'object' || !Array.isArray(markup.inline_keyboard))) return false
+  const rows = (markup?.inline_keyboard ?? []) as InlineButton[][]
+  const have = new Set(rows.flat().map(button => button?.url).filter(Boolean))
+  const add = wanted.filter(link => !have.has(link))
+  if (add.length > 0) {
+    const label = (i: number) => wanted.length === 1 ? OPEN_BUTTON_TEXT : `${OPEN_BUTTON_TEXT} (${wanted.indexOf(add[i]!) + 1})`
+    payload.reply_markup = {
+      ...(markup ?? {}),
+      inline_keyboard: [...add.map((url, i) => [{ text: label(i), url }]), ...rows],
+    }
+  }
+  return true
+}
+
 export function protectTelegramViewerLinks(payload: TelegramTextPayload): boolean {
   if (typeof payload.text !== 'string') return false
   const mode = payload.parse_mode?.toLowerCase()
@@ -85,10 +133,12 @@ export function protectTelegramViewerLinks(payload: TelegramTextPayload): boolea
         + payload.text.slice(index + raw.length)
     }
   }
+  const button = addOpenButtons(payload, matches.map(({ link }) => link))
   if (!payload.text.includes('Do not paste it back here')) {
+    const plain = button ? WARNING_WITH_BUTTON : WARNING
     const suffix = mode === 'markdownv2'
-      ? 'Copy\\-paste this one\\-time link into your browser\\. Do not paste it back here\\.'
-      : WARNING
+      ? plain.replace(/[-.]/g, '\\$&')
+      : plain
     if (payload.text.length + suffix.length + 2 <= 4096) payload.text += `\n\n${suffix}`
   }
   return true
