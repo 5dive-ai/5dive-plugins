@@ -47,7 +47,7 @@ describe('the link message follows what the box saw', () => {
     const m = renderConnectLink(parseConnectLink(TAP + 'check=0\n')!)
     expect(m.entities).toEqual([{ type: 'code', offset: m.text.indexOf(URL), length: URL.length }])
     expect(m.link_preview_options).toEqual({ is_disabled: true })
-    expect(m.reply_markup.inline_keyboard[0]![0]).toEqual({ text: 'Done — carry on', callback_data: `bdone:${DONE}` })
+    expect(m.reply_markup.inline_keyboard[1]![0]).toEqual({ text: 'Done — carry on', callback_data: `bdone:${DONE}` })
   })
 })
 

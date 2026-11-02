@@ -44,7 +44,7 @@ describe('what the owner reads', () => {
     expect(m.link_preview_options).toEqual({ is_disabled: true })
   })
   test('the Done button says the agent carries on', () => {
-    expect(m.reply_markup.inline_keyboard[0]![0]).toEqual({ text: 'Done — carry on', callback_data: `bdone:${DONE}` })
+    expect(m.reply_markup.inline_keyboard[1]![0]).toEqual({ text: 'Done — carry on', callback_data: `bdone:${DONE}` })
   })
   test('after Done: thanks, the agent is carrying on (not a login verdict)', () => {
     const t = renderConnectVerdict(parseConnectVerdict(DONE_OK)!)

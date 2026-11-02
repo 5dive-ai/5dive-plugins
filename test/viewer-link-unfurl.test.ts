@@ -28,7 +28,7 @@ describe.each(implementations)('%s protects one-time browser viewer links', (_na
       link_preview_options: { is_disabled: true },
       entities: [{ type: 'code', offset: 20, length: URL.length }],
     })
-    expect(payload.text).toContain('Copy-paste this one-time link into your browser.')
+    expect(payload.text).toContain('Tap Open the browser below, or copy-paste this one-time link into your browser.')
     expect(payload.text).toContain('Do not paste it back here.')
   })
 
@@ -37,7 +37,7 @@ describe.each(implementations)('%s protects one-time browser viewer links', (_na
     expect(protect(payload)).toBe(true)
     expect(payload.text).toContain(`\`${URL}\``)
     expect(payload.text).not.toContain(`\`\`${URL}\`\``)
-    expect(payload.text).toContain('Copy\\-paste this one\\-time link')
+    expect(payload.text).toContain('copy\\-paste this one\\-time link')
     expect(protect(payload)).toBe(true)
     expect(payload.text.match(new RegExp('`', 'g'))).toHaveLength(2)
     expect(payload.text.match(/Do not paste it back here/g)).toHaveLength(1)

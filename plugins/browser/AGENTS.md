@@ -28,7 +28,9 @@ refusal spends nothing.
 **A chat preview is a visit.** Hand the viewer URL over only as non-unfurling code, with
 "Copy-paste this one-time link into your browser. Do not paste it back into chat." Telegram
 agents use the reply tool's MarkdownV2 code span; the Telegram transport enforces the same
-rule. Other chat adapters must use their equivalent code formatting. A web dashboard may
+rule, and adds an "Open the browser" inline URL button under the message (DIVE-7506):
+Telegram never previews a URL button, so the owner's tap is the first visit. Never send the
+URL as a plain link or a text link. Other chat adapters must use their equivalent code formatting. A web dashboard may
 offer copy-only text or a copy button, but must not prefetch the URL.
 
 ## When YOU need the owner logged in: ask with a button (DIVE-4992)
