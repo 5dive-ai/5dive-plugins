@@ -864,7 +864,10 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
     if (!res.ok) throw new Error(`${res.status}`)
     const body = (await res.json()) as { pending?: typeof items; hear?: unknown }
     items = body.pending ?? []
-    hear = hearJobs(body.hear, AGENT, UPLOADS_DIR)
+    // DIVE-7503: only a seat that asked for clips hears them. A 5dive server's
+    // seats never ask (hearsHere), so hands-free stays off in their chats,
+    // encrypted or not, whatever a poll answer carries.
+    hear = hearsHere() ? hearJobs(body.hear, AGENT, UPLOADS_DIR) : []
     // DIVE-6816: a plain poll that got through (boot, the 5-minute timer)
     // (re)starts the chat-only loop; a no-op on any other box.
     if (wait === 0) ensureLongPoll()
@@ -1366,8 +1369,21 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
     } finally {
       dropPlainCopies([...copied, ...files], OUTBOX_DIR)
     }
+    // DIVE-7503: a chat-only box posts the sealed blobs to the API; on a 5dive
+    // server the box's file server hands them out from the outbox, as it does
+    // any reply file, so a standard seat there sends them through `event-e2e`.
     if (chatOnly()) await putReplyFiles(sealed.files)
-    const res = await postReply(chatId, sealed.body, sealed.files, null, true)
+    let res: Response
+    try {
+      res = await postReply(chatId, sealed.body, sealed.files, null, true)
+    } catch (err) {
+      for (const b of sealed.files) { try { unlinkSync(b) } catch {} }
+      // A relay from before DIVE-7502 has no `event-e2e`: refused, never resent in the clear.
+      if (RELAY && /allows only/.test(String(err))) {
+        throw new Error('reply not sent: this server cannot send encrypted replies yet (sudo 5dive self-update brings it). It was not sent unencrypted either.')
+      }
+      throw err
+    }
     const j = (await res.json().catch(() => null)) as { id?: number } | null
     const sentLine = `sent encrypted (id: ${j?.id ?? '?'})`
     if (args.voice !== true || !rawText.trim()) return sentLine

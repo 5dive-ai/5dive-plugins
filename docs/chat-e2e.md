@@ -2,7 +2,8 @@
 
 DIVE-6875 designed it; DIVE-6876 lands the box side in the `dashboard` plugin.
 The relay (our API and its database) carries only ciphertext for a server where
-`/etc/5dive/chat-e2e/` exists. Self-hosted (chat-only) servers only.
+`/etc/5dive/chat-e2e/` exists: a self-hosted (chat-only) server, or a 5dive server
+whose owner turned it on (DIVE-7499).
 
 | Piece | Where | Row |
 | --- | --- | --- |
@@ -95,6 +96,13 @@ The relay (`5dive _dashboard_relay`) needs two new ops for a standard seat:
 `event-e2e <chat> <envelope> <files…>` and `status-e2e <chat> <0|1> [<envelope>]`.
 A relay without them refuses, and the reply fails rather than going out in the clear.
 The relay's `put` must accept the `*.e2e` blobs in the outbox.
+
+On a 5dive server (not chat-only) the box's file server hands reply files out of the
+outbox, so no seat `put`s: a standard seat names its `<seat>-….e2e` blobs to
+`event-e2e`, which takes only those. A seat that cannot send sealed (a relay from before
+DIVE-7502) refuses the reply with a self-update hint and removes the blobs. Hands-free
+voice is off in every chat on a 5dive server: no seat there asks for clips, and one the
+poll offers anyway is not heard (DIVE-7503).
 
 ## Size
 
