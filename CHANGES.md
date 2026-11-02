@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.23: encrypted chat stays on once on, and a lost device list is posted again (DIVE-7520)
+
+An outside review of encrypted chat found two gaps on the box side.
+
+- **Pinned on.** Once a seat has seen encrypted chat on, a missing key folder (or root saying "not on") no longer reads as off: nothing reaches the agent and nothing goes out in the clear until the owner runs `sudo 5dive chat e2e disable` at the server.
+- **A lost device list is posted again.** When posting the new list after an approval or revoke fails, the message is no longer acked: it is offered again, root answers the retry with the same list, and the post is retried.
+- `docs/chat-e2e.md` writes down the new device-list rules (revision, owners, retries, agent binding) and the single-owner limit.
+
+Harness: `test/dive7520-dashboard-e2e-harden.test.ts` (6 tests; P2, P5 and S1 are red on 0.5.22).
+
 ### Fixed — dashboard 0.5.22: encrypted chat from a standard seat on a 5dive server (DIVE-7503)
 
 Encrypted web chat is coming to 5dive servers (DIVE-7499). A standard seat there reaches the API only through the root relay, and its server is not chat-only.

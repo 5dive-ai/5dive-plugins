@@ -98,7 +98,7 @@ describe('chat-e2e box side (DIVE-6876)', async () => {
 
   test('A4 an approval from a device comes back as the new device list, sealed to every device', async () => {
     const tablet = await device()
-    const a = await w.e2e.admit(await w.send({ t: 'approve', device: 'dev-tablet', pub: tablet.raw }, { m: 'c-a4' }), 'dashboard')
+    const a = await w.e2e.admit(await w.send({ t: 'approve', device: 'dev-tablet', pub: tablet.raw, rev: w.stub.roster().n }, { m: 'c-a4' }), 'dashboard')
     expect(a.kind).toBe('roster')
     const body = (a as { body: string }).body
     const list = await w.read(body)
