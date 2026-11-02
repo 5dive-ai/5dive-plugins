@@ -14,5 +14,7 @@
   },
   "version": "0.1.3",
   "manifest": "claude-plugin",
-  "blocks": []
+  "blocks": [
+    "plan-limit-off"
+  ]
 }

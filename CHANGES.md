@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram-grok / telegram-agy 0.5.37: a Grok agent out of its weekly plan says so in plain words (DIVE-7565)
+
+lodar on chill-gorge: «I think we didn't do proper usage limit hit handling». A Grok seat that ran out of its plan sent two raw `API error (status 402 Payment Required): Grok Build usage balance exhausted` relays, then «stopped responding — cause unknown … Try /restart», while a «Help improve Grok» box sat on its input.
+
+- **One plain line, once per limit hit:** «Dude has used up this week's Grok plan, so it can't answer until the limit resets. To keep going now, upgrade the plan at grok.com.» (plus the reset time when the screen shows one). It replaces the raw 402 relay and the stall notice, never says /restart, and later 402s stay quiet. A marker in the channel state dir is shared by the relay hook and the bridge, cleared when the agent answers again or after a week.
+- **«balance exhausted», «402 Payment Required» and «Weekly limit left: 0%»** now read as a used-up plan in the stall classifier, ahead of the generic quota and «cause unknown» branches. The stall auto-reply to an owner's message uses the same line.
+- **The «Help improve Grok» box is answered at boot and every minute after:** Enter only when Opt out is the highlighted answer, otherwise Shift+X dismisses it (sharing stays at Grok's default, off). It can never opt in. The choice lives on the Grok account, so there is no config setting to set instead.
+- **Grok only.** `plan-limit.ts` is rendered into telegram-agy (and qwen) switched off by the new `plan-limit-off` generator block; codex and the Claude plugin never show these words, so they are unchanged.
+
+Harness: `test/dive7565-grok-plan-used-up.test.ts` (22 tests on the real chill-gorge pane text; 7 red on the pre-fix bridge and hook, 2 red with the old quota regex).
+
 ### Changed — dashboard 0.5.24, telegram 0.5.131, buzz 0.2.2, telegram-grok / telegram-agy 0.5.36, telegram-codex 0.5.46, voice 1.11.6, browser 1.32.1: the plugins honour local-only mode (DIVE-7559)
 
 A law firm needs a box where nothing leaves the office (DIVE-7556). `/etc/5dive/local-only` (exists = on) is the switch every 5dive component reads; with it absent nothing here changes.
