@@ -15,7 +15,7 @@
 // The arm therefore runs TWO real server.ts processes against ONE stub control
 // plane and ONE shared state dir, and counts pushes across BOTH.
 import { describe, test, expect } from 'bun:test'
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, utimesSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, utimesSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -75,6 +75,32 @@ async function waitFor(pred: () => boolean, ms: number) {
     await Bun.sleep(25)
   }
   return pred()
+}
+
+function bootIdNow(): string {
+  try { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() } catch { return '-' }
+}
+
+// A pid that existed and is gone: spawn and reap a short-lived process.
+function deadPid(): number {
+  const p = Bun.spawnSync(['sh', '-c', 'echo $$'])
+  return Number(new TextDecoder().decode(p.stdout).trim())
+}
+
+function stubApi(queue: () => Array<{ id: number; text: string }>, ack: (ids: number[]) => void) {
+  return Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url)
+      if (url.pathname === '/server/messages/pending') return Response.json({ pending: queue() })
+      if (url.pathname === '/server/messages/pending/ack') {
+        const body = (await req.json()) as { ids: number[] }
+        ack(body.ids)
+        return Response.json({ ok: true, acked: body.ids.length })
+      }
+      return new Response('not found', { status: 404 })
+    },
+  })
 }
 
 describe('cross-process drain lock (DIVE-3809)', () => {
@@ -162,6 +188,78 @@ describe('cross-process drain lock (DIVE-3809)', () => {
       // The push lands before the ack and the release, so wait for the unlink
       // rather than reading the file the instant the message shows up.
       expect(await waitFor(() => !existsSync(lock), 5_000)).toBe(true)
+    } finally {
+      p.kill(); api.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 40_000)
+
+  // DIVE-7573 (D5): an adapter killed mid long-poll leaves a FRESH lock. The
+  // age bound honoured it for 2 minutes, so the chat was deaf for 80-120 s
+  // after every agent restart. A lock whose owner pid is gone, or that was
+  // written in an earlier boot, is broken at once — and a live owner's fresh
+  // lock is still honoured (the cross-process guard above must not weaken).
+  for (const [name, body] of [
+    ['a dead pid', () => `${deadPid()} ${bootIdNow()} ${new Date().toISOString()}\n`],
+    ['an earlier boot', () => `${process.pid} 00000000-0000-0000-0000-000000000000 ${new Date().toISOString()}\n`],
+  ] as const) {
+    test(`a FRESH lock left by ${name} is broken at once, not after 2 minutes`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'dead-owner-lock-'))
+      const lock = join(dir, 'pending-drain.lock')
+      writeFileSync(lock, body())   // mtime = now: the age bound alone would honour it
+      const delivered: string[] = []
+      let queue = [{ id: 9, text: 'right after a restart' }]
+      const api = stubApi(() => queue, ids => { queue = queue.filter(m => !ids.includes(m.id)) })
+      const p = spawnPlugin(dir, api.port, delivered)
+      try {
+        expect(await waitFor(() => delivered.length >= 1, BOOT_MS + 10_000)).toBe(true)
+        expect(delivered[0]).toBe('right after a restart')
+      } finally {
+        p.kill(); api.stop(true)
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 40_000)
+  }
+
+  test('a FRESH lock held by a LIVE process is still honoured', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'live-owner-lock-'))
+    const lock = join(dir, 'pending-drain.lock')
+    // This test process is alive and is not the plugin: a live foreign owner.
+    writeFileSync(lock, `${process.pid} ${bootIdNow()} ${new Date().toISOString()}\n`)
+    const delivered: string[] = []
+    let queue = [{ id: 11, text: 'must wait for the holder' }]
+    const api = stubApi(() => queue, ids => { queue = queue.filter(m => !ids.includes(m.id)) })
+    const p = spawnPlugin(dir, api.port, delivered)
+    try {
+      await Bun.sleep(BOOT_MS + 3_000)
+      expect(delivered).toEqual([])
+      expect(existsSync(lock)).toBe(true)
+    } finally {
+      p.kill(); api.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 40_000)
+
+  test('a plugin stopped mid long-poll releases the lock on exit', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'exit-release-'))
+    const lock = join(dir, 'pending-drain.lock')
+    const delivered: string[] = []
+    let inPoll = false
+    // Hold every pending request open, like the chat-only long poll does.
+    const api = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === '/server/messages/pending') { inPoll = true; await Bun.sleep(30_000); return Response.json({ pending: [] }) }
+        return new Response('not found', { status: 404 })
+      },
+    })
+    const p = spawnPlugin(dir, api.port, delivered)
+    try {
+      expect(await waitFor(() => inPoll && existsSync(lock), BOOT_MS + 10_000)).toBe(true)
+      p.kill('SIGTERM')
+      await p.exited
+      expect(existsSync(lock)).toBe(false)
     } finally {
       p.kill(); api.stop(true)
       rmSync(dir, { recursive: true, force: true })

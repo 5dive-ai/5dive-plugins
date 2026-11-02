@@ -785,6 +785,39 @@ let drainEnded: Promise<unknown> = Promise.resolve()
 // two minutes is far past any healthy pass.
 const DRAIN_LOCK_STALE_MS = 2 * 60_000
 
+// DIVE-7573 (D5): the time bound alone made every agent restart deaf. The
+// chat-only long poll holds the lock for the whole held request, so killing
+// the adapter mid-poll (any restart; `agent create` does one) left a FRESH
+// lock, and the new adapter skipped every pass until it aged out — 80-120 s
+// of a chat that hears nothing. The lock now names its owner (pid + boot id),
+// and an owner that is provably gone — its pid no longer exists, or it was
+// written in an earlier boot — is broken at once. The time bound stays as the
+// backstop for a lock whose owner cannot be read (pre-7573 format, pid reuse).
+function bootId(): string {
+  try { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() } catch { return '' }
+}
+const BOOT_ID = bootId()
+
+// True when the lock's recorded owner is provably gone.
+function drainLockOwnerGone(body: string): boolean {
+  const [pidStr, boot] = body.trim().split(/\s+/)
+  const pid = Number(pidStr)
+  if (!Number.isInteger(pid) || pid <= 0) return false        // unreadable: let the age decide
+  if (pid === process.pid) return false                       // ours (never re-entered; be safe)
+  // `boot` is a boot id only in the 7573 format (36-char uuid); the old
+  // format's second field is an ISO timestamp and proves nothing.
+  if (BOOT_ID && boot && /^[0-9a-f-]{36}$/.test(boot) && boot !== BOOT_ID) return true
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (err) {
+    // EPERM: alive, just not ours to signal. Only ESRCH proves it is gone.
+    return (err as NodeJS.ErrnoException).code === 'ESRCH'
+  }
+}
+
+let holdingDrainLock = false
+
 // Returns true if THIS process now holds the lock. Never throws: a filesystem
 // that cannot support the lock must degrade to today's per-process-only
 // behaviour, not stop the customer's message from being collected.
@@ -792,20 +825,28 @@ function acquireDrainLock(): boolean {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = openSync(DRAIN_LOCK, 'wx')
-      try { writeSync(fd, `${process.pid} ${new Date().toISOString()}\n`) } catch {}
+      try { writeSync(fd, `${process.pid} ${BOOT_ID || '-'} ${new Date().toISOString()}\n`) } catch {}
       closeSync(fd)
+      holdingDrainLock = true
       return true
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
         process.stderr.write(`dashboard channel: drain lock unavailable (${err}); per-process guard only\n`)
         return true
       }
-      // Held. Break it only if it is provably stale, then retry the create
-      // once — if another process wins that race, we simply skip this pass.
+      // Held. Break it only if its owner is provably gone or it is provably
+      // stale, then retry the create once — if another process wins that
+      // race, we simply skip this pass.
       try {
-        const age = Date.now() - statSync(DRAIN_LOCK).mtimeMs
-        if (age <= DRAIN_LOCK_STALE_MS) return false
-        process.stderr.write(`dashboard channel: breaking stale drain lock (age ${Math.round(age / 1000)}s)\n`)
+        let body = ''
+        try { body = readFileSync(DRAIN_LOCK, 'utf8') } catch {}
+        if (drainLockOwnerGone(body)) {
+          process.stderr.write(`dashboard channel: breaking drain lock of a dead adapter (${body.trim().split(/\s+/)[0]})\n`)
+        } else {
+          const age = Date.now() - statSync(DRAIN_LOCK).mtimeMs
+          if (age <= DRAIN_LOCK_STALE_MS) return false
+          process.stderr.write(`dashboard channel: breaking stale drain lock (age ${Math.round(age / 1000)}s)\n`)
+        }
         unlinkSync(DRAIN_LOCK)
       } catch { return false }
     }
@@ -814,8 +855,14 @@ function acquireDrainLock(): boolean {
 }
 
 function releaseDrainLock(): void {
+  holdingDrainLock = false
   try { unlinkSync(DRAIN_LOCK) } catch {}
 }
+
+// DIVE-7573 (D5): a graceful exit mid-long-poll releases the lock too, so the
+// next adapter does not even need the owner check. Synchronous on purpose —
+// 'exit' handlers cannot await.
+process.on('exit', () => { if (holdingDrainLock) releaseDrainLock() })
 
 // DIVE-6816: `wait` > 0 is the chat-only long poll (the API holds the request
 // until a message lands); every other caller passes nothing and gets the plain
