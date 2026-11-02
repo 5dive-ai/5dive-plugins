@@ -18,8 +18,9 @@
  */
 
 import { readFileSync, existsSync } from 'fs'
-import { homedir } from 'os'
+import { homedir, userInfo } from 'os'
 import { join } from 'path'
+import { planUsedUp, planUsedUpText, claimPlanNotice } from '../plan-limit.ts'
 
 function exitContinue(): never {
   process.stdout.write(JSON.stringify({ continue: true }))
@@ -117,7 +118,16 @@ try { access = JSON.parse(readFileSync(join(STATE_DIR, 'access.json'), 'utf8')) 
 const recipients = access.allowFrom ?? []
 if (recipients.length === 0) exitContinue()
 
-const body = `⚠️ grok: ${text.slice(0, 3500)}`
+// DIVE-7565: a used-up plan ("402 Payment Required … usage balance exhausted")
+// is one plain line to the owner, once per limit hit, shared with the server's
+// stall notice through the marker in STATE_DIR. Every later 402 stays quiet.
+let body = `⚠️ grok: ${text.slice(0, 3500)}`
+if (planUsedUp(text)) {
+  if (!claimPlanNotice(STATE_DIR)) exitContinue()
+  let user = ''
+  try { user = userInfo().username } catch {}
+  body = planUsedUpText(user.startsWith('agent-') ? user.slice('agent-'.length) : '', text)
+}
 
 await Promise.all(recipients.map(chat_id =>
   fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {

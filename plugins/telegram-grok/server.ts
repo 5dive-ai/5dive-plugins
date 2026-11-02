@@ -41,6 +41,7 @@ import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, typ
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { writePending, previewOf, pendingNotice } from './pending-inbound.ts'
+import { PLAN_ON, planUsedUp, planUsedUpText, claimPlanNotice, clearPlanNotice, optInBoxShowing, optOutSelected } from './plan-limit.ts'
 import {
   siblingYounger, writeHandoffRequest, readHandoffRequest, clearHandoffRequest,
   writeHandoffQueue, takeHandoffQueue,
@@ -430,7 +431,9 @@ function enqueueInbound(msg: InboundMsg) {
   // moment the loop recovers — clearStallAlert() flips stallAlerted back off.
   if (!STALL_ALERT_DISABLED && stallAlerted) {
     const { cause, detail } = detectStallCauseCached()
-    const text = `⚠️ ${agentName()} can’t respond right now — ${cause}.\n${detail}.`
+    // DIVE-7565: a used-up plan is said in plain words, in reply to the owner's own message.
+    const text = cause === PLAN_USED_UP_CAUSE ? planUsedUpText(agentName(), _lastPane)
+      : `⚠️ ${agentName()} can’t respond right now — ${cause}.\n${detail}.`
     bot.api.sendMessage(msg.chat_id, text,
       msg.message_thread_id ? { message_thread_id: Number(msg.message_thread_id) } : undefined)
       .catch((err: any) => process.stderr.write(`telegram-grok: stall auto-reply failed: ${err?.message}\n`))
@@ -2907,6 +2910,8 @@ let rearmSubmitFailed = false
 
 function capitalize(s: string): string { return s.charAt(0).toUpperCase() + s.slice(1) }
 
+const PLAN_USED_UP_CAUSE = 'its plan is used up'
+
 // Capture the agent's tmux pane and classify a stall cause from known failure
 // banners, so the alert can name the actual problem. Best-effort: any failure
 // to read/classify falls back to a generic "wedged" message.
@@ -2919,6 +2924,10 @@ function detectStallCause(): { cause: string; detail: string } {
       { timeout: 5_000, encoding: 'utf8' })
     _lastPane = pane
     const tail = pane.slice(-4000)
+    // DIVE-7565: Grok's plan is used up ("402 Payment Required", "usage balance
+    // exhausted", "Weekly limit left: 0%"). /restart cannot help, so this is its
+    // own cause and its own plain-words message (sendStallAlert).
+    if (planUsedUp(tail)) return { cause: PLAN_USED_UP_CAUSE, detail: 'it can answer again once the limit resets' }
     // Model/credit quota exhausted (e.g. Antigravity "Individual quota reached").
     if (/quota reached|out of (?:credits|quota)|usage limit|rate limit exceeded/i.test(tail)) {
       const reset = tail.match(/resets? in[^\n]*/i)?.[0]?.trim()
@@ -2974,14 +2983,19 @@ function sendStallAlert(): void {
   if (stallAlerted || stallPinged) return
   const name = agentName()
   const { cause, detail } = detectStallCause()
-  const text = `⚠️ ${name} stopped responding — ${cause}.\n${detail}.\n\n`
-    + 'The Telegram listen loop isn’t recovering on its own. Try /restart, or check the agent pane.'
+  const plan = cause === PLAN_USED_UP_CAUSE
+  // DIVE-7565: a used-up plan gets ONE plain line, never "/restart", and only if
+  // the error relay hook has not already sent it for this limit hit.
+  const text = plan ? planUsedUpText(name, _lastPane)
+    : `⚠️ ${name} stopped responding — ${cause}.\n${detail}.\n\n`
+      + 'The Telegram listen loop isn’t recovering on its own. Try /restart, or check the agent pane.'
   const owners = loadAccess().allowFrom ?? []
   if (owners.length === 0) {
     process.stderr.write('telegram-grok: stall detected but no allowFrom owner to alert\n')
     return
   }
-  for (const id of owners) {
+  const notify = !plan || claimPlanNotice(STATE_DIR)
+  for (const id of notify ? owners : []) {
     bot.api.sendMessage(id, text).catch((err: any) =>
       process.stderr.write(`telegram-grok: stall alert to ${id} failed: ${err?.message}\n`))
   }
@@ -3000,6 +3014,8 @@ function sendStallAlert(): void {
 // Loop recovered — drop the dedup flag so a future stall alerts again.
 function clearStallAlert(): void {
   rearmSubmitFailed = false
+  // It answers again, so the plan is back: the next limit hit gets its notice.
+  if (PLAN_ON) clearPlanNotice(STATE_DIR)
   if (!stallAlerted && !stallPinged) return
   stallAlerted = false
   stallPinged = false
@@ -3207,6 +3223,59 @@ function startRearmWatchdog(): void {
   timer.unref?.()
 }
 
+// ── "Help improve Grok" box (DIVE-7565) ─────────────────────────────────────
+// Grok asks each account once whether it may keep coding data, in a box drawn
+// over the input. Nobody is at a seat's screen to answer it, so the agent sits
+// behind it (seen on chill-gorge 2026-11-02, after its plan ran out). The CLI
+// has no setting that skips it, so answer it here: Enter only when Opt out is
+// visibly the selected answer, otherwise dismiss it (Shift+X), which leaves
+// sharing at Grok's default, off. This path can never opt in.
+const OPT_IN_CHECK_MS = 60_000
+
+function capturePaneStyledSync(name: string): string | null {
+  try {
+    const cp = require('child_process')
+    return cp.execFileSync('tmux', ['capture-pane', '-e', '-t', `agent-${name}`, '-p'],
+      { timeout: 5_000, encoding: 'utf8' }) as string
+  } catch { return null }
+}
+
+let optInAnswering = false
+// A box that does not close after a few presses is not the box we know; stop
+// typing into it rather than leave keystrokes in the composer every minute.
+const OPT_IN_MAX_TRIES = 3
+let optInTries = 0
+async function answerOptInBox(name: string): Promise<void> {
+  if (optInAnswering || optInTries >= OPT_IN_MAX_TRIES) return
+  optInAnswering = true
+  optInTries++
+  try {
+    const styled = capturePaneStyledSync(name)
+    if (styled === null || !optInBoxShowing(styled.replace(/\x1b\[[0-9;:]*m/g, ''))) return
+    const pick = optOutSelected(styled) === true ? 'Enter' : 'X'
+    if (!(await sendKeysAsync(name, [pick]))) return
+    await rearmSleep(REARM_SUBMIT_SETTLE_MS)
+    const after = capturePaneSync(name)
+    const gone = after !== null && !optInBoxShowing(after)
+    if (gone) optInTries = 0
+    process.stderr.write(`telegram-grok: "Help improve Grok" box ${pick === 'Enter' ? 'answered Opt out' : 'dismissed'}${gone ? '' : ' (still showing)'}\n`)
+  } finally {
+    optInAnswering = false
+  }
+}
+
+function startOptInWatch(): void {
+  if (!PLAN_ON || REARM_DISABLED) return
+  const name = agentName()
+  if (name === 'unknown') return
+  const tick = () => {
+    const pane = capturePaneSync(name)
+    if (pane !== null && optInBoxShowing(pane)) void answerOptInBox(name)
+  }
+  setTimeout(tick, 5_000).unref?.()
+  setInterval(tick, OPT_IN_CHECK_MS).unref?.()
+}
+
 // ============================================================================
 // Boot
 // ============================================================================
@@ -3265,6 +3334,7 @@ process.stdin.once('close', onParentDisconnect)
 await mcp.connect(new StdioServerTransport())
 
 startRearmWatchdog()
+startOptInWatch()
 startAgentInbox()
 
 // DIVE-1503/1558 pinned-banner store I/O. Heuristic state: a lost read/write only

@@ -1,0 +1,9 @@
+[
+  {
+    "find": "export const PLAN_ON = true",
+    "replace": "export const PLAN_ON = false",
+    "files": [
+      "plan-limit.ts"
+    ]
+  }
+]
