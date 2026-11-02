@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.25: the office chat on a local-only box answers in seconds and its files reach the agent (DIVE-7566)
+
+The DIVE-7560 end-to-end proof (main, 2026-11-02) ran a fully-local box with the office chat. Every message waited for the 5-minute timer (86 s to 4 min 38 s measured) and a file sent from the chat never reached the agent: both were only switched on by the chat-only marker, which a local-only box does not write.
+
+- **The office chat counts as a self-held chat.** When `/etc/5dive/api-base` (the root-owned file, never `DASHBOARD_API_BASE`) points at a loopback address, which is what `5dive local serve` writes, the adapter holds the long poll and fetches each upload before the agent sees the message, as on a chat-only box. Reply files are posted to it first, too.
+- **A box never linked to 5dive.app starts its chat.** With no token file at all, a seat on the office chat now asks the root relay, which holds the office chat's own token (5dive CLI, same row). Before, the adapter exited "connectord token not found".
+
+Harness: `test/dive6816-dashboard-chat-only.test.ts`, block DIVE-7566 (3 tests, all red on the pre-fix adapter; the chat-only and marker-off arms still pass unchanged).
+
 ### Fixed — telegram-grok / telegram-agy 0.5.37: a Grok agent out of its weekly plan says so in plain words (DIVE-7565)
 
 lodar on chill-gorge: «I think we didn't do proper usage limit hit handling». A Grok seat that ran out of its plan sent two raw `API error (status 402 Payment Required): Grok Build usage balance exhausted` relays, then «stopped responding — cause unknown … Try /restart», while a «Help improve Grok» box sat on its input.

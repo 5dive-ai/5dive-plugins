@@ -26,6 +26,18 @@ export function isChatOnly(marker: string): boolean {
   return existsSync(marker)
 }
 
+/**
+ * DIVE-7566: the box's own office chat (local-only mode, DIVE-7558) is the
+ * control plane. `5dive local serve` points /etc/5dive/api-base at its loopback
+ * listener, and that server works exactly like the chat-only API: it holds a
+ * long poll, and it keeps an upload in its own store until the adapter fetches
+ * it. Only the root-owned FILE counts (never DASHBOARD_API_BASE), so a preview
+ * or test pointed at a loopback stub is not taken for an office box.
+ */
+export function isOfficeChatBase(base: string | null): boolean {
+  return !!base && /^http:\/\/(127(\.\d{1,3}){3}|localhost|\[::1\])(:\d{1,5})?\/?$/i.test(base)
+}
+
 const UPLOAD_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,199}$/
 
 /**
