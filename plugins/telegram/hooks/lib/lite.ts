@@ -128,6 +128,12 @@ export const LITE_STRINGS = {
     },
     limitReached: (when: string | null) =>
       when ? `Недельный лимит исчерпан, обновится ${when}. Подробности в кабинете.` : 'Лимит исчерпан. Подробности в кабинете.',
+    // DIVE-7641: a usage limit whose reset time is known says when work goes on.
+    // `resume` only when the box will pick the work up itself; else `reset`.
+    limitAt: {
+      resume: (when: string) => `Лимит исчерпан, продолжу ${when}. Подробности в кабинете.`,
+      reset: (when: string) => `Лимит исчерпан, обновится ${when}. Подробности в кабинете.`,
+    },
     // DIVE-5194: the carry-over nudge (context-nudge.ts and its ho: buttons),
     // one line per tier, in the words a client can read.
     carryover: {
@@ -170,6 +176,10 @@ export const LITE_STRINGS = {
     },
     limitReached: (when: string | null) =>
       when ? `This week's allowance is used up, it renews ${when}. Details are in your account.` : 'Your allowance is used up. Details are in your account.',
+    limitAt: {
+      resume: (when: string) => `Limit reached, I'll continue ${when}. Details in your account.`,
+      reset: (when: string) => `Limit reached, resets ${when}. Details in your account.`,
+    },
     carryover: {
       tiers: [
         'This conversation is getting long. A new one keeps answers sharp. Start fresh, or keep going?',
@@ -489,9 +499,52 @@ export function liteUsageText(lang: Lang, a: Allowance): string {
   }
 }
 
-/** The limit-reached line. Names the day only for a weekly cap. */
-export function liteLimitText(lang: Lang, a: Allowance): string {
+/** DIVE-7641: a known reset, for the limit line. `resumes`: the box will pick
+ *  the work up itself when it lifts (a reset time AND a pane to drive). */
+export type LimitReset = { epoch: number | null; resumes: boolean; now?: Date; timeZone?: string }
+
+const DAY_MS = 24 * 3600 * 1000
+
+/**
+ * DIVE-7641: when a reset lands, in the words of the limit line: the clock time
+ * in the box's own zone (a partner box runs in its client's zone), and the day
+ * when it is not today. ru `в 03:10` · `завтра в 03:10` · `в среду в 03:10` ·
+ * `11 ноября в 03:10`; en `at 03:10` · `tomorrow at 03:10` · `on Wednesday at
+ * 03:10` · `on November 11 at 03:10`. null for a reset already past or a zone
+ * Intl cannot read, so the caller keeps the line without a time. Never throws.
+ */
+export function liteResetPhrase(lang: Lang, epochSec: number, now: Date = new Date(), timeZone?: string): string | null {
+  try {
+    const at = new Date(epochSec * 1000)
+    if (!Number.isFinite(at.getTime()) || at.getTime() <= now.getTime()) return null
+    const ymd = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
+    const dayOf = (d: Date) => {
+      const [y, m, dd] = ymd.format(d).split('-').map(n => parseInt(n, 10))
+      return Date.UTC(y!, m! - 1, dd!)
+    }
+    const day = dayOf(at)
+    const days = Math.round((day - dayOf(now)) / DAY_MS)
+    const clock = new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(at)
+    const ru = lang === 'ru'
+    if (days <= 0) return ru ? `в ${clock}` : `at ${clock}`
+    if (days === 1) return ru ? `завтра в ${clock}` : `tomorrow at ${clock}`
+    if (days < 7) return `${WEEKDAY[lang][new Date(day).getUTCDay()]} ${ru ? 'в' : 'at'} ${clock}`
+    const date = new Intl.DateTimeFormat(ru ? 'ru-RU' : 'en-US', { timeZone, month: 'long', day: 'numeric' }).format(at)
+    return ru ? `${date} в ${clock}` : `on ${date} at ${clock}`
+  } catch {
+    return null
+  }
+}
+
+/** The limit-reached line. Names the day only for a weekly cap. DIVE-7641: any
+ *  other limit with a known reset says when work goes on (`продолжу`) or when
+ *  the limit lifts (`обновится`); with none it is the line it always was. */
+export function liteLimitText(lang: Lang, a: Allowance, reset?: LimitReset): string {
   const when = a.kind === 'capped' && a.reset === 'weekly' && a.resetsAt ? weekdayPhrase(lang, a.resetsAt) : null
+  if (!when && reset?.epoch != null) {
+    const at = liteResetPhrase(lang, reset.epoch, reset.now, reset.timeZone)
+    if (at) return LITE_STRINGS[lang].limitAt[reset.resumes ? 'resume' : 'reset'](at)
+  }
   return LITE_STRINGS[lang].limitReached(when)
 }
 

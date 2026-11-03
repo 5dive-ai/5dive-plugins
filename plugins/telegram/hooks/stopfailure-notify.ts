@@ -203,7 +203,10 @@ if (LITE && isTermsNotAccepted) {
   const lang = readLiteLang()
   // DIVE-6979: an out-of-credit that reached here is the client's own used-up cap.
   const limitHit = isRateLimit || isOutOfCredit || /key limit exceeded|insufficient credits|more credits/i.test(raw)
-  text = limitHit ? liteLimitText(lang, allowance ?? (await readAllowance())) : LITE_STRINGS[lang].failed
+  // DIVE-7641: a usage limit with a known reset says when; "I'll continue" only
+  // when the resume helper below will run (the same test as the owner's DM).
+  const reset = isRateLimit && resetEpoch !== null ? { epoch: resetEpoch, resumes: !!tmuxCtx } : undefined
+  text = limitHit ? liteLimitText(lang, allowance ?? (await readAllowance()), reset) : LITE_STRINGS[lang].failed
   const accountUrl = liteAccountUrl(readChannelEnv('TELEGRAM_ACCOUNT_URL'))
   if (limitHit && accountUrl) markup = { inline_keyboard: [[{ text: LITE_STRINGS[lang].accountButton, url: accountUrl }]] }
 }
