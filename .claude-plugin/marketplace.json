@@ -29,6 +29,13 @@
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/buzz"
     },
     {
+      "name": "teams",
+      "description": "Microsoft Teams channel for Claude Code — each agent is its own contact in the customer's Microsoft 365 tenant (one single-tenant bot per agent). Microsoft posts to the agent's own HTTPS endpoint on the box; replies go straight back to the Bot Connector. Nothing passes through 5dive's servers. Refused on a fully offline (local-only) server.",
+      "category": "productivity",
+      "source": "./plugins/teams",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/teams"
+    },
+    {
       "name": "voice",
       "description": "Speak with your agent and hear it talk back — speech-to-text and text-to-speech on your own box, or on OpenRouter if you choose. In the 5dive web chat, turn on hands-free and tap once: it keeps listening, so you just talk. Maintained in 5dive-ai/5dive-voice; this entry is a byte-for-byte mirror of that repository's voice/ (1.11.6 as of DIVE-7559), so an install from here gets the same backend switch, host installer and settings as one from there. The reference implementation of the 5dive plugin contract: a channel-capability plugin, the shape every later channel plugin copies.",
       "category": "channel",

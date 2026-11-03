@@ -33,7 +33,7 @@ const PLUGINS = join(import.meta.dir, '..', 'plugins')
 // that can be left running after its parent dies. Enumerated, not globbed: a
 // new plugin should FAIL this list until someone decides which column it is in.
 const TIMER_PLUGINS = [
-  'telegram', 'buzz', 'dashboard',
+  'telegram', 'buzz', 'dashboard', 'teams',
   'telegram-agy', 'telegram-codex', 'telegram-grok', 'telegram-pi', 'telegram-opencode',
 ] as const
 // Nothing is exempt. `telegram` was, until its inline watchdog turned out to
@@ -199,7 +199,7 @@ describe('the watchdog is installed in every plugin that can orphan', () => {
 // ── 2b. static: the deafener cannot come back ───────────────────────────────
 
 describe('the channel start is not gated on a network step', () => {
-  const WITH_INSTALL = ['telegram', 'buzz', 'dashboard'] as const
+  const WITH_INSTALL = ['telegram', 'buzz', 'dashboard', 'teams'] as const
 
   for (const p of TIMER_PLUGINS) {
     test(`${p}: the start script never guards the server behind &&`, () => {

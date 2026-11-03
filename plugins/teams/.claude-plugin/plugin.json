@@ -1,0 +1,37 @@
+{
+  "name": "teams",
+  "description": "Microsoft Teams channel for Claude Code: each agent is its own contact in your company's Teams. Messages go between Microsoft and your own server only. DMs, files both ways, and tap buttons for questions.",
+  "version": "0.1.0",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/teams",
+  "keywords": [
+    "teams",
+    "microsoft-teams",
+    "microsoft-365",
+    "messaging",
+    "channel",
+    "mcp"
+  ],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": [
+      "channel",
+      "verb"
+    ],
+    "verbs": [
+      {
+        "name": "teams",
+        "summary": "add an agent to Microsoft Teams as its own contact",
+        "installs": "channel"
+      }
+    ],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    }
+  }
+}
