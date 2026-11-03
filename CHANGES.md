@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.132 (dashboard 0.5.28, shared lib only): a partner client's usage-limit line says when work goes on (DIVE-7641)
+
+On a partner box whose agent runs on the client's own subscription, a usage limit told the client only «Лимит исчерпан. Подробности в кабинете.», although the hook already knew the reset time. lodar, 2026-11-03: «сотрудник не пишет что лимит пришел - продолжу через 3 часа».
+
+- **The line names the time**, as a clock time in the box's zone (the client's), with the day when it is not today: «Лимит исчерпан, продолжу в 03:10. Подробности в кабинете.» / "Limit reached, I'll continue at 03:10. Details in your account."
+- **"I'll continue" only when the box resumes the work itself** (a reset time and a pane to drive, the same test as the owner's message). Otherwise «обновится в 03:10» / "resets at 03:10". With no reset time, the line is unchanged. The account button stays; the weekly-cap line keeps its day.
+
+Harness: `test/dive7641-lite-limit-time.test.ts` (13 tests; the 4 hook arms with a reset time are red on the pre-fix hook, the 2 without one pass on both).
+
 ### Fixed — dashboard 0.5.27: a box without voice never loops on "voice note failed" (DIVE-7603)
 
 The DIVE-7578 run 6 proof, on a local-only box with no voice add-on, saw a small local model (qwen3:8b) post 9 "voice note failed" messages in the owner's chat in 11 minutes, until the owner restarted the agent. The reply tool offered voice anyway, and each failure told the model to say that voice did not work, which it said with voice again.
