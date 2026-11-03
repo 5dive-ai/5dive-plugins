@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.27: a box without voice never loops on "voice note failed" (DIVE-7603)
+
+The DIVE-7578 run 6 proof, on a local-only box with no voice add-on, saw a small local model (qwen3:8b) post 9 "voice note failed" messages in the owner's chat in 11 minutes, until the owner restarted the agent. The reply tool offered voice anyway, and each failure told the model to say that voice did not work, which it said with voice again.
+
+- **Voice is offered only where it can be made.** With no `5dive-speak` on the box, the reply tool has no `voice` field and does not mention it; a `voice: true` sent anyway goes as text alone, and the agent is told to drop voice.
+- **A failure never invites a retry.** The first failed voice note asks for one line in text only. For 10 minutes after it, a voice request is not tried and the agent is told to say nothing more.
+
+Harness: `test/dive7603-dashboard-no-voice-loop.test.ts` (5 tests; both adapter arms are red on the pre-fix server).
+
 ### Fixed — dashboard 0.5.26: the chat hears again right after an agent restart, not two minutes later (DIVE-7573)
 
 The DIVE-7560 run 2 proof measured the chat deaf for 80-120 s after every agent restart (79.9 s and 99.5 s), and a new agent deaf for its first two minutes, because `agent create` restarts it once. The killed adapter left its message-collection lock behind mid long-poll, and the new one waited until the lock was two minutes old. Every long-polling chat-only box had it, not only local-only ones.

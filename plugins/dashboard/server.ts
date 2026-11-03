@@ -40,6 +40,7 @@ import { AGY_DEFAULT_TIMINGS, startAgyDispatcher } from './agydispatch.ts'
 import { openclawTurn, startOpenclawDispatcher } from './openclawdispatch.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
+import { replyTool, voicePlan, voiceSkippedNote, voiceFailedOnce } from './voicereply.ts'
 import { audioSeconds, inboundAttachment, isAudioPath, isVoiceInbound, replyBody, voicesReply, webPlayable, withLengthName, type Probe, type Run } from './voicenote.ts'
 import {
   loadPendingRetryState,
@@ -1293,35 +1294,9 @@ function ensureLongPoll(): void {
 
 // DIVE-7347: Grok gets no tools here. Its plain-text answer IS the reply, so a
 // reply tool would only let it answer twice.
+// DIVE-7603: voice is offered only where 5dive-speak exists (voicereply.ts).
 mcp.setRequestHandler(ListToolsRequestSchema, async () => GROK ? { tools: [] } : ({
-  tools: [
-    {
-      name: 'reply',
-      description:
-        'Reply in the 5dive dashboard chat. Pass chat_id from the inbound message (normally "dashboard"). ' +
-        'Optionally pass files (absolute paths on this box) to offer as downloads in the chat. ' +
-        'An audio file (a voice note from 5dive-speak) plays in the chat; with files attached, text may be empty. ' +
-        'Set voice: true to answer a voice note: the text goes first, then the plugin speaks it and sends that voice note. ' +
-        'Text over 70 words (outside fenced code) is refused and nothing is sent: keep it to 60, or put the detail in a file and name it in one line.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          chat_id: { type: 'string' },
-          text: { type: 'string' },
-          files: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'Absolute file paths on this box to attach as downloadable files.',
-          },
-          voice: {
-            type: 'boolean',
-            description: 'Also speak text as a voice note (made on this box) and send it right after the text. Use it to answer a voice note.',
-          },
-        },
-        required: ['chat_id'],
-      },
-    },
-  ],
+  tools: [replyTool(existsSync(SPEAK))],
 }))
 
 const FFMPEG = process.env.DASHBOARD_FFMPEG ?? (['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'].find(p => existsSync(p)) ?? 'ffmpeg')
@@ -1338,7 +1313,13 @@ type ReplyArgs = { chat_id?: unknown; text?: unknown; files?: unknown; voice?: u
 // again with the file), each 2-3 s on a big model. The text has already gone
 // when this runs, so a voice note that fails costs the voice and never the
 // answer; the agent is told so it can say one line about it (DIVE-6440).
+// DIVE-7603: never invites a retry. No 5dive-speak: not tried, and the agent
+// is told to drop voice. A failure: one text line, then a cooldown in which a
+// voice request is skipped (voicereply.ts), so a small model cannot loop on it.
+let voiceFailedAt = 0
 async function speakReply(text: string, chatId: string): Promise<string> {
+  const plan = voicePlan(existsSync(SPEAK), voiceFailedAt, Date.now())
+  if (plan !== 'speak') return voiceSkippedNote(plan)
   let ogg = ''
   try {
     const { stdout } = await promisify(execFile)(SPEAK, ['--', text], { timeout: 90_000 })
@@ -1348,13 +1329,17 @@ async function speakReply(text: string, chatId: string): Promise<string> {
     const e = err as { code?: unknown; stderr?: unknown; message?: unknown }
     // Exit 3: the owner switched voice replies off. Text only, and no apology.
     if (e.code === 3) return 'voice replies are switched off on this server: the text went, say nothing about voice.'
-    const why = String(e.stderr || e.message || err).trim().split('\n').pop()
-    return `VOICE NOTE NOT SENT (${why}). The text went; say in one line that the voice reply did not work this time.`
+    voiceFailedAt = Date.now()
+    const why = String(e.stderr || e.message || err).trim().split('\n').pop() ?? 'unknown'
+    return voiceFailedOnce(why)
   }
   try {
-    return `voice note ${await sendDashboardReply({ chat_id: chatId, files: [ogg] })}`
+    const sent = `voice note ${await sendDashboardReply({ chat_id: chatId, files: [ogg] })}`
+    voiceFailedAt = 0
+    return sent
   } catch (err) {
-    return `VOICE NOTE NOT SENT (${err}). The text went; say in one line that the voice reply did not work this time.`
+    voiceFailedAt = Date.now()
+    return voiceFailedOnce(String(err))
   } finally {
     try { unlinkSync(ogg) } catch {}
   }
