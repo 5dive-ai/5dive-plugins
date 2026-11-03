@@ -503,34 +503,54 @@ export function liteUsageText(lang: Lang, a: Allowance): string {
  *  the work up itself when it lifts (a reset time AND a pane to drive). */
 export type LimitReset = { epoch: number | null; resumes: boolean; now?: Date; timeZone?: string }
 
-const DAY_MS = 24 * 3600 * 1000
+const WEEKDAY_SHORT: Record<Lang, string[]> = {
+  ru: ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'],
+  en: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
+}
+const EN_DAY_INDEX: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }
 
 /**
- * DIVE-7641: when a reset lands, in the words of the limit line: the clock time
- * in the box's own zone (a partner box runs in its client's zone), and the day
- * when it is not today. ru `в 03:10` · `завтра в 03:10` · `в среду в 03:10` ·
- * `11 ноября в 03:10`; en `at 03:10` · `tomorrow at 03:10` · `on Wednesday at
- * 03:10` · `on November 11 at 03:10`. null for a reset already past or a zone
- * Intl cannot read, so the caller keeps the line without a time. Never throws.
+ * When a reset lands, in the words of the limit line. DIVE-7657 (lodar
+ * 2026-11-03: «продолжу через... будет лучше», «в скобочках время»): the time
+ * left from now, then the clock time in brackets, in the box's own zone (a
+ * partner box runs in its client's zone).
+ *   ru `через 2 ч 50 мин (в 03:10)` · `через 40 мин (в 21:00)` · `через 3 ч (в 03:10)`
+ *      · `через 2 дн 5 ч (в ср 19:00)` · `меньше чем через минуту`
+ *   en `in 2 h 50 min (at 03:10)` · … · `in 2 d 5 h (Wed 19:00)` · `in under a minute`
+ * Rounded UP (to the minute; to the hour from a day on), and the bracket's clock
+ * is the reset rounded up to its minute, so the line never promises a return
+ * before the limit lifts. Plain abbreviations: no plural forms. null for a reset
+ * already past or a zone Intl cannot read, so the caller keeps the line without
+ * a time. Never throws.
  */
 export function liteResetPhrase(lang: Lang, epochSec: number, now: Date = new Date(), timeZone?: string): string | null {
   try {
-    const at = new Date(epochSec * 1000)
-    if (!Number.isFinite(at.getTime()) || at.getTime() <= now.getTime()) return null
-    const ymd = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
-    const dayOf = (d: Date) => {
-      const [y, m, dd] = ymd.format(d).split('-').map(n => parseInt(n, 10))
-      return Date.UTC(y!, m! - 1, dd!)
-    }
-    const day = dayOf(at)
-    const days = Math.round((day - dayOf(now)) / DAY_MS)
-    const clock = new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(at)
+    const at = new Date(Math.ceil(epochSec / 60) * 60 * 1000)
+    if (!Number.isFinite(at.getTime()) || epochSec * 1000 <= now.getTime()) return null
     const ru = lang === 'ru'
-    if (days <= 0) return ru ? `в ${clock}` : `at ${clock}`
-    if (days === 1) return ru ? `завтра в ${clock}` : `tomorrow at ${clock}`
-    if (days < 7) return `${WEEKDAY[lang][new Date(day).getUTCDay()]} ${ru ? 'в' : 'at'} ${clock}`
-    const date = new Intl.DateTimeFormat(ru ? 'ru-RU' : 'en-US', { timeZone, month: 'long', day: 'numeric' }).format(at)
-    return ru ? `${date} в ${clock}` : `on ${date} at ${clock}`
+    const clock = new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(at)
+    const deltaSec = epochSec - now.getTime() / 1000
+    if (deltaSec < 60) return ru ? 'меньше чем через минуту' : 'in under a minute'
+    const mins = Math.ceil(deltaSec / 60)
+    let left: string
+    let bracket: string
+    if (mins < 24 * 60) {
+      const h = Math.floor(mins / 60)
+      const m = mins % 60
+      const parts = [h ? (ru ? `${h} ч` : `${h} h`) : '', m ? (ru ? `${m} мин` : `${m} min`) : ''].filter(Boolean)
+      left = parts.join(' ')
+      bracket = ru ? `в ${clock}` : `at ${clock}`
+    } else {
+      const hours = Math.ceil(mins / 60)
+      const d = Math.floor(hours / 24)
+      const h = hours % 24
+      left = [ru ? `${d} дн` : `${d} d`, h ? (ru ? `${h} ч` : `${h} h`) : ''].filter(Boolean).join(' ')
+      const wd = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(at)
+      const day = WEEKDAY_SHORT[lang][EN_DAY_INDEX[wd] ?? -1]
+      if (!day) return null
+      bracket = ru ? `в ${day} ${clock}` : `${day} ${clock}`
+    }
+    return `${ru ? 'через' : 'in'} ${left} (${bracket})`
   } catch {
     return null
   }
