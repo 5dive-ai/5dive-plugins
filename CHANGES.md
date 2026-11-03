@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.133 (dashboard 0.5.29, shared lib only): a partner client's usage-limit line says how long until work goes on (DIVE-7657)
+
+Follow-up to DIVE-7641, which named a clock time: «продолжу в 03:10». lodar, 2026-11-03: «продолжу через... будет лучше», then «в скобочках время».
+
+- **Time left first, the clock time in brackets** (the box's zone): «Лимит исчерпан, продолжу через 2 ч 50 мин (в 03:10). Подробности в кабинете.» / "Limit reached, I'll continue in 2 h 50 min (at 03:10). Details in your account." Same for «обновится через …» / "resets in …".
+- **Short forms, no plurals:** «через 40 мин», «через 3 ч» (no «0 мин»), «через 2 дн 5 ч (в ср 19:00)» from a day on with the weekday in the bracket, and «меньше чем через минуту» / "in under a minute" with no bracket.
+- **Rounded up** (to the minute; to the hour from a day on), so the line never promises a return before the limit lifts. The weekly-cap line is unchanged.
+
+Harness: `test/dive7657-lite-limit-time-left.test.ts` (20 tests; 18 red on the pre-fix tree, the 2 unchanged-line arms pass on both); `test/dive7641-lite-limit-time.test.ts` moved to the new words.
+
 ### Fixed — telegram 0.5.132 (dashboard 0.5.28, shared lib only): a partner client's usage-limit line says when work goes on (DIVE-7641)
 
 On a partner box whose agent runs on the client's own subscription, a usage limit told the client only «Лимит исчерпан. Подробности в кабинете.», although the hook already knew the reset time. lodar, 2026-11-03: «сотрудник не пишет что лимит пришел - продолжу через 3 часа».
