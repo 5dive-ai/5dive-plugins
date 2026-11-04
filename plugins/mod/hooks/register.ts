@@ -80,13 +80,13 @@ import type { EngineInterface, Register } from 'claude-code'
 // The above-prompt seat panel (DIVE-4694). Its own file, its own flag, its own state;
 // registered from here because `hooks.json` admits exactly one module per plugin.
 import { registerPanel } from './panel'
-import { compile, envSet, evaluate, type Compiled, type Verdict } from './guard'
+import { compile, envSet, evaluate, filesWanted, type Compiled, type Verdict } from './guard'
 
 /** The schema version of a sink line. Bump only on a breaking change. */
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.6.1'
+const VERSION = '0.6.2'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
@@ -1158,7 +1158,8 @@ let lastPinned = 0
 // reason the "observe only" promise in the header is now scoped to the telemetry
 // hooks rather than to the file. Read `hooks/guard.ts` for what a policy is; this
 // section is only the wiring: the gate, the one `$.fs.read` that loads the document,
-// and the single call site inside the existing `tool.call` hook.
+// the reads of the files a policy's `file_args` name (DIVE-7673), and the single call
+// site inside the existing `tool.call` hook.
 //
 // WHY IT LIVES INSIDE THAT HOOK AND NOT IN A SECOND ONE. The engine refuses a second
 // UNMATCHED registration of an event a plugin already hooks, naming both sites
@@ -1181,6 +1182,9 @@ let lastPinned = 0
 
 /** Whether this session enforces policies, and which ones. */
 type Guard = { on: true; compiled: Compiled; env: Record<string, unknown> } | { on: false }
+
+/** DIVE-7673: how much of a named file the guard reads (an ask is 25 words; a body a page). */
+const GUARD_FILE_CAP = 64 * 1024
 
 /** Resolved once per session. */
 let guard: Promise<Guard> | null = null
@@ -1252,7 +1256,15 @@ async function verdictFor($: EngineInterface, tool: string, input: unknown): Pro
   try {
     const g = await (guard ??= resolveGuard($))
     if (!g.on) return null
-    return evaluate(g.compiled, { tool, input }, g.env)
+    // DIVE-7673: a policy's `file_args` (an `--ask-file=<path>`) is judged on that file's
+    // text too. A file that will not read is judged as absent: the call's own text still is.
+    const files: Record<string, string> = {}
+    for (const f of filesWanted(g.compiled, { tool, input }, g.env)) {
+      try {
+        files[f] = String(await $.fs.read(f)).slice(0, GUARD_FILE_CAP)
+      } catch {}
+    }
+    return evaluate(g.compiled, { tool, input, files }, g.env)
   } catch (err) {
     if (!guardFailureLogged) {
       guardFailureLogged = true

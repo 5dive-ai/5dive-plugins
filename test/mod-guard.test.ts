@@ -17,7 +17,7 @@
 import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { compile, envSet, evaluate, POLICY_SCHEMA } from '../plugins/mod/hooks/guard'
+import { compile, envSet, evaluate, filesWanted, POLICY_SCHEMA } from '../plugins/mod/hooks/guard'
 
 const ROOT = join(import.meta.dir, '..', 'plugins', 'mod')
 const DOC = JSON.parse(readFileSync(join(ROOT, 'policy', 'guard.json'), 'utf8'))
@@ -356,6 +356,94 @@ describe('policy: openrouter-key-mint — a new OpenRouter key for a test run', 
     const r = evaluate(SHIPPED, bash(MINT), NO_ENV)?.reason ?? ''
     expect(r).toContain('Claude plan')
     expect(r).toContain('emergency-api')
+  })
+})
+
+// DIVE-7673 (lodar 11-04, on DIVE-7667's gate «… needs up to $15 more on OpenRouter; $1.65 is left. Raise the
+// limit by $15?»: "you burned my OR again?? … now im furious"). The key-mint rule kept the seat from raising
+// the key itself, so it asked HIM to. Asking is the same spend; the mutant is a gate that only NAMES OpenRouter.
+describe('policy: openrouter-spend-ask — a gate or row asking lodar to fund OpenRouter', () => {
+  const ASKED = `5dive task need DIVE-7667 --type=approval --ask="The Grok arm needs up to $15 more on OpenRouter; $1.65 is left. Raise the limit by $15?" --recommend=approve`
+  const ASK_FILE = '/tmp/scratch/7667-ask.txt'
+  const withFiles = (command: string, files: Record<string, string>) => ({ ...bash(command), files })
+
+  test("DIVE-7667's own gate, word for word, is refused", () => {
+    expect(verdict(bash(ASKED))).toBe('openrouter-spend-ask')
+    expect(verdict(bash('5dive task need X --type=approval --ask="Raise the OpenRouter limit by $15?"'))).toBe('openrouter-spend-ask')
+  })
+
+  test('the other ways of asking for the money are refused too', () => {
+    for (const ask of [
+      'Top up OpenRouter with $10 for the bench?',
+      'Increase the openrouter key cap so the matrix can finish?',
+      'The bench needs more OpenRouter credits. OK?',
+      'OPENROUTER budget: bump it for tonight?',
+    ]) expect([ask, verdict(bash(`sudo 5dive task need DIVE-1 --type=decision --ask="${ask}"`))]).toEqual([ask, 'openrouter-spend-ask'])
+    expect(verdict(bash(`5dive task add "Raise the OpenRouter limit by $20 for the bench" --priority=high`))).toBe('openrouter-spend-ask')
+  })
+
+  test('an --ask-file is judged on the file it names, every spelling of the flag', () => {
+    const files = { [ASK_FILE]: 'The bench needs $15 more on OpenRouter. Raise the limit?' }
+    expect(evaluate(SHIPPED, withFiles(`5dive task need X --type=approval --ask-file=${ASK_FILE}`, files), NO_ENV)?.policy).toBe('openrouter-spend-ask')
+    expect(evaluate(SHIPPED, withFiles(`5dive task need X --type=approval --ask-file "${ASK_FILE}"`, files), NO_ENV)?.policy).toBe('openrouter-spend-ask')
+    expect(evaluate(SHIPPED, withFiles(`5dive task add "Grok bench" --priority=high --body-file='${ASK_FILE}'`, files), NO_ENV)?.policy).toBe('openrouter-spend-ask')
+    // The hook reads exactly the named file, for this policy only.
+    expect(filesWanted(SHIPPED, bash(`5dive task need X --ask-file=${ASK_FILE} --recommend-file=- && echo done`), NO_ENV)).toEqual([ASK_FILE])
+    expect(filesWanted(SHIPPED, bash('cat /etc/hosts'), NO_ENV)).toEqual([])
+    expect(filesWanted(SHIPPED, bash(`5dive task need X --ask-file=${ASK_FILE}`), { FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT: '1' })).toEqual([])
+  })
+
+  test('MUTANT: the same --ask-file with a harmless ask, or a file that did not read, runs', () => {
+    const cmd = `5dive task need X --type=approval --ask-file=${ASK_FILE}`
+    expect(evaluate(SHIPPED, withFiles(cmd, { [ASK_FILE]: "Customer's OpenRouter key shows an error. Reply?" }), NO_ENV)).toBeNull()
+    expect(evaluate(SHIPPED, withFiles(cmd, {}), NO_ENV)).toBeNull()
+  })
+
+  test('MUTANT: a gate or row that only NAMES OpenRouter stays open', () => {
+    for (const ask of [
+      "Customer's OpenRouter key shows an error, reply?",
+      "Customer's OpenRouter credit ran out. What do we tell them?",
+      "Customer can't top up OpenRouter from the AI tab. Reply?",
+      'Offer OpenRouter as a model option on the box?',
+    ]) expect([ask, verdict(bash(`5dive task need DIVE-1 --type=decision --ask="${ask}"`))]).toEqual([ask, null])
+    expect(verdict(bash(`5dive task add "Show the OpenRouter credit balance on the AI tab" --priority=high`))).toBeNull()
+  })
+
+  test('MUTANT: the money words without OpenRouter, or OpenRouter money outside a gate or row, are not this policy', () => {
+    expect(verdict(bash('5dive task need X --type=approval --ask="Raise the Hetzner limit by $15?"'))).toBeNull()
+    expect(verdict(bash('echo "Raise the OpenRouter limit by $15?" > notes.md'))).toBeNull()
+    expect(verdict(bash('curl -s https://openrouter.ai/api/v1/credits -H "Authorization: Bearer $OPENROUTER_MASTER_KEY_5DIVE"'))).toBeNull()
+  })
+
+  test("the seat can open it deliberately, with the key-mint rule's own setting", () => {
+    expect(verdict(bash(ASKED), { FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT: '1' })).toBeNull()
+    expect(verdict(bash(ASKED), { FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT: '0' })).toBe('openrouter-spend-ask')
+  })
+
+  test('the reason says asking is the same spend, and what to use instead', () => {
+    const r = evaluate(SHIPPED, bash(ASKED), NO_ENV)?.reason ?? ''
+    expect(r).toContain('same spend')
+    expect(r).toContain('Claude plan')
+    expect(r).toContain('emergency-api')
+    expect(r).toContain("product's own login")
+  })
+})
+
+describe('engine: require_flags and file_args (DIVE-7673)', () => {
+  const doc = (check: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    compile({ v: POLICY_SCHEMA, policies: [{ id: 'p', rule: 'r', tools: ['Bash'], text_keys: ['command'], deny: 'd {found}', ...extra, checks: [{ id: 'c', say: 's', ...check }] }] })
+
+  test('require_flags applies to require_all only; without it they stay case-sensitive', () => {
+    expect(evaluate(doc({ find: 'go', require_all: ['boom'], require_flags: 'i' }), bash('go BOOM'), NO_ENV)?.policy).toBe('p')
+    expect(evaluate(doc({ find: 'go', require_all: ['boom'] }), bash('go BOOM'), NO_ENV)).toBeNull()
+    expect(evaluate(doc({ find: 'go', require_all: ['boom'], require_flags: 'i' }), bash('GO boom'), NO_ENV)).toBeNull()
+  })
+
+  test('a policy without file_args never asks for a file, and a bad file_args regex drops its policy', () => {
+    expect(filesWanted(doc({ find: 'x' }), bash('x --ask-file=/a'), NO_ENV)).toEqual([])
+    const bad = doc({ find: 'x' }, { file_args: ['(['] })
+    expect(bad.policies).toEqual([])
+    expect(bad.drops[0]!.policy).toBe('p')
   })
 })
 

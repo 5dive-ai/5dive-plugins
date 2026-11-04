@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — mod 0.6.2: the guard refuses a gate or row that asks lodar to fund OpenRouter (DIVE-7673)
+
+On 11-04 a bench seat could not raise its OpenRouter key (the key-mint rule refused it), so it asked lodar to: a gate «… needs up to $15 more on OpenRouter; $1.65 is left. Raise the limit by $15?» reached his phone. lodar: *"you burned my OR again?? … now im furious"*.
+
+- **New policy `openrouter-spend-ask`.** A `5dive task need` or `task add` whose text names OpenRouter AND asks for money (raise or bump a limit, cap, budget or balance; top up or fund with a dollar amount; "$N more"; "more credits") is refused before it runs. The reason says asking is the same spend, and names the Claude plan profile, the Anthropic test key or the product's own login instead.
+- **A gate or row that only names OpenRouter runs**: a customer's error or empty credit, the OpenRouter option, a row about the credit balance on the AI tab.
+- **Words moved into a file are judged too**: the engine gains `file_args` (the hook reads `--ask-file`, `--body-file`, `--recommend-file`, `--quote-file`, `--options-file`, 64 KB cap) and `require_flags` (a case-blind name). The escape is the key-mint rule's own setting, `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT`.
+
+Harness: `test/mod-guard.test.ts` (+10 tests; with the policy removed, its 5 refusal arms go red and the 3 open arms stay green).
+
 ### Fixed — telegram 0.5.133 (dashboard 0.5.29, shared lib only): a partner client's usage-limit line says how long until work goes on (DIVE-7657)
 
 Follow-up to DIVE-7641, which named a clock time: «продолжу в 03:10». lodar, 2026-11-03: «продолжу через... будет лучше», then «в скобочках время».

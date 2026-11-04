@@ -52,6 +52,8 @@ jq -r '.policies[] | "\(.id)\t\(.rule)"' plugins/mod/policy/guard.json
 | `checks[].find` / `flags` / `group` | the trigger, and which capture group holds the value being judged. |
 | `checks[].allow_any` | values that are permitted. With `group`, this is what makes `1234567890` and `@example.com` pass and everything else fail. |
 | `checks[].require_all` | context the subject must also contain. This is what keeps *quoting* `smoke-verified` in a sentence from reading as *applying* the label. |
+| `checks[].require_flags` | optional regex flags for `require_all` (`i` for a case-blind name). Default none. |
+| `file_args` | optional. Regexes whose group 1 is a file the call reads its text from (`--ask-file=<path>`). The hook reads it (64 KB cap) and the policy judges that text with the call's own; a file that does not read is judged absent. |
 | `deny` | the reason handed to the model. `{found}`, `{path}` and `{rule}` are substituted. |
 
 The first policy in **file order** that matches answers, and evaluation stops: the model gets one
@@ -67,6 +69,8 @@ reason, not a report.
 | `runtime-store` | a direct write into `/var/lib/5dive`, `/var/log/5dive`, `/etc/5dive` or `tasks.db` | `FIVEDIVE_MOD_GUARD_ALLOW_RUNTIME_WRITE` |
 | `destructive-outside-workdir` | `rm -r` of a host path or a seat's dotfiles; `git clean -f` | `FIVEDIVE_MOD_GUARD_ALLOW_DESTRUCTIVE` |
 | `external-reply` | `gh pr/issue comment|review|create --repo <owner we do not own>` | `FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED` |
+| `openrouter-key-mint` | creating or raising an OpenRouter key over the keys API (POST/PATCH) | `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT` |
+| `openrouter-spend-ask` | a `5dive task need`/`task add` whose text (or `--ask-file`/`--body-file`) asks to fund or raise OpenRouter; one that only names OpenRouter runs | `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT` |
 
 ## Turning it on
 
