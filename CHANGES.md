@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.30: an agent's reply that gets "too many requests" is sent again, not lost (DIVE-7713, 5dive-ai/5dive#1550)
+
+A self-hosted box with nine agents lost eight web-chat replies in one morning: `dashboard reply failed: control plane returned 429 {"error":"Too many requests"}`. All nine agents' polls and replies shared one per-IP limit at the control plane (fixed there too, per box), and the reply tool gave up on the first refusal.
+
+- **A reply answered 429 or 503 is retried** with backoff (1s, 2s, 4s … 30s), honouring `Retry-After`, for up to 2 minutes, before the tool reports failure. The same body goes every time: an encrypted reply is sealed once, before.
+- **Other 5xx and a dropped connection are retried only when the reply carries a `reply_key`** (every direct post does, one key for all its tries). The control plane answers a repeat of a stored key with the stored row, so a retry after a proxy gave up on a reply the server had kept does not show it twice. Through the relay (positional ops, no key) only 429/503 are retried.
+- `DASHBOARD_REPLY_RETRY_MS` sets the budget; `0` is one try.
+
+Harness: `test/dive7713-reply-retry.test.ts` (10 tests; a mock control plane 429s twice with `Retry-After: 1`, then 200 → the tool succeeds and the same keyed reply went 3 times; on the pre-fix server both server arms are red, the 400 arm passes on both). `test/dive7520-dashboard-e2e-harden.test.ts` S1 pins one try, so its failed post still reaches the redelivery path it tests.
+
 ### Fixed — mod 0.6.2: the guard refuses a gate or row that asks lodar to fund OpenRouter (DIVE-7673)
 
 On 11-04 a bench seat could not raise its OpenRouter key (the key-mint rule refused it), so it asked lodar to: a gate «… needs up to $15 more on OpenRouter; $1.65 is left. Raise the limit by $15?» reached his phone. lodar: *"you burned my OR again?? … now im furious"*.

@@ -32,6 +32,7 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { homedir, userInfo } from 'os'
 import { join } from 'path'
+import { randomUUID } from 'crypto'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { API_BASE_FILE_DEFAULT, readApiBaseFile, resolveApiBase } from './apibase.ts'
@@ -52,6 +53,7 @@ import { deliveredLive, liveKey, loadLiveDeliveries, recordLiveDelivery, saveLiv
 import { makeWorkStatus } from './workstatus.ts'
 import { askRelayOp, numberedText, parseQuestion } from './question.ts'
 import { replyTooLong } from './replycap.ts'
+import { REPLY_RETRY_BUDGET_MS, sendReplyWithRetry } from './replyretry.ts'
 import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOfficeChatBase, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
 import { E2E_ARGV_DEFAULT, E2E_DIR_DEFAULT, E2E_REFUSED_TEXT, E2E_UNKNOWN_TEXT, dropPlainCopies, makeChatE2E, makeE2EGate, parseEnvelope, rootBoxCall } from './chate2e.ts'
@@ -1350,8 +1352,17 @@ async function speakReply(text: string, chatId: string): Promise<string> {
  * metadata says so, and the relay gets its own op, so a relay without it
  * refuses rather than posting the envelope as a plain message.
  */
+// DIVE-7713: how long a 429/5xx'd reply keeps trying; 0 = one try (tests of the paths behind a failed post).
+const REPLY_RETRY_MS = (() => {
+  const n = Number(process.env.DASHBOARD_REPLY_RETRY_MS)
+  return process.env.DASHBOARD_REPLY_RETRY_MS !== undefined && Number.isFinite(n) && n >= 0 ? n : REPLY_RETRY_BUDGET_MS
+})()
+
 async function postReply(chatId: string, body: string, files: string[], q: ChatQuestion | null, e2e: boolean): Promise<Response> {
-  const res = await authedFetch(`${API_BASE}/server/messages/event`, 'outbound reply', {
+  // DIVE-7713: one key for every try of this reply, so a retry after a 5xx the
+  // server had in fact stored answers that row instead of posting it twice.
+  const replyKey = RELAY ? '' : `r-${randomUUID().replace(/-/g, '')}`
+  const init: RequestInit = {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -1359,9 +1370,22 @@ async function postReply(chatId: string, body: string, files: string[], q: ChatQ
     body: JSON.stringify({
       agent: AGENT,
       body,
-      metadata: { chat_id: chatId, ...(files.length ? { files } : {}), ...(q ? { question: q } : {}), ...(e2e ? { e2e: { v: 1 } } : {}) },
+      metadata: {
+        chat_id: chatId,
+        ...(files.length ? { files } : {}),
+        ...(q ? { question: q } : {}),
+        ...(e2e ? { e2e: { v: 1 } } : {}),
+        ...(replyKey ? { reply_key: replyKey } : {}),
+      },
     }),
-  }, e2e ? ['event-e2e', chatId, body, ...files] : q ? askRelayOp(chatId, body, q) : ['event', chatId, body, ...files])
+  }
+  const relayOp = e2e ? ['event-e2e', chatId, body, ...files] : q ? askRelayOp(chatId, body, q) : ['event', chatId, body, ...files]
+  const res = await sendReplyWithRetry(() => authedFetch(`${API_BASE}/server/messages/event`, 'outbound reply', init, relayOp), {
+    keyed: !!replyKey,
+    budgetMs: REPLY_RETRY_MS,
+    onRetry: (why, waitMs, attempt) =>
+      recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `outbound reply got ${why}; retry ${attempt} in ${Math.round(waitMs / 1000)}s`),
+  })
   if (!res.ok) {
     const detail = await res.text().catch(() => '')
     throw new Error(`dashboard reply failed: control plane returned ${res.status} ${detail.slice(0, 200)}`)
