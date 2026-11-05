@@ -153,7 +153,21 @@ export function readEntriesFrom(transcriptPath: string, offset: number): Transcr
 // retries / falls back) instead of silently reusing a stale earlier line.
 const RATE_LIMIT_LOOKBACK = 40
 
-export function findRateLimitText(entries: TranscriptEntry[]): string | null {
+// DIVE-7748: Claude Code's own wall line, as the block it writes starts:
+// "You've hit your weekly limit · resets Nov 9, 5am (TZ)", "You've reached your
+// Opus limit …", "5-hour limit reached ∙ resets 3pm", "Claude usage limit
+// reached. Your limit will reset at 3pm". Anchored at the block's start, so a
+// seat quoting a wall line mid-prose (a bug report it is reading) is not one.
+export const WALL_LINE_RE =
+  /^\s*(?:(?:you(?:'|\u2019)ve|you have)\s+(?:hit|reached)\s+your\b[^\n]{0,40}?\blimit\b|[^\n]{0,40}?\blimit\s+reached\b)/i
+const RESET_CLUE = /resets?\b|reset (?:at|in)\b|try again (?:at|in)\b|\bin\s+\d+\s*(?:h|m|hour|min|sec)|\d{1,2}(?::\d{2})?\s*(?:am|pm)/i
+
+// The wall the turn ended on: the newest synthetic rate-limit message, else the
+// newest block that IS a wall line (WALL_LINE_RE) with a reset clue. Never a
+// clock time from other text: in a session that hit its 5-hour wall many times,
+// that is an old `resets 10:40pm`, and on a weekly wall it passed a reset ~4
+// days early as `--wall` (DIVE-7748). Null when the wall is not written yet.
+export function findWallText(entries: TranscriptEntry[]): string | null {
   const from = Math.max(0, entries.length - RATE_LIMIT_LOOKBACK)
   // Primary: the synthetic message claude tags error="rate_limit". Most
   // reliable when present. Bounded to the recent window (see above).
@@ -168,17 +182,37 @@ export function findRateLimitText(entries: TranscriptEntry[]): string | null {
       }
     }
   }
-  // Fallback: the tag isn't guaranteed (weekly/5h-limit phrasings, upstream
-  // changes). Scan the same recent window's text blocks for a line that
-  // carries an actual reset clue — a clock time or a "reset/try again in …"
-  // phrase — and return it for parseResetEpoch to interpret. Kept specific to
-  // avoid returning unrelated prose.
-  const RESET_TIME = /resets?\b|reset (?:at|in)\b|try again (?:at|in)\b|\bin\s+\d+\s*(?:h|m|hour|min|sec)|\d{1,2}(?::\d{2})?\s*(?:am|pm)/i
+  // The tag isn't guaranteed (weekly/5h-limit phrasings, upstream changes):
+  // the newest untagged block that is itself a wall line.
   for (let i = entries.length - 1; i >= from; i--) {
     const content = entries[i].message?.content
     if (!Array.isArray(content)) continue
     for (const block of content) {
-      if (block.type === 'text' && typeof block.text === 'string' && RESET_TIME.test(block.text)) {
+      if (block.type === 'text' && typeof block.text === 'string' && isWallLine(block.text)) {
+        return block.text
+      }
+    }
+  }
+  return null
+}
+
+/** A wall line with a reset clue in it (see WALL_LINE_RE). */
+export function isWallLine(text: string): boolean {
+  return WALL_LINE_RE.test(text) && RESET_CLUE.test(text)
+}
+
+export function findRateLimitText(entries: TranscriptEntry[]): string | null {
+  const wall = findWallText(entries)
+  if (wall !== null) return wall
+  // Last resort, when no wall line is in the window: the newest text block
+  // that carries any reset clue — a clock time or a "reset/try again in …"
+  // phrase — for parseResetEpoch to interpret.
+  const from = Math.max(0, entries.length - RATE_LIMIT_LOOKBACK)
+  for (let i = entries.length - 1; i >= from; i--) {
+    const content = entries[i].message?.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (block.type === 'text' && typeof block.text === 'string' && RESET_CLUE.test(block.text)) {
         return block.text
       }
     }

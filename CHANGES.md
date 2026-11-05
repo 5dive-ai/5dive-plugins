@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.134 (dashboard 0.5.31, shared lib only): a weekly wall parks the account until its printed date, not the next clock time (DIVE-7748)
+
+teal-fox 2026-11-04: a seat's turn ended on `You've hit your weekly limit · resets Nov 9, 5am (Europe/Nicosia)`, and the StopFailure hook moved it with `--wall=1793842800` (Nov 5, 01:40Z). The walled account left cooldown ~97 h early, so rotation could put a seat straight back on it.
+
+- **A dated reset is read as that date.** `resets Nov 9, 5am (TZ)` (also `4:30pm`, `November`, `at 17:00`) is the instant in that zone, with the year nearest to now (`resets Jan 2` read on Dec 30 is next year). It is tried before any clock, so `continuing automatically at 5am` beside it no longer wins. A date already past or more than 8 days out is unknown, never the next 5am (same bound as the CLI's DIVE-5837 parse).
+- **`--wall` is the reset of the wall the turn ended on.** The retries now wait for Claude Code's wall line (the tagged rate-limit message, or a block that starts `You've hit your … limit` / `… limit reached`). Before, the first clock time in the window ended the wait, and in a session full of 5-hour `resets 10:40pm` lines that was the wrong one. A wall line in the payload message comes next. Any loose clock is only the last resort, and the pane is now read for the dated form too.
+- **A late clock time east of UTC lands today.** The zone offset is read from the full date, not the clock alone: `resets 11pm (Europe/Nicosia)` read one day late before.
+
+Harness: `test/dive7748-weekly-wall-dated-reset.test.ts` (14 tests, clock pinned to 2026-11-04T20:50Z). On the pre-fix lib 11 are red and the 3 that pin old behaviour pass. With only the parse fixed, the 3 transcript-selection arms are still red. Related suites (25 files, 434 tests) pass.
+
 ### Fixed — dashboard 0.5.30: an agent's reply that gets "too many requests" is sent again, not lost (DIVE-7713, 5dive-ai/5dive#1550)
 
 A self-hosted box with nine agents lost eight web-chat replies in one morning: `dashboard reply failed: control plane returned 429 {"error":"Too many requests"}`. All nine agents' polls and replies shared one per-IP limit at the control plane (fixed there too, per box), and the reply tool gave up on the first refusal.
