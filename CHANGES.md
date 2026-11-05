@@ -1,6 +1,6 @@
 ## Unreleased
 
-### Fixed — dashboard 0.5.31: an OpenClaw agent on a slow office AI is not cut off after 10 minutes (DIVE-7730)
+### Fixed — dashboard 0.5.32: an OpenClaw agent on a slow office AI is not cut off after 10 minutes (DIVE-7730)
 
 The office chat ran every OpenClaw turn with `openclaw agent --timeout 600`. On a CPU-only office AI the first answer needs ~30 min (OpenClaw's opening prompt is ~12,800 tokens), so every turn ended "OpenClaw could not answer just now". The limit now comes from `DASHBOARD_OPENCLAW_TURN_TIMEOUT_S` (60 to 7200 seconds, else 600). The 5dive CLI exports 1800 for an OpenClaw seat on your own AI.
 
