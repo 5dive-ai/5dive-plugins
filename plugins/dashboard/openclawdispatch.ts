@@ -97,6 +97,12 @@ export type RunTurn = (prompt: string) => Promise<{ stdout: string; stderr: stri
  * can read argv in `ps`); the gateway-backed `agent` opens --message-file as a
  * path, so `-` for stdin is not an option there.
  */
+/** The turn limit in seconds: a whole number from 60 to 7200, else 600. */
+export function openclawTurnTimeoutS(raw: string | undefined): number {
+  const n = Number(raw)
+  return Number.isInteger(n) && n >= 60 && n <= 7200 ? n : 600
+}
+
 export function openclawTurn(bin: string, turnDir: string, timeoutS = 600): RunTurn {
   let n = 0
   return prompt => new Promise(resolve => {

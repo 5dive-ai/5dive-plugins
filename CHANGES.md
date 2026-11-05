@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.31: an OpenClaw agent on a slow office AI is not cut off after 10 minutes (DIVE-7730)
+
+The office chat ran every OpenClaw turn with `openclaw agent --timeout 600`. On a CPU-only office AI the first answer needs ~30 min (OpenClaw's opening prompt is ~12,800 tokens), so every turn ended "OpenClaw could not answer just now". The limit now comes from `DASHBOARD_OPENCLAW_TURN_TIMEOUT_S` (60 to 7200 seconds, else 600). The 5dive CLI exports 1800 for an OpenClaw seat on your own AI.
+
+Harness: `test/dive7730-openclaw-turn-timeout.test.ts` (2 tests: the value check, and a fake `openclaw` binary receives `--timeout 1800`).
+
 ### Fixed — telegram-codex 0.5.47: a Codex agent can read a text, PDF or other non-picture file sent in chat (DIVE-7730)
 
 The chat's one attachment field (`image_path`) carries the first upload whatever it is: the web chat, the office chat and Telegram all fill it. The Codex dispatcher handed it to the model as an image every time, so a `.txt` reached the model as "image content omitted because it could not be processed" and the agent answered that it could not read the file (measured on a firewalled box: a Codex agent on qwen3:8b in the office chat, DIVE-7730).
