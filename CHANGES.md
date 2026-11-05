@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.47: a Codex agent can read a text, PDF or other non-picture file sent in chat (DIVE-7730)
+
+The chat's one attachment field (`image_path`) carries the first upload whatever it is: the web chat, the office chat and Telegram all fill it. The Codex dispatcher handed it to the model as an image every time, so a `.txt` reached the model as "image content omitted because it could not be processed" and the agent answered that it could not read the file (measured on a firewalled box: a Codex agent on qwen3:8b in the office chat, DIVE-7730).
+
+- **A picture (png, jpg, gif, webp, bmp) still goes as an image.** Any other file goes as one text line naming its path, which the agent opens with its own tools. On the same box the agent then ran `cat` on the file.
+
+Harness: `test/codex-dispatcher.test.ts` (22 tests; the new one checks the helper and a real turn start with a `.pdf` attachment: no image input, the path in the last text input; the file is red on the pre-fix dispatcher).
+
 ### Fixed — dashboard 0.5.30: an agent's reply that gets "too many requests" is sent again, not lost (DIVE-7713, 5dive-ai/5dive#1550)
 
 A self-hosted box with nine agents lost eight web-chat replies in one morning: `dashboard reply failed: control plane returned 429 {"error":"Too many requests"}`. All nine agents' polls and replies shared one per-IP limit at the control plane (fixed there too, per box), and the reply tool gave up on the first refusal.
