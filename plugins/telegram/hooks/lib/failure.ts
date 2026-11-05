@@ -4,7 +4,7 @@
 // of this file (plugins/dashboard/hooks/SHARED.txt), so the two channels cannot
 // disagree about whether an agent hit its limit or a server blip.
 
-import { readEntries, findRateLimitText, turnWindow, type WindowCheck } from './transcript'
+import { readEntries, findRateLimitText, findWallText, isWallLine, turnWindow, type WindowCheck } from './transcript'
 import { parseResetEpoch } from './time'
 import { isTermsWall } from './terms'
 import type { HookPayload, TranscriptEntry } from './types'
@@ -91,7 +91,9 @@ export function failureMessage(payload: HookPayload): string {
     .join(' | ') || 'no details'
 }
 
-// Resolve an unlock/reset epoch. Order: payload → transcript → message text → pane.
+// Resolve an unlock/reset epoch. Order: payload → the transcript's wall line →
+// a wall line in the message text → any reset clue in the transcript → message
+// text → pane.
 //
 // Not the pane first: when claude shows the "Stop and wait" menu, the pane
 // switches to the alternate screen and the preceding "resets Xpm (TZ)" line
@@ -99,11 +101,16 @@ export function failureMessage(payload: HookPayload): string {
 // structured synthetic message (error="rate_limit", isApiErrorMessage=true).
 //
 // The synthetic rate-limit entry is written ~concurrently with the hook firing,
-// so the first read can miss it (flush race). findRateLimitText is bounded to
+// so the first read can miss it (flush race). findWallText is bounded to
 // recent entries, so a miss returns null rather than reusing a stale earlier
 // episode's reset line — so a usage limit re-reads the transcript a few times
 // over ~2s. Other failures don't retry (no extra latency). Returns the entries
 // as last read, which the caller routes on.
+//
+// DIVE-7748: the retries wait for the WALL line the turn ended on. Before, any
+// clock time in the window ended the wait on the first read, and on a weekly
+// wall that was an older 5-hour `resets 10:40pm`: the walled account left
+// cooldown ~4 days early. A loose clock is read only when no wall line came.
 export async function resolveResetEpoch(
   payload: HookPayload,
   msg: string,
@@ -129,9 +136,9 @@ export async function resolveResetEpoch(
         await new Promise(r => setTimeout(r, 500))
         entries = readEntries(transcriptPath, enough)
       }
-      const transcriptResetText = findRateLimitText(entries)
-      if (transcriptResetText) {
-        const e = parseResetEpoch(transcriptResetText)
+      const wallText = findWallText(entries)
+      if (wallText) {
+        const e = parseResetEpoch(wallText)
         if (e !== null) {
           resetEpoch = e
           break
@@ -139,9 +146,15 @@ export async function resolveResetEpoch(
       }
     }
   }
+  if (resetEpoch === null && isWallLine(msg)) resetEpoch = parseResetEpoch(msg)
+  if (resetEpoch === null && transcriptPath) {
+    const looseText = findRateLimitText(entries)
+    if (looseText) resetEpoch = parseResetEpoch(looseText)
+  }
   if (resetEpoch === null) resetEpoch = parseResetEpoch(msg)
   if (resetEpoch === null && pane) {
-    const line = pane.split('\n').find(l => /resets?\s+\d/i.test(l))
+    // `resets 9pm` or, on a weekly wall, `resets Nov 9, 5am` (DIVE-7748).
+    const line = pane.split('\n').find(l => /resets?\s+(?:\d|[a-z]{3}[a-z]*\.?\s+\d)/i.test(l))
     if (line) resetEpoch = parseResetEpoch(line)
   }
   return { resetEpoch, entries }
