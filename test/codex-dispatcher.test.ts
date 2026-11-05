@@ -3,6 +3,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  attachmentInput,
   ChannelDispatcher,
   parseOutboundMessage,
   type DispatchMessage,
@@ -70,6 +71,20 @@ describe('Codex app-server channel dispatcher', () => {
     expect(parseOutboundMessage('keep [[5dive-attachment:relative.txt]] inline')).toEqual({
       text: 'keep [[5dive-attachment:relative.txt]] inline', files: [],
     })
+  })
+
+  // DIVE-7730: the one attachment field carries any file; only a picture is an image.
+  test('a picture attachment goes as an image, any other file as its path', async () => {
+    expect(attachmentInput('/home/claude/chat-uploads/a/1-shot.PNG')).toEqual({ type: 'localImage', path: '/home/claude/chat-uploads/a/1-shot.PNG' })
+    expect(attachmentInput('/home/claude/chat-uploads/a/1-note.txt')).toMatchObject({ type: 'text', text: expect.stringContaining('/home/claude/chat-uploads/a/1-note.txt') })
+    expect(attachmentInput('relative.txt')).toBeNull()
+    expect(attachmentInput(undefined)).toBeNull()
+    const h = harness()
+    await h.dispatcher.initialize()
+    await h.dispatcher.submit({ ...telegram('tg-f', 'read this'), image_path: '/tmp/up/report.pdf' })
+    const input = h.requests.find(r => r.method === 'turn/start')?.params.input as Array<Record<string, unknown>>
+    expect(input.some(i => i.type === 'localImage')).toBe(false)
+    expect(input.at(-1)).toMatchObject({ type: 'text', text: expect.stringContaining('/tmp/up/report.pdf') })
   })
 
   test('idle inbound starts a turn without model-owned polling', async () => {

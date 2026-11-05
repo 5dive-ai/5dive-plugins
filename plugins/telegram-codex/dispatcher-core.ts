@@ -509,8 +509,23 @@ function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?
   if (transcript) input.push({ type: 'text', text: transcript, text_elements: [] })
   if (handoff) input.push({ type: 'text', text: handoff, text_elements: [] })
   input.push({ type: 'text', text: message.text, text_elements: [] })
-  if (message.image_path?.startsWith('/')) input.push({ type: 'localImage', path: message.image_path })
+  const attached = attachmentInput(message.image_path)
+  if (attached) input.push(attached)
   return input
+}
+
+// DIVE-7730: image_path is the chat's ONE attachment field, whatever the file
+// is: the web chat, the office chat and Telegram all put the first upload
+// there. Only a picture can go to the model as an image. A .txt, .pdf or .csv
+// sent as localImage reached the model as "image content omitted because it
+// could not be processed", so the agent never read it (measured: codex on
+// qwen3:8b in the office chat). Any other file goes as its path, which the
+// agent opens with its own tools.
+const IMAGE_FILE = /\.(png|jpe?g|gif|webp|bmp)$/i
+export function attachmentInput(path: unknown): Record<string, unknown> | null {
+  if (typeof path !== 'string' || !path.startsWith('/')) return null
+  if (IMAGE_FILE.test(path)) return { type: 'localImage', path }
+  return { type: 'text', text: `[attached file: ${path} — open it from that path to read it]`, text_elements: [] }
 }
 
 /** Keep a quoted snippet short enough to stay one line of context. */

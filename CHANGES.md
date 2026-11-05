@@ -1,5 +1,19 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.32: an OpenClaw agent on a slow office AI is not cut off after 10 minutes (DIVE-7730)
+
+The office chat ran every OpenClaw turn with `openclaw agent --timeout 600`. On a CPU-only office AI the first answer needs ~30 min (OpenClaw's opening prompt is ~12,800 tokens), so every turn ended "OpenClaw could not answer just now". The limit now comes from `DASHBOARD_OPENCLAW_TURN_TIMEOUT_S` (60 to 7200 seconds, else 600). The 5dive CLI exports 1800 for an OpenClaw seat on your own AI.
+
+Harness: `test/dive7730-openclaw-turn-timeout.test.ts` (2 tests: the value check, and a fake `openclaw` binary receives `--timeout 1800`).
+
+### Fixed — telegram-codex 0.5.47: a Codex agent can read a text, PDF or other non-picture file sent in chat (DIVE-7730)
+
+The chat's one attachment field (`image_path`) carries the first upload whatever it is: the web chat, the office chat and Telegram all fill it. The Codex dispatcher handed it to the model as an image every time, so a `.txt` reached the model as "image content omitted because it could not be processed" and the agent answered that it could not read the file (measured on a firewalled box: a Codex agent on qwen3:8b in the office chat, DIVE-7730).
+
+- **A picture (png, jpg, gif, webp, bmp) still goes as an image.** Any other file goes as one text line naming its path, which the agent opens with its own tools. On the same box the agent then ran `cat` on the file.
+
+Harness: `test/codex-dispatcher.test.ts` (22 tests; the new one checks the helper and a real turn start with a `.pdf` attachment: no image input, the path in the last text input; the file is red on the pre-fix dispatcher).
+
 ### Fixed — telegram 0.5.134 (dashboard 0.5.31, shared lib only): a weekly wall parks the account until its printed date, not the next clock time (DIVE-7748)
 
 teal-fox 2026-11-04: a seat's turn ended on `You've hit your weekly limit · resets Nov 9, 5am (Europe/Nicosia)`, and the StopFailure hook moved it with `--wall=1793842800` (Nov 5, 01:40Z). The walled account left cooldown ~97 h early, so rotation could put a seat straight back on it.

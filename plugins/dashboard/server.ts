@@ -38,7 +38,7 @@ import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { API_BASE_FILE_DEFAULT, readApiBaseFile, resolveApiBase } from './apibase.ts'
 import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
 import { AGY_DEFAULT_TIMINGS, startAgyDispatcher } from './agydispatch.ts'
-import { openclawTurn, startOpenclawDispatcher } from './openclawdispatch.ts'
+import { openclawTurn, openclawTurnTimeoutS, startOpenclawDispatcher } from './openclawdispatch.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
 import { replyTool, voicePlan, voiceSkippedNote, voiceFailedOnce } from './voicereply.ts'
@@ -1606,7 +1606,10 @@ if (!DISPATCHER_ADAPTER) {
     startOpenclawDispatcher({
       inboxDir: DISPATCHER_INBOX_DIR,
       outboxDir: DISPATCHER_OUTBOX_DIR,
-      run: openclawTurn(process.env.DASHBOARD_OPENCLAW_BIN ?? '/home/claude/.local/bin/openclaw', join(DISPATCHER_STATE_DIR, 'turns')),
+      // DIVE-7730: a seat on an office AI sets a longer turn (the box's start
+      // exports 1800): on a CPU the first answer took ~30 min, past the 600 s default.
+      run: openclawTurn(process.env.DASHBOARD_OPENCLAW_BIN ?? '/home/claude/.local/bin/openclaw', join(DISPATCHER_STATE_DIR, 'turns'),
+        openclawTurnTimeoutS(process.env.DASHBOARD_OPENCLAW_TURN_TIMEOUT_S)),
       // Test seam: shorten the boot-time retry.
       ...(process.env.DASHBOARD_OPENCLAW_RETRY_MS ? { retryMs: Number(process.env.DASHBOARD_OPENCLAW_RETRY_MS) } : {}),
     })
