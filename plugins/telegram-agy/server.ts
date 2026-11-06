@@ -42,6 +42,7 @@ import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { writePending, previewOf, pendingNotice } from './pending-inbound.ts'
 import { PLAN_ON, planUsedUp, planUsedUpText, claimPlanNotice, clearPlanNotice, optInBoxShowing, optOutSelected } from './plan-limit.ts'
+import { replyTooLong } from './replycap.ts'
 import {
   siblingYounger, writeHandoffRequest, readHandoffRequest, clearHandoffRequest,
   writeHandoffQueue, takeHandoffQueue,
@@ -2664,6 +2665,10 @@ async function callTool(req: CallToolRequest) {
       case 'reply': {
         const chat_id = String(args.chat_id)
         const text = String(args.text)
+        // DIVE-7811 (DIVE-6862's rule, every harness): a reply over the word cap
+        // is refused, nothing is sent, and the error tells the model to cut it.
+        const tooLong = replyTooLong(text)
+        if (tooLong) throw new Error(tooLong)
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         // Forum-topic routing — see the reply tool description. Omitted →
         // reply goes to General (or the only thread, in a plain group / DM).
@@ -2746,6 +2751,9 @@ async function callTool(req: CallToolRequest) {
       }
 
       case 'edit_message': {
+        // An agent refused on reply must not move the wall into an edit of its ack.
+        const editTooLong = replyTooLong(String(args.text))
+        if (editTooLong) throw new Error(editTooLong)
         const chat_id = String(args.chat_id)
         const message_id = Number(args.message_id)
         assertAllowedChat(chat_id)

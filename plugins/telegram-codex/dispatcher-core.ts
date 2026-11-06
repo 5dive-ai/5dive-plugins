@@ -1,4 +1,5 @@
 import { migrateState } from './compat.ts'
+import { cutItPrompt, replyTooLong, REPLY_CUT_TRIES } from './replycap.ts'
 
 export type DispatchSource = 'telegram' | 'dashboard' | 'agent'
 
@@ -29,6 +30,11 @@ export type DispatchMessage = {
   control?: ControlOp
   /** The level a `set-effort` control asks for; refused on any other verb. */
   effort?: string
+  /**
+   * DIVE-7811: this turn is the model rewriting a reply that was over the word
+   * cap; the number is which rewrite it is (1, 2). Set by the dispatcher only.
+   */
+  cut?: number
 }
 
 /**
@@ -573,6 +579,8 @@ export class ChannelDispatcher {
     /** The newest commentary folded into the ack, kept in case no answer follows. */
     note?: { text: string; itemId: string }
   }
+  /** DIVE-7811: the over-cap reply of the active turn, held back while the model rewrites it. */
+  private cut?: { turnId: string; refusal: string; text: string; itemId: string }
 
   constructor(
     private readonly rpc: RpcPort,
@@ -718,6 +726,7 @@ export class ChannelDispatcher {
         // Order is the contract: "/clear" then "do X" means X belongs to the new
         // session, so nothing steers past a control still waiting in the queue.
         if (message.control || this.state.compacting || this.state.active?.message.control
+          || this.state.active?.message.cut
           || this.state.pending.some(m => m.control)
           || this.state.active!.routeKey !== routeKey(message.route)) {
           this.state.pending.push(message)
@@ -1052,7 +1061,7 @@ export class ChannelDispatcher {
           // `notify` still marks which is the answer (unknown phase: unset).
           const phase = params?.item?.phase
           const notify = phase === 'final_answer' ? { notify: true } : phase === 'commentary' ? { notify: false } : {}
-          await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message', ...notify })
+          await this.publishAnswer(this.state.active.route, text, { turnId, itemId, kind: 'message', ...notify })
           return
         }
         // DIVE-5508: commentary is progress, not a message. It edits the
@@ -1070,7 +1079,7 @@ export class ChannelDispatcher {
           // A commentary that carries a file still goes as a (silent) message:
           // the ack cannot hold an attachment.
           if (phase === 'final_answer') p.answered = true
-          await this.sink.publish(this.state.active.route, text, { turnId, itemId, kind: 'message', notify: phase === 'final_answer' })
+          await this.publishAnswer(this.state.active.route, text, { turnId, itemId, kind: 'message', notify: phase === 'final_answer' })
         } else {
           p.held = { text, itemId }
         }
@@ -1087,9 +1096,11 @@ export class ChannelDispatcher {
         // its last commentary becomes it, rather than vanishing with the ack.
         if (progress && !progress.answered && progress.note) {
           const { text, itemId } = progress.note
-          await this.sink.publish(completed.route, text, { turnId, itemId, kind: 'message', notify: params?.turn?.status === 'completed' })
+          await this.publishAnswer(completed.route, text, { turnId, itemId, kind: 'message', notify: params?.turn?.status === 'completed' })
         }
         this.progress = undefined
+        const cut = this.cut?.turnId === turnId ? this.cut : undefined
+        this.cut = undefined
         if (progress) {
           const took = fmtElapsed(Date.now() - progress.startedAt)
           const steps = progress.steps ? ` · ${progress.steps} step${progress.steps === 1 ? '' : 's'}` : ''
@@ -1097,6 +1108,19 @@ export class ChannelDispatcher {
             ? `✅ Done in ${took}${steps}` : `⚠️ Stopped after ${took}${steps}`, { turnId, kind: 'progress-done', steps: progress.steps })
         }
         this.state.active = undefined
+        // DIVE-7811: the reply was over the cap. A finished turn gets the model
+        // to rewrite it, next and ahead of the queue; a failed one sends it as
+        // written, never silence.
+        if (cut && params?.turn?.status === 'completed') {
+          this.state.pending.unshift({
+            id: `cut-${turnId}`,
+            text: cutItPrompt(cut.refusal),
+            route: completed.route,
+            cut: (completed.message.cut ?? 0) + 1,
+          })
+        } else if (cut) {
+          await this.sink.publish(completed.route, cut.text, { turnId, itemId: cut.itemId, kind: 'message', notify: false })
+        }
         const compaction = completed.message.control === 'compact' ? this.state.compacting : undefined
         if (compaction) this.state.compacting = undefined
         if (params?.turn?.status !== 'completed') {
@@ -1114,7 +1138,8 @@ export class ChannelDispatcher {
         for (const key of this.itemText.keys()) {
           if (key.startsWith(`${turnId}:`)) this.itemText.delete(key)
         }
-        await this.rotateIfLarge(completed.route)
+        // A rewrite needs the thread that holds the long reply: rotate after it.
+        if (!cut) await this.rotateIfLarge(completed.route)
         this.persist()
         await this.startNext()
       }
@@ -1152,7 +1177,8 @@ export class ChannelDispatcher {
     // A Telegram turn gets the sticky ack: the first progress event opens it
     // (the adapter waits a few seconds before showing it, so a quick answer
     // arrives alone). Other channels keep their plain replies.
-    if (message.route.source === 'telegram') {
+    // A rewrite turn (DIVE-7811) answers under the ack its first turn already closed.
+    if (message.route.source === 'telegram' && !message.cut) {
       this.progress = { turnId, steps: 0, startedAt: Date.now(), lastAt: Date.now() }
       await this.publishProgress(message.route, 'starting', { turnId, kind: 'progress', steps: 0 })
     } else {
@@ -1177,6 +1203,24 @@ export class ChannelDispatcher {
     this.persist()
   }
 
+  /**
+   * DIVE-7811: a model message the chat will read. Over the word cap, with a
+   * rewrite left, it is held, and the turn's end asks the model to cut it
+   * (cutItPrompt); the rewrite is what the chat gets. Agent-to-agent turns are
+   * not chat and are never capped; system notices never come through here.
+   */
+  private async publishAnswer(route: DispatchRoute, text: string, meta: PublishMeta): Promise<void> {
+    const active = this.state.active
+    const refusal = route.source === 'agent' || !active || (active.message.cut ?? 0) >= REPLY_CUT_TRIES
+      ? null : replyTooLong(text)
+    if (refusal && active) {
+      // The newest long message of the turn is the one rewritten.
+      this.cut = { turnId: active.turnId, refusal, text, itemId: String(meta.itemId ?? '') }
+      return
+    }
+    await this.sink.publish(route, text, meta)
+  }
+
   /** Progress is decoration: a failed write must never fail the turn. */
   private async publishProgress(route: DispatchRoute, text: string, meta: PublishMeta): Promise<void> {
     try { await this.sink.publish(route, text, meta) } catch {}
@@ -1189,7 +1233,7 @@ export class ChannelDispatcher {
     const { text, itemId } = p.held
     p.held = undefined
     p.answered = true
-    await this.sink.publish(route, text, { turnId: p.turnId, itemId, kind: 'message', notify })
+    await this.publishAnswer(route, text, { turnId: p.turnId, itemId, kind: 'message', notify })
   }
 
   private async startNext(): Promise<void> {

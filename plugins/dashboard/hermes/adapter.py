@@ -35,6 +35,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -60,6 +61,76 @@ POLL_SECONDS = 0.5
 MAX_MESSAGE_LENGTH = 16000
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"}
 _AUDIO_EXT = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".webm"}
+
+
+# -- the chat reply cap (DIVE-7811) -------------------------------------------
+#
+# A port of plugins/dashboard/replycap.ts: same count, same refusal, same
+# rewrite prompt (test/dive7811-reply-cap-every-harness.test.ts holds the two
+# in step). A Hermes answer is its plain text, so there is no tool error to
+# show: an over-cap final answer is held, the agent gets the refusal as its
+# next message, and the chat gets the rewrite. After REPLY_CUT_TRIES rewrites
+# the last version goes as written.
+
+REPLY_WORD_CAP = 70
+REPLY_WORD_TARGET = 60
+REPLY_CUT_TRIES = 2
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def reply_word_cap(env: Optional[Dict[str, str]] = None) -> int:
+    raw = ((env if env is not None else os.environ).get("FIVEDIVE_REPLY_MAX_WORDS") or "").strip()
+    if not raw:
+        return REPLY_WORD_CAP
+    try:
+        n = int(raw)
+    except ValueError:
+        return REPLY_WORD_CAP
+    return n if n >= 0 else REPLY_WORD_CAP
+
+
+def _without_fenced_code(text: str) -> str:
+    lines = text.split("\n")
+    keep: List[str] = []
+    i = 0
+    while i < len(lines):
+        m = _FENCE_RE.match(lines[i])
+        if m:
+            fence = m.group(1)
+            close = -1
+            for j in range(i + 1, len(lines)):
+                c = _FENCE_RE.match(lines[j])
+                if c and c.group(1)[0] == fence[0] and len(c.group(1)) >= len(fence) and lines[j].strip() == c.group(1):
+                    close = j
+                    break
+            if close >= 0:
+                i = close + 1
+                continue
+        keep.append(lines[i])
+        i += 1
+    return "\n".join(keep)
+
+
+def count_reply_words(text: str) -> int:
+    if not text:
+        return 0
+    return sum(1 for tok in _without_fenced_code(text).split() if any(ch.isalnum() for ch in tok))
+
+
+def reply_too_long(text: Any, cap: Optional[int] = None) -> Optional[str]:
+    cap = reply_word_cap() if cap is None else cap
+    if cap <= 0 or not isinstance(text, str):
+        return None
+    n = count_reply_words(text)
+    if n <= cap:
+        return None
+    return (f"too long: {n} words; cut to {min(REPLY_WORD_TARGET, cap)} or attach a file "
+            "and name it in one line. Nothing was sent.")
+
+
+def cut_it_prompt(refusal: str) -> str:
+    return (f"[5dive chat: your last reply was not sent. {refusal} Write your answer again, "
+            "shorter. Only the new version reaches the chat.]")
 
 
 # -- spool I/O (no gateway state, so tests drive it directly) -----------------
@@ -167,6 +238,13 @@ class FiveDiveAdapter(BasePlatformAdapter):
         # A voice note is answered by voice: the first reply after one is
         # marked so the bridge speaks it, the way the web chat does for Claude.
         self._voice_pending: Dict[str, bool] = {}
+        # DIVE-7811: per chat, the owner's last message (a rewrite ask rides
+        # its source), how many rewrites this answer has had, the long version
+        # kept in case the rewrite never comes, and the tasks asking for one.
+        self._last_event: Dict[str, MessageEvent] = {}
+        self._cut_tries: Dict[str, int] = {}
+        self._cut_fallback: Dict[str, str] = {}
+        self._cut_tasks: set = set()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self._spool:
@@ -221,7 +299,7 @@ class FiveDiveAdapter(BasePlatformAdapter):
             media_urls, media_types = [upload], [mime]
         if route.get("voice"):
             self._voice_pending[chat_id] = True
-        return MessageEvent(
+        event = MessageEvent(
             text=str(msg.get("text") or ""),
             message_type=kind,
             source=source,
@@ -231,9 +309,62 @@ class FiveDiveAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
         )
+        self._last_event[chat_id] = event
+        return event
 
     async def _on_message(self, msg: Dict[str, Any]) -> None:
-        await self.handle_message(self.event_for(msg))
+        event = self.event_for(msg)
+        # A new message from the owner: its answer starts with every rewrite left.
+        self._cut_tries.pop(event.source.chat_id, None)
+        self._cut_fallback.pop(event.source.chat_id, None)
+        await self.handle_message(event)
+
+    def _hold_for_cut(self, chat_id: str, text: str, metadata: Optional[Dict[str, Any]]) -> bool:
+        """True when this final answer is over the cap and goes back for a rewrite.
+
+        Only the turn's final answer (the gateway marks it ``notify``) is
+        capped; progress lines and system notices are not.
+        """
+        if not (metadata or {}).get("notify") or chat_id not in self._last_event:
+            return False
+        tries = self._cut_tries.get(chat_id, 0)
+        refusal = reply_too_long(text) if tries < REPLY_CUT_TRIES else None
+        if not refusal:
+            self._cut_tries.pop(chat_id, None)
+            self._cut_fallback.pop(chat_id, None)
+            return False
+        self._cut_tries[chat_id] = tries + 1
+        self._cut_fallback[chat_id] = text
+        task = asyncio.ensure_future(self._ask_cut(chat_id, refusal))
+        self._cut_tasks.add(task)
+        task.add_done_callback(self._cut_tasks.discard)
+        logger.info("[%s] reply over the word cap; asking for a rewrite (%d)", self.name, tries + 1)
+        return True
+
+    async def _ask_cut(self, chat_id: str, refusal: str) -> None:
+        try:
+            # The turn that wrote the long answer is still closing; a message
+            # into a busy session would interrupt it, so wait for it to end.
+            for _ in range(240):
+                if not getattr(self, "_active_sessions", None):
+                    break
+                await asyncio.sleep(0.5)
+            base = self._last_event[chat_id]
+            await self.handle_message(MessageEvent(
+                text=cut_it_prompt(refusal),
+                message_type=MessageType.TEXT,
+                source=base.source,
+                message_id=f"cut-{uuid.uuid4().hex[:8]}",
+                raw_message={},
+                timestamp=datetime.now(tz=timezone.utc),
+                media_urls=[],
+                media_types=[],
+            ))
+        except Exception as e:  # never silence: the long answer goes as written
+            logger.error("[%s] could not ask for a rewrite: %s", self.name, e)
+            fallback = self._cut_fallback.pop(chat_id, None)
+            if fallback:
+                self._reply(chat_id, fallback)
 
     def _reply(self, chat_id: str, text: str, files: Optional[List[str]] = None) -> SendResult:
         try:
@@ -253,7 +384,10 @@ class FiveDiveAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not content.strip():
             return SendResult(success=True, message_id=None)
-        return self._reply(chat_id, content[: self.MAX_MESSAGE_LENGTH])
+        text = content[: self.MAX_MESSAGE_LENGTH]
+        if self._hold_for_cut(chat_id, text, metadata):
+            return SendResult(success=True, message_id=None)
+        return self._reply(chat_id, text)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
