@@ -42,6 +42,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 - v0.5.44 — DIVE-7478: `/start` gets no second hello in a chat the box already greeted at connect (`connect-greeted.json`, this bot, 10 min).
 - v0.5.46 — DIVE-7559: under local-only mode the notice hooks send nothing to Telegram.
 - v0.5.47 — DIVE-7730: a non-picture chat attachment goes to the model as its path, not as an image.
+- v0.5.48 — DIVE-7811: a chat reply over 70 words goes back to the agent to cut; only the rewrite is sent (shared `replycap.ts`).
 - v0.5.45 — DIVE-7506: a one-time browser viewer link keeps its code span and gets an "Open the browser" URL button under the message.
 - v0.5.38 — DIVE-6988: a '?' inside quotes no longer costs a yes/no question its buttons (shared `tna.ts`).
 - v0.5.37 — DIVE-6963: `AGENTS.md`: a set-answer question names the agent's pick first and lists it first ("no preference" only for taste).
