@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.136, telegram-codex 0.5.49, telegram-grok / telegram-agy 0.5.39, telegram-opencode 0.5.15, telegram-pi 0.1.15: a Telegram poll that gets no answer is cut off and retried, not left hanging for 8 minutes (DIVE-7825)
+
+Box report 748: after a Telegram outage a seat got no messages for about eight minutes, then all five at once. Every bridge built its bot with the client's default 500 s request timeout, and that covered the poll for new messages too. When Telegram stopped answering one poll, it sat for the full 500 s. The poll loop's error handler retries silently, and the heartbeat file beats on its own timer, so nothing showed it.
+
+- **`pollguard.ts`** (byte-identical in all six bridges, and in the generator's copy list): a transformer on the poll only. A poll with no answer by its 30 s window plus 15 s is aborted, so the loop's 3 s retry fires. Uploads keep the long timeout.
+- **A log line.** A failed poll writes `getUpdates failed (N in a row): <why>; retrying in 3s` to stderr (then at most one a minute while it keeps failing), and the first success after says it recovered.
+- **`bot.lastpoll`** in the state dir: its time is the last poll that came back, set again when a process takes the poll slot and removed on shutdown. `5dive liveness` reads it (CLI DIVE-7825) to report a stuck poller as `poll-stalled`. `bot.heartbeat` is unchanged: it still marks who holds the poll slot.
+
+Harness: `test/dive7825-poll-guard.test.ts` (15 tests): a fake transport that never answers is cut off at the deadline and the retry gets the queued messages, `bot.lastpoll` stays put during the hang and moves after, a 25-failure streak logs twice, a stop is not logged, other methods pass through, and every bridge wires it. Taking the poll guard out makes the hang test time out; unwiring it from one bridge fails that bridge's arm.
+
 ### Fixed — telegram-codex 0.5.48, telegram-grok / telegram-agy 0.5.38, dashboard 0.5.33 (telegram 0.5.135, shared file only): every agent's chat reply is held to 70 words, not just Claude Code's (DIVE-7811)
 
 Since DIVE-6862 a Claude Code agent's `reply` over 70 words is refused and the error tells it to cut to 60. Codex, Grok, OpenClaw, Hermes and Antigravity agents had no such check: their answers left through the dispatchers, which never capped.

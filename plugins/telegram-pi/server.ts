@@ -54,6 +54,7 @@ import { homedir } from 'os'
 import { join, sep } from 'path'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { createPollGuard, touchLastPoll } from './pollguard.ts'
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -130,6 +131,10 @@ if (!TOKEN) {
 // fresh. Acquisition happens in the poll bootstrap at the bottom of the file.
 const HEARTBEAT_FILE = join(STATE_DIR, 'bot.heartbeat')
 const HEARTBEAT_MS = 3000
+// DIVE-7825: the beacon above beats on a timer, so it stays fresh while the poll
+// itself is stuck. This file's mtime is the last getUpdates that came back
+// (written by pollguard.ts); `5dive liveness` reads it to see a stalled poll.
+const LAST_POLL_FILE = join(STATE_DIR, 'bot.lastpoll')
 // 3 missed beats — how long a newcomer waits before deciding the incumbent died.
 const HEARTBEAT_STALE_MS = 9000
 
@@ -452,6 +457,12 @@ function handleSessionEvent(chat_id: string, event: any): void {
 // ============================================================================
 
 const bot = new Bot(TOKEN)
+// DIVE-7825: bound the long poll (the client's 500 s default left the channel deaf
+// for ~8 min after a Telegram outage, with no log line) and record each poll.
+bot.api.config.use(createPollGuard({
+  lastPollFile: LAST_POLL_FILE,
+  log: line => process.stderr.write(`telegram-pi: ${line}\n`),
+}))
 // DIVE-1674: never deliver a bare 'undefined'/empty payload to the user.
 // This is the single transport choke point every send flows through, so a
 // guard here kills the symptom regardless of which caller passed undefined
@@ -2054,6 +2065,7 @@ function shutdown() {
       unlinkSync(PID_FILE)
       if (heartbeatTimer) clearInterval(heartbeatTimer)
       try { unlinkSync(HEARTBEAT_FILE) } catch {}
+      try { unlinkSync(LAST_POLL_FILE) } catch {}
     }
   } catch {}
   bot.stop().catch(() => {})
@@ -2266,6 +2278,7 @@ void (async () => {
   await acquireSlot()
   if (shuttingDown) return
   bumpHeartbeat()
+  touchLastPoll(LAST_POLL_FILE) // DIVE-7825: taking the slot starts the poll clock
   heartbeatTimer = setInterval(bumpHeartbeat, HEARTBEAT_MS)
 
   for (let attempt = 1; ; attempt++) {

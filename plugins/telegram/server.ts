@@ -84,6 +84,7 @@ import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
+import { createPollGuard, touchLastPoll } from './pollguard.ts'
 import { createAckStatus, restoreJournal, type ShownRecord } from './ackstatus.ts'
 import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, renderConnectLink, renderConnectVerdict, connectAgentNote, connectFailureText, type ConnectTap } from './browser-connect.ts'
 import { relayOwnerAskTap } from './owner-ask.ts'
@@ -327,6 +328,10 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // the bottom of the file.
 const HEARTBEAT_FILE = join(STATE_DIR, 'bot.heartbeat')
 const HEARTBEAT_MS = 3000
+// DIVE-7825: the beacon above beats on a timer, so it stays fresh while the poll
+// itself is stuck. This file's mtime is the last getUpdates that came back
+// (written by pollguard.ts); `5dive liveness` reads it to see a stalled poll.
+const LAST_POLL_FILE = join(STATE_DIR, 'bot.lastpoll')
 // 3 missed beats — how long a newcomer waits before deciding the incumbent died.
 const HEARTBEAT_STALE_MS = 9000
 
@@ -378,6 +383,12 @@ process.on('uncaughtException', err => {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
+// DIVE-7825: bound the long poll (the client's 500 s default left the channel deaf
+// for ~8 min after a Telegram outage, with no log line) and record each poll.
+bot.api.config.use(createPollGuard({
+  lastPollFile: LAST_POLL_FILE,
+  log: line => process.stderr.write(`telegram channel: ${line}\n`),
+}))
 
 // Telegram rejects sendMessage/editMessageText text over 4096 chars
 // (400: message is too long). A rejected ctx.reply only surfaces in
@@ -2347,6 +2358,7 @@ function shutdown(): void {
       rmSync(PID_FILE)
       if (heartbeatTimer) clearInterval(heartbeatTimer)
       try { rmSync(HEARTBEAT_FILE) } catch {}
+      try { rmSync(LAST_POLL_FILE) } catch {}
     }
   } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
@@ -7764,7 +7776,9 @@ if (SEND_ONLY) {
     }
   }
   const bumpHeartbeat = () => { try { writeFileSync(HEARTBEAT_FILE, String(Date.now())) } catch {} }
-  const startHeartbeat = () => { bumpHeartbeat(); heartbeatTimer = setInterval(bumpHeartbeat, HEARTBEAT_MS) }
+  // DIVE-7825: taking the slot starts the poll clock, so a stale file from an
+  // earlier process never reads as a stall before this one's first poll returns.
+  const startHeartbeat = () => { bumpHeartbeat(); touchLastPoll(LAST_POLL_FILE); heartbeatTimer = setInterval(bumpHeartbeat, HEARTBEAT_MS) }
 
   await acquireSlot()
   if (shuttingDown) return
