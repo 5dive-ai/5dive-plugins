@@ -62,6 +62,12 @@ Every request is checked: Microsoft's signature, your bot's ID and your tenant. 
 
 Teams admin center > **Teams apps** > **Manage apps** > **Upload new app** > the App package. Then make it available (setup or permission policies) to the people who should talk to the agent.
 
+**Upload new app greyed out?** A new Microsoft 365 often shows "setting up your new app management experience" for a while. Do this instead:
+
+1. Teams admin center > **Teams apps** > **Setup policies** > **Global** > turn **Upload custom apps** on > Save.
+2. dev.teams.microsoft.com > **Apps** > **Import app** > the App package.
+3. Open the app > **Preview in Teams** > **Add**.
+
 ## What people can do
 
 - Message the agent 1:1, like a colleague.
