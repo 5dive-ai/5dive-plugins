@@ -11,8 +11,9 @@
 // WHAT THIS FILE IS. Pure functions over a JSON document. No `$`, no I/O, no clock —
 // which is what makes every policy gradeable by `bun test` with no engine, in both
 // directions: the deny must fire on the bad input AND must not fire on the good one.
-// `register.ts` owns the one `$.fs.read` that loads the document and the single call
-// site inside the existing `tool.call` hook.
+// `register.ts` owns the one `$.fs.read` that loads the document, the reads of the files
+// `filesWanted` names (DIVE-7673), and the single call site inside the existing
+// `tool.call` hook.
 //
 // THE DOCUMENT IS DATA, NOT CODE (a row constraint). A new policy is a new object in
 // plugins/mod/policy/guard.json — ops extends the list without a plugin release, and
@@ -47,6 +48,11 @@ export type Check = {
    * keeps `smoke-verified` in a sentence from reading as applying the label.
    */
   require_all?: string[]
+  /**
+   * Flags for `require_all`'s regexes (DIVE-7673: `i`, so "OpenRouter", "openrouter" and
+   * "OPENROUTER" are one name). Default none, which is what every older check compiled with.
+   */
+  require_flags?: string
   /** The human half of the deny, with `{match}` replaced by what was found. */
   say: string
 }
@@ -62,6 +68,13 @@ export type Policy = {
   path_any?: string[]
   /** A seat setting that, when set to a non-empty value other than "0", skips it. */
   unless_env?: string
+  /**
+   * DIVE-7673: regexes over the text whose group 1 is a FILE the call reads its text from
+   * (`5dive task need --ask-file=<path>`). That file's text is judged with the call's own,
+   * so moving the words into a file does not move them past the policy. This file reads
+   * nothing: `filesWanted` names the paths, the hook reads them and passes `call.files`.
+   */
+  file_args?: string[]
   checks: Check[]
   /** Template: `{found}` the check's `say`, `{path}` the write's path, `{rule}`. */
   deny: string
@@ -92,6 +105,7 @@ type CompiledPolicy = {
   textKeys: string[]
   pathAny: RegExp[]
   unlessEnv?: string
+  fileArgs: RegExp[]
   checks: CompiledCheck[]
   deny: string
 }
@@ -147,7 +161,7 @@ export function compile(doc: unknown): Compiled {
           re: re(c.find, c.flags ?? ''),
           ...(typeof c.group === 'number' ? { group: c.group } : {}),
           allow: (c.allow_any ?? []).map((s) => re(s, '')),
-          require: (c.require_all ?? []).map((s) => re(s, '')),
+          require: (c.require_all ?? []).map((s) => re(s, c.require_flags ?? '')),
           say: c.say,
         }
       })
@@ -159,6 +173,7 @@ export function compile(doc: unknown): Compiled {
         textKeys: p.text_keys ?? [],
         pathAny: (p.path_any ?? []).map((s) => re(s, '')),
         ...(typeof p.unless_env === 'string' ? { unlessEnv: p.unless_env } : {}),
+        fileArgs: (p.file_args ?? []).map((s) => re(s, 'g')),
         checks,
         deny: p.deny,
       })
@@ -202,6 +217,43 @@ function hits(c: CompiledCheck, s: string): Array<{ whole: string; value: string
   return found
 }
 
+/** The text a policy judges: its text keys, then each named file's text the hook read. */
+function textOf(p: CompiledPolicy, input: unknown, files: Readonly<Record<string, string>>): string {
+  const text = p.textKeys.map((k) => str(input, k)).join('\n')
+  const read = filePaths(p, text)
+    .map((f) => files[f])
+    .filter((v): v is string => typeof v === 'string')
+  return read.length === 0 ? text : [text, ...read].join('\n')
+}
+
+/** The files a policy's `file_args` name in `text`. `-` (stdin) is no file. */
+function filePaths(p: CompiledPolicy, text: string): string[] {
+  const out: string[] = []
+  for (const r of p.fileArgs) {
+    r.lastIndex = 0
+    for (const m of text.matchAll(r)) {
+      const f = m[1] ?? ''
+      if (f !== '' && f !== '-' && !out.includes(f)) out.push(f)
+    }
+  }
+  return out
+}
+
+/**
+ * DIVE-7673: the files the hook must read before `evaluate`, for the policies that apply
+ * to this call (its tool, and not opened by their seat setting). Pure: paths only.
+ */
+export function filesWanted(compiled: Compiled, call: { tool: string; input: unknown }, env: Record<string, unknown>): string[] {
+  const out: string[] = []
+  for (const p of compiled.policies) {
+    if (p.fileArgs.length === 0 || !p.tools.has(call.tool)) continue
+    if (p.unlessEnv !== undefined && envSet(env, p.unlessEnv)) continue
+    const text = p.textKeys.map((k) => str(call.input, k)).join('\n')
+    for (const f of filePaths(p, text)) if (!out.includes(f)) out.push(f)
+  }
+  return out
+}
+
 /** What a policy decided about one call. */
 export type Verdict = { policy: string; check: string; reason: string } | null
 
@@ -217,7 +269,7 @@ export type Verdict = { policy: string; check: string; reason: string } | null
  */
 export function evaluate(
   compiled: Compiled,
-  call: { tool: string; input: unknown },
+  call: { tool: string; input: unknown; files?: Readonly<Record<string, string>> },
   env: Record<string, unknown>,
 ): Verdict {
   for (const p of compiled.policies) {
@@ -226,7 +278,7 @@ export function evaluate(
 
     const path = p.pathKeys.map((k) => str(call.input, k)).find((v) => v !== '') ?? ''
     if (p.pathAny.length > 0 && !p.pathAny.some((r) => r.test(path))) continue
-    const text = p.textKeys.map((k) => str(call.input, k)).join('\n')
+    const text = textOf(p, call.input, call.files ?? {})
 
     for (const c of p.checks) {
       const subject = c.on === 'path' ? path : text

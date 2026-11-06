@@ -3,7 +3,8 @@
 // although the hook already knew when the limit lifts (lodar 2026-11-03: «а
 // сотрудник не пишет что лимит пришел - продолжу через 3 часа»). The line now
 // says when, as a clock time in the box's zone, with the day when it is not
-// today; «продолжу» only when the box resumes the work itself. These pin the
+// today; «продолжу» only when the box resumes the work itself. DIVE-7657 changed
+// the words to the time left with the clock in brackets (dive7657 pins them). These pin the
 // words, then drive the REAL Telegram hook against the local Bot API stub.
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
@@ -11,7 +12,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
-import { liteLimitText, liteResetPhrase, type Allowance } from '../plugins/telegram/hooks/lib/lite.ts'
+import { liteLimitText, type Allowance } from '../plugins/telegram/hooks/lib/lite.ts'
 import * as dashLite from '../plugins/dashboard/hooks/lib/lite.ts'
 
 const ZONE = 'Etc/GMT-7' // the live client's offset, UTC+7 (no DST)
@@ -24,27 +25,13 @@ describe('DIVE-7641 the limit line says when', () => {
   const at = (epoch: number, resumes: boolean, now = NOW) => ({ epoch, resumes, now, timeZone: ZONE })
 
   test('ru and en, with the box resuming the work itself', () => {
-    expect(liteLimitText('ru', OWN, at(sec('2026-11-03T20:10:00Z'), true))).toBe('Лимит исчерпан, продолжу в 03:10. Подробности в кабинете.')
-    expect(liteLimitText('en', OWN, at(sec('2026-11-03T20:10:00Z'), true))).toBe("Limit reached, I'll continue at 03:10. Details in your account.")
+    expect(liteLimitText('ru', OWN, at(sec('2026-11-03T20:10:00Z'), true))).toBe('Лимит исчерпан, продолжу через 2 ч 57 мин (в 03:10). Подробности в кабинете.')
+    expect(liteLimitText('en', OWN, at(sec('2026-11-03T20:10:00Z'), true))).toBe("Limit reached, I'll continue in 2 h 57 min (at 03:10). Details in your account.")
   })
 
   test('ru and en, with no pane to resume: when it resets, not a promise', () => {
-    expect(liteLimitText('ru', OWN, at(sec('2026-11-03T20:10:00Z'), false))).toBe('Лимит исчерпан, обновится в 03:10. Подробности в кабинете.')
-    expect(liteLimitText('en', OWN, at(sec('2026-11-03T20:10:00Z'), false))).toBe('Limit reached, resets at 03:10. Details in your account.')
-  })
-
-  test('the day is added when it is not today, in the box zone', () => {
-    const evening = new Date('2026-11-03T10:00:00Z') // 17:00 on Tue 3 Nov in the box zone
-    expect(liteResetPhrase('ru', sec('2026-11-03T20:10:00Z'), evening, ZONE)).toBe('завтра в 03:10')
-    expect(liteResetPhrase('en', sec('2026-11-03T20:10:00Z'), evening, ZONE)).toBe('tomorrow at 03:10')
-    expect(liteResetPhrase('ru', sec('2026-11-06T05:00:00Z'), evening, ZONE)).toBe('в пятницу в 12:00')
-    expect(liteResetPhrase('en', sec('2026-11-06T05:00:00Z'), evening, ZONE)).toBe('on Friday at 12:00')
-    expect(liteResetPhrase('ru', sec('2026-11-12T05:00:00Z'), evening, ZONE)).toBe('12 ноября в 12:00')
-    expect(liteResetPhrase('en', sec('2026-11-12T05:00:00Z'), evening, ZONE)).toBe('on November 12 at 12:00')
-    // The live 7d window: 12:00Z on 4 Nov is 19:00 the same box-zone day as 00:13.
-    expect(liteResetPhrase('ru', sec('2026-11-04T12:00:00Z'), NOW, ZONE)).toBe('в 19:00')
-    // Same instant, a UTC box: still 3 Nov there, so it is tomorrow.
-    expect(liteResetPhrase('en', sec('2026-11-04T12:00:00Z'), NOW, 'UTC')).toBe('tomorrow at 12:00')
+    expect(liteLimitText('ru', OWN, at(sec('2026-11-03T20:10:00Z'), false))).toBe('Лимит исчерпан, обновится через 2 ч 57 мин (в 03:10). Подробности в кабинете.')
+    expect(liteLimitText('en', OWN, at(sec('2026-11-03T20:10:00Z'), false))).toBe('Limit reached, resets in 2 h 57 min (at 03:10). Details in your account.')
   })
 
   test('no reset, a reset already past, or an unreadable zone: the line it always was', () => {
@@ -68,7 +55,7 @@ describe('DIVE-7641 the limit line says when', () => {
   })
 
   test('the dashboard copy of lite.ts says the same', () => {
-    expect(dashLite.liteLimitText('ru', OWN, at(sec('2026-11-03T20:10:00Z'), true))).toBe('Лимит исчерпан, продолжу в 03:10. Подробности в кабинете.')
+    expect(dashLite.liteLimitText('ru', OWN, at(sec('2026-11-03T20:10:00Z'), true))).toBe('Лимит исчерпан, продолжу через 2 ч 57 мин (в 03:10). Подробности в кабинете.')
   })
 })
 
@@ -161,7 +148,7 @@ describe('DIVE-7641 telegram hook on a lite own-subscription box', () => {
   const T = 30000
 
   for (const lang of ['ru', 'en'] as const) {
-    test(`${lang}: a pane to resume → "I'll continue at HH:MM", with the account button`, async () => {
+    test(`${lang}: a pane to resume → "I'll continue in 3 h 2 min (at HH:MM)", with the account button`, async () => {
       const base = await startStub()
       const epoch = inThreeHours()
       const r = fire({ ...LIMIT, resetsAt: epoch, transcript_path: setup(lang) }, base, seatEnv())
@@ -169,18 +156,18 @@ describe('DIVE-7641 telegram hook on a lite own-subscription box', () => {
       const c = sent()
       expect(c.length).toBe(1)
       expect(c[0].text).toBe(expected(lang, epoch, true))
-      expect(c[0].text).toMatch(lang === 'ru' ? /^Лимит исчерпан, продолжу (завтра )?в \d\d:\d\d\. Подробности в кабинете\.$/ : /^Limit reached, I'll continue (tomorrow )?at \d\d:\d\d\. Details in your account\.$/)
+      expect(c[0].text).toMatch(lang === 'ru' ? /^Лимит исчерпан, продолжу через 3 ч 2 мин \(в \d\d:\d\d\)\. Подробности в кабинете\.$/ : /^Limit reached, I'll continue in 3 h 2 min \(at \d\d:\d\d\)\. Details in your account\.$/)
       expect(button(c[0].markup)).toEqual({ text: lang === 'ru' ? 'Открыть кабинет' : 'Open my account', url: ACCOUNT_URL })
     }, T)
 
-    test(`${lang}: no pane → "resets at HH:MM", never a promise to continue`, async () => {
+    test(`${lang}: no pane → "resets in 3 h 2 min (at HH:MM)", never a promise to continue`, async () => {
       const base = await startStub()
       const epoch = inThreeHours()
       fire({ ...LIMIT, resetsAt: epoch, transcript_path: setup(lang) }, base)
       const c = sent()
       expect(c.length).toBe(1)
       expect(c[0].text).toBe(expected(lang, epoch, false))
-      expect(c[0].text).toMatch(lang === 'ru' ? /^Лимит исчерпан, обновится (завтра )?в \d\d:\d\d\./ : /^Limit reached, resets (tomorrow )?at \d\d:\d\d\./)
+      expect(c[0].text).toMatch(lang === 'ru' ? /^Лимит исчерпан, обновится через 3 ч 2 мин \(в \d\d:\d\d\)\./ : /^Limit reached, resets in 3 h 2 min \(at \d\d:\d\d\)\./)
       expect(button(c[0].markup)?.url).toBe(ACCOUNT_URL)
     }, T)
 

@@ -1,5 +1,69 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.48, telegram-grok / telegram-agy 0.5.38, dashboard 0.5.33 (telegram 0.5.135, shared file only): every agent's chat reply is held to 70 words, not just Claude Code's (DIVE-7811)
+
+Since DIVE-6862 a Claude Code agent's `reply` over 70 words is refused and the error tells it to cut to 60. Codex, Grok, OpenClaw, Hermes and Antigravity agents had no such check: their answers left through the dispatchers, which never capped.
+
+- **Telegram reply tools.** `reply` and `edit_message` in telegram-codex, telegram-grok and telegram-agy refuse an over-cap text with the same error (`replycap.ts`, now copied into each plugin, and into the generator's byte-exact list).
+- **Web and office chat, where the answer is plain text.** The Codex dispatcher (Telegram and web), the Grok bridge, the OpenClaw dispatcher and the Hermes adapter hold an over-cap answer and send the model `[5dive chat: your last reply was not sent. too long: N words; cut to 60 … Write your answer again, shorter. Only the new version reaches the chat.]` as its next message. The rewrite is what the chat gets. The model does the cutting; nothing is truncated. After two rewrites the last version goes as written, and a rewrite that fails sends the long answer: a long answer beats none.
+- **Unchanged:** the same count (closed code fences free, a URL is one word, `FIVEDIVE_REPLY_MAX_WORDS` overrides, 0 turns it off); agent-to-agent turns, progress lines and system notices are never capped; Claude Code behaviour is as before. Antigravity's web chat already answered through the capped dashboard `reply` tool.
+
+Harness: `test/dive7811-reply-cap-every-harness.test.ts` (19 tests: codex Telegram and web, grok turn tracker and a live dispatcher with a fake pane, openclaw with a fake gateway, hermes through a stubbed gateway with a Python-vs-TS count parity table, and the three Telegram tools). Putting back the old file goes red per harness: codex 4, grok 3, openclaw 2, hermes 1, agy 1.
+
+### Fixed — dashboard 0.5.32: an OpenClaw agent on a slow office AI is not cut off after 10 minutes (DIVE-7730)
+
+The office chat ran every OpenClaw turn with `openclaw agent --timeout 600`. On a CPU-only office AI the first answer needs ~30 min (OpenClaw's opening prompt is ~12,800 tokens), so every turn ended "OpenClaw could not answer just now". The limit now comes from `DASHBOARD_OPENCLAW_TURN_TIMEOUT_S` (60 to 7200 seconds, else 600). The 5dive CLI exports 1800 for an OpenClaw seat on your own AI.
+
+Harness: `test/dive7730-openclaw-turn-timeout.test.ts` (2 tests: the value check, and a fake `openclaw` binary receives `--timeout 1800`).
+
+### Fixed — telegram-codex 0.5.47: a Codex agent can read a text, PDF or other non-picture file sent in chat (DIVE-7730)
+
+The chat's one attachment field (`image_path`) carries the first upload whatever it is: the web chat, the office chat and Telegram all fill it. The Codex dispatcher handed it to the model as an image every time, so a `.txt` reached the model as "image content omitted because it could not be processed" and the agent answered that it could not read the file (measured on a firewalled box: a Codex agent on qwen3:8b in the office chat, DIVE-7730).
+
+- **A picture (png, jpg, gif, webp, bmp) still goes as an image.** Any other file goes as one text line naming its path, which the agent opens with its own tools. On the same box the agent then ran `cat` on the file.
+
+Harness: `test/codex-dispatcher.test.ts` (22 tests; the new one checks the helper and a real turn start with a `.pdf` attachment: no image input, the path in the last text input; the file is red on the pre-fix dispatcher).
+
+### Fixed — telegram 0.5.134 (dashboard 0.5.31, shared lib only): a weekly wall parks the account until its printed date, not the next clock time (DIVE-7748)
+
+teal-fox 2026-11-04: a seat's turn ended on `You've hit your weekly limit · resets Nov 9, 5am (Europe/Nicosia)`, and the StopFailure hook moved it with `--wall=1793842800` (Nov 5, 01:40Z). The walled account left cooldown ~97 h early, so rotation could put a seat straight back on it.
+
+- **A dated reset is read as that date.** `resets Nov 9, 5am (TZ)` (also `4:30pm`, `November`, `at 17:00`) is the instant in that zone, with the year nearest to now (`resets Jan 2` read on Dec 30 is next year). It is tried before any clock, so `continuing automatically at 5am` beside it no longer wins. A date already past or more than 8 days out is unknown, never the next 5am (same bound as the CLI's DIVE-5837 parse).
+- **`--wall` is the reset of the wall the turn ended on.** The retries now wait for Claude Code's wall line (the tagged rate-limit message, or a block that starts `You've hit your … limit` / `… limit reached`). Before, the first clock time in the window ended the wait, and in a session full of 5-hour `resets 10:40pm` lines that was the wrong one. A wall line in the payload message comes next. Any loose clock is only the last resort, and the pane is now read for the dated form too.
+- **A late clock time east of UTC lands today.** The zone offset is read from the full date, not the clock alone: `resets 11pm (Europe/Nicosia)` read one day late before.
+
+Harness: `test/dive7748-weekly-wall-dated-reset.test.ts` (14 tests, clock pinned to 2026-11-04T20:50Z). On the pre-fix lib 11 are red and the 3 that pin old behaviour pass. With only the parse fixed, the 3 transcript-selection arms are still red. Related suites (25 files, 434 tests) pass.
+
+### Fixed — dashboard 0.5.30: an agent's reply that gets "too many requests" is sent again, not lost (DIVE-7713, 5dive-ai/5dive#1550)
+
+A self-hosted box with nine agents lost eight web-chat replies in one morning: `dashboard reply failed: control plane returned 429 {"error":"Too many requests"}`. All nine agents' polls and replies shared one per-IP limit at the control plane (fixed there too, per box), and the reply tool gave up on the first refusal.
+
+- **A reply answered 429 or 503 is retried** with backoff (1s, 2s, 4s … 30s), honouring `Retry-After`, for up to 2 minutes, before the tool reports failure. The same body goes every time: an encrypted reply is sealed once, before.
+- **Other 5xx and a dropped connection are retried only when the reply carries a `reply_key`** (every direct post does, one key for all its tries). The control plane answers a repeat of a stored key with the stored row, so a retry after a proxy gave up on a reply the server had kept does not show it twice. Through the relay (positional ops, no key) only 429/503 are retried.
+- `DASHBOARD_REPLY_RETRY_MS` sets the budget; `0` is one try.
+
+Harness: `test/dive7713-reply-retry.test.ts` (10 tests; a mock control plane 429s twice with `Retry-After: 1`, then 200 → the tool succeeds and the same keyed reply went 3 times; on the pre-fix server both server arms are red, the 400 arm passes on both). `test/dive7520-dashboard-e2e-harden.test.ts` S1 pins one try, so its failed post still reaches the redelivery path it tests.
+
+### Fixed — mod 0.6.2: the guard refuses a gate or row that asks lodar to fund OpenRouter (DIVE-7673)
+
+On 11-04 a bench seat could not raise its OpenRouter key (the key-mint rule refused it), so it asked lodar to: a gate «… needs up to $15 more on OpenRouter; $1.65 is left. Raise the limit by $15?» reached his phone. lodar: *"you burned my OR again?? … now im furious"*.
+
+- **New policy `openrouter-spend-ask`.** A `5dive task need` or `task add` whose text names OpenRouter AND asks for money (raise or bump a limit, cap, budget or balance; top up or fund with a dollar amount; "$N more"; "more credits") is refused before it runs. The reason says asking is the same spend, and names the Claude plan profile, the Anthropic test key or the product's own login instead.
+- **A gate or row that only names OpenRouter runs**: a customer's error or empty credit, the OpenRouter option, a row about the credit balance on the AI tab.
+- **Words moved into a file are judged too**: the engine gains `file_args` (the hook reads `--ask-file`, `--body-file`, `--recommend-file`, `--quote-file`, `--options-file`, 64 KB cap) and `require_flags` (a case-blind name). The escape is the key-mint rule's own setting, `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT`.
+
+Harness: `test/mod-guard.test.ts` (+10 tests; with the policy removed, its 5 refusal arms go red and the 3 open arms stay green).
+
+### Fixed — telegram 0.5.133 (dashboard 0.5.29, shared lib only): a partner client's usage-limit line says how long until work goes on (DIVE-7657)
+
+Follow-up to DIVE-7641, which named a clock time: «продолжу в 03:10». lodar, 2026-11-03: «продолжу через... будет лучше», then «в скобочках время».
+
+- **Time left first, the clock time in brackets** (the box's zone): «Лимит исчерпан, продолжу через 2 ч 50 мин (в 03:10). Подробности в кабинете.» / "Limit reached, I'll continue in 2 h 50 min (at 03:10). Details in your account." Same for «обновится через …» / "resets in …".
+- **Short forms, no plurals:** «через 40 мин», «через 3 ч» (no «0 мин»), «через 2 дн 5 ч (в ср 19:00)» from a day on with the weekday in the bracket, and «меньше чем через минуту» / "in under a minute" with no bracket.
+- **Rounded up** (to the minute; to the hour from a day on), so the line never promises a return before the limit lifts. The weekly-cap line is unchanged.
+
+Harness: `test/dive7657-lite-limit-time-left.test.ts` (20 tests; 18 red on the pre-fix tree, the 2 unchanged-line arms pass on both); `test/dive7641-lite-limit-time.test.ts` moved to the new words.
+
 ### Fixed — telegram 0.5.132 (dashboard 0.5.28, shared lib only): a partner client's usage-limit line says when work goes on (DIVE-7641)
 
 On a partner box whose agent runs on the client's own subscription, a usage limit told the client only «Лимит исчерпан. Подробности в кабинете.», although the hook already knew the reset time. lodar, 2026-11-03: «сотрудник не пишет что лимит пришел - продолжу через 3 часа».

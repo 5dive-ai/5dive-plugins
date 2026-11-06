@@ -173,6 +173,30 @@
         }
       ],
       "deny": "{found}. Every such key draws on lodar's own OpenRouter balance, and test and bench keys emptied it after he had said no twice. Put Claude Code seats on a Claude plan profile and every other harness on the Anthropic test key (auth profile `emergency-api`). A product test of the OpenRouter option itself uses the existing TEST_OPENROUTER_API_KEY. Reading /credits, listing keys and deleting a key stay open. Only lodar's own word opens this, through the seat's FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT setting. [{rule}]"
+    },
+    {
+      "id": "openrouter-spend-ask",
+      "rule": "Tests never ask lodar to fund or raise OpenRouter either: asking him is the same spend the key-mint rule refuses (main's rule from lodar, 10-16 / 10-25 / 10-27; refused by machine after DIVE-7667's gate, 11-04)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT",
+      "file_args": [
+        "--(?:ask|recommend|quote|body|options)-file[=\\s]+['\\\"]?([^\\s'\\\";|&)]+)"
+      ],
+      "checks": [
+        {
+          "id": "ask-to-fund",
+          "find": "\\b5dive\\s+task\\s+(?:need|add)\\b",
+          "flags": "",
+          "require_flags": "i",
+          "require_all": [
+            "open\\s?router",
+            "(?:\\b(?:raise|increase|bump|lift)\\b[^.?!\\n]{0,60}\\b(?:limits?|caps?|budget|credits?|balance)\\b|\\b(?:limits?|caps?|budget|credits?|balance)\\b[^.?!\\n]{0,30}\\b(?:raise|increase|bump|lift)\\b|\\b(?:raise|increase|bump|lift|top[\\s-]?up|fund|refill|reload)\\b[^.?!\\n]{0,40}\\$\\s?\\d|\\$\\s?\\d+(?:\\.\\d+)?\\s+(?:more|extra)\\b|\\bmore\\b[^.?!\\n]{0,20}\\b(?:credits?|budget|funds?|money)\\b)"
+          ],
+          "say": "asking for money or a higher limit on OpenRouter in a gate or a row"
+        }
+      ],
+      "deny": "{found}. Asking lodar to fund or raise OpenRouter for our own test or bench load is the same spend the key-mint rule refuses, and he has said no to it every time. Run the test on a Claude plan profile or the Anthropic test key (auth profile `emergency-api`), or on the product's own login (for Grok, Grok's own app on his plan). A gate or row that only names OpenRouter (a customer's bug, the OpenRouter option) stays open. Only lodar's own word opens this, through the seat's FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT setting. [{rule}]"
     }
   ]
 }

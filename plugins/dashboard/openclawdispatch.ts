@@ -18,6 +18,7 @@ import { execFile } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { routeOf, writeOutbox, type InboxMessage, type Route } from './grokdispatch.ts'
+import { cutItPrompt, replyTooLong, REPLY_CUT_TRIES } from './replycap.ts'
 
 export const OPENCLAW_HEADER = '[5dive web chat. Your answer here goes back to this chat as you write it.]'
 export const VOICE_HINT = '[It was spoken: answer in one to three short sentences with no lists, links or code; your answer is spoken back.]'
@@ -97,6 +98,12 @@ export type RunTurn = (prompt: string) => Promise<{ stdout: string; stderr: stri
  * can read argv in `ps`); the gateway-backed `agent` opens --message-file as a
  * path, so `-` for stdin is not an option there.
  */
+/** The turn limit in seconds: a whole number from 60 to 7200, else 600. */
+export function openclawTurnTimeoutS(raw: string | undefined): number {
+  const n = Number(raw)
+  return Number.isInteger(n) && n >= 60 && n <= 7200 ? n : 600
+}
+
 export function openclawTurn(bin: string, turnDir: string, timeoutS = 600): RunTurn {
   let n = 0
   return prompt => new Promise(resolve => {
@@ -140,6 +147,23 @@ export function startOpenclawDispatcher(o: OpenclawDispatcherOptions): { stop():
   }
   mkdirSync(o.inboxDir, { recursive: true, mode: 0o700 })
 
+  // DIVE-7811: an answer over the word cap goes back to the model in the same
+  // session, and the rewrite is what the chat gets. A rewrite that fails, or
+  // comes back empty, leaves the last answer to go as written: never silence.
+  const cutToSize = async (id: string, first: { text: string; files: string[] }) => {
+    let best = first
+    for (let n = 1; n <= REPLY_CUT_TRIES; n++) {
+      const refusal = replyTooLong(best.text)
+      if (!refusal) break
+      log(`dashboard openclaw: ${id} reply over the word cap; asking for a rewrite (${n})`)
+      const { stdout, code } = await o.run(`${OPENCLAW_HEADER}\n${cutItPrompt(refusal)}`)
+      const again = parseTurn(stdout, code)
+      if (again.kind !== 'reply') break
+      best = { text: again.text, files: again.files.length ? again.files : best.files }
+    }
+    return best
+  }
+
   const answer = async (msg: InboxMessage) => {
     const route = routeOf(msg)
     const prompt = promptFor(msg)
@@ -147,7 +171,8 @@ export function startOpenclawDispatcher(o: OpenclawDispatcherOptions): { stop():
       const { stdout, stderr, code } = await o.run(prompt)
       const turn = parseTurn(stdout, code)
       if (turn.kind === 'reply') {
-        reply(route, turn.text, turn.files)
+        const final = await cutToSize(String(msg.id ?? '?'), turn)
+        reply(route, final.text, final.files)
         log(`dashboard openclaw: answered ${String(msg.id ?? '?')} (${turn.text.length} chars, ${turn.files.length} files)`)
         return
       }

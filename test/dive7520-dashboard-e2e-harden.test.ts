@@ -133,6 +133,8 @@ describe('a lost device list is posted again (DIVE-7520)', () => {
         DASHBOARD_E2E_ARGV: JSON.stringify(['bun', STUB, join(dir, 'box')]),
         DASHBOARD_API_BASE: `http://127.0.0.1:${api.port}`,
         DASHBOARD_REDELIVERY_BACKOFF_MS: '0',
+        // DIVE-7713: one try, so the failed post reaches the redelivery path this tests.
+        DASHBOARD_REPLY_RETRY_MS: '0',
         CONNECTORD_TOKEN: TOKEN,
         USER: 'agent-tap',
       },
