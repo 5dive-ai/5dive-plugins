@@ -7,7 +7,7 @@ Teams ──HTTPS──▶ box Caddy (teams-<agent>.<box domain>) ──▶ 127.
 server.ts ──HTTPS──▶ Bot Connector serviceUrl (Microsoft) ──▶ Teams
 ```
 
-No 5dive server is on the path. Refused on a local-only (offline) box.
+No 5dive server is on the path. Shut on a local-only (offline) box until its IT opens Teams alone (`sudo 5dive config local-only allow teams`); the endpoint and every call to Microsoft check that switch on each message (`offline.ts`).
 
 - **Setup**: `sudo 5dive agent teams connect|status|disconnect <agent>` (`bin/teams`). The IT steps are in [docs/IT-GUIDE.md](docs/IT-GUIDE.md).
 - **Config**: `~/.claude/channels/teams/config.json` (0600, the agent's): `app_id`, `tenant_id`, `app_password`, `port`, `public_url`, `allowed_users`.

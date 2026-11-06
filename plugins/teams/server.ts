@@ -33,6 +33,7 @@ import { parseActivity, safeName, type InboundFile } from './activity.ts'
 import { normalizeServiceUrl, isAllowedConsentUploadUrl, inboundFileAuth, isPrivateAddress } from './hosts.ts'
 import { splitTrailingOptions, choiceCard, answeredCard, fileConsentCard, fileInfoCard, chunkText, type ConsentInvoke } from './cards.ts'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
+import { teamsShut, assertTeamsOpen, SHUT_LINE } from './offline.ts'
 
 const STATE_DIR = process.env.TEAMS_STATE_DIR || join(homedir(), '.claude', 'channels', 'teams')
 const CONFIG_PATH = join(STATE_DIR, 'config.json')
@@ -98,6 +99,7 @@ function logLine(dir: 'in' | 'out' | 'refused', conv: string, user: string, char
 // ── Microsoft's signing keys, cached ───────────────────────────────────────
 let keyCache: { keys: Jwk[]; at: number } | null = null
 async function fetchKeys(force = false): Promise<Jwk[]> {
+  assertTeamsOpen() // DIVE-7658: a shut local-only box asks Microsoft nothing
   if (!force && keyCache && Date.now() - keyCache.at < 6 * 3600_000) return keyCache.keys
   const meta: any = await (await fetch(BF_OPENID_URL)).json()
   const jwksUri = String(meta?.jwks_uri ?? '')
@@ -125,6 +127,7 @@ const botToken = cfg ? makeTokenSource(cfg) : async () => { throw new Error('Tea
 
 // ── Bot Connector calls ────────────────────────────────────────────────────
 async function connector(method: 'POST' | 'PUT', serviceUrl: string, path: string, body: unknown): Promise<any> {
+  assertTeamsOpen()
   const base = normalizeServiceUrl(serviceUrl) // refuses any host but Microsoft's
   const r = await fetch(`${base}${path}`, {
     method,
@@ -165,6 +168,7 @@ async function downloadInbound(f: InboundFile, msgId: string): Promise<string | 
     process.stderr.write(`teams: refusing file from ${(() => { try { return new URL(f.url).hostname } catch { return 'bad-url' } })()}\n`)
     return null
   }
+  assertTeamsOpen()
   await assertPublicHost(f.url)
   const headers: Record<string, string> = {}
   if (auth === 'token') headers.authorization = `Bearer ${await botToken()}`
@@ -221,6 +225,7 @@ async function onConsent(conv: string, c: ConsentInvoke) {
   }
   const url = c.uploadInfo.uploadUrl
   if (!isAllowedConsentUploadUrl(url)) throw new Error('upload URL is not a Microsoft host')
+  assertTeamsOpen()
   await assertPublicHost(url)
   const buf = readFileSync(p.path)
   const r = await fetch(url, {
@@ -405,6 +410,11 @@ function startEndpoint() {
       if (req.method === 'GET' && url.pathname === '/healthz') return new Response('ok\n')
       if (url.pathname !== '/api/messages') return new Response('not found\n', { status: 404 })
       if (req.method !== 'POST') return new Response('method not allowed\n', { status: 405 })
+      // DIVE-7658: local-only with Teams shut takes nothing in and so sends nothing out.
+      if (teamsShut()) {
+        logLine('refused', '-', '-', 0, 0, 'local-only: teams shut')
+        return new Response(SHUT_LINE + '\n', { status: 503 })
+      }
       const len = Number(req.headers.get('content-length') ?? 0)
       if (len > MAX_BODY) return new Response('too large\n', { status: 413 })
       let activity: any

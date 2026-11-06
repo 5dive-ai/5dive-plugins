@@ -11,7 +11,8 @@
 #   disconnect <agent>
 #
 # What connect does, in order:
-#   1. refuses on a fully offline server (Teams goes through Microsoft's cloud)
+#   1. refuses on a fully offline server (Teams goes through Microsoft's cloud),
+#      unless its IT opened Teams alone: sudo 5dive config local-only allow teams
 #   2. takes the bot's client secret from /etc/5dive/connectors/teams-<agent>.env,
 #      which only ever arrives through a one-time secret link (or `sudo 5dive
 #      secret write` at a terminal) — never as an argument, never in chat
@@ -46,10 +47,14 @@ teams_audit() {
     | "$FIVEDIVE_BIN" _audit_append >/dev/null 2>&1 || true
 }
 
-# The one line every outside service gives on an offline server.
+# The one line every outside service gives on an offline server. DIVE-7658:
+# the firm's IT may open Teams alone (`sudo 5dive config local-only allow
+# teams` writes `teams` into local-only.allow); everything else stays shut.
+LOCAL_ONLY_ALLOW_FILE="${FIVE_LOCAL_ONLY_ALLOW_FILE:-$(dirname "$LOCAL_ONLY_FILE")/local-only.allow}"
 teams_refuse_offline() {
   [[ -e "$LOCAL_ONLY_FILE" ]] || return 0
-  fail "$E_PERMISSION" "Teams goes through Microsoft's cloud, so it is off on a fully offline server (5dive config local-only off to allow outside services)."
+  grep -qxF teams "$LOCAL_ONLY_ALLOW_FILE" 2>/dev/null && return 0
+  fail "$E_PERMISSION" "Teams goes through Microsoft's cloud, so it is shut on this offline server. Your IT can open it alone: sudo 5dive config local-only allow teams"
 }
 
 _guid_ok() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; }
@@ -210,10 +215,11 @@ $name is ready for Microsoft Teams.
 
   App package:  $pkg
   Endpoint:     ${public:-"(not public yet) forward https://<your name>/api/messages to this server, port $port"}
+$( (( routed )) || printf '  Forward to:   http://127.0.0.1:%s/api/messages on this server (your reverse proxy runs here)\n' "$port")
 
 Next, your IT (one time, about 10 minutes):
-  1. Azure portal > the bot's app registration: messaging endpoint = the Endpoint above
-     (Azure Bot resource > Configuration), and the Microsoft Teams channel turned on.
+  1. The bot's messaging endpoint = the Endpoint above (Teams Developer Portal >
+     Bot management > the bot > Configure; or Azure Bot > Configuration).
   2. Teams admin center > Manage apps > Upload new app > the App package above.
   3. Make it available to the people who should talk to $name.
 EOF

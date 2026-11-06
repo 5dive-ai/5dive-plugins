@@ -42,14 +42,23 @@ run() {
     FIVE_LOCAL_ONLY_FILE="$W/local-only" TEAMS_PACKAGES_DIR="$W/pk" AGENT_HOME_ROOT="$W/home" \
     TEAMS_AGENT_USER="$ME" FIVEDIVE_JSON_MODE="${JSON:-0}" bash "$BIN" "$@" 2>&1
 }
-reset() { : >"$W/log"; echo telegram >"$W/channels"; rm -f "$W/routed" "$W/local-only" "$W/conn/"* "$W/home/agent-max/.claude/channels/teams/"* 2>/dev/null; echo 'FIVE_DOMAIN=box.example.com' >"$W/prov.env"; }
+reset() { : >"$W/log"; echo telegram >"$W/channels"; rm -f "$W/routed" "$W/local-only" "$W/local-only.allow" "$W/conn/"* "$W/home/agent-max/.claude/channels/teams/"* 2>/dev/null; echo 'FIVE_DOMAIN=box.example.com' >"$W/prov.env"; }
 
 echo "teams CLI"
 
 reset; touch "$W/local-only"
 out=$(run agent connect max --app-id=$APP --tenant-id=$TEN); rc=$?
-[[ $rc -eq 10 && "$out" == *"Teams goes through Microsoft's cloud, so it is off on a fully offline server"* && $(wc -l <<<"$out") -eq 1 ]] \
-  && ok "offline server: connect refuses with one line" || bad "offline refusal (rc=$rc)" "$out"
+[[ $rc -eq 10 && "$out" == *"Teams goes through Microsoft's cloud, so it is shut on this offline server"* && "$out" == *"local-only allow teams"* && $(wc -l <<<"$out") -eq 1 ]] \
+  && ok "offline server: connect refuses with one line naming IT's switch" || bad "offline refusal (rc=$rc)" "$out"
+
+# DIVE-7658: the firm's IT opened Teams alone → connect goes past the refusal.
+reset; touch "$W/local-only"; echo teams > "$W/local-only.allow"
+out=$(run agent connect max --app-id=$APP --tenant-id=$TEN); rc=$?
+[[ $rc -ne 10 && "$out" != *"shut on this offline server"* ]] \
+  && ok "offline server with Teams allowed: connect is not refused" || bad "allow teams (rc=$rc)" "$out"
+reset; touch "$W/local-only"; echo other > "$W/local-only.allow"
+out=$(run agent connect max --app-id=$APP --tenant-id=$TEN); rc=$?
+[[ $rc -eq 10 ]] && ok "an allow file without teams still refuses" || bad "allow other (rc=$rc)" "$out"
 
 reset
 out=$(run agent connect max --app-id=$APP --tenant-id=$TEN --secret=hunter2); rc=$?

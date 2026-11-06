@@ -1,47 +1,66 @@
-# Add an AI agent to Microsoft Teams (for your IT)
+# Add an AI agent to Microsoft Teams: a guide for your IT team
 
-Each agent becomes its own contact in your Teams, like a colleague. One bot per agent. About 10 minutes per agent.
+Each agent becomes its own contact in your Teams, like a colleague. Your IT team sets it up, in your own Microsoft 365, with your own admin rights. 5dive never gets access to your Microsoft 365. About 10 minutes per agent.
 
-**Where messages go:** between Microsoft Teams and your own 5dive server. Nothing passes through 5dive's servers. Teams is a Microsoft cloud service, so this does not work on a fully offline server.
+**You need**
 
-**You need:** a Microsoft 365 tenant where custom apps may be uploaded, and rights to create an app registration in Azure.
+- Microsoft 365 with Teams. Teams runs in Microsoft's cloud, so it needs internet.
+- Admin rights in your Microsoft 365 to register a bot and upload a custom app.
+- Root on your 5dive server.
+- One HTTPS address Microsoft can reach, published through your VPN gateway, DMZ or firewall to a reverse proxy on the 5dive server itself. A 5dive cloud server already has one.
 
-## 1. Create the bot in Azure (once per agent)
+**Where messages go:** only between Microsoft Teams and your 5dive server. Nothing passes through 5dive's servers.
 
-1. Azure portal > **Azure Bot** > Create. Type of app: **Single Tenant**. Let it create a new app registration.
-2. Open the new app registration. Copy the **Application (client) ID** and the **Directory (tenant) ID**.
-3. **Certificates & secrets** > New client secret. Keep this page open: the secret goes to your server in step 2, through a one-time link.
-4. Back on the Azure Bot: **Channels** > add **Microsoft Teams**.
+## 1. Fully offline server? Open Teams alone
 
-## 2. Connect the agent on your 5dive server
-
-Give your agent (or your 5dive admin) the two IDs. It runs:
+Skip this if your server is not in local-only mode. On a local-only server, Teams is shut until you open it:
 
 ```
-sudo 5dive agent teams connect <agent> --app-id=<Application ID> --tenant-id=<Directory ID> --task=<task>
+sudo 5dive config local-only allow teams
 ```
 
-You get a one-time link. Open it and paste the client secret. It goes to your server only, never into a chat.
+Only Teams messages go out, to Microsoft. Everything else stays offline, and `sudo 5dive config local-only check` still flags any other outside connection. Shut it again with `sudo 5dive config local-only deny teams`.
 
-The agent runs connect again. It prints two things:
+## 2. Register the bot (once per agent)
 
-- **Endpoint**: the address Microsoft will post messages to.
+Either way works. Pick **single tenant**, so only your organisation can reach it.
+
+- **Teams Developer Portal** (no Azure subscription): dev.teams.microsoft.com > **Tools** > **Bot management** > New bot. Then **Client secrets** > Add.
+- **Azure portal**: **Azure Bot** > Create, type **Single Tenant**. Then **Channels** > add **Microsoft Teams**, and in the bot's app registration, **Certificates & secrets** > New client secret.
+
+Note the bot's **App (client) ID**, your **Directory (tenant) ID**, and keep the secret's page open.
+
+## 3. Connect the agent on your server
+
+First save the bot's client secret on the server. It asks for it with hidden input, so it never lands in a chat, a log or the command line:
+
+```
+sudo 5dive secret write TEAMS_APP_PASSWORD --connector=teams-<agent>
+```
+
+Then connect:
+
+```
+sudo 5dive agent teams connect <agent> --app-id=<App ID> --tenant-id=<Directory ID> --endpoint=https://<your address>
+```
+
+It prints:
+
+- **Endpoint**: where Microsoft will post messages.
+- **Forward to**: your reverse proxy on the server sends your address's `/api/messages` here (`http://127.0.0.1:<port>`). The agent listens on the server itself only.
 - **App package**: a small zip with the agent's name, role and face.
 
-## 3. Point the bot at your server
+On a 5dive cloud server, leave out `--endpoint`: the address is made for you.
 
-Azure Bot > **Configuration** > Messaging endpoint = the **Endpoint** from step 2.
+## 4. Point the bot at your server
 
-- **5dive cloud server**: the endpoint is already public (`https://teams-<agent>.<your server>/api/messages`).
-- **Your own server**: publish one HTTPS address (reverse proxy or DMZ) that forwards `/api/messages` to the server on the port connect printed. Then the agent runs connect once more with `--endpoint=https://<that address>`.
+Set the bot's **Messaging endpoint** to the **Endpoint** from step 3 (Developer Portal: **Bot management** > the bot > **Configure**; Azure: **Configuration**).
 
-Only Microsoft needs to reach that address. Every request is checked against Microsoft's signature, your bot's ID and your tenant; anything else is refused.
+Every request is checked: Microsoft's signature, your bot's ID and your tenant. Anything else is refused.
 
-## 4. Add the app to Teams
+## 5. Add the app to Teams
 
-Teams admin center > **Teams apps** > **Manage apps** > **Upload new app** > the App package.
-
-Then make it available (app setup or permission policies) to the people who should talk to the agent. They find it under **Apps**, or pinned if you pin it.
+Teams admin center > **Teams apps** > **Manage apps** > **Upload new app** > the App package. Then make it available (setup or permission policies) to the people who should talk to the agent.
 
 ## What people can do
 
@@ -54,6 +73,6 @@ Group chats and channels are not supported yet.
 ## Check, and turn off
 
 - `5dive agent teams status <agent>`: connected, listening, reachable, last message time.
-- `sudo 5dive agent teams disconnect <agent>`: turns it off and deletes the secret from your server. Then remove the app in the Teams admin center and delete the client secret in Azure.
+- `sudo 5dive agent teams disconnect <agent>`: turns it off and deletes the secret from your server. Then remove the app in the Teams admin center and delete the bot's client secret.
 
 **If your company uses Claude Team or Enterprise:** an admin must allow channels for the Claude organisation, or the agent will not receive Teams messages.

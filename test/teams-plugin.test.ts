@@ -11,6 +11,7 @@ import { isAllowedServiceUrl, normalizeServiceUrl, isAllowedConsentUploadUrl, in
 import { splitTrailingOptions, optionValue, choiceCard, readSubmitValue, parseFileConsentInvoke, chunkText, CHOICE_KIND } from '../plugins/teams/cards.ts'
 import { parseActivity, cleanText, safeName } from '../plugins/teams/activity.ts'
 import { verifyRequest, checkClaims, bearer, makeTokenSource, BF_ISSUER } from '../plugins/teams/auth.ts'
+import { teamsShut, assertTeamsOpen, localOnlyPaths } from '../plugins/teams/offline.ts'
 
 const TENANT = '11111111-2222-3333-4444-555555555555'
 const APP = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -211,5 +212,44 @@ describe('is the request really from Microsoft, for this bot', () => {
     try { await tok() } catch (e: any) { msg = String(e?.message) }
     expect(msg).toContain('invalid_client')
     expect(msg).not.toContain('secret pw')
+  })
+})
+
+// DIVE-7658 design change: a local-only box keeps Teams shut until its IT
+// runs `sudo 5dive config local-only allow teams`.
+describe('the local-only switch (IT opens Teams alone)', () => {
+  const { mkdtempSync, writeFileSync, rmSync } = require('node:fs')
+  const { join } = require('node:path')
+  const { tmpdir } = require('node:os')
+  const d = mkdtempSync(join(tmpdir(), 'teams-lo-'))
+  const paths = localOnlyPaths({ FIVE_LOCAL_ONLY_FILE: join(d, 'local-only') })
+  test('the allow file sits beside the flag', () => {
+    expect(paths.allow).toBe(join(d, 'local-only.allow'))
+  })
+  test('not local-only: open', () => {
+    expect(teamsShut(paths)).toBe(false)
+  })
+  test('local-only, no allow file: shut, and outbound throws', () => {
+    writeFileSync(paths.flag, 'on\n')
+    expect(teamsShut(paths)).toBe(true)
+    expect(() => assertTeamsOpen(paths)).toThrow(/local-only allow teams/)
+  })
+  test('local-only, allow file names something else: shut', () => {
+    writeFileSync(paths.allow, 'other\n')
+    expect(teamsShut(paths)).toBe(true)
+  })
+  test('local-only, IT allowed teams: open', () => {
+    writeFileSync(paths.allow, 'teams\n')
+    expect(teamsShut(paths)).toBe(false)
+    expect(() => assertTeamsOpen(paths)).not.toThrow()
+    rmSync(d, { recursive: true, force: true })
+  })
+  test('server.ts: every road to Microsoft checks the switch, and the endpoint refuses before it fetches keys', () => {
+    const src = require('node:fs').readFileSync(join(import.meta.dir, '../plugins/teams/server.ts'), 'utf8') as string
+    const body = (fn: string) => src.slice(src.indexOf(`function ${fn}(`), src.indexOf('\n}\n', src.indexOf(`function ${fn}(`)))
+    for (const fn of ['fetchKeys', 'connector', 'downloadInbound', 'onConsent']) expect(body(fn)).toContain('assertTeamsOpen()')
+    const shut = src.indexOf('if (teamsShut())'), verify = src.indexOf("await verify(req.headers.get('authorization')")
+    expect(shut).toBeGreaterThan(0)
+    expect(shut).toBeLessThan(verify)
   })
 })
