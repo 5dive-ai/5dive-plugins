@@ -55,6 +55,7 @@ const COPY_FILES = [
   'viewer-link.ts', // DIVE-4493: one-time viewer-link transport guard — copied byte-exact
   'pending-inbound.ts', // DIVE-7422: mid-turn inbound state + surface decision — copied byte-exact
   'slot-handoff.ts', // DIVE-7460: poll-slot handoff to a newer sibling of the same session — copied byte-exact
+  'pollguard.ts', // DIVE-7825: the bounded long poll + bot.lastpoll — no tokens, copied byte-exact
   'replycap.ts', // DIVE-7811: the chat reply word cap — no tokens, copied byte-exact (the drift test lists every copy)
   'plan-limit.ts', // DIVE-7565: Grok's used-up-plan words + the opt-in box; switched off in every other runtime by the plan-limit-off block
   'pair.ts',
