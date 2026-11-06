@@ -1,5 +1,18 @@
 ## Unreleased
 
+### Added — dashboard 0.5.34: Pi and OpenCode agents answer in the 5dive app chat (DIVE-7348)
+
+A Pi or OpenCode agent can now be chatted with from 5dive.app. Neither runtime runs an MCP server for a channel (and on a Telegram seat the Telegram bridge is the seat's main process), so the dashboard server runs beside the seat (`server.ts --runtime=pi|opencode`, started by 5dive-agent-start as for OpenClaw) and **`clidispatch.ts`** answers each message with one headless turn of the seat's own CLI, always in the web chat's own session:
+
+- **Pi:** `pi -p --session-dir ~/.pi/channels/5dive/pi-sessions --continue`; the answer is stdout, a failed turn exits 1 with the reason on stderr.
+- **OpenCode:** `opencode run --format json`, then `--session <id>` with the id the first turn printed (kept in `~/.opencode/channels/5dive/opencode-session`; a session that is gone starts a new one, once). The answer is the text after the last tool call. A failed model call is an `error` event with exit 0, so the events decide, not the exit code. The turn drops the box-wide `XDG_CONFIG_HOME` and gets the pane's `OPENCODE_PERMISSION`, so it reads the seat's own model and asks nothing nobody can answer.
+- The message rides stdin, never argv. Turns run one at a time in the seat's work folder (`DASHBOARD_AGENT_WORKDIR`), limit `DASHBOARD_CLI_TURN_TIMEOUT_S` (default 600 s). An over-cap answer is rewritten in the same session (DIVE-7811).
+- **Never silence:** no answer, a provider refusal (its first sentence, no links: "Pi could not answer: You have no credits remaining."), a turn past the limit, a missing binary, each ends in a short notice.
+
+Measured live on 2026-11-06 with pi 1.5.0 and opencode 1.19.5 on an OpenRouter key: the second turn remembered the first; opencode ran a tool and answered after it. pi 0.80.6 has the same flags.
+
+Harness: `bun test test/dive7348-dashboard-pi-opencode.test.ts`, 15 tests (two through the real server with stand-in CLIs).
+
 ### Added — teams 0.2.0: one Microsoft sign-in makes each agent's Teams contact (DIVE-7831)
 
 `sudo 5dive agent teams connect <agent> --microsoft [--json]` replaces the IT steps on a 5dive cloud server. Not signed in: it starts Microsoft's sign-in and opens the page in the server's own browser (site `login.microsoftonline.com`); the app shows that page to the owner through the usual one-time viewer link. Signed in: it checks that Teams allows custom apps (and names the admin switch if not), makes the agent's Teams bot with Microsoft's `teams` CLI, keeps the secret on the server through `secret write`, connects the agent as before, and prints the **Add to Teams** link (`state=ready`). Asking again returns the same link; a run that made the bot and stopped part-way finishes it instead of making a second one.
