@@ -1,0 +1,75 @@
+{
+  "name": "@5dive/openclaw-channel",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin: the 5dive web and mobile chat, through the box's local spool.",
+  "license": "MIT",
+  "author": "5dive (https://5dive.ai)",
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/dashboard/openclaw-channel",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/5dive-ai/5dive-plugins",
+    "directory": "plugins/dashboard/openclaw-channel"
+  },
+  "type": "module",
+  "files": [
+    "dist/",
+    "index.ts",
+    "setup-entry.ts",
+    "src/",
+    "!src/**/*.test.ts",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "bun test src/spool.test.ts"
+  },
+  "devDependencies": {
+    "openclaw": "2026.11.1",
+    "typescript": "5.9.3"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.11.1"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "setupEntry": "./setup-entry.ts",
+    "runtimeSetupEntry": "./dist/setup-entry.js",
+    "channel": {
+      "id": "fivedive",
+      "label": "5dive app",
+      "selectionLabel": "5dive app (web and mobile chat)",
+      "blurb": "Talk to this agent from the 5dive web and mobile chat.",
+      "configuredState": {
+        "env": {
+          "anyOf": [
+            "FIVEDIVE_SPOOL_DIR"
+          ]
+        }
+      }
+    },
+    "install": {
+      "npmSpec": "@5dive/openclaw-channel",
+      "clawhubSpec": "clawhub:@5dive/openclaw-channel",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.11.1"
+    },
+    "compat": {
+      "pluginApi": ">=2026.11.1"
+    },
+    "build": {
+      "openclawVersion": "2026.11.1",
+      "pluginSdkVersion": "2026.11.1"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "id": "fivedive",
+  "name": "5dive app",
+  "description": "The 5dive web and mobile chat, through the box's local spool.",
+  "categories": ["channels"],
+  "channels": ["fivedive"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "fivedive": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "spoolDir": { "type": "string" },
+          "allowFrom": {
+            "type": "array",
+            "items": { "anyOf": [{ "type": "string" }, { "type": "number" }] }
+          },
+          "dmPolicy": { "type": "string", "enum": ["allowlist", "open", "pairing", "disabled"] },
+          "pollMs": { "type": "integer", "minimum": 100 }
+        }
+      },
+      "uiHints": {
+        "spoolDir": { "label": "Spool folder (FIVEDIVE_SPOOL_DIR wins)" },
+        "allowFrom": { "label": "Allowed senders (default: 5dive-app)" }
+      }
+    }
+  }
+}
