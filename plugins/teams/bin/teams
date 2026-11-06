@@ -350,11 +350,16 @@ _signin_start() {
   _signin_show "$url" "$fresh"
 }
 
-# Signed in: the page and the view are no longer needed.
+# Signed in: the page and the view are no longer needed. And the box's browser is
+# signed OUT of Microsoft again: its profile now holds the owner's Microsoft session
+# (an admin's, usually), and every agent on the box may use the box's browser logins.
+# Microsoft's tool keeps its own sign-in (MSCLI_HOME), which is all this needs.
 _signin_close() {
   [[ -e "$(_signin_url_file)" ]] || return 0
   "$FIVEDIVE_BIN" browser viewer-revoke "$SIGNIN_SITE" >/dev/null 2>&1 || true
   "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true
+  "$FIVEDIVE_BIN" browser forget "$SIGNIN_SITE" >/dev/null 2>&1 \
+    || warn "could not sign this server's browser out of Microsoft: sudo 5dive browser forget $SIGNIN_SITE"
   "$SYSTEMCTL" stop "$SIGNIN_UNIT" >/dev/null 2>&1 || true
   rm -f "$(_signin_url_file)"
 }

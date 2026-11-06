@@ -222,6 +222,9 @@ jq -e --arg a $APP --arg t $TEN '.app_id == $a and .tenant_id == $t and .app_pas
 [[ "$(cat "$W/channels")" == "telegram,teams" ]] && grep -qE "^route add teams-max" "$W/log" && ok "then connects as before: route and channel" || bad "connect steps" "$(cat "$W/log")"
 grep -q "browser viewer-revoke login.microsoftonline.com" "$W/log" && [[ ! -e "$W/mshome/signin.url" && ! -e "$W/active" ]] \
   && ok "signed in: the sign-in view is closed and the waiting sign-in stopped" || bad "close" "$(cat "$W/log")"
+# The box's browser held the owner's Microsoft session; every agent may use the box's browser logins.
+grep -q "browser forget login.microsoftonline.com" "$W/log" && [[ "$(grep -n "viewer-revoke login" "$W/log" | cut -d: -f1)" -lt "$(grep -n "browser forget login" "$W/log" | cut -d: -f1)" ]] \
+  && ok "signed in: the box's browser is signed out of Microsoft again, after the view is closed" || bad "forget" "$(cat "$W/log")"
 [[ "$out" != *s3cr3t* ]] && ! grep -q s3cr3t "$W/log" "$W/mslog" && ok "the secret is never printed or passed as an argument" || bad "secret leaked" "$out"
 grep -q '^TEAMS_APP_PASSWORD=ms-s3cr3t~value$' "$W/conn/teams-max.env" && ok "the secret went through secret write, on stdin" || bad "secret write" "$(cat "$W/conn/teams-max.env" 2>&1)"
 
