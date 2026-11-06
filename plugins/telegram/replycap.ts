@@ -3,9 +3,10 @@
 // advice: 27 of 30 graded replies still ran over it. A tool's error is read as
 // an instruction, so the rule lives here.
 //
-// BYTE-IDENTICAL in plugins/telegram/replycap.ts and plugins/dashboard/replycap.ts
-// (each plugin installs as its own tree). test/dive6862-reply-word-cap.test.ts
-// fails on any drift: edit one, copy it to the other.
+// BYTE-IDENTICAL in every plugin that ships a replycap.ts (each plugin installs
+// as its own tree; the generator copies it into its forks), and ported to
+// plugins/dashboard/hermes/adapter.py. test/dive7811-reply-cap-every-harness.test.ts
+// lists the copies and fails on any drift: edit one, copy it to the others.
 //
 //   - a word is a whitespace-separated token with a letter or digit in it, so a
 //     URL is one word and a bare "—" or "-" bullet is none;
@@ -63,4 +64,15 @@ export function replyTooLong(text: unknown, cap = replyWordCap()): string | null
   const n = countReplyWords(text)
   if (n <= cap) return null
   return `too long: ${n} words; cut to ${Math.min(REPLY_WORD_TARGET, cap)} or attach a file and name it in one line. Nothing was sent.`
+}
+
+// DIVE-7811: a harness whose answer is its plain text (the dispatchers, see the
+// test's header) has no tool error to read. Its dispatcher holds the long reply, sends
+// this back to the model as the next turn, and the chat gets the rewrite. The
+// model rewrites; nothing is ever cut mid-sentence. After REPLY_CUT_TRIES
+// rewrites the last version goes as written: a long answer beats no answer.
+export const REPLY_CUT_TRIES = 2
+
+export function cutItPrompt(refusal: string): string {
+  return `[5dive chat: your last reply was not sent. ${refusal} Write your answer again, shorter. Only the new version reaches the chat.]`
 }

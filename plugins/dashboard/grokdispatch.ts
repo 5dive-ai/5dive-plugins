@@ -30,6 +30,7 @@
 
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, watch, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
+import { cutItPrompt, replyTooLong, REPLY_CUT_TRIES } from './replycap.ts'
 
 export type GrokUpdate = { kind: string; text: string; raw: string; status?: string }
 
@@ -112,9 +113,17 @@ export const SIGNED_OUT_TEXT = 'Grok is not signed in on this computer yet, so i
 // user turn, but never one of ours.
 const KICK_PREFIX = 'A Telegram message is waiting'
 
-type Expected = { id: string; needle: string; route: Route; sentAt: number }
+// DIVE-7811: cut is which rewrite of an over-cap reply this turn is (0: a
+// real message); fallback is that long reply, sent as written if the rewrite
+// never comes, so a cut never ends in silence.
+type Cut = { cut?: number; fallback?: string }
+type Expected = { id: string; needle: string; route: Route; sentAt: number } & Cut
 // held: narration written before a tool call; tools: tool calls still running.
-type Active = { id: string; route: Route; cur: string[]; posted: number; lastAt: number; warned: boolean; held: string; tools: number }
+// refused: this turn's over-cap reply, which the model is asked to rewrite.
+type Active = { id: string; route: Route; cur: string[]; posted: number; lastAt: number; warned: boolean; held: string; tools: number; refused?: { refusal: string; text: string } } & Cut
+
+/** DIVE-7811: ask the model to rewrite an over-cap reply (rewrite number `cut`). */
+export type OnCut = (route: Route, prompt: string, cut: number, fallback: string) => void
 
 export type TurnTimings = {
   segmentQuietMs: number   // a streamed message with no new chunk for this long is complete
@@ -146,10 +155,17 @@ export class GrokTurns {
     private emit: (r: OutboxReply) => void,
     private now: () => number = Date.now,
     private t: TurnTimings = DEFAULT_TIMINGS,
+    private onCut?: OnCut,
   ) {}
 
-  expect(id: string, needle: string, route: Route): void {
-    this.expected.push({ id, needle, route, sentAt: this.now() })
+  expect(id: string, needle: string, route: Route, cut: Cut = {}): void {
+    this.expected.push({ id, needle, route, sentAt: this.now(), ...cut })
+  }
+
+  // A message that never got its answer: the rewrite's fallback, else a notice.
+  private unanswered(e: { route: Route; fallback?: string }, notice: string): void {
+    if (e.fallback) this.emit({ ...e.route, text: e.fallback, kind: 'message' })
+    else this.emit({ ...e.route, text: notice, kind: 'error' })
   }
 
   /** True while a message is waiting for its turn or its turn is being followed. */
@@ -197,13 +213,13 @@ export class GrokTurns {
       if (!a.posted && a.held && now - a.lastAt >= this.t.noAnswerMs) this.release(a)
       if (!a.posted && !a.warned && now - a.lastAt >= this.t.noAnswerMs) {
         a.warned = true
-        this.emit({ ...a.route, text: NO_ANSWER_TEXT, kind: 'error' })
+        this.unanswered(a, NO_ANSWER_TEXT)
+        a.fallback = undefined
       }
       if (now - a.lastAt >= this.t.followIdleMs) this.finish()
     }
     while (this.expected.length && now - this.expected[0]!.sentAt >= this.t.acceptMs) {
-      const lost = this.expected.shift()!
-      this.emit({ ...lost.route, text: NOT_TAKEN_TEXT, kind: 'error' })
+      this.unanswered(this.expected.shift()!, NOT_TAKEN_TEXT)
     }
   }
 
@@ -214,7 +230,7 @@ export class GrokTurns {
     this.userBuf = []
     if (i >= 0) {
       // Grok takes messages in order, so any earlier one it skipped is lost.
-      for (const lost of this.expected.splice(0, i)) this.emit({ ...lost.route, text: NOT_TAKEN_TEXT, kind: 'error' })
+      for (const lost of this.expected.splice(0, i)) this.unanswered(lost, NOT_TAKEN_TEXT)
       this.take(this.expected.shift()!)
       return
     }
@@ -231,7 +247,7 @@ export class GrokTurns {
 
   private take(e: Expected): void {
     this.finish()
-    this.active = { id: e.id, route: e.route, cur: [], posted: 0, lastAt: this.now(), warned: false, held: '', tools: 0 }
+    this.active = { id: e.id, route: e.route, cur: [], posted: 0, lastAt: this.now(), warned: false, held: '', tools: 0, cut: e.cut, fallback: e.fallback }
   }
 
   // Text before a tool call: kept back, and replaced by the next such text.
@@ -257,6 +273,15 @@ export class GrokTurns {
   }
 
   private post(a: Active, text: string): void {
+    // DIVE-7811: over the cap, with a rewrite left, the reply is held and the
+    // turn's end asks Grok to cut it. It counts as posted: Grok did answer.
+    const refusal = this.onCut && (a.cut ?? 0) < REPLY_CUT_TRIES ? replyTooLong(text) : null
+    if (refusal) {
+      a.refused = { refusal, text }
+      a.posted++
+      return
+    }
+    a.fallback = undefined   // the rewrite came: the long version is not needed
     // Only the first message of a turn is spoken: one voice note per answer.
     const { voice: _voice, ...plain } = a.route
     this.emit({ ...(a.posted ? plain : a.route), text, kind: 'message' })
@@ -268,8 +293,9 @@ export class GrokTurns {
     if (!a) return
     this.flush(a)
     if (!a.posted) this.release(a)
-    if (!a.posted && !a.warned) this.emit({ ...a.route, text: NO_ANSWER_TEXT, kind: 'error' })
+    if (!a.posted && !a.warned) this.unanswered(a, NO_ANSWER_TEXT)
     this.active = null
+    if (a.refused) this.onCut!(a.route, cutItPrompt(a.refused.refusal), (a.cut ?? 0) + 1, a.refused.text)
   }
 }
 
@@ -384,14 +410,20 @@ export function writeOutbox(dir: string, reply: OutboxReply, seq: string): void 
 export function startGrokDispatcher(o: GrokDispatcherOptions): { stop(): void; turns: GrokTurns } {
   const log = o.log ?? (line => process.stderr.write(line + '\n'))
   let seq = 0
+  let chain = Promise.resolve()
+  // DIVE-7811: an over-cap answer goes back to Grok as the next message.
+  const onCut: OnCut = (route, prompt, cut, fallback) => {
+    log(`dashboard grok: reply over the word cap; asking Grok to cut it (rewrite ${cut})`)
+    chain = chain.then(() => send({ id: `cut-${Date.now()}-${cut}`, text: prompt, route }, { cut, fallback }))
+      .catch(err => log(`dashboard grok: send failed: ${err}`))
+  }
   const turns = new GrokTurns(r => {
     writeOutbox(o.outboxDir, r, `${Date.now()}-${process.pid}-grok-${seq++}`)
     log(`dashboard grok: ${r.kind} -> chat ${r.chat_id} (${r.text.length} chars)`)
-  }, Date.now, o.timings ?? DEFAULT_TIMINGS)
+  }, Date.now, o.timings ?? DEFAULT_TIMINGS, onCut)
   const tail = new SessionTail(o.sessionsRoot)
   mkdirSync(o.inboxDir, { recursive: true, mode: 0o700 })
 
-  let chain = Promise.resolve()
   const seen = new Set<string>()
   const ingest = (name: string) => {
     if (!name.endsWith('.json') || seen.has(name)) return
@@ -403,19 +435,19 @@ export function startGrokDispatcher(o: GrokDispatcherOptions): { stop(): void; t
     chain = chain.then(() => send(msg)).catch(err => log(`dashboard grok: send failed: ${err}`))
       .finally(() => seen.delete(name))
   }
-  const send = async (msg: InboxMessage) => {
+  const send = async (msg: InboxMessage, cut: Cut = {}) => {
     const route = routeOf(msg)
     let pane = ''
     try { pane = await o.pane.capture() } catch (err) { log(`dashboard grok: pane capture failed: ${err}`) }
     if (signedOut(pane)) {
-      writeOutbox(o.outboxDir, { ...route, text: SIGNED_OUT_TEXT, kind: 'error' }, `${Date.now()}-${process.pid}-grok-${seq++}`)
+      writeOutbox(o.outboxDir, cut.fallback ? { ...route, text: cut.fallback, kind: 'message' } : { ...route, text: SIGNED_OUT_TEXT, kind: 'error' }, `${Date.now()}-${process.pid}-grok-${seq++}`)
       log('dashboard grok: Grok is on its sign-in screen; message not typed')
       return
     }
     // Catch up first, so text Grok wrote before this message is never read as its answer.
     for (const u of tail.read(!turns.busy())) turns.feed(u)
     const { prompt, needle } = promptFor(msg, o.hears?.() ?? false)
-    turns.expect(String(msg.id ?? ''), needle, route)
+    turns.expect(String(msg.id ?? ''), needle, route, cut)
     await o.pane.submit(prompt)
     log(`dashboard grok: typed ${String(msg.id ?? '?')} into the pane`)
   }

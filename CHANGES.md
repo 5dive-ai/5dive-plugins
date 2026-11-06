@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.48, telegram-grok / telegram-agy 0.5.38, dashboard 0.5.33 (telegram 0.5.135, shared file only): every agent's chat reply is held to 70 words, not just Claude Code's (DIVE-7811)
+
+Since DIVE-6862 a Claude Code agent's `reply` over 70 words is refused and the error tells it to cut to 60. Codex, Grok, OpenClaw, Hermes and Antigravity agents had no such check: their answers left through the dispatchers, which never capped.
+
+- **Telegram reply tools.** `reply` and `edit_message` in telegram-codex, telegram-grok and telegram-agy refuse an over-cap text with the same error (`replycap.ts`, now copied into each plugin, and into the generator's byte-exact list).
+- **Web and office chat, where the answer is plain text.** The Codex dispatcher (Telegram and web), the Grok bridge, the OpenClaw dispatcher and the Hermes adapter hold an over-cap answer and send the model `[5dive chat: your last reply was not sent. too long: N words; cut to 60 … Write your answer again, shorter. Only the new version reaches the chat.]` as its next message. The rewrite is what the chat gets. The model does the cutting; nothing is truncated. After two rewrites the last version goes as written, and a rewrite that fails sends the long answer: a long answer beats none.
+- **Unchanged:** the same count (closed code fences free, a URL is one word, `FIVEDIVE_REPLY_MAX_WORDS` overrides, 0 turns it off); agent-to-agent turns, progress lines and system notices are never capped; Claude Code behaviour is as before. Antigravity's web chat already answered through the capped dashboard `reply` tool.
+
+Harness: `test/dive7811-reply-cap-every-harness.test.ts` (19 tests: codex Telegram and web, grok turn tracker and a live dispatcher with a fake pane, openclaw with a fake gateway, hermes through a stubbed gateway with a Python-vs-TS count parity table, and the three Telegram tools). Putting back the old file goes red per harness: codex 4, grok 3, openclaw 2, hermes 1, agy 1.
+
 ### Fixed — dashboard 0.5.32: an OpenClaw agent on a slow office AI is not cut off after 10 minutes (DIVE-7730)
 
 The office chat ran every OpenClaw turn with `openclaw agent --timeout 600`. On a CPU-only office AI the first answer needs ~30 min (OpenClaw's opening prompt is ~12,800 tokens), so every turn ended "OpenClaw could not answer just now". The limit now comes from `DASHBOARD_OPENCLAW_TURN_TIMEOUT_S` (60 to 7200 seconds, else 600). The 5dive CLI exports 1800 for an OpenClaw seat on your own AI.
