@@ -28,7 +28,10 @@ case "$1 $2" in
     [[ "$3" == max ]] || exit 4
     printf '{"ok":true,"data":{"name":"max","type":"%s","channels":"%s"}}\n' "${STUB_TYPE:-claude}" "$(cat "$STUB_CHANNELS")" ;;
   "agent config") echo "${5#channels=}" >"$STUB_CHANNELS" ;;
-  "route ls") [[ -f "$STUB_ROUTED" ]] && echo "teams-max 39999 root" ;;
+  # The match comes FIRST and more lines follow, as on a real box: a reader
+  # that stops at the first hit leaves the rest to SIGPIPE, which pipefail
+  # reads as "not routed" (the live re-run of connect hit exactly that).
+  "route ls") [[ -f "$STUB_ROUTED" ]] && { echo "teams-max 39999 root"; sleep 0.3; echo "teams-zed 39998 root"; } ;;
   "route add") touch "$STUB_ROUTED" ;;
   "route rm") rm -f "$STUB_ROUTED" ;;
 esac

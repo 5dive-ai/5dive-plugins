@@ -93,7 +93,12 @@ _domain() {
   printf '%s' "$d"
 }
 
-_port_free() { ! ss -Hltn "( sport = :$1 )" 2>/dev/null | grep -q .; }
+_port_free() { [[ -z "$(ss -Hltn "( sport = :$1 )" 2>/dev/null)" ]]; }
+# Read the list whole, then match: under pipefail, `route ls | grep -q` reads
+# as "not routed" when grep exits on the first hit and route ls takes SIGPIPE,
+# so a re-run of connect tried to add a route it had already made.
+_has_route() { local out; out=$("$FIVEDIVE_BIN" route ls 2>/dev/null) || true
+  grep -qE "(^|[[:space:]])teams-$1([[:space:]]|$)" <<<"$out"; }
 
 # A stable port per agent (from its uid), moved on only if something else holds it.
 _pick_port() {
@@ -166,7 +171,7 @@ teams_connect() {
     public="${endpoint%/}"
     [[ "$public" == */api/messages ]] || public="$public/api/messages"
   elif domain=$(_domain); then
-    if ! "$FIVEDIVE_BIN" route ls 2>/dev/null | grep -qE "(^|[[:space:]])teams-$agent([[:space:]]|$)"; then
+    if ! _has_route "$agent"; then
       step "Publishing teams-$agent.$domain for this agent's Teams endpoint"
       "$FIVEDIVE_BIN" route add "teams-$agent" --port="$port" >&2 || fail "$E_VALIDATION" "could not publish teams-$agent.$domain"
     fi
@@ -243,7 +248,7 @@ teams_status() {
   if [[ -r "$cfg" ]] && jq -e '.app_id and .tenant_id and .app_password and .port' "$cfg" >/dev/null 2>&1; then
     connected=true
     port=$(jq -r .port "$cfg"); public=$(jq -r '.public_url // empty' "$cfg")
-    ss -Hltn "( sport = :$port )" 2>/dev/null | grep -q . && listening=true
+    [[ -n "$(ss -Hltn "( sport = :$port )" 2>/dev/null)" ]] && listening=true
     curl -fsS -m 3 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && healthy=true
     if [[ -n "$public" ]]; then
       curl -fsS -m 6 "${public%/api/messages}/healthz" >/dev/null 2>&1 && reachable=true || reachable=false
@@ -279,7 +284,7 @@ teams_disconnect() {
     step "Turning off the Teams channel for $agent"
     "$FIVEDIVE_BIN" agent config "$agent" set channels="${next:-none}" >&2 || warn "could not change channels; do it by hand"
   fi
-  if "$FIVEDIVE_BIN" route ls 2>/dev/null | grep -qE "(^|[[:space:]])teams-$agent([[:space:]]|$)"; then
+  if _has_route "$agent"; then
     "$FIVEDIVE_BIN" route rm "teams-$agent" >&2 || warn "could not remove the public name teams-$agent"
   fi
   rm -f "$(_state_dir "$agent")/config.json" "$(_state_dir "$agent")/state.json" "$(_connector "$agent")"
