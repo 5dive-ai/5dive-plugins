@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Added — teams 0.2.0: one Microsoft sign-in makes each agent's Teams contact (DIVE-7831)
+
+`sudo 5dive agent teams connect <agent> --microsoft [--json]` replaces the IT steps on a 5dive cloud server. Not signed in: it starts Microsoft's sign-in and opens the page in the server's own browser (site `login.microsoftonline.com`); the app shows that page to the owner through the usual one-time viewer link. Signed in: it checks that Teams allows custom apps (and names the admin switch if not), makes the agent's Teams bot with Microsoft's `teams` CLI, keeps the secret on the server through `secret write`, connects the agent as before, and prints the **Add to Teams** link (`state=ready`). Asking again returns the same link; a run that made the bot and stopped part-way finishes it instead of making a second one.
+
+- Microsoft's CLI is pinned to 3.0.4 and installed once (`/opt/5dive/teams-cli`, with `libsecret-1-0` so its sign-in persists). Its login stays in `/var/lib/5dive/teams-cli` (0700); the secret file it writes is made 0600 and deleted after.
+- The sign-in waits in its own unit (`5dive-teams-signin`, 15 minutes at most). `cli/ms-signin.mjs` runs the CLI's own sign-in and writes the page address to a file instead of opening a desktop browser; only a `https://login.microsoftonline.com/` address is ever opened.
+- `status --json` now carries `install_link`.
+
+Harness: `sudo bash tests/teams_cli_unit.sh`, 47 arms (29 new): the sign-in starts once and is reused, only Microsoft's page opens, the custom-apps checks stop before anything is made, the bot gets the agent's name and its own address, the secret never reaches argv or output, the second ask makes nothing new.
+
 ### Fixed — telegram 0.5.136, telegram-codex 0.5.49, telegram-grok / telegram-agy 0.5.39, telegram-opencode 0.5.15, telegram-pi 0.1.15: a Telegram poll that gets no answer is cut off and retried, not left hanging for 8 minutes (DIVE-7825)
 
 Box report 748: after a Telegram outage a seat got no messages for about eight minutes, then all five at once. Every bridge built its bot with the client's default 500 s request timeout, and that covered the poll for new messages too. When Telegram stopped answering one poll, it sat for the full 500 s. The poll loop's error handler retries silently, and the heartbeat file beats on its own timer, so nothing showed it.

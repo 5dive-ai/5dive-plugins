@@ -7,8 +7,18 @@
 #   connect <agent> --app-id=<id> --tenant-id=<id> [--endpoint=<https url>]
 #                   [--task=<DIVE-N>] [--name=<shown name>] [--role=<one line>]
 #                   [--allowed-users=<entra object ids>]
+#   connect <agent> --microsoft [--name=<shown name>] [--role=<one line>] [--json]
 #   status <agent>
 #   disconnect <agent>
+#
+# --microsoft (DIVE-7831) does every Microsoft step after ONE sign-in, with
+# Microsoft's own `teams` CLI (pinned, installed once into $MSCLI_PREFIX):
+#   not signed in → starts the sign-in and opens Microsoft's page in the box's own
+#     browser (site login.microsoftonline.com); the app shows it to the owner
+#     through a one-time viewer link. Exit 0 with state=sign_in under --json.
+#   signed in → checks Teams allows custom apps, `teams app create` (bot, secret,
+#     install link), the secret into the connector file, then the steps below,
+#     and prints the agent's "Add to Teams" link (state=ready).
 #
 # What connect does, in order:
 #   1. refuses on a fully offline server (Teams goes through Microsoft's cloud),
@@ -31,6 +41,19 @@ PROVISIONING="${TEAMS_PROVISIONING:-/etc/5dive/provisioning.env}"
 LOCAL_ONLY_FILE="${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}"
 PACKAGES_DIR="${TEAMS_PACKAGES_DIR:-/var/lib/5dive/teams}"
 HOME_ROOT="${AGENT_HOME_ROOT:-/home}"
+# DIVE-7831: Microsoft's teams CLI. Pinned: it is a young tool and its flags and
+# output may change under us. Its login is the box's, kept in MSCLI_HOME (0700).
+MSCLI_VERSION="3.0.4"
+MSCLI_PREFIX="${TEAMS_MSCLI_PREFIX:-/opt/5dive/teams-cli}"
+MSCLI_HOME="${TEAMS_MSCLI_HOME:-/var/lib/5dive/teams-cli}"
+MSCLI_BIN="${TEAMS_MSCLI_BIN:-$MSCLI_PREFIX/bin/teams}"
+MSCLI_DIST="${TEAMS_MSCLI_DIST:-$MSCLI_PREFIX/lib/node_modules/@microsoft/teams.cli/dist}"
+SYSTEMD_RUN="${TEAMS_SYSTEMD_RUN:-systemd-run}"
+SYSTEMCTL="${TEAMS_SYSTEMCTL:-systemctl}"
+SIGNIN_SITE="login.microsoftonline.com"
+SIGNIN_UNIT="5dive-teams-signin"
+SIGNIN_TTL=900
+SIGNIN_WAIT="${TEAMS_SIGNIN_WAIT:-30}"
 PORT_BASE=39100
 PORT_SPAN=800
 
@@ -114,9 +137,12 @@ _pick_port() {
 _cfg_get() { jq -r --arg k "$2" '.[$k] // empty' "$(_state_dir "$1")/config.json" 2>/dev/null || true; }
 
 teams_connect() {
-  local agent="" app_id="" tenant_id="" endpoint="" task="" allowed="" name="" role="" a
+  local a
+  for a in "$@"; do [[ "$a" == --microsoft ]] && { teams_connect_microsoft "$@"; return; }; done
+  local agent="" app_id="" tenant_id="" endpoint="" task="" allowed="" name="" role=""
   for a in "$@"; do
     case "$a" in
+      --json) FIVEDIVE_JSON_MODE=1 ;;
       --app-id=*) app_id="${a#*=}" ;;
       --tenant-id=*) tenant_id="${a#*=}" ;;
       --endpoint=*) endpoint="${a#*=}" ;;
@@ -213,6 +239,8 @@ teams_connect() {
     "$FIVEDIVE_BIN" agent restart "$agent" >/dev/null 2>&1 || warn "restart $agent to load the new settings"
   fi
   teams_audit connect "$agent" "--app-id=$app_id" "--tenant-id=$tenant_id" "--port=$port"
+  # --microsoft made the bot itself and prints its own next step (Add to Teams).
+  [[ "${TEAMS_CONNECT_QUIET:-0}" == 1 ]] && return 0
 
   cat <<EOF
 
@@ -238,16 +266,252 @@ EOF
   echo "  Guide: $TEAMS_PLUGIN_ROOT/docs/IT-GUIDE.md"
 }
 
+# ─── DIVE-7831: --microsoft, one sign-in, then 5dive makes each agent's bot ───
+
+# Microsoft's CLI, as root, with its login kept in MSCLI_HOME. umask 077: `app
+# create --env` writes the bot's secret under the caller's umask (0664 by default).
+_mscli() {
+  ( umask 077
+    HOME="$MSCLI_HOME" XDG_CONFIG_HOME="$MSCLI_HOME/.config" TEAMS_NO_INTERACTIVE=1 \
+      "$MSCLI_BIN" --disable-auto-update "$@" )
+}
+
+_node_ok() {  # Node >= 22.12, which Microsoft's CLI needs
+  local v; v=$(node -p 'process.versions.node' 2>/dev/null) || return 1
+  local maj="${v%%.*}" rest="${v#*.}"; local min="${rest%%.*}"
+  (( maj > 22 || (maj == 22 && min >= 12) ))
+}
+
+# Installed once, pinned. libsecret-1-0: without it the CLI keeps its login in
+# memory only, so every later command is signed out again (measured, DIVE-7828).
+# npm 11 skips keytar's install script unless it is allowed by name.
+_mscli_ensure() {
+  install -d -m 700 "$MSCLI_HOME"
+  "$MSCLI_BIN" --version 2>/dev/null | grep -qF "$MSCLI_VERSION" && return 0
+  _node_ok || fail "$E_VALIDATION" "Microsoft's Teams tool needs Node.js 22.12 or newer on this server: sudo 5dive browser setup installs it"
+  step "Installing Microsoft's Teams tool $MSCLI_VERSION (once)"
+  if ! ldconfig -p 2>/dev/null | grep -q 'libsecret-1\.so\.0'; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q libsecret-1-0 >&2 \
+      || fail "$E_VALIDATION" "could not install libsecret-1-0 (Microsoft's tool needs it to keep its sign-in)"
+  fi
+  install -d -m 755 "$MSCLI_PREFIX"
+  npm install -g --prefix "$MSCLI_PREFIX" --no-fund --no-audit --loglevel=error \
+      --allow-scripts=@azure/msal-node-extensions,keytar "@microsoft/teams.cli@$MSCLI_VERSION" >&2 \
+    || fail "$E_VALIDATION" "could not install Microsoft's Teams tool"
+  "$MSCLI_BIN" --version 2>/dev/null | grep -qF "$MSCLI_VERSION" \
+    || fail "$E_VALIDATION" "Microsoft's Teams tool did not install as version $MSCLI_VERSION"
+}
+
+_signin_url_file() { printf '%s/signin.url' "$MSCLI_HOME"; }
+_signin_waiting() { "$SYSTEMCTL" is-active --quiet "$SIGNIN_UNIT" 2>/dev/null && [[ -s "$(_signin_url_file)" ]]; }
+
+# Only Microsoft's own sign-in page, short enough for the browser's page check.
+_signin_url_ok() {
+  (( ${#1} <= 1000 )) && [[ "$1" =~ ^https://login\.microsoftonline\.com/[^[:space:][:cntrl:]]+$ ]]
+}
+
+# The page in the box's own browser. A person is about to use it, so plain
+# Chrome (--login). No profile yet: `auth` makes one (it opens the front page),
+# then the page we want. Mirrors the browser plugin's own Connect.
+_signin_show() {  # <url> <fresh: 1 = a new sign-in, so whatever tab is open is stale>
+  local url="$1" fresh="$2" e rc=0
+  e=$(mktemp)
+  (( fresh )) && { "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true; }
+  "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --login --url="$url" >/dev/null 2>"$e" || rc=$?
+  if (( rc != 0 )) && grep -q 'no profile for' "$e"; then
+    rc=0; "$FIVEDIVE_BIN" browser auth "$SIGNIN_SITE" >/dev/null 2>"$e" || rc=$?
+    if (( rc == 0 )); then
+      "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true
+      "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --login --url="$url" >/dev/null 2>"$e" || rc=$?
+    fi
+  fi
+  local why; why=$(tail -1 "$e"); rm -f "$e"
+  (( rc == 0 )) || fail "$E_VALIDATION" "this server's browser did not open Microsoft's sign-in: $why"
+}
+
+# Start the waiting sign-in (or reuse the one already waiting) and show its page.
+_signin_start() {
+  local uf url i fresh=0
+  uf=$(_signin_url_file)
+  if ! _signin_waiting; then
+    fresh=1
+    "$SYSTEMCTL" stop "$SIGNIN_UNIT" >/dev/null 2>&1 || true
+    rm -f "$uf"
+    local node; node=$(command -v node) || fail "$E_VALIDATION" "no Node.js on this server"
+    "$SYSTEMD_RUN" --quiet --collect --unit="$SIGNIN_UNIT" -p RuntimeMaxSec="$SIGNIN_TTL" -p UMask=0077 \
+        --setenv=HOME="$MSCLI_HOME" --setenv=XDG_CONFIG_HOME="$MSCLI_HOME/.config" --setenv=TEAMS_NO_INTERACTIVE=1 \
+        "$node" "$TEAMS_PLUGIN_ROOT/cli/ms-signin.mjs" "$MSCLI_DIST" "$uf" >&2 \
+      || fail "$E_VALIDATION" "could not start the Microsoft sign-in"
+    for ((i = 0; i < SIGNIN_WAIT * 4; i++)); do [[ -s "$uf" ]] && break; sleep 0.25; done
+  fi
+  url=$(head -1 "$uf" 2>/dev/null || true)
+  _signin_url_ok "$url" || { "$SYSTEMCTL" stop "$SIGNIN_UNIT" >/dev/null 2>&1 || true; rm -f "$uf"
+    fail "$E_VALIDATION" "Microsoft's sign-in did not start (no sign-in page came back)"; }
+  _signin_show "$url" "$fresh"
+}
+
+# Signed in: the page and the view are no longer needed.
+_signin_close() {
+  [[ -e "$(_signin_url_file)" ]] || return 0
+  "$FIVEDIVE_BIN" browser viewer-revoke "$SIGNIN_SITE" >/dev/null 2>&1 || true
+  "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true
+  "$SYSTEMCTL" stop "$SIGNIN_UNIT" >/dev/null 2>&1 || true
+  rm -f "$(_signin_url_file)"
+}
+
+_ms_say() {  # <state> <agent> [<key> <value>]... — one JSON line, or words
+  local state="$1" agent="$2"; shift 2
+  if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
+    local -a kv=(--arg state "$state" --arg agent "$agent")
+    local f='{state:$state, agent:$agent'
+    while (($# >= 2)); do kv+=(--arg "$1" "$2"); f+=", $1:\$$1"; shift 2; done
+    jq -cn "${kv[@]}" "{ok:true, data:$f}}"
+    return 0
+  fi
+  local -A v=(); while (($# >= 2)); do v[$1]="$2"; shift 2; done
+  case "$state" in
+    sign_in) cat <<EOF
+Sign in with Microsoft to finish. The sign-in page is open in this server's browser.
+In the 5dive app: Connect Microsoft Teams shows it to you. At a terminal, open it with:
+  sudo 5dive browser viewer $SIGNIN_SITE --bind=local
+Then run the same command again.
+EOF
+      ;;
+    blocked) printf '%s\n' "${v[message]}" ;;
+    ready) printf '%s is ready for Microsoft Teams.\n\nAdd to Teams: %s\n' "${v[name]}" "${v[install_link]}" ;;
+  esac
+}
+
+# Merge the Microsoft-made facts into the agent's 0600 config, keeping its owner.
+_cfg_merge() {  # <agent> <jq object>
+  local cfg; cfg="$(_state_dir "$1")/config.json"
+  local tmp; tmp=$(mktemp)
+  jq --argjson add "$2" '. + $add' "$cfg" >"$tmp" && cat "$tmp" >"$cfg"
+  rm -f "$tmp"
+}
+
+teams_connect_microsoft() {
+  local agent="" name="" role="" endpoint="" a
+  for a in "$@"; do
+    case "$a" in
+      --microsoft) ;;
+      --json) FIVEDIVE_JSON_MODE=1 ;;
+      --name=*) name="${a#*=}" ;;
+      --role=*) role="${a#*=}" ;;
+      --endpoint=*) endpoint="${a#*=}" ;;
+      --app-id=*|--tenant-id=*|--task=*)
+        fail "$E_USAGE" "--microsoft makes the bot itself: drop ${a%%=*}" ;;
+      --secret=*|--app-password=*|--client-secret=*)
+        fail "$E_VALIDATION" "the bot's secret is never an argument; --microsoft makes it on this server" ;;
+      -*) fail "$E_USAGE" "unknown flag: $a" ;;
+      *) [[ -z "$agent" ]] && agent="$a" || fail "$E_USAGE" "one agent at a time" ;;
+    esac
+  done
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent teams connect <agent> --microsoft [--name=<shown name>] [--role=<one line>] [--json]"
+  teams_refuse_offline
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent teams connect $agent --microsoft"
+  _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
+  local info; info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
+  [[ "$(jq -r '.type // empty' <<<"$info")" == claude ]] || fail "$E_VALIDATION" "Teams is for Claude Code agents for now"
+  [[ -n "$name" ]] || name="${agent^}"
+
+  # Already in Teams this way: the same link again, nothing new made.
+  local link; link=$(_cfg_get "$agent" install_link)
+  if [[ -n "$link" && -n "$(_cfg_get "$agent" app_id)" ]]; then
+    _signin_close
+    _ms_say ready "$agent" name "$name" install_link "$link"; return 0
+  fi
+  [[ -z "$(_cfg_get "$agent" app_id)" ]] \
+    || fail "$E_VALIDATION" "$agent is already in Teams through your IT's own bot. To switch to the one-sign-in way: sudo 5dive agent teams disconnect $agent, then connect again"
+
+  # Microsoft posts to the agent's public address, so the bot needs it now.
+  local public domain
+  if [[ -n "$endpoint" ]]; then
+    [[ "$endpoint" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || fail "$E_VALIDATION" "--endpoint must be an https:// address"
+    public="${endpoint%/}"; [[ "$public" == */api/messages ]] || public="$public/api/messages"
+  elif domain=$(_domain); then
+    public="https://teams-$agent.$domain/api/messages"
+  else
+    fail "$E_VALIDATION" "this server has no public name for Teams to reach. Give it one with --endpoint=https://<your name>, or use your IT's guide: $TEAMS_PLUGIN_ROOT/docs/IT-GUIDE.md"
+  fi
+
+  _mscli_ensure
+  local st; st=$(_mscli status --json 2>/dev/null | sed -n '/^{/,$p') || st=""
+  if [[ "$(jq -r '.loggedIn // false' <<<"$st" 2>/dev/null)" != true ]]; then
+    _signin_start
+    teams_audit connect "$agent" --microsoft sign_in
+    _ms_say sign_in "$agent" site "$SIGNIN_SITE"
+    [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && return 0
+    exit "$E_AUTH_REQUIRED"
+  fi
+  _signin_close
+
+  # Teams must allow custom apps, or the bot is made and nobody can add it.
+  local tside uside msg=""
+  tside=$(jq -r '.tdp.sideloading.tenant | if . == null then "unknown" else tostring end' <<<"$st" 2>/dev/null || echo unknown)
+  uside=$(jq -r '.tdp.sideloading.user | if . == null then "unknown" else tostring end' <<<"$st" 2>/dev/null || echo unknown)
+  if [[ "$tside" == false ]]; then
+    msg="Your Microsoft 365 does not allow custom apps yet. In the Teams admin center: Teams apps > Manage apps > Actions > Org-wide app settings > turn on Upload custom apps. Then try again."
+  elif [[ "$uside" == false ]]; then
+    msg="Your Teams account may not add custom apps yet. In the Teams admin center: Teams apps > Setup policies > Global > turn on Upload custom apps. Then try again."
+  fi
+  if [[ -n "$msg" ]]; then
+    _ms_say blocked "$agent" reason custom_apps_off message "$msg"
+    [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && return 0
+    exit "$E_PERMISSION"
+  fi
+
+  # Made once. A run that made the bot and then failed later finds this record
+  # (and the secret already in the connector) and does not make a second bot.
+  local made="$MSCLI_HOME/made-$agent.json" app_id tenant_id
+  if [[ ! -s "$made" ]] || ! _read_secret "$agent" >/dev/null; then
+    step "Making $name's Teams bot in your Microsoft 365"
+    local envf out err rc=0
+    envf=$(umask 077; mktemp "$MSCLI_HOME/app-XXXXXX.env")
+    err=$(mktemp)
+    out=$(_mscli app create --name "$name" --endpoint "$public" --env "$envf" --json 2>"$err") || rc=$?
+    out=$(sed -n '/^{/,$p' <<<"$out")
+    if (( rc != 0 )) || ! jq -e '.installLink and .botId' <<<"$out" >/dev/null 2>&1; then
+      rm -f "$envf"
+      local why; why=$(grep -v '^[[:space:]]*$' "$err" | tail -1); rm -f "$err"
+      fail "$E_VALIDATION" "Microsoft did not make the bot: ${why:-no answer}"
+    fi
+    rm -f "$err"
+    local secret
+    app_id=$(sed -n 's/^CLIENT_ID=//p' "$envf" | tail -1 | tr -d "\"'")
+    tenant_id=$(sed -n 's/^TENANT_ID=//p' "$envf" | tail -1 | tr -d "\"'")
+    secret=$(sed -n 's/^CLIENT_SECRET=//p' "$envf" | tail -1)
+    secret="${secret%\"}"; secret="${secret#\"}"
+    shred -u "$envf" 2>/dev/null || rm -f "$envf"
+    [[ -n "$secret" ]] || fail "$E_VALIDATION" "Microsoft made the bot but gave no secret"
+    printf '%s' "$secret" | "$FIVEDIVE_BIN" secret write TEAMS_APP_PASSWORD --connector="teams-$agent" >/dev/null \
+      || fail "$E_VALIDATION" "could not keep the bot's secret on this server"
+    unset secret
+    ( umask 077; jq -c --arg app "$app_id" --arg ten "$tenant_id" \
+        '{install_link:.installLink, teams_app_id:.teamsAppId, bot_id:.botId, app_id:$app, tenant_id:$ten}' <<<"$out" >"$made" )
+  fi
+  app_id=$(jq -r '.app_id // empty' "$made"); tenant_id=$(jq -r '.tenant_id // empty' "$made")
+  link=$(jq -r '.install_link // empty' "$made")
+
+  step "Connecting $name"
+  TEAMS_CONNECT_QUIET=1 teams_connect "$agent" "--app-id=$app_id" "--tenant-id=$tenant_id" \
+    ${endpoint:+"--endpoint=$endpoint"} "--name=$name" ${role:+"--role=$role"} >&2
+  _cfg_merge "$agent" "$(jq -c '{install_link, teams_app_id}' "$made")"
+  rm -f "$made"
+  _ms_say ready "$agent" name "$name" install_link "$link"
+}
+
 teams_status() {
   local agent="${1:-}"
   [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent teams status <agent>"
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
   local dir; dir=$(_state_dir "$agent")
   local cfg="$dir/config.json"
-  local connected=false port="" public="" listening=false healthy=false reachable=unknown chans="" last=""
+  local connected=false port="" public="" listening=false healthy=false reachable=unknown chans="" last="" link=""
   if [[ -r "$cfg" ]] && jq -e '.app_id and .tenant_id and .app_password and .port' "$cfg" >/dev/null 2>&1; then
     connected=true
     port=$(jq -r .port "$cfg"); public=$(jq -r '.public_url // empty' "$cfg")
+    link=$(jq -r '.install_link // empty' "$cfg")
     [[ -n "$(ss -Hltn "( sport = :$port )" 2>/dev/null)" ]] && listening=true
     curl -fsS -m 3 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && healthy=true
     if [[ -n "$public" ]]; then
@@ -258,8 +522,8 @@ teams_status() {
   [[ -r "$dir/messages.log" ]] && last=$(tail -1 "$dir/messages.log" | cut -f1,2)
   if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
     jq -n --arg a "$agent" --argjson c "$connected" --arg p "$port" --arg u "$public" --argjson l "$listening" \
-      --argjson h "$healthy" --arg r "$reachable" --arg ch "$chans" --arg last "$last" \
-      '{ok:true, data:{agent:$a, connected:$c, port:$p, endpoint:$u, listening:$l, healthy:$h, reachable_from_internet:$r, channels:$ch, last_message:$last}}'
+      --argjson h "$healthy" --arg r "$reachable" --arg ch "$chans" --arg last "$last" --arg link "$link" \
+      '{ok:true, data:{agent:$a, connected:$c, port:$p, endpoint:$u, listening:$l, healthy:$h, reachable_from_internet:$r, channels:$ch, last_message:$last, install_link:$link}}'
     return 0
   fi
   echo "agent:      $agent"
@@ -270,6 +534,7 @@ teams_status() {
   echo "listening:  $listening (127.0.0.1:$port, healthy=$healthy)"
   echo "public:     $reachable"
   echo "last:       ${last:-"no message yet"}"
+  [[ -z "$link" ]] || echo "add:        $link"
 }
 
 teams_disconnect() {
@@ -289,6 +554,7 @@ teams_disconnect() {
   fi
   rm -f "$(_state_dir "$agent")/config.json" "$(_state_dir "$agent")/state.json" "$(_connector "$agent")"
   rm -rf "$CONNECTORS_DIR/teams-$agent.d"
+  rm -f "$MSCLI_HOME/made-$agent.json"
   teams_audit disconnect "$agent"
   echo "$agent is off Teams. The secret is deleted from this server. Your IT can remove the app in the Teams admin center and delete the bot's secret in Azure."
 }
@@ -306,6 +572,9 @@ _teams_main() {
 
   sudo 5dive agent teams connect <agent> --app-id=<id> --tenant-id=<id> [--endpoint=<https url>]
                                  [--task=<DIVE-N>] [--name=<shown name>] [--role=<one line>]
+  sudo 5dive agent teams connect <agent> --microsoft [--name=<shown name>] [--role=<one line>] [--json]
+                                 one Microsoft sign-in in this box's browser, then 5dive makes
+                                 the agent's Teams bot and prints its "Add to Teams" link
   5dive agent teams status <agent>
   sudo 5dive agent teams disconnect <agent>
 USAGE
