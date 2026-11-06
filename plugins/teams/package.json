@@ -1,0 +1,13 @@
+{
+  "name": "@5dive/teams-plugin",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": "./server.ts",
+  "scripts": {
+    "start": "test -f /etc/5dive/local-only -a -d node_modules || bun install --no-summary; bun start.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "jose": "^6.0.0"
+  }
+}

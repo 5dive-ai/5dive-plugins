@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# `5dive agent teams …` — put an agent in Microsoft Teams as its own contact
+# (DIVE-7658). Published by the teams plugin; core finds it because plugin.json
+# declares the `teams` verb, and core hands `5dive agent teams <sub>` here as
+# `5dive teams agent <sub>` (same shape as buzz).
+#
+#   connect <agent> --app-id=<id> --tenant-id=<id> [--endpoint=<https url>]
+#                   [--task=<DIVE-N>] [--name=<shown name>] [--role=<one line>]
+#                   [--allowed-users=<entra object ids>]
+#   status <agent>
+#   disconnect <agent>
+#
+# What connect does, in order:
+#   1. refuses on a fully offline server (Teams goes through Microsoft's cloud),
+#      unless its IT opened Teams alone: sudo 5dive config local-only allow teams
+#   2. takes the bot's client secret from /etc/5dive/connectors/teams-<agent>.env,
+#      which only ever arrives through a one-time secret link (or `sudo 5dive
+#      secret write` at a terminal) — never as an argument, never in chat
+#   3. writes the agent's ~/.claude/channels/teams/config.json (0600, the agent's)
+#   4. gives the endpoint a public name: on a 5dive box, teams-<agent>.<box
+#      domain> straight to this box's Caddy; on a self-hosted box, the address
+#      the office's IT forwards (printed)
+#   5. builds the Teams app package (the agent's face, name and role)
+#   6. turns the channel on: `5dive agent config <agent> set channels=…,teams`
+set -euo pipefail
+
+TEAMS_PLUGIN_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+FIVEDIVE_BIN="${TEAMS_5DIVE_BIN:-/usr/local/bin/5dive}"
+CONNECTORS_DIR="${TEAMS_CONNECTORS_DIR:-/etc/5dive/connectors}"
+PROVISIONING="${TEAMS_PROVISIONING:-/etc/5dive/provisioning.env}"
+LOCAL_ONLY_FILE="${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}"
+PACKAGES_DIR="${TEAMS_PACKAGES_DIR:-/var/lib/5dive/teams}"
+HOME_ROOT="${AGENT_HOME_ROOT:-/home}"
+PORT_BASE=39100
+PORT_SPAN=800
+
+readonly E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_AUTH_REQUIRED=6 E_PERMISSION=10
+
+fail() { local c="$1"; shift; echo "error: $*" >&2; exit "$c"; }
+step() { echo "==> $*" >&2; }
+warn() { echo "warn: $*" >&2; }
+
+teams_audit() {
+  [[ $EUID -eq 0 ]] || return 0
+  jq -cn --arg ts "$(date -Iseconds)" --arg u "${SUDO_USER:-${USER:-root}}" --arg c "agent teams" \
+    --args '{ts:$ts, user:$u, cmd:$c, args:$ARGS.positional, via:"teams-plugin"}' -- "$@" 2>/dev/null \
+    | "$FIVEDIVE_BIN" _audit_append >/dev/null 2>&1 || true
+}
+
+# The one line every outside service gives on an offline server. DIVE-7658:
+# the firm's IT may open Teams alone (`sudo 5dive config local-only allow
+# teams` writes `teams` into local-only.allow); everything else stays shut.
+LOCAL_ONLY_ALLOW_FILE="${FIVE_LOCAL_ONLY_ALLOW_FILE:-$(dirname "$LOCAL_ONLY_FILE")/local-only.allow}"
+teams_refuse_offline() {
+  [[ -e "$LOCAL_ONLY_FILE" ]] || return 0
+  grep -qxF teams "$LOCAL_ONLY_ALLOW_FILE" 2>/dev/null && return 0
+  fail "$E_PERMISSION" "Teams goes through Microsoft's cloud, so it is shut on this offline server. Your IT can open it alone: sudo 5dive config local-only allow teams"
+}
+
+_guid_ok() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; }
+_name_ok() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; }
+
+# TEAMS_AGENT_USER: the harness's stand-in for agent-<name> (it cannot create
+# users). Only root runs connect, and root's environment is already root's.
+_agent_user() { printf '%s' "${TEAMS_AGENT_USER:-agent-$1}"; }
+_state_dir()  { printf '%s/agent-%s/.claude/channels/teams' "$HOME_ROOT" "$1"; }
+_connector()  { printf '%s/teams-%s.env' "$CONNECTORS_DIR" "$1"; }
+
+_agent_json() {
+  "$FIVEDIVE_BIN" agent info "$1" --json 2>/dev/null | jq -e '.data // .' 2>/dev/null
+}
+
+# The secret as stored by `secret write`: KEY=value, or KEY_FILE=<path> for a
+# multi-line value. Printed to stdout for the caller to put in the 0600 config.
+_read_secret() {
+  local f; f=$(_connector "$1")
+  [[ -r "$f" ]] || return 1
+  local v; v=$(sed -n 's/^TEAMS_APP_PASSWORD=//p' "$f" | tail -1)
+  if [[ -z "$v" ]]; then
+    local p; p=$(sed -n 's/^TEAMS_APP_PASSWORD_FILE=//p' "$f" | tail -1)
+    [[ -n "$p" && -r "$p" ]] && v=$(head -c 4096 "$p" | tr -d '\n')
+  fi
+  v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
+}
+
+_domain() {
+  local d=""
+  [[ -r "$PROVISIONING" ]] && d=$(sed -n 's/^FIVE_DOMAIN=//p' "$PROVISIONING" | tail -1)
+  d="${d%\"}"; d="${d#\"}"
+  [[ "$d" =~ ^[a-z0-9_]([a-z0-9_.-]*[a-z0-9])?$ && "$d" == *.* ]] || return 1
+  printf '%s' "$d"
+}
+
+_port_free() { [[ -z "$(ss -Hltn "( sport = :$1 )" 2>/dev/null)" ]]; }
+# Read the list whole, then match: under pipefail, `route ls | grep -q` reads
+# as "not routed" when grep exits on the first hit and route ls takes SIGPIPE,
+# so a re-run of connect tried to add a route it had already made.
+_has_route() { local out; out=$("$FIVEDIVE_BIN" route ls 2>/dev/null) || true
+  grep -qE "(^|[[:space:]])teams-$1([[:space:]]|$)" <<<"$out"; }
+
+# A stable port per agent (from its uid), moved on only if something else holds it.
+_pick_port() {
+  local uid; uid=$(id -u "$(_agent_user "$1")")
+  local i p
+  for ((i = 0; i < PORT_SPAN; i++)); do
+    p=$((PORT_BASE + (uid + i) % PORT_SPAN))
+    _port_free "$p" && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+_cfg_get() { jq -r --arg k "$2" '.[$k] // empty' "$(_state_dir "$1")/config.json" 2>/dev/null || true; }
+
+teams_connect() {
+  local agent="" app_id="" tenant_id="" endpoint="" task="" allowed="" name="" role="" a
+  for a in "$@"; do
+    case "$a" in
+      --app-id=*) app_id="${a#*=}" ;;
+      --tenant-id=*) tenant_id="${a#*=}" ;;
+      --endpoint=*) endpoint="${a#*=}" ;;
+      --task=*) task="${a#*=}" ;;
+      --allowed-users=*) allowed="${a#*=}" ;;
+      --name=*) name="${a#*=}" ;;
+      --role=*) role="${a#*=}" ;;
+      --secret=*|--app-password=*|--client-secret=*)
+        fail "$E_VALIDATION" "the bot's secret is never an argument (it would sit in the shell history and the audit log). It arrives through a one-time link: rerun with --task=<DIVE-N>, or at a terminal: sudo 5dive secret write TEAMS_APP_PASSWORD --connector=teams-<agent>" ;;
+      -*) fail "$E_USAGE" "unknown flag: $a" ;;
+      *) [[ -z "$agent" ]] && agent="$a" || fail "$E_USAGE" "one agent at a time" ;;
+    esac
+  done
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent teams connect <agent> --app-id=<id> --tenant-id=<id> [--endpoint=<https url>] [--task=<DIVE-N>]"
+  teams_refuse_offline
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent teams connect $agent …"
+  _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
+  local info; info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
+  local type; type=$(jq -r '.type // empty' <<<"$info")
+  [[ "$type" == claude ]] || fail "$E_VALIDATION" "Teams is for Claude Code agents for now ('$agent' is $type)"
+
+  # Re-running connect keeps what it already knows.
+  [[ -n "$app_id" ]] || app_id=$(_cfg_get "$agent" app_id)
+  [[ -n "$tenant_id" ]] || tenant_id=$(_cfg_get "$agent" tenant_id)
+  _guid_ok "$app_id" || fail "$E_VALIDATION" "--app-id must be the bot's Application (client) ID, a GUID like 00000000-0000-0000-0000-000000000000"
+  _guid_ok "$tenant_id" || fail "$E_VALIDATION" "--tenant-id must be your Microsoft 365 Directory (tenant) ID, a GUID"
+  if [[ -n "$endpoint" ]]; then
+    [[ "$endpoint" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || fail "$E_VALIDATION" "--endpoint must be an https:// address"
+  fi
+
+  local secret
+  if ! secret=$(_read_secret "$agent"); then
+    if [[ -n "$task" ]]; then
+      step "Asking for the bot's client secret through a one-time link (task $task)"
+      "$FIVEDIVE_BIN" task need "$task" --type=secret --secret-key=TEAMS_APP_PASSWORD --connector="teams-$agent" \
+        --ask="Paste the client secret of the Teams bot for $agent (from Azure: the app registration, Certificates & secrets). It goes only to this server." \
+        || fail "$E_AUTH_REQUIRED" "could not open the secret request on $task"
+      echo "Waiting for the secret. When it is in, run the same connect again." >&2
+      exit "$E_AUTH_REQUIRED"
+    fi
+    fail "$E_AUTH_REQUIRED" "the bot's client secret is not on this server yet. Rerun with --task=<DIVE-N> to send a one-time link, or at a terminal: sudo 5dive secret write TEAMS_APP_PASSWORD --connector=teams-$agent"
+  fi
+
+  local user; user=$(_agent_user "$agent")
+  local dir; dir=$(_state_dir "$agent")
+  local port; port=$(_cfg_get "$agent" port)
+  [[ "$port" =~ ^[0-9]+$ ]] || port=$(_pick_port "$agent") || fail "$E_VALIDATION" "no free port in ${PORT_BASE}-$((PORT_BASE + PORT_SPAN - 1))"
+
+  # The public name. Never a 5dive relay: Microsoft posts to this box.
+  local public="" domain="" routed=0
+  if [[ -n "$endpoint" ]]; then
+    public="${endpoint%/}"
+    [[ "$public" == */api/messages ]] || public="$public/api/messages"
+  elif domain=$(_domain); then
+    if ! _has_route "$agent"; then
+      step "Publishing teams-$agent.$domain for this agent's Teams endpoint"
+      "$FIVEDIVE_BIN" route add "teams-$agent" --port="$port" >&2 || fail "$E_VALIDATION" "could not publish teams-$agent.$domain"
+    fi
+    public="https://teams-$agent.$domain/api/messages"
+    routed=1
+  fi
+
+  step "Writing the agent's Teams settings"
+  install -d -o "$user" -g "$(id -gn "$user")" -m 700 "$dir"
+  local tmp; tmp=$(mktemp)
+  jq -n --arg app "$app_id" --arg ten "$tenant_id" --arg pw "$secret" --argjson port "$port" \
+        --arg pub "$public" --arg allowed "$allowed" '
+    {app_id:$app, tenant_id:$ten, app_password:$pw, port:$port}
+    + (if $pub != "" then {public_url:$pub} else {} end)
+    + (if $allowed != "" then {allowed_users: ($allowed | split(",") | map(select(length > 0)))} else {} end)' >"$tmp"
+  install -o "$user" -g "$(id -gn "$user")" -m 600 "$tmp" "$dir/config.json"
+  rm -f "$tmp"
+  unset secret
+
+  step "Building the Teams app package"
+  local avatar pkg
+  # The contact's name and role as people in Teams will see them.
+  [[ -n "$name" ]] || name="${agent^}"
+  avatar="$HOME_ROOT/agent-$agent/.claude/avatar.png"
+  install -d -m 755 "$PACKAGES_DIR"
+  pkg="$PACKAGES_DIR/$agent-teams-app.zip"
+  python3 -I "$TEAMS_PLUGIN_ROOT/cli/package.py" --out="$pkg" --app-id="$app_id" --name="$name" \
+    --role="${role:-AI teammate}" --avatar="$avatar" --endpoint="$public" >&2 \
+    || fail "$E_VALIDATION" "could not build the Teams app package"
+  chmod 644 "$pkg"
+
+  local chans; chans=$(jq -r '.channels // "none"' <<<"$info")
+  if [[ ",$chans," != *",teams,"* ]]; then
+    step "Turning on the Teams channel for $agent (restarts it)"
+    local next; [[ "$chans" == none || -z "$chans" ]] && next=teams || next="$chans,teams"
+    "$FIVEDIVE_BIN" agent config "$agent" set channels="$next" >&2 \
+      || fail "$E_VALIDATION" "could not add the teams channel (this server's 5dive may predate Teams: sudo 5dive self-update)"
+  else
+    "$FIVEDIVE_BIN" agent restart "$agent" >/dev/null 2>&1 || warn "restart $agent to load the new settings"
+  fi
+  teams_audit connect "$agent" "--app-id=$app_id" "--tenant-id=$tenant_id" "--port=$port"
+
+  cat <<EOF
+
+$name is ready for Microsoft Teams.
+
+  App package:  $pkg
+  Endpoint:     ${public:-"(not public yet) forward https://<your name>/api/messages to this server, port $port"}
+$( (( routed )) || printf '  Forward to:   http://127.0.0.1:%s/api/messages on this server (your reverse proxy runs here)\n' "$port")
+
+Next, your IT (one time, about 10 minutes):
+  1. The bot's messaging endpoint = the Endpoint above (Teams Developer Portal >
+     Bot management > the bot > Configure; or Azure Bot > Configuration).
+  2. Teams admin center > Manage apps > Upload new app > the App package above.
+  3. Make it available to the people who should talk to $name.
+EOF
+  if (( ! routed )) && [[ -z "$endpoint" ]]; then
+    cat <<EOF
+  4. Forward the public address to this server: https://<your name>/api/messages
+     -> http://127.0.0.1:$port/api/messages (reverse proxy or DMZ), then rerun
+     connect with --endpoint=https://<your name>.
+EOF
+  fi
+  echo "  Guide: $TEAMS_PLUGIN_ROOT/docs/IT-GUIDE.md"
+}
+
+teams_status() {
+  local agent="${1:-}"
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent teams status <agent>"
+  _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
+  local dir; dir=$(_state_dir "$agent")
+  local cfg="$dir/config.json"
+  local connected=false port="" public="" listening=false healthy=false reachable=unknown chans="" last=""
+  if [[ -r "$cfg" ]] && jq -e '.app_id and .tenant_id and .app_password and .port' "$cfg" >/dev/null 2>&1; then
+    connected=true
+    port=$(jq -r .port "$cfg"); public=$(jq -r '.public_url // empty' "$cfg")
+    [[ -n "$(ss -Hltn "( sport = :$port )" 2>/dev/null)" ]] && listening=true
+    curl -fsS -m 3 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && healthy=true
+    if [[ -n "$public" ]]; then
+      curl -fsS -m 6 "${public%/api/messages}/healthz" >/dev/null 2>&1 && reachable=true || reachable=false
+    fi
+  fi
+  chans=$(_agent_json "$agent" | jq -r '.channels // "none"' 2>/dev/null || echo "?")
+  [[ -r "$dir/messages.log" ]] && last=$(tail -1 "$dir/messages.log" | cut -f1,2)
+  if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
+    jq -n --arg a "$agent" --argjson c "$connected" --arg p "$port" --arg u "$public" --argjson l "$listening" \
+      --argjson h "$healthy" --arg r "$reachable" --arg ch "$chans" --arg last "$last" \
+      '{ok:true, data:{agent:$a, connected:$c, port:$p, endpoint:$u, listening:$l, healthy:$h, reachable_from_internet:$r, channels:$ch, last_message:$last}}'
+    return 0
+  fi
+  echo "agent:      $agent"
+  echo "connected:  $connected"
+  [[ "$connected" == true ]] || { echo "next:       sudo 5dive agent teams connect $agent --app-id=<id> --tenant-id=<id>"; return 0; }
+  echo "channel on: $([[ ",$chans," == *",teams,"* ]] && echo yes || echo "no (channels=$chans)")"
+  echo "endpoint:   ${public:-"(none: forward one to 127.0.0.1:$port)"}"
+  echo "listening:  $listening (127.0.0.1:$port, healthy=$healthy)"
+  echo "public:     $reachable"
+  echo "last:       ${last:-"no message yet"}"
+}
+
+teams_disconnect() {
+  local agent="${1:-}"
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent teams disconnect <agent>"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent teams disconnect $agent"
+  _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
+  local info; info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
+  local chans; chans=$(jq -r '.channels // "none"' <<<"$info")
+  if [[ ",$chans," == *",teams,"* ]]; then
+    local next; next=$(tr ',' '\n' <<<"$chans" | grep -vx teams | paste -sd, -)
+    step "Turning off the Teams channel for $agent"
+    "$FIVEDIVE_BIN" agent config "$agent" set channels="${next:-none}" >&2 || warn "could not change channels; do it by hand"
+  fi
+  if _has_route "$agent"; then
+    "$FIVEDIVE_BIN" route rm "teams-$agent" >&2 || warn "could not remove the public name teams-$agent"
+  fi
+  rm -f "$(_state_dir "$agent")/config.json" "$(_state_dir "$agent")/state.json" "$(_connector "$agent")"
+  rm -rf "$CONNECTORS_DIR/teams-$agent.d"
+  teams_audit disconnect "$agent"
+  echo "$agent is off Teams. The secret is deleted from this server. Your IT can remove the app in the Teams admin center and delete the bot's secret in Azure."
+}
+
+_teams_main() {
+  [[ "${1:-}" == agent ]] && shift
+  local sub="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    connect) teams_connect "$@" ;;
+    status) teams_status "$@" ;;
+    disconnect) teams_disconnect "$@" ;;
+    ""|-h|--help|help)
+      cat >&2 <<'USAGE'
+5dive agent teams — an agent as its own contact in Microsoft Teams (plugin teams@5dive-plugins)
+
+  sudo 5dive agent teams connect <agent> --app-id=<id> --tenant-id=<id> [--endpoint=<https url>]
+                                 [--task=<DIVE-N>] [--name=<shown name>] [--role=<one line>]
+  5dive agent teams status <agent>
+  sudo 5dive agent teams disconnect <agent>
+USAGE
+      [[ -n "$sub" ]] && return 0
+      return "$E_USAGE" ;;
+    *) fail "$E_USAGE" "unknown teams command: $sub (connect|status|disconnect)" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _teams_main "$@"
+fi
