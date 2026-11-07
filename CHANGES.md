@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Fixed — voice 1.11.7: setup fails when the speech engine never starts, instead of saying voice is set up (DIVE-7855)
+
+Bug report 761: the whisper model download hung, nothing answered on :8765, and setup only warned, so the box reported voice as set up and on.
+
+- **`5dive-setup-voice`:** when whisper-service does not answer within 6 minutes, the later steps still run (the model may finish later), then the run exits 1 with the reason and the log. Mirrors 5dive-voice 1.11.7 byte for byte.
+
+Harness: 5dive-voice `tests/quiet-setup.test.sh` (57 arms; the 7 new ones red on 1.11.6).
+
 ### Fixed — telegram 0.5.137: a revoked AI sign-in tells the owner to sign in again, not "Please run /login" (DIVE-7835)
 
 Seen 2026-11-06: a client's Claude sign-in was revoked and every agent answered every message with Claude Code's raw "OAuth token revoked · Please run /login" until the client wrote to support.
