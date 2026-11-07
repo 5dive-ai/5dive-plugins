@@ -42,7 +42,9 @@ import { setTimeout as sleep } from 'timers/promises'
 import { readPayload } from './lib/payload'
 import { readEntries, readEntriesFrom, transcriptSize, analyzeTurn, hadTelegramToolCallAfter } from './lib/transcript'
 import { sendMessage, getToken } from './lib/telegram'
-import { isLite, readLiteLang, readAllowance, liteLimitText, recordOpsDetail, LITE_STRINGS } from './lib/lite'
+import { isLite, readLiteLang, readAllowance, liteLimitText, recordOpsDetail, LITE_STRINGS, liteAccountUrl, readChannelEnv } from './lib/lite'
+import { endedOnSigninRefusal, SIGNIN_NOTICE } from './lib/signin'
+import { inboundLang } from './lib/terms'
 
 // DIVE-5121: on a lite (partner-client) box every line this hook sends is the
 // neutral, localized one, and the technical text goes to ops instead. Default
@@ -274,6 +276,23 @@ if (a.hadSend) process.exit(0)
 // kept relaying `(auto-relay) …` on top of the 👍. A react on an OLDER message
 // does not set reactedNewest and falls through to the relay below, unchanged.
 if (a.reactedNewest) process.exit(0)
+
+// DIVE-7835: the turn ended on Claude Code's own sign-in refusal ("OAuth token
+// revoked · Please run /login"). That is not the agent's answer, and the raw
+// line means nothing to the owner: say the sign-in stopped working and how to
+// sign in again (/login, tappable), in their language. A partner's client has
+// no /login: they sign in again from their account page.
+if (endedOnSigninRefusal(entries)) {
+  const lang = inboundLang(entries) ?? readLiteLang()
+  let markup: unknown = undefined
+  if (LITE) {
+    recordOpsDetail('stop-reply-check', `sign-in refused: ${a.texts.join(' ').slice(0, 200)}`)
+    const accountUrl = liteAccountUrl(readChannelEnv('TELEGRAM_ACCOUNT_URL'))
+    if (accountUrl) markup = { inline_keyboard: [[{ text: LITE_STRINGS[lang].accountButton, url: accountUrl }]] }
+  }
+  await sendMessage(chatId, SIGNIN_NOTICE[LITE ? 'client' : 'owner'][lang], threadId, markup)
+  process.exit(0)
+}
 
 // No reply/edit_message this turn. If the agent produced transcript text,
 // it "talked to the transcript instead of replying" — relay it.

@@ -81,6 +81,7 @@ import { unsendableAudio, isAudioFile, voiceFailedNote, voiceFailedError } from 
 import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { questionLabel } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
+import { authStartArgv, LOGIN_ADMIN_TIER } from './hooks/lib/signin'
 import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
@@ -3732,8 +3733,9 @@ type AuthState = { state?: string; url?: string; code?: string; error?: string; 
 
 // Thin wrappers over `sudo -n 5dive agent auth …`. read5diveJson fail-softs to
 // null and re-parses stdout on non-zero exit.
-async function authStart(type: string): Promise<{ sessionId?: string; error?: string }> {
-  const j = await read5diveJson(['agent', 'auth', 'start', type, '--json'], 15000)
+// DIVE-7835: the seat's own account (authStartArgv), so a revoked one is what gets signed in again.
+async function authStart(type: string, authProfile?: string): Promise<{ sessionId?: string; error?: string }> {
+  const j = await read5diveJson(authStartArgv(type, authProfile), 15000)
   if (j?.ok && j.data?.sessionId) return { sessionId: String(j.data.sessionId) }
   return { error: j?.error?.message ?? 'auth start failed' }
 }
@@ -4555,7 +4557,9 @@ const commandHandlers: Record<string, CommandHandler> = {
       return
     }
     const agents = await read5diveJson(['agent', 'list', '--json'])
-    const type = agentTypeOf(agents?.ok && Array.isArray(agents.data) ? agents.data : null, me)
+    const list: FiveDiveAgentEntry[] | null = agents?.ok && Array.isArray(agents.data) ? agents.data : null
+    const type = agentTypeOf(list, me)
+    const authProfile = list?.find(a => a.name === me)?.authProfile
     if (!type) {
       await ctx.reply(`Couldn't detect your coding-CLI type — try the dashboard or \`5dive agent auth\`.`)
       return
@@ -4569,7 +4573,7 @@ const commandHandlers: Record<string, CommandHandler> = {
     }
     const chatId = String(ctx.chat!.id)
     await ctx.reply(`🔐 Starting ${type} login…`)
-    const started = await authStart(type)
+    const started = await authStart(type, authProfile)
     if (!started.sessionId) {
       await ctx.reply(`Couldn't start login: ${started.error}. Try again in a moment.`)
       return
@@ -5613,7 +5617,9 @@ for (const def of COMMAND_REGISTRY) {
     // one admin-tier message, before anything runs. The seat is read only for
     // such a command, and 'unknown' runs the handler as before.
     if (standardSeatRoute(def.name, String(ctx.match ?? '')) === 'admin' && (await seatTier()) === 'no') {
-      await ctx.reply(adminTierText(liteLang(ctx.from?.language_code)))
+      // DIVE-7835: /login is what the sign-in notice tells the owner to tap, so it says where to sign in instead.
+      const lang = liteLang(ctx.from?.language_code)
+      await ctx.reply(def.name === 'login' ? LOGIN_ADMIN_TIER[lang] : adminTierText(lang))
       return
     }
     await handler(ctx, gate)

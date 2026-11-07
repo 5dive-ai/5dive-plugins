@@ -28,6 +28,7 @@ import { wallRotate, readActiveAccount, type Run } from './lib/wall-rotate'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
 import { inboundLang, TERMS_NOTICE } from './lib/terms'
 import { classifyFailure, failureMessage, resolveResetEpoch, CREDIT_NOTICE } from './lib/failure'
+import { endedOnSigninRefusal, isSigninPayload, SIGNIN_NOTICE } from './lib/signin'
 import { RESUME_LOCK_TTL_MS, resumeLogDir as makeResumeLogDir, tryAcquireResumeLock } from './lib/resume-lock'
 import { onDemoAccount, readDemoKey, isKeyLimitText, claimDemoNotice, releaseDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
 
@@ -78,6 +79,11 @@ const isTermsNotAccepted = kind.isTermsNotAccepted
 const isOutOfCredit = kind.isOutOfCredit
 let isRateLimit = kind.isRateLimit
 let isTransientApiError = kind.isTransientApiError
+// DIVE-7835: the account turned the turn away for its sign-in (revoked or
+// expired). Not a limit, not a blip: nothing clears it but signing in again.
+const isSigninRefused =
+  !isTermsNotAccepted && !isOutOfCredit && !isRateLimit && !isTransientApiError &&
+  (isSigninPayload(payload) || endedOnSigninRefusal(entries))
 
 // Memoized active-account cache for resolveActiveAccount(). Declared here at
 // module top — NOT next to its function below — because resolveActiveAccount is
@@ -157,6 +163,9 @@ if (isTermsNotAccepted) {
   } else {
     text = 'Usage limit hit — waiting for reset.'
   }
+} else if (isSigninRefused) {
+  // DIVE-7835: never the raw "Please run /login"; /login here signs in this agent's own account.
+  text = SIGNIN_NOTICE.owner[inboundLang(entries) ?? readLiteLang()]
 } else if (isTransientApiError) {
   // Transient server-side blip — an Overloaded/5xx, or a 429 "temporarily
   // limiting requests" that's explicitly NOT a usage limit. It self-clears on
@@ -198,6 +207,13 @@ if (LITE && isTermsNotAccepted) {
   // the raw 402 stays in the ops log.
   recordOpsDetail('stopfailure', `out of AI credit: ${msg}`)
   text = CREDIT_NOTICE.client[readLiteLang()]
+} else if (LITE && isSigninRefused) {
+  // DIVE-7835: the client signs in again from their account page (no /login there).
+  recordOpsDetail('stopfailure', `sign-in refused: ${msg}`)
+  const lang = readLiteLang()
+  text = SIGNIN_NOTICE.client[inboundLang(entries) ?? lang]
+  const accountUrl = liteAccountUrl(readChannelEnv('TELEGRAM_ACCOUNT_URL'))
+  if (accountUrl) markup = { inline_keyboard: [[{ text: LITE_STRINGS[lang].accountButton, url: accountUrl }]] }
 } else if (LITE) {
   recordOpsDetail('stopfailure', text)
   const lang = readLiteLang()
@@ -342,7 +358,7 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
 // respawn storm collapses to one DM per cooldown window. Kept message-independent
 // (like the usage-limit key already was): distinct errors of the same kind within
 // the window collapse — an acceptable tradeoff against a 550-message storm.
-const notifyKind = isTermsNotAccepted ? 'terms' : isOutOfCredit ? 'credit' : isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : 'stop'
+const notifyKind = isTermsNotAccepted ? 'terms' : isOutOfCredit ? 'credit' : isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : isSigninRefused ? 'signin' : 'stop'
 let shouldSend = true
 {
   const dir = resumeLogDir || makeResumeLogDir()
