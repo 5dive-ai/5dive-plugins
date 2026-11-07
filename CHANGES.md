@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.137: a revoked AI sign-in tells the owner to sign in again, not "Please run /login" (DIVE-7835)
+
+Seen 2026-11-06: a client's Claude sign-in was revoked and every agent answered every message with Claude Code's raw "OAuth token revoked · Please run /login" until the client wrote to support.
+
+- **`hooks/lib/signin.ts`:** a turn that ended on Claude Code's own sign-in refusal (an API-error message saying the OAuth token was revoked or expired, "Not logged in", "Please run /login", or `authentication_failed`) is a sign-in, not an answer. An invalid API key or an empty balance is not; the agent's own words never are.
+- **Stop hook:** that turn is no longer auto-relayed. The chat gets one line in the owner's language: the sign-in stopped working, tap /login to sign in again. A partner's client (lite) is told to sign in again on their account page, with the account button.
+- **StopFailure hook:** the same line replaces "The agent stopped with an error: …", deduplicated per episode under its own kind (`signin`).
+- **/login** now signs in the account the agent is bound to (`agent auth start <type> --auth-profile=<it>`); before, it signed in the box default and a seat on its own revoked account stayed revoked. On a standard-tier seat it says where to sign in instead of only "needs an admin-tier agent".
+
+Harness: `bun test test/dive7835-signin-notice.test.ts`, 13 tests (8 drive the real hooks against a Bot API stub).
+
 ### Added — dashboard 0.5.34: Pi and OpenCode agents answer in the 5dive app chat (DIVE-7348)
 
 A Pi or OpenCode agent can now be chatted with from 5dive.app. Neither runtime runs an MCP server for a channel (and on a Telegram seat the Telegram bridge is the seat's main process), so the dashboard server runs beside the seat (`server.ts --runtime=pi|opencode`, started by 5dive-agent-start as for OpenClaw) and **`clidispatch.ts`** answers each message with one headless turn of the seat's own CLI, always in the web chat's own session:
