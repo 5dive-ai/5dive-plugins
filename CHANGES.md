@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Added — devteam 0.4.0: the daily proof publish also writes the review loop, `verifier.json` (DIVE-7863)
+
+The /team page gets a second live chart: how often one agent's work is sent back by the agent that reviews it. It reads a new file on the same public `status` branch, written in the same commit as the badge.
+
+- **`proof publish` → `_proof_review_build`:** per day, for the 30 whole days before the publish date, each shipped task counts once on the day of its last `task.done`: reviewed (graded or sent back), passed first review, or sent back at least once. A merge conflict after a pass is not a send-back. Plus the window totals, including every task shipped, reviewed or not.
+- **Why it was sent back:** one fixed category per send-back (failing tests, unclear writing, no proof it works, clashes with newer work, not what was asked, safety or privacy, other), by rule from the reviewer's finding. No preserved finding or no rule hit is "other". Only the category leaves the box: never the feedback text, a title or an ident.
+- A failure in this block never stops the badge; `verifier.json` keeps its old `date` and the page hides a stale one.
+
+Harness: `tests/devteam/proof_review_unit.sh`, 18 arms, including a negative control (a finding that carries a title and an ident comes out only as its category; a leak mutation turns 6 arms red).
+
 ### Fixed — voice 1.11.7: setup fails when the speech engine never starts, instead of saying voice is set up (DIVE-7855)
 
 Bug report 761: the whisper model download hung, nothing answered on :8765, and setup only warned, so the box reported voice as set up and on.

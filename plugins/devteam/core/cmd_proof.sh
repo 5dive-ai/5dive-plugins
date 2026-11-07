@@ -857,6 +857,9 @@ pathlib.Path("README.md").write_text(
     "- `badge.json` is what the README badge renders (shields.io endpoint schema)\n"
     "- `zero-human.json` is the full current datapoint\n"
     "- `history.jsonl` is every daily datapoint, append-only\n"
+    "- `verifier.json` is the review loop: per day, tasks a second agent checked, "
+    "how many passed the first check and how many were sent back first, plus why "
+    "(fixed categories only, never the reviewer's words)\n"
 )
 print(f"{today} ({_win_label}: {w_ship} shipped, {w_ask} {ask_word})")
 PROOFPY
@@ -865,6 +868,12 @@ PROOFPY
   set -e
   [ "$rc" -eq 3 ] && return 3
   [ "$rc" -eq 0 ] || return "$rc"
+
+  # DIVE-7863: the review loop, published beside the badge in the same commit.
+  # A failure here never blocks the badge: verifier.json is simply not rewritten,
+  # its own `date` goes stale, and the page hides a stale block rather than show it.
+  _proof_review_build "$today" "$now_iso" "$win_days" \
+    || echo "proof: verifier.json not refreshed (the badge still publishes)" >&2
 
   git add -A
   if git diff --cached --quiet; then echo "no changes"; return 0; fi
@@ -886,6 +895,145 @@ PROOFPY
   git push --quiet origin "$branch" || return "$E_GENERIC"
   echo "$summary"
   return 0
+}
+
+# _proof_review_build <today> <now_iso> <win_days> — DIVE-7863. Writes
+# verifier.json in the cwd (the status-branch checkout) from the task board's
+# lifecycle_events, read-only:
+#   - each task counts ONCE, on the UTC day of its last `task.done`, over the
+#     <win_days> whole days BEFORE <today> (no half-day bar at 02:00 UTC);
+#   - reviewed  = it had a `task.graded` or `task.rejected` before that done;
+#   - sentBack  = it had a real `task.rejected` (a merge conflict after a PASS is
+#     the merger's bounce, not a quality finding, and is not counted);
+#   - firstTry  = reviewed and never sent back.
+# The reasons are one fixed category per real send-back, classified by rule from
+# the FINDING half of that bounce's preserved "rejected (iteration N): …" line;
+# a bounce with no matching line, or no rule hit, is "other". Only the category
+# slug leaves this box: never the feedback text, a title or an ident (the
+# 2026-10-13 co-sign leak). Unit harness: tests/devteam/proof_review_unit.sh,
+# which extracts the REVIEWPY block below.
+_proof_review_build() {
+  local today="$1" now_iso="$2" win_days="$3"
+  [ -n "${TASKS_DB:-}" ] && [ -r "$TASKS_DB" ] || { echo "proof: no readable task board at '${TASKS_DB:-}'" >&2; return 1; }
+  REVIEW_DB="$TASKS_DB" TODAY="$today" NOW_ISO="$now_iso" WINDOW_DAYS="$win_days" \
+    METHODOLOGY_URL="$_PROOF_METHODOLOGY_URL" \
+    python3 <<'REVIEWPY'
+import collections, datetime, json, os, pathlib, re, sqlite3
+
+today = datetime.date.fromisoformat(os.environ["TODAY"])
+win = int(os.environ["WINDOW_DAYS"])
+start = today - datetime.timedelta(days=win)
+end = today - datetime.timedelta(days=1)
+db = sqlite3.connect("file:" + os.environ["REVIEW_DB"] + "?mode=ro", uri=True)
+
+MERGE_AFTER_PASS = "%merge conflict after a PASS%"
+rows = db.execute("""
+WITH done AS (
+  SELECT ident, MAX(ts) AS done_ts FROM lifecycle_events
+  WHERE kind = 'task.done' AND ident IS NOT NULL
+  GROUP BY ident
+  HAVING date(MAX(ts)) BETWEEN :start AND :end)
+SELECT d.ident, date(d.done_ts),
+  EXISTS (SELECT 1 FROM lifecycle_events e WHERE e.ident = d.ident
+          AND e.kind IN ('task.graded', 'task.rejected') AND e.ts <= d.done_ts),
+  (SELECT group_concat(COALESCE(CAST(substr(e.detail, instr(e.detail, 'at iteration ') + 13) AS INTEGER), 0), ',')
+     FROM lifecycle_events e WHERE e.ident = d.ident AND e.kind = 'task.rejected'
+     AND e.ts <= d.done_ts AND COALESCE(e.detail, '') NOT LIKE :mc)
+FROM done d
+""", {"start": start.isoformat(), "end": end.isoformat(), "mc": MERGE_AFTER_PASS}).fetchall()
+
+# Fixed categories, first rule that matches wins. Order matters: the narrow,
+# unambiguous ones go first so a FINDING that says "tests fail because it
+# conflicts with main" lands on the conflict, not the symptom.
+CATEGORIES = [
+    ("conflict", "Clashes with newer work",
+     r"MERGE CONFLICT|merge conflict|conflicts? with|rebase|no longer merges|not mergeable|behind main|stale (base|head)"),
+    ("safety", "Safety or privacy",
+     r"leak|secret|privacy|private|unsafe|security|credential|injection"),
+    ("writing", "Unclear writing",
+     r"rubric|copy[- ]grade|lodar\.sh|lint\.sh|DRAFT-SHA|wording|reads? (as|like)|wall of text|3-second"),
+    ("tests", "Failing tests",
+     r"\btests? (fail|red)|\bred\b|CI (is )?(red|fail)|failing|\bFAIL\b|fails?\b|harness|mutation|not green|exit(s|ed)? [1-9]|rc [1-9]"),
+    ("proof", "No proof it works",
+     r"screenshot|evidence|proof|unverified|not (shown|verified|measured|run)|no live|live arm|cannot verify|can't verify|preview"),
+    ("ask", "Not what was asked",
+     r"criteri|acceptance|\bask\b|\bspec\b|does not|doesn't|did not|missing|wrong|instead of|still (prints|shows|says)|not (met|done|fixed|delivered)|expected|should"),
+]
+OTHER = ("other", "Other")
+LINE = re.compile(r"❌ \S+ rejected \(iteration (\d+)\): (.*)")
+
+def classify(feedback):
+    finding = feedback.split("FIX:")[0]
+    for slug, _label, pattern in CATEGORIES:
+        if re.search(pattern, finding, re.I):
+            return slug
+    return OTHER[0]
+
+days = {}
+d = start
+while d <= end:
+    days[d.isoformat()] = {"date": d.isoformat(), "reviewed": 0, "firstTry": 0, "sentBack": 0}
+    d += datetime.timedelta(days=1)
+reasons = collections.Counter()
+shipped = send_backs = 0
+for ident, day, reviewed, iterations in rows:
+    shipped += 1
+    if not reviewed or day not in days:
+        continue
+    bucket = days[day]
+    bucket["reviewed"] += 1
+    if not iterations:
+        bucket["firstTry"] += 1
+        continue
+    bucket["sentBack"] += 1
+    text = "\n".join(db.execute(
+        "SELECT COALESCE(body, '') || char(10) || COALESCE(result, '') FROM tasks WHERE ident = ?",
+        (ident,)).fetchone() or ("",))
+    by_iteration = collections.defaultdict(list)
+    seen = set()
+    for m in LINE.finditer(text):
+        key = (m.group(1), m.group(2)[:200])
+        if key not in seen:
+            seen.add(key)
+            by_iteration[int(m.group(1))].append(m.group(2))
+    for it in iterations.split(","):
+        send_backs += 1
+        lines = by_iteration.get(int(it or 0))
+        reasons[classify(lines.pop(0)) if lines else OTHER[0]] += 1
+
+day_list = list(days.values())
+totals = {
+    "shipped": shipped,
+    "reviewed": sum(x["reviewed"] for x in day_list),
+    "firstTry": sum(x["firstTry"] for x in day_list),
+    "sentBack": sum(x["sentBack"] for x in day_list),
+    "sendBacks": send_backs,
+}
+out = {
+    "date": today.isoformat(),
+    "generatedAtUtc": os.environ["NOW_ISO"],
+    "window": {"days": win, "from": start.isoformat(), "to": end.isoformat(),
+               "basis": "each task counts once, on the UTC day of its last task.done; the window is the whole days before the publish date"},
+    "totals": totals,
+    "days": day_list,
+    "reasons": {
+        "basis": "one fixed category per send-back, by rule from the reviewer's finding; no match or no preserved finding = other. Sums to totals.sendBacks.",
+        "total": sum(reasons.values()),
+        "categories": [{"key": k, "label": label, "count": reasons.get(k, 0)}
+                       for k, label, _p in CATEGORIES] + [{"key": OTHER[0], "label": OTHER[1], "count": reasons.get(OTHER[0], 0)}],
+    },
+    "definitions": {
+        "reviewed": "a second agent graded or sent back the task before it shipped",
+        "firstTry": "reviewed, never sent back",
+        "sentBack": "sent back to its builder at least once (a merge conflict after a pass does not count)",
+        "shipped": "every task shipped in the window, reviewed or not; small routine tasks skip review",
+    },
+    "methodology": os.environ.get("METHODOLOGY_URL", ""),
+}
+assert out["reasons"]["total"] == totals["sendBacks"]
+assert totals["reviewed"] == totals["firstTry"] + totals["sentBack"]
+pathlib.Path("verifier.json").write_text(json.dumps(out, indent=2) + "\n")
+REVIEWPY
 }
 
 # _proof_publish [--dry-run] [--repo=<url>] [--branch=<b>] — one-shot publish.
