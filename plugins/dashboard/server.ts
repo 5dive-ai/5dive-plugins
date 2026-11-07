@@ -39,6 +39,7 @@ import { API_BASE_FILE_DEFAULT, readApiBaseFile, resolveApiBase } from './apibas
 import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
 import { AGY_DEFAULT_TIMINGS, startAgyDispatcher } from './agydispatch.ts'
 import { openclawTurn, openclawTurnTimeoutS, startOpenclawDispatcher } from './openclawdispatch.ts'
+import { cliTurn, cliTurnTimeoutS, startCliDispatcher } from './clidispatch.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
 import { replyTool, voicePlan, voiceSkippedNote, voiceFailedOnce } from './voicereply.ts'
@@ -81,14 +82,22 @@ const OPENCLAW = RUNTIME === 'openclaw'
 // ~/.gemini/config/mcp_config.json and answers through the reply tool;
 // agydispatch.ts types each message into agy's pane.
 const AGY = RUNTIME === 'antigravity'
+// DIVE-7348: a Pi or OpenCode seat. Like OpenClaw, the start script runs this
+// server beside the seat, and clidispatch.ts answers each message with one
+// headless `pi -p` / `opencode run` turn in the web chat's own session.
+const PI = RUNTIME === 'pi'
+const OPENCODE = RUNTIME === 'opencode'
+const CLI_RUNTIME = PI || OPENCODE
 // Grok may hand an MCP server a trimmed environment; the seat name comes from USER.
-if ((GROK || HERMES || OPENCLAW || AGY) && !process.env.USER) process.env.USER = userInfo().username
-const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'dashboard' || GROK || HERMES || OPENCLAW || AGY
+if ((GROK || HERMES || OPENCLAW || AGY || CLI_RUNTIME) && !process.env.USER) process.env.USER = userInfo().username
+const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'dashboard' || GROK || HERMES || OPENCLAW || AGY || CLI_RUNTIME
 const DISPATCHER_STATE_DIR = process.env.CODEX_DISPATCHER_STATE_DIR
   ?? (GROK ? join(homedir(), '.grok', 'channels', 'dashboard-dispatcher')
     : AGY ? join(homedir(), '.gemini', 'channels', 'dashboard-dispatcher')
     : HERMES ? join(homedir(), '.hermes', 'channels', '5dive')
     : OPENCLAW ? join(homedir(), '.openclaw', 'channels', '5dive')
+    : PI ? join(homedir(), '.pi', 'channels', '5dive')
+    : OPENCODE ? join(homedir(), '.opencode', 'channels', '5dive')
     : join(homedir(), '.codex', 'channels', 'dispatcher'))
 const DISPATCHER_INBOX_DIR = join(DISPATCHER_STATE_DIR, 'inbox')
 const DISPATCHER_OUTBOX_DIR = join(DISPATCHER_STATE_DIR, 'outbox', 'dashboard')
@@ -1614,6 +1623,25 @@ if (!DISPATCHER_ADAPTER) {
       ...(process.env.DASHBOARD_OPENCLAW_RETRY_MS ? { retryMs: Number(process.env.DASHBOARD_OPENCLAW_RETRY_MS) } : {}),
     })
   }
+} else if (CLI_RUNTIME) {
+  // No MCP parent here either: the seat's start script supervises this process.
+  const runtime = PI ? 'pi' : 'opencode'
+  process.stderr.write(`dashboard channel: ${runtime} web chat bridge active (DIVE-7348), spool ${DISPATCHER_STATE_DIR}\n`)
+  startDispatcherOutbox()
+  startCliDispatcher({
+    runtime,
+    inboxDir: DISPATCHER_INBOX_DIR,
+    outboxDir: DISPATCHER_OUTBOX_DIR,
+    run: cliTurn({
+      runtime,
+      bin: process.env.DASHBOARD_CLI_BIN ?? `/home/claude/.local/bin/${runtime}`,
+      stateDir: DISPATCHER_STATE_DIR,
+      // The seat's work folder (5dive-agent-start exports it), so a turn works where the seat does.
+      cwd: process.env.DASHBOARD_AGENT_WORKDIR || process.cwd(),
+      timeoutS: cliTurnTimeoutS(process.env.DASHBOARD_CLI_TURN_TIMEOUT_S),
+      log: line => process.stderr.write(line + '\n'),
+    }),
+  })
 } else {
   process.stderr.write('dashboard channel: app-server dispatcher adapter active; native MCP delivery is not running\n')
   startDispatcherOutbox()
