@@ -132,6 +132,11 @@ export FIVEDIVE_BROWSER_CLI="$TMP/no-5dive-cli"
 export FIVEDIVE_BROWSER_TMP_ROOT="$TMP/tmproot"
 export FIVEDIVE_BROWSER_AUTO_PROPOSE=0 FIVEDIVE_BROWSER_DRIFT_ON_PROBE=0 FIVEDIVE_BROWSER_EVICT_ON_PROBE=0
 export FIVEDIVE_BROWSER_APPROVAL_POLICY="$TMP/no-policy.json"
+# DIVE-7972: every capture writes a page-read mark into the approval dir, and a
+# mark under 30 min old turns publish and send to ask. Left on the default, that
+# dir is the runner's real home, so an earlier harness's captures (CI runs
+# browser_plugin_unit.sh first) made R5's declared publish ask. Keep it here.
+export FIVEDIVE_BROWSER_APPROVAL_DIR="$TMP/approvals"
 export FIVEDIVE_BROWSER_CONNECT_PRIV="$TMP/fake-connect"
 # NO ARM REACHES REAL SUDO for an on-demand serve (DIVE-5389). The R9b arms
 # point this at the plugin itself; everywhere else it is absent.
