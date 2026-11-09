@@ -1,0 +1,17 @@
+{
+  "description": "5dive teams plugin (DIVE-7976): a member's risky ask (root, paying, deleting, sending outside the firm, settings, keys, access) waits for an admin's yes on Teams.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/role-guard.ts",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

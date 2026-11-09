@@ -9,6 +9,16 @@ On a partner box (`TELEGRAM_PROFILE=lite`) the DIVE-5993 notice (a Claude Team/E
 
 Checked: `bun test test/dive8012-lite-org-policy-notice.test.ts`: 23 pass; 19 of them red on the previous release. Dropping `LITE` at the call site turns the wiring arm red.
 
+### Added — teams 0.3.0: admins and members on an office box (DIVE-7976)
+
+Everyone a firm let in on Teams was equal, so any employee could tell an agent with sudo, logins and the Vault to do anything. Now each person is an **admin** (the owner and the people IT names) or a **member** (everyone else let in).
+
+- **The role comes from the channel (`roles.ts`):** the server looks the sender's Entra object id up in the box's roles file (`/etc/5dive/roles.json`, root's, 0644; ids keyed `teams:<id>`, `telegram:<id>`) and puts `sender_role=admin|member` on the inbound tag, the field DIVE-7972 named. Message text and display names never change it.
+- **A member's risky ask waits for an admin (`hooks/role-guard.ts`):** a PreToolUse hook holds root, paying, deleting, sending outside the firm, and changing settings, keys or access while the newest Teams message (30 min) is a member's. Its reason tells the agent to use the new `ask_admin` tool, which sends each admin who has chatted with it an Approve / Decline card. An admin's Approve is a message from an admin, so the held call then goes through; a Decline keeps the hold. The member is never asked. Ordinary work passes untouched.
+- **The verb:** `sudo 5dive agent teams admins add|remove <Entra object id>`, `admins check on|off` (off = everyone equal again), `admins members-may <kinds|none>` to widen; `5dive agent teams admins` lists. No new service, no cloud login: it works on an offline box.
+
+Checked: `bun test ./test/dive7976-teams-roles.test.ts`, 14 tests, the hook run as a real process; a mutant that makes every sender admin turns 6 red. `sudo bash tests/teams_admins_unit.sh`, 17 arms; a mutant with the root check removed turns 1 red. `sudo bash tests/teams_cli_unit.sh` 48/48 and `bun test ./test/teams-plugin.test.ts` 32/32 unchanged.
+
 ### Fixed — browser 1.32.3: a login view's stop waits out its cap on Ubuntu 26.04 (DIVE-7978)
 
 Plugins main read red on `fork parity` from 2026-11-07: T49e's stop left after ~0.6 s instead of waiting out its 1 s cap. The same commit was green on GitHub's ubuntu-24.04 runner and red on ubuntu-26.04.
