@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.140: a partner client's org-policy notice names their cabinet, not 5dive (DIVE-8012)
+
+On a partner box (`TELEGRAM_PROFILE=lite`) the DIVE-5993 notice (a Claude Team/Enterprise org with chat channels off) goes straight to the partner's client. Its last line told them to switch accounts «на странице агента в панели 5dive», a dashboard they do not have.
+
+- **`orgpolicy.ts`:** `orgPolicyText(name, lang, lite)`. On lite the way-out line says it is done in the cabinet, in the agent's settings («Это делается в кабинете, в настройках агента …» / "You do that from your account page, in …'s settings"). Step 5 keeps `/restart`: the lite bridge runs it itself, with no model turn. The settings JSON is unchanged and still lists `5dive-plugins`, since the org's list must name it.
+- **`server.ts`:** the notice passes `LITE`. The default profile's text is byte-identical (six shas pinned from the previous release, ru and en).
+
+Checked: `bun test test/dive8012-lite-org-policy-notice.test.ts`: 23 pass; 19 of them red on the previous release. Dropping `LITE` at the call site turns the wiring arm red.
+
 ### Added — teams 0.5.0 + telegram 0.5.139: a new person knocks; the owner lets them in from Telegram (DIVE-8036)
 
 A Teams connection whose config says `access: "knock"` (every NEW `5dive agent teams connect`, and `5dive people sync`) no longer lets the whole tenant write. A message from someone not on `allowed_users` (and not an admin in `/etc/5dive/roles.json`) never reaches the agent:

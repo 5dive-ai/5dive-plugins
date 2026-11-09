@@ -22,6 +22,13 @@
 // when there is none. claude.ai and the 5dive dashboard have no Russian
 // interface, so their menu names stay English, in quotes. The agent's name is
 // in quotes too: Russian would decline it otherwise.
+//
+// DIVE-8012: on a partner client's box (TELEGRAM_PROFILE=lite) the bot talks to
+// the partner's client, who has never heard of 5dive and has no 5dive dashboard.
+// The way-out line points at the partner's cabinet instead («в кабинете», as
+// lite.ts says for the limit). Step 5 stays: /restart is one of the lite
+// bridge's own commands and runs without a model turn. The settings JSON keeps
+// marketplace 5dive-plugins on every profile: the org's list must name it.
 
 import { existsSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -57,7 +64,8 @@ export function orgPolicyButton(lang: Lang = 'en'): string {
 }
 
 // HTML (parse_mode) so the JSON sits in a code block Telegram offers to copy.
-export function orgPolicyText(name: string, lang: Lang = 'en'): string {
+// `lite` is the box's profile (server.ts passes LITE); false is the text as it was.
+export function orgPolicyText(name: string, lang: Lang = 'en', lite = false): string {
   if (lang === 'ru') {
     const n = html(name.trim())
     const agent = n ? `агент «${n}»` : 'ваш агент'
@@ -73,7 +81,9 @@ export function orgPolicyText(name: string, lang: Lang = 'en'): string {
         `5. Перезапустите ${of}: отправьте сюда /restart.`,
       ].join('\n'),
       `<pre><code class="language-json">${html(ORG_POLICY_JSON)}</code></pre>`,
-      `Не получается изменить настройку компании? Тогда переключите ${of} на личный аккаунт Claude (Pro или Max), где чат с агентами включён по умолчанию: на странице ${of} в панели 5dive откройте «Account», затем «Switch account».`,
+      lite
+        ? `Не получается изменить настройку компании? Тогда переключите ${of} на личный аккаунт Claude (Pro или Max), где чат с агентами включён по умолчанию. Это делается в кабинете, в настройках ${of}.`
+        : `Не получается изменить настройку компании? Тогда переключите ${of} на личный аккаунт Claude (Pro или Max), где чат с агентами включён по умолчанию: на странице ${of} в панели 5dive откройте «Account», затем «Switch account».`,
     ].join('\n\n')
   }
   const n = html(name.trim() || 'Your agent')
@@ -88,7 +98,9 @@ export function orgPolicyText(name: string, lang: Lang = 'en'): string {
       `5. Restart ${n}: send /restart here.`,
     ].join('\n'),
     `<pre><code class="language-json">${html(ORG_POLICY_JSON)}</code></pre>`,
-    `Can't change the company setting? Switch ${n} to a personal Claude account (Pro or Max) instead, where agent chat is on by default: on ${n}'s page in the 5dive dashboard, Account, then Switch account.`,
+    lite
+      ? `Can't change the company setting? Switch ${n} to a personal Claude account (Pro or Max) instead, where agent chat is on by default. You do that from your account page, in ${name.trim() ? `${n}'s` : "the agent's"} settings.`
+      : `Can't change the company setting? Switch ${n} to a personal Claude account (Pro or Max) instead, where agent chat is on by default: on ${n}'s page in the 5dive dashboard, Account, then Switch account.`,
   ].join('\n\n')
 }
 

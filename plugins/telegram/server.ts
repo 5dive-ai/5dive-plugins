@@ -5429,7 +5429,8 @@ const orgPolicyNotice = makeOrgPolicyNotifier({
   send: async chat => {
     // DIVE-6599: in the owner's Telegram language.
     const lang = langOfChat(chat)
-    const text = orgPolicyText(bot.botInfo?.first_name ?? '', lang)
+    // DIVE-8012: a partner client's box names the cabinet, not the 5dive dashboard.
+    const text = orgPolicyText(bot.botInfo?.first_name ?? '', lang, LITE)
     const sent = await bot.api.sendMessage(Number(chat), text, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
