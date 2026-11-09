@@ -260,7 +260,10 @@ Next, your IT (one time, about 10 minutes):
   1. The bot's messaging endpoint = the Endpoint above (Teams Developer Portal >
      Bot management > the bot > Configure; or Azure Bot > Configuration).
   2. Teams admin center > Manage apps > Upload new app > the App package above.
-  3. Make it available to the people who should talk to $name.
+  3. Make it available to the people who should talk to $name. People can
+     also add $name to a group chat or a team channel and @mention it there.
+  Already in Teams? Upload this package over the old app (Manage apps > the
+  app > Upload file) so $name can join group chats and channels.
 EOF
   if (( ! routed )) && [[ -z "$endpoint" ]]; then
     cat <<EOF
@@ -280,6 +283,35 @@ _mscli() {
   ( umask 077
     HOME="$MSCLI_HOME" XDG_CONFIG_HOME="$MSCLI_HOME/.config" TEAMS_NO_INTERACTIVE=1 \
       "$MSCLI_BIN" --disable-auto-update "$@" )
+}
+
+# DIVE-8022: why a call failed, in Microsoft's words. Asked for --json, the CLI
+# reports its error on STDOUT ({ok:false, error:{message}}); stderr carries its
+# own warnings, and one of them comes on EVERY call on a box with no desktop
+# keyring ("Warning: libsecret not found …" / "Install it for secure storage:
+# sudo apt install libsecret-1-dev"), so the last stderr line is that hint, never
+# the reason. Only a crash outside its handler lands on stderr alone.
+_ms_why() {  # <stdout> <stderr file>
+  local w lines
+  w=$(jq -r 'select(type == "object") | .error.message // empty' <<<"$1" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1) || w=""
+  if [[ -z "$w" ]]; then
+    lines=$(sed 's/\x1b\[[0-9;]*m//g' "$2" 2>/dev/null | grep -v '^[[:space:]]*$' \
+      | grep -viE '^[[:space:]]*(\(node:[0-9]+\) )?warning\b|libsecret|secure storage' || true)
+    w=$(grep -iE 'error' <<<"$lines" | tail -1) || w=""
+    [[ -n "$w" ]] || w=$(head -1 <<<"$lines")
+  fi
+  w=$(tr -d '[:cntrl:]' <<<"$w")
+  printf '%s' "${w:0:300}"
+}
+
+# The whole answer of the last failed call, for whoever looks next (root, 0600,
+# beside the CLI's login). The card shows one line; this keeps the rest.
+_ms_keep_error() {  # <what> <rc> <stdout> <stderr file>
+  ( umask 077
+    { printf '%s  teams %s  exit %s\n--- stdout\n' "$(date -u +%FT%TZ)" "$1" "$2"
+      jq 'del(.credentials?)' <<<"$3" 2>/dev/null || printf '%s\n' "$3"
+      printf -- '--- stderr\n'; cat "$4" 2>/dev/null
+    } >"$MSCLI_HOME/last-error.log" ) || true
 }
 
 _node_ok() {  # Node >= 22.12, which Microsoft's CLI needs
@@ -393,6 +425,22 @@ EOF
   esac
 }
 
+# DIVE-8023: a bot `teams app create` makes is 1:1 only. Widen it to group chats
+# and team channels, and note that in the agent's config so a re-run knows.
+# Best effort: the agent still works 1:1 if Microsoft refuses.
+MS_SCOPES="personal,team,groupChat"
+_ms_groups() {  # <agent> <teams app id>
+  local agent="$1" tid="$2" out
+  [[ -n "$tid" ]] || { warn "no Teams app id kept for $agent, so it stays 1:1 only. Disconnect and connect again to fix it."; return 1; }
+  if out=$(_mscli app update "$tid" --scopes "$MS_SCOPES" --json 2>/dev/null) \
+     && jq -e '.updated.scopes' <<<"$(sed -n '/^{/,$p' <<<"$out")" >/dev/null 2>&1; then
+    _cfg_merge "$agent" "$(jq -cn --arg s "$MS_SCOPES" '{scopes:$s}')"
+    return 0
+  fi
+  warn "Microsoft did not open group chats and channels for $agent; it still works 1:1. Run the same command again later."
+  return 1
+}
+
 # Merge the Microsoft-made facts into the agent's 0600 config, keeping its owner.
 _cfg_merge() {  # <agent> <jq object>
   local cfg; cfg="$(_state_dir "$1")/config.json"
@@ -426,10 +474,27 @@ teams_connect_microsoft() {
   [[ "$(jq -r '.type // empty' <<<"$info")" == claude ]] || fail "$E_VALIDATION" "Teams is for Claude Code agents for now"
   [[ -n "$name" ]] || name="${agent^}"
 
-  # Already in Teams this way: the same link again, nothing new made.
+  # Already in Teams this way: the same link again, nothing new made. A bot made
+  # before DIVE-8023 is 1:1 only: widen it once (needs the sign-in), and the
+  # owner opens the same link again to take the update.
   local link; link=$(_cfg_get "$agent" install_link)
   if [[ -n "$link" && -n "$(_cfg_get "$agent" app_id)" ]]; then
-    _signin_close
+    if [[ "$(_cfg_get "$agent" scopes)" != "$MS_SCOPES" ]]; then
+      _mscli_ensure
+      local st0; st0=$(_mscli status --json 2>/dev/null | sed -n '/^{/,$p') || st0=""
+      if [[ "$(jq -r '.loggedIn // false' <<<"$st0" 2>/dev/null)" != true ]]; then
+        _signin_start
+        teams_audit connect "$agent" --microsoft sign_in groups
+        _ms_say sign_in "$agent" site "$SIGNIN_SITE"
+        [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && return 0
+        exit "$E_AUTH_REQUIRED"
+      fi
+      _signin_close
+      step "Letting $name join group chats and channels"
+      _ms_groups "$agent" "$(_cfg_get "$agent" teams_app_id)" && teams_audit connect "$agent" --microsoft groups || true
+    else
+      _signin_close
+    fi
     _ms_say ready "$agent" name "$name" install_link "$link"; return 0
   fi
   [[ -z "$(_cfg_get "$agent" app_id)" ]] \
@@ -477,14 +542,25 @@ teams_connect_microsoft() {
   local made="$MSCLI_HOME/made-$agent.json" app_id tenant_id
   if [[ ! -s "$made" ]] || ! _read_secret "$agent" >/dev/null; then
     step "Making $name's Teams bot in your Microsoft 365"
-    local envf out err rc=0
+    local envf out err rc=0 icons avatar iconargs=()
     envf=$(umask 077; mktemp "$MSCLI_HOME/app-XXXXXX.env")
     err=$(mktemp)
-    out=$(_mscli app create --name "$name" --endpoint "$public" --env "$envf" --json 2>"$err") || rc=$?
+    # DIVE-8022: the agent's face as the bot's picture, as the IT-guide package
+    # has it. No face (or one that cannot be read): no icons, Teams' own tile.
+    icons=$(mktemp -d)
+    avatar="$HOME_ROOT/agent-$agent/.claude/avatar.png"
+    if [[ -f "$avatar" && ! -L "$avatar" ]] \
+      && python3 -I "$TEAMS_PLUGIN_ROOT/cli/package.py" --icons-dir="$icons" --avatar="$avatar" >/dev/null 2>&1 \
+      && [[ -s "$icons/color.png" && -s "$icons/outline.png" ]]; then
+      iconargs=(--color-icon "$icons/color.png" --outline-icon "$icons/outline.png")
+    fi
+    out=$(_mscli app create --name "$name" --endpoint "$public" --env "$envf" --json "${iconargs[@]}" 2>"$err") || rc=$?
+    rm -rf "$icons"
     out=$(sed -n '/^{/,$p' <<<"$out")
     if (( rc != 0 )) || ! jq -e '.installLink and .botId' <<<"$out" >/dev/null 2>&1; then
       rm -f "$envf"
-      local why; why=$(grep -v '^[[:space:]]*$' "$err" | tail -1); rm -f "$err"
+      _ms_keep_error "app create" "$rc" "$out" "$err"
+      local why; why=$(_ms_why "$out" "$err"); rm -f "$err"
       fail "$E_VALIDATION" "Microsoft did not make the bot: ${why:-no answer}"
     fi
     rm -f "$err"
@@ -509,6 +585,8 @@ teams_connect_microsoft() {
     ${endpoint:+"--endpoint=$endpoint"} "--name=$name" ${role:+"--role=$role"} >&2
   _cfg_merge "$agent" "$(jq -c '{install_link, teams_app_id}' "$made")"
   rm -f "$made"
+  step "Letting $name join group chats and channels"
+  _ms_groups "$agent" "$(_cfg_get "$agent" teams_app_id)" || true
   _ms_say ready "$agent" name "$name" install_link "$link"
 }
 

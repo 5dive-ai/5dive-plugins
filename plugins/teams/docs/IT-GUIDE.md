@@ -71,10 +71,13 @@ Teams admin center > **Teams apps** > **Manage apps** > **Upload new app** > the
 ## What people can do
 
 - Message the agent 1:1, like a colleague.
+- Add it to a group chat or a team channel and @mention it. It answers there, in the same thread, and knows who asked.
 - Tap buttons when it asks a question with set answers.
-- Send it files and get files back (Teams asks them to accept a file first).
+- Send it files and get files back (Teams asks them to accept a file first; in a group or channel it can send only small images).
 
-Group chats and channels are not supported yet.
+In a group or channel the agent reads only the messages that @mention it, not the rest of the chat (reading the whole chat would need extra Teams permissions, and is not offered yet). Each person keeps their own role there: a member's risky ask still waits for an admin, who approves in their own 1:1 chat with the agent.
+
+**Added the agent before group chats existed?** Run the same connect command again, then upload the new App package over the old app (Teams admin center > **Manage apps** > the app > **Upload file**). If you used the one-sign-in way, open the agent's Add to Teams link again instead.
 
 ## Name your admins
 

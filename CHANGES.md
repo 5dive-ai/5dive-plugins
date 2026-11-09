@@ -9,6 +9,18 @@ On a partner box (`TELEGRAM_PROFILE=lite`) the DIVE-5993 notice (a Claude Team/E
 
 Checked: `bun test test/dive8012-lite-org-policy-notice.test.ts`: 23 pass; 19 of them red on the previous release. Dropping `LITE` at the call site turns the wiring arm red.
 
+### Fixed — teams 0.3.1: a failed Teams connect shows Microsoft's reason, not a libsecret hint; the bot gets the agent's face (DIVE-8022)
+
+When Microsoft did not make an agent's bot, the app card said "Install it for secure storage: sudo apt install libsecret-1-dev", which fixes nothing. Microsoft's CLI, run with `--json`, reports its error on stdout (`{ok:false, error:{message}}`), and prints its libsecret warning on stderr on every call on a box with no desktop keyring. Connect only read the last stderr line.
+
+- The card now shows Microsoft's own error message. A crash outside the CLI's handler falls back to stderr, with warning lines and color codes removed.
+- The whole answer (stdout, stderr, exit code) is kept in `last-error.log`, root-only (0600), beside the CLI's login, so the next failure can be diagnosed.
+- The warning cannot be switched off: the CLI prints it unconditionally when the keyring is missing (`dist/auth/cache.js`, 3.0.4).
+
+Also (lodar, «can we add avatars?»): an agent made this way now shows its face in Teams. `app create` gets `--color-icon` (the face, centre-cropped to 192x192) and `--outline-icon` (a 32x32 white ring), as the IT-guide package already had. Boxes have no Pillow, so `cli/package.py` now reads a plain PNG face with the standard library; that also gives the IT-guide package the face instead of the plain tile. No face, an unreadable one, or a symlink: no icons, and Teams shows its own tile. Agents already made keep their tile until made again (`app update` bumps the app's version and asks people to reinstall, so connect does not do it on its own).
+
+Checked: `sudo bash tests/teams_cli_unit.sh` 59/59; the 4 error arms are red on the old `bin/teams`, the face arm is red on the old `bin/teams`, and the no-Pillow arm is red on the old `package.py`.
+
 ### Added — teams 0.3.0: admins and members on an office box (DIVE-7976)
 
 Everyone a firm let in on Teams was equal, so any employee could tell an agent with sudo, logins and the Vault to do anything. Now each person is an **admin** (the owner and the people IT names) or a **member** (everyone else let in).
