@@ -1,0 +1,34 @@
+# DIVE-7973: Dependabot SECURITY updates are on for this repo (main, 11-09).
+# Their PRs used to be titled "Bump x from …"; every entry below gives them a
+# conventional "fix(deps): …" title instead, the shape the release tooling and
+# the 5dive repo's nightly cut accept.
+#
+# open-pull-requests-limit: 0 turns OFF routine version-bump PRs. Security
+# updates are not affected by that limit; they still open, and still take the
+# commit-message prefix from the matching entry here.
+version: 2
+updates:
+  - package-ecosystem: bun
+    directories:   # every plugin with a bun.lock; plugins/browser has none (npm below)
+      - /plugins/buzz
+      - /plugins/dashboard
+      - /plugins/teams
+      - /plugins/telegram
+      - /plugins/telegram-agy
+      - /plugins/telegram-codex
+      - /plugins/telegram-grok
+      - /plugins/telegram-opencode
+      - /plugins/telegram-pi
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 0
+    commit-message: { prefix: "fix(deps)" }
+  - package-ecosystem: npm
+    directory: /plugins/browser
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 0
+    commit-message: { prefix: "fix(deps)" }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 0
+    commit-message: { prefix: "fix(deps)" }
