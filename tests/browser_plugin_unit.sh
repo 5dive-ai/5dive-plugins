@@ -7787,6 +7787,15 @@ t49_stop FIVEDIVE_BROWSER_COOKIE_SETTLE=1
 t  'T49e serve --stop stops' 0 "$RC"
 t  'T49e ...after waiting out the cap' 'yes' "$( (( T49MS >= 900 && T49MS < 4000 )) && echo yes || echo "no (${T49MS}ms)")"
 t  'T49e ...and Chrome is gone' 'no' "$(t49_alive)"
+if ! (( T49MS >= 900 && T49MS < 4000 )); then
+  # A RED T49e EXPLAINS ITSELF (DIVE-7978): the same stop again under a timestamped
+  # xtrace, cut to the cookie wait, so the log says what ended it early.
+  t49_serve
+  env PATH="$T49PATH" PS4='+${EPOCHREALTIME} ${LINENO}: ' FIVEDIVE_BROWSER_COOKIE_SETTLE=1 \
+    bash -x "${T49BIN:-$BROWSER}" serve "$S49" --stop >/dev/null 2>"$T49D/stop.xtrace"
+  { echo "T49e xtrace of the cookie wait (bash $BASH_VERSION, date: $(date --version 2>&1 | head -1)):"
+    sed -n '/ local cs=/,$p' "$T49D/stop.xtrace" | head -120; } >&2
+fi
 
 # --- T49c a Chrome that ignores SIGTERM is still stopped: SIGKILL after the bound ---
 t49_serve T49_DEAF=1
