@@ -19,6 +19,7 @@ No 5dive server is on the path. Shut on a local-only (offline) box until its IT 
 
 - Every request: Bot Framework JWT (RS256, Microsoft's published keys, the key must endorse `msteams`), issuer, audience = this bot, expiry, and the token's `serviceurl` claim must equal the activity's (`auth.ts`).
 - Then: the tenant must be the customer's, the chat must be 1:1, and an optional `allowed_users` list (`activity.ts`).
+- Roles (DIVE-7976, `roles.ts`, `hooks/role-guard.ts`): each sender is `admin` or `member` from their Entra id in `/etc/5dive/roles.json`, carried as `sender_role`. A member's risky ask (root, pay, delete, send outside, settings, keys, access) is held until an admin taps Approve on the `ask_admin` card. Set with `sudo 5dive agent teams admins …`.
 - The bot token is only ever sent to Microsoft's Bot Framework hosts; file uploads only to SharePoint/OneDrive; downloads only from those, after a private-address check (`hosts.ts`).
 - A reply goes only to a chat that has written to the agent.
 

@@ -76,6 +76,16 @@ Teams admin center > **Teams apps** > **Manage apps** > **Upload new app** > the
 
 Group chats and channels are not supported yet.
 
+## Name your admins
+
+Everyone you let in is a **member**: they can chat, ask and have the agent do its normal work. Running commands as root, paying, deleting, sending anything outside your company, and changing settings, keys or anyone's access need an **admin's** yes; the agent asks the admins in Teams with an Approve button, never the person who asked. Until you name one, nobody can approve. Name each admin by their Entra object ID (Teams admin center > **Users** > the person > **Object ID**), once per server, for all its agents:
+
+```
+sudo 5dive agent teams admins add <Object ID>
+```
+
+`5dive agent teams admins` lists them; `admins remove <Object ID>` takes one away. To let members do one kind without asking, for example delete files: `sudo 5dive agent teams admins members-may delete`. To make everyone equal again: `sudo 5dive agent teams admins check off`.
+
 ## Check, and turn off
 
 - `5dive agent teams status <agent>`: connected, listening, reachable, last message time.

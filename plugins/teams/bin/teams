@@ -10,6 +10,10 @@
 #   connect <agent> --microsoft [--name=<shown name>] [--role=<one line>] [--json]
 #   status <agent>
 #   disconnect <agent>
+#   admins [list]                       who is an admin on this box (DIVE-7976)
+#   admins add|remove <entra object id | teams:<id> | telegram:<id>>
+#   admins check on|off                 off = everyone allowed in is equal again
+#   admins members-may <kind,…|none>    widen: kinds a member may do without an admin
 #
 # --microsoft (DIVE-7831) does every Microsoft step after ONE sign-in, with
 # Microsoft's own `teams` CLI (pinned, installed once into $MSCLI_PREFIX):
@@ -54,6 +58,8 @@ SIGNIN_SITE="login.microsoftonline.com"
 SIGNIN_UNIT="5dive-teams-signin"
 SIGNIN_TTL=900
 SIGNIN_WAIT="${TEAMS_SIGNIN_WAIT:-30}"
+ROLES_FILE="${FIVEDIVE_ROLES_FILE:-/etc/5dive/roles.json}"
+RISK_KINDS="root pay delete send settings access"
 PORT_BASE=39100
 PORT_SPAN=800
 
@@ -564,6 +570,82 @@ teams_disconnect() {
   echo "$agent is off Teams. The secret is deleted from this server. Your IT can remove the app in the Teams admin center and delete the bot's secret in Azure."
 }
 
+# ── admins and members (DIVE-7976) ─────────────────────────────────────────
+# One roles file per box, read by every agent's Teams channel (roles.ts):
+#   { "check": "on"|"off", "admins": ["teams:<id>", …], "members_may": [kind, …] }
+# Root writes it (0644 root:root), so an agent cannot make its own asker an admin.
+_roles_read() {  # a missing file is an empty one; a broken one is refused, never overwritten
+  [[ -e "$ROLES_FILE" ]] || { jq -nc '{check:"on", admins:[], members_may:[]}'; return; }
+  jq -ce '{check: (if .check == "off" then "off" else "on" end), admins: ((.admins // []) | map(ascii_downcase)), members_may: (.members_may // [])}' "$ROLES_FILE" 2>/dev/null \
+    || fail "$E_VALIDATION" "$ROLES_FILE is not valid JSON; fix or remove it first"
+}
+_roles_write() {  # <json>
+  local tmp; mkdir -p -- "$(dirname "$ROLES_FILE")"
+  tmp="$(mktemp "$ROLES_FILE.XXXXXX")"
+  jq . <<<"$1" >"$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$ROLES_FILE"
+}
+_role_key() {  # <id> -> channel:id, or fail
+  local id="${1,,}"
+  if _guid_ok "$id"; then printf 'teams:%s' "$id"; return; fi
+  if [[ "$id" =~ ^teams:([0-9a-f-]{36})$ ]] && _guid_ok "${BASH_REMATCH[1]}"; then printf '%s' "$id"; return; fi
+  if [[ "$id" =~ ^telegram:[0-9]{1,20}$ ]]; then printf '%s' "$id"; return; fi
+  fail "$E_VALIDATION" "not an id: ${1:-(none)}. Give the person's Entra object id (Teams admin center > Users > the person > Object ID), or telegram:<user id>"
+}
+teams_admins() {
+  local sub="${1:-list}"; [[ $# -gt 0 ]] && shift
+  local cur key; cur="$(_roles_read)"
+  case "$sub" in
+    list|ls)
+      local n; n=$(jq '.admins | length' <<<"$cur")
+      if [[ "$(jq -r .check <<<"$cur")" == off ]]; then
+        echo "Roles are off on this server: everyone allowed in is treated as an admin."
+      elif (( n == 0 )); then
+        echo "No admins yet: everyone is a member, and a member's risky ask waits until IT names an admin."
+      else
+        echo "Admins ($n):"; jq -r '.admins[] | "  " + .' <<<"$cur"
+        echo "Everyone else allowed in is a member: a risky ask from them waits for an admin's yes."
+      fi
+      local may; may=$(jq -r '.members_may | join(", ")' <<<"$cur")
+      [[ -n "$may" ]] && echo "Members may also, without an admin: $may"
+      return 0 ;;
+  esac
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "changing admins needs root: sudo 5dive agent teams admins $sub $*"
+  case "$sub" in
+    add)
+      key="$(_role_key "${1:-}")"
+      _roles_write "$(jq -c --arg k "$key" '.admins = ((.admins + [$k]) | unique)' <<<"$cur")"
+      teams_audit admins add "$key"
+      echo "$key is an admin. Their risky asks go ahead, and they get the approval cards." ;;
+    remove|rm)
+      key="$(_role_key "${1:-}")"
+      jq -e --arg k "$key" '.admins | index($k)' <<<"$cur" >/dev/null || fail "$E_NOT_FOUND" "$key is not an admin"
+      _roles_write "$(jq -c --arg k "$key" '.admins -= [$k]' <<<"$cur")"
+      teams_audit admins remove "$key"
+      echo "$key is a member now." ;;
+    check)
+      case "${1:-}" in
+        on|off) ;;
+        *) fail "$E_USAGE" "admins check on|off" ;;
+      esac
+      _roles_write "$(jq -c --arg v "$1" '.check = $v' <<<"$cur")"
+      teams_audit admins check "$1"
+      [[ "$1" == off ]] && echo "Roles off: everyone allowed in can ask for anything again." || echo "Roles on: a member's risky ask waits for an admin's yes." ;;
+    members-may)
+      local list="${1:-}" k out=()
+      [[ -n "$list" ]] || fail "$E_USAGE" "admins members-may <kind,…|none>, kinds: ${RISK_KINDS// /, }"
+      if [[ "$list" != none ]]; then
+        for k in ${list//,/ }; do
+          [[ " $RISK_KINDS " == *" $k "* ]] || fail "$E_VALIDATION" "unknown kind: $k (kinds: ${RISK_KINDS// /, })"
+          out+=("$k")
+        done
+      fi
+      _roles_write "$(jq -c '.members_may = ($ARGS.positional | unique)' --args "${out[@]}" <<<"$cur")"
+      teams_audit admins members-may "$list"
+      echo "Members may now, without an admin: ${out[*]:-nothing risky}" ;;
+    *) fail "$E_USAGE" "unknown admins command: $sub (list|add|remove|check|members-may)" ;;
+  esac
+}
+
 _teams_main() {
   [[ "${1:-}" == agent ]] && shift
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift
@@ -571,6 +653,7 @@ _teams_main() {
     connect) teams_connect "$@" ;;
     status) teams_status "$@" ;;
     disconnect) teams_disconnect "$@" ;;
+    admins) teams_admins "$@" ;;
     ""|-h|--help|help)
       cat >&2 <<'USAGE'
 5dive agent teams — an agent as its own contact in Microsoft Teams (plugin teams@5dive-plugins)
@@ -582,10 +665,14 @@ _teams_main() {
                                  the agent's Teams bot and prints its "Add to Teams" link
   5dive agent teams status <agent>
   sudo 5dive agent teams disconnect <agent>
+  5dive agent teams admins                  who is an admin on this server
+  sudo 5dive agent teams admins add|remove <Entra object id>
+  sudo 5dive agent teams admins check on|off
+  sudo 5dive agent teams admins members-may <root,pay,delete,send,settings,access|none>
 USAGE
       [[ -n "$sub" ]] && return 0
       return "$E_USAGE" ;;
-    *) fail "$E_USAGE" "unknown teams command: $sub (connect|status|disconnect)" ;;
+    *) fail "$E_USAGE" "unknown teams command: $sub (connect|status|disconnect|admins)" ;;
   esac
 }
 
