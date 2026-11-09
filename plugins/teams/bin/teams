@@ -506,10 +506,20 @@ teams_connect_microsoft() {
   local made="$MSCLI_HOME/made-$agent.json" app_id tenant_id
   if [[ ! -s "$made" ]] || ! _read_secret "$agent" >/dev/null; then
     step "Making $name's Teams bot in your Microsoft 365"
-    local envf out err rc=0
+    local envf out err rc=0 icons avatar iconargs=()
     envf=$(umask 077; mktemp "$MSCLI_HOME/app-XXXXXX.env")
     err=$(mktemp)
-    out=$(_mscli app create --name "$name" --endpoint "$public" --env "$envf" --json 2>"$err") || rc=$?
+    # DIVE-8022: the agent's face as the bot's picture, as the IT-guide package
+    # has it. No face (or one that cannot be read): no icons, Teams' own tile.
+    icons=$(mktemp -d)
+    avatar="$HOME_ROOT/agent-$agent/.claude/avatar.png"
+    if [[ -f "$avatar" && ! -L "$avatar" ]] \
+      && python3 -I "$TEAMS_PLUGIN_ROOT/cli/package.py" --icons-dir="$icons" --avatar="$avatar" >/dev/null 2>&1 \
+      && [[ -s "$icons/color.png" && -s "$icons/outline.png" ]]; then
+      iconargs=(--color-icon "$icons/color.png" --outline-icon "$icons/outline.png")
+    fi
+    out=$(_mscli app create --name "$name" --endpoint "$public" --env "$envf" --json "${iconargs[@]}" 2>"$err") || rc=$?
+    rm -rf "$icons"
     out=$(sed -n '/^{/,$p' <<<"$out")
     if (( rc != 0 )) || ! jq -e '.installLink and .botId' <<<"$out" >/dev/null 2>&1; then
       rm -f "$envf"
