@@ -159,6 +159,7 @@ cfg="$W/home/agent-max/.claude/channels/teams/config.json"
 [[ "$(stat -c %a "$cfg" 2>/dev/null)" == 600 && "$(stat -c %U "$cfg")" == "$ME" ]] && ok "config is 0600 and the agent's" || bad "config mode/owner" "$(ls -l "$cfg" 2>&1)"
 jq -e --arg a $APP --arg t $TEN '.app_id == $a and .tenant_id == $t and .app_password == "s3cr3t-value" and (.port | type == "number") and .public_url == "https://teams-max.box.example.com/api/messages"' "$cfg" >/dev/null \
   && ok "config carries the ids, the secret, a port and the box's own endpoint" || bad "config fields" "$(cat "$cfg")"
+jq -e '.access == "knock"' "$cfg" >/dev/null && ok "DIVE-8036: a new connection knocks (a stranger's message waits for the owner)" || bad "new connection access" "$(jq -c 'del(.app_password)' "$cfg")"
 grep -qE "^route add teams-max --port=[0-9]+$" "$W/log" && ok "the endpoint is published on the box's own domain (no 5dive relay)" || bad "route add" "$(cat "$W/log")"
 [[ "$(cat "$W/channels")" == "telegram,teams" ]] && ok "the channel is added beside the existing one" || bad "channels" "$(cat "$W/channels")"
 [[ "$out" != *s3cr3t* ]] && ! grep -q s3cr3t "$W/log" && ok "the secret is never printed or passed to core" || bad "secret leaked" "$out"
@@ -173,6 +174,12 @@ unzip -p "$W/pk/max-teams-app.zip" manifest.json 2>/dev/null | jq -e '.bots[0].s
 out=$(run agent connect max); rc=$?
 [[ $rc -eq 0 ]] && ! grep -q "route add" "$W/log" && [[ "$(cat "$W/channels")" == "telegram,teams" ]] \
   && ok "re-running connect keeps its ids, route and channel (idempotent)" || bad "rerun (rc=$rc)" "$(cat "$W/log"; echo "$out")"
+
+jq -e '.access == "knock"' "$cfg" >/dev/null && ok "DIVE-8036: re-running connect keeps knocking on" || bad "rerun access" "$(jq -c 'del(.app_password)' "$cfg")"
+# A connection made before DIVE-8036 has no access key: a re-run must not start knocking on it.
+jq 'del(.access)' "$cfg" >"$cfg.tmp" && cat "$cfg.tmp" >"$cfg" && rm -f "$cfg.tmp"
+out=$(run agent connect max); rc=$?
+[[ $rc -eq 0 ]] && jq -e 'has("access") | not' "$cfg" >/dev/null && ok "DIVE-8036: an older connection stays open to the tenant on a re-run" || bad "old connection access (rc=$rc)" "$(jq -c 'del(.app_password)' "$cfg")"
 
 out=$(JSON=1 run agent status max); rc=$?
 jq -e '.data.connected == true and .data.channels == "telegram,teams"' <<<"$out" >/dev/null && ok "status --json reports connected" || bad "status" "$out"

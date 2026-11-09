@@ -89,6 +89,7 @@ import { createPollGuard, touchLastPoll } from './pollguard.ts'
 import { createAckStatus, restoreJournal, type ShownRecord } from './ackstatus.ts'
 import { parseConnectTap, connectStdin, parseConnectLink, parseConnectVerdict, renderConnectLink, renderConnectVerdict, connectAgentNote, connectFailureText, type ConnectTap } from './browser-connect.ts'
 import { relayOwnerAskTap } from './owner-ask.ts'
+import { relayKnockTap } from './knocktap.ts'
 import { parseAccessTap, resolveTarget, planTap, applyAdd, applyRemove, ownerIds, isOwner, guestIds, personLabel, agentNote, readStore, writeStore, pruneStore, findOpen, openCount, newRequestId, newPickId, ACCESS_STRINGS, REQUEST_TTL_MS, MAX_OPEN_REQUESTS, MAX_GUEST_BUTTONS, type AccessTap, type AccessRequest, type Person } from './accessreq.ts'
 import { tapContent, tapMeta, tapLogEntry } from './buttontap.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
@@ -5984,6 +5985,17 @@ async function runOwnerAsk(args: string[]): Promise<string> {
   }
 }
 
+// DIVE-8036: the owner's knock answer, through the seat's
+// `people knock answer *` line (or as root on an admin seat).
+async function runKnockAnswer(args: string[]): Promise<string> {
+  try {
+    return (await sudo5dive(args, { timeout: 45_000 })).stdout
+  } catch (err) {
+    if (isAdminTierRequired(err)) return JSON.stringify({ ok: false, error: { class: 'permission', message: "This server can't take the answer here yet — answer in 5dive.app, Team tab." } })
+    return String((err as { stdout?: unknown })?.stdout ?? '')
+  }
+}
+
 // DIVE-5171: relay a Yes/No or choice-list button tap to the agent. The tap
 // says it is a tap — in the content, in meta (via=button + the answered message
 // id + Telegram's callback id) and in the recent_messages log — because a bare
@@ -6046,6 +6058,19 @@ bot.on('callback_query:data', async ctx => {
     await handleAccessTap(ctx, accessTap, senderId)
     return
   }
+
+  // DIVE-8036: Allow / Admin / No on a knock (someone new wrote to this agent
+  // on Teams). Before the generic bridge, which would hand the owner's nonce
+  // into the agent's session. Owners only; the CLI checks the proof per choice.
+  const knocked = await relayKnockTap(data, senderId, ctx.callbackQuery.message?.text, {
+    isOwner: uid => isOwner(access, uid),
+    run: runKnockAnswer,
+    answer: text => ctx.answerCallbackQuery({ text }).then(() => {}, () => {}),
+    edit: text => ctx.editMessageText(text).then(() => true, () => false),
+    dropButtons: () => ctx.editMessageReplyMarkup().then(() => {}, () => {}),
+    log: line => process.stderr.write(`telegram channel: ${line}\n`),
+  })
+  if (knocked) return
 
   // DIVE-4992: an agent's Connect <site> button. Checked here, before the
   // generic agent-keyboard bridge below, which would otherwise hand the code
