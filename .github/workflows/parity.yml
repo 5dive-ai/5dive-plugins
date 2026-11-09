@@ -75,41 +75,32 @@ jobs:
       # silence, not a green.
       - name: devteam core files harness
         run: bash tests/devteam_core_unit.sh
-      - name: browser plugin harness
-        run: bash tests/browser_plugin_unit.sh
-      # DIVE-4992: the agent-initiated Connect request and its privileged half,
-      # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
-      - name: browser connect-request harness
-        run: bash tests/browser_connect_request_unit.sh
-      # DIVE-4997: reflex drafts a login check, the owner approves it, drift —
-      # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
-      - name: browser reflex-propose harness
-        run: bash tests/browser_reflex_propose_unit.sh
-      # DIVE-5190: each launch's own TMPDIR, removed on exit and reaped after a
-      # kill — graded through the real bin/browser with a fake Chrome.
-      - name: browser tmpdir harness
-        run: bash tests/browser_tmpdir_unit.sh
+      # DIVE-8050: plugins/browser IS 5dive-ai/5dive-browser's browser/, byte for
+      # byte. A hand edit here matches no upstream commit and is red; behind main is
+      # a named warning. Then 5dive-browser's OWN harnesses, from the matched commit,
+      # grade this tree (they replaced nine hand-kept copies that had drifted: the
+      # copies are why a sync was a merge, and why nobody synced for five weeks).
+      - name: browser mirror is byte-for-byte 5dive-browser
+        run: bash tests/browser_mirror.sh check
+        env:
+          BROWSER_UPSTREAM_DIR: ${{ runner.temp }}/5dive-browser
+          BROWSER_MIRROR_BRANCH: ${{ github.head_ref }}
+      - name: browser registry entry harness
+        run: bash tests/browser_registry_unit.sh
+      - name: browser harnesses (5dive-browser's own, on this tree)
+        run: >-
+          bash tests/browser_mirror.sh run
+          browser_plugin_unit.sh browser_connect_request_unit.sh browser_reflex_propose_unit.sh
+          browser_tmpdir_unit.sh browser_input_drive_unit.sh browser_routine_delta_unit.sh
+          browser_probe_timeout_unit.sh browser_served_probe_unit.sh browser_launch_env_unit.sh
+          browser_act_upload_unit.sh
+        env:
+          BROWSER_UPSTREAM_DIR: ${{ runner.temp }}/5dive-browser
+          BROWSER_MIRROR_BRANCH: ${{ github.head_ref }}
       # DIVE-7658: `5dive agent teams connect|status|disconnect` against a stubbed
       # 5dive. Root: connect writes another user's 0600 file and refuses anyone else.
       - name: teams CLI harness
         run: sudo bash tests/teams_cli_unit.sh
-      # DIVE-5287: input mode, mirrored from 5dive-browser with `browser/` read as
-      # `plugins/browser/`. Its live arms use the runner's own Xvfb + Chrome.
-      - name: browser input drive mode harness
-        run: bash tests/browser_input_drive_unit.sh
-      # DIVE-5335: routines and delta snapshots, mirrored from 5dive-browser with
-      # `browser/` read as `plugins/browser/`.
-      - name: browser routine and delta harness
-        run: bash tests/browser_routine_delta_unit.sh
-      # DIVE-5375: a probe's Chrome that never exits is stopped at budget + slack,
-      # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
-      - name: browser probe timeout harness
-        run: bash tests/browser_probe_timeout_unit.sh
-      # DIVE-5388: served sites checked through their own browser, a headless bot
-      # check is `unverifiable` not "Needs you", and the generic header check —
-      # mirrored from 5dive-browser with `browser/` read as `plugins/browser/`.
-      - name: browser served probe and generic check harness
-        run: bash tests/browser_served_probe_unit.sh
       # DIVE-4397: the unprivileged-first 5dive reader, and the arms that assert
       # all five telegram forks still route through it. `bun test` does not reach
       # it — the module is driven with an injected exec function from bash, and
@@ -145,11 +136,11 @@ jobs:
             bun build --no-bundle "$f" --outfile=/dev/null >/dev/null || { echo "PARSE FAILED: $f"; rc=1; }
           done
           exit $rc
-      # DIVE-5336: the owner's authenticator seed, mirrored from 5dive-browser
-      # (DIVE-5386). LAST in the job: its live arm needs the pinned
-      # playwright-core installed next to the plugin, and the browser suites
-      # above grade the executor's "playwright is absent" refusals.
-      - name: install the pinned browser playwright-core
-        run: npm install --prefix plugins/browser --no-audit --no-fund
-      - name: browser totp harness
-        run: bash tests/browser_totp_unit.sh
+      # DIVE-5336: the owner's authenticator seed. LAST: its live arm needs the
+      # pinned playwright-core, installed in the copied tree (`run --npm`), and the
+      # browser suites above grade the executor's "playwright is absent" refusals.
+      - name: browser totp harness (5dive-browser's own, on this tree)
+        run: bash tests/browser_mirror.sh run --npm browser_totp_unit.sh
+        env:
+          BROWSER_UPSTREAM_DIR: ${{ runner.temp }}/5dive-browser
+          BROWSER_MIRROR_BRANCH: ${{ github.head_ref }}

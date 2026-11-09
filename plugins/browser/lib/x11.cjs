@@ -8,7 +8,7 @@
 // --remote-debugging-*, no --enable-automation — and the agent acts on it the
 // way the person at the viewer does: through the X display it is drawn on.
 //
-// It does three things and nothing else:
+// It does four things and nothing else:
 //   1. SCREENSHOT the display (GetImage on the root window -> PNG).
 //   2. INPUT through the XTEST extension — pointer moves, clicks, scroll
 //      notches, key presses. XTEST events enter the X server exactly where a
@@ -18,6 +18,10 @@
 //   3. READ THE WINDOW TITLE (WM_NAME / _NET_WM_NAME), which is the page title
 //      Chrome publishes to the window system. It is the one piece of page state
 //      that is readable with no channel into the browser at all.
+//   4. DROP A FILE onto the page (DIVE-6704), over XDND: the drag-and-drop
+//      protocol a file manager speaks to Chrome. Chrome reads the dropped file
+//      itself and the page gets a trusted `drop`, as from a person's drag. No
+//      file chooser is involved, so nothing depends on GTK taking a typed path.
 //
 // WHY NOT xdotool / ImageMagick. They would be two more packages a box has to
 // carry and `setup` has to install, for a protocol this small. The X11 wire
@@ -41,14 +45,20 @@ const X11_DIR = process.env.FIVEDIVE_BROWSER_X11_DIR || '/tmp/.X11-unix';
 
 // Core request opcodes used here.
 const OP = {
-  GetWindowAttributes: 3, QueryTree: 15, InternAtom: 16, GetProperty: 20,
+  CreateWindow: 1, GetWindowAttributes: 3, DestroyWindow: 4, ConfigureWindow: 12, GetGeometry: 14, QueryTree: 15,
+  InternAtom: 16, ChangeProperty: 18, GetProperty: 20, SetSelectionOwner: 22, ConvertSelection: 24, SendEvent: 25,
   QueryPointer: 38, SetInputFocus: 42, GetInputFocus: 43, GetImage: 73, QueryExtension: 98,
   ChangeKeyboardMapping: 100, GetKeyboardMapping: 101,
 };
+// Core event codes the drop listens for (the sent-event bit 0x80 is masked off).
+const XE = { PropertyNotify: 28, SelectionRequest: 30, SelectionNotify: 31, ClientMessage: 33 };
 // XTEST FakeInput event types.
 const EV = { KeyPress: 2, KeyRelease: 3, ButtonPress: 4, ButtonRelease: 5, Motion: 6 };
 
 const pad4 = (n) => (4 - (n % 4)) % 4;
+// One ChangeProperty without BIG-REQUESTS is at most 262140 bytes; a paste stays
+// well under it rather than speak INCR.
+const PASTE_MAX = 200000;
 
 function displaySocket(display) {
   const m = String(display || '').match(/^:?(\d+)(?:\.\d+)?$/);
@@ -66,7 +76,8 @@ class X11 {
     this.setup = null;
     this.atoms = new Map();
     this.keymap = null;
-    this.scratch = new Map();     // keysym -> keycode we bound for it
+    this.listeners = new Set();   // fn(event) for every event the server sends
+    this.nextId = 0;
   }
 
   connect() {
@@ -128,9 +139,11 @@ class X11 {
           const err = new Error(`X error ${msg[1]} (request ${msg[10]}.${msg.readUInt16LE(8)})`);
           if (p) { this.pending.delete(seq); p.reject(err); } else this.voidErrors.push(err);
         } else if (p) { this.pending.delete(seq); p.resolve(msg); }
+      } else {
+        // Events. Most (MappingNotify after a keymap change, among others) carry
+        // nothing this client needs; the drop listens for its own (DIVE-6704).
+        for (const fn of this.listeners) { try { fn(msg); } catch (e) { /* a listener's own fault */ } }
       }
-      // Events (MappingNotify after a keymap change, among others) are not
-      // selected for and carry nothing this client needs.
     }
   }
 
@@ -255,6 +268,70 @@ class X11 {
     return { window: best.t, page: best.t.replace(/ [-–—] (Google Chrome|Chromium)(?: [^-–—]*)?$/, ''), id: best.id };
   }
 
+  // ---- the window's size (DIVE-6646) --------------------------------------
+  // A phone at the login-link viewer gets the browser WINDOW narrowed to the
+  // phone's width, so the site lays itself out for a phone and the phone draws
+  // it at about 1:1. With no window manager on the display, a ConfigureWindow
+  // from any client is applied as asked and Chrome follows it like any resize.
+  async geometry(win) {
+    const b = Buffer.alloc(4); b.writeUInt32LE(win, 0);
+    const r = await this.req(OP.GetGeometry, 0, b, true);
+    return { x: r.readInt16LE(12), y: r.readInt16LE(14), w: r.readUInt16LE(16), h: r.readUInt16LE(18) };
+  }
+
+  async configure(win, g) {
+    const b = Buffer.alloc(24);
+    b.writeUInt32LE(win, 0);
+    b.writeUInt16LE(0x0f, 4);                    // x | y | width | height
+    b.writeInt32LE(g.x, 8); b.writeInt32LE(g.y, 12);
+    b.writeUInt32LE(g.w, 16); b.writeUInt32LE(g.h, 20);
+    this.req(OP.ConfigureWindow, 0, b, false);
+    await this.sync();
+  }
+
+  // The browser's main window: the largest viewable top-level browser window
+  // that is not override-redirect (menus and popups are; the window is not).
+  async browserWindow(pid) {
+    let best = null;
+    for (const w of await this.children(this.root)) {
+      const a = await this.attrs(w);
+      if (!a.viewable || a.override || !(await this.isBrowserWindow(w, pid))) continue;
+      let g; try { g = await this.geometry(w); } catch (e) { continue; }
+      if (!best || g.w * g.h > best.g.w * best.g.h) best = { id: w, g };
+    }
+    return best;
+  }
+
+  // ---- a popup window of the browser (DIVE-7680) ---------------------------
+  // Box bug 690: a click opened Google's or Meta's sign-in in its OWN browser
+  // window. With no window manager nothing gives a new window the keyboard, and
+  // browserWindow() (the largest) and browserDialog() (a file chooser, which skips
+  // every other "… - Google Chrome" window) both kept input on the window under
+  // it. So the popup showed in the screenshot and every key went behind it.
+  // This finds it: the topmost viewable browser window that is not the main one,
+  // not override-redirect (menus are), titled like a browser window, and smaller
+  // than the main window (a second full-size window is a tab torn off, not a
+  // popup). Returns {id, name, page} or null.
+  async browserPopup(pid) {
+    const main = await this.browserWindow(pid);
+    if (!main) return null;
+    const area = main.g.w * main.g.h;
+    const kids = await this.children(this.root);
+    for (let i = kids.length - 1; i >= 0; i--) {      // topmost first
+      const w = kids[i];
+      if (w === main.id) continue;
+      const a = await this.attrs(w);
+      if (!a.viewable || a.override) continue;
+      if (!(await this.isBrowserWindow(w, pid))) continue;
+      const name = (await this.prop(w, '_NET_WM_NAME', 'UTF8_STRING')) || (await this.prop(w, 'WM_NAME', 'STRING'));
+      if (!/ [-–—] (Google Chrome|Chromium)/.test(name || '')) continue;   // a dialog is browserDialog's
+      let g; try { g = await this.geometry(w); } catch (e) { continue; }
+      if (g.w * g.h >= area) continue;
+      return { id: w, name, page: name.replace(/ [-–—] (Google Chrome|Chromium)(?: [^-–—]*)?$/, '') };
+    }
+    return null;
+  }
+
   // ---- whose window is it -------------------------------------------------
   // WHY THIS EXISTS (DIVE-5287, quinn's rejection). XTEST input is delivered by
   // the X server to whichever window has the keyboard focus (keys) or is under
@@ -285,6 +362,39 @@ class X11 {
     if (!win || win === this.root) return false;
     if (pid && (await this.prop32(win, '_NET_WM_PID')) === pid) return true;
     return /chrom/i.test(await this.prop(win, 'WM_CLASS', 'STRING'));
+  }
+
+  async attrs(win) {
+    const b = Buffer.alloc(4); b.writeUInt32LE(win, 0);
+    try { const r = await this.req(OP.GetWindowAttributes, 0, b, true); return { viewable: r[26] === 2, override: r[27] === 1 }; }
+    catch (e) { return { viewable: false, override: false }; }
+  }
+
+  // ---- the browser's own dialog (DIVE-5740) -------------------------------
+  // A page's upload control opens Chrome's GTK file chooser: a second top-level
+  // window of the browser, small, named "Open File" or similar, transient for
+  // the main window. With no window manager nothing gives it the keyboard, and
+  // on chill-gorge the focus fell to the root window (0x21f on Xvfb), so the
+  // click that opened it was reported as lost and the next keys were sent to
+  // the PAGE behind it (a corrupted ad draft). While it is up, it is where keys
+  // belong. Menus and popups are override-redirect and do not count.
+  async browserDialog(pid) {
+    const main = (await this.windowTitle()).id;
+    const kids = await this.children(this.root);
+    for (let i = kids.length - 1; i >= 0; i--) {      // topmost first
+      const w = kids[i];
+      if (w === main) continue;
+      const a = await this.attrs(w);
+      if (!a.viewable || a.override) continue;
+      if (!(await this.isBrowserWindow(w, pid))) continue;
+      const name = (await this.prop(w, '_NET_WM_NAME', 'UTF8_STRING')) || (await this.prop(w, 'WM_NAME', 'STRING'));
+      const transient = await this.prop32(w, 'WM_TRANSIENT_FOR');
+      if (/ [-–—] (Google Chrome|Chromium)/.test(name || '')) continue;   // another browser window, not a dialog
+      if ((transient && transient !== this.root) || /^(open|save|select|upload|choose)\b|file/i.test(name || '')) {
+        return { id: w, name: name || '' };
+      }
+    }
+    return null;
   }
 
   // The window and its ancestors up to (not including) the root: with a window
@@ -342,6 +452,12 @@ class X11 {
   // when a window maps or is clicked — and CONFIRM it with the server. Throws
   // when it cannot be made true: input sent anyway would be dropped silently.
   async ensureBrowserFocus(pid, waitMs) {
+    // An open dialog of the browser takes the keys, not the page behind it.
+    const dlg = await this.browserDialog(pid);
+    if (dlg) return this.focusOn(dlg.id, waitMs, `the browser's "${dlg.name || 'dialog'}" window`);
+    // ...and so does a popup window it opened, a sign-in window on top (DIVE-7680).
+    const pw = await this.browserPopup(pid);
+    if (pw) return this.focusOn(pw.id, waitMs, `the browser's popup window "${pw.page || pw.name}"`);
     let t = await this.keyboardTarget(pid);
     if (t.browser) return t.browser;
     const main = (await this.windowTitle()).id;
@@ -357,6 +473,296 @@ class X11 {
       await sleep(50);
     }
     throw new Error(`the keyboard focus is not on the browser window (it is on ${t.focus === 0 ? 'no window' : t.focus === 1 ? 'the window under the pointer' : '0x' + t.focus.toString(16)}) and could not be moved there`);
+  }
+
+  // Put the keyboard on exactly <win> (or a window inside it), confirmed.
+  async focusOn(win, waitMs, what) {
+    const until = Date.now() + (waitMs || 2000);
+    let f = 0;
+    for (;;) {
+      const r = await this.req(OP.GetInputFocus, 0, null, true);
+      f = r.readUInt32LE(8);
+      if (f > 1 && (await this.lineage(f)).includes(win)) return win;
+      if (Date.now() >= until) break;
+      try { await this.setFocus(win); } catch (e) { /* not viewable yet: retried */ }
+      await sleep(50);
+    }
+    throw new Error(`the keyboard focus could not be put on ${what} (it is on 0x${f.toString(16)})`);
+  }
+
+  // ---- dropping a file (DIVE-6704) ----------------------------------------
+  // WHY A DROP. chill-gorge, Chrome 154, 2026-10-21: the upload step's file
+  // chooser showed the typed path in its location field and still did not take
+  // it on Open, for every path, while CI's Chrome 155 passed the same step. A
+  // drop has no dialog in it. The daemon offers the file as text/uri-list on
+  // the XdndSelection, the browser fetches it and reads the file itself, and
+  // the page gets a trusted `drop` on whatever is at the point: an
+  // <input type=file>, or a site's drop area. The protocol is XDND version 5
+  // (freedesktop.org/wiki/Specifications/XDND), which every file manager speaks.
+
+  newId() {
+    const m = this.setup.ridMask, shift = Math.log2(m & -m);
+    this.nextId++;
+    return (this.setup.ridBase | ((this.nextId << shift) & m)) >>> 0;
+  }
+
+  // An unmapped 1x1 window of this connection's own: the drag's source, and the
+  // owner of the selection the browser reads the file's name from.
+  async createInputWindow() {
+    const id = this.newId(), b = Buffer.alloc(32);
+    b.writeUInt32LE(id, 0); b.writeUInt32LE(this.root, 4);
+    b.writeInt16LE(-10, 8); b.writeInt16LE(-10, 10); b.writeUInt16LE(1, 12); b.writeUInt16LE(1, 14);
+    b.writeUInt16LE(0, 16); b.writeUInt16LE(2, 18);              // border 0, InputOnly
+    b.writeUInt32LE(0, 20);                                      // visual: CopyFromParent
+    b.writeUInt32LE(0x800, 24); b.writeUInt32LE(0x400000, 28);   // CWEventMask: PropertyChangeMask
+    this.req(OP.CreateWindow, 0, b, false);
+    await this.sync();
+    return id;
+  }
+
+  async destroyWindow(win) {
+    const b = Buffer.alloc(4); b.writeUInt32LE(win, 0);
+    this.req(OP.DestroyWindow, 0, b, false);
+    await this.sync();
+  }
+
+  // ChangeProperty with atoms already interned, so it is sent at once (an
+  // answer to a SelectionRequest must reach the server before its notify).
+  changeProp(win, prop, type, data, mode) {
+    const fmt = Buffer.isBuffer(data) ? 8 : 32;
+    const bytes = fmt === 8 ? data : Buffer.alloc(data.length * 4);
+    if (fmt === 32) data.forEach((v, i) => bytes.writeUInt32LE(v >>> 0, i * 4));
+    const b = Buffer.alloc(20 + bytes.length);
+    b.writeUInt32LE(win, 0); b.writeUInt32LE(prop, 4); b.writeUInt32LE(type, 8);
+    b[12] = fmt; b.writeUInt32LE(fmt === 8 ? bytes.length : data.length, 16); bytes.copy(b, 20);
+    this.req(OP.ChangeProperty, mode || 0, b, false);
+  }
+
+  // SendEvent of a 32-byte event to <dest>, with no event mask: the server
+  // hands it to the client that created <dest>, which is how XDND talks.
+  sendEvent(dest, ev) {
+    const b = Buffer.alloc(40);
+    b.writeUInt32LE(dest, 0); b.writeUInt32LE(0, 4); ev.copy(b, 8);
+    this.req(OP.SendEvent, 0, b, false);
+  }
+
+  async clientMessage(dest, type, data) {
+    const ev = Buffer.alloc(32);
+    ev[0] = XE.ClientMessage; ev[1] = 32;
+    ev.writeUInt32LE(dest, 4); ev.writeUInt32LE(await this.atom(type), 8);
+    for (let i = 0; i < 5; i++) ev.writeUInt32LE((data[i] || 0) >>> 0, 12 + i * 4);
+    this.sendEvent(dest, ev);
+    await this.sync();
+  }
+
+  // DIVE-6775: close a top-level window as a window manager's close button does:
+  // WM_PROTOCOLS/WM_DELETE_WINDOW. No key is involved, so it works on a dialog
+  // that never got the keyboard; GTK answers it as the dialog's Cancel.
+  async closeWindow(win) {
+    await this.clientMessage(win, 'WM_PROTOCOLS', [await this.atom('WM_DELETE_WINDOW'), 0]);
+  }
+
+  // The events that match `pred`, from now on: next(ms) resolves the oldest,
+  // or null when none comes within ms. stop() when done.
+  events(pred) {
+    const q = [], waiters = [];
+    const fn = (e) => { if (!pred(e)) return; const w = waiters.shift(); if (w) w(e); else q.push(e); };
+    this.listeners.add(fn);
+    return {
+      next: (ms) => q.length ? Promise.resolve(q.shift()) : new Promise((resolve) => {
+        const w = (e) => { clearTimeout(t); resolve(e); };
+        const t = setTimeout(() => { const i = waiters.indexOf(w); if (i >= 0) waiters.splice(i, 1); resolve(null); },
+          Math.max(0, ms));
+        waiters.push(w);
+      }),
+      stop: () => { this.listeners.delete(fn); },
+    };
+  }
+
+  // The server's clock, which a selection owner has to name: a zero-length
+  // append to a property of our own window, and the time on its PropertyNotify.
+  async serverTime(win) {
+    const ev = this.events((e) => (e[0] & 0x7f) === XE.PropertyNotify && e.readUInt32LE(4) === win);
+    try {
+      this.changeProp(win, await this.atom('_5DIVE_TIME'), await this.atom('STRING'), Buffer.alloc(0), 2 /* Append */);
+      const e = await ev.next(2000);
+      if (!e) throw new Error('the X server never said what time it is, so nothing can be offered to the browser');
+      return e.readUInt32LE(12);
+    } finally { ev.stop(); }
+  }
+
+  // Own <selection> on <win> from <time>, and answer every request for it from
+  // `offers` ({ 'text/uri-list': Buffer }) and TARGETS. `served` lists the
+  // targets handed out, so a caller can say whether the browser ever asked.
+  async ownSelection(selection, win, time, offers) {
+    const sel = await this.atom(selection), TARGETS = await this.atom('TARGETS'), ATOM = await this.atom('ATOM');
+    const types = new Map();
+    for (const [k, v] of Object.entries(offers)) types.set(await this.atom(k), v);
+    const served = [];
+    const fn = (e) => {
+      if ((e[0] & 0x7f) !== XE.SelectionRequest || e.readUInt32LE(8) !== win || e.readUInt32LE(16) !== sel) return;
+      const t = e.readUInt32LE(4), requestor = e.readUInt32LE(12), target = e.readUInt32LE(20);
+      let property = e.readUInt32LE(24) || target;     // an obsolete client names none: the target, by the ICCCM
+      if (target === TARGETS) this.changeProp(requestor, property, ATOM, [TARGETS, ...types.keys()]);
+      else if (types.has(target)) { this.changeProp(requestor, property, target, types.get(target)); served.push(target); }
+      else property = 0;                                // not offered: the requestor reads None
+      const ev = Buffer.alloc(32);
+      ev[0] = XE.SelectionNotify;
+      ev.writeUInt32LE(t, 4); ev.writeUInt32LE(requestor, 8); ev.writeUInt32LE(sel, 12);
+      ev.writeUInt32LE(target, 16); ev.writeUInt32LE(property, 20);
+      this.sendEvent(requestor, ev);
+    };
+    this.listeners.add(fn);
+    const b = Buffer.alloc(12);
+    b.writeUInt32LE(win, 0); b.writeUInt32LE(sel, 4); b.writeUInt32LE(time, 8);
+    this.req(OP.SetSelectionOwner, 0, b, false);
+    await this.sync();
+    return { served, stop: () => { this.listeners.delete(fn); } };
+  }
+
+  // DIVE-7237 (GAP-17): <text> into the focused field as ONE paste, not as
+  // keystrokes. A code editor answers each typed key (closes a quote, commits an
+  // autocomplete on "," or ".", re-indents a new line), so a pixel code typed key
+  // by key came out with characters changed and dropped (Shopify's custom pixel,
+  // DIVE-6902). A paste is inserted as it is. The text is offered on CLIPBOARD
+  // from a window of our own, ctrl+v is pressed, and the window is destroyed
+  // once the browser has read it, so nothing holds the text for a later paste.
+  // Resolves { served } — false when nothing asked for it (no text field had
+  // the focus). One property request: at most PASTE_MAX bytes.
+  async paste(text, waitMs) {
+    const data = Buffer.from(String(text), 'utf8');
+    if (!data.length) throw new Error('nothing to paste');
+    if (data.length > PASTE_MAX) throw new Error(`${data.length} bytes is more than one paste carries (${PASTE_MAX}); split it`);
+    const win = await this.createInputWindow();
+    let own = null;
+    try {
+      const time = await this.serverTime(win);
+      own = await this.ownSelection('CLIPBOARD', win, time,
+        { UTF8_STRING: data, 'text/plain;charset=utf-8': data, TEXT: data });
+      const before = await this.atom('UTF8_STRING');
+      await this.press('ctrl+v');
+      const until = Date.now() + (waitMs || 3000);
+      while (Date.now() < until && !own.served.length) await sleep(30);
+      if (own.served.length) await sleep(150);   // a second target (TARGETS first) arrives right after
+      return { served: own.served.length > 0, utf8: own.served.includes(before) };
+    } finally {
+      if (own) own.stop();
+      await this.destroyWindow(win).catch(() => {});   // the selection goes with the window
+    }
+  }
+
+  // DIVE-7171: what is on the CLIPBOARD, read as any X client reads it, and
+  // then cleared. A site that shows a new API key masked, with only a Copy
+  // button (CJdropshipping), puts it here and nowhere else. ConvertSelection of
+  // CLIPBOARD (UTF8_STRING, then STRING) onto a window of our own, the
+  // property read and deleted; then the selection is taken by that window and
+  // the window destroyed, so nothing holds the value for the next paste.
+  // Resolves { text, cleared } — text '' when nobody holds the clipboard.
+  async readClipboard(waitMs) {
+    const win = await this.createInputWindow();
+    try {
+      const sel = await this.atom('CLIPBOARD'), into = await this.atom('_5DIVE_CLIP');
+      const time = await this.serverTime(win);
+      let text = '';
+      for (const tname of ['UTF8_STRING', 'STRING']) {
+        const target = await this.atom(tname);
+        const ev = this.events((e) => (e[0] & 0x7f) === XE.SelectionNotify && e.readUInt32LE(8) === win);
+        let e;
+        try {
+          const b = Buffer.alloc(20);
+          b.writeUInt32LE(win, 0); b.writeUInt32LE(sel, 4); b.writeUInt32LE(target, 8);
+          b.writeUInt32LE(into, 12); b.writeUInt32LE(time, 16);
+          this.req(OP.ConvertSelection, 0, b, false);
+          e = await ev.next(waitMs || 3000);
+        } finally { ev.stop(); }
+        if (!e) throw new Error('the clipboard\'s owner never answered, so nothing was read');
+        if (e.readUInt32LE(20) === 0) continue;          // property None: not held, or not in this type
+        const g = Buffer.alloc(20);
+        g.writeUInt32LE(win, 0); g.writeUInt32LE(into, 4); g.writeUInt32LE(0, 8);   // AnyPropertyType
+        g.writeUInt32LE(0, 12); g.writeUInt32LE(16384, 16);                         // up to 64 KB
+        const r = await this.req(OP.GetProperty, 1 /* delete */, g, true);
+        if (r.readUInt32LE(8) === await this.atom('INCR')) throw new Error('the clipboard holds more than this reads at once (64 KB), so nothing was read');
+        if (r[1] !== 8) continue;
+        text = r.subarray(32, 32 + r.readUInt32LE(16)).toString(tname === 'UTF8_STRING' ? 'utf8' : 'latin1');
+        break;
+      }
+      const o = Buffer.alloc(12);
+      o.writeUInt32LE(win, 0); o.writeUInt32LE(sel, 4); o.writeUInt32LE(0, 8);      // CurrentTime
+      this.req(OP.SetSelectionOwner, 0, o, false);
+      await this.sync();
+      return { text, cleared: true };
+    } finally {
+      await this.destroyWindow(win).catch(() => {});   // the selection it owns goes with it
+    }
+  }
+
+  // The window at the pointer that takes drops: the outermost one with
+  // XdndAware (the browser's top-level window), and the version it speaks.
+  async dropTarget() {
+    for (const w of await this.underPointer()) {
+      const v = await this.prop32(w, 'XdndAware');
+      if (v !== null) return { win: w, version: v };
+    }
+    return null;
+  }
+
+  // Drag <file> onto x,y and drop it, as a file manager does. Resolves
+  // { finished, accepted, fetched } when the browser has said it is done;
+  // throws, having sent XdndLeave so the page sees the drag go, when what is at
+  // the point never takes a file.
+  async dropFile(x, y, file, pid, opts) {
+    const o = opts || {};
+    await this.move(x, y);
+    const tgt = await this.dropTarget();
+    if (!tgt) throw new Error(`nothing at ${x},${y} takes a dropped file: no window there speaks drag-and-drop`);
+    if (pid && !(await this.isBrowserWindow(tgt.win, pid))) {
+      throw new Error(`the window at ${x},${y} that takes drops is not the browser (0x${tgt.win.toString(16)}), so nothing was dropped`);
+    }
+    const version = Math.min(5, tgt.version);
+    if (version < 3) throw new Error(`the browser speaks drag-and-drop version ${tgt.version}, older than this needs (3)`);
+    const uri = require('url').pathToFileURL(file).href;
+    const src = await this.createInputWindow();
+    const [STATUS, FINISHED, COPY, URIS] = await Promise.all(
+      ['XdndStatus', 'XdndFinished', 'XdndActionCopy', 'text/uri-list'].map((a) => this.atom(a)));
+    const said = this.events((e) => (e[0] & 0x7f) === XE.ClientMessage && e.readUInt32LE(4) === src);
+    let sel = null;
+    try {
+      const t = await this.serverTime(src);
+      sel = await this.ownSelection('XdndSelection', src, t, { 'text/uri-list': Buffer.from(uri + '\r\n') });
+      await this.clientMessage(tgt.win, 'XdndEnter', [src, version << 24, URIS]);
+      // The first answers are "no" while the page has not seen the drag yet:
+      // Chrome answers each position with what the page said to the one before.
+      // So keep the drag over the point, as a hand does, until it says yes.
+      let yes = false, answers = 0;
+      const until = Date.now() + (o.acceptMs || 5000);
+      while (!yes && Date.now() < until) {
+        await this.clientMessage(tgt.win, 'XdndPosition', [src, 0, ((x & 0xffff) << 16) | (y & 0xffff), t, COPY]);
+        for (let e; (e = await said.next(400));) {
+          if (e.readUInt32LE(8) !== STATUS) continue;
+          answers++; yes = !!(e.readUInt32LE(16) & 1);
+          break;
+        }
+        if (!yes) await sleep(100);
+      }
+      if (!yes) {
+        await this.clientMessage(tgt.win, 'XdndLeave', [src]);
+        throw new Error(`the page at ${x},${y} did not take the file: ` + (answers
+          ? `the browser answered ${answers} drag position(s) with "no drop here"`
+          : 'the browser never answered the drag'));
+      }
+      await this.clientMessage(tgt.win, 'XdndDrop', [src, 0, t]);
+      let fin = null;
+      const until2 = Date.now() + (o.finishMs || 8000);
+      while (!fin && Date.now() < until2) {
+        const e = await said.next(until2 - Date.now());
+        if (!e) break;
+        if (e.readUInt32LE(8) === FINISHED) fin = e;
+      }
+      return { finished: !!fin, accepted: !!fin && (version < 5 || !!(fin.readUInt32LE(16) & 1)), fetched: sel.served.length };
+    } finally {
+      said.stop(); if (sel) sel.stop();
+      try { await this.destroyWindow(src); } catch (e) { /* the connection is going anyway */ }
+    }
   }
 
   // ---- input --------------------------------------------------------------
@@ -404,40 +810,54 @@ class X11 {
     const { minKeycode: min, maxKeycode: max } = this.setup;
     const b = Buffer.alloc(4); b[0] = min; b[1] = max - min + 1;
     const r = await this.req(OP.GetKeyboardMapping, 0, b, true);
-    const per = r[1], map = new Map(), free = [];
+    const per = r[1], map = new Map(), spare = [], held = new Map();
     for (let kc = min; kc <= max; kc++) {
       const base = 32 + (kc - min) * per * 4;
-      let any = false;
+      const on = new Set();
       for (let lvl = 0; lvl < per; lvl++) {
         const ks = r.readUInt32LE(base + lvl * 4);
         if (!ks) continue;
-        any = true;
+        on.add(ks);
         if (lvl < 2 && !map.has(ks)) map.set(ks, { kc, shift: lvl === 1 });
       }
-      if (!any && kc > min + 8) free.push(kc);
+      if (kc <= min + 8) continue;
+      // A key with nothing on it is spare. So is a key an earlier connection
+      // bound for one character (a single Unicode keysym, nothing else): this
+      // daemon after a restart, or xdotool. It keeps its character until the
+      // spare keys run out, and is then rebound like any other.
+      const [only] = on;
+      if (!on.size) spare.unshift(kc);
+      else if (on.size === 1 && isUnicodeKeysym(only)) { spare.push(kc); held.set(kc, only); }
     }
-    this.keymap = { map, free, per };
+    this.keymap = { map, spare, held, per };
     return this.keymap;
   }
 
   // keysym -> {kc, shift}. A keysym the keyboard has no key for (é, ü, an
-  // emoji) is bound to a spare keycode for the moment it is typed, the way
+  // emoji, 服) is bound to a spare keycode for the moment it is typed, the way
   // xdotool does it; the page receives the character, as from a real layout.
+  // The spare keys are RECYCLED, least recently used first: Xvfb's keymap has
+  // about 18 of them, and a Chinese message has more distinct characters than
+  // that (DIVE-5433: chill-gorge's Telegram draft stopped after '服务器上',
+  // the 18th). A key is rebound only after every other spare has been used
+  // since, so the page has long read the character it carried.
   async keyFor(ks) {
     const km = await this.loadKeymap();
     const hit = km.map.get(ks);
-    if (hit) return hit;
-    if (this.scratch.has(ks)) return { kc: this.scratch.get(ks), shift: false };
-    const kc = km.free.shift();
+    if (hit) { touch(km.spare, hit.kc); return hit; }
+    const kc = km.spare.shift();
     if (!kc) throw new Error(`no spare key to type keysym 0x${ks.toString(16)} with`);
+    const was = km.held.get(kc);
+    if (was !== undefined && km.map.get(was)?.kc === kc) km.map.delete(was);
     const body = Buffer.alloc(4 + km.per * 4);
     body[0] = kc; body[1] = km.per;
     for (let i = 0; i < km.per; i++) body.writeUInt32LE(i < 2 ? ks : 0, 4 + i * 4);
     this.req(OP.ChangeKeyboardMapping, 1, body, false);
     await this.sync();
     await sleep(40);   // clients re-read the map on MappingNotify; give them the moment
-    this.scratch.set(ks, kc);
-    return { kc, shift: false };
+    const k = { kc, shift: false };
+    km.map.set(ks, k); km.held.set(kc, ks); km.spare.push(kc);
+    return k;
   }
 
   async tapKeysym(ks, mods) {
@@ -567,11 +987,20 @@ function charKeysym(ch) {
   const cp = ch.codePointAt(0);
   return cp >= 0x20 && cp <= 0x7e ? cp : cp >= 0xa0 && cp <= 0xff ? cp : 0x01000000 + cp;
 }
+// The keysym a character gets when it has none of its own: 0x01000000 + code point.
+function isUnicodeKeysym(ks) { return ks >= 0x01000100 && ks <= 0x0110ffff; }
+// Move a spare key to the most-recently-used end, if it is one.
+function touch(spare, kc) {
+  const i = spare.indexOf(kc);
+  if (i >= 0) { spare.splice(i, 1); spare.push(kc); }
+}
 function keysymOf(name) {
   const f = String(name).match(/^f([1-9]|1[0-2])$/i);
   if (f) return 0xffbd + Number(f[1]);
   const canon = ALIASES[String(name).toLowerCase()] || name;
   if (KEYSYM[canon] !== undefined) return KEYSYM[canon];
+  // A modifier on its own is a key too (DIVE-5740: 'ctrl' was "not a key").
+  if (MODS[String(name).toLowerCase()] !== undefined) return MODS[String(name).toLowerCase()];
   if ([...String(name)].length === 1) return charKeysym(String(name));
   return null;
 }
@@ -588,4 +1017,4 @@ async function open(display) {
   return x;
 }
 
-module.exports = { open, displaySocket, keysymOf, charKeysym, encodePNG, crc32, KEYSYM };
+module.exports = { open, displaySocket, keysymOf, charKeysym, encodePNG, crc32, KEYSYM, XE };

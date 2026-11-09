@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — browser 1.73.0: the registry copy is byte-for-byte 5dive-browser again, and CI keeps it that way (DIVE-8050)
+
+Box bug report 828 (witty-palm): `act` with an `upload` step said "'upload' is not an act step". 5dive-browser has had it since 1.64.0 (DIVE-7237); this copy was last synced on 10-02 (1.32.0) and took only hand ports after. 87 upstream commits never arrived, among them `act` upload and the rc-133 crash fix (DIVE-7432, report 604). Boxes keep landing here because the app's one-click install names `browser@5dive-plugins`.
+
+- **`plugins/browser`:** byte-for-byte 5dive-ai/5dive-browser 1.73.0 (its git tree hash equals upstream's `browser/`). Three of the four hand ports since 10-02 (DIVE-7972 page text is untrusted data, DIVE-7559 local-only mode, DIVE-7506 the viewer-link button) were never upstream; they went there first, in 1.73.0, so this sync keeps them. DIVE-7978 was already there (1.72.1).
+- **`tests/browser_mirror.sh`:** `check` fails when `plugins/browser` equals no 5dive-browser main commit (on a PR, the same-named upstream branch too); behind main is a warning naming the gap. `run` runs 5dive-browser's OWN harnesses, from the matched commit, on a copy of this tree. `sync [<ref>]` is the whole port.
+- **CI (`parity.yml`):** the nine hand-kept harness copies (`tests/browser_*.sh`, `tests/x11_stack.cjs`) are gone; they had drifted, and they are why each sync was a merge. CI now runs `check`, then upstream's plugin, connect-request, reflex-propose, tmpdir, input-drive, routine/delta, probe-timeout, served-probe, launch-env and act-upload harnesses, then totp with playwright-core installed.
+- **`tests/browser_registry_unit.sh`:** the registry-only arms (the deprecation notice in `marketplace.json` and never inside the mirror; was TR28), R1-R4, 30 arms.
+
 ### Fixed — teams 0.5.1: a knock carries the sender's email from the tenant, so the box binds it to the person the owner added (DIVE-8032)
 
 The owner can add a person in the app by name and email before they ever write. Their first Teams message knocked with no email, so the box made a second person record. The knock now carries the address Microsoft holds for that sender.

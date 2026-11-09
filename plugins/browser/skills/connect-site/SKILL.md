@@ -3,7 +3,7 @@ name: connect-site
 description: Get a human logged into a site on the box, then use that logged-in session. Use when you need a site the agent has no session for — "log in to X", "connect my X account", "the agent needs a logged-in X", "open a browser on the box", "X says I'm signed out" — or when `5dive browser status` is not `authenticated`. Not for browsing or acting on a public page — the browser does that with nothing connected (the use-browser skill) — and not for anything a site's API already does.
 ---
 
-# connect-site — use the bound dashboard handoff, then stop and check
+# connect-site — hand the owner a bound login, then stop and check
 
 You cannot log a person in. What you CAN do is put a real browser on the box, mint a
 one-time link to it, hand that link to the human over whatever channel you are paired to,
@@ -12,6 +12,21 @@ your later `run` calls reuse.
 
 The commands are easy. The orchestration is where seats get it wrong, and every mistake
 here is **silent** — nothing errors, the human just never gets in.
+
+## Claude in Chrome for this agent (opt-in, DIVE-6345)
+
+When the owner asks to "connect Claude in Chrome" (or "the Claude extension") for you, it is a
+different flow from a site login, and it is one command:
+
+```bash
+5dive browser claude connect          # claude.ai opens on the owner's phone, through the same live window
+5dive browser claude connect --wait   # until they are done, then the agent's own login is checked
+```
+
+The owner signs in to claude.ai once in that window ("Continue with Google" is quickest) and taps
+Authorize for your own login; nobody copies a code. If it says the box is not turned on, the owner
+(or main) runs `sudo 5dive agent config <you> set chrome=on` first. After `--wait` says connected,
+restart yourself (`sudo 5dive agent _self_restart`) so you run on that login with Chrome on.
 
 ## THE RULE THAT COSTS THE MOST WHEN BROKEN
 
@@ -39,8 +54,8 @@ spends nothing. A good nonce is the customer's only redemption.
 
 ## When YOU need the owner logged in: ask with a button (DIVE-4992)
 
-Do not walk the owner through the dashboard, and never hand them a link you made
-yourself. Ask from your own seat:
+Do not walk the owner through the login steps yourself, and never hand them a link you
+made yourself. Ask from your own seat:
 
 ```bash
 5dive browser connect-request <site> --reason="<one line: why you need it>"
@@ -53,9 +68,28 @@ They log in, then tap **Done**. Done revokes the view, stops the browser and pro
 that order. You get a channel message at each step, `[browser connect] …`. After the
 Done message, `5dive browser status <site>` has the verdict. Do not poll while you wait.
 
-If `connect-request` refuses because the seat has no paired owner, its Telegram bridge
-cannot relay the tap, or it has no grant, fall back to the owner's own path, the shipped
-flow below.
+**On a self-hosted box linked to the 5dive app**, the ask goes to your chat there first: one
+**Connect <site>** link (or **Open <site>** for a check) with **Done** and **Not now** under it.
+You never see the link. Their answer comes back to you as a chat message; then run
+`5dive browser connect-done <site>`, which closes their view and prints the verdict. The first
+ask on a box can take about 2 minutes while it sets up its secure web address; if it cannot
+make one, the chat tells the owner to use their login shell (below) and you get a message.
+
+**On a self-hosted box (no 5dive domain) with nobody paired on Telegram**, not linked to the app, the same
+`connect-request` (and `--challenge`) still reaches the owner: the ask waits in their login
+shell on the box (DIVE-7078). Their next login lists it. `sudo 5dive browser asks open <site>`
+gives them the one-time login link, or the SSH steps to the same window when login links are
+off, and `sudo 5dive browser asks done <site>` checks the login and messages you. You never
+see the link. If you talk to the owner before then, tell them once to run
+`sudo 5dive browser asks`; never run it yourself, and do not poll while you wait.
+
+On a box 5dive built (it has a 5dive domain), if `connect-request` refuses because the seat
+has no paired owner, its Telegram bridge cannot relay the tap, or it has no grant, fall back
+to the owner's own path there, the shipped flow below. That flow exists only on those boxes.
+
+On a self-hosted box (no 5dive domain) the owner's tap is refused with "login links off"
+unless the owner turned them on. That is the owner's choice, not yours: tell them once
+that `sudo 5dive browser login-link` lists the options, and never run it yourself.
 
 On a box in local-only mode (`/etc/5dive/local-only` exists) `connect-request` refuses:
 nothing may go to Telegram there. Ask the owner in the office chat to log in at the box.
@@ -122,6 +156,21 @@ The view is ephemeral; the login profile is durable. Revoke promptly: a live vie
 keyboard attached to the person's account.
 <!-- 5dive:connect-site-flow:end -->
 
+## Google once per group (DIVE-6013)
+
+Connected sites share a sign-in when they are in the same **group** (one browser profile). New
+sites join **Main**, so if Main is signed in to Google, a new site's "Continue with Google" sees
+the account — tap it, no fresh Google login. A site that predates groups has its own profile;
+`5dive browser group ls` shows which. To give it Main's Google: `5dive browser group move <site>
+Main` (the owner's call — its old profile is kept aside, not merged). A second Google account
+belongs in a second group (`group create Work`, then `group move <site> Work`).
+
+**The box's Google counts too (DIVE-7168).** Once the owner has signed in to Google in the box's
+browser (any `asks open` or Connect link), a new site an agent opens joins that browser by itself,
+and the agent does a "Continue with Google" sign-up with no owner tap. So do not send the owner a
+link for a sign-up: send one only for a password, a wider Google grant, or a code or robot check
+you could not clear yourself (see below).
+
 ## What will actually go wrong
 
 - **`serve` fails closed on a box without the stack.** Server mode needs chromium, Xvfb,
@@ -169,12 +218,23 @@ keyboard attached to the person's account.
 ## The line this capability does not cross
 
 This is **persistent human-authenticated sessions** — a person logs in, once, by hand, and
-the agent is granted permission to operate the session, never the credentials. It is not
-anti-bot bypassing. A CAPTCHA, a 2FA prompt or an "unusual activity" interstitial is a
-**hard stop that asks for a person**: surface it, do not attempt it, do not look for a way
-around it. Ask them with `5dive browser connect-request <site> --challenge --url=<page>` (the
-use-browser skill has the whole handoff), then carry on after their Done. The one exception is
-the owner's own authenticator: if the owner saved the site's
+the agent is granted permission to operate the session, never the credentials.
+It is not anti-bot bypassing: no solver service, no fingerprint tricks, no way round a check;
+the agent clears one only the way a person at the screen would.
+
+**Sign-in checks are the agent's job (DIVE-7881, lodar 2026-11-07: «remove rules»).** An email
+or SMS verification, a code box, a 2-step prompt, an "unusual activity" page and a robot check
+are cleared by the agent, like a person would: it opens the newest mail from that site in the
+box's mailbox and follows its link or types its code, ticks the robot check, waits out "Just a
+moment…", retries. No paid solver service. It asks the owner only when it truly can't (no
+mailbox here, a code sent to the owner's phone, a check still there after a few tries), with
+`5dive browser connect-request <site> --challenge --url=<page>` (the use-browser skill has the
+whole handoff), and carries on after their Done. **Custom gates, off by default:** the owner
+turns a stop back on per site or for all, `sudo 5dive browser gate on bank.com robot` (or
+`code`, or `all`); then that check stops (exit 75) and asks them. `5dive browser gate` lists them.
+What never turns off: read only the site's own mail, never paste a code or link into chat,
+never type a password the owner did not save. The owner's own authenticator works too:
+if the owner saved the site's
 authenticator seed on the box (`5dive browser totp status <site>`), `run` types the 2FA code
 itself. To offer that, file the secret gate `totp status` prints, so the owner pastes the seed
 on the box's one-time link. Never ask for it in chat, and never echo it back. Never ask the human for a password, never accept one, never write one down, and
@@ -206,3 +266,5 @@ Lessons from browser jobs that went wrong on real sites (DIVE-5390). One line ea
 
 - **Each site's login is its own.** A Google sign-in on one site does not carry to another, so "Sign in with Google" on a new site still needs the owner to connect that site.
 - **Served is not signed in.** A running browser can hold an expired session. Check `5dive browser status <site>` reads authenticated before you hand off work that needs the login, and run the connect handover if it does not.
+- **`busy: held by … until <time>` is not signed out.** A person is at the viewer, or another job still holds the browser. Wait until that time and retry once; never join their session.
+- **A verification link or code can expire within minutes.** Have the inbox or chat that receives it served and authenticated before you press the button that sends it.

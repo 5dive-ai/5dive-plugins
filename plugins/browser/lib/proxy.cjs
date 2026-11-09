@@ -61,4 +61,31 @@ function launchProxy(profile) {
   return out;
 }
 
-module.exports = { FILE, proxyFile, launchProxy };
+// HOW THE ROUTE REACHES CHROME (DIVE-7643). Two ways, chosen by whether the
+// proxy carries a login:
+//
+// - WITH a login: Playwright's `proxy` option, the only way to answer the
+//   proxy's auth challenge (the header above). Only http(s) gets here: `proxy
+//   set` refuses a login on socks.
+// - WITHOUT one: a plain `--proxy-server=scheme://host:port` arg, as input mode
+//   has done since DIVE-7476. Handing a socks5 proxy to Playwright's option
+//   makes Playwright add `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE
+//   <proxy host>"`, and a headed Chrome answers that flag with its yellow
+//   "You are using an unsupported command-line flag" bar across every window
+//   the customer sees and every screenshot an agent takes. The flag was a DNS
+//   guard, and it is not needed: Chrome's own socks5 resolves the hostname AT
+//   the proxy, so the page still leaves from the proxy's IP. Do not replace it
+//   with --test-type to hide the bar: that switches off other warnings too.
+//   `<-loopback>` keeps what Playwright's option did, so localhost goes through
+//   the proxy too and the route does not change for any page.
+//
+// Returns { args, option }: args to append to the launch args, and the keys to
+// spread into the launch options. Unset → no args and no key, byte-for-byte
+// the launch from before DIVE-4951.
+function launchRoute(via) {
+  if (!via) return { args: [], option: {} };
+  if (via.username || via.password) return { args: [], option: { proxy: via } };
+  return { args: [`--proxy-server=${via.server}`, '--proxy-bypass-list=<-loopback>'], option: {} };
+}
+
+module.exports = { FILE, proxyFile, launchProxy, launchRoute };
