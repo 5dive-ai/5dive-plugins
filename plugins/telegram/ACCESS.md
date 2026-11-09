@@ -59,7 +59,7 @@ Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`.
 
 With the default `requireMention: true`, the bot responds only when @mentioned, replied to, or called by name (see Mention detection). Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
 
-On a 5dive box the app's **In groups, answer** setting (`5dive agent telegram-access groups <agent> --answer=name|every`) sets `requireMention` on every group at once and stores `groupsRequireMention`, which a group the owner adds later gets. Without the key a new group answers when called by name.
+On a 5dive box the app's **In groups, answer** setting (`5dive agent telegram-access groups <agent> --answer=name|every`) sets `requireMention` on every group at once and stores `groupsRequireMention`, which a group the owner adds later gets. It also stores `groupsOwnerOnly: false`: groups opened to everyone on purpose. **Without that key a group the owner adds lets in its owners only** (DIVE-7972): its `allowFrom` is the owners, so a stranger who joins through an invite link cannot call the agent. Every inbound carries `sender_role` (`owner`, `guest` or `member`), and a non-owner's message in a group reaches the agent inside an `UNTRUSTED` marker block.
 
 `--answer=owner` ("When I call it by name") also stores `groupsOwnerOnly: true` and lets each group's owners in alone (`allowFrom`). Then a group message from anyone but an owner is dropped before the agent or its group log sees it, and a group the owner adds later gets the same.
 

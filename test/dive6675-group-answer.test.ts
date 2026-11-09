@@ -33,18 +33,20 @@ const base: JoinInput = {
 const owner = (extra: Record<string, unknown> = {}) => ({ owners: ['111'], allowFrom: ['111'], groups: {} as Record<string, unknown>, ...extra })
 
 describe('a group the owner adds answers as the setting says', () => {
-  test('no setting stored: by name, as before', () => {
+  // DIVE-7972: the CLI's by name / every message now stores groupsOwnerOnly: false
+  // (opened on purpose); with nothing stored the new group lets in its owners only.
+  test('no setting stored: by name, its owners only (DIVE-7972)', () => {
     const a = owner()
     expect(admitOnJoin(a, '-1001', { id: 111 })).toBe(true)
-    expect(a.groups['-1001']).toEqual({ requireMention: true, allowFrom: [] })
+    expect(a.groups['-1001']).toEqual({ requireMention: true, allowFrom: ['111'] })
   })
   test('set to every message: the new group answers every message', () => {
-    const a = owner({ groupsRequireMention: false })
+    const a = owner({ groupsRequireMention: false, groupsOwnerOnly: false })
     expect(admitOnJoin(a, '-1001', { id: 111 })).toBe(true)
     expect(a.groups['-1001']).toEqual({ requireMention: false, allowFrom: [] })
   })
   test('set to by name: by name', () => {
-    const a = owner({ groupsRequireMention: true })
+    const a = owner({ groupsRequireMention: true, groupsOwnerOnly: false })
     admitOnJoin(a, '-1001', { id: 111 })
     expect(a.groups['-1001']).toEqual({ requireMention: true, allowFrom: [] })
   })
