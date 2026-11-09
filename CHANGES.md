@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — browser 1.32.2: a login view's stop waits out its cap on Ubuntu 26.04 (DIVE-7978)
+
+Plugins main read red on `fork parity` from 2026-11-07: T49e's stop left after ~0.6 s instead of waiting out its 1 s cap. The same commit was green on GitHub's ubuntu-24.04 runner and red on ubuntu-26.04.
+
+- **Cause:** Ubuntu 26.04's coreutils is uutils, and its `date +%3N` is wrong for the first 100 ms of every second. It drops the leading zeros of the nanoseconds, then cuts to 3 digits, so 0.005 s reads as 0.535 s. One such read inside the cookie wait ended it early. On a 26.04 box, Done could cut off a sign-in that the wait was there to save.
+- **`bin/browser`:** a new `_now_ms` reads bash's own `EPOCHREALTIME` (no fork, no coreutils), and every `date +%s%3N` (the cookie wait, the routine replay timer) now uses it.
+- **Harnesses:** the T49 fake Chrome, the T49/R11 stopwatches and the three bench timers use the same clock.
+- **New arm T49g:** a fake `date` that jumps 5 s ahead on its second `%3N` read; the stop still waits out its cap. A mutant timed by `date +%s%3N` leaves at once.
+
 ### Added — crew 0.1.0: the CrewAI runtime is a plugin, and its feed receipt is off by default (DIVE-7950)
 
 `5dive crew` left the core CLI (lodar 11-09: optional features are plugins, never core). `sudo 5dive plugin add crew@5dive-plugins` brings it back with the same subcommands; a box without it gets one line pointing here.

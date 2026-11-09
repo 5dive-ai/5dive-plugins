@@ -103,7 +103,7 @@ cat > "$FIVEDIVE_BROWSER_ADAPTER_DIR/$SITE.json" <<JSON
   "actions": {} }
 JSON
 
-now_ms() { date +%s%3N; }
+now_ms() { local t="${EPOCHREALTIME//[!0-9]/}"; echo $(( t / 1000 )); }  # not date +%s%3N: uutils misprints it (DIVE-7978)
 median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}'; }
 
 # A FAILED ARM IS PRINTED, NEVER AVERAGED. A verb that refused is fast for the

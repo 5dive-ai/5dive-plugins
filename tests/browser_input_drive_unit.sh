@@ -456,10 +456,13 @@ r11_serve() {  # r11_serve [browser] — a fresh input serve whose commit is 1.5
 r11_admit() {  # what viewer-redeem writes (graded there, in browser_plugin_unit.sh T10d)
   ( umask 077; printf 'admitted_at=%s\n' "${1:-$(date -u +%s)}" > "$R11D/.5dive-viewer.admitted" )
 }
+# The stopwatch is the shell's clock: uutils date (ubuntu-26.04) misprints %3N in the
+# first 100 ms of each second (DIVE-7978).
+r11_now_ms() { local t="${EPOCHREALTIME//[!0-9]/}"; echo $(( t / 1000 )); }
 r11_stop() {  # r11_stop [browser] — times the stop into R11MS
-  local s; s=$(date +%s%3N)
+  local s; s=$(r11_now_ms)
   "${1:-$BROWSER}" serve tiktok.com --stop >/dev/null 2>&1; R11RC=$?
-  R11MS=$(( $(date +%s%3N) - s ))
+  R11MS=$(( $(r11_now_ms) - s ))
 }
 r11_cookie() { cat "$R11D/Default/Cookies" 2>/dev/null; }
 
