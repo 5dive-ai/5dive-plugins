@@ -43,6 +43,18 @@ Then restart the gateway (`hermes gateway restart`).
 | `FIVEDIVE_SPOOL_DIR` | yes | the folder the 5dive bridge reads and writes (`inbox/`, `outbox/dashboard/`) |
 | `FIVEDIVE_ALLOWED_USERS` | recommended | allowed senders; the bridge sends as `5dive-app` |
 | `FIVEDIVE_ALLOW_ALL_USERS` | no | `true` lets every sender in the folder through |
+| `FIVEDIVE_REPLY_MAX_WORDS` | no | word cap on one answer (default 70; a longer one goes back to the agent to shorten; `0` turns it off) |
+| `FIVEDIVE_HOME_CHANNEL` | no | where cron results go; the app chat is `dashboard` |
+
+Needs Hermes 0.19.0 or newer.
+
+## What it touches
+
+- Reads and writes only its spool folder, plus the upload files the 5dive
+  bridge names in a message (on the same box).
+- Checks the folder every half second while the gateway runs.
+- No network calls, no listener, no shell commands, no stored credentials,
+  no telemetry.
 
 ## Maintainer
 

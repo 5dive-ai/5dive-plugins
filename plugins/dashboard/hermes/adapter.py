@@ -28,6 +28,8 @@ Configuration (env, read at construct time; env wins over config.yaml extra):
     FIVEDIVE_SPOOL_DIR        the spool directory (required)
     FIVEDIVE_ALLOWED_USERS    senders allowed in; the bridge sends as 5dive-app
     FIVEDIVE_ALLOW_ALL_USERS  allow every sender in the spool
+    FIVEDIVE_REPLY_MAX_WORDS  word cap on a chat answer (default 70, 0 = off)
+    FIVEDIVE_HOME_CHANNEL     where cron results go (the chat is "dashboard")
 """
 
 import asyncio
@@ -50,6 +52,27 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Settings come through Hermes's profile-scoped secret reader, never a bare
+# os.environ read: under a multiplexing gateway os.environ can hold another
+# profile's value. get_scoped_secret (gateway.platforms._shared) is that reader
+# plus the default-profile startup fallback; agent.secret_scope.get_secret is
+# the plain one. Hermes before 0.22 has neither and runs one profile per
+# process, so os.environ is the agent's own there.
+try:
+    from gateway.platforms._shared import get_scoped_secret as _scoped_env
+except ImportError:  # Hermes < 0.22
+    try:
+        from agent.secret_scope import get_secret as _scoped_env
+    except ImportError:
+        def _scoped_env(name: str, default: Optional[str] = None) -> Optional[str]:
+            return os.environ.get(name, default)
+
+
+def env_setting(name: str) -> str:
+    """One FIVEDIVE_* setting for the active profile, stripped; "" when unset."""
+    return str(_scoped_env(name) or "").strip()
+
 
 PLATFORM_NAME = "fivedive"
 # The one sender the bridge writes as. The chat has a single owner, the person
@@ -79,7 +102,8 @@ _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
 def reply_word_cap(env: Optional[Dict[str, str]] = None) -> int:
-    raw = ((env if env is not None else os.environ).get("FIVEDIVE_REPLY_MAX_WORDS") or "").strip()
+    raw = ((env.get("FIVEDIVE_REPLY_MAX_WORDS") or "").strip() if env is not None
+           else env_setting("FIVEDIVE_REPLY_MAX_WORDS"))
     if not raw:
         return REPLY_WORD_CAP
     try:
@@ -137,7 +161,7 @@ def cut_it_prompt(refusal: str) -> str:
 
 
 def spool_dir(extra: Optional[Dict[str, Any]] = None) -> str:
-    return (os.getenv("FIVEDIVE_SPOOL_DIR") or (extra or {}).get("spool_dir") or "").strip()
+    return (env_setting("FIVEDIVE_SPOOL_DIR") or str((extra or {}).get("spool_dir") or "")).strip()
 
 
 def inbox_dir(spool: str) -> str:
