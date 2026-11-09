@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — teams 0.3.1: a failed Teams connect shows Microsoft's reason, not a libsecret hint (DIVE-8022)
+
+When Microsoft did not make an agent's bot, the app card said "Install it for secure storage: sudo apt install libsecret-1-dev", which fixes nothing. Microsoft's CLI, run with `--json`, reports its error on stdout (`{ok:false, error:{message}}`), and prints its libsecret warning on stderr on every call on a box with no desktop keyring. Connect only read the last stderr line.
+
+- The card now shows Microsoft's own error message. A crash outside the CLI's handler falls back to stderr, with warning lines and color codes removed.
+- The whole answer (stdout, stderr, exit code) is kept in `last-error.log`, root-only (0600), beside the CLI's login, so the next failure can be diagnosed.
+- The warning cannot be switched off: the CLI prints it unconditionally when the keyring is missing (`dist/auth/cache.js`, 3.0.4).
+
+Checked: `sudo bash tests/teams_cli_unit.sh` 53/53; the 4 new arms are red on the old `bin/teams`.
+
 ### Added — teams 0.3.0: admins and members on an office box (DIVE-7976)
 
 Everyone a firm let in on Teams was equal, so any employee could tell an agent with sudo, logins and the Vault to do anything. Now each person is an **admin** (the owner and the people IT names) or a **member** (everyone else let in).

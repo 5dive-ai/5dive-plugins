@@ -59,6 +59,18 @@ case "$1" in
       printf '{"loggedIn":true,"username":"admin@firm.example","tenantId":"%s","tdp":{"connected":true,"sideloading":{"tenant":%s,"user":%s}}}\n' "$MS_TEN" "$t" "$u"
     else echo '{"loggedIn":false,"username":null,"tdp":null}'; fi ;;
   app)
+    # DIVE-8022: the libsecret warning comes on every call on a box with no
+    # keyring. $MS_DIR/ms-fail picks how a failure is told: json = the CLI's own
+    # {ok:false} on stdout (its --json handler); stderr = a crash outside it,
+    # message then suggestion, in color; warn = the warnings and nothing else.
+    if [[ -s "$MS_DIR/ms-fail" ]]; then
+      printf '\e[33mWarning: libsecret not found — token cache will be stored unencrypted.\nInstall it for secure storage: sudo apt install libsecret-1-dev\e[39m\n' >&2
+      case "$(cat "$MS_DIR/ms-fail")" in
+        json) printf '{\n  "ok": false,\n  "error": {\n    "code": "NOT_FOUND_AAD",\n    "message": "AAD app not yet available in Graph API.",\n    "suggestion": "Try again shortly."\n  }\n}\n' ;;
+        stderr) printf '\e[31mFailed to get TDP token.\e[39m\nTry `teams login` again.\n' >&2 ;;
+      esac
+      exit 1
+    fi
     env=""; while (($#)); do [[ "$1" == --env ]] && env="$2"; shift; done
     rm -f "$env"  # the worst case: a fresh file made under the caller's umask
     printf 'CLIENT_ID=%s\nCLIENT_SECRET=ms-s3cr3t~value\nTENANT_ID=%s\n' "$MS_APP" "$MS_TEN" >"$env"
@@ -164,7 +176,7 @@ out=$(run agent disconnect max); rc=$?
   && ok "disconnect removes the channel, the route, the settings and the secret" || bad "disconnect (rc=$rc)" "$(cat "$W/log"; echo "$out")"
 
 # ─── DIVE-7831: --microsoft ───
-msreset() { reset; rm -f "$W/ms-in" "$W/ms-side" "$W/active" "$W/envmode" "$W/np" "$W/mshome/"*; : >"$W/mslog"; }
+msreset() { reset; rm -f "$W/ms-in" "$W/ms-side" "$W/ms-fail" "$W/active" "$W/envmode" "$W/np" "$W/mshome/"*; : >"$W/mslog"; }
 cfg="$W/home/agent-max/.claude/channels/teams/config.json"
 
 msreset
@@ -246,6 +258,24 @@ msreset; touch "$W/ms-in"; echo 'TEAMS_APP_PASSWORD=x' >"$W/conn/teams-max.env";
 out=$(JSON=1 run agent connect max --microsoft); rc=$?
 [[ $rc -eq 3 && "$out" == *"through your IT's own bot"* ]] && ! grep -q "app create" "$W/mslog" \
   && ok "an agent already on its IT's bot is not switched silently" || bad "it-path guard (rc=$rc)" "$out"
+
+# DIVE-8022: a failed make shows Microsoft's reason, never the CLI's libsecret hint.
+msreset; touch "$W/ms-in"; echo json >"$W/ms-fail"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -ne 0 && "$out" == *"Microsoft did not make the bot: AAD app not yet available in Graph API."* && "$out" != *libsecret* ]] \
+  && ok "a failed make shows Microsoft's own reason (its --json error), not the libsecret warning" || bad "json why (rc=$rc)" "$out"
+log="$W/mshome/last-error.log"
+[[ "$(stat -c %a "$log" 2>/dev/null)" == 600 ]] && grep -q "NOT_FOUND_AAD" "$log" && grep -q "Try again shortly" "$log" && grep -q "libsecret" "$log" \
+  && ok "the whole answer is kept in a 0600 log beside the CLI's login" || bad "error log" "$(ls -l "$log" 2>&1; cat "$log" 2>&1)"
+! ls "$W/mshome"/app-*.env >/dev/null 2>&1 && [[ ! -e "$cfg" ]] && ok "a failed make leaves no secret file and connects nothing" || bad "fail leftovers" "$(ls -la "$W/mshome")"
+msreset; touch "$W/ms-in"; echo stderr >"$W/ms-fail"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -ne 0 && "$out" == *"Microsoft did not make the bot: Failed to get TDP token."* && "$out" != *libsecret* && "$out" != *$'\e'* ]] \
+  && ok "a crash told on stderr: the real line, without the warnings or color codes" || bad "stderr why (rc=$rc)" "$out"
+msreset; touch "$W/ms-in"; echo warn >"$W/ms-fail"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -ne 0 && "$out" == *"Microsoft did not make the bot: no answer"* && "$out" != *libsecret* ]] \
+  && ok "only warnings: says no answer rather than sending anyone to apt" || bad "warn-only (rc=$rc)" "$out"
 
 msreset; rm -f "$W/prov.env"
 out=$(JSON=1 run agent connect max --microsoft); rc=$?

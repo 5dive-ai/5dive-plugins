@@ -282,6 +282,35 @@ _mscli() {
       "$MSCLI_BIN" --disable-auto-update "$@" )
 }
 
+# DIVE-8022: why a call failed, in Microsoft's words. Asked for --json, the CLI
+# reports its error on STDOUT ({ok:false, error:{message}}); stderr carries its
+# own warnings, and one of them comes on EVERY call on a box with no desktop
+# keyring ("Warning: libsecret not found …" / "Install it for secure storage:
+# sudo apt install libsecret-1-dev"), so the last stderr line is that hint, never
+# the reason. Only a crash outside its handler lands on stderr alone.
+_ms_why() {  # <stdout> <stderr file>
+  local w lines
+  w=$(jq -r 'select(type == "object") | .error.message // empty' <<<"$1" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1) || w=""
+  if [[ -z "$w" ]]; then
+    lines=$(sed 's/\x1b\[[0-9;]*m//g' "$2" 2>/dev/null | grep -v '^[[:space:]]*$' \
+      | grep -viE '^[[:space:]]*(\(node:[0-9]+\) )?warning\b|libsecret|secure storage' || true)
+    w=$(grep -iE 'error' <<<"$lines" | tail -1) || w=""
+    [[ -n "$w" ]] || w=$(head -1 <<<"$lines")
+  fi
+  w=$(tr -d '[:cntrl:]' <<<"$w")
+  printf '%s' "${w:0:300}"
+}
+
+# The whole answer of the last failed call, for whoever looks next (root, 0600,
+# beside the CLI's login). The card shows one line; this keeps the rest.
+_ms_keep_error() {  # <what> <rc> <stdout> <stderr file>
+  ( umask 077
+    { printf '%s  teams %s  exit %s\n--- stdout\n' "$(date -u +%FT%TZ)" "$1" "$2"
+      jq 'del(.credentials?)' <<<"$3" 2>/dev/null || printf '%s\n' "$3"
+      printf -- '--- stderr\n'; cat "$4" 2>/dev/null
+    } >"$MSCLI_HOME/last-error.log" ) || true
+}
+
 _node_ok() {  # Node >= 22.12, which Microsoft's CLI needs
   local v; v=$(node -p 'process.versions.node' 2>/dev/null) || return 1
   local maj="${v%%.*}" rest="${v#*.}"; local min="${rest%%.*}"
@@ -484,7 +513,8 @@ teams_connect_microsoft() {
     out=$(sed -n '/^{/,$p' <<<"$out")
     if (( rc != 0 )) || ! jq -e '.installLink and .botId' <<<"$out" >/dev/null 2>&1; then
       rm -f "$envf"
-      local why; why=$(grep -v '^[[:space:]]*$' "$err" | tail -1); rm -f "$err"
+      _ms_keep_error "app create" "$rc" "$out" "$err"
+      local why; why=$(_ms_why "$out" "$err"); rm -f "$err"
       fail "$E_VALIDATION" "Microsoft did not make the bot: ${why:-no answer}"
     fi
     rm -f "$err"
