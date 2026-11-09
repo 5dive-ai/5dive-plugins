@@ -142,13 +142,14 @@ async function verify(auth: string | null, activity: any) {
 const botToken = cfg ? makeTokenSource(cfg) : async () => { throw new Error('Teams not configured') }
 
 // ── Bot Connector calls ────────────────────────────────────────────────────
-async function connector(method: 'POST' | 'PUT', serviceUrl: string, path: string, body: unknown): Promise<any> {
+async function connector(method: 'POST' | 'PUT' | 'GET', serviceUrl: string, path: string, body?: unknown, timeoutMs?: number): Promise<any> {
   assertTeamsOpen()
   const base = normalizeServiceUrl(serviceUrl) // refuses any host but Microsoft's
   const r = await fetch(`${base}${path}`, {
     method,
     headers: { authorization: `Bearer ${await botToken()}`, 'content-type': 'application/json' },
-    body: JSON.stringify(body),
+    body: method === 'GET' ? undefined : JSON.stringify(body),
+    signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
   })
   const text = await r.text()
   if (!r.ok) throw new Error(`Teams said ${r.status}: ${text.slice(0, 300)}`)
@@ -269,7 +270,7 @@ async function onConsent(conv: string, c: ConsentInvoke) {
 
 // ── MCP ────────────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'teams', version: '0.5.0' },
+  { name: 'teams', version: '0.5.1' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions: [
@@ -515,6 +516,18 @@ function deliverHeld(item: HeldItem, w: Where) {
   logLine('in', w.conv, meta.user_id ?? '?', item.text.length, 0, 'knock: let in')
   deliver(item.text || '(sent a file)', meta)
 }
+// The knocking sender's member record, from the tenant (TeamsInfo.getMember's
+// REST call): the email the owner's card shows and the box binds by
+// (DIVE-8032). Never from the message text. A slow or failed lookup files the
+// knock without an email.
+async function memberOf(w: Where, sender: string): Promise<unknown> {
+  try {
+    return await connector('GET', w.serviceUrl, `/v3/conversations/${encodeURIComponent(w.conv)}/members/${encodeURIComponent(sender)}`, undefined, 5_000)
+  } catch (e) {
+    knockLog(`knock: member lookup failed: ${String(e).slice(0, 120)}`)
+    return null
+  }
+}
 async function sudoRun(args: string[]): Promise<string> {
   try {
     const p = Bun.spawn(['sudo', '-n', ...args], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' })
@@ -528,7 +541,7 @@ async function sudoRun(args: string[]): Promise<string> {
   }
 }
 const knockLog = (line: string) => process.stderr.write(`teams: ${line}\n`)
-const knockIO = { run: sudoRun, say: sayTo, deliver: deliverHeld, save: saveState, log: knockLog }
+const knockIO = { run: sudoRun, member: memberOf, say: sayTo, deliver: deliverHeld, save: saveState, log: knockLog }
 let answering = false
 async function checkAnswers() {
   if (answering) return
