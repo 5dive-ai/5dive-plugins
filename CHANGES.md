@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.35: the Hermes app-chat plugin meets the Hermes plugin catalog rules (DIVE-7945)
+
+Before we list `fivedive` in Hermes's plugin catalog (`hermes plugins catalog`), the plugin has to pass the catalog's admission rules, not only the validator.
+
+- **`hermes/adapter.py`:** `FIVEDIVE_SPOOL_DIR` and `FIVEDIVE_REPLY_MAX_WORDS` are read through Hermes's profile-scoped reader (`gateway.platforms._shared.get_scoped_secret`, else `agent.secret_scope.get_secret`), never a bare `os.environ` read, so a multi-profile gateway never hands one profile another's spool. Hermes before 0.22 has neither and runs one profile per process; there it reads the env as before.
+- **`hermes/plugin.yaml` 1.0.1:** declares every variable the adapter reads (`FIVEDIVE_REPLY_MAX_WORDS`, `FIVEDIVE_HOME_CHANNEL` added), a `requires_hermes: ">=0.19.0"` floor (what our seats run), and a disclosure line.
+- **`hermes/README.md`:** the two variables, the floor, and what the plugin touches.
+
+Checked: `hermes plugins validate --install-deps` on Hermes v0.23.0, 15 of 15 pass, security scan safe; `bun test` dive7349 + dive7811, 27 pass.
+
 ### Added — devteam 0.4.0: the daily proof publish also writes the review loop, `verifier.json` (DIVE-7863)
 
 The /team page gets a second live chart: how often one agent's work is sent back by the agent that reviews it. It reads a new file on the same public `status` branch, written in the same commit as the badge.

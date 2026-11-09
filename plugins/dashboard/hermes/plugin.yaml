@@ -1,13 +1,19 @@
 name: fivedive
 label: 5dive app
 kind: platform
-version: 1.0.0
+version: 1.0.1
+requires_hermes: ">=0.19.0"
 description: >
   5dive app chat for Hermes Agent. On a 5dive box the dashboard bridge
   (plugins/dashboard/server.ts) receives every message typed in the 5dive
   web and mobile chat and drops it in a local spool directory; this adapter
   hands each one to the gateway and writes the agent's answer back to the
   same spool, which the bridge sends to the chat.
+
+  Disclosure: reads and writes only its spool directory and the upload
+  files the bridge names in a message; polls the spool every 0.5 s inside
+  the gateway; no network calls, no listener, no shell commands, no stored
+  credentials.
 
   The spool directory is the trust boundary: it is created mode 0700 for
   the agent's own user, so only that user (or root) can write a message
@@ -26,4 +32,12 @@ optional_env:
   - name: FIVEDIVE_ALLOW_ALL_USERS
     description: "Allow every sender in the spool (true/false)"
     prompt: "Allow all senders? (true/false)"
+    password: false
+  - name: FIVEDIVE_REPLY_MAX_WORDS
+    description: "Word cap on one chat answer; a longer answer is sent back to the agent to shorten (default 70, 0 turns it off)"
+    prompt: "Reply word cap (0 = off)"
+    password: false
+  - name: FIVEDIVE_HOME_CHANNEL
+    description: "Where cron results are delivered (the 5dive chat is \"dashboard\")"
+    prompt: "Home channel (dashboard)"
     password: false
