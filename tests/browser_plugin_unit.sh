@@ -7827,8 +7827,9 @@ echo \$\$ > "$T49D/chrome.pid"
 [[ -n "\${T49_DEAF:-}" ]] && trap '' TERM || trap 'exit 0' TERM
 t0=""; done=0
 while :; do
-  [[ -z "\$t0" && -e "$T49D/signin" ]] && t0=\$(date +%s%3N)
-  if [[ -n "\${T49_COMMIT_MS:-}" && -n "\$t0" ]] && (( ! done && \$(date +%s%3N) - t0 >= T49_COMMIT_MS )); then
+  now=\${EPOCHREALTIME//[!0-9]/}; now=\$(( now / 1000 ))   # never \`date +%s%3N\` (DIVE-7978)
+  [[ -z "\$t0" && -e "$T49D/signin" ]] && t0=\$now
+  if [[ -n "\${T49_COMMIT_MS:-}" && -n "\$t0" ]] && (( ! done && now - t0 >= T49_COMMIT_MS )); then
     mkdir -p "\$ud/Default"; echo user_session > "\$ud/Default/Cookies"; done=1
   fi
   sleep 0.05
@@ -7844,10 +7845,14 @@ t49_serve() {  # a person's login view: plain Chrome on its own Xvfb
 }
 t49_alive() { kill -0 "$(cat "$T49D/chrome.pid" 2>/dev/null)" 2>/dev/null && echo yes || echo no; }
 t49_cookie() { cat "$D49/Default/Cookies" 2>/dev/null; }
+# The stopwatch is the shell's clock, not `date +%s%3N`: uutils date (ubuntu-26.04)
+# misprints %3N in the first 100 ms of each second (DIVE-7978), which read as a stop
+# that returned early.
+now_ms() { local t="${EPOCHREALTIME//[!0-9]/}"; echo $(( t / 1000 )); }
 t49_stop() {  # t49_stop [env...] — times the stop into T49MS
-  local s; s=$(date +%s%3N)
+  local s; s=$(now_ms)
   run env PATH="$T49PATH" "$@" "${T49BIN:-$BROWSER}" serve "$S49" --stop
-  T49MS=$(( $(date +%s%3N) - s ))
+  T49MS=$(( $(now_ms) - s ))
 }
 
 # --- T49a a sign-in's cookies pending at Done reach disk: the stop waits for Chrome's commit ---
@@ -7872,6 +7877,40 @@ t49_stop FIVEDIVE_BROWSER_COOKIE_SETTLE=1
 t  'T49e serve --stop stops' 0 "$RC"
 t  'T49e ...after waiting out the cap' 'yes' "$( (( T49MS >= 900 && T49MS < 4000 )) && echo yes || echo "no (${T49MS}ms)")"
 t  'T49e ...and Chrome is gone' 'no' "$(t49_alive)"
+
+# --- T49g the cap is timed by the shell's clock, not by `date` (DIVE-7978) ---
+# uutils date, Ubuntu 26.04's coreutils, prints %3N wrong for the first 100 ms of every
+# second (leading zeros dropped, then cut to 3 digits: 0.005 s reads as 0.535 s). One such
+# read in the wait ended it early: T49e red on every ubuntu-26.04 runner from 2026-11-07.
+# This `date` makes the misread certain: every %3N read after its first is 5 s ahead.
+T49BD="$T49D/baddate"; mkdir -p "$T49BD"
+cat > "$T49BD/date" <<BADDATE
+#!/usr/bin/env bash
+if [[ "\$*" == '+%s%3N' ]]; then
+  n=\$(cat "$T49D/baddate.n" 2>/dev/null || echo 0); echo \$(( n + 1 )) > "$T49D/baddate.n"
+  t=\${EPOCHREALTIME//[!0-9]/}; echo \$(( t / 1000 + (n > 0 ? 5000 : 0) ))
+else exec $(command -v date) "\$@"; fi
+BADDATE
+chmod +x "$T49BD/date"
+rm -f "$T49D/baddate.n"
+t  'T49g (control) the fake date jumps ahead on its second %3N read' 'yes' \
+  "$( a=$("$T49BD/date" +%s%3N); b=$("$T49BD/date" +%s%3N); (( b - a >= 5000 )) && echo yes || echo "no ($a $b)")"
+t  'T49g (control) ...and passes every other format through' "$(date -u +%Y)" "$("$T49BD/date" -u +%Y)"
+rm -f "$T49D/baddate.n"
+t49_serve
+t  'T49g (setup) a login view with no commit coming serves' 'yes' "$(t49_alive)"
+t49_stop PATH="$T49BD:$T49PATH" FIVEDIVE_BROWSER_COOKIE_SETTLE=1
+t  'T49g with a date that misreads %3N, the stop still waits out the cap' 'yes' "$( (( T49MS >= 900 && T49MS < 4000 )) && echo yes || echo "no (${T49MS}ms)")"
+t  'T49g ...and stops' '0 no' "$RC $(t49_alive)"
+# The mutant: the wait timed by `date +%s%3N` again leaves at its second read.
+MUT49G="$T49D/mutg"; rm -rf "$MUT49G"; cp -r "$ROOT/plugins/browser" "$MUT49G"
+sed -i 's/\$(_now_ms)/$(date +%s%3N)/g' "$MUT49G/bin/browser"
+t  'T49g (anchor) the mutation applied' 'yes' "$(grep -q 'sdl=\$(( \$(date +%s%3N)' "$MUT49G/bin/browser" && echo yes || echo no)"
+rm -f "$T49D/baddate.n"
+t49_serve
+T49BIN="$MUT49G/bin/browser" t49_stop PATH="$T49BD:$T49PATH" FIVEDIVE_BROWSER_COOKIE_SETTLE=3
+t  'T49g (mutant) a wait timed by date +%s%3N leaves well before its 3 s cap' 'yes' "$( (( T49MS < 2500 )) && echo yes || echo "no (${T49MS}ms)")"
+t  'T49g (mutant) ...and the fake date was read by it' 'yes' "$( [[ -s "$T49D/baddate.n" ]] && echo yes || echo no)"
 
 # --- T49c a Chrome that ignores SIGTERM is still stopped: SIGKILL after the bound ---
 t49_serve T49_DEAF=1

@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — browser 1.32.3: a login view's stop waits out its cap on Ubuntu 26.04 (DIVE-7978)
+
+Plugins main read red on `fork parity` from 2026-11-07: T49e's stop left after ~0.6 s instead of waiting out its 1 s cap. The same commit was green on GitHub's ubuntu-24.04 runner and red on ubuntu-26.04.
+
+- **Cause:** Ubuntu 26.04's coreutils is uutils, and its `date +%3N` is wrong for the first 100 ms of every second. It drops the leading zeros of the nanoseconds, then cuts to 3 digits, so 0.005 s reads as 0.535 s. One such read inside the cookie wait ended it early. On a 26.04 box, Done could cut off a sign-in that the wait was there to save.
+- **`bin/browser`:** a new `_now_ms` reads bash's own `EPOCHREALTIME` (no fork, no coreutils), and every `date +%s%3N` (the cookie wait, the routine replay timer) now uses it.
+- **Harnesses:** the T49 fake Chrome, the T49/R11 stopwatches and the three bench timers use the same clock.
+- **New arm T49g:** a fake `date` that jumps 5 s ahead on its second `%3N` read; the stop still waits out its cap. A mutant timed by `date +%s%3N` leaves at once.
+
 ### Fixed — telegram 0.5.138, browser 1.32.2: outside text no longer reaches an agent as if its owner sent it (DIVE-7972)
 
 Three paths from the DIVE-7963 security pass, where someone other than the owner could give orders to an agent that has sudo.

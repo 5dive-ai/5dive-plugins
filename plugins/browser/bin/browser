@@ -3917,6 +3917,19 @@ _serve_running() {  # _serve_running <dir> -> echoes display, 0 if live
 
 _kv() { [[ -f "$1" ]] && sed -n "s/^$2=//p" "$1" | head -1; }
 
+# MILLISECONDS FROM THE SHELL'S OWN CLOCK, NEVER `date` with %3N (DIVE-7978). The
+# uutils `date` that Ubuntu 26.04 ships as coreutils misprints %3N for the first
+# tenth of every second: it drops the leading zeros of the nanoseconds and THEN
+# cuts to 3 digits, so 0.005 s reads as 0.535 s. One such read inside a deadline
+# loop ends the loop up to 0.9 s early: the login view's cookie wait below left
+# before its cap on GitHub's ubuntu-26.04 runner (T49e red from 2026-11-07 on).
+# EPOCHREALTIME is bash's (5.0+): no fork, and no coreutils to differ. A bash
+# without it falls back to whole seconds: coarse, but never early.
+_now_ms() {
+  local t="${EPOCHREALTIME//[!0-9]/}"
+  if [[ -n "$t" ]]; then printf '%s\n' "$(( t / 1000 ))"; else printf '%s\n' "$(( $(date +%s) * 1000 ))"; fi
+}
+
 cmd_serve() {
   local site="" stop=0 login=0 start_url=""
   while (($#)); do
@@ -3991,8 +4004,8 @@ cmd_serve() {
       if [[ -n "$sref" ]] && (( cs > 0 )); then
         # A WALL-CLOCK deadline, not a count of sleeps: each turn of this loop
         # forks, and 480 turns of "0.05 s" measured 27.5 s — past the budget.
-        local sdl=$(( $(date +%s%3N) + cs * 1000 )) ck committed=0
-        while (( $(date +%s%3N) < sdl )) && _pid_live "$hpid"; do
+        local sdl=$(( $(_now_ms) + cs * 1000 )) ck committed=0
+        while (( $(_now_ms) < sdl )) && _pid_live "$hpid"; do
           for ck in "$dir/Default/Network/Cookies" "$dir/Default/Cookies"; do
             [[ "$ck" -nt "$sref" ]] && { committed=1; break 2; }
           done
@@ -6196,7 +6209,7 @@ cmd_replay() {
 
   local self="${BASH_SOURCE[0]}" k seg steps url expect wf errf res rc=0 picks models=0 healed=0 nsteps=0 profile
   profile="$(jq -r '.profile // .site' "$file")"
-  local t0; t0=$(date +%s%3N)
+  local t0; t0=$(_now_ms)
   errf="$(mktemp /tmp/5dive-browser-replay.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the replay"
   for (( k = from; k <= acts; k++ )); do
     seg=$(jq -c --argjson i "$((k - 1))" '.acts[$i]' "$file")
@@ -6238,7 +6251,7 @@ cmd_replay() {
       rm -f -- "$errf"
       if (( json )); then
         jq -nc --arg n "$name" --arg s "$site" --argjson k "$k" --argjson a "$acts" --argjson rc "$rc" --argjson m "$models" \
-          --argjson h "$healed" --argjson st "$nsteps" --argjson ms "$(( $(date +%s%3N) - t0 ))" --argjson r "${res:-null}" \
+          --argjson h "$healed" --argjson st "$nsteps" --argjson ms "$(( $(_now_ms) - t0 ))" --argjson r "${res:-null}" \
           '{routine:$n, site:$s, verdict:"stopped", stopped_at:$k, acts:$a, exit:$rc, steps:$st, model_calls:$m, repicked:$h, wall_ms:$ms, act:$r}' 2>/dev/null
       fi
       return "$rc"
@@ -6247,7 +6260,7 @@ cmd_replay() {
   rm -f -- "$errf"
   local tmp; tmp="$(mktemp "${file%/*}/.rec.XXXXXX")" && jq -c --argjson now "$(date +%s)" '.replays = ((.replays // 0) + 1) | .last_replayed = $now' "$file" > "$tmp" \
     && mv -f -- "$tmp" "$file" && chmod 600 "$file"
-  local ms=$(( $(date +%s%3N) - t0 ))
+  local ms=$(( $(_now_ms) - t0 ))
   if (( json )); then
     jq -nc --arg n "$name" --arg s "$site" --argjson a "$acts" --argjson f "$from" --argjson m "$models" --argjson h "$healed" \
       --argjson st "$nsteps" --argjson ms "$ms" --argjson r "${res:-null}" \

@@ -62,7 +62,7 @@ SEAT="$(id -un)"
 mkdir -p "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT" "$FIVEDIVE_BROWSER_ADAPTER_DIR"
 chmod 711 "$FIVEDIVE_BROWSER_PROFILE_ROOT"; chmod 700 "$FIVEDIVE_BROWSER_PROFILE_ROOT/$SEAT"
 
-now_ms() { date +%s%3N; }
+now_ms() { local t="${EPOCHREALTIME//[!0-9]/}"; echo $(( t / 1000 )); }  # not date +%s%3N: uutils misprints it (DIVE-7978)
 # Claude's image cost: fit in 1568 px on the long edge and ~1.15 MP, then w*h/750.
 img_tokens() {
   [[ -s "$1" ]] || { echo 0; return; }
