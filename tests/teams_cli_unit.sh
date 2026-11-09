@@ -19,7 +19,7 @@ APP=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
 TEN=11111111-2222-3333-4444-555555555555
 ME="${SUDO_USER:-root}"
 
-mkdir -p "$W/home/agent-max/.claude" "$W/conn" "$W/pk"
+mkdir -p "$W/home/agent-max/.claude" "$W/conn" "$W/pk" "$W/tmp"
 cat >"$W/5dive" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >>"$STUB_LOG"
@@ -59,11 +59,29 @@ case "$1" in
       printf '{"loggedIn":true,"username":"admin@firm.example","tenantId":"%s","tdp":{"connected":true,"sideloading":{"tenant":%s,"user":%s}}}\n' "$MS_TEN" "$t" "$u"
     else echo '{"loggedIn":false,"username":null,"tdp":null}'; fi ;;
   app)
+    # DIVE-8022: the libsecret warning comes on every call on a box with no
+    # keyring. $MS_DIR/ms-fail picks how a failure is told: json = the CLI's own
+    # {ok:false} on stdout (its --json handler); stderr = a crash outside it,
+    # message then suggestion, in color; warn = the warnings and nothing else.
+    if [[ -s "$MS_DIR/ms-fail" ]]; then
+      printf '\e[33mWarning: libsecret not found — token cache will be stored unencrypted.\nInstall it for secure storage: sudo apt install libsecret-1-dev\e[39m\n' >&2
+      case "$(cat "$MS_DIR/ms-fail")" in
+        json) printf '{\n  "ok": false,\n  "error": {\n    "code": "NOT_FOUND_AAD",\n    "message": "AAD app not yet available in Graph API.",\n    "suggestion": "Try again shortly."\n  }\n}\n' ;;
+        stderr) printf '\e[31mFailed to get TDP token.\e[39m\nTry `teams login` again.\n' >&2 ;;
+      esac
+      exit 1
+    fi
     if [[ "$2" == update ]]; then  # DIVE-8023: widen scopes; fails while $MS_DIR/ms-noscope exists
       [[ -e "$MS_DIR/ms-noscope" ]] && { echo "Error: forbidden" >&2; exit 1; }
       printf '{"teamsAppId":"%s","updated":{"scopes":["personal","team","groupChat"]},"needsReinstall":true}\n' "$3"; exit 0
     fi
-    env=""; while (($#)); do [[ "$1" == --env ]] && env="$2"; shift; done
+    # DIVE-8022: the icon files are gone once the call returns; keep a copy to grade.
+    env=""; while (($#)); do
+      case "$1" in
+        --env) env="$2" ;;
+        --color-icon) cp "$2" "$MS_DIR/got-color.png" ;;
+        --outline-icon) cp "$2" "$MS_DIR/got-outline.png" ;;
+      esac; shift; done
     rm -f "$env"  # the worst case: a fresh file made under the caller's umask
     printf 'CLIENT_ID=%s\nCLIENT_SECRET=ms-s3cr3t~value\nTENANT_ID=%s\n' "$MS_APP" "$MS_TEN" >"$env"
     stat -c %a "$env" >"$MS_DIR/envmode"
@@ -91,7 +109,7 @@ run() {
     STUB_LOG="$W/log" STUB_CHANNELS="$W/channels" STUB_ROUTED="$W/routed" STUB_TYPE="${STUB_TYPE:-claude}" \
     TEAMS_5DIVE_BIN="$W/5dive" TEAMS_CONNECTORS_DIR="$W/conn" TEAMS_PROVISIONING="$W/prov.env" \
     FIVE_LOCAL_ONLY_FILE="$W/local-only" TEAMS_PACKAGES_DIR="$W/pk" AGENT_HOME_ROOT="$W/home" \
-    TEAMS_AGENT_USER="$ME" FIVEDIVE_JSON_MODE="${JSON:-0}" bash "$BIN" "$@" 2>&1
+    TMPDIR="$W/tmp" TEAMS_AGENT_USER="$ME" FIVEDIVE_JSON_MODE="${JSON:-0}" bash "$BIN" "$@" 2>&1
 }
 reset() { : >"$W/log"; echo telegram >"$W/channels"; rm -f "$W/routed" "$W/local-only" "$W/local-only.allow" "$W/conn/"* "$W/home/agent-max/.claude/channels/teams/"* 2>/dev/null; echo 'FIVE_DOMAIN=box.example.com' >"$W/prov.env"; }
 
@@ -172,7 +190,7 @@ out=$(run agent disconnect max); rc=$?
   && ok "disconnect removes the channel, the route, the settings and the secret" || bad "disconnect (rc=$rc)" "$(cat "$W/log"; echo "$out")"
 
 # ─── DIVE-7831: --microsoft ───
-msreset() { reset; rm -f "$W/ms-in" "$W/ms-side" "$W/active" "$W/envmode" "$W/np" "$W/mshome/"*; : >"$W/mslog"; }
+msreset() { reset; rm -f "$W/ms-in" "$W/ms-side" "$W/ms-fail" "$W/active" "$W/envmode" "$W/np" "$W/mshome/"* "$W/got-"*.png "$W/home/agent-max/.claude/avatar.png"; : >"$W/mslog"; }
 cfg="$W/home/agent-max/.claude/channels/teams/config.json"
 
 msreset
@@ -223,6 +241,8 @@ out=$(JSON=1 run agent connect max --microsoft --role=Paralegal); rc=$?
   && ok "signed in: ready, with the Add to Teams link" || bad "ready (rc=$rc)" "$out"
 grep -qF "app create --name Max --endpoint https://teams-max.box.example.com/api/messages --env $W/mshome/app-" "$W/mslog" \
   && ok "the bot is made with the agent's name and its own address on this box" || bad "app create args" "$(cat "$W/mslog")"
+! grep -q -- "-icon" "$W/mslog" && [[ ! -e "$W/got-color.png" ]] \
+  && ok "an agent with no face: no icons are sent, Teams shows its own tile" || bad "no-face icons" "$(cat "$W/mslog")"
 [[ "$(cat "$W/envmode" 2>/dev/null)" == 600 ]] && ok "Microsoft's secret file is 0600 while it exists" || bad "env mode" "$(cat "$W/envmode" 2>&1)"
 ! ls "$W/mshome"/app-*.env >/dev/null 2>&1 && [[ ! -e "$W/mshome/made-max.json" ]] && ok "the secret file and the made-record are gone after" || bad "leftovers" "$(ls -la "$W/mshome")"
 jq -e --arg a $APP --arg t $TEN '.app_id == $a and .tenant_id == $t and .app_password == "ms-s3cr3t~value" and .install_link and .teams_app_id == "t-app-1" and .public_url == "https://teams-max.box.example.com/api/messages"' "$cfg" >/dev/null \
@@ -276,6 +296,69 @@ msreset; touch "$W/ms-in"; echo 'TEAMS_APP_PASSWORD=x' >"$W/conn/teams-max.env";
 out=$(JSON=1 run agent connect max --microsoft); rc=$?
 [[ $rc -eq 3 && "$out" == *"through your IT's own bot"* ]] && ! grep -q "app create" "$W/mslog" \
   && ok "an agent already on its IT's bot is not switched silently" || bad "it-path guard (rc=$rc)" "$out"
+
+# DIVE-8022: a failed make shows Microsoft's reason, never the CLI's libsecret hint.
+msreset; touch "$W/ms-in"; echo json >"$W/ms-fail"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -ne 0 && "$out" == *"Microsoft did not make the bot: AAD app not yet available in Graph API."* && "$out" != *libsecret* ]] \
+  && ok "a failed make shows Microsoft's own reason (its --json error), not the libsecret warning" || bad "json why (rc=$rc)" "$out"
+log="$W/mshome/last-error.log"
+[[ "$(stat -c %a "$log" 2>/dev/null)" == 600 ]] && grep -q "NOT_FOUND_AAD" "$log" && grep -q "Try again shortly" "$log" && grep -q "libsecret" "$log" \
+  && ok "the whole answer is kept in a 0600 log beside the CLI's login" || bad "error log" "$(ls -l "$log" 2>&1; cat "$log" 2>&1)"
+! ls "$W/mshome"/app-*.env >/dev/null 2>&1 && [[ ! -e "$cfg" ]] && ok "a failed make leaves no secret file and connects nothing" || bad "fail leftovers" "$(ls -la "$W/mshome")"
+msreset; touch "$W/ms-in"; echo stderr >"$W/ms-fail"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -ne 0 && "$out" == *"Microsoft did not make the bot: Failed to get TDP token."* && "$out" != *libsecret* && "$out" != *$'\e'* ]] \
+  && ok "a crash told on stderr: the real line, without the warnings or color codes" || bad "stderr why (rc=$rc)" "$out"
+msreset; touch "$W/ms-in"; echo warn >"$W/ms-fail"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -ne 0 && "$out" == *"Microsoft did not make the bot: no answer"* && "$out" != *libsecret* ]] \
+  && ok "only warnings: says no answer rather than sending anyone to apt" || bad "warn-only (rc=$rc)" "$out"
+
+# DIVE-8022 (lodar 11:38Z «can we add avatars?»): the bot gets the agent's face.
+# png <file>: width height colour-type, read from the PNG header.
+pnghdr() { python3 -I -c 'import struct,sys; b=open(sys.argv[1],"rb").read(26); print(*struct.unpack(">IIxB", b[16:26])) if b[:8]==b"\x89PNG\r\n\x1a\n" else print("notpng")' "$1" 2>/dev/null; }
+# A 300x200 RGB face whose rows use all five PNG filters, as real avatars do.
+python3 -I - "$W/home/agent-max/.claude/avatar.png" <<'PY'
+import struct, sys, zlib
+w, h = 300, 200
+rows = [bytes(((x * 7 + y) & 255, (y * 3) & 255, (x ^ y) & 255)[c] for x in range(w) for c in range(3)) for y in range(h)]
+def enc(f, cur, prev):
+    out = bytearray([f])
+    for i, v in enumerate(cur):
+        a = cur[i - 3] if i >= 3 else 0; b = prev[i]; c = prev[i - 3] if i >= 3 else 0
+        p = a + b - c; pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+        pr = (0, a, b, (a + b) >> 1, a if pa <= pb and pa <= pc else b if pb <= pc else c)[f]
+        out.append((v - pr) & 255)
+    return out
+raw, prev = bytearray(), bytes(w * 3)
+for y, r in enumerate(rows):
+    raw += enc(y % 5, r, prev); prev = r
+ch = lambda k, d: struct.pack(">I", len(d)) + k + d + struct.pack(">I", zlib.crc32(k + d) & 0xFFFFFFFF)
+open(sys.argv[1], "wb").write(b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + ch(b"IDAT", zlib.compress(bytes(raw))) + ch(b"IEND", b""))
+PY
+cp "$W/home/agent-max/.claude/avatar.png" "$W/face.png"
+msreset; touch "$W/ms-in"; cp "$W/face.png" "$W/home/agent-max/.claude/avatar.png"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -eq 0 ]] && grep -qE "app create .*--color-icon [^ ]+/color\.png --outline-icon [^ ]+/outline\.png" "$W/mslog" \
+  && [[ "$(pnghdr "$W/got-color.png")" == "192 192 6" && "$(pnghdr "$W/got-outline.png")" == "32 32 6" ]] \
+  && ok "an agent with a face: the bot is made with it (192x192) and a 32x32 outline with transparency" \
+  || bad "face icons (rc=$rc)" "$(cat "$W/mslog"; pnghdr "$W/got-color.png"; pnghdr "$W/got-outline.png")"
+[[ -z "$(find "$W/tmp" -name '*.png')" ]] && ok "the icon files are not left behind" || bad "icon leftovers" "$(find "$W/tmp")"
+# Boxes have no Pillow: the standard-library reader must give the same picture.
+python3 -I - "$ROOT/plugins/teams/cli" "$W/face.png" <<'PY' && ok "no Pillow: the face is read by the standard library, every PNG filter decoded exactly" || bad "stdlib face"
+import sys; sys.modules["PIL"] = None; sys.path.insert(0, sys.argv[1]); import package
+w, h, rows = package.png_pixels(open(sys.argv[2], "rb").read())
+want = lambda x, y: ((x * 7 + y) & 255, (y * 3) & 255, (x ^ y) & 255, 255)
+assert (w, h) == (300, 200) and all(rows[y][x] == want(x, y) for y in range(h) for x in range(w))
+face = package.face_icon(sys.argv[2]); assert face and face[16:26] == bytes.fromhex("000000c0000000c00806")
+PY
+msreset; touch "$W/ms-in"; printf 'not a png' >"$W/home/agent-max/.claude/avatar.png"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -eq 0 ]] && ! grep -q -- "-icon" "$W/mslog" && ok "an unreadable face: the bot is still made, with Teams' own tile" || bad "bad face (rc=$rc)" "$out"
+msreset; touch "$W/ms-in"; ln -s "$W/face.png" "$W/home/agent-max/.claude/avatar.png"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -eq 0 ]] && ! grep -q -- "-icon" "$W/mslog" && ok "a face that is a link elsewhere is not followed by root" || bad "symlink face (rc=$rc)" "$(cat "$W/mslog")"
 
 msreset; rm -f "$W/prov.env"
 out=$(JSON=1 run agent connect max --microsoft); rc=$?
