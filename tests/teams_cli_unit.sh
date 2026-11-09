@@ -71,6 +71,10 @@ case "$1" in
       esac
       exit 1
     fi
+    if [[ "$2" == update ]]; then  # DIVE-8023: widen scopes; fails while $MS_DIR/ms-noscope exists
+      [[ -e "$MS_DIR/ms-noscope" ]] && { echo "Error: forbidden" >&2; exit 1; }
+      printf '{"teamsAppId":"%s","updated":{"scopes":["personal","team","groupChat"]},"needsReinstall":true}\n' "$3"; exit 0
+    fi
     # DIVE-8022: the icon files are gone once the call returns; keep a copy to grade.
     env=""; while (($#)); do
       case "$1" in
@@ -160,6 +164,10 @@ grep -qE "^route add teams-max --port=[0-9]+$" "$W/log" && ok "the endpoint is p
 [[ "$out" != *s3cr3t* ]] && ! grep -q s3cr3t "$W/log" && ok "the secret is never printed or passed to core" || bad "secret leaked" "$out"
 unzip -p "$W/pk/max-teams-app.zip" manifest.json 2>/dev/null | jq -e --arg a $APP '.bots[0].botId == $a and .name.short == "Max" and .description.short == "Paralegal" and .validDomains == ["teams-max.box.example.com"]' >/dev/null \
   && ok "the app package names the bot, the agent and its role" || bad "package manifest" "$(unzip -l "$W/pk/max-teams-app.zip" 2>&1)"
+unzip -p "$W/pk/max-teams-app.zip" manifest.json 2>/dev/null | jq -e '.bots[0].scopes == ["personal","groupChat","team"] and .version == "1.1.0" and (.description.full | test("group chat or channel"))' >/dev/null \
+  && ok "DIVE-8023: the package lets the agent into group chats and channels, as a newer version IT can upload over the old" || bad "package scopes" "$(unzip -p "$W/pk/max-teams-app.zip" manifest.json 2>&1)"
+[[ "$out" == *"group chat or a team channel"* && "$out" == *"Upload this package over the old app"* ]] \
+  && ok "DIVE-8023: connect tells IT about groups and how an existing app takes the update" || bad "groups words" "$out"
 
 : >"$W/log"
 out=$(run agent connect max); rc=$?
@@ -254,6 +262,28 @@ out=$(JSON=1 run agent connect max --microsoft); rc=$?
   && ok "asking again: the same link, no second bot" || bad "rerun (rc=$rc)" "$out"
 out=$(JSON=1 run agent status max)
 jq -e '.data.install_link | test("t-app-1")' <<<"$out" >/dev/null && ok "status --json carries the Add to Teams link" || bad "status link" "$out"
+
+# ─── DIVE-8023: the one-sign-in bot is widened to group chats and channels ───
+# (the create run above): one scope update on the app it made, noted in config.
+[[ "$(grep -c "^app update" "$W/mslog")" == 0 ]] && ok "DIVE-8023: a re-run with groups already open asks Microsoft nothing more" || bad "rerun update" "$(cat "$W/mslog")"
+jq -e '.scopes == "personal,team,groupChat"' "$cfg" >/dev/null && ok "DIVE-8023: the made bot was widened to group chats and channels (noted in config)" || bad "scopes cfg" "$(cat "$cfg")"
+# A bot made before DIVE-8023 (no scopes noted): re-running connect widens it once.
+jq 'del(.scopes)' "$cfg" >"$W/c.tmp" && cat "$W/c.tmp" >"$cfg"; : >"$W/mslog"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -eq 0 ]] && grep -qx "app update t-app-1 --scopes personal,team,groupChat --json" "$W/mslog" && ! grep -q "app create" "$W/mslog" \
+  && jq -e '.data.state == "ready" and (.data.install_link | test("t-app-1"))' <<<"$(tail -1 <<<"$out")" >/dev/null && jq -e '.scopes == "personal,team,groupChat"' "$cfg" >/dev/null \
+  && ok "DIVE-8023: an existing 1:1 bot is widened by re-running connect, same link, no second bot" || bad "upgrade (rc=$rc)" "$(cat "$W/mslog"; echo "$out")"
+# Signed out: the widening waits for the sign-in, like a first connect.
+jq 'del(.scopes)' "$cfg" >"$W/c.tmp" && cat "$W/c.tmp" >"$cfg"; rm -f "$W/ms-in"; : >"$W/mslog"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -eq 0 ]] && jq -e '.data.state == "sign_in"' <<<"$out" >/dev/null && ! grep -q "^app update" "$W/mslog" \
+  && ok "DIVE-8023: signed out, the upgrade asks for the sign-in first" || bad "upgrade signed out (rc=$rc)" "$out"
+# Microsoft refuses the widening: still ready 1:1, nothing noted, so the next run tries again.
+touch "$W/ms-in" "$W/ms-noscope"; : >"$W/mslog"
+out=$(JSON=1 run agent connect max --microsoft); rc=$?
+[[ $rc -eq 0 ]] && jq -e '.data.state == "ready"' <<<"$(tail -1 <<<"$out")" >/dev/null && ! jq -e '.scopes' "$cfg" >/dev/null && [[ "$out" == *"still works 1:1"* ]] \
+  && ok "DIVE-8023: a refused widening leaves the agent working 1:1 and says so" || bad "upgrade refused (rc=$rc)" "$out"
+rm -f "$W/ms-noscope"
 
 # A run that made the bot and died before connecting does not make a second one.
 msreset; touch "$W/ms-in"; echo 'TEAMS_APP_PASSWORD=ms-s3cr3t~value' >"$W/conn/teams-max.env"

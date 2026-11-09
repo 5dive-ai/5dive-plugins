@@ -260,7 +260,10 @@ Next, your IT (one time, about 10 minutes):
   1. The bot's messaging endpoint = the Endpoint above (Teams Developer Portal >
      Bot management > the bot > Configure; or Azure Bot > Configuration).
   2. Teams admin center > Manage apps > Upload new app > the App package above.
-  3. Make it available to the people who should talk to $name.
+  3. Make it available to the people who should talk to $name. People can
+     also add $name to a group chat or a team channel and @mention it there.
+  Already in Teams? Upload this package over the old app (Manage apps > the
+  app > Upload file) so $name can join group chats and channels.
 EOF
   if (( ! routed )) && [[ -z "$endpoint" ]]; then
     cat <<EOF
@@ -422,6 +425,22 @@ EOF
   esac
 }
 
+# DIVE-8023: a bot `teams app create` makes is 1:1 only. Widen it to group chats
+# and team channels, and note that in the agent's config so a re-run knows.
+# Best effort: the agent still works 1:1 if Microsoft refuses.
+MS_SCOPES="personal,team,groupChat"
+_ms_groups() {  # <agent> <teams app id>
+  local agent="$1" tid="$2" out
+  [[ -n "$tid" ]] || { warn "no Teams app id kept for $agent, so it stays 1:1 only. Disconnect and connect again to fix it."; return 1; }
+  if out=$(_mscli app update "$tid" --scopes "$MS_SCOPES" --json 2>/dev/null) \
+     && jq -e '.updated.scopes' <<<"$(sed -n '/^{/,$p' <<<"$out")" >/dev/null 2>&1; then
+    _cfg_merge "$agent" "$(jq -cn --arg s "$MS_SCOPES" '{scopes:$s}')"
+    return 0
+  fi
+  warn "Microsoft did not open group chats and channels for $agent; it still works 1:1. Run the same command again later."
+  return 1
+}
+
 # Merge the Microsoft-made facts into the agent's 0600 config, keeping its owner.
 _cfg_merge() {  # <agent> <jq object>
   local cfg; cfg="$(_state_dir "$1")/config.json"
@@ -455,10 +474,27 @@ teams_connect_microsoft() {
   [[ "$(jq -r '.type // empty' <<<"$info")" == claude ]] || fail "$E_VALIDATION" "Teams is for Claude Code agents for now"
   [[ -n "$name" ]] || name="${agent^}"
 
-  # Already in Teams this way: the same link again, nothing new made.
+  # Already in Teams this way: the same link again, nothing new made. A bot made
+  # before DIVE-8023 is 1:1 only: widen it once (needs the sign-in), and the
+  # owner opens the same link again to take the update.
   local link; link=$(_cfg_get "$agent" install_link)
   if [[ -n "$link" && -n "$(_cfg_get "$agent" app_id)" ]]; then
-    _signin_close
+    if [[ "$(_cfg_get "$agent" scopes)" != "$MS_SCOPES" ]]; then
+      _mscli_ensure
+      local st0; st0=$(_mscli status --json 2>/dev/null | sed -n '/^{/,$p') || st0=""
+      if [[ "$(jq -r '.loggedIn // false' <<<"$st0" 2>/dev/null)" != true ]]; then
+        _signin_start
+        teams_audit connect "$agent" --microsoft sign_in groups
+        _ms_say sign_in "$agent" site "$SIGNIN_SITE"
+        [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && return 0
+        exit "$E_AUTH_REQUIRED"
+      fi
+      _signin_close
+      step "Letting $name join group chats and channels"
+      _ms_groups "$agent" "$(_cfg_get "$agent" teams_app_id)" && teams_audit connect "$agent" --microsoft groups || true
+    else
+      _signin_close
+    fi
     _ms_say ready "$agent" name "$name" install_link "$link"; return 0
   fi
   [[ -z "$(_cfg_get "$agent" app_id)" ]] \
@@ -549,6 +585,8 @@ teams_connect_microsoft() {
     ${endpoint:+"--endpoint=$endpoint"} "--name=$name" ${role:+"--role=$role"} >&2
   _cfg_merge "$agent" "$(jq -c '{install_link, teams_app_id}' "$made")"
   rm -f "$made"
+  step "Letting $name join group chats and channels"
+  _ms_groups "$agent" "$(_cfg_get "$agent" teams_app_id)" || true
   _ms_say ready "$agent" name "$name" install_link "$link"
 }
 
