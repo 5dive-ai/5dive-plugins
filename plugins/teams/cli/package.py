@@ -81,7 +81,9 @@ def manifest(app_id, name, role, endpoint):
     return {
         "$schema": MANIFEST_SCHEMA,
         "manifestVersion": "1.17",
-        "version": "1.0.0",
+        # 1.1.0 (DIVE-8023): group chats and channels. Teams takes an updated
+        # package only with a higher version.
+        "version": "1.1.0",
         # The app id is its own GUID, derived from the bot id so a rebuilt
         # package UPDATES the uploaded app instead of adding a second one.
         "id": str(uuid.uuid5(uuid.NAMESPACE_URL, "5dive-teams:" + app_id.lower())),
@@ -96,7 +98,8 @@ def manifest(app_id, name, role, endpoint):
             "short": clip(role, 80),
             "full": clip(
                 name + " is an AI teammate that runs on your company's own server. "
-                "Message it like a colleague. Messages go between Microsoft Teams and that server only.",
+                "Message it like a colleague, or add it to a group chat or channel and @mention it. "
+                "Messages go between Microsoft Teams and that server only.",
                 4000,
             ),
         },
@@ -105,7 +108,7 @@ def manifest(app_id, name, role, endpoint):
         "bots": [
             {
                 "botId": app_id,
-                "scopes": ["personal"],
+                "scopes": ["personal", "groupChat", "team"],
                 "supportsFiles": True,
                 "isNotificationOnly": False,
             }

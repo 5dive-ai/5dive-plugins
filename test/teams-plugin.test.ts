@@ -9,7 +9,7 @@
 import { describe, test, expect } from 'bun:test'
 import { isAllowedServiceUrl, normalizeServiceUrl, isAllowedConsentUploadUrl, inboundFileAuth, isPrivateAddress } from '../plugins/teams/hosts.ts'
 import { splitTrailingOptions, optionValue, choiceCard, readSubmitValue, parseFileConsentInvoke, chunkText, CHOICE_KIND } from '../plugins/teams/cards.ts'
-import { parseActivity, cleanText, safeName } from '../plugins/teams/activity.ts'
+import { parseActivity, cleanText, safeName, baseConversation, mentionsBot, groupText, chatTypeOf } from '../plugins/teams/activity.ts'
 import { verifyRequest, checkClaims, bearer, makeTokenSource, BF_ISSUER } from '../plugins/teams/auth.ts'
 import { teamsShut, assertTeamsOpen, localOnlyPaths } from '../plugins/teams/offline.ts'
 
@@ -109,9 +109,71 @@ describe('reading an activity', () => {
     const p = parseActivity(dm({ channelData: { tenant: { id: 'other' } }, conversation: { id: 'a:c', conversationType: 'personal', tenantId: 'other' } }), policy)
     expect(p).toEqual({ kind: 'ignore', reason: 'tenant other' })
   })
-  test('group chats and channel posts are out of scope', () => {
-    const p = parseActivity(dm({ conversation: { id: '19:g', conversationType: 'groupChat', tenantId: TENANT } }), policy)
-    expect(p.kind).toBe('ignore')
+  // DIVE-8023: group chats and channels, the Telegram group model.
+  const BOT = `28:${APP}`
+  const mention = (name = 'Vesper') => ({ type: 'mention', text: `<at>${name}</at>`, mentioned: { id: BOT, name } })
+  const group = (over: Record<string, any> = {}) => dm({
+    conversation: { id: '19:g1@thread.v2', conversationType: 'groupChat', tenantId: TENANT, name: 'Deal room' },
+    recipient: { id: BOT, name: 'Vesper' },
+    text: '<at>Vesper</at> what is due today?',
+    entities: [mention()],
+    ...over,
+  })
+  const chanId = '19:c1@thread.tacv2;messageid=1731150000000'
+  const channel = (over: Record<string, any> = {}) => dm({
+    conversation: { id: chanId, conversationType: 'channel', tenantId: TENANT, isGroup: true },
+    channelData: { tenant: { id: TENANT }, team: { id: '19:t', name: 'Legal' }, channel: { id: '19:c1@thread.tacv2', name: 'Contracts' } },
+    recipient: { id: BOT, name: 'Vesper' },
+    text: '<at>Vesper</at> summarise the thread',
+    entities: [mention()],
+    ...over,
+  })
+  test('a group chat message that @mentions the agent arrives, mention stripped, sender and chat named', () => {
+    const p: any = parseActivity(group(), policy)
+    expect(p.kind).toBe('message')
+    expect(p.text).toBe('what is due today?')
+    expect(p.chatType).toBe('group')
+    expect(p.meta).toMatchObject({ chat_id: '19:g1@thread.v2', user: 'Test User', user_id: 'user-1', chat_type: 'group', chat_name: 'Deal room' })
+  })
+  test('a group chat message without the mention is not delivered', () => {
+    expect(parseActivity(group({ text: 'lunch?', entities: [] }), policy)).toEqual({ kind: 'ignore', reason: 'not mentioned' })
+  })
+  test('a mention of someone else is not a mention of the agent, and is kept as @Name', () => {
+    const other = { type: 'mention', text: '<at>Ana</at>', mentioned: { id: '29:ana', name: 'Ana' } }
+    expect(parseActivity(group({ text: '<at>Ana</at> can you check?', entities: [other] }), policy).kind).toBe('ignore')
+    const p: any = parseActivity(group({ text: '<at>Vesper</at> ask <at>Ana</at> about the lease', entities: [mention(), other] }), policy)
+    expect(p.text).toBe('ask @Ana about the lease')
+  })
+  test('a channel post @mentioning the agent keeps its thread id so the reply lands in the thread', () => {
+    const p: any = parseActivity(channel(), policy)
+    expect(p.kind).toBe('message')
+    expect(p.text).toBe('summarise the thread')
+    expect(p.conversationId).toBe(chanId)
+    expect(p.meta).toMatchObject({ chat_id: chanId, chat_type: 'channel', chat_name: 'Legal › Contracts', user: 'Test User' })
+    expect(baseConversation(chanId)).toBe('19:c1@thread.tacv2')
+    expect(parseActivity(channel({ text: 'no mention here', entities: [] }), policy).kind).toBe('ignore')
+  })
+  test('the agent is recognised by its recipient id too, case aside', () => {
+    expect(mentionsBot({ recipient: { id: 'X' }, entities: [{ type: 'mention', mentioned: { id: 'x' } }] }, APP)).toBe(true)
+    expect(mentionsBot({ entities: [{ type: 'mention', mentioned: { id: BOT.toUpperCase() } }] }, APP)).toBe(true)
+    expect(mentionsBot({ entities: [{ type: 'mention', mentioned: { id: '28:someone-else' } }] }, APP)).toBe(false)
+    expect(groupText({ text: '<at>Vesper</at>&nbsp;hi', entities: [mention()] }, APP)).toBe('hi')
+  })
+  test('in a group the same guards hold: another tenant, the allowlist', () => {
+    expect(parseActivity(group({ channelData: { tenant: { id: 'other' } }, conversation: { id: '19:g', conversationType: 'groupChat', tenantId: 'other' } }), policy).kind).toBe('ignore')
+    expect(parseActivity(group(), { ...policy, allowedUsers: ['someone-else'] })).toEqual({ kind: 'ignore', reason: 'user not allowed' })
+  })
+  test('a tap on the agent\'s buttons in a group needs no mention; file consent is 1:1 only', () => {
+    const p: any = parseActivity(group({ text: undefined, entities: [], value: { kind: CHOICE_KIND, card: 'c1', choice: 'Yes' } }), policy)
+    expect(p.kind).toBe('button')
+    expect(p.meta).toMatchObject({ via: 'button', chat_type: 'group', user_id: 'user-1' })
+    const inv = group({ type: 'invoke', name: 'fileConsent/invoke', value: { type: 'fileUpload', action: 'accept', context: { uploadId: 'u1' }, uploadInfo: { uploadUrl: 'https://x.sharepoint.com/u' } } })
+    expect(parseActivity(inv, policy).kind).toBe('ignore')
+  })
+  test('a DM still works and says chat_type="personal"; unknown conversation types are refused', () => {
+    expect((parseActivity(dm(), policy) as any).meta.chat_type).toBe('personal')
+    expect(chatTypeOf('meeting')).toBe(null)
+    expect(parseActivity(dm({ conversation: { id: 'x', conversationType: 'meeting', tenantId: TENANT } }), policy).kind).toBe('ignore')
   })
   test('an allowlist, when set, is enforced', () => {
     expect(parseActivity(dm(), { ...policy, allowedUsers: ['someone-else'] }).kind).toBe('ignore')
