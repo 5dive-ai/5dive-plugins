@@ -211,12 +211,21 @@ teams_connect() {
     routed=1
   fi
 
+  # DIVE-8036: a NEW connection lets in only people the owner allowed; anyone
+  # else knocks (their message waits for the owner's Allow / Admin / No). A
+  # re-run keeps what the connection had: one made before knocks stays open to
+  # the whole tenant until `5dive people` (or the owner) turns knocking on.
+  local access
+  if [[ -f "$dir/config.json" ]]; then access=$(_cfg_get "$agent" access); else access=knock; fi
+  [[ -z "$access" || "$access" == knock ]] || access=""
+
   step "Writing the agent's Teams settings"
   install -d -o "$user" -g "$(id -gn "$user")" -m 700 "$dir"
   local tmp; tmp=$(mktemp)
   jq -n --arg app "$app_id" --arg ten "$tenant_id" --arg pw "$secret" --argjson port "$port" \
-        --arg pub "$public" --arg allowed "$allowed" '
+        --arg pub "$public" --arg allowed "$allowed" --arg access "$access" '
     {app_id:$app, tenant_id:$ten, app_password:$pw, port:$port}
+    + (if $access != "" then {access:$access} else {} end)
     + (if $pub != "" then {public_url:$pub} else {} end)
     + (if $allowed != "" then {allowed_users: ($allowed | split(",") | map(select(length > 0)))} else {} end)' >"$tmp"
   install -o "$user" -g "$(id -gn "$user")" -m 600 "$tmp" "$dir/config.json"

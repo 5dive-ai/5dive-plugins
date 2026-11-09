@@ -19,7 +19,7 @@
 // `5dive agent teams connect`:
 //   { app_id, tenant_id, app_password, port, public_url?, allowed_users? }
 
-import { readFileSync, writeFileSync, mkdirSync, statSync, appendFileSync, renameSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, statSync, appendFileSync, renameSync, watch } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, basename, extname } from 'node:path'
 import { lookup } from 'node:dns/promises'
@@ -35,6 +35,7 @@ import { splitTrailingOptions, choiceCard, answeredCard, fileConsentCard, fileIn
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { teamsShut, assertTeamsOpen, SHUT_LINE } from './offline.ts'
 import { loadRoles, roleOf, writeMark, readMark, applyRole, type Mark } from './roles.ts'
+import { readAccess, isKnockMode, needsKnock, readKnockState, onStranger, applyAnswers, type KnockState, type HeldItem, type Where } from './knock.ts'
 
 const STATE_DIR = process.env.TEAMS_STATE_DIR || join(homedir(), '.claude', 'channels', 'teams')
 const CONFIG_PATH = join(STATE_DIR, 'config.json')
@@ -46,6 +47,9 @@ const MAX_BODY = 1024 * 1024
 const MAX_FILE = 25 * 1024 * 1024
 const INLINE_IMAGE_MAX = 3 * 1024 * 1024
 const PENDING_TTL_MS = 15 * 60 * 1000
+const KNOCKS_DIR = join(STATE_DIR, 'knocks') // DIVE-8036: the CLI drops the owner's answers here
+// The agent this server is: the seat's home is /home/agent-<name>.
+const AGENT = basename(homedir()).replace(/^agent-/, '')
 
 type Config = { app_id: string; tenant_id: string; app_password: string; port: number; public_url?: string; allowed_users?: string[] }
 
@@ -70,13 +74,14 @@ const cfg = loadConfig()
 type Conv = { serviceUrl: string; user: string; userId: string; lastSeen: string; role?: string; type?: ChatType }
 const MAX_SHARED_CONVS = 300
 type CardRec = { conv: string; activityId: string; body: string; hold?: Mark }
-type State = { conversations: Record<string, Conv>; cards: Record<string, CardRec> }
+// DIVE-8036: knock = messages held for the owner's OK and the per-sender "not open" count.
+type State = { conversations: Record<string, Conv>; cards: Record<string, CardRec>; knock: KnockState }
 function loadState(): State {
   try {
     const s = JSON.parse(readFileSync(STATE_PATH, 'utf8'))
-    return { conversations: s.conversations ?? {}, cards: s.cards ?? {} }
+    return { conversations: s.conversations ?? {}, cards: s.cards ?? {}, knock: readKnockState(s.knock) }
   } catch {
-    return { conversations: {}, cards: {} }
+    return { conversations: {}, cards: {}, knock: readKnockState(null) }
   }
 }
 const state = loadState()
@@ -264,7 +269,7 @@ async function onConsent(conv: string, c: ConsentInvoke) {
 
 // ── MCP ────────────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'teams', version: '0.4.0' },
+  { name: 'teams', version: '0.5.0' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions: [
@@ -405,9 +410,29 @@ function deliver(content: string, meta: Record<string, string>) {
 
 // ── the endpoint ───────────────────────────────────────────────────────────
 async function handle(activity: any) {
-  const parsed = parseActivity(activity, { tenantId: cfg!.tenant_id, appId: cfg!.app_id, allowedUsers: cfg!.allowed_users })
+  // Read fresh: `5dive people sync` rewrites allowed_users and access while we run (DIVE-8036).
+  const access = readAccess(CONFIG_PATH)
+  const knock = isKnockMode(access)
+  // In knock mode a stranger is not refused here: their message is held below.
+  const parsed = parseActivity(activity, { tenantId: cfg!.tenant_id, appId: cfg!.app_id, allowedUsers: knock ? undefined : access.allowed_users })
   if (parsed.kind === 'ignore') {
     if (activity?.type === 'message') logLine('refused', String(activity?.conversation?.id ?? '?'), String(activity?.from?.aadObjectId ?? '?'), 0, 0, parsed.reason)
+    return
+  }
+  const senderId = String(activity?.from?.aadObjectId ?? '')
+  if (knock && needsKnock(access, loadRoles(), senderId)) {
+    // DIVE-8036: a new person. Nothing reaches the agent and the chat is not opened
+    // to it; the owner is asked. Only a message knocks: a tap or a file-consent
+    // answer from a stranger is not something they could have been sent.
+    if (parsed.kind !== 'message') {
+      logLine('refused', parsed.conversationId, senderId, 0, 0, `knock: ${parsed.kind}`)
+      return
+    }
+    const where: Where = { conv: parsed.conversationId, serviceUrl: normalizeServiceUrl(parsed.serviceUrl), chatType: parsed.chatType }
+    let text = parsed.text
+    if (parsed.files.length) text += `\n\n[${parsed.files.length} file(s) were sent before you could see this chat; ask them to send again]`
+    const status = await onStranger(state.knock, AGENT, where, parsed.meta.user_id, parsed.meta.user, { text, meta: { ...parsed.meta } }, knockIO)
+    logLine('refused', parsed.conversationId, parsed.meta.user_id, parsed.text.length, parsed.files.length, `knock: ${status}`)
     return
   }
   // DIVE-7976: the sender's role, from their Entra id and the box's roles file.
@@ -471,6 +496,60 @@ async function handle(activity: any) {
   deliver(text || '(sent a file)', meta)
 }
 
+// ── DIVE-8036: knocks ──────────────────────────────────────────────────────
+// A line to a person whose chat is held: straight to the serviceUrl Microsoft
+// signed for it, never through the conversations map the reply tool reads.
+async function sayTo(w: Where, text: string) {
+  await connector('POST', w.serviceUrl, convPath(w.conv), { type: 'message', text, textFormat: 'markdown' })
+}
+// The owner said yes: the chat opens to the agent, with the sender's role, and
+// the held message arrives as any inbound does.
+function deliverHeld(item: HeldItem, w: Where) {
+  const meta = { ...item.meta }
+  const role = applyRole(meta, w.conv, loadRoles(), MARK_PATH)
+  state.conversations[w.conv] = {
+    serviceUrl: w.serviceUrl, user: meta.user ?? '', userId: meta.user_id ?? '',
+    lastSeen: new Date().toISOString(), role, type: (w.chatType as ChatType) || 'personal',
+  }
+  saveState()
+  logLine('in', w.conv, meta.user_id ?? '?', item.text.length, 0, 'knock: let in')
+  deliver(item.text || '(sent a file)', meta)
+}
+async function sudoRun(args: string[]): Promise<string> {
+  try {
+    const p = Bun.spawn(['sudo', '-n', ...args], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' })
+    const timer = setTimeout(() => p.kill(), 30_000)
+    const out = await new Response(p.stdout).text()
+    await p.exited
+    clearTimeout(timer)
+    return out
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: { message: String(e) } })
+  }
+}
+const knockLog = (line: string) => process.stderr.write(`teams: ${line}\n`)
+const knockIO = { run: sudoRun, say: sayTo, deliver: deliverHeld, save: saveState, log: knockLog }
+let answering = false
+async function checkAnswers() {
+  if (answering) return
+  answering = true
+  try {
+    await applyAnswers(KNOCKS_DIR, state.knock, AGENT, { deliver: deliverHeld, say: sayTo, save: saveState, log: knockLog })
+  } finally {
+    answering = false
+  }
+}
+function watchKnocks() {
+  // fs.watch misses events on some filesystems and the dir may not exist yet
+  // (the CLI makes it on the first answer): a slow poll backs the watch up.
+  setInterval(() => void checkAnswers(), 5_000).unref?.()
+  try {
+    mkdirSync(KNOCKS_DIR, { recursive: true, mode: 0o700 })
+    watch(KNOCKS_DIR, () => void checkAnswers())
+  } catch {}
+  void checkAnswers()
+}
+
 function startEndpoint() {
   if (!cfg) {
     recordLifecycle(STATE_DIR, 'start', 'teams', 'not configured: no config.json (run: sudo 5dive agent teams connect <agent>)')
@@ -515,6 +594,7 @@ function startEndpoint() {
     },
   })
   recordLifecycle(STATE_DIR, 'start', 'teams', `endpoint listening on 127.0.0.1:${cfg.port}`)
+  watchKnocks()
 }
 
 installLifecycle({ channel: 'teams', stateDir: STATE_DIR })
