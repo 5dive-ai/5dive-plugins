@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed — teams 0.5.1: a knock carries the sender's email from the tenant, so the box binds it to the person the owner added (DIVE-8032)
+
+The owner can add a person in the app by name and email before they ever write. Their first Teams message knocked with no email, so the box made a second person record. The knock now carries the address Microsoft holds for that sender.
+
+- **`teams/knock.ts`:** `onStranger` asks for the sender's member record (`HoldIO.member`) and `memberEmail` takes its `email`, else a UPN shaped like an email, only when the record's `aadObjectId` is the knocking id. `knockFileArgs(sender, name, email)` adds `--email=<addr>` (lowercased, at most 120 characters, never looser than the box's check). Never from the message text.
+- **`teams/server.ts`:** `memberOf` is the REST call `TeamsInfo.getMember` makes, `GET {serviceUrl}/v3/conversations/{id}/members/{aadObjectId}`, with a 5 s timeout. A failed or slow lookup files the knock without an email, as before.
+
+Checked: `bun test test/dive8036-knock.test.ts` 27/27; the 5 new tests do not load on the previous release (no `memberEmail`); dropping `--email` from the argv turns 2 red, dropping `member` from the server wiring turns 1 red.
+
 ### Fixed — telegram 0.5.140: a partner client's org-policy notice names their cabinet, not 5dive (DIVE-8012)
 
 On a partner box (`TELEGRAM_PROFILE=lite`) the DIVE-5993 notice (a Claude Team/Enterprise org with chat channels off) goes straight to the partner's client. Its last line told them to switch accounts «на странице агента в панели 5dive», a dashboard they do not have.

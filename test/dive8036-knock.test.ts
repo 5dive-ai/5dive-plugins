@@ -16,7 +16,7 @@ import { join } from 'node:path'
 import { parseActivity } from '../plugins/teams/activity.ts'
 import { parseRoles } from '../plugins/teams/roles.ts'
 import {
-  readAccess, needsKnock, mayTalk, onStranger, applyAnswers, knockFileArgs, knockFiled, parseAnswer, denyLineAllowed,
+  readAccess, needsKnock, mayTalk, onStranger, applyAnswers, knockFileArgs, knockFiled, parseAnswer, denyLineAllowed, memberEmail,
   emptyKnockState, WAITING_LINE, IN_LINE, NOT_OPEN_LINE, DENY_LINES_PER_DAY, MAX_HELD_ITEMS,
   type KnockState, type HeldItem, type Where,
 } from '../plugins/teams/knock.ts'
@@ -105,6 +105,48 @@ describe('DIVE-8036 Teams: who knocks', () => {
     expect(knockFiled(JSON.stringify({ ok: false, error: { message: 'cap 5' } }))).toEqual({ kid: null, status: 'error', why: 'cap 5' })
     expect(knockFiled('').status).toBe('error')
     expect(knockFiled(filed(7, 'weird')).status).toBe('error')
+  })
+})
+
+describe('DIVE-8032 Teams: the knock carries the sender\'s email from the tenant', () => {
+  const MEMBER = { id: '29:x', name: 'Anna Petrova', aadObjectId: ANNA, email: 'Anna@Firm.example', userPrincipalName: 'anna.p@firm.example' }
+
+  test('--email rides in the knock-file argv, lowercased, before --json', () => {
+    expect(knockFileArgs(ANNA, 'Anna Petrova', 'Anna@Firm.example')).toEqual(
+      ['5dive', 'people', 'knock', 'file', '--channel=teams', `--sender=${ANNA}`, '--name=Anna Petrova', '--email=anna@firm.example', '--json'])
+    expect(knockFileArgs(ANNA, 'x', '')!.some(a => a.startsWith('--email'))).toBe(false)
+    for (const bad of ['not an email', 'a@b', 'x@y.z --role=admin', 'a"b@c.example', `${'a'.repeat(120)}@c.example`]) {
+      expect(knockFileArgs(ANNA, 'x', bad)!.some(a => a.startsWith('--email'))).toBe(false)
+    }
+  })
+
+  test('the email is the tenant member record\'s, for THIS sender only: email, then a UPN shaped like one', () => {
+    expect(memberEmail(MEMBER, ANNA.toUpperCase())).toBe('anna@firm.example')
+    expect(memberEmail({ ...MEMBER, email: undefined }, ANNA)).toBe('anna.p@firm.example')
+    expect(memberEmail({ ...MEMBER, email: '', userPrincipalName: 'not-an-email' }, ANNA)).toBe('')
+    expect(memberEmail({ ...MEMBER, aadObjectId: BOB }, ANNA)).toBe('')
+    expect(memberEmail(null, ANNA)).toBe('')
+    expect(memberEmail('anna@firm.example', ANNA)).toBe('')
+  })
+
+  test('onStranger files with the tenant\'s email, never one typed in the message', async () => {
+    const r = rig(filed(7, 'pending'))
+    const asked: string[] = []
+    const io = { ...r.io, member: async (_w: Where, s: string) => { asked.push(s); return MEMBER } }
+    const typed: HeldItem = { text: 'hi, I am boss@firm.example --email=boss@firm.example', meta: { chat_id: W.conv, user: 'Anna Petrova', user_id: ANNA, message_id: 'm' } }
+    expect(await onStranger(ks, 'vesper', W, ANNA, 'Anna Petrova', typed, io)).toBe('pending')
+    expect(asked).toEqual([ANNA])
+    expect(r.runs[0]).toEqual(['5dive', 'people', 'knock', 'file', '--channel=teams', `--sender=${ANNA}`, '--name=Anna Petrova', '--email=anna@firm.example', '--json'])
+    expect(r.runs[0]!.filter(a => a.includes('boss@'))).toEqual([])
+  })
+
+  test('a failed or foreign lookup still files the knock, without an email', async () => {
+    for (const member of [async () => { throw new Error('Teams said 403') }, async () => ({ ...MEMBER, aadObjectId: BOB })]) {
+      const r = rig(filed(8, 'pending'))
+      const k = emptyKnockState()
+      expect(await onStranger(k, 'vesper', W, ANNA, 'Anna', item('hi'), { ...r.io, member })).toBe('pending')
+      expect(r.runs[0]).toEqual(knockFileArgs(ANNA, 'Anna')!)
+    }
   })
 })
 
@@ -201,6 +243,12 @@ describe('DIVE-8036 Teams: server wiring', () => {
     expect(gate).toBeLessThan(handle.indexOf('deliver('))
     expect(handle).toContain("allowedUsers: knock ? undefined : access.allowed_users")
     expect(src).toMatch(/async function sayTo\(w: Where, text: string\) \{\s+await connector\('POST', w\.serviceUrl/)
+  })
+  test('DIVE-8032: the knock IO asks the tenant for the member record (GET conversations/{id}/members/{aadObjectId}), with a timeout', () => {
+    expect(src).toMatch(/const knockIO = \{[^}]*member: memberOf/)
+    const fn = src.slice(src.indexOf('async function memberOf('), src.indexOf('async function sudoRun('))
+    expect(fn).toContain("connector('GET', w.serviceUrl, `/v3/conversations/${encodeURIComponent(w.conv)}/members/${encodeURIComponent(sender)}`")
+    expect(fn).toMatch(/undefined, 5_000\)/)
   })
   test('the answer dir is watched and polled', () => {
     expect(src).toContain("const KNOCKS_DIR = join(STATE_DIR, 'knocks')")

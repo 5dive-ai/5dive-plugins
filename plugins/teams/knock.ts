@@ -129,14 +129,39 @@ export const NOT_OPEN_LINE = (agent: string) => `${shownName(agent)} isn't open 
 
 const ENTRA_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
+// Never looser than the box (cmd_people.sh _people_check_email, <=120 chars):
+// an address it refuses would refuse the whole knock.
+const EMAIL_RE = /^[^\s@<>"',;:()\[\]\\]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/
+
+/** The sender's email, from the tenant's own member record (Bot Connector
+ *  GET conversations/{id}/members/{aadObjectId}, what TeamsInfo.getMember
+ *  reads) — never from the message. Only a record for THIS sender counts:
+ *  its aadObjectId must be the knocking id. `email` first, then the UPN
+ *  when it has an email's shape. Anything else is '' (the knock files
+ *  without an email and the box makes a fresh person, as before). */
+export function memberEmail(member: unknown, sender: string): string {
+  const m = member as Record<string, unknown> | null
+  if (!m || typeof m !== 'object') return ''
+  if (String(m.aadObjectId ?? '').toLowerCase() !== sender.toLowerCase()) return ''
+  for (const v of [m.email, m.userPrincipalName]) {
+    const e = typeof v === 'string' ? v.trim().toLowerCase() : ''
+    if (e.length <= 120 && EMAIL_RE.test(e)) return e
+  }
+  return ''
+}
+
 /** The argv after `sudo -n`. The seat is the agent (the CLI reads it from
  *  SUDO_UID, never from argv), so no --agent. Shaped to match the seat's
- *  sudoers line `/usr/local/bin/5dive people knock file *`. */
-export function knockFileArgs(sender: string, name: string): string[] | null {
+ *  sudoers line `/usr/local/bin/5dive people knock file *`. `email` is the
+ *  tenant's address for the sender (memberEmail), so the box can bind the
+ *  knock to a person the owner added by email (DIVE-8032). */
+export function knockFileArgs(sender: string, name: string, email = ''): string[] | null {
   if (!ENTRA_RE.test(sender)) return null
   const clean = name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 80)
   const args = ['5dive', 'people', 'knock', 'file', '--channel=teams', `--sender=${sender.toLowerCase()}`]
   if (clean) args.push(`--name=${clean}`)
+  const mail = email.trim().toLowerCase()
+  if (mail.length <= 120 && EMAIL_RE.test(mail)) args.push(`--email=${mail}`)
   args.push('--json')
   return args
 }
@@ -242,6 +267,8 @@ export async function applyAnswers(dir: string, ks: KnockState, agent: string, i
 export type HoldIO = {
   /** `sudo -n <args>`: resolves with stdout, a refusal's envelope included */
   run: (args: string[]) => Promise<string>
+  /** the sender's member record from the tenant (Bot Connector), or null; never throws */
+  member?: (where: Where, sender: string) => Promise<unknown>
   say: (where: Where, text: string) => Promise<void>
   deliver: (item: HeldItem, where: Where) => void
   save: () => void
@@ -252,7 +279,12 @@ export type HoldIO = {
  *  agent unless the CLI says the person is already allowed (a race with an
  *  answer, or the owner added them from the app). */
 export async function onStranger(ks: KnockState, agent: string, where: Where, sender: string, name: string, item: HeldItem, io: HoldIO, now = new Date()): Promise<Filed['status']> {
-  const args = knockFileArgs(sender, name)
+  if (!ENTRA_RE.test(sender)) {
+    io.log(`knock: sender ${sender.slice(0, 12)} is not an Entra id; refused`)
+    return 'error'
+  }
+  const email = io.member ? memberEmail(await io.member(where, sender).catch(() => null), sender) : ''
+  const args = knockFileArgs(sender, name, email)
   if (!args) {
     io.log(`knock: sender ${sender.slice(0, 12)} is not an Entra id; refused`)
     return 'error'
