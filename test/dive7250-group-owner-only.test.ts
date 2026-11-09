@@ -73,8 +73,14 @@ describe('a group the owner adds later', () => {
     expect(admitOnJoin(a, '-1001', { id: 111 })).toBe(true)
     expect(a.groups['-1001']).toEqual({ requireMention: true, allowFrom: ['111'] })
   })
-  test('not owner only: as before', () => {
+  // DIVE-7972: no choice stored = owners only; opened on purpose = as before.
+  test('no choice stored: by name, its owners let in (DIVE-7972)', () => {
     const a = access()
+    admitOnJoin(a, '-1001', { id: 111 })
+    expect(a.groups['-1001']).toEqual({ requireMention: true, allowFrom: ['111'] })
+  })
+  test('opened to everyone (groupsOwnerOnly: false): as before', () => {
+    const a = access({ groupsOwnerOnly: false })
     admitOnJoin(a, '-1001', { id: 111 })
     expect(a.groups['-1001']).toEqual({ requireMention: true, allowFrom: [] })
   })
@@ -93,6 +99,6 @@ describe('the hello tells nobody else to call her', () => {
     expect(groupJoinLines({ ...base, lite: false, ownerOnly: true })).toEqual(["👋 Hi, I'm Olivia. I answer only the person who added me."])
   })
   test('the join passes the setting to the hello', () => {
-    expect(SERVER).toContain('ownerOnly: access.groupsOwnerOnly === true,')
+    expect(SERVER).toContain('ownerOnly: access.groupsOwnerOnly === true || (approved && !groupsOpenToMembers(access)),')
   })
 })

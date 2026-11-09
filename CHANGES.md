@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.138, browser 1.32.2: outside text no longer reaches an agent as if its owner sent it (DIVE-7972)
+
+Three paths from the DIVE-7963 security pass, where someone other than the owner could give orders to an agent that has sudo.
+
+- **Team-bot relay (telegram, `untrusted.ts` `relayInVerdict`):** the relay-in drain now re-checks every relayed message on the agent's own access.json before it is delivered: the agent's team group, its topic, and a sender on its allowFrom. No list means nobody gets through. The root listener checks the same thing first (5dive-cli, same row); this second check covers a planted file or a listener older than the fix.
+- **Groups the owner adds (telegram, `groupjoin.ts`):** a new group lets in its owners only, unless the owner opened groups on purpose (the CLI's "by name" or "every message" now stores `groupsOwnerOnly: false`). Before, a new group let in anyone who joined through an invite link. Groups already set up keep their settings.
+- **Who is speaking (telegram):** every inbound carries `sender_role` = `owner`, `guest` or `member`. In a group, a non-owner's message arrives inside a random-marker `UNTRUSTED` block. One sentence in the channel instructions says what the roles mean.
+- **Browser page text (browser, `bin/browser`, `lib/delta.cjs`):** `page.md` and the snapshot delta put the page's text between two `UNTRUSTED-PAGE-<id>` markers, with a fresh id each read. After any page read, `publish` and `send` ask the owner first for 30 minutes (exit 73, answered with one tap), even under `standard`. Only `yolo` skips this. The delta ignores the marker lines, so a re-read is not counted as a change.
+
+Checked: `bun test test/dive7972-outside-text-fenced.test.ts`: 21 pass. Two mutants (relay sender check removed; old open default for new groups) each turn arms red. The DIVE-5368/6675/7250/5121 tests were updated to the new default and the new instruction sentence. `tests/browser_plugin_unit.sh` through the new T7972 block: 1478 pass, 0 fail, including a mutant with the page-read rule removed. `tests/browser_routine_delta_unit.sh`: 95 pass.
+
 ### Added — crew 0.1.0: the CrewAI runtime is a plugin, and its feed receipt is off by default (DIVE-7950)
 
 `5dive crew` left the core CLI (lodar 11-09: optional features are plugins, never core). `sudo 5dive plugin add crew@5dive-plugins` brings it back with the same subcommands; a box without it gets one line pointing here.

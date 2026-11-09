@@ -67,10 +67,11 @@ describe('who added the bot decides whether the group is approved', () => {
     expect(access.groups).toEqual({})
     expect(Object.keys(access.discovered)).toEqual(['-100777'])
   })
-  test('the owner adds it: in groups, mention-only, nobody else listed', () => {
+  // DIVE-7972: the new group lets in its owners only (not the guest 222).
+  test('the owner adds it: in groups, mention-only, its owners only', () => {
     const access = { owners: ['111'], allowFrom: ['111', '222'], groups: {} as Record<string, unknown> }
     expect(admitOnJoin(access, '-100888', { id: 111 })).toBe(true)
-    expect(access.groups).toEqual({ '-100888': { requireMention: true, allowFrom: [] } })
+    expect(access.groups).toEqual({ '-100888': { requireMention: true, allowFrom: ['111'] } })
     // an approved group's own settings are never reset by a re-add
     access.groups['-100888'] = { requireMention: false, allowFrom: ['5'] }
     expect(admitOnJoin(access, '-100888', { id: 111 })).toBe(false)
