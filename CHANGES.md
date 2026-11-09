@@ -1,5 +1,16 @@
 ## Unreleased
 
+### Added — teams 0.5.0 + telegram 0.5.139: a new person knocks; the owner lets them in from Telegram (DIVE-8036)
+
+A Teams connection whose config says `access: "knock"` (every NEW `5dive agent teams connect`, and `5dive people sync`) no longer lets the whole tenant write. A message from someone not on `allowed_users` (and not an admin in `/etc/5dive/roles.json`) never reaches the agent:
+
+- **Hold (`teams/knock.ts`):** the server keeps the message (the newest 5, text capped) in its own state, runs `sudo -n 5dive people knock file --channel=teams --sender=<entra id> --name=<shown name> --json`, and tells the person once: «I've asked the owner to let you talk to Vesper. Your message waits until they do.» The held chat is not opened to the agent, so it cannot reply into it.
+- **Answer:** the CLI drops `knocks/<kid>.json` in the agent's teams state dir; the server watches it (plus a 5 s poll). Allow / Admin: «You're in — Vesper will answer here.», then the held messages arrive as normal inbound, with the sender's role. No: «Vesper isn't open to you — ask your admin.», then at most 3 such lines a day per sender, and silence.
+- **Owner card (`telegram/knocktap.ts`):** a `kn:<kid>:allow|admin|no:<nonce>` tap is answered only for an id in the bot's owners record and relayed as `sudo -n 5dive people knock answer <kid> <choice> --proof=<that button's nonce> --by=telegram:<uid> --json`; the card is edited to the outcome. A guest's tap runs nothing. A standard seat reaches it through its probed `people knock answer *` line.
+- A connection made before this keeps no `access` key: today's behaviour, also after a re-run of connect.
+
+Checked: `bun test test/dive8036-knock.test.ts` 22/22 (hold, release on allow and admin, deny, rate limit, no-access-key unchanged, owner-only tap with a guest negative); `sudo bash tests/teams_cli_unit.sh` 69/69.
+
 ### Fixed — teams 0.3.1: a failed Teams connect shows Microsoft's reason, not a libsecret hint; the bot gets the agent's face (DIVE-8022)
 
 When Microsoft did not make an agent's bot, the app card said "Install it for secure storage: sudo apt install libsecret-1-dev", which fixes nothing. Microsoft's CLI, run with `--json`, reports its error on stdout (`{ok:false, error:{message}}`), and prints its libsecret warning on stderr on every call on a box with no desktop keyring. Connect only read the last stderr line.

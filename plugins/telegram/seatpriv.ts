@@ -229,13 +229,20 @@ export function standardSeatMaySudo(argv: string[]): boolean {
 //     let someone write; root lifts the owner-only lock on THIS seat's own bot
 //     (the agent comes from SUDO_UID, the line names no args).
 export const BROWSER_CONNECT_PROBE_ARGV = ['-n', '-l', '/usr/local/bin/5dive', 'browser', '_connect']
+//   people knock answer: DIVE-8036, the owner's Allow / Admin / No on a knock.
+//     The line is `5dive people knock answer *` (cmd_agent_create.sh), so this
+//     entry matches by PREFIX; root checks the tap proof for the choice given.
 export const TELEGRAM_OPEN_PROBE_ARGV = ['-n', '-l', '/usr/local/bin/5dive', 'agent', '_telegram_open']
-const PROBED_STANDARD_GRANTS: { argv: string[]; probe: string[] }[] = [
+export const KNOCK_ANSWER_PROBE_ARGV = ['-n', '-l', '/usr/local/bin/5dive', 'people', 'knock', 'answer', '0', 'no']
+const PROBED_STANDARD_GRANTS: { argv: string[]; probe: string[]; prefix?: boolean }[] = [
   { argv: ['5dive', 'browser', '_connect'], probe: BROWSER_CONNECT_PROBE_ARGV },
   { argv: ['5dive', 'agent', '_telegram_open'], probe: TELEGRAM_OPEN_PROBE_ARGV },
+  { argv: ['5dive', 'people', 'knock', 'answer'], probe: KNOCK_ANSWER_PROBE_ARGV, prefix: true },
 ]
+const grantMatches = (g: { argv: string[]; prefix?: boolean }, argv: string[]) =>
+  g.prefix ? argv.length > g.argv.length && g.argv.every((w, i) => w === argv[i]) : sameArgv(g.argv, argv)
 export function standardSeatMayHold(argv: string[]): boolean {
-  return PROBED_STANDARD_GRANTS.some(g => sameArgv(g.argv, argv))
+  return PROBED_STANDARD_GRANTS.some(g => grantMatches(g, argv))
 }
 
 // Verbs the CLI serves to an UNPRIVILEGED caller (5dive-cli origin/main,
@@ -332,7 +339,7 @@ export function createSudoGate(o: {
   const now = o.now ?? Date.now
   const held = new Map<string, { v: boolean; at: number }>()
   const holds = async (argv: string[]): Promise<boolean> => {
-    const g = PROBED_STANDARD_GRANTS.find(x => sameArgv(x.argv, argv))
+    const g = PROBED_STANDARD_GRANTS.find(x => grantMatches(x, argv))
     if (!g || !o.mayProbe) return false
     const key = g.argv.join(' ')
     const c = held.get(key)
