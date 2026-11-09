@@ -134,6 +134,10 @@ export FIVEDIVE_BROWSER_AUTO_PROPOSE=0 FIVEDIVE_BROWSER_DRIFT_ON_PROBE=0
 # Off for every arm that grades the owner's policy on its own; the T7972 block
 # turns it on and grades the rule itself.
 export FIVEDIVE_BROWSER_PAGE_READ_WINDOW=0
+# Every capture also writes that page-read mark into the approval dir. Arms that
+# grade approvals name their own dir; the rest keep the mark in $TMP, never the
+# runner's real home, where it would make the NEXT harness's publish ask.
+export FIVEDIVE_BROWSER_APPROVAL_DIR="$TMP/approvals-default"
 run() { local o="$TMP/.o" e="$TMP/.e"; "$@" >"$o" 2>"$e"; RC=$?; OUT=$(cat "$o"); ERR=$(cat "$e"); return 0; }
 
 SEAT="$(id -un)"
