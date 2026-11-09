@@ -80,11 +80,14 @@ jobs:
       # a named warning. Then 5dive-browser's OWN harnesses, from the matched commit,
       # grade this tree (they replaced nine hand-kept copies that had drifted: the
       # copies are why a sync was a merge, and why nobody synced for five weeks).
+      # head_ref is empty on a push run, so fall back to the pushed branch's name: a
+      # push of a feature branch then matches its same-named upstream branch exactly as
+      # its pull_request run does (on main, ref_name=main is just a main commit).
       - name: browser mirror is byte-for-byte 5dive-browser
         run: bash tests/browser_mirror.sh check
         env:
           BROWSER_UPSTREAM_DIR: ${{ runner.temp }}/5dive-browser
-          BROWSER_MIRROR_BRANCH: ${{ github.head_ref }}
+          BROWSER_MIRROR_BRANCH: ${{ github.head_ref || github.ref_name }}
       - name: browser registry entry harness
         run: bash tests/browser_registry_unit.sh
       - name: browser harnesses (5dive-browser's own, on this tree)
@@ -96,7 +99,7 @@ jobs:
           browser_act_upload_unit.sh
         env:
           BROWSER_UPSTREAM_DIR: ${{ runner.temp }}/5dive-browser
-          BROWSER_MIRROR_BRANCH: ${{ github.head_ref }}
+          BROWSER_MIRROR_BRANCH: ${{ github.head_ref || github.ref_name }}
       # DIVE-7658: `5dive agent teams connect|status|disconnect` against a stubbed
       # 5dive. Root: connect writes another user's 0600 file and refuses anyone else.
       - name: teams CLI harness
@@ -143,4 +146,4 @@ jobs:
         run: bash tests/browser_mirror.sh run --npm browser_totp_unit.sh
         env:
           BROWSER_UPSTREAM_DIR: ${{ runner.temp }}/5dive-browser
-          BROWSER_MIRROR_BRANCH: ${{ github.head_ref }}
+          BROWSER_MIRROR_BRANCH: ${{ github.head_ref || github.ref_name }}
