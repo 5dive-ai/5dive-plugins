@@ -164,13 +164,16 @@ describe('no profile set = the plugin as it is today', () => {
       /^\s*lite: LITE,$/,
       // DIVE-5419: lite gets "typing…" but no status edits on a client's chat.
       /^\s*if \(!LITE\) ackStatus\.noteReply\($/,
+      // DIVE-8012: the org-policy notice takes the profile as data (orgpolicy.ts).
+      /^\s*const text = orgPolicyText\(bot\.botInfo\?\.first_name \?\? '', lang, LITE\)$/,
     ]
     const odd = uses.filter(l => !shapes.some(re => re.test(l)))
     expect(odd).toEqual([])
     // DIVE-5368: 15 — the lite pairing reply (`if (LITE) {`) and `lite: LITE,`.
     // DIVE-5419: 16 — the status-edit guard on the reply.
     // DIVE-6859: 15 — lite gets the Yes/No pair, so its guard is gone.
-    expect(uses).toHaveLength(15)
+    // DIVE-8012: 16 — the org-policy notice's `lang, LITE)`.
+    expect(uses).toHaveLength(16)
   })
 
   test('the lite front door is registered only under LITE, ahead of every other update handler', () => {
