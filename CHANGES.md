@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Added — crew 0.1.0: the CrewAI runtime is a plugin, and its feed receipt is off by default (DIVE-7950)
+
+`5dive crew` left the core CLI (lodar 11-09: optional features are plugins, never core). `sudo 5dive plugin add crew@5dive-plugins` brings it back with the same subcommands; a box without it gets one line pointing here.
+
+- **`plugins/crew/bin/crew`:** core's `src/cmd_crew.sh` (5dive-ai/5dive@1440f835), moved verbatim behind a prelude that stands in for core's `fail`/`ok`/`step`/`warn`, `--json` and local-only. Crews already under `~/.5dive/crews` keep working.
+- **The work receipt is opt-in.** `crew run` sends nothing to the 5dive feed unless you pass `--receipt`. `--no-receipt` still parses. Local-only mode still wins over `--receipt`.
+- **Fixed on the way:** install now makes the crew's `storage/` memory folder (core made one named `{storage}`), and a failed kickoff prints its output instead of dying silently under `set -e`.
+
+Checked: `bun test test/crew-plugin.test.ts`, 12 pass (install, no receipt by default, `--receipt` posts one to a stub ingest, local-only, root refusal, `--json`); two mutants (receipt default-on, `--receipt` ignored) each turn 2 arms red.
+
 ### Fixed — dashboard 0.5.35: the Hermes app-chat plugin meets the Hermes plugin catalog rules (DIVE-7945)
 
 Before we list `fivedive` in Hermes's plugin catalog (`hermes plugins catalog`), the plugin has to pass the catalog's admission rules, not only the validator.

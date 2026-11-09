@@ -1,0 +1,33 @@
+{
+  "name": "crew",
+  "description": "Run your CrewAI crew 24/7 on your own 5dive server: install it from git, give it your own AI key, run it on a schedule. Memory persists between runs. Nothing is sent to 5dive unless you add --receipt.",
+  "version": "0.1.0",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/crew",
+  "keywords": [
+    "crewai",
+    "crew",
+    "agents",
+    "runtime"
+  ],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": [
+      "verb"
+    ],
+    "verbs": [
+      {
+        "name": "crew",
+        "summary": "run a CrewAI crew on this server"
+      }
+    ],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    }
+  }
+}
