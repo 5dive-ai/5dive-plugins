@@ -62,6 +62,13 @@
       "category": "development",
       "source": "./plugins/devteam",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/devteam"
+    },
+    {
+      "name": "crew",
+      "description": "CrewAI runtime: install a CrewAI crew from git and run it on the box with the owner's own AI key, its memory kept on disk between runs. Sends nothing to 5dive unless a run passes --receipt (one signed work receipt to the 5dive feed). Refuses root.",
+      "category": "productivity",
+      "source": "./plugins/crew",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/crew"
     }
   ]
 }
