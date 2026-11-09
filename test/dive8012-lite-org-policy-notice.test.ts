@@ -83,7 +83,7 @@ describe('lite: the name stays escaped', () => {
 })
 
 describe('default profile: byte-identical to before DIVE-8012', () => {
-  // sha256 of origin/main cfa582c's orgPolicyText output for each case.
+  // sha256 of the previous release's (cfa582c) orgPolicyText output for each case.
   const before: Record<string, string> = {
     'ru|Maya': '793b09755fec62c53afcba070b29e5555a311b2aa11c979a86ec3f862d06e32a',
     'ru|': 'e077c07235925ae75677db5ece527cdac7d9446a463b1762df420b7965529101',
