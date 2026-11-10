@@ -34,6 +34,7 @@ import { homedir, userInfo } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
+import { makeSeatGuard } from './seatguard.ts'
 import { writeDispatcherInbox } from './dispatcher-inbox.ts'
 import { API_BASE_FILE_DEFAULT, readApiBaseFile, resolveApiBase } from './apibase.ts'
 import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
@@ -345,6 +346,27 @@ const AGENT = (process.env.USER ?? '').replace(/^agent-/, '')
 if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(AGENT)) {
   process.stderr.write(`dashboard channel: cannot derive agent name from USER="${process.env.USER ?? ''}"\n`)
   process.exit(1)
+}
+
+// DIVE-8138: stop when this agent is no longer on the box (see seatguard.ts).
+// An orphan of a removed agent kept polling and acking its dead name for days.
+{
+  const passwd = process.env.DASHBOARD_PASSWD_FILE ?? '/etc/passwd'
+  const guard = makeSeatGuard({
+    user: process.env.USER ?? '',
+    uid: process.getuid?.() ?? -1,
+    read: () => { try { return readFileSync(passwd, 'utf8') } catch { return null } },
+  })
+  if (guard.armed) {
+    const everyMs = Number(process.env.DASHBOARD_SEAT_CHECK_MS) > 0 ? Number(process.env.DASHBOARD_SEAT_CHECK_MS) : 60_000
+    setInterval(() => {
+      if (guard.check() !== 'gone') return
+      const now = guard.seen()
+      recordLifecycle(STATE_DIR, 'exit', 'dashboard',
+        `agent ${AGENT} is no longer on this box (uid ${process.getuid?.()} is ${now ? `now ${now}` : 'gone from passwd'}); stopping`)
+      process.exit(0)
+    }, everyMs).unref?.()
+  }
 }
 
 // --- DIVE-3810: the credential is mutable, and its failure has to be visible --
@@ -962,6 +984,13 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
   for (const job of hear) void hearClip(job)
   if (items.length === 0) return hear.length === 0 && wait > 0 && Date.now() - started < 1_000 ? 'empty-fast' : 'ok'
   const acked: number[] = []
+  // DIVE-8138: a batch that put nothing in front of the session (every row in
+  // backoff, parked, already live or unreadable) paces like an empty poll. It
+  // returned 'ok', so the long poll asked again at once, and the API answered
+  // at once because the rows were still owed: a spin that also 429'd the box's
+  // healthy agents. Pacing does not depend on the API honouring an ack.
+  let pushed = 0
+  const idle = (): PollOutcome => (pushed === 0 && wait > 0 ? 'empty-fast' : 'ok')
   const live = loadLiveDeliveries(LIVE_DELIVERY_FILE)
   for (const m of items) {
     if (typeof m?.text !== 'string' || !m.text.trim()) { acked.push(m.id); continue }
@@ -981,10 +1010,17 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
           STATE_DIR,
           'delivery',
           'dashboard',
-          `pending message id=${m.id} parked after ${decision.next.attempts} unacknowledged attempts`,
+          `pending message id=${m.id} parked after ${decision.next.attempts} unacknowledged attempts; acked, not pushed again`,
         )
         savePendingRetryState(PENDING_RETRY_FILE, retryState)
       }
+      // DIVE-8138: a parked row is ACKED. Left unacked it stays owed, so the
+      // API answers every long poll with it at once and the poll spins (server
+      // 589: 560k polls a day) — and whether it ever stops depended on the
+      // API's attempt cap being at or below ours. Each ack hides it for the
+      // API's re-drain TTL and counts toward that cap, so the API retires it
+      // whatever the cap is. It is never pushed again from here.
+      acked.push(m.id)
       continue
     }
     // Persist BEFORE handing bytes to the harness. A process death between the
@@ -1028,11 +1064,12 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
         `pending message id=${m.id} pushed attempt=${decision.attempt} redelivery=${decision.redelivery}`,
       )
       acked.push(m.id)
+      pushed++
     } catch (err) {
       recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `pending push failed id=${m.id} attempt=${decision.attempt}: ${err}`)
     }
   }
-  if (acked.length === 0) return 'ok'
+  if (acked.length === 0) return idle()
   try {
     const ack = await authedFetch(`${API_BASE}/server/messages/pending/ack`, 'pending ack', {
       method: 'POST',
@@ -1065,8 +1102,11 @@ async function drainPendingOnce(wait = 0): Promise<PollOutcome> {
       'dashboard',
       `pending ack failed ids=${acked.join(',')} (retry state retained): ${err}`,
     )
+    // DIVE-8138: the rows stay owed, so the next poll would get them at once:
+    // back off like any failed call (a 429 here is the API asking for exactly that).
+    return 'error'
   }
-  return 'ok'
+  return idle()
 }
 
 // --- DIVE-6816: a chat-only box moves the chat's files itself ---------------
