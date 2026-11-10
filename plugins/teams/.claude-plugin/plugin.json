@@ -1,7 +1,7 @@
 {
   "name": "teams",
   "description": "Microsoft Teams channel for Claude Code: each agent is its own contact in your company's Teams. Messages go between Microsoft and your own server only. DMs, files both ways, and tap buttons for questions.",
-  "version": "0.1.0",
+  "version": "0.5.2",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com"

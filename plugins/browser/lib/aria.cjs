@@ -47,7 +47,7 @@ const path = require('path');
 const INTERACTIVE = [
   'button', 'link', 'textbox', 'searchbox', 'checkbox', 'radio', 'combobox',
   'listbox', 'option', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'switch',
-  'slider', 'spinbutton', 'tab', 'treeitem',
+  'slider', 'spinbutton', 'tab', 'treeitem', 'clickable',
 ];
 
 // THE PAGE-SIDE WALK. Serialized into the browser by page.evaluate, so it may
@@ -72,9 +72,21 @@ function pageWalk(opts) {
     number: 'spinbutton', file: 'button', hidden: null,
   };
 
+  // THE ROOT A NAME IS LOOKED UP IN. An id or a label[for] inside a shadow root
+  // is only found from that root; document.getElementById cannot see it.
+  function scopeOf(el) {
+    var r = el.getRootNode ? el.getRootNode() : null;
+    return r && r.getElementById && r.querySelector ? r : el.ownerDocument;
+  }
+
   function roleOf(el) {
     var explicit = (el.getAttribute('role') || '').trim().split(/\s+/)[0];
     if (explicit) return explicit.toLowerCase();
+    // A RICH-TEXT EDITOR IS A TEXT FIELD (DIVE-7007). Shopify's product Description
+    // is TinyMCE: an iframe whose <body contenteditable> is the field a person types
+    // in, and it carries no role, so the map listed its toolbar and not the field.
+    // The editing host only: everything inside it is editable too.
+    if (el.isContentEditable === true && !(el.parentElement && el.parentElement.isContentEditable)) return 'textbox';
     var tag = el.tagName.toLowerCase();
     if (tag === 'input') {
       var t = (el.getAttribute('type') || 'text').toLowerCase();
@@ -85,8 +97,37 @@ function pageWalk(opts) {
     return ROLE_BY_TAG[tag] || null;
   }
 
+  // A WEB COMPONENT'S TEXT IS WHERE IT IS DRAWN (DIVE-7007). textContent reads the
+  // light DOM only, so a control whose words a shadow root draws, or that shows its
+  // light children through <slot>s in its own order, was named by the wrong words or
+  // none: Shopify's Status picker offered `clickable/Not visible on selected sales
+  // channels or markets` for the option a person reads as "Draft". So when the
+  // subtree crosses a shadow root or a filled slot, the name is read the way the page
+  // draws it, a slot's content set apart by spaces; otherwise it is textContent, as
+  // before, so no ref on a page without web components changes.
+  var DRAWN_NODES_MAX = 2000, DRAWN_CHARS_MAX = 400;
+  function drawnText(el) {
+    var deep = false, parts = [], len = 0, seen = 0;
+    function go(n) {
+      if (++seen > DRAWN_NODES_MAX || len > DRAWN_CHARS_MAX) return;
+      if (n.nodeType === 3) { parts.push(n.nodeValue); len += n.nodeValue.length; return; }
+      if (n.nodeType !== 1 && n.nodeType !== 11) return;
+      var t = n.tagName ? n.tagName.toLowerCase() : '';
+      if (t === 'script' || t === 'style') return;
+      if (t === 'slot' && typeof n.assignedNodes === 'function') {
+        var a = n.assignedNodes({ flatten: true });
+        if (a.length) { deep = true; parts.push(' '); a.forEach(go); parts.push(' '); return; }
+      }
+      if (n.shadowRoot) deep = true;
+      var kids = (n.shadowRoot || n).childNodes || [];
+      for (var i = 0; i < kids.length; i++) go(kids[i]);
+    }
+    go(el);
+    return deep ? parts.join('') : null;
+  }
   function text(el) {
-    return (el.textContent || '').replace(/\s+/g, ' ').trim();
+    var drawn = drawnText(el);
+    return (drawn !== null ? drawn : el.textContent || '').replace(/\s+/g, ' ').trim();
   }
 
   // Accessible name, in the order the ARIA spec resolves it, stopping at the
@@ -95,11 +136,21 @@ function pageWalk(opts) {
   // node still appears: a ref of `button/` is useless, but hiding the node would
   // tell the agent the button does not exist, which is worse than telling it the
   // button has no label.
+  // A NAME IS A LABEL, NOT A PAGE (DIVE-7303). OhioMeansJobs wraps a 1,000-option
+  // job list in a <label>, so every option took the whole label's text as its
+  // name: 1,211 refs made a 66 MB tree.json and held the snapshot 150-220 s on the
+  // bench. An option is named by its own text, never its list's label, and no name
+  // runs past NAME_MAX characters (a ref is copied by the agent; 200 is a long one).
+  var NAME_MAX = 200;
   function nameOf(el) {
+    var n = fullName(el);
+    return n.length > NAME_MAX ? n.slice(0, NAME_MAX).trim() : n;
+  }
+  function fullName(el) {
     var byId = el.getAttribute('aria-labelledby');
     if (byId) {
       var parts = byId.split(/\s+/).map(function (id) {
-        var n = el.ownerDocument.getElementById(id);
+        var n = scopeOf(el).getElementById(id);
         return n ? text(n) : '';
       }).filter(Boolean);
       if (parts.length) return parts.join(' ');
@@ -107,10 +158,11 @@ function pageWalk(opts) {
     var lab = el.getAttribute('aria-label');
     if (lab && lab.trim()) return lab.trim();
     if (el.id) {
-      var forLab = el.ownerDocument.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      var forLab = scopeOf(el).querySelector('label[for="' + CSS.escape(el.id) + '"]');
       if (forLab && text(forLab)) return text(forLab);
     }
-    var wrap = el.closest ? el.closest('label') : null;
+    var wrap = el.closest && el.tagName.toLowerCase() !== 'option' && (el.getAttribute('role') || '') !== 'option'
+      ? el.closest('label') : null;
     if (wrap && text(wrap)) return text(wrap);
     var ph = el.getAttribute('placeholder');
     if (ph && ph.trim()) return ph.trim();
@@ -135,18 +187,77 @@ function pageWalk(opts) {
     if (el.tagName.toLowerCase() === 'input' && (el.getAttribute('type') || '') === 'hidden') return true;
     var st = el.ownerDocument.defaultView.getComputedStyle(el);
     if (st && (st.display === 'none' || st.visibility === 'hidden')) return true;
+    // NOT RENDERED AT ALL (DIVE-6778). display:none is not inherited, so a link in a
+    // closed menu reads display:inline and was offered; on the bench a third of the
+    // failed clicks were such links, each waiting out the click's bound for an element
+    // that can never show. A node that renders has at least one layout box (fixed
+    // ones too); an <option> draws none of its own, and display:contents none by design.
+    var tag = el.tagName.toLowerCase();
+    if (tag !== 'option' && tag !== 'optgroup' && !(st && st.display === 'contents')
+        && typeof el.getClientRects === 'function' && el.getClientRects().length === 0) return true;
     return false;
   }
 
   var interactive = {};
   (opts.interactiveRoles || []).forEach(function (r) { interactive[r] = true; });
 
+  // ---- WHAT A PERSON CAN CLICK, NOT ONLY WHAT ARIA NAMES (DIVE-6965) --------
+  //
+  // On bench v3 OpenClaw passed 14 tasks 5dive failed, and on 4 of them the
+  // control was there and the walk did not list it: a calendar's month arrow and
+  // day cells (plain divs with a click handler), a cookie banner inside a shadow
+  // root (Usercentrics, so every later click hit the banner), custom dropdowns.
+  // OpenClaw's snapshot lists all of these; this walk now does too.
+  //
+  // A SHADOW ROOT IS WALKED where its host stands. document.querySelectorAll
+  // never enters one. The marker it stamps there is still found by the step:
+  // Playwright's CSS engine pierces open shadow roots. A closed one stays shut.
+  function elements(root, into) {
+    var els = root.querySelectorAll('*');
+    for (var j = 0; j < els.length; j++) {
+      into.push(els[j]);
+      if (els[j].shadowRoot) elements(els[j].shadowRoot, into);
+    }
+    return into;
+  }
+  // AN ELEMENT WITH NO ACTIONABLE ROLE IS `clickable` when it is drawn with a
+  // pointer cursor its parent does not have, or carries an onclick, and sits in
+  // no control and holds none. A pointer cursor is inherited, so without the
+  // parent test every span inside a card would be offered; a card that wraps a
+  // real link or button is that control's to answer for.
+  var NEVER_CLICKABLE = { html: 1, head: 1, body: 1, script: 1, style: 1 };
+  var CONTROL = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=option]';
+  function pointer(el) {
+    var st = el && el.ownerDocument.defaultView.getComputedStyle(el);
+    return !!(st && st.cursor === 'pointer');
+  }
+  // THE PARENT IT IS DRAWN IN (DIVE-7007): a slotted child inherits its cursor from
+  // the slot, and a shadow root's top element from the host, not from parentElement.
+  // Without this, the small print slotted into each Shopify picker option inherited
+  // the option's pointer and was offered as a second clickable.
+  function drawnParent(el) {
+    if (el.assignedSlot) return el.assignedSlot;
+    if (el.parentElement) return el.parentElement;
+    var r = el.getRootNode ? el.getRootNode() : null;
+    return (r && r.host) || null;
+  }
+  function clickable(el) {
+    if (NEVER_CLICKABLE[el.tagName.toLowerCase()]) return false;
+    var handler = el.hasAttribute('onclick');
+    if (!handler && (!pointer(el) || pointer(drawnParent(el)))) return false;
+    for (var p = drawnParent(el); p; p = drawnParent(p)) {
+      if (interactive[roleOf(p)]) return false;
+    }
+    return !(typeof el.querySelector === 'function' && el.querySelector(CONTROL));
+  }
+
   var out = [];
   var seen = {};
-  var all = document.querySelectorAll('*');
+  var all = elements(document, []);
   for (var i = 0; i < all.length; i++) {
     var el = all[i];
     var role = roleOf(el);
+    if (!interactive[role] && clickable(el)) role = 'clickable';
     if (!role) continue;
     if (opts.interactiveOnly && !interactive[role]) continue;
     if (hidden(el)) continue;
@@ -212,12 +323,168 @@ const REF_PREFIX = 'ref=';
 const isRef = (s) => typeof s === 'string' && s.startsWith(REF_PREFIX);
 const refBody = (s) => s.slice(REF_PREFIX.length);
 
-async function walk(page, { interactiveOnly = false, mark = null } = {}) {
-  return page.evaluate(pageWalk, {
-    interactiveOnly,
-    interactiveRoles: INTERACTIVE,
-    mark,
+// ---- A CONTROL INSIDE A FRAME (DIVE-6966) ------------------------------------
+//
+// On bench v3 Chase's IRA calculator lives in a cross-origin iframe: `snapshot`
+// listed 0 of its controls, and OpenClaw passed by snapshotting the frame and
+// pressing ArrowUp on each slider. document.querySelectorAll never enters a
+// frame, and a cross-origin one cannot be reached from the page's script at all,
+// so each drawn child frame gets the SAME walk through Playwright's own handle on
+// it, and its refs name the frame they are in:
+//
+//     ref=frame:IRA calculator >> slider/Annual contribution
+//
+// A FRAME IS NAMED BY ITS ELEMENT: title, aria-label, name, id, else the host it
+// loads. Two siblings with one name take #n, as a ref does. Nested frames chain.
+// The page's own refs are untouched: each frame counts its own #n, so a frame
+// that comes or goes never renumbers a ref outside it.
+//
+// THE STEP NEEDS NO FRAME CODE. The ref resolves to one selector that enters the
+// frame (`<frame> >> internal:control=enter-frame >> <element>`, the string
+// Playwright's frameLocator builds), and page.fill/click/press/waitForSelector
+// and page.locator all follow it. Only what runs a function in the page by hand
+// (stepRisk) resolves the frame first: frameFor below.
+//
+// A walk that resolves a ref on the page itself does not visit frames, so a step
+// on a page's own control costs what it did. Frames are walked only to list them
+// (tree, snapshot, the re-read after an act) and to resolve a ref that names one.
+const FRAME_PREFIX = 'frame:';
+const FRAME_SEP = ' >> ';
+const ENTER_FRAME = ' >> internal:control=enter-frame >> ';
+const FRAMES_MAX = 20;          // an ad-heavy page draws dozens; the first 20 drawn are walked
+const FRAME_DEPTH_MAX = 3;
+const FRAME_WALK_MS = 3000;     // a frame still loading answers nothing rather than holding the walk
+let frameSeq = 0;
+
+function splitRef(ref) {  // 'frame:A >> button/Go' -> { frames: ['A'], el: 'button/Go' }
+  const parts = String(ref).split(FRAME_SEP);
+  let i = 0;
+  while (i < parts.length - 1 && parts[i].startsWith(FRAME_PREFIX)) i++;
+  return { frames: parts.slice(0, i).map((p) => p.slice(FRAME_PREFIX.length)), el: parts.slice(i).join(FRAME_SEP) };
+}
+const framePrefix = (chain) => chain.map((l) => FRAME_PREFIX + l + FRAME_SEP).join('');
+// A label can hold neither the separator nor a slash (stepRisk reads the ref's name after the first one).
+const frameLabel = (l) => String(l || '').replace(/>>/g, '>').replace(/\//g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+
+function settled(p, ms) {  // p's value, or null when it fails or takes longer than ms
+  let timer;
+  return Promise.race([
+    Promise.resolve(p).catch(() => null),
+    new Promise((r) => { timer = setTimeout(() => r(null), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// In the page that holds the frame element: its name, or null when it is not drawn
+// (display:none, or a 1x1 tracking pixel).
+function _frameLabelIn(el) {
+  var st = el.ownerDocument.defaultView.getComputedStyle(el);
+  if (st && (st.display === 'none' || st.visibility === 'hidden')) return null;
+  var b = el.getBoundingClientRect();
+  if (b.width < 2 || b.height < 2) return null;
+  var host = '';
+  try { host = new URL(el.getAttribute('src') || '', location.href).hostname; } catch (e) { host = ''; }
+  return el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('name') || el.id || host || 'frame';
+}
+
+// Every drawn child frame, outermost first: [{ frame, chain: ['A', 'B#2'] }].
+async function frameList(page) {
+  if (!page || typeof page.mainFrame !== 'function') return [];
+  const out = [];
+  async function kids(parent, chain, depth) {
+    if (depth > FRAME_DEPTH_MAX || out.length >= FRAMES_MAX) return;
+    const children = typeof parent.childFrames === 'function' ? parent.childFrames() : [];
+    const labels = await Promise.all(children.map((f) => settled((async () => {
+      const h = await f.frameElement();
+      try { return frameLabel(await h.evaluate(_frameLabelIn)) || null; } finally { h.dispose().catch(() => {}); }
+    })(), FRAME_WALK_MS)));
+    const total = {}, seen = {};
+    labels.forEach((l) => { if (l) total[l] = (total[l] || 0) + 1; });
+    const mine = [];
+    children.forEach((f, i) => {
+      const l = labels[i];
+      if (!l) return;
+      seen[l] = (seen[l] || 0) + 1;
+      mine.push({ frame: f, chain: chain.concat(total[l] > 1 ? `${l}#${seen[l]}` : l) });
+    });
+    for (const m of mine) {
+      if (out.length >= FRAMES_MAX) return;
+      out.push(m);
+      await kids(m.frame, m.chain, depth + 1);
+    }
+  }
+  await kids(page.mainFrame(), [], 1);
+  return out;
+}
+
+// The walk of every drawn frame, its refs prefixed with the frame they are in.
+async function frameNodes(page, args, frames = null) {
+  const list = frames || await frameList(page);
+  const walks = await Promise.all(list.map((f) =>
+    settled(f.frame.evaluate(pageWalk, { ...args, mark: null, snapshot: false }), FRAME_WALK_MS)));
+  const nodes = [];
+  list.forEach((f, i) => {
+    const w = walks[i];
+    if (!w || !Array.isArray(w.nodes)) return;
+    const pre = framePrefix(f.chain);
+    w.nodes.forEach((n) => nodes.push({ ...n, ref: pre + n.ref }));
   });
+  return nodes;
+}
+
+// Mark mode for a ref that names a frame: the element is marked in its frame, each
+// frame element in the page that holds it, and the selector enters them in order.
+async function markInFrame(page, ref, interactiveOnly) {
+  const { frames: want, el } = splitRef(ref);
+  const args = { interactiveOnly, interactiveRoles: INTERACTIVE };
+  const list = await frameList(page);
+  const hit = list.find((f) => f.chain.join(FRAME_SEP) === want.join(FRAME_SEP));
+  if (!hit) return { nodes: await frameNodes(page, args, list), marker: null };
+  const w = await hit.frame.evaluate(pageWalk, { ...args, mark: el });
+  const pre = framePrefix(hit.chain);
+  const nodes = w.nodes.map((n) => ({ ...n, ref: pre + n.ref }));
+  if (!w.marker) return { nodes, marker: null };
+  const path = [];
+  for (let f = hit.frame; f.parentFrame(); f = f.parentFrame()) path.unshift(f);
+  const sels = [];
+  for (const f of path) {
+    const id = `f${(++frameSeq).toString(36)}${Date.now().toString(36)}`;
+    const h = await f.frameElement();
+    try { await h.evaluate((e, v) => e.setAttribute('data-5dive-frame', v), id); } finally { h.dispose().catch(() => {}); }
+    sels.push(`[data-5dive-frame="${id}"]`);
+  }
+  sels.push(`[data-5dive-ref="${w.marker}"]`);
+  return { nodes, marker: w.marker, sel: sels.join(ENTER_FRAME) };
+}
+
+// One page function in every drawn frame, the answers joined (the re-read's text).
+async function framesEval(page, fn, arg) {
+  const list = await frameList(page);
+  const got = await Promise.all(list.map((f) => settled(f.frame.evaluate(fn, arg), FRAME_WALK_MS)));
+  return got.filter(Boolean).map(String).join('\n');
+}
+
+// A selector that enters frames -> the frame it ends in and the selector there.
+async function frameFor(page, sel) {
+  const parts = String(sel).split(ENTER_FRAME);
+  if (parts.length === 1) return { at: page, sel };
+  let at = page;
+  for (const p of parts.slice(0, -1)) {
+    const h = await at.$(p);
+    if (!h) throw new Error(`the frame ${p} is no longer on the page`);
+    at = await h.contentFrame();
+    if (!at) throw new Error(`${p} is not a frame`);
+  }
+  return { at, sel: parts[parts.length - 1] };
+}
+
+async function walk(page, { interactiveOnly = false, mark = null } = {}) {
+  if (mark && splitRef(mark).frames.length) return markInFrame(page, mark, interactiveOnly);
+  const args = { interactiveOnly, interactiveRoles: INTERACTIVE };
+  const top = await page.evaluate(pageWalk, { ...args, mark });
+  if (mark || !top || !Array.isArray(top.nodes)) return top;
+  const more = await frameNodes(page, args);
+  if (more.length) top.nodes = top.nodes.concat(more);
+  return top;
 }
 
 // THE ATOMIC READ (DIVE-4653). One page.evaluate, one DOM instant, everything a
@@ -229,13 +496,20 @@ async function walk(page, { interactiveOnly = false, mark = null } = {}) {
 // Markdown, the links and the word count stay the pinned extractor's answer
 // about bytes we can hash and re-extract, rather than a second summariser living
 // in the page where nobody can check it.
+//
+// A frame's controls (DIVE-6966) are walked right after, not in the same instant:
+// a frame is another document, and only the page's own DOM goes to the extractor.
 async function snapshot(page, { interactiveOnly = false } = {}) {
-  return page.evaluate(pageWalk, {
+  const snap = await page.evaluate(pageWalk, {
     interactiveOnly,
     interactiveRoles: INTERACTIVE,
     mark: null,
     snapshot: true,
   });
+  if (!snap || !Array.isArray(snap.nodes)) return snap;
+  const more = await frameNodes(page, { interactiveOnly, interactiveRoles: INTERACTIVE });
+  if (more.length) snap.nodes = snap.nodes.concat(more);
+  return snap;
 }
 
 // ref=  ->  a CSS selector for the one element it names, or a refusal.
@@ -248,9 +522,10 @@ async function snapshot(page, { interactiveOnly = false } = {}) {
 // most expensive.
 async function resolveRef(page, sel) {
   const ref = refBody(sel);
-  const { nodes, marker } = await walk(page, { mark: ref });
+  const { nodes, marker, sel: framed } = await walk(page, { mark: ref });
+  if (framed) return framed;   // a control inside a frame (DIVE-6966)
   if (marker) return `[data-5dive-ref="${marker}"]`;
-  const roleOnly = ref.split('/')[0];
+  const roleOnly = refParts(ref).role;
   const near = nodes.filter((n) => n.role === roleOnly).slice(0, 8).map((n) => `ref=${n.ref}`);
   const hint = near.length
     ? ` Refs of that role on this page: ${near.join(', ')}.`
@@ -414,11 +689,13 @@ async function onRef(page, step, sel, act, { timeoutMs = 30000, attemptMs = REFI
       if (Date.now() >= deadline - 50) throw e;
       let gone = false;
       try { gone = (await page.locator(cur).count()) === 0; } catch (x) { throw e; }
-      if (!gone) {
-        // Still on the page: only slow. A non-timeout failure is a real one.
-        if (!(e && e.name === 'TimeoutError')) throw e;
-        continue;
-      }
+      // STILL ON THE PAGE IS A FAILURE, NOT A RETRY (DIVE-6778). Playwright's own
+      // attempt already waited the whole attemptMs for it to be visible, enabled
+      // and not covered; going round again only repeated that wait until the 30 s
+      // step bound. On the bench every such click was a consent overlay over the
+      // element, so each one cost 30 s and still failed. The error names what
+      // covers it, which is what the next act needs.
+      if (!gone) throw e;
       let urlNow = '';
       try { urlNow = String(await page.url()); } catch (x) { /* compared as '' */ }
       if (actedAlready(e && e.message) || urlNow !== urlBefore) throw e;
@@ -439,6 +716,62 @@ async function onRef(page, step, sel, act, { timeoutMs = 30000, attemptMs = REFI
       cur = next;
     }
   }
+}
+
+// ---- CLICK: A CONTROL THE PAGE DRAWS ELSEWHERE (DIVE-6778) ------------------
+//
+// A styled checkbox is a 0x0 <input> under the label a person clicks, and
+// page.click waits its whole bound for that input to become visible, which it
+// never does: on the bench a filter checkbox cost 5 s and a failed step, then the
+// agent's retry cost the same again. A REF only (the walk offered it, so it is on
+// the page): given a second to show, else its label is clicked, else the element
+// itself through the page, and the step says which. A CSS selector, a recipe's,
+// keeps Playwright's click exactly. A stub page without isVisible keeps it too.
+const CLICK_SHOW_MS = 1000;
+// The re-read after a FAILED step settles this long, not the run's 1.2 s: the step
+// that failed timed out or was refused, so the page has nothing new to settle into.
+const FAILED_SETTLE_MS = 300;
+// A CONTROL SOMETHING ELSE SITS ON (DIVE-6778): a cookie banner over the page. Its
+// click waited the whole 5 s while Playwright retried into the banner, then failed
+// anyway, on 8 of 135 bench calls. When the element's own centre hits another
+// element, the click gets 1.5 s: still Playwright's click and its scroll retries
+// (a sticky header clears on the first), but a banner fails in 1.5 s, not 5.
+const COVERED_CLICK_MS = 1500;
+async function coverOf(loc) {   // what sits on the element's centre, or null
+  try {
+    return await loc.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) return null;
+      const root = el.getRootNode && el.getRootNode().elementFromPoint ? el.getRootNode() : document;
+      const t = root.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!t || t === el || el.contains(t) || t.contains(el)) return null;
+      return t.tagName.toLowerCase() + (t.id ? `#${t.id}` : '') +
+        (typeof t.className === 'string' && t.className.trim() ? `.${t.className.trim().split(/\s+/)[0]}` : '');
+    });
+  } catch (e) { return null; }
+}
+async function clickStep(page, step, x, timeout, { log = null } = {}) {
+  if (!isRef(step.selector)) return page.click(x, { timeout });
+  let loc, shown = true;
+  try {
+    loc = page.locator(x);   // a ref's marker is on exactly one element
+    shown = await loc.isVisible();
+    if (!shown) {
+      try { await loc.waitFor({ state: 'visible', timeout: Math.min(CLICK_SHOW_MS, timeout) }); shown = true; }
+      catch (e) { shown = false; }
+    }
+  } catch (e) { shown = true; }
+  if (shown) {
+    const cover = timeout > COVERED_CLICK_MS ? await coverOf(loc) : null;
+    if (cover && log) log(`step ${step.selector}: ${cover} sits on it, so the click gets ${COVERED_CLICK_MS / 1000} s, not ${timeout / 1000} s`);
+    return page.click(x, { timeout: cover ? COVERED_CLICK_MS : timeout });
+  }
+  const how = await loc.evaluate((el) => {
+    const lab = el.labels && el.labels[0];
+    if (lab && lab.getClientRects().length) { lab.click(); return 'its label'; }
+    el.click(); return 'the page (element.click())';
+  });
+  if (log) log(`step ${step.selector}: the element is on the page but not visible; clicked it through ${how}`);
 }
 
 // ---- TYPE: KEY BY KEY --------------------------------------------------------
@@ -517,8 +850,18 @@ async function typeKeys(page, sel, value, delayMs, { timeoutMs = 30000 } = {}) {
 // IT IS A GUARD, NOT A CLASSIFIER OF INTENT. It catches the literal buttons. An
 // agent that submits an order through a button labelled "Continue" is not caught
 // here, and saying so is better than a pattern list that pretends otherwise.
+//
+// GOING TO THE PAY PAGE IS NOT PAYING (DIVE-7164). `pay` named Checkout, Check out
+// and Proceed to checkout/payment too, so Shopify's "Secure Checkout" — a link to
+// the page with the card form — stopped as a payment, with a $2.99 off the cart
+// as its amount, after the owner had already said yes to "fill it to the pay
+// button". It is the button that charges that is the owner's: Pay, Place order,
+// Complete purchase, Buy, Subscribe. The page in between shows the total and
+// takes nothing, and the act that leaves it still stops.
+// The verbs that FINISH a checkout charge, so Complete/Confirm/Finish/Submit
+// (your) checkout stay pay; only the bare way to the page left the class.
 const RISK = [
-  ['pay', /\b(buy|buy now|purchase|place (your |my )?order|order now|confirm (order|purchase|payment)|complete (order|purchase|payment)|pay( now)?|checkout|check out|proceed to (checkout|payment)|subscribe|donate|book now|start (free )?trial|upgrade( now)?)\b/i],
+  ['pay', /\b(buy|buy now|purchase|place (your |my )?order|order now|(complete|confirm|finish|submit) (your |my )?(checkout|order|purchase|payment)|pay( now)?|subscribe|donate|book now|start (free )?trial|upgrade( now)?)\b/i],
   ['publish', /\b(post|publish|tweet|reply|repost|retweet|share|comment|submit|save and publish|go live)\b/i],
   ['send', /\b(send|send now|send message|send email)\b/i],
   ['delete', /\b(delete|remove|discard|erase|trash|destroy|deactivate|close (my )?account|unsubscribe|empty trash)\b/i],
@@ -533,7 +876,11 @@ function classifyLabel(label) {
 function _labelIn(arg) {
   const el = document.querySelector(arg.sel);
   if (!el) return '';
-  const txt = (n) => n ? [n.getAttribute && n.getAttribute('aria-label'), n.innerText, n.value, n.title]
+  // A field's value is what was typed into it, not its label (DIVE-7670): only a
+  // button-shaped input carries its label in value.
+  const btnValue = (n) => String(n.tagName || '').toLowerCase() === 'input'
+    && /^(submit|button|reset|image)$/i.test(String((n.getAttribute && n.getAttribute('type')) || n.type || ''));
+  const txt = (n) => n ? [n.getAttribute && n.getAttribute('aria-label'), n.innerText, btnValue(n) ? n.value : '', n.title]
     .filter((x) => typeof x === 'string' && x.trim()).join(' ').slice(0, 160) : '';
   if (arg.op !== 'press') return txt(el);
   const form = el.form || (el.closest && el.closest('form'));
@@ -541,6 +888,27 @@ function _labelIn(arg) {
   const sub = form.querySelector('button[type=submit],input[type=submit],button:not([type])');
   return txt(sub) || String(form.getAttribute('action') || '');
 }
+// CLICKING INTO A FIELD ONLY FOCUSES IT (DIVE-7670). Measured on Shopify's
+// abandoned-checkout email editor: a click into the Subject box stopped as a pay,
+// because its label was read as aria-label + VALUE, "Subject Complete your order",
+// and the value is the email's subject line. A click on a text-entry control cannot
+// pay, publish, send or delete, so it has no class. Enter in it still reads the
+// form's submit button. In the page, like _labelIn.
+function _textEntryIn(arg) {
+  var el = null;
+  try { el = arg.sel ? document.querySelector(arg.sel) : null; } catch (e) { el = null; }
+  if (!el) return false;
+  if (el.isContentEditable === true) return true;
+  var tag = String(el.tagName || '').toLowerCase();
+  if (tag === 'textarea') return true;
+  if (tag === 'input') {
+    var t = String((el.getAttribute && el.getAttribute('type')) || el.type || 'text').toLowerCase();
+    return !/^(button|submit|reset|image|checkbox|radio)$/.test(t);
+  }
+  try { return !!(el.matches && el.matches('[contenteditable=""],[contenteditable=true],[contenteditable=plaintext-only],[role=textbox],[role=searchbox],[role=combobox]')); }
+  catch (e) { return false; }
+}
+const TEXT_ENTRY_ROLES = /^(textbox|searchbox|combobox)$/i;
 // Is a plain Enter here a formless composer's send key? In the page, like _labelIn.
 function _composerIn(arg) {
   var el = null;
@@ -566,7 +934,7 @@ function _composerIn(arg) {
 //            chip on the page, chips and input values only), subject,
 //            first_line of the body
 //   pay      payee (a field that names one, else the site), amount (a price on
-//            the button, else on a "total" line, else the first on the page)
+//            the button, else on a "Total" line (not "Subtotal", DIVE-7164), else the first on the page)
 //   publish  text, the first 280 characters of the composer
 //   delete   item: the row, list item or dialog heading the button belongs to
 // It is a READ of well-known shapes, not an understanding of the page: a field it
@@ -607,7 +975,7 @@ function _payloadIn(arg) {
     var money = /(?:[$€£¥₽₹]|\b(?:USD|EUR|GBP|RUB|INR|JPY|CAD|AUD)\b)\s?\d(?:[\d.,]*\d)?|\d(?:[\d.,]*\d)?\s?(?:[$€£¥₽₹]|\b(?:USD|EUR|GBP|RUB|INR|JPY|CAD|AUD)\b)/;
     var m = text(el).match(money);
     if (!m) { var lines = String((root.innerText || root.textContent || '')).split(/\r?\n/);
-      for (var j = 0; j < lines.length && !m; j++) if (/total/i.test(lines[j])) m = lines[j].match(money);
+      for (var j = 0; j < lines.length && !m; j++) if (/\btotal\b/i.test(lines[j])) m = lines[j].match(money);
       if (!m) m = String(root.innerText || root.textContent || '').match(money); }
     if (m) out.amount = norm(m[0]);
     var payee = first('[aria-label*="payee" i],[data-payee],[name=payee]');
@@ -644,26 +1012,35 @@ function cleanPayload(p) {
 async function stepRisk(page, step, sel) {
   if (!step || (step.op !== 'click' && step.op !== 'press')) return null;
   let cls = null, label = '';
+  let at = page, inSel = sel;   // a control inside a frame is read in its frame (DIVE-6966)
+  try { ({ at, sel: inSel } = await frameFor(page, sel)); } catch (e) { at = page; inSel = sel; }
   if (step.op === 'press') {
     const key = String(step.key || '');
     if (!/(^|\+)Enter$/i.test(key)) return null;
     if (/(Control|Meta|Ctrl|Cmd)\+/i.test(key)) { cls = 'send'; label = key; }
     else if (/^Enter$/i.test(key)) {
       let composer = false;
-      try { composer = (await page.evaluate(_composerIn, { sel, op: step.op, composerOf: true })) === true; } catch (e) { composer = false; }
+      try { composer = (await at.evaluate(_composerIn, { sel: inSel, op: step.op, composerOf: true })) === true; } catch (e) { composer = false; }
       if (composer) { cls = 'send'; label = `${key} in a composer with no form`; }
     }
+  }
+  if (!cls && step.op === 'click') {
+    const role = isRef(step.selector) ? refBody(step.selector).split('>>').pop().trim().split('/')[0] : '';
+    if (TEXT_ENTRY_ROLES.test(role)) return null;
+    let entry = false;
+    try { entry = (await at.evaluate(_textEntryIn, { sel: inSel, op: step.op, textEntryOf: true })) === true; } catch (e) { entry = false; }
+    if (entry) return null;
   }
   if (!cls) {
     const refName = isRef(step.selector) ? refBody(step.selector).replace(/^[^/]*\//, '').replace(/#\d+$/, '') : '';
     let live = '';
-    try { live = await page.evaluate(_labelIn, { sel, op: step.op, riskOf: true }); } catch (e) { live = ''; }
+    try { live = await at.evaluate(_labelIn, { sel: inSel, op: step.op, riskOf: true }); } catch (e) { live = ''; }
     label = [refName, live].filter(Boolean).join(' | ').slice(0, 200);
     cls = classifyLabel(label);
   }
   if (!cls) return null;
   let payload = {};
-  try { payload = await page.evaluate(_payloadIn, { sel, op: step.op, cls, payloadOf: true }); } catch (e) { payload = {}; }
+  try { payload = await at.evaluate(_payloadIn, { sel: inSel, op: step.op, cls, payloadOf: true }); } catch (e) { payload = {}; }
   return { cls, label: cleanText(label), payload: cleanPayload(payload) };
 }
 
@@ -701,8 +1078,9 @@ const REPICK_OP = { click: 'click', fill: 'fill', type: 'fill', select: 'select'
 const SELF_BROWSER = path.join(__dirname, '..', 'bin', 'browser');
 
 function refParts(ref) {  // 'button/Decline#2' -> { role: 'button', name: 'Decline' }
-  const role = ref.split('/')[0];
-  return { role, name: ref.slice(role.length + 1).replace(/#\d+$/, '') };
+  const el = splitRef(ref).el;   // a frame's ref is read past its frame (DIVE-6966)
+  const role = el.split('/')[0];
+  return { role, name: el.slice(role.length + 1).replace(/#\d+$/, '') };
 }
 
 // The by-name tier: EVERY node that qualifies, so the caller can see there were two.
@@ -715,6 +1093,61 @@ function nameMatches(nodes, ref) {
     const have = norm(n.name);
     return n.role === role && have !== '' && (have === want || have.includes(want) || want.includes(have));
   });
+}
+
+// THE SAME FIELD UNDER ANOTHER ROLE (DIVE-6371). A text field can change role
+// when it is focused: Wikipedia's search box is a `searchbox` until a fill
+// focuses it, then its typeahead mounts and both search inputs read `combobox`,
+// with the same name, in the same order (measured in a headed Chrome). Headless
+// never mounted it, so the cold executor's refs held; a headed one is what a
+// person gets, and the fill's own ref is gone by the press that follows it. The
+// ref with only its role swapped inside the text-field family, name and #n kept,
+// is that same field. Exactly one such ref on the page, or none is picked.
+const FIELD_ROLES = ['textbox', 'searchbox', 'combobox'];
+function fieldRoleMatch(nodes, ref) {
+  const { frames, el } = splitRef(ref);
+  const role = el.split('/')[0];
+  if (!FIELD_ROLES.includes(role)) return null;
+  const rest = el.slice(role.length);
+  const hits = FIELD_ROLES.filter((r) => r !== role).map((r) => framePrefix(frames) + r + rest)
+    .filter((alt) => (nodes || []).some((x) => x.ref === alt));
+  return hits.length === 1 ? hits[0] : null;
+}
+
+// THE FIELD, MID-SWAP (DIVE-7701). Wikipedia's typeahead does not change the
+// field's role in place: it REMOVES the server-rendered `searchbox` and mounts
+// a `combobox` in its place, once its script has loaded. Between the two there
+// is a window in which neither is on the page. The routine bench fell into it:
+// replay's press re-derived `combobox/Search Wikipedia` (the role run 1
+// recorded), saw only the old `searchbox`, picked it as the same field, and by
+// the next walk that one was gone too: "matches nothing either", red on main
+// 3 times in 20 runs on 2026-11-04 (runs 41790551000, 41800062244 x2).
+//
+// So a TEXT FIELD caught mid-swap is looked for again for a short while: the ref
+// as written first, then the one same-name, same-#n field under another role
+// (fieldRoleMatch). It waits only when the FIRST walk already shows that twin,
+// and only up to FIELD_SWAP_MS: a field that is plainly absent, and every other
+// role, keeps the one-shot resolve (DIVE-4674, T28g-i; DIVE-7701 it1 reject),
+// and nothing here widens WHAT may be picked — the same two refs the one-shot
+// path took, at a later instant. -> { ref: null|<alt>, sel } or { ref: false, alt }.
+const FIELD_SWAP_MS = 5000;
+async function fieldSettle(page, from, nodes, { waitMs = FIELD_SWAP_MS, pollMs = 250 } = {}) {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  let alt = null;
+  for (let first = true; ; first = false) {
+    if (!first) {
+      try { return { ref: null, sel: await resolveRef(page, from) }; }   // the ref as written, now there
+      catch (e) { if (!e.refMiss) throw e; nodes = e.nodes; }
+    }
+    const a = fieldRoleMatch(nodes, refBody(from));
+    if (a) {
+      alt = a;
+      try { return { ref: a, sel: await resolveRef(page, REF_PREFIX + a) }; }
+      catch (e) { if (!e.refMiss) throw e; }
+    }
+    if (Date.now() >= deadline) return { ref: false, alt };
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+  }
 }
 
 // bin/browser `_reflex-pick`, the tree on stdin. Never throws: anything that is
@@ -759,10 +1192,27 @@ async function resolveOrRepick(page, step, n, opts = {}) {
   let url = '', site = '';
   try { url = String(await page.url()); site = new URL(url).hostname; } catch (e) { site = ''; }
   const tree = { url, nodes: (miss.nodes || []).filter((x) => INTERACTIVE.includes(x.role)) };
-  const r = site ? await reflexPick(site, args, tree) : { reflex: 'error', why: 'the page has no host name' };
+  // Only a miss that already SHOWS the swap waits: walk 1 has the same field
+  // under another role (S1/S2 in browser_field_swap_unit.sh). A field that is
+  // plainly absent keeps DIVE-4674's one look and its rc 70 (T28g-i).
+  const twin = fieldRoleMatch(miss.nodes, refBody(from));
+  let field = twin, fieldSel = null;
+  if (twin && FIELD_ROLES.includes(role) && step.op !== 'wait_for') {   // wait_for has waited already
+    field = null;
+    const got = await fieldSettle(page, from, miss.nodes, { waitMs: opts.fieldSwapMs ?? FIELD_SWAP_MS });
+    if (got.ref === null) return { sel: got.sel, retry: null };   // late, not missing: no re-pick
+    if (got.ref) { field = got.ref; fieldSel = got.sel; }
+    else if (got.alt) throw failAs(` The same field under another role picked ref=${got.alt}, and that matches nothing either.`);
+  }
+  const r = field ? { reflex: 'skipped' }
+    : site ? await reflexPick(site, args, tree) : { reflex: 'error', why: 'the page has no host name' };
 
   let pick;
-  if (r.reflex === 'ok' && !(r.error && r.error !== 'no_candidates')) {
+  if (field) {
+    // "name match" is the word bin/browser's routine recorder reads (_routine_picks).
+    pick = { ref: field, line: `name match picked ref=${field}`,
+             said: `The same field under another role picked ref=${field}`, review: false };
+  } else if (r.reflex === 'ok' && !(r.error && r.error !== 'no_candidates')) {
     const conf = typeof r.confidence === 'number' ? r.confidence : null;
     if (!r.ref) throw failAs(' Reflex proposed no element for it.');
     if (conf === null || conf < REPICK_MIN_CONFIDENCE) {
@@ -779,8 +1229,8 @@ async function resolveOrRepick(page, step, n, opts = {}) {
     pick = { ref: hits[0].ref, line: `name match picked ref=${hits[0].ref}`,
              said: `${why ? `${why.trim()} ` : ''}A name match picked ref=${hits[0].ref}`, review: false };
   }
-  let sel;
-  try { sel = await resolveRef(page, REF_PREFIX + pick.ref); }
+  let sel = fieldSel;
+  if (!sel) try { sel = await resolveRef(page, REF_PREFIX + pick.ref); }
   catch (e) { if (!e.refMiss) throw e; throw failAs(` ${pick.said}, and that matches nothing either.`); }
   const risk = pick.review ? { cls: 'pay, post, send or delete' } : await stepRisk(page, step, sel);
   if (risk) {
@@ -819,8 +1269,18 @@ function _visibleIn(arg) {
   var body = document.body;
   var text = norm(body ? (body.innerText || body.textContent) : '');
   if (arg.mode === 'text') return text.indexOf(norm(t)) >= 0;
+  // INTO OPEN SHADOW ROOTS, as the step's own selector goes (DIVE-7007): on Shopify
+  // `fill input[name=title]` worked and `--wait-for=input[name=title]` waited 30 s,
+  // because the field is drawn inside <s-internal-text-field>'s shadow root.
+  function deep(root, into) {
+    var hit = root.querySelectorAll(t);
+    for (var i = 0; i < hit.length; i++) into.push(hit[i]);
+    var all = root.querySelectorAll('*');
+    for (var j = 0; j < all.length; j++) if (all[j].shadowRoot) deep(all[j].shadowRoot, into);
+    return into;
+  }
   var els = null;
-  try { els = document.querySelectorAll(t); } catch (e) { els = null; }
+  try { els = deep(document, []); } catch (e) { els = null; }
   if (els) for (var i = 0; i < els.length; i++) if (shown(els[i])) return true;
   return text.indexOf(norm(t)) >= 0;
 }
@@ -836,6 +1296,27 @@ function _textIn() {
   var live = document.querySelectorAll('[aria-live],[role=alert],[role=status],[role=log]');
   for (var i = 0; i < live.length; i++) parts.push(live[i].textContent || '');
   return parts.join('\n').replace(/[ \t]+/g, ' ');
+}
+
+// WHAT THE FORM FIELDS HOLD (DIVE-6795), reported beside the text and NEVER
+// graded: `fill 75201 --expect=75201` read NOT VERIFIED over a field showing
+// it, and the model opened the picture to find out why. A field holds what the
+// agent typed, so a failed save still shows the title it typed, and grading it
+// would say `verified` (the DIVE-6651 shape). bin/browser says why instead.
+// Text fields, text areas and the chosen option of a select; never a password
+// or a hidden input.
+function _valuesIn() {
+  var out = [];
+  var els = document.querySelectorAll('input,textarea,select');
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i], t = String(el.type || '').toLowerCase();
+    if (t === 'password' || t === 'hidden' || t === 'file') continue;
+    if (el.tagName === 'SELECT') {
+      var o = el.selectedOptions && el.selectedOptions[0];
+      if (o) out.push(o.textContent || '');
+    } else if (t !== 'checkbox' && t !== 'radio' && el.value) out.push(String(el.value));
+  }
+  return out.join('\n');
 }
 
 // The ONE element a verify is graded on (DIVE-4984): a Sent list is read at its
@@ -880,9 +1361,73 @@ async function waitForVisible(page, target, { timeoutMs = 30000, pollMs = 250 } 
   }
 }
 
+// CLOUDFLARE'S "Just a moment..." IS A WAIT FIRST, AND A STOP ONLY IF IT STAYS
+// (DIVE-6317). Round 5 stopped gamma.app at the first sight of that title. A
+// real Chrome usually gets past it on its own in 5-15 s, in the SAME page load:
+// a fresh load starts the check over, so an agent's `sleep 20` and a second
+// snapshot measured nothing. So right after a goto, while the title is one of
+// these self-clearing interstitials, the page is watched for up to `timeoutMs`
+// (FIVEDIVE_BROWSER_INTERSTITIAL_WAIT_MS, default 20 s since DIVE-7303). It never clicks: if the
+// title is still there at the end, the caller's existing hard stop applies, and
+// that stop is the handoff (connect-request --challenge).
+// DIVE-6334: 30 s did not clear gamma.app from cic-arm-a's datacenter IP in
+// round 6 (twice). 90 s was the row's bound: a "Just a moment..." that clears by
+// itself is over long before it, and the wait ends at the first look it has gone,
+// so a page that clears pays only its own time. A --wait-for behind one that
+// never cleared is skipped, so the whole call stays inside a 2-minute tool limit.
+// DIVE-7303: 20 s. On the fresh-100 bench not one of ten waits cleared in its
+// 90 s (bbb.org, cars.com, ziprecruiter, merriam-webster), and those ten were a
+// fifth of all snapshot time; Claude in Chrome hands the page back at once. A
+// check that clears by itself does it in 5-15 s, so 20 s keeps those and stops
+// paying 70 s more for the ones that stay.
+// Only the titles that clear by themselves: "Attention Required" and "Access
+// denied" are blocks, and waiting on them buys nothing.
+const INTERSTITIAL_TITLE = /(just a moment|checking your browser|one moment,? please)/i;
+const INTERSTITIAL_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_INTERSTITIAL_WAIT_MS || 20000);
+async function waitInterstitial(page, { timeoutMs = INTERSTITIAL_WAIT_MS, pollMs = 1000 } = {}) {
+  const titleNow = async () => { try { return String(await page.title()); } catch (e) { return null; } };
+  let t = await titleNow();
+  if (t === null || !INTERSTITIAL_TITLE.test(t)) return null;
+  const first = t;
+  let waited = 0;
+  while (waited < timeoutMs) {
+    const step = Math.min(pollMs, Math.max(1, timeoutMs - waited));
+    await page.waitForTimeout(step);
+    waited += step;
+    t = await titleNow();            // null: mid-navigation, which is the check clearing
+    if (t !== null && !INTERSTITIAL_TITLE.test(t)) return { title: first, cleared: true, waited_ms: waited };
+  }
+  return { title: first, cleared: false, waited_ms: waited };
+}
+
+// A --wait-for BEHIND A CHALLENGE THAT STAYED (DIVE-6371). It is not waited for
+// (it would only wait again, DIVE-6317), and the answer SAYS so instead of being
+// absent: an absent wait_for is what bin/browser reads as "a session daemon from
+// before --wait-for existed", and on exact-swallow it printed exactly that for a
+// Chrome launched 5 s earlier with no daemon in the path.
+async function waitForPast(page, target, inter, opts) {
+  if (inter && !inter.cleared) {
+    return { target: String(target || ''), met: false, waited_ms: 0, skipped: 'challenge' };
+  }
+  return waitForVisible(page, target, opts);
+}
+
+// navigator.webdriver IS THE OTHER TELL (DIVE-6371). A Chrome driven over CDP
+// reports it true, headed or not, and a bot check reads it before anything else.
+// The flag Playwright's own MCP browser launches with turns it off; an operator's
+// own --disable-blink-features (FIVEDIVE_BROWSER_CHROME_ARGS) is left alone.
+function unmarkedArgs(extra) {
+  return (extra || []).some((a) => /^--disable-blink-features/.test(a))
+    ? [] : ['--disable-blink-features=AutomationControlled'];
+}
+
 // `--expect` as an EARLY EXIT, never as the verdict. bin/browser still greps
 // what comes back (grep -E, one engine, like the probe's markers), so a pattern
-// JS reads differently only costs the full window, never a wrong answer.
+// JS reads differently only costs the full window, never a wrong answer. It
+// tests what bin/browser grades: for `act`, the text, the title, the url, never
+// the document (DIVE-6651) — a hidden span that matched would stop the wait
+// early and ship the wrong moment. `expectDoc` is `run`'s in-session verify,
+// whose grader still reads the document it fetched.
 function expectRe(p) {
   if (typeof p !== 'string' || !p) return null;
   try { return new RegExp(p, 'i'); }
@@ -896,6 +1441,48 @@ function expectRe(p) {
 // page as it now stands, never by navigating: a reload would throw away the very
 // draft or cart the act just built.
 //
+// ...AFTER A SETTLE THAT ENDS WHEN THE PAGE IS QUIET (DIVE-6778), never later
+// than the fixed one did. The fixed 1.2 s was paid on every act and every goto,
+// a page that was done in 0.2 s included; playwright-mcp waits for the requests
+// the action started instead. So: 0.25 s, then done once no document, XHR or
+// fetch request is in flight and the DOM has not changed for 0.25 s. A page that
+// polls or animates never gets there and waits the full bound, exactly as before.
+// No watch (the one-shot driver, a stub page) keeps the fixed wait.
+const SETTLE_QUIET_MS = 250;
+const WATCHED = new Set(['document', 'xhr', 'fetch']);
+function requestWatch(target) {   // requests in flight on a page or context, from now
+  if (!target || typeof target.on !== 'function' || typeof target.off !== 'function') return null;
+  const live = new Set();
+  const on = (r) => { try { if (WATCHED.has(r.resourceType())) live.add(r); } catch (e) { /* not counted */ } };
+  const off = (r) => { live.delete(r); };
+  target.on('request', on); target.on('requestfinished', off); target.on('requestfailed', off);
+  return {
+    inflight: () => live.size,
+    stop: () => { target.off('request', on); target.off('requestfinished', off); target.off('requestfailed', off); },
+  };
+}
+async function settleQuiet(page, ms, watch) {   // -> true when it ended quiet, not at the bound
+  if (!(ms > 0)) return false;
+  if (!watch || typeof page.evaluate !== 'function') { await page.waitForTimeout(ms); return false; }
+  const end = Date.now() + ms;
+  await page.waitForTimeout(Math.min(SETTLE_QUIET_MS, ms));
+  while (Date.now() < end) {
+    const left = end - Date.now();
+    if (watch.inflight() > 0) { await page.waitForTimeout(Math.min(50, left)); continue; }
+    let quiet = false;
+    try {
+      quiet = await page.evaluate((q) => new Promise((done) => {
+        const o = new MutationObserver(() => { clearTimeout(t); o.disconnect(); done(false); });
+        const t = setTimeout(() => { o.disconnect(); done(true); }, q);
+        o.observe(document, { subtree: true, childList: true, characterData: true,
+          attributeFilter: ['hidden', 'open', 'disabled', 'aria-hidden', 'aria-expanded'] });
+      }), Math.min(SETTLE_QUIET_MS, left));
+    } catch (e) { await page.waitForTimeout(Math.min(50, Math.max(0, end - Date.now()))); }   // navigating
+    if (quiet && watch.inflight() === 0) return true;
+  }
+  return false;
+}
+
 // ...AND READ AGAIN UNTIL --expect MATCHES, for a few seconds (DIVE-4983). A
 // "Message sent" toast arrives after the click; the one read taken at the settle
 // missed it, and `act` printed NOT VERIFIED on a mail that was in the Sent folder.
@@ -903,11 +1490,27 @@ function expectRe(p) {
 // ship are the instant the toast was on screen. `waitFor` is `--wait-for`, and
 // `walk` adds the refs, so an act leaves the same triple a snapshot does.
 // `scope` (DIVE-4984) narrows the read to one element: `run`'s in-session verify.
+// DID THE PAGE MOVE SINCE IT WAS READ (DIVE-7680)? Box bug 690: an act's report
+// paired a url and title read at one instant with a picture taken later, after
+// the tab had gone on to Google's chooser. The report's url is compared with the
+// page's url once the picture is taken. Returns "<was> -> <now>" when it moved,
+// else null. Only the address counts: a title that changes while the page stays
+// is a page still loading, which the settle already covers.
+function movedSince(page, after) {
+  let now = '';
+  try { now = String(page.url()); } catch (e) { return null; }
+  const was = String((after && after.url) || '');
+  if (!was || !now || was === now) return null;
+  const strip = (u) => u.replace(/#.*$/, '');
+  if (strip(was) === strip(now)) return null;
+  return `${was.slice(0, 120)} -> ${now.slice(0, 120)}`;
+}
+
 async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 30000,
                                  expect = null, expectWaitMs = 0, pollMs = 250, walk: walkOpts = null,
-                                 scope = null } = {}) {
+                                 scope = null, expectDoc = false, watch = null } = {}) {
   const waited = waitFor ? await waitForVisible(page, waitFor, { timeoutMs: waitTimeoutMs, pollMs }) : null;
-  if (settleMs > 0) { try { await page.waitForTimeout(settleMs); } catch (e) { /* the read still runs */ } }
+  if (settleMs > 0) { try { await settleQuiet(page, settleMs, watch); } catch (e) { /* the read still runs */ } }
   const readNow = async () => {
     const o = { url: '', title: '', html: '', text: '' };
     try { o.url = String(await page.url()); } catch (e) { /* recorded empty */ }
@@ -924,11 +1527,16 @@ async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 3
     }
     try { o.html = String(await page.content()); } catch (e) { /* recorded empty */ }
     try { o.text = String(await page.evaluate(_textIn, { textOf: true }) || ''); } catch (e) { /* recorded empty */ }
+    try { o.values = String(await page.evaluate(_valuesIn, { valuesOf: true }) || ''); } catch (e) { /* recorded empty */ }
+    // And every drawn frame's (DIVE-6966): a value set in a calculator's frame is read there.
+    try { const t = await framesEval(page, _textIn, { textOf: true }); if (t) o.text += '\n' + t; } catch (e) { /* the page's own */ }
+    try { const v = await framesEval(page, _valuesIn, { valuesOf: true }); if (v) o.values = [o.values, v].filter(Boolean).join('\n'); } catch (e) { /* the page's own */ }
     return o;
   };
   const re = expectRe(expect);
+  const seen = (o) => re.test(o.text) || re.test(o.title) || re.test(o.url) || (expectDoc && re.test(o.html));
   let out = await readNow(), polled = 0;
-  while (re && !re.test(out.text) && !re.test(out.html) && polled < expectWaitMs) {
+  while (re && !seen(out) && polled < expectWaitMs) {
     const step = Math.min(pollMs, expectWaitMs - polled);
     try { await page.waitForTimeout(step); } catch (e) { break; }
     polled += step;
@@ -941,6 +1549,78 @@ async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 3
   if (waited) out.wait_for = waited;
   if (re) out.expect_polled_ms = polled;
   return out;
+}
+
+// THE PICTURE SHOWS WHAT --expect MATCHED (DIVE-8051). WebJudge grades the
+// screenshots, never the answer, and an act's page.png is the browser WINDOW: a
+// matched "$850 estimate" or "Climate Controlled" chip below the fold was in the
+// agent's text and in no picture (om2w-a7a73c8f: "none of the screenshots show a
+// cost estimate"). So after a matched --expect, when no match is on screen, the
+// first visible one is scrolled to the middle before the picture is taken. The
+// agent takes no extra step for it: the act that proved the job pictures its
+// proof. A match already in view moves nothing. The smallest elements whose text
+// matches are the candidates (a match split over a <b> and its sentence is their
+// parent); one taller than 1.5 screens is a page section, not a proof, and is
+// skipped. Self-contained: it runs in the page.
+function _showIn(arg) {
+  const src = String((arg && arg.expect) || '');
+  if (!src || typeof document === 'undefined' || !document.body) return null;
+  let re;
+  try { re = new RegExp(src, 'i'); }
+  catch (e) { const l = src.toLowerCase(); re = { test: (x) => String(x).toLowerCase().includes(l) }; }
+  const vh = (typeof window !== 'undefined' && window.innerHeight) || 0;
+  if (!(vh > 0)) return null;
+  const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|TITLE|SVG)$/i;
+  const hits = [];
+  const visit = (el) => {
+    if (hits.length >= 60 || SKIP.test(String(el.tagName || ''))) return false;
+    if (!re.test(String(el.textContent || ''))) return false;
+    let below = false;
+    for (const c of Array.from(el.children || [])) if (visit(c)) below = true;
+    if (!below) hits.push(el);
+    return true;
+  };
+  visit(document.body);
+  let first = null;
+  for (const el of hits) {
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+    if (!(r && r.width > 0 && r.height > 0) || r.height > vh * 1.5) continue;
+    try {
+      const st = getComputedStyle(el);
+      if (st.visibility === 'hidden' || st.display === 'none') continue;
+    } catch (e) { /* drawn: it has a box */ }
+    if (r.bottom > 0 && r.top < vh) return { show_report: true, in_view: true };
+    if (!first) first = el;
+  }
+  if (!first) return null;
+  try { first.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { return null; }
+  return { show_report: true, scrolled: true,
+    text: String(first.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80) };
+}
+async function showExpect(page, expect, text) {   // -> {scrolled,text} | {in_view} | null; never throws
+  if (!expect || !page || typeof page.evaluate !== 'function') return null;
+  // Only a match in the page's TEXT is a thing on the page to show: one in the
+  // title or the url has nothing to scroll to.
+  const re = expectRe(String(expect));
+  if (!re || !re.test(String(text || ''))) return null;
+  let r = null;
+  try { r = await page.evaluate(_showIn, { expect: String(expect), showOf: true }); } catch (e) { return null; }
+  if (!r || r.show_report !== true) return null;
+  if (r.scrolled) { try { await page.waitForTimeout(150); } catch (e) { /* the picture still runs */ } }
+  return r;
+}
+
+// A FAILED STEP'S ERROR, SHORT (DIVE-6795). Playwright appends a "Call log:" of
+// 30 lines of retries, which the agent read after every failed click on the
+// bench. Its first line says what failed; the one log line worth keeping is the
+// reason (what intercepts the pointer, not visible, not enabled), at the end.
+const WHY_RE = /intercepts pointer events|not visible|not enabled|not editable|not stable|outside of the viewport|detached|did not match any/;
+function stepErrorText(message) {
+  const [head, log] = String(message || '').split('\nCall log:');
+  if (log === undefined) return head;
+  const why = log.split('\n').map((l) => l.replace(/^[\s-]*/, '').trim()).filter((l) => WHY_RE.test(l)).pop();
+  return why ? `${head.trim()} (${why})` : head.trim();
 }
 
 // The line bin/browser keys on. One line, a fixed prefix, JSON after it, so the
@@ -1066,13 +1746,16 @@ function render(nodes, { json = false } = {}) {
   }).join('\n');
 }
 
-module.exports = { INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
-  resolveRefWithin, resolveStepSelector, resolveOrRepick, nameMatches, REPICK_MIN_CONFIDENCE,
-  onRef, refind, REFIND_OPS, _markFocusedIn,
+module.exports = { movedSince, INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
+  resolveRefWithin, resolveStepSelector, resolveOrRepick, nameMatches, REPICK_MIN_CONFIDENCE, FIELD_SWAP_MS,
+  onRef, refind, REFIND_OPS, _markFocusedIn, clickStep, FAILED_SETTLE_MS, COVERED_CLICK_MS,
+  requestWatch, settleQuiet,
   isRef, render, REF_PREFIX,
+  splitRef, frameList, frameFor, FRAME_PREFIX, ENTER_FRAME,
   typeDelay, typeRefusal, typeKeys, TYPE_DELAY_DEFAULT, TYPE_DELAY_MAX,
-  classifyLabel, stepRisk, pageAfter, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER, OWNER_ALLOWED_PREFIX,
+  classifyLabel, stepRisk, pageAfter, showExpect, _showIn, stepErrorText, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER, OWNER_ALLOWED_PREFIX,
   STEP_FAILED_PREFIX, failedStep,
   redirectWhy, checkLanding, E_REDIRECTED,
   _payloadIn, cleanText, cleanPayload,
-  waitForVisible, _visibleIn, _textIn, _scopeIn };
+  INTERSTITIAL_TITLE, waitInterstitial, waitForPast, unmarkedArgs, fieldRoleMatch,
+  waitForVisible, _visibleIn, _textIn, _valuesIn, _scopeIn };

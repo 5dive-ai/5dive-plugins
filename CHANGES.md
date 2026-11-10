@@ -1,5 +1,178 @@
 ## Unreleased
 
+### Fixed — browser 1.74.0 on the one-click install: the registry copy re-synced from 5dive-browser main (DIVE-8116)
+
+`browser@5dive-plugins` (the app's one-click card) was still 1.73.0 after 5dive-browser 1.74.0 merged (DIVE-8051, #145). `bash tests/browser_mirror.sh sync ac8743f5`; `check` reads `OK: plugins/browser 1.74.0 == 5dive-browser main ac8743f`.
+
+- **`plugins/browser`:** byte-for-byte 5dive-browser ac8743f. An act whose `--expect` matched below the fold scrolls the match into view before its screenshot, so the picture shows the proof; the use-browser skill says to `--expect` the proof, set filters on the page's own control, and never turn a named filter off.
+- **CI (`parity.yml`):** upstream's new `browser_act_show_expect_unit.sh` joins the harnesses run on this tree.
+- **No floor raise:** since DIVE-5645 the nightly converger moves official browser installs to the newest release; `_BS_PLUGIN_MIN` (1.25.0) is only a minimum.
+
+### Fixed — teams 0.5.2: `connect --microsoft` works on a self-hosted box (DIVE-8111)
+
+Measured on a fresh install.5dive.ai box (DIVE-8107): the sign-in never opened unless connect ran as the app runs it (`SUDO_USER=claude`).
+
+- **The box's browser, as the box seat.** Every browser call (`serve`, `auth`, `viewer`, `viewer-revoke`, `forget`) now runs with `SUDO_USER=<box seat>` (`claude`, or `FIVEDIVE_BROWSER_BOX_SEAT`), as the app's `sudo -n 5dive browser …` does. Root at a terminal used to reach root's own store ("mode 755, want 700"; Chrome refuses root), a sudo user its own (`runuser: … Permission denied`).
+- **A working view at a terminal.** Without `--json`, connect makes the `--bind=local` view itself and prints its VNC line and an ssh hint; the old printed `sudo 5dive browser viewer …` looked in the caller's store ("no browser is serving"). `--json` (the app) makes none: the app mints its own.
+- **Prerequisites in one line, first.** The browser plugin, Chrome, Node 22.12+ and the box seat are checked before anything is installed or started, and named together with `sudo 5dive plugin install browser && sudo 5dive browser setup`. A box already signed in does not need them.
+- **The port before the sign-in.** With `--endpoint`, the sign-in step (text and `--json`: `port`, `forward`) names `http://127.0.0.1:<port>`; without a public name, the error names it. It is the port the bot then listens on.
+- **Knocks are visible without Telegram.** `ready` says a stranger's first message waits and how to answer; `agent teams status` lists this agent's waiting knocks (`--json`: `waiting`). The IT guide gains a short one-sign-in section.
+
+Checked: `sudo bash tests/teams_cli_unit.sh` 80/80; 11 of its arms are red on the previous `bin/teams`.
+
+### Fixed — browser 1.73.0: the registry copy is byte-for-byte 5dive-browser again, and CI keeps it that way (DIVE-8050)
+
+Box bug report 828 (witty-palm): `act` with an `upload` step said "'upload' is not an act step". 5dive-browser has had it since 1.64.0 (DIVE-7237); this copy was last synced on 10-02 (1.32.0) and took only hand ports after. 87 upstream commits never arrived, among them `act` upload and the rc-133 crash fix (DIVE-7432, report 604). Boxes keep landing here because the app's one-click install names `browser@5dive-plugins`.
+
+- **`plugins/browser`:** byte-for-byte 5dive-ai/5dive-browser 1.73.0 (its git tree hash equals upstream's `browser/`). Three of the four hand ports since 10-02 (DIVE-7972 page text is untrusted data, DIVE-7559 local-only mode, DIVE-7506 the viewer-link button) were never upstream; they went there first, in 1.73.0, so this sync keeps them. DIVE-7978 was already there (1.72.1).
+- **A page-text fence id that cannot be made refuses, never spins (5dive-browser 4485977).** Bounded to eight tries; the upstream harness job also gained a 60-minute timeout.
+- **`tests/browser_mirror.sh`:** `check` fails when `plugins/browser` equals no 5dive-browser main commit (on a PR, the same-named upstream branch too); behind main is a warning naming the gap. `run` runs 5dive-browser's OWN harnesses, from the matched commit, on a copy of this tree. `sync [<ref>]` is the whole port.
+- **CI (`parity.yml`):** the nine hand-kept harness copies (`tests/browser_*.sh`, `tests/x11_stack.cjs`) are gone; they had drifted, and they are why each sync was a merge. CI now runs `check`, then upstream's plugin, connect-request, reflex-propose, tmpdir, input-drive, routine/delta, probe-timeout, served-probe, launch-env and act-upload harnesses, then totp with playwright-core installed.
+- **`tests/browser_registry_unit.sh`:** the registry-only arms (the deprecation notice in `marketplace.json` and never inside the mirror; was TR28), R1-R4, 30 arms.
+
+### Fixed — teams 0.5.1: a knock carries the sender's email from the tenant, so the box binds it to the person the owner added (DIVE-8032)
+
+The owner can add a person in the app by name and email before they ever write. Their first Teams message knocked with no email, so the box made a second person record. The knock now carries the address Microsoft holds for that sender.
+
+- **`teams/knock.ts`:** `onStranger` asks for the sender's member record (`HoldIO.member`) and `memberEmail` takes its `email`, else a UPN shaped like an email, only when the record's `aadObjectId` is the knocking id. `knockFileArgs(sender, name, email)` adds `--email=<addr>` (lowercased, at most 120 characters, never looser than the box's check). Never from the message text.
+- **`teams/server.ts`:** `memberOf` is the REST call `TeamsInfo.getMember` makes, `GET {serviceUrl}/v3/conversations/{id}/members/{aadObjectId}`, with a 5 s timeout. A failed or slow lookup files the knock without an email, as before.
+
+Checked: `bun test test/dive8036-knock.test.ts` 27/27; the 5 new tests do not load on the previous release (no `memberEmail`); dropping `--email` from the argv turns 2 red, dropping `member` from the server wiring turns 1 red.
+
+### Fixed — telegram 0.5.140: a partner client's org-policy notice names their cabinet, not 5dive (DIVE-8012)
+
+On a partner box (`TELEGRAM_PROFILE=lite`) the DIVE-5993 notice (a Claude Team/Enterprise org with chat channels off) goes straight to the partner's client. Its last line told them to switch accounts «на странице агента в панели 5dive», a dashboard they do not have.
+
+- **`orgpolicy.ts`:** `orgPolicyText(name, lang, lite)`. On lite the way-out line says it is done in the cabinet, in the agent's settings («Это делается в кабинете, в настройках агента …» / "You do that from your account page, in …'s settings"). Step 5 keeps `/restart`: the lite bridge runs it itself, with no model turn. The settings JSON is unchanged and still lists `5dive-plugins`, since the org's list must name it.
+- **`server.ts`:** the notice passes `LITE`. The default profile's text is byte-identical (six shas pinned from the previous release, ru and en).
+
+Checked: `bun test test/dive8012-lite-org-policy-notice.test.ts`: 23 pass; 19 of them red on the previous release. Dropping `LITE` at the call site turns the wiring arm red.
+
+### Added — teams 0.5.0 + telegram 0.5.139: a new person knocks; the owner lets them in from Telegram (DIVE-8036)
+
+A Teams connection whose config says `access: "knock"` (every NEW `5dive agent teams connect`, and `5dive people sync`) no longer lets the whole tenant write. A message from someone not on `allowed_users` (and not an admin in `/etc/5dive/roles.json`) never reaches the agent:
+
+- **Hold (`teams/knock.ts`):** the server keeps the message (the newest 5, text capped) in its own state, runs `sudo -n 5dive people knock file --channel=teams --sender=<entra id> --name=<shown name> --json`, and tells the person once: «I've asked the owner to let you talk to Vesper. Your message waits until they do.» The held chat is not opened to the agent, so it cannot reply into it.
+- **Answer:** the CLI drops `knocks/<kid>.json` in the agent's teams state dir; the server watches it (plus a 5 s poll). Allow / Admin: «You're in — Vesper will answer here.», then the held messages arrive as normal inbound, with the sender's role. No: «Vesper isn't open to you — ask your admin.», then at most 3 such lines a day per sender, and silence.
+- **Owner card (`telegram/knocktap.ts`):** a `kn:<kid>:allow|admin|no:<nonce>` tap is answered only for an id in the bot's owners record and relayed as `sudo -n 5dive people knock answer <kid> <choice> --proof=<that button's nonce> --by=telegram:<uid> --json`; the card is edited to the outcome. A guest's tap runs nothing. A standard seat reaches it through its probed `people knock answer *` line.
+- A connection made before this keeps no `access` key: today's behaviour, also after a re-run of connect.
+
+Checked: `bun test test/dive8036-knock.test.ts` 22/22 (hold, release on allow and admin, deny, rate limit, no-access-key unchanged, owner-only tap with a guest negative); `sudo bash tests/teams_cli_unit.sh` 69/69.
+
+### Fixed — teams 0.3.1: a failed Teams connect shows Microsoft's reason, not a libsecret hint; the bot gets the agent's face (DIVE-8022)
+
+When Microsoft did not make an agent's bot, the app card said "Install it for secure storage: sudo apt install libsecret-1-dev", which fixes nothing. Microsoft's CLI, run with `--json`, reports its error on stdout (`{ok:false, error:{message}}`), and prints its libsecret warning on stderr on every call on a box with no desktop keyring. Connect only read the last stderr line.
+
+- The card now shows Microsoft's own error message. A crash outside the CLI's handler falls back to stderr, with warning lines and color codes removed.
+- The whole answer (stdout, stderr, exit code) is kept in `last-error.log`, root-only (0600), beside the CLI's login, so the next failure can be diagnosed.
+- The warning cannot be switched off: the CLI prints it unconditionally when the keyring is missing (`dist/auth/cache.js`, 3.0.4).
+
+Also (lodar, «can we add avatars?»): an agent made this way now shows its face in Teams. `app create` gets `--color-icon` (the face, centre-cropped to 192x192) and `--outline-icon` (a 32x32 white ring), as the IT-guide package already had. Boxes have no Pillow, so `cli/package.py` now reads a plain PNG face with the standard library; that also gives the IT-guide package the face instead of the plain tile. No face, an unreadable one, or a symlink: no icons, and Teams shows its own tile. Agents already made keep their tile until made again (`app update` bumps the app's version and asks people to reinstall, so connect does not do it on its own).
+
+Checked: `sudo bash tests/teams_cli_unit.sh` 59/59; the 4 error arms are red on the old `bin/teams`, the face arm is red on the old `bin/teams`, and the no-Pillow arm is red on the old `package.py`.
+
+### Added — teams 0.3.0: admins and members on an office box (DIVE-7976)
+
+Everyone a firm let in on Teams was equal, so any employee could tell an agent with sudo, logins and the Vault to do anything. Now each person is an **admin** (the owner and the people IT names) or a **member** (everyone else let in).
+
+- **The role comes from the channel (`roles.ts`):** the server looks the sender's Entra object id up in the box's roles file (`/etc/5dive/roles.json`, root's, 0644; ids keyed `teams:<id>`, `telegram:<id>`) and puts `sender_role=admin|member` on the inbound tag, the field DIVE-7972 named. Message text and display names never change it.
+- **A member's risky ask waits for an admin (`hooks/role-guard.ts`):** a PreToolUse hook holds root, paying, deleting, sending outside the firm, and changing settings, keys or access while the newest Teams message (30 min) is a member's. Its reason tells the agent to use the new `ask_admin` tool, which sends each admin who has chatted with it an Approve / Decline card. An admin's Approve is a message from an admin, so the held call then goes through; a Decline keeps the hold. The member is never asked. Ordinary work passes untouched.
+- **The verb:** `sudo 5dive agent teams admins add|remove <Entra object id>`, `admins check on|off` (off = everyone equal again), `admins members-may <kinds|none>` to widen; `5dive agent teams admins` lists. No new service, no cloud login: it works on an offline box.
+
+Checked: `bun test ./test/dive7976-teams-roles.test.ts`, 14 tests, the hook run as a real process; a mutant that makes every sender admin turns 6 red. `sudo bash tests/teams_admins_unit.sh`, 17 arms; a mutant with the root check removed turns 1 red. `sudo bash tests/teams_cli_unit.sh` 48/48 and `bun test ./test/teams-plugin.test.ts` 32/32 unchanged.
+
+### Fixed — browser 1.32.3: a login view's stop waits out its cap on Ubuntu 26.04 (DIVE-7978)
+
+Plugins main read red on `fork parity` from 2026-11-07: T49e's stop left after ~0.6 s instead of waiting out its 1 s cap. The same commit was green on GitHub's ubuntu-24.04 runner and red on ubuntu-26.04.
+
+- **Cause:** Ubuntu 26.04's coreutils is uutils, and its `date +%3N` is wrong for the first 100 ms of every second. It drops the leading zeros of the nanoseconds, then cuts to 3 digits, so 0.005 s reads as 0.535 s. One such read inside the cookie wait ended it early. On a 26.04 box, Done could cut off a sign-in that the wait was there to save.
+- **`bin/browser`:** a new `_now_ms` reads bash's own `EPOCHREALTIME` (no fork, no coreutils), and every `date +%s%3N` (the cookie wait, the routine replay timer) now uses it.
+- **Harnesses:** the T49 fake Chrome, the T49/R11 stopwatches and the three bench timers use the same clock.
+- **New arm T49g:** a fake `date` that jumps 5 s ahead on its second `%3N` read; the stop still waits out its cap. A mutant timed by `date +%s%3N` leaves at once.
+
+### Fixed — telegram 0.5.138, browser 1.32.2: outside text no longer reaches an agent as if its owner sent it (DIVE-7972)
+
+Three paths from the DIVE-7963 security pass, where someone other than the owner could give orders to an agent that has sudo.
+
+- **Team-bot relay (telegram, `untrusted.ts` `relayInVerdict`):** the relay-in drain now re-checks every relayed message on the agent's own access.json before it is delivered: the agent's team group, its topic, and a sender on its allowFrom. No list means nobody gets through. The root listener checks the same thing first (5dive-cli, same row); this second check covers a planted file or a listener older than the fix.
+- **Groups the owner adds (telegram, `groupjoin.ts`):** a new group lets in its owners only, unless the owner opened groups on purpose (the CLI's "by name" or "every message" now stores `groupsOwnerOnly: false`). Before, a new group let in anyone who joined through an invite link. Groups already set up keep their settings.
+- **Who is speaking (telegram):** every inbound carries `sender_role` = `owner`, `guest` or `member`. In a group, a non-owner's message arrives inside a random-marker `UNTRUSTED` block. One sentence in the channel instructions says what the roles mean.
+- **Browser page text (browser, `bin/browser`, `lib/delta.cjs`):** `page.md` and the snapshot delta put the page's text between two `UNTRUSTED-PAGE-<id>` markers, with a fresh id each read. After any page read, `publish` and `send` ask the owner first for 30 minutes (exit 73, answered with one tap), even under `standard`. Only `yolo` skips this. The delta ignores the marker lines, so a re-read is not counted as a change.
+
+Checked: `bun test test/dive7972-outside-text-fenced.test.ts`: 21 pass. Two mutants (relay sender check removed; old open default for new groups) each turn arms red. The DIVE-5368/6675/7250/5121 tests were updated to the new default and the new instruction sentence. `tests/browser_plugin_unit.sh` through the new T7972 block: 1478 pass, 0 fail, including a mutant with the page-read rule removed. `tests/browser_routine_delta_unit.sh`: 95 pass.
+
+### Added — crew 0.1.0: the CrewAI runtime is a plugin, and its feed receipt is off by default (DIVE-7950)
+
+`5dive crew` left the core CLI (lodar 11-09: optional features are plugins, never core). `sudo 5dive plugin add crew@5dive-plugins` brings it back with the same subcommands; a box without it gets one line pointing here.
+
+- **`plugins/crew/bin/crew`:** core's `src/cmd_crew.sh` (5dive-ai/5dive@1440f835), moved verbatim behind a prelude that stands in for core's `fail`/`ok`/`step`/`warn`, `--json` and local-only. Crews already under `~/.5dive/crews` keep working.
+- **The work receipt is opt-in.** `crew run` sends nothing to the 5dive feed unless you pass `--receipt`. `--no-receipt` still parses. Local-only mode still wins over `--receipt`.
+- **Fixed on the way:** install now makes the crew's `storage/` memory folder (core made one named `{storage}`), and a failed kickoff prints its output instead of dying silently under `set -e`.
+
+Checked: `bun test test/crew-plugin.test.ts`, 12 pass (install, no receipt by default, `--receipt` posts one to a stub ingest, local-only, root refusal, `--json`); two mutants (receipt default-on, `--receipt` ignored) each turn 2 arms red.
+
+### Fixed — dashboard 0.5.35: the Hermes app-chat plugin meets the Hermes plugin catalog rules (DIVE-7945)
+
+Before we list `fivedive` in Hermes's plugin catalog (`hermes plugins catalog`), the plugin has to pass the catalog's admission rules, not only the validator.
+
+- **`hermes/adapter.py`:** `FIVEDIVE_SPOOL_DIR` and `FIVEDIVE_REPLY_MAX_WORDS` are read through Hermes's profile-scoped reader (`gateway.platforms._shared.get_scoped_secret`, else `agent.secret_scope.get_secret`), never a bare `os.environ` read, so a multi-profile gateway never hands one profile another's spool. Hermes before 0.22 has neither and runs one profile per process; there it reads the env as before.
+- **`hermes/plugin.yaml` 1.0.1:** declares every variable the adapter reads (`FIVEDIVE_REPLY_MAX_WORDS`, `FIVEDIVE_HOME_CHANNEL` added), a `requires_hermes: ">=0.19.0"` floor (what our seats run), and a disclosure line.
+- **`hermes/README.md`:** the two variables, the floor, and what the plugin touches.
+
+Checked: `hermes plugins validate --install-deps` on Hermes v0.23.0, 15 of 15 pass, security scan safe; `bun test` dive7349 + dive7811, 27 pass.
+
+### Added — devteam 0.4.0: the daily proof publish also writes the review loop, `verifier.json` (DIVE-7863)
+
+The /team page gets a second live chart: how often one agent's work is sent back by the agent that reviews it. It reads a new file on the same public `status` branch, written in the same commit as the badge.
+
+- **`proof publish` → `_proof_review_build`:** per day, for the 30 whole days before the publish date, each shipped task counts once on the day of its last `task.done`: reviewed (graded or sent back), passed first review, or sent back at least once. A merge conflict after a pass is not a send-back. Plus the window totals, including every task shipped, reviewed or not.
+- **Why it was sent back:** one fixed category per send-back (failing tests, unclear writing, no proof it works, clashes with newer work, not what was asked, safety or privacy, other), by rule from the reviewer's finding. No preserved finding or no rule hit is "other". Only the category leaves the box: never the feedback text, a title or an ident.
+- A failure in this block never stops the badge; `verifier.json` keeps its old `date` and the page hides a stale one.
+
+Harness: `tests/devteam/proof_review_unit.sh`, 18 arms, including a negative control (a finding that carries a title and an ident comes out only as its category; a leak mutation turns 6 arms red).
+
+### Fixed — voice 1.11.7: setup fails when the speech engine never starts, instead of saying voice is set up (DIVE-7855)
+
+Bug report 761: the whisper model download hung, nothing answered on :8765, and setup only warned, so the box reported voice as set up and on.
+
+- **`5dive-setup-voice`:** when whisper-service does not answer within 6 minutes, the later steps still run (the model may finish later), then the run exits 1 with the reason and the log. Mirrors 5dive-voice 1.11.7 byte for byte.
+
+Harness: 5dive-voice `tests/quiet-setup.test.sh` (57 arms; the 7 new ones red on 1.11.6).
+
+### Fixed — telegram 0.5.137: a revoked AI sign-in tells the owner to sign in again, not "Please run /login" (DIVE-7835)
+
+Seen 2026-11-06: a client's Claude sign-in was revoked and every agent answered every message with Claude Code's raw "OAuth token revoked · Please run /login" until the client wrote to support.
+
+- **`hooks/lib/signin.ts`:** a turn that ended on Claude Code's own sign-in refusal (an API-error message saying the OAuth token was revoked or expired, "Not logged in", "Please run /login", or `authentication_failed`) is a sign-in, not an answer. An invalid API key or an empty balance is not; the agent's own words never are.
+- **Stop hook:** that turn is no longer auto-relayed. The chat gets one line in the owner's language: the sign-in stopped working, tap /login to sign in again. A partner's client (lite) is told to sign in again on their account page, with the account button.
+- **StopFailure hook:** the same line replaces "The agent stopped with an error: …", deduplicated per episode under its own kind (`signin`).
+- **/login** now signs in the account the agent is bound to (`agent auth start <type> --auth-profile=<it>`); before, it signed in the box default and a seat on its own revoked account stayed revoked. On a standard-tier seat it says where to sign in instead of only "needs an admin-tier agent".
+
+Harness: `bun test test/dive7835-signin-notice.test.ts`, 13 tests (8 drive the real hooks against a Bot API stub).
+
+### Added — dashboard 0.5.34: Pi and OpenCode agents answer in the 5dive app chat (DIVE-7348)
+
+A Pi or OpenCode agent can now be chatted with from 5dive.app. Neither runtime runs an MCP server for a channel (and on a Telegram seat the Telegram bridge is the seat's main process), so the dashboard server runs beside the seat (`server.ts --runtime=pi|opencode`, started by 5dive-agent-start as for OpenClaw) and **`clidispatch.ts`** answers each message with one headless turn of the seat's own CLI, always in the web chat's own session:
+
+- **Pi:** `pi -p --session-dir ~/.pi/channels/5dive/pi-sessions --continue`; the answer is stdout, a failed turn exits 1 with the reason on stderr.
+- **OpenCode:** `opencode run --format json`, then `--session <id>` with the id the first turn printed (kept in `~/.opencode/channels/5dive/opencode-session`; a session that is gone starts a new one, once). The answer is the text after the last tool call. A failed model call is an `error` event with exit 0, so the events decide, not the exit code. The turn drops the box-wide `XDG_CONFIG_HOME` and gets the pane's `OPENCODE_PERMISSION`, so it reads the seat's own model and asks nothing nobody can answer.
+- The message rides stdin, never argv. Turns run one at a time in the seat's work folder (`DASHBOARD_AGENT_WORKDIR`), limit `DASHBOARD_CLI_TURN_TIMEOUT_S` (default 600 s). An over-cap answer is rewritten in the same session (DIVE-7811).
+- **Never silence:** no answer, a provider refusal (its first sentence, no links: "Pi could not answer: You have no credits remaining."), a turn past the limit, a missing binary, each ends in a short notice.
+
+Measured live on 2026-11-06 with pi 1.5.0 and opencode 1.19.5 on an OpenRouter key: the second turn remembered the first; opencode ran a tool and answered after it. pi 0.80.6 has the same flags.
+
+Harness: `bun test test/dive7348-dashboard-pi-opencode.test.ts`, 15 tests (two through the real server with stand-in CLIs).
+
+### Added — teams 0.2.0: one Microsoft sign-in makes each agent's Teams contact (DIVE-7831)
+
+`sudo 5dive agent teams connect <agent> --microsoft [--json]` replaces the IT steps on a 5dive cloud server. Not signed in: it starts Microsoft's sign-in and opens the page in the server's own browser (site `login.microsoftonline.com`); the app shows that page to the owner through the usual one-time viewer link. Signed in: it checks that Teams allows custom apps (and names the admin switch if not), makes the agent's Teams bot with Microsoft's `teams` CLI, keeps the secret on the server through `secret write`, connects the agent as before, and prints the **Add to Teams** link (`state=ready`). Asking again returns the same link; a run that made the bot and stopped part-way finishes it instead of making a second one.
+
+- Microsoft's CLI is pinned to 3.0.4 and installed once (`/opt/5dive/teams-cli`, with `libsecret-1-0` so its sign-in persists). Its login stays in `/var/lib/5dive/teams-cli` (0700); the secret file it writes is made 0600 and deleted after.
+- The sign-in waits in its own unit (`5dive-teams-signin`, 15 minutes at most). `cli/ms-signin.mjs` runs the CLI's own sign-in and writes the page address to a file instead of opening a desktop browser; only a `https://login.microsoftonline.com/` address is ever opened.
+- `status --json` now carries `install_link`.
+
+Harness: `sudo bash tests/teams_cli_unit.sh`, 47 arms (29 new): the sign-in starts once and is reused, only Microsoft's page opens, the custom-apps checks stop before anything is made, the bot gets the agent's name and its own address, the secret never reaches argv or output, the second ask makes nothing new.
+
 ### Fixed — telegram 0.5.136, telegram-codex 0.5.49, telegram-grok / telegram-agy 0.5.39, telegram-opencode 0.5.15, telegram-pi 0.1.15: a Telegram poll that gets no answer is cut off and retried, not left hanging for 8 minutes (DIVE-7825)
 
 Box report 748: after a Telegram outage a seat got no messages for about eight minutes, then all five at once. Every bridge built its bot with the client's default 500 s request timeout, and that covered the poll for new messages too. When Telegram stopped answering one poll, it sat for the full 500 s. The poll loop's error handler retries silently, and the heartbeat file beats on its own timer, so nothing showed it.

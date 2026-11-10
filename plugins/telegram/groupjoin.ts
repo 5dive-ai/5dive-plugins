@@ -51,23 +51,54 @@ export function ownerOnlyDrops(
   return access.groupsOwnerOnly === true && !groupOwnerIds(access).includes(senderId)
 }
 
+/** DIVE-7972 (DIVE-7963 #6): a group the owner adds lets in its OWNERS only
+ *  unless the owner opened groups to everyone on purpose. Before, a new group got
+ *  `allowFrom: []`, so anyone who joined through an invite link could call a sudo
+ *  agent and be read as its owner. Opening groups is now an explicit act: the
+ *  CLI's "In groups, answer: by name / every message" stores
+ *  `groupsOwnerOnly: false` (5dive-cli DIVE-7972); "owner only" stores true; a
+ *  box that never chose (the key absent) gets the safe default, as the
+ *  codex/grok/pi forks already do. Groups admitted before this keep their entry. */
+export function groupsOpenToMembers(access: { groupsOwnerOnly?: boolean }): boolean {
+  return access.groupsOwnerOnly === false
+}
+
 /** The join's decision, on the handler's copy of access: an owner's add puts
- *  the group in `groups`, answering when called by name unless the agent is set
- *  to every message (`groupsRequireMention: false`, DIVE-6675); any other add
- *  leaves it only in `discovered` (written by the handler before this), waiting
- *  for approval. Set to owner only (DIVE-7250), it answers its owners by name. */
+ *  the group in `groups`; any other add leaves it only in `discovered` (written
+ *  by the handler before this), waiting for approval. The new group lets in its
+ *  owners only (DIVE-7972), answering by name unless the agent is set to every
+ *  message; opened to everyone (`groupsOwnerOnly: false`), it answers anyone,
+ *  by name unless set to every message (`groupsRequireMention: false`, DIVE-6675).
+ *  Set to owner only (DIVE-7250), it answers its owners by name. */
 export function admitOnJoin(
   access: { owners?: string[]; allowFrom: string[]; groups: Record<string, unknown>; groupsRequireMention?: boolean; groupsOwnerOnly?: boolean },
   chatId: string,
   from: From,
 ): boolean {
   const approved = !(chatId in access.groups) && addedByOwner(access.owners, access.allowFrom, from)
-  // DIVE-7250: set to "When I call it by name", the group lets in its owners only.
   if (approved)
     access.groups[chatId] = access.groupsOwnerOnly === true
       ? { requireMention: true, allowFrom: groupOwnerIds(access) }
-      : { requireMention: access.groupsRequireMention !== false, allowFrom: [] }
+      : groupsOpenToMembers(access)
+        ? { requireMention: access.groupsRequireMention !== false, allowFrom: [] }
+        : { requireMention: access.groupsRequireMention !== false, allowFrom: groupOwnerIds(access) }
   return approved
+}
+
+/** DIVE-7972: who sent a message, as the agent must weigh it.
+ *  - `owner`: a recorded owner the bot still answers (groupOwnerIds). A box with
+ *    no owners record yet has one pairing level, so anyone in allowFrom counts.
+ *  - `guest`: someone the owner let DM the agent (in allowFrom), not an owner.
+ *  - `member`: neither, e.g. anyone in a group opened to everyone. */
+export type SenderRole = 'owner' | 'guest' | 'member'
+export function senderRole(
+  access: { owners?: string[]; allowFrom: readonly string[] },
+  senderId: string,
+): SenderRole {
+  const owners = groupOwnerIds(access)
+  const noRecord = !Array.isArray(access.owners) || access.owners.length === 0
+  if (owners.includes(senderId) || (noRecord && access.allowFrom.includes(senderId))) return 'owner'
+  return access.allowFrom.includes(senderId) ? 'guest' : 'member'
 }
 
 /** DIVE-5867: the owners record's format, stored beside it as `ownersSeed`.

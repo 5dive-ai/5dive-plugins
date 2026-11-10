@@ -52,6 +52,51 @@ const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
 // served browser and a cold run cannot leave through two different routes.
 const proxy = require(path.join(__dirname, '..', 'lib', 'proxy.cjs'));
 const totp = require(path.join(__dirname, '..', 'lib', 'totp.cjs'));
+// DIVE-6844: never type a saved login on a page outside its own site.
+function savedHostCheck(page, s) {
+  if (s.host && !totp.hostAllowed(page.url(), s.host)) {
+    throw new Error(`this saved login is for ${s.host}, and the page is not on it (${(() => { try { return new URL(page.url()).host; } catch { return 'unknown'; } })()}); nothing was typed`);
+  }
+}
+const downloads = require(path.join(__dirname, '..', 'lib', 'downloads.cjs'));
+const gsignin = require(path.join(__dirname, '..', 'lib', 'google-signin.cjs'));
+const popup = require(path.join(__dirname, '..', 'lib', 'popup.cjs'));
+const frontTab = require(path.join(__dirname, '..', 'lib', 'front-tab.cjs'));
+const cleanExit = require(path.join(__dirname, '..', 'lib', 'clean-exit.cjs'));
+const sessionKeep = require(path.join(__dirname, '..', 'lib', 'session-keep.cjs'));
+// What each tab looked like when the agent last saw it, so an act can answer with
+// what changed instead of the whole page (DIVE-6795, lib/look.cjs).
+const look = require(path.join(__dirname, '..', 'lib', 'look.cjs'));
+const pageLoad = require(path.join(__dirname, '..', 'lib', 'page-load.cjs'));
+const looks = look.memory();
+
+// THE PAGE TEXT IS EXTRACTED HERE, WARM (DIVE-6778). The CLI derived page.md with a
+// fresh `node lib/extract.bundle.cjs` per page: a 3 MB load and a cold JIT on every
+// snapshot, act and read, 1.4 s where this long-lived process takes 0.75 s
+// (Wikipedia; twice that on the bench's busy 2 cores). The CLI sends the sha256 of
+// the bundle it would run, and this process answers only when its own bundle is
+// those exact bytes: a session started by another release, or a CLI pointed at
+// another extractor, gets nothing back and runs its own, as before.
+let extractFn = null, extractSha = '';
+function extractor() {
+  if (extractFn === null) {
+    extractFn = false;
+    try {
+      const file = path.join(__dirname, '..', 'lib', 'extract.bundle.cjs');
+      extractSha = require('crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+      globalThis.__FIVEDIVE_EXTRACT_LIB = 1;   // require the bundle as a library: no CLI run
+      const m = require(file);
+      if (m && typeof m.extract === 'function') extractFn = m.extract;
+    } catch (e) { extractFn = false; }
+  }
+  return extractFn;
+}
+async function extractFor(req, html, url) {
+  if (!req || typeof req.extract !== 'string' || typeof html !== 'string' || !html.trim() || !url) return undefined;
+  const fn = extractor();
+  if (!fn || req.extract !== extractSha) return undefined;
+  try { return await fn(html, url); } catch (e) { return undefined; }
+}
 
 // DIVE-4587: Chrome keeps its crashpad DB under $XDG_CONFIG_HOME whatever
 // --user-data-dir says, and 5dive boxes share one XDG_CONFIG_HOME across every
@@ -59,10 +104,22 @@ const totp = require(path.join(__dirname, '..', 'lib', 'totp.cjs'));
 // launch CHECK-fails (rc 133, no output). bin/browser unsets it too; this is the
 // same belt-and-braces the driver keeps, for the same reason — the parent is not
 // a process this file controls.
-delete process.env.XDG_CONFIG_HOME;
+// DIVE-5638: bin/browser now hands Chrome a crash dir of its own (a per-launch
+// 0700 dir, named twice so it can be told from the shared value). Keep that one.
+if (!process.env.FIVEDIVE_BROWSER_CHROME_CONFIG ||
+    process.env.XDG_CONFIG_HOME !== process.env.FIVEDIVE_BROWSER_CHROME_CONFIG) {
+  delete process.env.XDG_CONFIG_HOME;
+}
 
 const PROG = '5dive browser daemon';
 const E_NOTHING_RAN = 70, E_FAILED = 1, E_UNAVAILABLE = 69, E_PERM = 77;
+// 74 (DIVE-7528): input mode only, never a bin/browser exit. The page is the
+// site's own error page (adapter probe.refused_when_title_matches). bin/browser
+// turns it into a stop (75) whose advice is NOT a handoff.
+const E_SITE_REFUSED = 74;
+// 76 (DIVE-7572): input mode, a typed address that never finished loading (its
+// title stayed the address). bin/browser's E_NOT_READY: the fix is to wait.
+const E_NOT_LOADED = 76;
 
 // ---- WHO IS ASKING (DIVE-4664 scope (c)) -----------------------------------
 //
@@ -122,8 +179,21 @@ const STEPS = {
   press:    ['selector', 'key'],
 };
 const STEP_TIMEOUT = Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || 30000);
+// AN AGENT'S STEP GIVES UP SOONER THAN A RECIPE'S (DIVE-6778). `act` sends
+// step_ms (10 s by default): its steps are the agent's guesses, and a wait_for
+// for text that never shows, or a click on a covered element, waited the whole
+// 30 s and failed anyway (bench: 40 s acts against 3-4 s for a rival's click).
+// A goto keeps the page-load bound; `run`'s reviewed recipes send none.
+const stepLimit = (req) => {
+  const n = Number(req && req.step_ms);
+  return Number.isInteger(n) && n > 0 && n < STEP_TIMEOUT ? n : STEP_TIMEOUT;
+};
 // How long a request waits for the one in flight before it is refused (DIVE-4927).
 const BUSY_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_BUSY_WAIT_MS || 60000);
+// How long an input-mode `front` waits for a request in flight to end before it
+// gives up rather than type into it (DIVE-7674). Inside bin/browser's
+// VIEWER_FRONT_S, with room left for the keys.
+const FRONT_IDLE_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_FRONT_IDLE_WAIT_MS || 2000);
 
 // THE LEASE ANCHOR MUST BE THE CALLER'S OWN PROCESS (DIVE-4927). A brokered
 // lease is held for as long as its anchor pid lives, and the caller names that
@@ -165,11 +235,36 @@ const settleOf = (req, fallback) => {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 };
 const TREE_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200);
+// ONE PAGE OF A `read` GETS 40 s, WHATEVER IT DOES (DIVE-6778). page.title() and
+// page.content() run inside the page and take no timeout, so a tab whose script
+// never yields held a bench read of two stores.bestbuy.com pages for over seven
+// minutes; every call behind it was refused as busy and the job timed out.
+const FAILED_SETTLE_MS = aria.FAILED_SETTLE_MS;
+// The re-read of a page that came into view, or moved, while the report was being
+// read (DIVE-7680): it has loaded its first document already, so a short settle.
+const POPUP_REREAD_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_POPUP_REREAD_SETTLE_MS) || 300;
+const READ_PAGE_MS = Number(process.env.FIVEDIVE_BROWSER_READ_PAGE_MS || 40000);
+const within = (ms, p, what) => {
+  let timer;
+  return Promise.race([p, new Promise((_, no) => { timer = setTimeout(() => no(new Error(what)), ms); })])
+    .finally(() => clearTimeout(timer));
+};
 
 // HOW LONG A PROBE MAY WAIT FOR THE PAGE TO SAY WHICH STATE IT IS IN
 // (DIVE-4794). Spent only while NOTHING is known — the loop returns the instant
 // any marker matches — so an adapter that answers at DCL pays nothing for it.
 const PROBE_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_PROBE_WAIT_MS || 8000);
+// ONE WALL CLOCK FOR THE WHOLE PROBE (DIVE-7648). The steps inside a probe each
+// had their own limit or none (newPage none, goto 20 s, content() none, close
+// none), and `busy` is freed only when the request returns. On exact-swallow
+// (report 680, 2026-11-03) one probe of a signed-in Shopify admin held its
+// group's session for 230-380 s, and google.com and cjdropshipping.com in that
+// group were refused as busy the whole time. Past this the probe answers, its
+// tab is closed without waiting, and the session is free; whatever the tab was
+// still doing is abandoned. Under the 38 s the cold probe's cap allows.
+const PROBE_HARD_MS = Number(process.env.FIVEDIVE_BROWSER_PROBE_HARD_MS || 35000);
+// How long a page that is still navigating gets to reach its next DOM, per look.
+const NAV_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_NAV_SETTLE_MS || 5000);
 
 function die(code, msg) { process.stderr.write(`${PROG}: ${msg}\n`); process.exit(code); }
 
@@ -193,7 +288,9 @@ function sandboxWanted() {
 // place is a claim one edit can remove from both callers at once.
 function launchArgs(sandbox) {
   const extra = (process.env.FIVEDIVE_BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);
-  const args = [...(sandbox ? [] : ['--no-sandbox']), '--disable-gpu', ...extra];
+  // DIVE-7204: no "Restore pages?" bubble after a serve that was stopped, not closed.
+  const args = [...(sandbox ? [] : ['--no-sandbox']), '--disable-gpu', '--hide-crash-restore-bubble',
+    ...aria.unmarkedArgs(extra), ...extra];
   const bad = args.filter(a => /^--remote-debugging/.test(a));
   if (bad.length) {
     die(E_NOTHING_RAN, `refusing to launch with ${bad.join(' ')}. The daemon holds CDP over the child's ` +
@@ -287,6 +384,9 @@ async function serveMode(profile, sock, broker, input) {
   if (!chrome) die(E_UNAVAILABLE, 'no chrome named for this daemon — a session must be held in the same ' +
     'browser the profile was logged in with, so the executable is passed in rather than guessed here.');
 
+  // DIVE-7204: the last serve was stopped, not closed; say it closed cleanly so
+  // the window opens with no "Restore pages?" bubble (lib/clean-exit.cjs).
+  cleanExit.markCleanExit(profile);
   // INPUT MODE (DIVE-5287): plain Chrome, driven through the X display. No
   // Playwright, no CDP pipe, nothing on the page to detect. See inputLaunch.
   let ctx;
@@ -297,14 +397,17 @@ async function serveMode(profile, sock, broker, input) {
   // with, and `proxy set`/`clear` say so rather than moving a live login's IP.
   let viaProxy;
   try { viaProxy = proxy.launchProxy(profile); } catch (e) { die(E_UNAVAILABLE, e.message); }
+  // DIVE-7643: a proxy with no login is a plain --proxy-server arg (lib/proxy.cjs
+  // launchRoute), so Playwright adds no flag that raises Chrome's warning bar.
+  const route = proxy.launchRoute(viaProxy);
   const { chromium } = loadPlaywright();
   const launch = (sandbox) => chromium.launchPersistentContext(profile, {
     headless: false,
     executablePath: chrome,
-    args: launchArgs(sandbox),
+    args: [...launchArgs(sandbox), ...route.args],
     chromiumSandbox: sandbox,
     viewport: null,
-    ...(viaProxy ? { proxy: viaProxy } : {}),
+    ...route.option,
   });
   try {
     ctx = await launch(sandboxWanted());
@@ -343,7 +446,15 @@ async function serveMode(profile, sock, broker, input) {
   // GUARDED, because the harness's recording stub is not an EventEmitter and a
   // daemon that cannot be tested is a daemon whose refusals are unmeasured. The
   // real playwright context always has it.
-  if (typeof ctx.on === 'function') ctx.on('close', () => { cleanup(); process.exit(0); });
+  //
+  // NOT DURING OUR OWN SHUTDOWN (DIVE-7314 it3). Playwright emits `close` when
+  // Chrome drops the CDP pipe, which is the START of its shutdown, and exiting
+  // node there makes Playwright kill Chrome before it writes the profile out:
+  // on CI's Chrome the stopped profile had no cookie file at all, so neither a
+  // kept session login nor an ordinary lasting cookie reached the next browser.
+  // A `shutdown` request sets this and waits for ctx.close() to see Chrome exit.
+  let shuttingDown = false;
+  if (typeof ctx.on === 'function') ctx.on('close', () => { if (shuttingDown) return; cleanup(); process.exit(0); });
 
   // WHAT IS IN FLIGHT, not only THAT something is: a refusal that cannot say
   // who has the browser sends the caller to a `lease --status` that reads free.
@@ -351,15 +462,18 @@ async function serveMode(profile, sock, broker, input) {
   const cleanup = () => { try { fs.unlinkSync(sock); } catch (e) { /* already gone */ } };
 
   const server = net.createServer((conn) => {
-    let buf = '';
+    // The request's bytes, searched only where they are new (DIVE-7303, as callMode):
+    // an upload step carries its file, up to 16 MB, inside this one line.
+    let parts = [];
     const send = (o) => { try { conn.write(JSON.stringify(o) + '\n'); } catch (e) { /* caller left */ } };
     const end = (rc) => { send({ t: 'end', rc }); try { conn.end(); } catch (e) { /* caller left */ } };
     conn.on('error', () => { /* a caller that walks away is not an error here */ });
     conn.on('data', async (d) => {
-      buf += d.toString('utf8');
-      const nl = buf.indexOf('\n');
-      if (nl < 0) return;
-      const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+      const nl = d.indexOf(10);
+      if (nl < 0) { parts.push(d); return; }
+      parts.push(d.subarray(0, nl));
+      const line = Buffer.concat(parts).toString('utf8');
+      parts = nl + 1 < d.length ? [d.subarray(nl + 1)] : [];
       let req;
       try { req = JSON.parse(line); } catch (e) { send({ t: 'err', msg: `request is not JSON: ${e.message}` }); return end(E_NOTHING_RAN); }
 
@@ -398,6 +512,15 @@ async function serveMode(profile, sock, broker, input) {
           send({ t: 'err', msg: `stopping this session is the owning seat's act: it is the box's login and other seats are using it. Nothing was stopped.` });
           return end(E_PERM);
         }
+        // A swap (bin/browser's own stop-and-start) keeps the session-only
+        // logins (DIVE-7314, lib/session-keep.cjs). Input mode has no cookie
+        // API; bin/browser's file rewrite is that mode's only keep.
+        let kept = 0;
+        if (req.keep_session && typeof ctx.cookies === 'function') {
+          try { kept = await sessionKeep.keepSessionCookies(ctx); } catch (e) { /* a stop must not fail on this */ }
+          send({ t: 'out', data: `kept=${kept}\n` });
+        }
+        shuttingDown = true;
         end(0); cleanup(); try { await ctx.close(); } catch (e) { /* going anyway */ } process.exit(0);
       }
 
@@ -432,6 +555,27 @@ async function serveMode(profile, sock, broker, input) {
         return;
       }
 
+      // THE SITE'S TAB IN FRONT, AT ONCE (DIVE-7257). A person is being shown
+      // this window for one site; the viewer must not queue behind a run, and
+      // bringing a tab forward reads and loads nothing the lease protects.
+      // In input mode it presses keys (DIVE-7674), so it never types into a
+      // request in flight: it waits a moment for one to end, and holds the
+      // window while it types.
+      if (req.op === 'front') {
+        let held = false;
+        try {
+          if (input) {
+            const until = Date.now() + FRONT_IDLE_WAIT_MS;
+            while (busy && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
+            if (!busy) { busy = { op: 'front', seat: behalf, since: Date.now() }; held = true; }
+          }
+          await frontRequest(ctx, input, req, send, end, input && !held);
+        }
+        catch (e) { send({ t: 'err', msg: e && e.message ? e.message : String(e) }); end(E_FAILED); }
+        finally { if (held) busy = null; }
+        return;
+      }
+
       // ONE REQUEST AT A TIME — AND A SHORT WAIT, THEN A REFUSAL (DIVE-4927).
       // This used to refuse on the spot, on the theory that the lease already
       // serialises callers so a second request mid-run must be one that skipped
@@ -460,8 +604,10 @@ async function serveMode(profile, sock, broker, input) {
         else if (req.op === 'tree') await treeRequest(ctx, req, send, end);
         else if (req.op === 'snapshot') await snapshotRequest(ctx, req, send, end);
         else if (req.op === 'render') await renderRequest(ctx, req, send, end);
+        else if (req.op === 'read') await readRequest(ctx, req, send, end);
         else if (req.op === 'plan') await planRequest(ctx, req, send, end);
         else if (req.op === 'totp') await totpRequest(ctx, profile, req, send, end);
+        else if (req.op === 'download') await downloadRequest(ctx, req, send, end);
         else { send({ t: 'err', msg: `unknown op '${req.op}'` }); end(E_NOTHING_RAN); }
       } catch (e) {
         send({ t: 'err', msg: e && e.message ? e.message : String(e) });
@@ -489,14 +635,100 @@ async function serveMode(profile, sock, broker, input) {
   });
   server.on('error', (e) => die(E_UNAVAILABLE, `could not listen on ${sock}: ${e.message}`));
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
-    process.on(sig, async () => { cleanup(); try { await ctx.close(); } catch (e) { /* going anyway */ } process.exit(0); });
+    // The same wait as `shutdown` (DIVE-7314 it3): a signalled stop lets Chrome
+    // write its profile out instead of exiting on the context's close event.
+    process.on(sig, async () => { shuttingDown = true; cleanup(); try { await ctx.close(); } catch (e) { /* going anyway */ } process.exit(0); });
   }
 }
 
+// THE TAB AGENTS DRIVE is the first one, until a person is shown another tab of
+// this window for its site (DIVE-7257, frontRequest): from then on it is that
+// one, so the person watches the tab the agent's next step acts in. It goes back
+// to the first tab when that one closes.
+let driven = null;
 async function pageOf(ctx) {
-  const p = ctx.pages()[0] || await ctx.newPage();
+  if (driven && (driven.isClosed() || !ctx.pages().includes(driven))) driven = null;
+  const p = driven || ctx.pages()[0] || popup.mine(await ctx.newPage());
   p.setDefaultTimeout(STEP_TIMEOUT);
   return p;
+}
+
+// A SITE OF A GROUP SHOWS ITS OWN TAB (DIVE-7257). The sites of a sign-in group
+// share this one window, so the viewer for bing.com showed the Google Play tab
+// that was in front. Before the window is handed to a person: a tab on the
+// site comes to the front (lib/front-tab.cjs picks it), or a new tab opens on the
+// site's URL when none is on it. No other tab is navigated or closed.
+//
+// INPUT MODE (DIVE-7674): no automation channel lists the tabs, so the window's
+// own record decides (lib/front-tab.cjs inputFront): a window last sent to
+// another site gets one new tab on this site's URL, typed through the keyboard;
+// a window already on this site is left as it is. It was "nothing moves" until
+// report 688: Connect for business.facebook.com showed CJ's live session.
+async function frontRequest(ctx, input, req, send, end, inUse) {
+  const url = String(req.url || '');
+  if (!/^https?:\/\/[^\s]+$/i.test(url) || url.length > 2000) {
+    send({ t: 'err', msg: 'front needs the site\'s http(s) url' }); return end(E_NOTHING_RAN);
+  }
+  const host = frontTab.hostOf(url);
+  const out = (o) => send({ t: 'out', data: JSON.stringify(o) + '\n' });
+  if (input) {
+    if (inUse) { out({ host, moved: false, why: 'another request is driving this window, so nothing was typed into it' }); return end(0); }
+    out(await frontTab.inputFront(ctx, url, {
+      sleep: sleepMs, keys: () => keysReachBrowser(ctx),
+      typeUrl: (u) => gotoByKeys(ctx, u),
+    }));
+    return end(0);
+  }
+  let page = frontTab.pick(ctx.pages(), host, driven || ctx.pages()[0]);
+  const opened = !page;
+  if (opened) {
+    page = popup.mine(await ctx.newPage());
+    // Not awaited, as the start URL is not: the person must not wait on a slow
+    // site, and a tab they can see loading beats a viewer that never opens.
+    page.goto(url, { waitUntil: 'domcontentloaded' })
+      .catch((e) => process.stderr.write(`${PROG}: NOTE — could not open ${url}: ${String(e && e.message).split('\n')[0]}\n`));
+  }
+  await page.bringToFront();
+  driven = page;
+  out({ host, moved: true, opened, tab: ctx.pages().indexOf(page) });
+  return end(0);
+}
+
+// THE POPUP AN EARLIER ACT LEFT IN VIEW (DIVE-6392). This browser outlives each
+// request, so the follower of the last act does too: a request on a URL of the
+// popup's own site goes to the popup (an OAuth chooser is answered in the window
+// it opened in, not in a second load of its URL in the main tab), and any other
+// URL goes to the main tab as before. lib/popup.cjs, shared with the cold loop.
+let front = null;
+// The popup a read was just handed because it came after the last act (below):
+// it is read where it is, never navigated to the URL the read named.
+let latePopup = null;
+async function pageFor(ctx, url, { read = false } = {}) {
+  const base = await pageOf(ctx);
+  latePopup = null;
+  if (!front || front.base !== base) {
+    if (front) front.stop();
+    front = popup.follow(base, { stepTimeout: STEP_TIMEOUT });
+  }
+  // A WINDOW THAT CAME AFTER THE LAST ACT'S WAIT (DIVE-7680) is taken now, before
+  // this request picks its page. Box bug 690: Supliful's Google chooser came after
+  // the act's report, and the snapshot with no URL read the sign-up form under it.
+  // A snapshot with no URL names the page the last act reported, which is the
+  // opener: so a READ of the opener's own URL is handed the late popup, the window
+  // on top of it. An act that names that URL still goes to the opener.
+  if (front.waiting) {
+    const before = front.page;
+    front.use({ log: (l) => process.stderr.write(`${PROG}: ${l}\n`) });
+    try { await front.drain(); } catch (e) { /* the page in view is read as it is */ }
+    if (read && front.page !== before && url && sameUrl(base.url(), url)) latePopup = front.page;
+  }
+  front.use({});   // the last request's lines go nowhere now; a plan sets its own
+  return latePopup || front.pageFor(url) || base;
+}
+// A popup still on the URL asked for is not loaded again: a reload of an OAuth
+// window can lose the sign-in it is in the middle of.
+function inPopup(page, url) {
+  return !!front && page !== front.base && (page === latePopup || sameUrl(page.url(), url));
 }
 
 // ---- the probe, and the thing it un-breaks ---------------------------------
@@ -543,6 +775,31 @@ const reOf = (p) => {
   try { return new RegExp(p, 'i'); } catch (e) { return null; }  // bin/browser greps it anyway
 };
 
+// A PAGE THAT IS STILL NAVIGATING HAS NOT ANSWERED YET (DIVE-7648). Shopify's
+// admin redirects admin.shopify.com/ -> /store/<id> and then routes inside the
+// app; a content() that lands in one of those hops throws "Unable to retrieve
+// content because the page is navigating" (or "Execution context was
+// destroyed"), and the probe reported that as a page that did not load. It is
+// "not yet": wait for the next DOM, bounded, and say so with null.
+const NAVIGATING = /page is navigating|Execution context was destroyed/i;
+async function contentOrNull(page, ms) {
+  try { return await page.content(); }
+  catch (e) {
+    if (!NAVIGATING.test(String(e && e.message))) throw e;
+    try { await page.waitForLoadState('domcontentloaded', { timeout: Math.max(1, ms) }); } catch (e2) { /* the next look decides */ }
+    return null;
+  }
+}
+// The same, for a caller that needs a document: a few looks, then the error.
+async function contentSettled(page, ms) {
+  const stop = Date.now() + Math.max(1, ms);
+  for (;;) {
+    const html = await contentOrNull(page, Math.max(1, stop - Date.now()));
+    if (html !== null) return html;
+    if (Date.now() >= stop) throw new Error('the page was still navigating when the wait ran out');
+  }
+}
+
 async function probeRequest(ctx, req, send, end) {
   if (typeof req.url !== 'string' || !/^https?:\/\//.test(req.url)) {
     send({ t: 'err', msg: 'probe needs an http(s) url to load' }); return end(E_NOTHING_RAN);
@@ -550,6 +807,10 @@ async function probeRequest(ctx, req, send, end) {
   const settle = Number(process.env.FIVEDIVE_BROWSER_PROBE_SETTLE_MS || 800);
   const until = (req.until && typeof req.until === 'object') ? req.until : {};
   const positive = reOf(until.logged_in);
+  // WHERE THE PAGE LANDED CAN END THE WAIT TOO (DIVE-7648): an adapter may name
+  // the address a signed-in session lands on. Like the markers, only an early
+  // exit — bin/browser makes the verdict from the final URL it is told.
+  const landed = reOf(until.logged_in_url);
   const marks = [reOf(until.challenge), reOf(until.logged_out), positive].filter(Boolean);
   // THE POSITIVE MARKER IS WHAT MAKES A WAIT TERMINATE, so it is also what
   // permits one. Every request carries a challenge marker (bin/browser has a
@@ -558,41 +819,65 @@ async function probeRequest(ctx, req, send, end) {
   // already had — including the server-rendered adapters that classify on the
   // absence of a login form. Without a logged-in marker this is the old single
   // settle to the millisecond.
-  const deadline = positive
+  const hardMs = Number(req.hard) > 0 ? Math.min(Number(req.hard), PROBE_HARD_MS) : PROBE_HARD_MS;
+  const t0 = Date.now();
+  const left = () => hardMs - (Date.now() - t0);
+  const deadline = (positive || landed)
     ? Math.max(settle, Number(req.wait) > 0 ? Number(req.wait) : PROBE_WAIT_MS)
     : settle;
   const step = Math.min(Number(process.env.FIVEDIVE_BROWSER_PROBE_POLL_MS || 400), Math.max(1, deadline));
-  let page;
-  try {
-    page = await ctx.newPage();
-    page.setDefaultTimeout(Number(process.env.FIVEDIVE_BROWSER_PROBE_TIMEOUT || 20000));
-    await page.goto(req.url, { waitUntil: 'domcontentloaded' });
+  let page, over = false;
+  const urlNow = () => { try { return page.url(); } catch (e) { return ''; } };
+  const said = (html) => (html !== null && marks.some(r => r.test(html))) || (!!landed && landed.test(urlNow()));
+  const work = (async () => {
+    page = popup.mine(await ctx.newPage());
+    if (over) return null;
+    page.setDefaultTimeout(Math.max(1, Math.min(Number(process.env.FIVEDIVE_BROWSER_PROBE_TIMEOUT || 20000), left())));
+    // A REDIRECT THAT INTERRUPTS THE LOAD IS THE LOAD (DIVE-6795's goTo), which
+    // the admin's own hop to /store/<id> can do.
+    await goTo(page, req.url);
     // THE WHOLE DOCUMENT, uncapped, like the cold probe: a challenge banner is
     // as likely to be late in a large DOM as early, and a truncating capture
     // cannot see a marker past the cap. bin/browser greps what comes back.
     await page.waitForTimeout(settle);
-    let html = await page.content();
+    let html = await contentOrNull(page, Math.min(NAV_SETTLE_MS, left()));
     let waited = settle;
     // NEVER `networkidle`: a web app that long-polls never idles, and waiting
     // for it is what made a `read` hang for 150s on a real box. The evidence
     // itself is the signal instead — the first document in which the page has
-    // said something about its login state is the one we answer with.
-    while (waited < deadline && !marks.some(r => r.test(html))) {
-      await page.waitForTimeout(step);
+    // said something about its login state is the one we answer with. A look
+    // that met a navigation (null) is a look that said nothing yet.
+    while (!over && waited < deadline && (html === null || !said(html))) {
+      if (html !== null) await page.waitForTimeout(step);
       waited += step;
-      html = await page.content();
+      html = await contentOrNull(page, Math.min(NAV_SETTLE_MS, left()));
     }
+    if (html === null) html = await contentSettled(page, Math.min(NAV_SETTLE_MS, left()));
+    return html;
+  })();
+  try {
+    const html = await within(Math.max(1, hardMs), work,
+      `the page did not settle within ${Math.round(hardMs / 1000)}s; the probe was stopped and the session freed`);
     // WHERE THE PAGE LANDED (DIVE-5388), for the generic check: a redirect to a
     // sign-in path is a signed-out login whatever the page says. A log line, so
     // it reaches the caller's stderr and never the document it greps.
-    if (req.report_url) send({ t: 'log', line: `5dive-probe-final-url: ${page.url()}` });
+    if (req.report_url) send({ t: 'log', line: `5dive-probe-final-url: ${urlNow()}` });
     send({ t: 'out', data: html.endsWith('\n') ? html : html + '\n' });
     end(0);
   } catch (e) {
+    over = true;
     send({ t: 'err', msg: `could not load ${req.url}: ${e.message}` });
     end(E_FAILED);
   } finally {
-    try { if (page) await page.close(); } catch (e) { /* the tab is going anyway */ }
+    over = true;
+    // The abandoned work may still reject once its tab is gone; that is expected.
+    work.catch(() => {});
+    // NEVER WAIT ON THE CLOSE: a tab whose script never yields can hold close()
+    // as long as it held content(), and the session must be free now.
+    const shut = (p) => { try { Promise.resolve(p.close()).catch(() => {}); } catch (e) { /* going anyway */ } };
+    if (page) shut(page);
+    // A tab newPage() hands over after the deadline is closed when it arrives.
+    else work.finally(() => { if (page) shut(page); }).catch(() => {});
   }
 }
 
@@ -609,7 +894,7 @@ async function totpRequest(ctx, profile, req, send, end) {
   let page;
   try {
     assertLease(req, 'totp');
-    page = await ctx.newPage();
+    page = popup.mine(await ctx.newPage());
     page.setDefaultTimeout(STEP_TIMEOUT);
     const r = await totp.fill(page, profile, { url: req.url, base: req.host,
       settleMs: Number(process.env.FIVEDIVE_BROWSER_RUN_SETTLE_MS || 1500) });
@@ -643,24 +928,27 @@ async function renderRequest(ctx, req, send, end) {
   let page;
   try {
     assertLease(req, 'render');
-    page = await ctx.newPage();
+    page = popup.mine(await ctx.newPage());
     page.setDefaultTimeout(Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || STEP_TIMEOUT));
     const w = Number(req.width) || 1280, h = Number(req.height) || 800;
     if (typeof page.setViewportSize === 'function') {
       try { await page.setViewportSize({ width: w, height: h }); } catch (e) { /* headed ctx may refuse */ }
     }
     await page.goto(req.url, { waitUntil: 'domcontentloaded' });
+    const inter = await aria.waitInterstitial(page);   // DIVE-6317, as snapshot
     // `read --wait-for` on a brokered seat (DIVE-4983), the same wait snapshot has.
     const waited = req.wait_for
-      ? await aria.waitForVisible(page, String(req.wait_for), { timeoutMs: STEP_TIMEOUT }) : null;
+      ? await aria.waitForPast(page, String(req.wait_for), inter, { timeoutMs: STEP_TIMEOUT }) : null;
     await page.waitForTimeout(Number(req.wait) || Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
     const buf = await page.screenshot({ fullPage: !!req.full });
-    const html = await page.content();
+    // A client-side redirect mid-render is "not yet", not a failed shot (DIVE-7648).
+    const html = await contentSettled(page, NAV_SETTLE_MS);
     send({ t: 'out', data: JSON.stringify({
       url: req.url,
       png: Buffer.isBuffer(buf) ? buf.toString('base64') : Buffer.from(String(buf)).toString('base64'),
       html,
       ...(waited ? { wait_for: waited } : {}),
+      ...(inter ? { interstitial: inter } : {}),
     }) + '\n' });
     end(0);
   } catch (e) {
@@ -671,17 +959,103 @@ async function renderRequest(ctx, req, send, end) {
   }
 }
 
+// ---- download: the bytes at one URL (DIVE-7646) ----
+//
+// Fetched through this context's own request client, so the profile's cookies
+// ride along, and sent back as the act's download lines (lib/downloads.cjs
+// stream): this process is the profile's OWNER and never writes a path the
+// caller chose (DIVE-4662). No tab is opened, so a person at the viewer is not
+// navigated away. One line {act_download, i:0, name, bytes, type} then the chunks,
+// or {act_download, i:0, name, error} and exit 1.
+async function downloadRequest(ctx, req, send, end) {
+  if (typeof req.url !== 'string' || !/^https?:\/\//.test(req.url)) {
+    send({ t: 'err', msg: 'download needs an http(s) url' }); return end(E_NOTHING_RAN);
+  }
+  try { assertLease(req, 'download'); } catch (e) { send({ t: 'err', msg: e.message }); return end(E_FAILED); }
+  const r = await downloads.fetchFile(ctx, req.url);
+  if (!r.ok) {
+    send({ t: 'out', data: JSON.stringify({ act_download: true, i: 0, name: downloads.safeName(downloads.nameFrom({}, req.url), new Set()), error: r.error }) + '\n' });
+    return end(E_FAILED);
+  }
+  let dir = null;
+  try {
+    dir = fs.mkdtempSync(path.join(require('os').tmpdir(), '5dive-dl-'));
+    const entries = await downloads.save({ list: [], files: [{ name: r.name, type: r.type, buf: r.buf }] }, dir);
+    downloads.stream(entries, (line) => send({ t: 'out', data: line }));
+    end(entries[0] && entries[0].error ? E_FAILED : 0);
+  } catch (e) {
+    send({ t: 'err', msg: `the file was fetched but could not be handed back: ${e.message}` });
+    end(E_FAILED);
+  } finally {
+    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* its TMPDIR is reaped */ } }
+  }
+}
+
+// ---- read: several pages in ONE request, loaded side by side (DIVE-6771) ----
+//
+// `read <url> <url>…` on a served profile used to send one `render` per page,
+// and this loop takes one request at a time: on the bench rig the three R1
+// pages came back ~10 s apart (35.7 s, against 9.4 s for one), each one also
+// sitting through `read`'s 8 s --virtual-time-budget as a REAL wait and taking
+// a screenshot nobody asked for. Here every page gets its own tab (a person at
+// the viewer is not navigated away), all of them load at once, and each waits
+// only the settle the cold executor's readMode waits. No PNG: a read keeps the
+// document. A page that fails is named in its own entry; the others still land.
+async function readRequest(ctx, req, send, end) {
+  const urls = Array.isArray(req.urls) ? req.urls : [];
+  if (!urls.length || urls.length > 5 || !urls.every((u) => typeof u === 'string' && /^https?:\/\//.test(u))) {
+    send({ t: 'err', msg: 'read needs one to five http(s) urls' }); return end(E_NOTHING_RAN);
+  }
+  try { assertLease(req, 'read'); } catch (e) { send({ t: 'err', msg: e.message }); return end(E_FAILED); }
+  const settle = Number(req.wait) || TREE_SETTLE_MS;
+  // THE PAGE THE BROWSER IS ALREADY ON IS READ AS IT IS (DIVE-6778), as snapshot reads
+  // it: `snapshot <url>` then `links <url>` loaded the same page a second time.
+  let shown = null;
+  try { shown = await pageFor(ctx, urls[0], { read: true }); } catch (e) { shown = null; }
+  const pages = await Promise.all(urls.map(async (url) => {
+    let page;
+    try {
+      return await within(READ_PAGE_MS, (async () => {
+        if (shown && (inPopup(shown, url) || isOn(shown, url))) {
+          return { url, ok: true, html: await shown.content(), shown: true };
+        }
+        page = popup.mine(await ctx.newPage());
+        page.setDefaultTimeout(Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || STEP_TIMEOUT));
+        // The default settle ends when this tab is quiet (DIVE-6778); a --wait is waited in full.
+        const watch = !Number(req.wait) && typeof page.context === 'function' ? aria.requestWatch(page) : null;
+        await page.goto(url, { waitUntil: 'domcontentloaded' });
+        const inter = await aria.waitInterstitial(page, { timeoutMs: Math.min(READ_PAGE_MS / 2, 20000) });
+        await aria.settleQuiet(page, settle, watch);
+        const html = await page.content();
+        return { url, ok: true, html, ...(inter ? { interstitial: inter } : {}) };
+      })(), `the page did not finish loading within ${Math.round(READ_PAGE_MS / 1000)} s; nothing of it was read`);
+    } catch (e) {
+      return { url, ok: false, error: e.message };
+    } finally {
+      // Not awaited: closing a tab whose script never yields can hang too.
+      try { if (page) page.close().catch(() => { /* the tab is going anyway */ }); } catch (e) { /* same */ }
+    }
+  }));
+  // One page at a time: the extraction is CPU, and the tabs are already closed.
+  for (const p of pages) if (p.ok) p.extracted = await extractFor(req, p.html, p.url);
+  send({ t: 'out', data: JSON.stringify({ pages }) + '\n' });
+  end(0);
+}
+
 async function treeRequest(ctx, req, send, end) {
   if (typeof req.url !== 'string' || !/^https?:\/\//.test(req.url)) {
     send({ t: 'err', msg: 'tree needs an http(s) url to enumerate' }); return end(E_NOTHING_RAN);
   }
   try {
-    const page = await pageOf(ctx);
+    const page = await pageFor(ctx, req.url, { read: true });
     assertLease(req, 'tree');
-    await page.goto(req.url, { waitUntil: 'domcontentloaded' });
+    // Not reloaded when the browser is already on it (DIVE-6778), as snapshot.
+    const stay = inPopup(page, req.url) || isOn(page, req.url);
+    if (!stay) await goTo(page, req.url);
     // NEVER network idle: a live web app long-polls and never idles — that is
     // what makes a `read` hang for 150s on a real Gmail.
-    await page.waitForTimeout(settleOf(req, TREE_SETTLE_MS));
+    const settle = settleOf(req, stay ? 0 : TREE_SETTLE_MS);
+    if (settle > 0) await page.waitForTimeout(settle);
     const { nodes } = await aria.walk(page, { interactiveOnly: !!req.interactive });
     send({ t: 'out', data: JSON.stringify({ url: req.url, nodes }) + '\n' });
     end(0);
@@ -735,14 +1109,52 @@ async function snapshotRequest(ctx, req, send, end) {
     return end(E_NOTHING_RAN);
   }
   try {
-    const page = await pageOf(ctx);
+    const page = await pageFor(ctx, req.url, { read: true });
     assertLease(req, 'snapshot');
-    await page.goto(req.url, { waitUntil: 'domcontentloaded' });
-    // --wait-for (DIVE-4983), exactly as the cold driver's snapshotMode does it.
-    const waited = req.wait_for
-      ? await aria.waitForVisible(page, String(req.wait_for), { timeoutMs: STEP_TIMEOUT }) : null;
-    await page.waitForTimeout(settleOf(req, TREE_SETTLE_MS));
+    if (page === latePopup) {
+      send({ t: 'log', line: `  a popup opened after the last act: ${popup.hostOf(page.url())}. It is on top of ${popup.hostOf(req.url)}, so this read is of it (${page.url()}).` });
+    }
+    // The document's HTTP status, as the cold driver records it (DIVE-6725).
+    let resp = null;
+    // THE PAGE THE BROWSER IS ALREADY ON IS READ AS IT IS (DIVE-6778), as `act`'s
+    // own URL already is (DIVE-5817). The reload cost a full page load plus the
+    // settle on every snapshot after an act (bench: 8.8 s median against 0.4 s for
+    // agent-browser's snapshot), and it threw away what the act had just done to
+    // the page: a typed value, an open menu. No load, so no settle either: the
+    // act that left the page here already waited its own.
+    // A SNAPSHOT WITH NO URL (req.here, DIVE-7801) is the page in view, wherever it
+    // went: the url it names is only the last act's, kept to pick the tab. Box bug
+    // 738: a same-tab OAuth redirect left that tab on Google's chooser, and a load
+    // of its URL again would replay a sign-in already under way.
+    const stay = !!req.here || inPopup(page, req.url) || isOn(page, req.url);
+    // A late popup (DIVE-7680) is read at its own address, not the one the read named.
+    const readAt = page === latePopup || req.here ? String(page.url()) : req.url;
+    if (stay) send({ t: 'log', line: `  the browser is already on ${readAt}; read as it is, not reloaded` });
+    // The load's settle ends when the page is quiet, as act's does (DIVE-6778).
+    const watch = !stay && typeof page.context === 'function' ? aria.requestWatch(page.context()) : null;
+    let inter, waited, loading = false;
+    try {
+      if (!stay) resp = await goTo(page, req.url);
+      // A Cloudflare "Just a moment..." clears in this same load, or not at all
+      // (DIVE-6317). A --wait-for behind one that never cleared would only wait again.
+      inter = await aria.waitInterstitial(page);
+      // --wait-for (DIVE-4983), exactly as the cold driver's snapshotMode does it,
+      // bounded as an act's wait_for is (DIVE-7303): a miss waited 30 s on the bench.
+      waited = req.wait_for
+        ? await aria.waitForPast(page, String(req.wait_for), inter, { timeoutMs: stepLimit(req) }) : null;
+      // The settle never waits for the network to go quiet (a page with ads never
+      // does); it SAYS so instead (DIVE-7303), so the agent knows a late part may
+      // still come and can look again, as Claude in Chrome's agent does.
+      const settle = settleOf(req, stay ? 0 : TREE_SETTLE_MS);
+      if (settle > 0) loading = !(await aria.settleQuiet(page, settle, watch)) && !!watch;
+    } finally { if (watch) watch.stop(); }
     const snap = await aria.snapshot(page, { interactiveOnly: !!req.interactive });
+    // The agent has now seen this tab: the next act on it says what changed since.
+    if (req.look) {
+      let text = '';
+      try { text = String(await page.evaluate(aria._textIn, { textOf: true }) || ''); } catch (e) { /* refs alone */ }
+      looks.remember(page, look.lookOf(snap.url || req.url, snap.nodes, text));
+    }
     let png = null;
     if (!inline) {
       fs.writeFileSync(req.html, snap.html || '', { mode: 0o600 });
@@ -752,7 +1164,7 @@ async function snapshotRequest(ctx, req, send, end) {
       png = Buffer.isBuffer(buf) ? buf.toString('base64') : Buffer.from(String(buf)).toString('base64');
     }
     send({ t: 'out', data: JSON.stringify({
-      url: snap.url || req.url,
+      url: snap.url || readAt,
       title: snap.title || '',
       nodes: snap.nodes || [],
       html_bytes: Buffer.byteLength(snap.html || ''),
@@ -760,12 +1172,67 @@ async function snapshotRequest(ctx, req, send, end) {
       html_inline: inline ? (snap.html || '') : undefined,
       png_b64: png,
       ...(waited ? { wait_for: waited } : {}),
+      ...(inter ? { interstitial: inter } : {}),
+      ...(loading ? { still_loading: true } : {}),
+      // A served browser is a headed one (the launch above), recorded as the cold one is.
+      browser_mode: 'headed',
+      // The popup this was read from, when it is one (DIVE-7680).
+      ...(front && page !== front.base && front.popup ? { popup: front.popup } : {}),
+      ...(resp ? { http_status: resp.status() } : {}),
+      extracted: await extractFor(req, snap.html, snap.url || readAt),
     }) + '\n' });
     end(0);
   } catch (e) {
     send({ t: 'err', msg: `could not capture ${req.url}: ${e.message}` });
     end(E_NOTHING_RAN);
   }
+}
+
+// The same page, as a browser normalises it (`https://a.test` is `https://a.test/`).
+// The fragment counts: a hash-routed app's `#/inbox` and `#/drafts` are two pages.
+function sameUrl(a, b) {
+  try { return new URL(a).href === new URL(b).href; } catch (e) { return false; }
+}
+// WHERE A PAGE WAS SENT, AND WHERE IT LANDED (DIVE-6778). `snapshot https://www.amtrak.com/`
+// lands on /home, and the agent's next `links https://www.amtrak.com/` loaded the
+// site again in a new tab (9-11 s on the bench) because neither URL equals the
+// other. A page is on <url> when it shows it, or when <url> is what its last goto
+// asked for and it has not moved since.
+const sentTo = new WeakMap();
+// A LOAD THE PAGE'S OWN REDIRECT INTERRUPTED IS THAT PAGE, LOADED (DIVE-6795).
+// The served browser is started ON the first url; when the site redirects it
+// (amtrak.com -> /home) while the snapshot's goto runs, Playwright throws
+// "interrupted by another navigation", and 2 of the bench's first 5 snapshots
+// died on it (exit 69, then a second call). The navigation that won is waited for.
+// ...AND SO IS A LOAD THAT ABORTED BECAUSE THE SAME SITE WAS STILL LOADING
+// (DIVE-7303). The first snapshot of the public profile starts the served browser
+// ON its url, then loads it again; Chrome drops one of the two with
+// net::ERR_ABORTED, and 8 of the fresh-100 bench's jobs opened with that exit 69
+// and a second call that found the browser already there. When the page did land
+// on the site it was sent to, that is the load; anywhere else, or still on the
+// page it left (a same-site download aborts too), the error stands.
+const sameOrigin = (a, b) => { try { return new URL(a).origin === new URL(b).origin; } catch (e) { return false; } };
+async function goTo(page, url) {
+  let resp = null, before = '';
+  try { before = page.url(); } catch (e) { /* none */ }
+  try { resp = await page.goto(url, { waitUntil: 'domcontentloaded' }); }
+  catch (e) {
+    const msg = String(e && e.message);
+    if (/net::ERR_ABORTED/.test(msg)) {
+      try { await page.waitForLoadState('domcontentloaded'); } catch (e2) { /* judged by where it is */ }
+      if (!sameOrigin(page.url(), url) || page.url() === before) throw e;
+    } else {
+      if (!/interrupted by another navigation/.test(msg)) throw e;
+      await page.waitForLoadState('domcontentloaded');
+    }
+  }
+  try { sentTo.set(page, { asked: url, landed: page.url() }); } catch (e) { /* only a shortcut is lost */ }
+  return resp;
+}
+function isOn(page, url) {
+  if (sameUrl(page.url(), url)) return true;
+  const s = sentTo.get(page);
+  return !!s && s.landed === page.url() && sameUrl(s.asked, url);
 }
 
 async function planRequest(ctx, req, send, end) {
@@ -786,6 +1253,10 @@ async function planRequest(ctx, req, send, end) {
         e.nothingRan = true; throw e;
       }
       const out = { op: s.op };
+      // DIVE-6844: the site a saved login is for (bin/browser sets it, never a page).
+      if ((s.op === 'fill' || s.op === 'type') && typeof s.host === 'string' && s.host) out.host = s.host;
+      // DIVE-7237: an act's upload carries the file's bytes, read by the calling seat.
+      if (s.op === 'upload' && s.file && typeof s.file === 'object' && typeof s.file.b64 === 'string') out.file = s.file;
       for (const field of spec) {
         if (typeof s[field] !== 'string' || !s[field]) {
           const e = new Error(`step ${i + 1} (${s.op}) is missing '${field}'`); e.nothingRan = true; throw e;
@@ -815,19 +1286,40 @@ async function planRequest(ctx, req, send, end) {
   // that throws may already have navigated, a click may already have posted. The
   // expensive direction is claiming nothing ran when something did — that is the
   // blind retry that double-posts.
-  let stepsRun = 0, needsOwner = null, retry = null, at = -1;
+  let stepsRun = 0, signedIn = false, needsOwner = null, retry = null, at = -1, lastOp = null;
+  const stepMs = stepLimit(req);
   let page;
-  try { page = await pageOf(ctx); }
+  // The act's own URL picks the window (DIVE-6392): the popup an earlier act left
+  // open when it is on that popup's site or the act names no URL, otherwise the main tab.
+  const first = resolved[0] && resolved[0].op === 'goto' ? resolved[0].url : null;
+  try { page = await pageFor(ctx, first); }
   catch (e) {
     send({ t: 'err', msg: `the session is open but would not give up a page: ${e.message}` });
     send({ t: 'err', msg: 'not one step ran, so nothing was published and there is nothing to re-read.' });
     return end(E_NOTHING_RAN);
   }
+  // A FILE A CLICK DOWNLOADS (DIVE-5751), watched from before step one and handed
+  // back after the re-read — lib/downloads.cjs, shared with the one-shot loop.
+  const dl = (req.report && req.report.downloads) ? downloads.watch(ctx, page) : null;
+  // The requests the steps start, on every tab of the context (a popup's too), so
+  // the settles below end when the page is quiet (DIVE-6778, lib/aria.cjs settleQuiet).
+  const watch = typeof page.context === 'function' ? aria.requestWatch(page.context()) : null;
+  const done = () => { front.use({}); if (watch) watch.stop(); };
+  const quiet = watch ? (ms) => aria.settleQuiet(front.page, ms, watch) : null;
+  if (page === front.base) front.home();
+  front.use({
+    log: (l) => send({ t: 'log', line: `  ${l}` }),
+    onOpen: async (p) => {
+      const inter = await aria.waitInterstitial(p);   // watched, never clicked (DIVE-6317)
+      if (inter) send({ t: 'log', line: `  the popup's "${inter.title}" ${inter.cleared ? `cleared by itself after ${inter.waited_ms} ms` : `was still there after ${inter.waited_ms} ms`}` });
+    },
+  });
   try {
     for (let i = 0; i < resolved.length; i++) {
       const s = resolved[i];
       const where = `step ${i + 1} (${s.op})`;
       at = i;
+      page = await front.sync(lastOp, quiet);
       // BEFORE THE RESOLVE AND BEFORE THE COUNTER. Both touch the page, and the
       // point is to touch nothing once the browser is someone else's.
       assertLease(req, where);
@@ -836,7 +1328,17 @@ async function planRequest(ctx, req, send, end) {
       // the other one, because the defect was that there are two of them.
       // One retry on a picked element when a ref matches nothing — the same call
       // as the one-shot driver's loop (lib/aria.cjs resolveOrRepick).
-      const { sel, retry: r } = await aria.resolveOrRepick(page, s, i + 1, { timeoutMs: STEP_TIMEOUT });
+      // GOOGLE'S SIGN-IN PAGES (DIVE-6228), before the step touches one: a password,
+      // a code, a robot check, adding an account or a wider grant stops the plan
+      // here, whatever the steps say. lib/google-signin.cjs, shared by both loops.
+      const gs = await gsignin.stepStop(page, s, (req && req.gates) || []);
+      if (gs) {
+        send({ t: 'err', msg: gsignin.STOP_PREFIX.trim() + ' ' + JSON.stringify(gs) });
+        throw new Error(`${where}: not run. ${gs.why}`);
+      }
+      // DIVE-7168: the sign-in the guard allowed, said once per act for the owner's record.
+      if (!signedIn) { const gg = await gsignin.stepGrant(page, s); if (gg) { signedIn = true; send({ t: 'err', msg: gsignin.GRANT_PREFIX.trim() + ' ' + JSON.stringify(gg) }); } }
+      const { sel, retry: r } = await aria.resolveOrRepick(page, s, i + 1, { timeoutMs: stepMs });
       if (r) assertLease(req, where);
       retry = r;
       // THE OWNER'S FOUR (DIVE-4943) — the same check, in the same place, as the
@@ -853,33 +1355,67 @@ async function planRequest(ctx, req, send, end) {
       // step that may have acted, and the owner's check is read again on it —
       // lib/aria.cjs onRef, shared by both loops.
       const on = (act) => aria.onRef(page, s, sel, act, {
-        timeoutMs: STEP_TIMEOUT, log: (l) => send({ t: 'log', line: `  ${l}` }),
+        timeoutMs: stepMs, log: (l) => send({ t: 'log', line: `  ${l}` }),
         check: (req.guard && !req.approved) ? async (x) => {
           const k = await aria.stepRisk(page, s, x);
           return !k || (Array.isArray(req.allow_kinds) && req.allow_kinds.includes(k.cls));
         } : null,
       });
+      // DIVE-6844: a saved login carries the site it is for, and is typed on
+      // no other (the page may have moved since the act began). Checked here,
+      // not on the case lines, which older harnesses match byte for byte.
+      if (s.op === 'fill' || s.op === 'type') savedHostCheck(page, s);
+      // DIVE-7237: an act's upload carries the file's bytes, read by the caller
+      // (who may hold files this browser's seat cannot open); an adapter's names a path.
+      if (s.op === 'upload' && s.file && typeof s.file.b64 === 'string') {
+        s.path = { name: String(s.file.name || 'upload'), mimeType: String(s.file.mimeType || 'application/octet-stream'), buffer: Buffer.from(s.file.b64, 'base64') };
+      }
+      let landedFile = false;   // DIVE-7646: a file is no page to judge a landing by
       switch (s.op) {
         case 'goto': {
-          await page.goto(s.url, { waitUntil: 'domcontentloaded' });
+          // THE ACT'S OWN URL DOES NOT RELOAD THE PAGE IT IS ALREADY ON (DIVE-5817).
+          // `act <url>` puts a goto in front of the steps; in a served browser
+          // that sat on <url> since the last act, the reload threw away what the
+          // page held (a 6-digit code box a site had just opened). Only that
+          // first, caller-less goto, and only on an exact URL match: a goto the
+          // steps name themselves still navigates, which is how to ask for a reload.
+          // A popup an earlier act left on this URL is never reloaded either (DIVE-6392).
+          if (i === 0 && (req.stay === true || inPopup(page, s.url)) && sameUrl(page.url(), s.url)) {
+            send({ t: 'log', line: `  ${where}: already on ${s.url}; not reloaded, so the page keeps what it holds` });
+            break;
+          }
+          // A GOTO THAT LANDS ON A FILE HANDS IT OVER (DIVE-7646), as the cold driver.
+          let resp = null;
+          try { resp = await goTo(page, s.url); }
+          catch (e) {
+            if (!(dl && /Download is starting/.test(String(e && e.message)))) throw e;
+            send({ t: 'log', line: `  ${where}: ${s.url} is a file, and it is downloading` });
+            landedFile = true;
+            break;
+          }
+          const kept = await downloads.keepResponse(dl, ctx, resp);
+          if (kept) { send({ t: 'log', line: `  ${where}: ${s.url} is a file (${kept.type || 'attachment'}); it is handed over with the act` }); landedFile = true; break; }
+          const inter = await aria.waitInterstitial(page);   // DIVE-6317
+          if (inter) send({ t: 'log', line: `  ${where}: "${inter.title}" ${inter.cleared ? `cleared by itself after ${inter.waited_ms} ms` : `was still there after ${inter.waited_ms} ms`}` });
           const ms = settleOf(req, RUN_SETTLE_MS);
-          if (ms > 0) await page.waitForTimeout(ms);
+          if (ms > 0) await aria.settleQuiet(page, ms, watch);
           break;
         }
         case 'fill':     await on((x, timeout) => page.fill(x, s.value, { timeout })); break;
-        case 'type':     await aria.typeKeys(page, sel, s.value, s.delay_ms, { timeoutMs: STEP_TIMEOUT }); break;
-        case 'click':    await on((x, timeout) => page.click(x, { timeout })); break;
-        case 'wait_for': await page.waitForSelector(sel); break;
+        case 'type':     await aria.typeKeys(page, sel, s.value, s.delay_ms, { timeoutMs: stepMs }); break;
+        case 'click':    await on((x, timeout) => aria.clickStep(page, s, x, timeout, { log: (l) => send({ t: 'log', line: `  ${l}` }) })); break;
+        case 'wait_for': await page.waitForSelector(sel, { timeout: stepMs }); break;
         case 'select':   await on((x, timeout) => page.selectOption(x, s.value, { timeout })); break;
         case 'upload':   await on((x, timeout) => page.setInputFiles(x, s.path, { timeout })); break;
         case 'press':    await on((x, timeout) => page.press(x, s.key, { timeout })); break;
       }
       if (retry) send({ t: 'log', line: `  ${retry}ok` });
       retry = null;
+      lastOp = s.op;
       send({ t: 'log', line: `  ${where} ok` });
       // WHERE THE GOTO LANDED (DIVE-4991), said every time, exactly as the cold
       // driver says it. This IS the served browser, so there is nothing to retry in.
-      if (s.op === 'goto' && req.landing) {
+      if (s.op === 'goto' && req.landing && !landedFile) {
         const land = await aria.checkLanding(page, s.url, req.landing);
         if (land.line) send({ t: 'log', line: land.line });
         if (land.loginWall) throw new Error(`${where}: ${land.loginWall}`);
@@ -888,19 +1424,30 @@ async function planRequest(ctx, req, send, end) {
     at = -1;
   } catch (e) {
     if (retry) send({ t: 'log', line: `  ${retry}failed` });
-    send({ t: 'err', msg: e.message });
+    // Without Playwright's 30-line "Call log:" (DIVE-6795, aria.stepErrorText).
+    send({ t: 'err', msg: aria.stepErrorText(e.message) });
     // Which step (DIVE-4990), exactly as the one-shot driver says it.
     if (at >= 0) send({ t: 'err', msg: aria.STEP_FAILED_PREFIX.trim() + ' ' + JSON.stringify(aria.failedStep(at + 1, resolved[at], e)) });
     if (!stepsRun) {
+      if (dl) dl.stop();
       send({ t: 'err', msg: 'the session was open but not one step ran, so nothing was published and ' +
         'there is nothing to re-read.' });
+      done();
       return end(E_NOTHING_RAN);
     }
-    await sendReport(page, req, send);
+    // The step that failed may have opened the popup: the re-read shows it either way.
+    try { page = await front.sync(resolved[at] ? resolved[at].op : lastOp); } catch (e2) { /* re-read the page we have */ }
+    await sendReport(page, req, send, { failed: true, watch });
+    done();
+    await sendDownloads(dl, send);
     return end(E_FAILED);
   }
   if (needsOwner) send({ t: 'err', msg: aria.NEEDS_OWNER_PREFIX.trim() + ' ' + JSON.stringify(needsOwner) });
-  await sendReport(page, req, send);
+  page = await front.sync(lastOp, quiet);
+  // A click whose page went quiet inside the popup wait has settled already.
+  await sendReport(page, req, send, { watch, settled: front.settled });
+  done();
+  await sendDownloads(dl, send);
   // THE SESSION STAYS WARM AND THE PAGE STAYS WHERE IT IS. Closing the context
   // here would give back exactly the launch this daemon exists to stop paying.
   end(needsOwner ? aria.E_NEEDS_OWNER : 0);
@@ -909,27 +1456,93 @@ async function planRequest(ctx, req, send, end) {
 // `act`'s re-read (DIVE-4943), sent back INLINE: the caller may be a brokered
 // seat that cannot hand this process a path (the DIVE-4794 trade `snapshot`
 // already makes). One `out` line of JSON, and only when the request asked.
-async function sendReport(page, req, send) {
+async function sendReport(page, req, send, { failed = false, watch = null, settled = false } = {}) {
   if (!req.report) return;
   const r = req.report;
   try {
-    // DIVE-4983: the same wait, --expect window and refs the cold driver's report takes.
-    const after = await aria.pageAfter(page, {
-      settleMs: settleOf(req, RUN_SETTLE_MS), waitFor: r.wait_for || null, waitTimeoutMs: STEP_TIMEOUT,
-      expect: r.expect || null, expectWaitMs: Number(r.expect_wait_ms) || 0,
+    // DIVE-4983: the same wait, --expect window and refs the cold driver's report takes,
+    // and nothing waited for after a failed step (DIVE-6778, as the cold driver): a
+    // step that timed out changed nothing, so its re-read settles 0.3 s, not 1.2 s.
+    const readOpts = (ms) => ({
+      settleMs: ms, waitFor: failed ? null : (r.wait_for || null), waitTimeoutMs: STEP_TIMEOUT,
+      expect: r.expect || null, expectWaitMs: failed ? 0 : (Number(r.expect_wait_ms) || 0),
       walk: r.tree ? { interactiveOnly: !!r.interactive } : null,
-      scope: r.scope || null,
+      scope: r.scope || null, expectDoc: !!r.expect_doc, watch,
     });
-    let png = null;
-    if (r.shot) {
-      const buf = await page.screenshot({});
-      png = Buffer.isBuffer(buf) ? buf.toString('base64') : Buffer.from(String(buf)).toString('base64');
+    const shoot = async (pg) => {
+      if (!r.shot) return null;
+      const buf = await pg.screenshot({});
+      return Buffer.isBuffer(buf) ? buf.toString('base64') : Buffer.from(String(buf)).toString('base64');
+    };
+    let after = await aria.pageAfter(page, readOpts(failed ? Math.min(FAILED_SETTLE_MS, settleOf(req, RUN_SETTLE_MS)) : settled && req.settle === undefined ? 0 : settleOf(req, RUN_SETTLE_MS)));
+    // ONE REPORT, ONE PAGE (DIVE-7680): a window that arrived during the settle is
+    // the page in view, so the report is of it; and a page that moved between the
+    // read and the picture is read again, so url, title, refs and png agree.
+    if (front && front.waiting) {
+      const was = page;
+      try { page = await front.drain(); } catch (e) { /* the page we have */ }
+      if (page !== was) after = await aria.pageAfter(page, readOpts(POPUP_REREAD_SETTLE_MS));
     }
-    send({ t: 'out', data: JSON.stringify({ act_report: true, url: after.url, title: after.title,
-      html_inline: after.html, png_b64: png, text: after.text, nodes: after.nodes,
-      wait_for: after.wait_for, expect_polled_ms: after.expect_polled_ms, scope: after.scope }) + '\n' });
+    // DIVE-8051: the picture shows what --expect matched, scrolled to it when it is off screen.
+    if (!failed && r.expect && !r.scope && r.shot) {
+      const shown = await aria.showExpect(page, r.expect, after.text);
+      if (shown && shown.scrolled) send({ t: 'log', line: `  the picture is scrolled to what --expect matched: "${shown.text}"` });
+    }
+    let png = await shoot(page);
+    const moved = aria.movedSince(page, after);
+    if (moved) {
+      send({ t: 'log', line: `  the page moved while it was being read (${moved}); read again so the picture and the page agree` });
+      after = await aria.pageAfter(page, readOpts(POPUP_REREAD_SETTLE_MS));
+      png = await shoot(page);
+    }
+    // WHAT CHANGED SINCE THE AGENT LAST SAW THIS TAB (DIVE-6795), when asked. A
+    // scoped re-read is one element's text, not the page's, so it is no look.
+    const seen = req.look && !after.scope && Array.isArray(after.nodes)
+      ? looks.since(page, look.lookOf(after.url, after.nodes, after.text)) : undefined;
+    const report = { act_report: true, url: after.url, title: after.title,
+      text: after.text, values: after.values,
+      wait_for: after.wait_for, expect_polled_ms: after.expect_polled_ms, scope: after.scope,
+      // DIVE-6392: the mode the steps ran in (a served browser is headed), and the
+      // popup in view when there is one.
+      browser_mode: 'headed', popup: (front && front.popup) || null,
+      look: seen,
+      extracted: await extractFor(req, after.html, after.url) };
+    // SPLIT, when the caller asked (DIVE-6795): the document, the picture and the
+    // refs each on a line of their own, so bin/browser reads the small report
+    // without parsing megabytes of HTML six times over (1.6 s on a Wikipedia
+    // article). Base64 for the two files: a sed and a decode, no JSON parse. A
+    // caller that did not ask gets the one line it always got.
+    if (!req.split) {
+      send({ t: 'out', data: JSON.stringify({ ...report, html_inline: after.html, png_b64: png, nodes: after.nodes }) + '\n' });
+    } else {
+      send({ t: 'out', data: JSON.stringify(report) + '\n' });
+      send({ t: 'out', data: '{"act_html_b64":"' + Buffer.from(after.html || '').toString('base64') + '"}\n' });
+      if (png) send({ t: 'out', data: '{"act_png_b64":"' + png + '"}\n' });
+      if (Array.isArray(after.nodes)) send({ t: 'out', data: JSON.stringify({ act_tree: true, url: after.url, title: after.title, nodes: after.nodes }) + '\n' });
+    }
   } catch (e) {
     send({ t: 'err', msg: `the steps ran but the page could not be re-read afterwards: ${e.message}` });
+  }
+}
+
+// The downloads an act started (DIVE-5751), sent back INLINE for the reason the
+// re-read is: this process is the profile's owner, the caller may be another
+// seat, and the owner writing a caller-chosen path is the DIVE-4662 hole. Saved
+// into a directory of this process's own (its TMPDIR is private, DIVE-5190),
+// streamed as chunk lines, and removed. Never fatal: the steps already ran.
+async function sendDownloads(dl, send) {
+  if (!dl) return;
+  dl.stop();
+  if (!dl.list.length && !dl.files.length) return;
+  let dir = null;
+  try {
+    dir = fs.mkdtempSync(path.join(require('os').tmpdir(), '5dive-act-dl-'));
+    const entries = await downloads.save(dl, dir);
+    downloads.stream(entries, (line) => send({ t: 'out', data: line }));
+  } catch (e) {
+    send({ t: 'err', msg: `the act started a download that could not be handed back: ${e.message}` });
+  } finally {
+    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* its TMPDIR is reaped */ } }
   }
 }
 
@@ -962,6 +1575,10 @@ async function sendReport(page, req, send) {
 const INPUT_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_SETTLE_MS || 1200);
 const INPUT_GOTO_SETTLE_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_GOTO_SETTLE_MS || 2500);
 const INPUT_WINDOW_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_WINDOW_WAIT_MS || 20000);
+// DIVE-7572: how long a typed address gets to LOAD before the read says it did
+// not. INPUT_GOTO_SETTLE_MS is the least it waits; this is the most. "Loaded" is
+// the window title no longer being the address (lib/page-load.cjs).
+const INPUT_LOAD_WAIT_MS = Number(process.env.FIVEDIVE_BROWSER_INPUT_LOAD_WAIT_MS || 20000);
 // THE PAGE MUST BE TAKING INPUT BEFORE INPUT IS SENT (quinn's rejection of the
 // first delivery). Measured on Chrome 153 / Xvfb, 2026-09-30: a click and keys
 // sent within ~100ms of a page's title appearing are DROPPED — no mousedown, no
@@ -984,6 +1601,14 @@ function plainArgs(profile, sandbox) {
   const extra = (process.env.FIVEDIVE_BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);
   const args = [`--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check',
     '--window-size=1280,800', '--window-position=0,0', '--disable-features=TranslateUI',
+    // DIVE-6345: a tab behind another is still painted. Chrome stops painting a
+    // background tab, so Claude in Chrome's screenshots of its own working tab
+    // hung for 30 s and the agent looped (10-14 head-to-head). The automated
+    // launch gets the same three from Playwright's defaults already.
+    '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+    '--disable-backgrounding-occluded-windows',
+    // DIVE-7204: the "Restore pages?" bubble sits where a real click can land.
+    '--hide-crash-restore-bubble',
     ...(sandbox ? [] : ['--no-sandbox']), ...extra];
   const bad = args.filter(a => /^--(remote-debugging|enable-automation|headless)/.test(a));
   if (bad.length) {
@@ -997,19 +1622,26 @@ function plainArgs(profile, sandbox) {
 async function inputLaunch(profile, chrome) {
   const x11 = require(path.join(__dirname, '..', 'lib', 'x11.cjs'));
   if (!process.env.DISPLAY) die(E_UNAVAILABLE, 'input mode needs the display the browser is drawn on, and no DISPLAY was set.');
-  // A PROXIED SEAT DOES NOT GET INPUT MODE (DIVE-4951's rule, same reason).
+  // A PROXY WITH A LOGIN DOES NOT GET INPUT MODE (DIVE-4951's rule, same reason).
   // Plain Chrome cannot carry the proxy's login, so it would put this login on
   // the box's own IP — the route the proxy is there to avoid.
+  // A PROXY WITH NO LOGIN DOES (DIVE-7476). --proxy-server takes
+  // scheme://host:port, which is all such a proxy is (`proxy set` refuses a
+  // login on socks5 anyway, so every socks proxy lands here). Refusing it too
+  // closed the one escape a site that refuses the automated browser has: report
+  // 617, amazon.co.jp behind the owner's login-less residential socks5.
   let viaProxy = null;
   try { viaProxy = proxy.launchProxy(profile); } catch (e) { die(E_UNAVAILABLE, e.message); }
-  if (viaProxy) {
-    die(E_UNAVAILABLE, 'this seat has a proxy set, and input mode is plain Chrome, which cannot carry a proxy ' +
-      'login: it would take this login out through the box\'s own IP. Nothing was started. Clear the proxy ' +
-      '(`5dive browser proxy clear`) to use input mode here.');
+  if (viaProxy && (viaProxy.username || viaProxy.password)) {
+    die(E_UNAVAILABLE, 'this seat has a proxy with a login set, and input mode is plain Chrome, which cannot carry a proxy ' +
+      'login: it would take this login out through the box\'s own IP. Nothing was started. Use a proxy endpoint ' +
+      'with no username and password, or clear the proxy (`5dive browser proxy clear`), to use input mode here.');
   }
+  // `server` is scheme://host:port with no userinfo (lib/proxy.cjs strips it).
+  const proxyArgs = viaProxy ? [`--proxy-server=${viaProxy.server}`] : [];
   const startUrl = process.env.FIVEDIVE_BROWSER_START_URL || '';
   const start = async (sandbox) => {
-    const args = plainArgs(profile, sandbox);
+    const args = [...plainArgs(profile, sandbox), ...proxyArgs];
     if (/^https?:\/\//i.test(startUrl)) args.push(startUrl);
     const child = cp.spawn(chrome, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let tail = '';
@@ -1067,6 +1699,9 @@ async function inputLaunch(profile, chrome) {
   return {
     input: true, child, x, seen,
     handoff: null,
+    // The host this window was last sent to (DIVE-7674): the start URL, then
+    // every goto typed into it. `front` reads it; nothing else does.
+    lastHost: /^https?:\/\//i.test(startUrl) ? frontTab.hostOf(startUrl) : '',
     // SIGTERM is Chrome's clean shutdown: it writes the profile out, which is
     // the durable half (the login). SIGKILL only for one that will not go.
     close: async () => {
@@ -1145,13 +1780,138 @@ async function clickInBrowser(be, s) {
     steps: 0, from: { x: s.x, y: s.y } });
   let k;
   for (let i = 0; i < 20; i++) {
+    // DIVE-5740: a click on an upload control opens the browser's file chooser,
+    // and the focus falls to the root window. That is the click WORKING: give
+    // the chooser the keyboard and say so, instead of calling the click lost.
+    const dlg = await be.x.browserDialog(be.child.pid);
+    if (dlg) {
+      await be.x.focusOn(dlg.id, 2000, `the browser's "${dlg.name || 'dialog'}" window`);
+      return { dialog: dlg.name || 'dialog' };
+    }
     k = await be.x.keyboardTarget(be.child.pid);
     if (k.browser) return;
+    // ...and a click that CLOSED one (its Open or Cancel) drops the focus to
+    // the root window the same way. The click landed on the browser (checked
+    // above), so hand the keyboard back to it, as a window manager would.
+    if (k.focus === be.x.root) {
+      try { await be.x.ensureBrowserFocus(be.child.pid, 1000); return; } catch (e) { /* reported below */ }
+    }
     await sleepMs(50);
   }
   throw new Error(`the click at ${s.x},${s.y} was sent, but afterwards the keyboard focus is not on the browser ` +
     `(${k.focus === 0 ? 'no window' : k.focus === 1 ? 'the window under the pointer' : '0x' + k.focus.toString(16)}), ` +
     `so it may not have reached the page; stopping rather than typing into nothing`);
+}
+
+// DIVE-5740: an upload as a person does it. Click the page's upload control,
+// let the browser's file chooser open, type the absolute path into it (ctrl+l
+// opens its location field), Open (alt+o), and confirm the chooser CLOSED. A chooser
+// still up means the path was not taken: Escape (or a window close, DIVE-6775),
+// then drop the file on the same point (DIVE-6704), and fail by name if that
+// does not take either, so nothing goes on to type into a dialog or a page by mistake.
+async function uploadByChooser(be, s) {
+  const pid = be.child.pid;
+  if (await be.x.browserDialog(pid)) throw new Error('a file chooser is already open; finish or close it (press Escape) first');
+  const r = await clickInBrowser(be, s);
+  let dlg = r && r.dialog ? await be.x.browserDialog(pid) : null;
+  for (let i = 0; !dlg && i < 50; i++) { await sleepMs(100); dlg = await be.x.browserDialog(pid); }
+  if (!dlg) throw new Error(`no file chooser opened after the click at ${s.x},${s.y}: point the upload step at the page's upload button (take a shot first)`);
+  // Paced the same with FIVEDIVE_BROWSER_INPUT_FAST: the waits are not a
+  // person's, they are GTK's. Its location field completes the path from a
+  // folder it reads in the background, and keys that outrun that read come out
+  // of the field in a different order than they went in.
+  await be.x.focusOn(dlg.id, 2000, `the "${dlg.name}" window`);
+  await be.x.press('ctrl+l'); await sleepMs(300);
+  await be.x.type(s.path, 20);
+  await sleepMs(600);
+  // OPEN, NOT RETURN. CI at f1a440c showed the path typed exactly right and
+  // Return closing the chooser with "No file chosen". The field reports said
+  // the same ("click Open: Return alone can close it with nothing attached").
+  // alt+o is the chooser's own mnemonic for its Open button, so it is that
+  // click without needing the button's position: with no window manager the
+  // chooser can be taller than the screen, and Open is then cut off.
+  // FIVEDIVE_BROWSER_CHOOSER_OPEN_KEY: another key for a box whose chooser
+  // wants one; the harness sets a dead key to grade the drop below.
+  await be.x.press(process.env.FIVEDIVE_BROWSER_CHOOSER_OPEN_KEY || 'alt+o');
+  for (let i = 0; i < 50; i++) {
+    await sleepMs(100);
+    if (!(await be.x.browserDialog(pid))) {
+      try { await be.x.ensureBrowserFocus(pid, 1000); } catch (e) { /* the next key step says so */ }
+      return `the file chooser took ${s.path} and closed (check the shot: the page should now name the file)`;
+    }
+  }
+  // DIVE-6704: A CHOOSER THAT WILL NOT TAKE THE PATH IS NOT THE END. chill-gorge's
+  // (Chrome 154) showed the typed path in its field and stayed open on Open for
+  // every path, while CI's passed. So the same file is dropped on the same
+  // point: the upload control the step names takes a drop with no dialog.
+  // Escape up to three times. One Escape left a real chooser open (Chrome 153,
+  // the dev host's grade of L14): with the path's completion list up, the
+  // first Escape can close only the list.
+  // FIVEDIVE_BROWSER_CHOOSER_CLOSE_KEY: as the Open key above, for the harness.
+  const closeKey = process.env.FIVEDIVE_BROWSER_CHOOSER_CLOSE_KEY || 'Escape';
+  for (let k = 0; k < 3 && (await be.x.browserDialog(pid)); k++) {
+    try { await be.x.focusOn(dlg.id, 1000, 'the file chooser'); await be.x.press(closeKey); } catch (e) { /* reported below */ }
+    for (let i = 0; i < 10 && (await be.x.browserDialog(pid)); i++) await sleepMs(100);
+  }
+  // DIVE-6775: AND A CHOOSER THAT IGNORES ITS KEYS IS NOT THE END EITHER.
+  // chill-gorge's took neither alt+o nor Escape, while a mouse click on its
+  // Cancel closed it. So close it without a key: WM_DELETE_WINDOW is what a
+  // window manager's close button sends, and GTK answers it as Cancel.
+  // FIVEDIVE_BROWSER_CHOOSER_WINDOW_CLOSE=0 skips it: the harness's way to make
+  // the chooser no close will shut, and grade the way out the error names.
+  let how = 'Escape';
+  if (process.env.FIVEDIVE_BROWSER_CHOOSER_WINDOW_CLOSE !== '0' && (await be.x.browserDialog(pid))) {
+    how = 'a window close';
+    try { await be.x.closeWindow(dlg.id); } catch (e) { /* reported below */ }
+    for (let i = 0; i < 20 && (await be.x.browserDialog(pid)); i++) await sleepMs(100);
+  }
+  const what = `the file chooser did not take ${s.path} (still open after Open)`;
+  if (await be.x.browserDialog(pid)) {
+    const c = await chooserCancelPoint(be, dlg.id);
+    throw new Error(`${what}, and it would not close on Escape or a window close; nothing was attached. ` +
+      `Click its Cancel${c ? ` at about ${c.x},${c.y}` : ' (bottom right, left of Open)'} with a click step, then drop the file instead`);
+  }
+  try { await be.x.ensureBrowserFocus(pid, 1000); } catch (e) { /* the drop checks the pointer itself */ }
+  try {
+    return `${what}, so it was closed (${how}) and the file ${await dropOnPage(be, s)}`;
+  } catch (e) {
+    throw new Error(`${what}; it was closed (${how}), and dropping the file on ${s.x},${s.y} instead failed too: ${e.message}`);
+  }
+}
+
+// Where a GTK chooser's Cancel sits, for a person to click: bottom right, left
+// of Open, about 217 by 30 px in from that corner (chill-gorge's 1124x822 had
+// it at 985,792), and never past the screen's edge. A guess to name, not to click.
+async function chooserCancelPoint(be, win) {
+  try {
+    const g = await be.x.geometry(win), sc = { w: be.x.width, h: be.x.height };
+    return { x: Math.max(0, Math.min(sc.w - 1, g.x + g.w - 217)), y: Math.max(0, Math.min(sc.h - 1, g.y + g.h - 30)) };
+  } catch (e) { return null; }
+}
+
+// DIVE-6704: a file DROPPED on the page, the way a person drags one in from a
+// file manager (lib/x11.cjs dropFile: XDND). There is no chooser, so nothing
+// rests on GTK taking a typed path. Whatever is at the point gets the drop: an
+// <input type=file> takes the file, a site's drop area uploads it. A point that
+// is neither makes Chrome OPEN the file in the tab instead; the title says so,
+// and that is said by name rather than called a success.
+async function dropOnPage(be, s) {
+  const pid = be.child.pid;
+  if (await be.x.browserDialog(pid)) throw new Error('a file chooser is open; close it (press Escape) before dropping a file');
+  await be.x.move(s.x, s.y);
+  await pointerOnBrowser(be, 'dropped');
+  const before = (await be.x.windowTitle()).page;
+  const r = await be.x.dropFile(s.x, s.y, s.path, pid);
+  await sleepMs(500);
+  const after = (await be.x.windowTitle()).page, base = path.basename(s.path);
+  if (after !== before && (after === base || after === s.path || after.startsWith('file://'))) {
+    throw new Error(`the point ${s.x},${s.y} is not an upload control or a drop area, so the browser opened ${base} ` +
+      'in the tab instead of attaching it (go back with alt+Left, then point at the upload control or drop area)');
+  }
+  try { await be.x.ensureBrowserFocus(pid, 1000); } catch (e) { /* the next key step says so */ }
+  return r.finished
+    ? `was dropped at ${s.x},${s.y} and the browser took it (check the shot: the page should now name the file)`
+    : `was dropped at ${s.x},${s.y}; the browser did not confirm it (check the shot: the page should name the file)`;
 }
 
 async function gotoByKeys(be, url) {
@@ -1166,11 +1926,29 @@ async function gotoByKeys(be, url) {
   await x.press('Return');
 }
 
+// Type <url> and wait for it to load: at least <minMs>, then until the title is
+// no longer the address (at most INPUT_LOAD_WAIT_MS), then the quiet gate. The
+// title is read only after this, so a refused or challenge title is matched on
+// the page, not on the address Chrome shows while it loads (DIVE-7572).
+async function gotoLoaded(be, url, minMs) {
+  await gotoByKeys(be, url);
+  return pageLoad.untilLoaded(async () => (await be.x.windowTitle()).page, () => settled(be),
+    { url, minMs, maxMs: Math.max(minMs, INPUT_LOAD_WAIT_MS), pollMs: 100, sleep: sleepMs });
+}
+const notLoadedMsg = (site, ld) =>
+  `NOT LOADED: the ${site} page did not finish loading within ${Math.round(ld.waited_ms / 1000)}s: its title is still ` +
+  `its address ("${ld.title}"), so nothing on it was read as the page. The screenshot shows how far it got. ` +
+  `Try again; if it never loads, the site or the connection is not answering this browser.`;
+
 async function screenOf(be) {
   const png = await be.x.screenshotPNG();
   const t = await be.x.windowTitle();
-  return { drive: 'input', title: t.page, window_title: t.window, width: be.x.width, height: be.x.height,
-    png_b64: png.toString('base64') };
+  // A popup window of the browser on top (DIVE-7680) is the page the input goes
+  // to, so the report names it: its title is the one the hard stops read.
+  const pw = await be.x.browserPopup(be.child.pid).catch(() => null);
+  return { drive: 'input', title: pw ? pw.page : t.page, window_title: pw ? pw.name : t.window,
+    ...(pw ? { popup_window: pw.page || pw.name, opener_title: t.page } : {}),
+    width: be.x.width, height: be.x.height, png_b64: png.toString('base64') };
 }
 
 const INPUT_STEPS = {
@@ -1178,19 +1956,33 @@ const INPUT_STEPS = {
                  && (s.count === undefined || [1, 2, 3].includes(s.count)),
   move:   (s) => num(s.x) && num(s.y),
   type:   (s) => typeof s.value === 'string' && s.value.length > 0 && s.value.length <= INPUT_MAX_TEXT,
+  paste:  (s) => typeof s.value === 'string' && s.value.length > 0 && Buffer.byteLength(s.value) <= 200000,
   press:  (s) => typeof s.key === 'string' && /^[A-Za-z0-9+_ -]{1,40}$|^.$/u.test(s.key),
   scroll: (s) => (s.dy === undefined || (Number.isInteger(s.dy) && Math.abs(s.dy) <= 50))
                  && (s.dx === undefined || (Number.isInteger(s.dx) && Math.abs(s.dx) <= 50))
                  && (s.dy !== undefined || s.dx !== undefined),
   goto:   (s) => typeof s.url === 'string' && /^https?:\/\/[^\s]+$/.test(s.url) && s.url.length <= 2000,
   wait:   (s) => Number.isInteger(s.ms) && s.ms >= 0 && s.ms <= INPUT_MAX_WAIT_MS,
+  upload: (s) => num(s.x) && num(s.y) && typeof s.path === 'string' && /^\/[^\n\r\0]{1,4095}$/.test(s.path),
+  drop:   (s) => num(s.x) && num(s.y) && typeof s.path === 'string' && /^\/[^\n\r\0]{1,4095}$/.test(s.path),
 };
 function num(v) { return Number.isInteger(v) && v >= 0 && v < 10000; }
-const INPUT_VOCAB = 'click{x,y[,button,count]} move{x,y} type{value} press{key} scroll{dy[,dx,x,y]} goto{url} wait{ms}';
+const INPUT_VOCAB = 'click{x,y[,button,count]} move{x,y} type{value} paste{value} press{key} scroll{dy[,dx,x,y]} goto{url} wait{ms} upload{x,y,path} drop{x,y,path}';
 
 async function inputRequest(be, profile, req, send, end, behalf) {
   const site = path.basename(profile);
   const reChallenge = reOf(req.challenge);
+  // DIVE-7528: a site's own error page, served instead of the page (Amazon's
+  // "ご迷惑をおかけしています！"). A stop like a challenge, but there is nothing on
+  // it for a person to clear, so it must not send anyone to a handoff.
+  const reRefused = reOf(req.refused);
+  const stopOf = (title, lead, tail) => {
+    if (reRefused && reRefused.test(title))
+      return { rc: E_SITE_REFUSED, msg: `REFUSED${lead}: ${site} served its own error page ("${title}") instead of the page you asked for. This is the site refusing this browser, not a security check: there is nothing on it for a person to clear, so a handoff will not help.${tail}` };
+    if (reChallenge && reChallenge.test(title))
+      return { rc: 75, msg: `CHALLENGE${lead}: the page title is "${title}", which is a security check.${tail} Try it like a person first (tick its box, or wait and look again); a person clears it only if it stays, or if the owner gated it: 5dive browser handoff ${site}` };
+    return null;
+  };
   const out = (o) => send({ t: 'out', data: JSON.stringify(o) + '\n' });
 
   if (req.op === 'hand') {
@@ -1245,37 +2037,66 @@ async function inputRequest(be, profile, req, send, end, behalf) {
       let opened = false;
       for (let i = 0; i < 20 && !opened; i++) { await sleepMs(100); opened = (await be.x.windowTitle()).window !== before; }
       if (!opened) return skip('no new tab opened, so nothing was loaded');
-      await gotoByKeys(be, req.url);
-      await sleepMs(Number.isFinite(Number(req.wait)) && req.wait !== undefined ? Math.min(Number(req.wait), INPUT_MAX_WAIT_MS) : INPUT_GOTO_SETTLE_MS);
-      await settled(be);
+      // DIVE-7572: the title once the page has LOADED, not the address Chrome
+      // shows while it loads. Classification stays the caller's; `loaded` says
+      // whether the title is the page's own.
+      const ld = await gotoLoaded(be, req.url,
+        Number.isFinite(Number(req.wait)) && req.wait !== undefined ? Math.min(Number(req.wait), INPUT_MAX_WAIT_MS) : INPUT_GOTO_SETTLE_MS);
       const t = await be.x.windowTitle();
       if (!viewerLive(profile) && !be.handoff) {
         await keysReachBrowser(be);
         await be.x.press('ctrl+w');
         await sleepMs(150);
       }
-      out({ drive: 'input', navigated: true, url_requested: req.url, title: t.page, window_title: t.window });
+      out({ drive: 'input', navigated: true, loaded: ld.loaded, url_requested: req.url, title: t.page, window_title: t.window });
       return end(0);
     } catch (e) {
       send({ t: 'err', msg: `could not check ${site} in a tab of its own: ${e.message}` }); return end(E_FAILED);
     }
   }
 
+  // THE CLIPBOARD, FOR A KEY A SITE SHOWS ONLY AS A COPY BUTTON (DIVE-7171).
+  // Read and cleared by the X client, answered to the lease holder only, and
+  // refused while a person is in the window: then it may hold what THEY copied.
+  // bin/browser pipes the text into the secret store and never prints it.
+  if (req.op === 'clipboard') {
+    const no = inputRefusal(be, profile, req, 'clipboard');
+    if (no) { send({ t: 'err', msg: no }); return end(E_UNAVAILABLE); }
+    let got;
+    try { got = await be.x.readClipboard(); }
+    catch (e) { send({ t: 'err', msg: `could not read the ${site} window's clipboard: ${e.message}` }); return end(E_FAILED); }
+    if (got.text.length > INPUT_MAX_TEXT) {
+      send({ t: 'err', msg: `the ${site} window's clipboard held ${got.text.length} characters, more than a key (${INPUT_MAX_TEXT} at most). It was cleared; nothing was sent.` });
+      return end(E_NOTHING_RAN);
+    }
+    out({ drive: 'input', chars: got.text.length, cleared: got.cleared, text: got.text });
+    return end(0);
+  }
+
   if (req.op === 'screen') {
+    let ld = null;
     try {
       if (req.url) {
         if (!INPUT_STEPS.goto({ url: req.url })) { send({ t: 'err', msg: 'screen --url needs an http(s) url' }); return end(E_NOTHING_RAN); }
         const no = inputRefusal(be, profile, req, 'screen');
         if (no) { send({ t: 'err', msg: no }); return end(E_UNAVAILABLE); }
-        await gotoByKeys(be, req.url);
-        await sleepMs(Number.isFinite(Number(req.wait)) && req.wait !== undefined ? Number(req.wait) : INPUT_GOTO_SETTLE_MS);
+        be.lastHost = frontTab.hostOf(req.url);
+        ld = await gotoLoaded(be, req.url,
+          Number.isFinite(Number(req.wait)) && req.wait !== undefined ? Math.min(Number(req.wait), INPUT_MAX_WAIT_MS) : INPUT_GOTO_SETTLE_MS);
       } else if (Number(req.wait) > 0) await sleepMs(Math.min(Number(req.wait), INPUT_MAX_WAIT_MS));
       const shot = await screenOf(be);
-      out({ ...shot, url_requested: req.url || null, handoff: !!be.handoff, viewer: viewerLive(profile) });
-      if (reChallenge && reChallenge.test(shot.title)) {
-        send({ t: 'err', msg: `CHALLENGE: the page title is "${shot.title}", which is a security check. A person clears it: 5dive browser handoff ${site}` });
-        return end(75);
+      if (ld && !ld.loaded) {
+        // A refused title that showed up in the last instant still wins: it is the answer.
+        const late = stopOf(shot.title, '', '');
+        out({ ...shot, url_requested: req.url, handoff: !!be.handoff, viewer: viewerLive(profile),
+              ...(late && late.rc === E_SITE_REFUSED ? { refused: true } : { loaded: false }) });
+        if (late) { send({ t: 'err', msg: late.msg }); return end(late.rc); }
+        send({ t: 'err', msg: notLoadedMsg(site, { ...ld, title: shot.title }) }); return end(E_NOT_LOADED);
       }
+      const stop = stopOf(shot.title, '', '');
+      out({ ...shot, url_requested: req.url || null, handoff: !!be.handoff, viewer: viewerLive(profile),
+            ...(stop && stop.rc === E_SITE_REFUSED ? { refused: true } : {}) });
+      if (stop) { send({ t: 'err', msg: stop.msg }); return end(stop.rc); }
       return end(0);
     } catch (e) {
       send({ t: 'err', msg: `could not read the ${site} screen: ${e.message}` }); return end(E_FAILED);
@@ -1294,7 +2115,7 @@ async function inputRequest(be, profile, req, send, end, behalf) {
           `Input mode takes: ${INPUT_VOCAB} — coordinates are pixels of the ${be.x.width}x${be.x.height} screenshot. Nothing ran.` });
         return end(E_NOTHING_RAN);
       }
-      if ((s.op === 'click' || s.op === 'move' || (s.op === 'scroll' && s.x !== undefined)) &&
+      if ((s.op === 'click' || s.op === 'upload' || s.op === 'drop' || s.op === 'move' || (s.op === 'scroll' && s.x !== undefined)) &&
           ((s.x !== undefined && s.x >= be.x.width) || (s.y !== undefined && s.y >= be.x.height))) {
         send({ t: 'err', msg: `step ${i + 1} (${s.op}) points at ${s.x},${s.y}, outside the ${be.x.width}x${be.x.height} screen. Nothing ran.` });
         return end(E_NOTHING_RAN);
@@ -1313,28 +2134,58 @@ async function inputRequest(be, profile, req, send, end, behalf) {
         ran++;
         try {
           switch (s.op) {
-            case 'click': await clickInBrowser(be, s); break;
+            case 'click': {
+              const r = await clickInBrowser(be, s);
+              if (r && r.dialog) send({ t: 'log', line: `  ${where}: the browser opened its "${r.dialog}" window, which now has the keyboard (a file chooser: type the file's absolute path and press alt+o (Open; Return can close it with nothing attached), or use an upload{x,y,path} step, or drop{x,y,path} onto the page instead)` });
+              // A click that opened a popup window (DIVE-7680): it takes the keys
+              // from here until it closes, and the output says so.
+              else {
+                const pw = await be.x.browserPopup(be.child.pid).catch(() => null);
+                if (pw && pw.id !== be.popupWin) {
+                  be.popupWin = pw.id;
+                  try { await be.x.focusOn(pw.id, 2000, `the browser's popup window "${pw.page || pw.name}"`); } catch (e) { /* the next key step says so */ }
+                  send({ t: 'log', line: `  ${where}: a popup window opened: "${pw.page || pw.name}". It is on top and now has the keyboard; the steps after this type into it, and when it closes the page under it has the keyboard again.` });
+                } else if (!pw) be.popupWin = 0;
+              }
+              break;
+            }
+            case 'upload': send({ t: 'log', line: `  ${where}: ${await uploadByChooser(be, s)}` }); break;
+            case 'drop': send({ t: 'log', line: `  ${where}: the file ${await dropOnPage(be, s)}` }); break;
             case 'move': await be.x.move(s.x, s.y); break;
             case 'type': await keysReachBrowser(be); await be.x.type(s.value); break;
+            // DIVE-7237: code, or any long text, goes in whole (a code editor rewrites typed keys).
+            case 'paste': {
+              await keysReachBrowser(be);
+              const r = await be.x.paste(s.value);
+              if (!r.served) throw new Error('ctrl+v was pressed but the browser never read the clipboard: click into the text field first. Nothing was pasted');
+              break;
+            }
             case 'press': await keysReachBrowser(be); await be.x.press(s.key); break;
             case 'scroll':
               if (s.x !== undefined) await be.x.move(s.x, s.y);
               await pointerOnBrowser(be, 'scrolled');   // wheel notches go to the window under the pointer, too
               await be.x.scroll(s.dy || 0, s.dx || 0, null); break;
-            case 'goto': await gotoByKeys(be, s.url); await sleepMs(INPUT_GOTO_SETTLE_MS); break;
+            case 'goto': {
+              be.lastHost = frontTab.hostOf(s.url);
+              const ld = await gotoLoaded(be, s.url, INPUT_GOTO_SETTLE_MS);
+              // A refused/challenge title is the hard stop's to name, below.
+              if (!ld.loaded && !stopOf(ld.title, '', '')) throw new Error(notLoadedMsg(site, ld) + ' Stopped; the rest of the plan did not run.');
+              break;
+            }
             case 'wait': await sleepMs(s.ms); break;
           }
         } catch (e) { e.message = `${where}: ${e.message}`; throw e; }
         send({ t: 'log', line: `  ${where} ok` });
         // THE HARD STOP, between steps: a plan does not keep typing into a
         // challenge that appeared under it.
-        if (reChallenge) {
+        if (reChallenge || reRefused) {
           const t = await be.x.windowTitle();
-          if (reChallenge.test(t.page)) {
+          const stop = stopOf(t.page, ` after ${where}`, ' Stopped; the rest of the plan did not run.');
+          if (stop) {
             await sleepMs(300);
-            out({ ...(await screenOf(be)), act_report: true, steps_run: ran });
-            send({ t: 'err', msg: `CHALLENGE after ${where}: the page title is "${t.page}", which is a security check. Stopped; the rest of the plan did not run. A person clears it: 5dive browser handoff ${site}` });
-            return end(75);
+            out({ ...(await screenOf(be)), act_report: true, steps_run: ran, ...(stop.rc === E_SITE_REFUSED ? { refused: true } : {}) });
+            send({ t: 'err', msg: stop.msg });
+            return end(stop.rc);
           }
         }
       }
@@ -1350,11 +2201,9 @@ async function inputRequest(be, profile, req, send, end, behalf) {
     const ms = Number.isFinite(Number(req.settle)) && req.settle !== undefined ? Number(req.settle) : INPUT_SETTLE_MS;
     if (ms > 0) await sleepMs(Math.min(ms, INPUT_MAX_WAIT_MS));
     const shot = await screenOf(be);
-    out({ ...shot, act_report: true, steps_run: ran });
-    if (reChallenge && reChallenge.test(shot.title)) {
-      send({ t: 'err', msg: `CHALLENGE: the page the steps left is titled "${shot.title}", which is a security check. A person clears it: 5dive browser handoff ${site}` });
-      return end(75);
-    }
+    const stop = stopOf(shot.title, ' (the page the steps left)', '');
+    out({ ...shot, act_report: true, steps_run: ran, ...(stop && stop.rc === E_SITE_REFUSED ? { refused: true } : {}) });
+    if (stop) { send({ t: 'err', msg: stop.msg }); return end(stop.rc); }
     return end(0);
   }
 
@@ -1365,6 +2214,7 @@ async function inputRequest(be, profile, req, send, end, behalf) {
     tree: 'there is no DOM tree to enumerate: read the screenshot (`5dive browser shot`) and act on pixel coordinates',
     snapshot: '`5dive browser snapshot` on an input-mode site returns the screenshot and the window title, not a DOM',
     render: '`5dive browser shot` on an input-mode site returns a screenshot of the live window',
+    download: 'this browser has no request client to fetch a file with; a file the page downloads lands in the browser\'s own download folder',
     plan: 'adapter actions address the page by selector, and input mode has no DOM to resolve a selector in: use `5dive browser act <site> --steps=` with input steps (' + INPUT_VOCAB + ')',
   }[req.op];
   send({ t: 'err', msg: instead
@@ -1378,14 +2228,20 @@ function callMode(sock) {
   let req;
   try { req = JSON.parse(raw); } catch (e) { die(E_NOTHING_RAN, `the request on stdin is not JSON: ${e.message}`); }
   const conn = net.createConnection(sock);
-  let buf = '', ended = false;
+  // ONLY THE NEW BYTES ARE SEARCHED FOR THE LINE'S END (DIVE-7303). The reply was
+  // one string that every chunk was appended to and searched from its start, so a
+  // multi-megabyte answer (a results page of 1,211 refs) cost the square of its
+  // size: 90% CPU in this client for 150-220 s on the bench, while the browser
+  // had answered in seconds. The pieces are kept as bytes and joined once per
+  // line, which also never cuts a character that spans two chunks.
+  let parts = [], ended = false;
   conn.on('connect', () => conn.write(JSON.stringify(req) + '\n'));
   conn.on('error', (e) => die(E_UNAVAILABLE, `no live session at ${sock}: ${e.message}`));
   conn.on('data', (d) => {
-    buf += d.toString('utf8');
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+    let from = 0, nl;
+    while ((nl = d.indexOf(10, from)) >= 0) {
+      parts.push(d.subarray(from, nl)); from = nl + 1;
+      const line = Buffer.concat(parts).toString('utf8'); parts = [];
       if (!line) continue;
       let f; try { f = JSON.parse(line); } catch (e) { continue; }
       if (f.t === 'log') process.stderr.write(f.line + '\n');
@@ -1402,6 +2258,7 @@ function callMode(sock) {
       // and exit on its own, which is the only exit that cannot truncate.
       else if (f.t === 'end') { ended = true; process.exitCode = f.rc; conn.end(); }
     }
+    if (from < d.length) parts.push(d.subarray(from));
   });
   // A DAEMON THAT DIES MID-REQUEST IS NOT A ZERO. Without this the socket simply
   // closes and node exits 0 — a publish whose browser crashed would read as a

@@ -52,6 +52,19 @@ It prints:
 
 On a 5dive cloud server, leave out `--endpoint`: the address is made for you.
 
+### Faster: one Microsoft sign-in
+
+Instead of steps 2 to 4, 5dive can make the bot for you after one Microsoft sign-in:
+
+```
+sudo 5dive agent teams connect <agent> --microsoft --endpoint=https://<your address>
+```
+
+- **Once per server**, set up its browser (the sign-in runs in it): `sudo 5dive plugin install browser && sudo 5dive browser setup`.
+- **First**, point your address at the port it names (`http://127.0.0.1:<port>`). Run it without `--endpoint` to see the port. Use a reverse proxy or a named tunnel: a quick tunnel's address changes on every restart.
+- **Sign in** through the view it prints. If Microsoft asks to secure your account, **Not now** is fine. Then run the same command again for the **Add to Teams** link.
+- **Only people you allow can write to the agent.** Someone new waits: `sudo 5dive people ls` shows them, `sudo 5dive people knock answer <number> allow` lets them in. Or add them first with `sudo 5dive people add`.
+
 ## 4. Point the bot at your server
 
 Set the bot's **Messaging endpoint** to the **Endpoint** from step 3 (Developer Portal: **Bot management** > the bot > **Configure**; Azure: **Configuration**).
@@ -71,10 +84,23 @@ Teams admin center > **Teams apps** > **Manage apps** > **Upload new app** > the
 ## What people can do
 
 - Message the agent 1:1, like a colleague.
+- Add it to a group chat or a team channel and @mention it. It answers there, in the same thread, and knows who asked.
 - Tap buttons when it asks a question with set answers.
-- Send it files and get files back (Teams asks them to accept a file first).
+- Send it files and get files back (Teams asks them to accept a file first; in a group or channel it can send only small images).
 
-Group chats and channels are not supported yet.
+In a group or channel the agent reads only the messages that @mention it, not the rest of the chat (reading the whole chat would need extra Teams permissions, and is not offered yet). Each person keeps their own role there: a member's risky ask still waits for an admin, who approves in their own 1:1 chat with the agent.
+
+**Added the agent before group chats existed?** Run the same connect command again, then upload the new App package over the old app (Teams admin center > **Manage apps** > the app > **Upload file**). If you used the one-sign-in way, open the agent's Add to Teams link again instead.
+
+## Name your admins
+
+Everyone you let in is a **member**: they can chat, ask and have the agent do its normal work. Running commands as root, paying, deleting, sending anything outside your company, and changing settings, keys or anyone's access need an **admin's** yes; the agent asks the admins in Teams with an Approve button, never the person who asked. Until you name one, nobody can approve. Name each admin by their Entra object ID (Teams admin center > **Users** > the person > **Object ID**), once per server, for all its agents:
+
+```
+sudo 5dive agent teams admins add <Object ID>
+```
+
+`5dive agent teams admins` lists them; `admins remove <Object ID>` takes one away. To let members do one kind without asking, for example delete files: `sudo 5dive agent teams admins members-may delete`. To make everyone equal again: `sudo 5dive agent teams admins check off`.
 
 ## Check, and turn off
 

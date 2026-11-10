@@ -10,20 +10,23 @@ server.ts ──HTTPS──▶ Bot Connector serviceUrl (Microsoft) ──▶ Te
 No 5dive server is on the path. Shut on a local-only (offline) box until its IT opens Teams alone (`sudo 5dive config local-only allow teams`); the endpoint and every call to Microsoft check that switch on each message (`offline.ts`).
 
 - **Setup**: `sudo 5dive agent teams connect|status|disconnect <agent>` (`bin/teams`). The IT steps are in [docs/IT-GUIDE.md](docs/IT-GUIDE.md).
+- **One sign-in** (DIVE-7831): `sudo 5dive agent teams connect <agent> --microsoft [--json]` signs in to Microsoft once, in the box's own browser (the 5dive app shows it through a one-time viewer link), then makes each agent's Teams bot with Microsoft's `teams` CLI (pinned 3.0.4, in `/opt/5dive/teams-cli`, its login in `/var/lib/5dive/teams-cli`, 0700) and prints its **Add to Teams** link. The bot's secret goes straight into the connector file. A second agent needs no new sign-in. A code sign-in is not offered: Microsoft's security defaults block it (error 530035).
 - **Config**: `~/.claude/channels/teams/config.json` (0600, the agent's): `app_id`, `tenant_id`, `app_password`, `port`, `public_url`, `allowed_users`.
-- **Session contract**: the same as Telegram. Inbound is `<channel source="teams" chat_id … user user_id ts>`, with `file_path` for a received file and `via="button"` for a tap. Outbound is `reply` (text, `files`) and `edit_message`. A trailing numbered list (2-8 lines, each under 90 characters) becomes Adaptive Card buttons.
+- **Session contract**: the same as Telegram. Inbound is `<channel source="teams" chat_id … user user_id chat_type [chat_name] ts>`, with `file_path` for a received file and `via="button"` for a tap. Outbound is `reply` (text, `files`) and `edit_message`. A trailing numbered list (2-8 lines, each under 90 characters) becomes Adaptive Card buttons.
 - **Logs**: `~/.claude/channels/teams/messages.log` (one metadata line per message, never its text) and `lifecycle.log`.
 
 ## Security
 
 - Every request: Bot Framework JWT (RS256, Microsoft's published keys, the key must endorse `msteams`), issuer, audience = this bot, expiry, and the token's `serviceurl` claim must equal the activity's (`auth.ts`).
-- Then: the tenant must be the customer's, the chat must be 1:1, and an optional `allowed_users` list (`activity.ts`).
+- Then: the tenant must be the customer's, an optional `allowed_users` list, and in a group chat or channel the message must @mention this bot (`activity.ts`).
+- Group chats and channels (DIVE-8023): the manifest's bot scopes are `personal`, `groupChat`, `team` (package 1.1.0; `connect --microsoft` widens its own bot with `teams app update --scopes`). Only a message that @mentions the bot is delivered, its mention stripped and others kept as `@Name`; `chat_type` is `personal|group|channel`. A reply to a channel's `chat_id` lands in its thread (the id carries `;messageid=`). Roles are per sender; `ask_admin` cards go to admins' 1:1 chats only, never into a group. Non-image files go 1:1 only (Teams has no file consent in groups).
+- Roles (DIVE-7976, `roles.ts`, `hooks/role-guard.ts`): each sender is `admin` or `member` from their Entra id in `/etc/5dive/roles.json`, carried as `sender_role`. A member's risky ask (root, pay, delete, send outside, settings, keys, access) is held until an admin taps Approve on the `ask_admin` card. Set with `sudo 5dive agent teams admins …`.
 - The bot token is only ever sent to Microsoft's Bot Framework hosts; file uploads only to SharePoint/OneDrive; downloads only from those, after a private-address check (`hosts.ts`).
 - A reply goes only to a chat that has written to the agent.
 
 ## Not yet
 
-- Group chats and channels.
+- Background chatter in groups and channels (messages that do not @mention the agent): needs the RSC permissions `ChannelMessage.Read.Group` / `ChatMessage.Read.Chat` and a policy for when to speak.
 - The typed fallback the Telegram and dashboard plugins have for seats where Claude Code refuses channels (API-billed seats). A Claude Team/Enterprise org also needs channels allowed by its admin.
 - Other harnesses (Codex, Hermes, OpenClaw...). OpenClaw has its own `@openclaw/msteams`.
 

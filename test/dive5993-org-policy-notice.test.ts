@@ -209,7 +209,7 @@ describe('server wiring', () => {
   })
   test("DIVE-6599: the notice reads the owner's chat language, the one the bridge's buttons use", () => {
     expect(src).toContain('const lang = langOfChat(chat)')
-    expect(src).toContain("orgPolicyText(bot.botInfo?.first_name ?? '', lang)")
+    expect(src).toContain("orgPolicyText(bot.botInfo?.first_name ?? '', lang, LITE)")
   })
   test('the session injector still fires only on refused', () => {
     expect(src).toContain("if (route === 'inject')")

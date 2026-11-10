@@ -109,6 +109,11 @@ die()  { printf '%s✗ %s%s\n' "$R" "$*" "$X" >&2; [[ -z "${QUIET:-}" ]] || { DI
 # a test that evals them on their own runs exactly as before.
 VOICE_SETUP_LOG="${VOICE_SETUP_LOG:-/var/log/5dive-voice-setup.log}"
 QUIET=""; STEP=""; LAST_OK=""; OPEN=0; DIED=0
+# Set by step_service when whisper never answered. The steps after it still run
+# (the model may finish later, and then everything else is in place), but the
+# run ends non-zero: report 761's box said "set up" and "on" while nothing
+# listened on :8765, because this was only a warning.
+SERVICE_DOWN=0
 TG=""; TY=""; TR=""; TX=""
 
 # quiet_step <title> — end the previous step's line and start this one's.
@@ -420,6 +425,7 @@ step_service() {
     sleep 2
   done
   warn "whisper-service not healthy after 6min — check: journalctl -u whisper-service"
+  SERVICE_DOWN=1
 }
 
 # DIVE-7409: 5dive-speak upgrades edge-tts itself when Microsoft refuses the
@@ -692,6 +698,10 @@ main() {
     claudemd) step_claudemd ;;
     all)      step_apt; step_pip; step_service; step_wrapper; step_state; step_claudemd ;;
   esac
+  if (( SERVICE_DOWN )); then
+    [[ -z "$QUIET" ]] || quiet_close
+    die "voice is installed, but its speech engine (whisper-service) did not start within 6 minutes, so voice notes cannot be heard yet. Check: journalctl -u whisper-service. Run setup again once it answers: sudo 5dive voice setup"
+  fi
   if [[ -n "$QUIET" ]]; then
     quiet_close
     [[ "$cmd" != all ]] || printf 'Voice is set up. Check it any time:  5dive voice\n' >&3

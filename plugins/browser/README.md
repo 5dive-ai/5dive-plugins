@@ -1,16 +1,24 @@
 # browser — persistent human-authenticated browser sessions
 
-**What this is, in the words the decision landed on (lodar, 2026-09-07): persistent
-human-authenticated browser sessions.** It is *not* anti-bot bypassing. A CAPTCHA, a 2FA prompt or
-an "unusual activity" interstitial is a **hard stop that asks for a person** — the executor never
-attempts to solve one. That is a decision, not a limitation, and the second framing invites legal
-and reputational exposure the actual design avoids. Use the first one in docs, marketing and the
-plugin description.
+**What this is (lodar, 2026-09-07): persistent human-authenticated browser sessions.** A person
+logs in to a site once, by hand; the agent is granted the session, never the password.
 
-**One exception, and it is the owner's own (DIVE-5336): an authenticator-app 2FA prompt, on a
-site whose owner saved that site's authenticator seed on the box.** See
-[The owner's authenticator seed](#the-owners-authenticator-seed-dive-5336). A CAPTCHA, an emailed
-or SMS code and an "are you human" step still stop and ask for a person.
+**Sign-in checks are the agent's job (DIVE-7881, lodar 2026-11-07: «remove rules», «im for freedom
+and custom gates»).** An email or SMS verification, a code box, a 2-step prompt, an "unusual
+activity" page and a robot check are cleared by the agent like a person would: it reads the site's
+own verification mail in the box's mailbox and follows its link or types its code (or the owner's
+saved `.2fa`, see [The owner's authenticator seed](#the-owners-authenticator-seed-dive-5336)), ticks
+the robot check, waits out "Just a moment…", retries. No paid solver service. The executor no
+longer turns a code box, a 2-step prompt or a robot check into an automatic stop (75): it hands the
+page back with how to clear it. The agent asks the owner only when it truly can't (no mailbox here,
+a code sent to the owner's phone, a check that stays, a sign-in that IS the owner's identity).
+
+**Custom gates, off by default.** The owner turns a stop back on per site or for all:
+`sudo 5dive browser gate on bank.com robot` (`code`, `robot` or `all`; `all` for every site).
+That check then stops (75) and asks them. One root-owned file, `<profile root>/.sign-in-gates.json`,
+read like the approval policy: a file the owner does not own is no gate. `5dive browser gate` lists
+them. What never turns off: read only the site's own mail, never paste a code or link into chat,
+never type a password the owner did not save.
 
 `5dive browser` is a **general capability, not a distribution product.** We do not curate a
 platform list and we do not choose per-site API-vs-browser paths; the user does. Adapters are
@@ -18,7 +26,7 @@ therefore a **public surface**, and "how does a user add a site" is a core desig
 than a detail.
 
 ```
-5dive browser setup                 # once, as root: create the profile store
+5dive browser setup                 # once, as root: installs Chrome, a virtual screen, VNC and Node 22 if missing (+ a seat's profile store)
 5dive browser auth <site>           # a browser opens; you log in yourself
 5dive browser status                # per-site auth state; run this on a SCHEDULE
 5dive browser probe-all             # scheduled sweep; a served site is checked through its own browser
@@ -46,7 +54,26 @@ connected site); a refusal naming the accounts when there are several (`github.c
 `act` runs agent-written steps in the fixed vocabulary (`goto fill type click wait_for select press`)
 through the same executors, lease and login gate as `run`, and grades `--expect` against the page
 as the steps left it; a step that fails fails the run, whatever --expect matched, and the failure
-names the step (`--json`: `failed_step`). **Publishing, sending and deleting run and are logged by default, while paying stops
+names the step (`--json`: `failed_step`). **One of the agent's steps waits 10 s, not 30 s
+(DIVE-6778):** a `wait_for`, or a click or fill on an element that never becomes clickable, gives
+up after `FIVEDIVE_BROWSER_ACT_STEP_MS` (10000); a `goto` keeps the page-load bound, and `run`'s
+reviewed recipes keep `FIVEDIVE_BROWSER_STEP_TIMEOUT` (30 s). **A file a step downloads reaches the seat (DIVE-5751):**
+both step loops watch the act's tabs for Playwright's `download` event and save each file after the
+re-read (`lib/downloads.cjs`), under the site's suggested name made safe (last path segment, no
+leading dot, `-2` on a repeat). `act` moves it into its artifact directory as `downloads/<name>`
+(0600) and prints `downloaded: <path> (<name>, <bytes> bytes)` after the verdict, whatever the
+verdict (`--json`: `downloads`). The served browser runs as the profile's owner, so it sends the
+bytes back over the socket in base64 chunks and the caller writes them, as `snapshot` does. A
+download over `FIVEDIVE_BROWSER_DOWNLOAD_MAX_MB` (100) or unfinished after
+`FIVEDIVE_BROWSER_DOWNLOAD_WAIT_MS` (120000) is cancelled or dropped, and named on stderr with the
+reason. **A file at a URL is saved with `download` (DIVE-7646):** Chrome shows a PDF in its viewer,
+which fires no `download` event and whose buttons Playwright cannot click, so `download <site> <url>
+[--out=<file|dir/>]` fetches the URL through the site's own browser context (its cookies ride
+along; `lib/downloads.cjs` `fetchFile`), by the road a read takes (the served browser over the
+socket, else the one-shot driver), and prints `downloaded: <path> (<name>, <bytes> bytes, <type>)`.
+A sign-in page instead of the file exits 75 and saves nothing; any other web page, a non-2xx or a
+file over the cap exits 69. A `goto` in `act` that lands on a PDF (or an attachment) hands it over
+the same way. Input-mode sites have no request client and refuse it. **Publishing, sending and deleting run and are logged by default, while paying stops
 for the owner's approval (standard, DIVE-5148); under the owner's `careful` all four stop
 before the step** (exit 73): the executor
 reads the live element's label (`lib/aria.cjs` `stepRisk`, shared by both step loops), and a kind
@@ -264,6 +291,28 @@ than a cookie export:
 3. **No password ever enters our process** — the difference between "we had a breach" and "we had a
    breach and it did not matter."
 
+## Groups: one sign-in for many sites (DIVE-6013)
+
+A **group** is one browser profile shared by several sites, so a sign-in made once in it — Google
+above all — carries to every site in the group: each site's "Continue with Google" sees the
+account instead of asking for a fresh Google sign-in (which Google often refuses in an automated
+browser). Different groups share nothing, so a second Google account is a second group.
+
+- Every **new** site joins the default group, **Main** (`group default <group>` to change it,
+  `--none` for a profile per site as before).
+- A site connected **before** groups keeps its own profile, untouched — no upgrade merges cookies.
+  `group move <site> Main` moves it (its own profile is kept aside, not merged; `--own` brings it
+  back) and `group move --all Main` moves every one in one step.
+- `group create Main --from=google.com` makes an existing profile the group's, keeping what it
+  is signed in to.
+- A labelled account (`github.com_work`) is its own profile by default, and a group holds one
+  account per site — it is one cookie jar.
+- One group is one browser: two sites of one group are used one at a time, like one site was.
+
+On disk a group is `<seat>/.group-<id>/` and each of its sites is a relative link
+`<seat>/<site> -> .group-<id>`; the link is the whole mapping. `group ls --json` is the dashboard's
+read.
+
 ## A profile directory IS a credential
 
 Anything that can read the directory can replay the session, regardless of the permission model
@@ -273,7 +322,8 @@ store is:
 ```
 /var/lib/5dive/browser-profiles/          root, 0711   traverse, do not list
                               /<seat>/    that seat,  0700
-                                     /<site>/         0700
+                                     /<site>/         0700   (or a link to a group:)
+                                     /.group-<id>/    0700   one profile, shared by its sites
 
 /var/lib/5dive/browser-sessions/          root, 0711   traverse, do not list
                               /<seat>/    seat:group, 0750   the broker rendezvous
@@ -372,6 +422,13 @@ without a scheduled probe the agent finds out **mid-publish**. So:
   An adapter with no positive marker is untouched — one look, classified on the negative alone —
   because without something to terminate on, waiting only adds a chrome launch to reach the same
   answer.
+- **A slow single-page app can name a longer wait and the address a signed-in session lands on**
+  (DIVE-7648): `probe.wait_ms` replaces the 8000 ms for that adapter's served probe, and
+  `probe.logged_in_when_url_matches` reads `authenticated` from the served probe's final URL when
+  the page shows no logged-out marker, no challenge marker and no bot-check title. Shopify's admin
+  uses both. Every served probe also has one hard deadline (`FIVEDIVE_BROWSER_PROBE_HARD_MS`,
+  default 35000): past it the probe answers, its tab is closed, and the session is free again. A
+  page that is mid-redirect when it is read is looked at again, not reported as a failed load.
 - **A served profile is probed through its session daemon, or not at all.** Chrome allows one
   instance per profile directory, so a probe launched at a profile `serve` is holding is handed
   off to the running browser and returns an empty document. With a session daemon (a 0700 unix
@@ -486,9 +543,12 @@ The artifacts, 0600 in a 0700 directory chosen exactly as `read` chooses one:
 | `page.png` | the same tab at the same instant (`--no-shot` skips it; `--full` is a tall viewport) |
 
 **On a served profile it runs inside the warm browser** (DIVE-4621's daemon) — no launch, no stop,
-no restart, and a person at a viewer is not disturbed. This is the render op that daemon did not
-have, which is why `shot` and `read` still cycle a cold chrome of their own; `snapshot` does not
-retrofit them, and they remain the right verbs when one field is all you want.
+no restart, and a person at a viewer is not disturbed. **A page the served browser is already on is
+read as it is, not reloaded** (DIVE-6778), so a snapshot after an act shows what the act left (a
+typed value, an open menu) and costs no page load; `tree` does the same. **The first snapshot of
+the public profile starts its served browser** on that page, as the first `act` does, so the calls
+after it are warm. `read` and `links` also read in a tab of a served browser (DIVE-6778); only
+`shot` still cycles a cold chrome of its own.
 
 Every guard the other render verbs carry applies unchanged: the site boundary, the 0700 profile
 audit, the live-viewer refusal, the positive authenticated-session probe, the per-site lease, and
@@ -533,7 +593,8 @@ Measured on en.wikipedia.org with real Chrome in CI (`tests/browser_routine_benc
 ### `browser read` — Markdown and provenance from the authenticated page
 
 ```
-5dive browser read <site> <url> [--out=<dir>] [--json] [--wait=<ms>] [--wait-for=<target>]
+5dive browser read <site> <url> [--full] [--out=<dir>] [--json] [--wait=<ms>] [--wait-for=<target>]
+5dive browser read [<site>] <url> <url>… [--full]          # up to 5 pages, one call (DIVE-6732)
 5dive browser links <site> <url> [--out=<dir>] [--wait=<ms>] [--wait-for=<target>]
 ```
 
@@ -545,6 +606,25 @@ schema.org data, word count, capture/browser/extractor versions, and the SHA-256
 With no `--out`, the directory is created mode 0700 beneath the seat's private artifact root;
 each artifact is 0600. An explicit directory must meet that same ownership and mode contract, and
 can never be the live profile or a directory beneath it. A logged-out refusal creates nothing.
+
+**What it prints is the page's head, not the page (DIVE-6732).** The front matter and the
+facts (label/value tables) are printed whole, then the page text up to 6000 characters
+(`FIVEDIVE_BROWSER_READ_PRINT_MAX`), cut at a line, with one line naming the complete `page.md`.
+A Wikipedia article is 40-110 KB of Markdown, and every later model call of a job reads whatever
+a read printed again. `--full` prints all of it; `page.md` on disk always has all of it.
+
+**Several urls, one call, loaded side by side.** `read <url> <url> <url>` takes the browser's
+lease once, has the executor open every page in its own tab of one browser at the same time, and
+derives the pages in parallel (the extractor is seconds of CPU on a big article). Pages print in
+the order asked, each under a `==> <url> <==` line, each with its own artifacts directory named on
+stderr; together they share the print budget. Every url must open in the same profile as the
+first: one with a login of its own beside public ones is refused, not read logged out. A page that
+does not load is named under its url, the others are still read, and the call exits non-zero. A
+served browser gets them in one request too, a tab each, all loading at once (a session started
+by a release before 1.52.1 renders them one after another). One url on a served browser is read
+the same way, in a tab of its own (DIVE-6778): before 1.53.0 it stopped the served browser, read
+cold and started it again, losing the page the agent was acting on. `--out`, `--json` and
+`--wait-for` take one url.
 
 `--json` prints the metadata plus Markdown as one object. `links` is the same one-capture read and
 the same evidence triple, but prints only the extracted article's absolute link objects. It is not
@@ -649,12 +729,27 @@ because its one re-read came before the toast.
   few seconds later and `read` exits 76 with nothing written, rather than hanging.
 - **`--expect` is re-read for a window.** After the last step, `act` reads the page again until
   `--expect` matches or `--expect-wait` ms pass (default 5000, `FIVEDIVE_BROWSER_EXPECT_WAIT_MS`),
-  against the document **and** the text a person sees, toasts and `aria-live` regions included. The
+  against the text a person sees, toasts and `aria-live` regions included, plus the title and the
+  url — **never the raw document** (DIVE-6651): Search Console keeps a hidden "Indexing requested"
+  span on the page, and grading `page.html` read `verified` while the screen said "Something went
+  wrong". The
   read that matched is the one that ships, so `page.png` shows the toast. `--expect-wait=0` is the
   old single read. The verdict is still `grep -iE` in `bin/browser`; the executor's poll is only an
   early exit, so a pattern JavaScript reads differently costs the window, never a wrong answer.
-- **`act` leaves what `snapshot` leaves:** `tree.json` (`--interactive` narrows it), `page.md` and
-  `page.meta.json`, beside `page.html`, `page.png` and `after.json`, all from the page the steps left.
+- **`act` leaves what `snapshot` leaves:** `tree.json` (`--interactive` narrows it), beside
+  `page.html`, `page.png` and `after.json`, all from the page the steps left. On a served browser it
+  prints **what the steps changed** (DIVE-6795, `lib/look.cjs`): the served browser remembers each
+  tab as the agent last saw it (a snapshot or an act) and answers with the interactive refs that
+  appeared and went away and the lines of text that are new, capped (60 refs, 8 of a list's options,
+  1.5 KB of text). `after.json` carries it as `look`, `--json` as `changed`. The extracted
+  `page.md` and `page.meta.json` are derived only for `--full` (or a cold run): Defuddle cost each
+  act 0.9-4 s for text the agent mostly did not read. Otherwise `page.md` is the page's plain text,
+  the same text `--expect` is graded on.
+- What the form fields hold is read too (`lib/aria.cjs` `_valuesIn`, `after.json` `values`) and
+  never graded: a failed save still shows the title that was typed. An `--expect` only a field
+  matches says so instead of pointing at the picture. `snapshot --interactive` prints up to 300 refs
+  (`FIVEDIVE_BROWSER_INLINE_SNAP_REFS_MAX`), and `snapshot <site>` with no URL reads the page the
+  last act or snapshot on it left.
 
 **76 is not 75.** 75 means the session is cold and a person has to log in again. 76 means the
 session is fine and the page was not ready: wait for it. Do not re-authenticate, and do not re-run
@@ -691,6 +786,7 @@ when.
 | `google.com` | `accounts.google.com/signin/v2/identifier` | `<title>Sign in - Google Accounts</title>` | BOTH halves: the sign-in page's title, exactly, 1 match logged out (an 857 KB render, throwaway profile); 0 logged in, where `status` read authenticated. It probes the sign-in page because a logged-out `myaccount.google.com` renders a marketing page with 0 matches, and it matches the title, not the words "Sign in". The `send` action's steps and its Sent-folder verify were measured on a live Gmail on 2026-09-25 (see the file's `_comment`) |
 | `booking.com` | `/` | `data-testid="auth-link-in-view"` | BOTH halves: 1 match in each of two logged-out renders, 0 in the logged-in one (header "Your account", Genius level), where `status` read authenticated. The first draft's marker was the Sign in link's href, `account.booking.com/auth/oauth2?client_id=`, as counted; the marker is a regex, `2?` is an optional 2, and it matched 0 logged-out renders. It ships two actions, `search` and `hotels` (`--city --checkin --checkout --adults --rooms --max_eur`, dates YYYY-MM-DD, cheapest first): a cold `run` of a results URL is redirected to an undated city page and retried once in the served browser (DIVE-4991), so `serve booking.com` first saves that round trip — and expect NOT VERIFIED, because the verify is a public fetch and Booking answers that with a different page |
 | `web.telegram.org` | `/k/` | out: `(page-signQR\|auth-qr-form\|…)`, **in:** `class="([^"]* )?chatlist[ "]` | the POSITIVE marker on both halves: `chatlist` as a whole class name, 1 match on the live signed-in render (`class="chatlist virtual-chatlist"`), 0 on the shell and on both 2026-09-25 signed-out renders. The first marker, `class="[^"]*chatlist`, also matched the signed-out render's `chatlist-container` class and read a signed-out profile as `authenticated`; the logged-out marker matched 0 on the live session but its logged-out render was never observed — the K app does not paint sign-in inside the probe's window on a fresh profile. That gap fails SAFE only because of the positive marker: neither matching is `UNKNOWN`, not a login |
+| `shopify.com` | `admin.shopify.com/` | out: `cZone: ?'accounts\.shopify\.com'\|/session-service/login`, **in:** `/store/<handle>/(orders\|products\|customers)` | BOTH halves on the Dropshipping trial box: two throwaway profiles land on accounts.shopify.com's Cloudflare check, which the out-marker matches in both; the drawn signed-in admin has 5 in-matches and 0 out-matches, and `status` read authenticated where the generic check had read the public site's "Log in" link as expired. The real login form past Cloudflare was never observed; it reads `UNKNOWN`, not a login, because of the positive marker |
 
 Every shipped adapter but two has `"actions": {}`: they classify a session, and the actions a
 site's owner wants are theirs to write in their seat's `.adapters/`. booking.com's `search` and
@@ -889,10 +985,11 @@ action that half happened.
 
 **Playwright is pinned.** The plugin's `package.json` (`browser/package.json` in this repo) names an exact `playwright-core` version,
 no caret: the driver speaks CDP to a Chrome holding a human's live session, and a silent minor bump
-changes the launch arguments under a credential. Install it with
-`npm install --prefix <the plugin directory>`; without it, `run` refuses and says so.
+changes the launch arguments under a credential. Without it, `run` refuses and says so.
 
-On a managed 5dive box nobody types that command. The nightly browser-stack converger
+On a self-hosted box `sudo 5dive browser setup` installs it (DIVE-6089, DIVE-6112), installing
+Node.js 22 first when node is missing or older than 20; a hire never does. On a managed 5dive box
+nobody types that command. The nightly browser-stack converger
 (`/usr/local/bin/5dive-browser-stack-install`, shipped by 5dive-api) reads the pin out of this
 `package.json`, installs it as root into the enabled package directory with `--ignore-scripts`, and
 does so again after every `plugin upgrade` replaces that directory — until then its status file reads
@@ -949,7 +1046,8 @@ case (chill-gorge, 2026-09-30). Through the session daemon's Playwright launch
 sign-in form. Plain Chrome on the same profile, box and IP rendered it. So the blocker is the
 channel, not the IP, and a proxy does not fix it.
 
-An adapter opts a site in with `"drive": "input"`. Any site can; `tiktok.com.json` ships with it.
+An adapter opts a site in with `"drive": "input"`. Any site can; `tiktok.com.json` and
+`amazon.co.jp.json` (DIVE-7476: every automated read returned Amazon's error page) ship with it.
 Then:
 
 - `serve` starts `session-daemon --input`. That daemon launches Chrome with exactly the DIVE-5203
@@ -980,6 +1078,21 @@ Then:
   generic list) stops an act between steps with 75. TikTok's slider captcha is an in-page overlay
   and does not change the title; the agent sees it in the screenshot, and the skill tells it to
   hand the window over.
+- A site's own **error page** (adapter `probe.refused_when_title_matches`; no generic list) is
+  a stop too, but not a challenge (DIVE-7528). The daemon answers 74 with `refused: true`, and the
+  command exits 75 saying the site refused the read, with **no** handoff advice: the page has
+  nothing on it for a person to clear. Amazon's 「ご迷惑をおかけしています！」 is one.
+- An adapter with `"fetch_when_refused": true` (amazon.co.jp) turns that stop on `snapshot <url>`
+  into a **plain-HTTP read of the same page** (DIVE-7688): the serving seat's proxy (socks names
+  resolved through it; a proxy file that cannot be read or parsed is no fallback), a Chrome user
+  agent, no cookie read or written, so the profile and its login are untouched. It exits 0 with
+  `page.md`, `page.meta.json` (`read_by: "http"`, `signed_in: false`) and the browser's screen as
+  `browser-refused.png`. Not HTTP 200, a redirect off the site, or the same error page or a check
+  on the plain read keeps the stop (75).
+- A typed address is read only once it has **loaded** (DIVE-7572): the title is no longer the
+  address Chrome shows while a page has no title of its own (at least 2.5 s, at most
+  `FIVEDIVE_BROWSER_INPUT_LOAD_WAIT_MS`, default 20 s). A page that never loads exits **76**
+  ("did not finish loading"), with its screenshot and `loaded: false`, never 0.
 - `status` (and `probe-all`) loads the probe URL in a **new tab of its own**, reads the window
   title once it settles, and closes that tab (DIVE-5388). It does this only when nobody is driving:
   no handoff, nobody in the viewer, no lease. Otherwise it reads the current title, says
@@ -990,8 +1103,10 @@ Then:
   by the last signed-in read, or `unknown` when there has never been one. It is never
   `authenticated` by elimination. A daemon from before 1.31.0 has no `title_probe`. Until it is
   restarted, `status` behaves as before.
-- A proxied seat is refused input mode rather than served off its proxy, for DIVE-4951's reason:
-  plain Chrome cannot carry a proxy login.
+- A seat whose proxy has a **login** is refused input mode rather than served off its proxy, for
+  DIVE-4951's reason: plain Chrome cannot carry a proxy login. A proxy with **no** login (every
+  socks5 one) is passed to plain Chrome as `--proxy-server=<scheme>://<host>:<port>`, so input
+  mode keeps the seat's route (DIVE-7476).
 
 Why screenshots and not a Chrome extension, which main's design note preferred: branded Google
 Chrome has ignored `--load-extension` since 137. On this host's Chrome 153 both the flag and its

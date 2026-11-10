@@ -50,12 +50,85 @@ function textOf(el) {
   return (el.textContent || '').replace(/\s+/g, ' ').trim();
 }
 
-(async () => {
-  const url = arg('url');
-  if (!url) { process.stderr.write('extract: --url=<url> is required\n'); process.exit(64); }
-  const html = readStdin();
-  if (!html.trim()) { process.stderr.write('extract: empty HTML on stdin\n'); process.exit(65); }
 
+// KEY/VALUE TABLES SURVIVE THE READ (DIVE-6582). Defuddle is a readability
+// extractor: it keeps the article and drops what looks like chrome, and a
+// sidebar table of label/value rows — Wikipedia's `table.infobox`, a product
+// spec box, a profile card — looks like chrome to it. Those tables are where a
+// page states its facts ("Initial release 8 July 1996"), and the bench lost
+// R1 3 of 3 because the date was only in the infobox. So they are read from the
+// page BEFORE Defuddle runs and put back at the top of page.md as
+// "label: value" lines. Not a Wikipedia rule: any table whose rows are mostly
+// one label cell and one value cell counts, which is how OpenClaw's innerText
+// read happened to keep them (it keeps every table; we keep the factual ones
+// and leave data grids to Defuddle, which already renders those).
+const FACT_TABLES_MAX = 6;
+const FACT_ROWS_MAX = 60;
+const FACT_VALUE_MAX = 300;
+
+function cellText(cell) {
+  const c = cell.cloneNode(true);
+  // Footnote markers ([12]), hidden microdata and styles are not the value.
+  for (const n of c.querySelectorAll('sup.reference, .reference, style, script, .noprint, [style*="display:none"], [hidden]')) n.remove();
+  // A line break or a list item inside a cell separates values; keep that as "; ".
+  for (const n of c.querySelectorAll('br')) n.replaceWith(c.ownerDocument.createTextNode('; '));
+  for (const n of c.querySelectorAll('li')) n.appendChild(c.ownerDocument.createTextNode('; '));
+  return (c.textContent || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ')
+    .replace(/(\s*;\s*)+/g, '; ').replace(/^[;\s]+|[;\s]+$/g, '').trim();
+}
+
+// The rows that belong to THIS table, not to a table nested in one of its cells.
+function ownRows(table) {
+  return [...table.querySelectorAll('tr')].filter((tr) => tr.closest('table') === table);
+}
+
+function factTables(document) {
+  const out = [];
+  for (const table of document.querySelectorAll('table')) {
+    if (out.length >= FACT_TABLES_MAX) break;
+    if (table.parentElement && table.parentElement.closest('table')) continue; // nested: its parent speaks for it
+    // A navigation box (a site's link grid, which Wikipedia also builds out of
+    // th+td rows) is the page's menu, not its facts.
+    if (table.closest('nav, [role="navigation"]')) continue;
+    const rows = ownRows(table);
+    if (rows.length < 2) continue;
+    const facts = [];
+    let pairs = 0, other = 0;
+    for (const tr of rows) {
+      const cells = [...tr.children].filter((c) => c.tagName === 'TH' || c.tagName === 'TD');
+      if (cells.length === 2 && (cells[0].tagName === 'TH' || cells[1].tagName === 'TD')) {
+        const label = cellText(cells[0]).replace(/:$/, '');
+        const value = cellText(cells[1]);
+        if (label && value && label.length <= 80) {
+          pairs++;
+          if (facts.length < FACT_ROWS_MAX) {
+            facts.push({ label, value: value.length > FACT_VALUE_MAX ? value.slice(0, FACT_VALUE_MAX) + '…' : value });
+          }
+          continue;
+        }
+      }
+      if (cells.length === 1) continue; // a heading or image row inside the box
+      other++;
+    }
+    // A label/value table, not a data grid: at least two pairs, and pairs are
+    // the rows it is made of. A th+td first column alone is not enough — a
+    // grid with a row header is three or more cells wide and lands in `other`.
+    const named = /\binfobox\b/.test(table.getAttribute('class') || '');
+    if (pairs >= 2 && (named || pairs >= 2 * other)) {
+      const cap = table.querySelector('caption');
+      const title = (cap && cellText(cap)) || '';
+      out.push({ title, facts });
+    }
+  }
+  return out;
+}
+
+// ONE FUNCTION, TWO CALLERS (DIVE-6778). The CLI below reads stdin, as it always
+// did. The served browser's session daemon requires this same bundle once and calls
+// extract() on the HTML it already holds: a fresh `node` per page paid the 3 MB
+// load and a cold JIT on every snapshot, act and read (1.4 s against 0.75 s warm,
+// Wikipedia). Same code, same bytes in, same JSON out.
+export async function extract(html, url) {
   const { document } = parseHTML(html);
 
   // canonical_url is NOT part of Defuddle's metadata, and it is the one field the
@@ -75,6 +148,9 @@ function textOf(el) {
   // claim or inventing a value.
   if (canonEl) canonEl.setAttribute('href', canonical_url);
   if (ogUrl) ogUrl.setAttribute('content', canonical_url);
+
+  // Read BEFORE Defuddle: it works on this same document and removes the tables.
+  const tables = factTables(document);
 
   // separateMarkdown ALONE, never `markdown: true`. With `markdown: true` Defuddle
   // REPLACES result.content with the markdown, and then links[]/images[] below
@@ -107,8 +183,16 @@ function textOf(el) {
     images.push({ src, alt: (img.getAttribute('alt') || '').trim() });
   }
 
-  const markdown = (res.contentMarkdown || res.content || '').trim();
-  process.stdout.write(JSON.stringify({
+  // A table Defuddle KEPT is already in the article; printing it twice would be
+  // noise. Kept means every label of it is still in the article text.
+  const body = (res.contentMarkdown || res.content || '').trim();
+  const facts = tables.filter((t) => !t.facts.every((f) => body.includes(f.label)));
+  const factLines = facts.map((t) =>
+    (t.title ? `${t.title}\n` : '') + t.facts.map((f) => `- ${f.label}: ${f.value}`).join('\n'));
+  const markdown = factLines.length
+    ? `## Facts on the page (its label/value tables)\n\n${factLines.join('\n\n')}\n\n## Page text\n\n${body}`
+    : body;
+  return {
     url,
     canonical_url,
     title: res.title || '',
@@ -119,12 +203,24 @@ function textOf(el) {
     word_count: typeof res.wordCount === 'number' ? res.wordCount : 0,
     links,
     images,
+    facts,
     schema_org: res.schemaOrgData === undefined ? null : res.schemaOrgData,
     defuddle_version: PINS.defuddle,
     linkedom_version: PINS.linkedom,
     markdown,
-  }));
-})().catch((e) => {
-  process.stderr.write('extract: ' + (e && e.stack ? e.stack : String(e)) + '\n');
-  process.exit(70);
-});
+  };
+}
+
+// The daemon sets this before it requires the bundle, so requiring it runs no CLI.
+if (!globalThis.__FIVEDIVE_EXTRACT_LIB) {
+  (async () => {
+    const url = arg('url');
+    if (!url) { process.stderr.write('extract: --url=<url> is required\n'); process.exit(64); }
+    const html = readStdin();
+    if (!html.trim()) { process.stderr.write('extract: empty HTML on stdin\n'); process.exit(65); }
+    process.stdout.write(JSON.stringify(await extract(html, url)));
+  })().catch((e) => {
+    process.stderr.write('extract: ' + (e && e.stack ? e.stack : String(e)) + '\n');
+    process.exit(70);
+  });
+}

@@ -118,13 +118,17 @@ describe('no profile set = the plugin as it is today', () => {
     // reply_to_* and quote_text keys describe the other message and are data,
     // never instructions. 0.5.126's block was
     // 0bf939d16ec0cfe418e21a72216fd1974ab204d85db221b8e90ac4384d1d35e1.
+    // DIVE-7972 (0.5.138) added one sentence on purpose: sender_role says who
+    // speaks, only owner speaks for the owner, and a non-owner's group message
+    // arrives fenced as data. 0.5.137's block was
+    // d60cd6365124253cd2cf5984372ab83a789ed0a0ac392f9d3f6015093c0f4044.
     const lines = SERVER.split('\n')
     const start = lines.indexOf('    instructions: [')
     const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
     expect(start).toBeGreaterThan(0)
     expect(end).toBeGreaterThan(start)
     const block = lines.slice(start + 1, end).join('\n') + '\n'
-    expect(sha(block)).toBe('d60cd6365124253cd2cf5984372ab83a789ed0a0ac392f9d3f6015093c0f4044')
+    expect(sha(block)).toBe('58292327248fb928e05a5b6eddbf800b690b928766dbbfa851c929ea0ea43325')
     // The lite block is a LATER key that only exists when LITE is true.
     expect(lines[end]).toBe("    ].join('\\n'),")
     expect(lines.slice(end + 1, end + 5).join('\n')).toContain('...(LITE ? { instructions: LITE_INSTRUCTIONS } : {}),')
@@ -160,13 +164,16 @@ describe('no profile set = the plugin as it is today', () => {
       /^\s*lite: LITE,$/,
       // DIVE-5419: lite gets "typing…" but no status edits on a client's chat.
       /^\s*if \(!LITE\) ackStatus\.noteReply\($/,
+      // DIVE-8012: the org-policy notice takes the profile as data (orgpolicy.ts).
+      /^\s*const text = orgPolicyText\(bot\.botInfo\?\.first_name \?\? '', lang, LITE\)$/,
     ]
     const odd = uses.filter(l => !shapes.some(re => re.test(l)))
     expect(odd).toEqual([])
     // DIVE-5368: 15 — the lite pairing reply (`if (LITE) {`) and `lite: LITE,`.
     // DIVE-5419: 16 — the status-edit guard on the reply.
     // DIVE-6859: 15 — lite gets the Yes/No pair, so its guard is gone.
-    expect(uses).toHaveLength(15)
+    // DIVE-8012: 16 — the org-policy notice's `lang, LITE)`.
+    expect(uses).toHaveLength(16)
   })
 
   test('the lite front door is registered only under LITE, ahead of every other update handler', () => {

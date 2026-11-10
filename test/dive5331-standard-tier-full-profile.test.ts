@@ -257,8 +257,12 @@ describe('server.ts wiring', () => {
   test('the dispatcher refuses an admin-only command before its handler, and only on a standard seat', () => {
     const gate = loop.indexOf("standardSeatRoute(def.name, String(ctx.match ?? '')) === 'admin' && (await seatTier()) === 'no'")
     expect(gate).toBeGreaterThan(-1)
-    expect(loop.indexOf('adminTierText(liteLang(ctx.from?.language_code))')).toBeGreaterThan(gate)
-    expect(loop.indexOf('await handler(ctx, gate)')).toBeGreaterThan(gate)
+    // DIVE-7835: /login answers with where to sign in; every other admin-only command keeps adminTierText.
+    const refusal = loop.indexOf("await ctx.reply(def.name === 'login' ? LOGIN_ADMIN_TIER[lang] : adminTierText(lang))")
+    const handler = loop.indexOf('await handler(ctx, gate)')
+    expect(loop.indexOf('const lang = liteLang(ctx.from?.language_code)')).toBeGreaterThan(gate)
+    expect(refusal).toBeGreaterThan(gate)
+    expect(handler).toBeGreaterThan(refusal)
   })
   test('server.ts spawns sudo nowhere but the gate', () => {
     expect(SERVER).not.toMatch(/execFileP\(\s*SUDO/)
