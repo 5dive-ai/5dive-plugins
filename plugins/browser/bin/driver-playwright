@@ -618,6 +618,11 @@ async function writeReport(page, report, pop, { failed = false } = {}) {
     // ...and a page that moved between the read and the picture is read again,
     // so url, title, refs and png describe the same page.
     if (report.shot) {
+      // DIVE-8051: the picture shows what --expect matched, scrolled to it when it is off screen.
+      if (!failed && report.expect && !report.scope) {
+        const shown = await aria.showExpect(page, report.expect, after.text);
+        if (shown && shown.scrolled) process.stderr.write(`  the picture is scrolled to what --expect matched: "${shown.text}"\n`);
+      }
       await page.screenshot({ path: report.shot });
       const moved = aria.movedSince(page, after);
       if (moved) {

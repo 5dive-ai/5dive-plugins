@@ -1551,6 +1551,66 @@ async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 3
   return out;
 }
 
+// THE PICTURE SHOWS WHAT --expect MATCHED (DIVE-8051). WebJudge grades the
+// screenshots, never the answer, and an act's page.png is the browser WINDOW: a
+// matched "$850 estimate" or "Climate Controlled" chip below the fold was in the
+// agent's text and in no picture (om2w-a7a73c8f: "none of the screenshots show a
+// cost estimate"). So after a matched --expect, when no match is on screen, the
+// first visible one is scrolled to the middle before the picture is taken. The
+// agent takes no extra step for it: the act that proved the job pictures its
+// proof. A match already in view moves nothing. The smallest elements whose text
+// matches are the candidates (a match split over a <b> and its sentence is their
+// parent); one taller than 1.5 screens is a page section, not a proof, and is
+// skipped. Self-contained: it runs in the page.
+function _showIn(arg) {
+  const src = String((arg && arg.expect) || '');
+  if (!src || typeof document === 'undefined' || !document.body) return null;
+  let re;
+  try { re = new RegExp(src, 'i'); }
+  catch (e) { const l = src.toLowerCase(); re = { test: (x) => String(x).toLowerCase().includes(l) }; }
+  const vh = (typeof window !== 'undefined' && window.innerHeight) || 0;
+  if (!(vh > 0)) return null;
+  const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|TITLE|SVG)$/i;
+  const hits = [];
+  const visit = (el) => {
+    if (hits.length >= 60 || SKIP.test(String(el.tagName || ''))) return false;
+    if (!re.test(String(el.textContent || ''))) return false;
+    let below = false;
+    for (const c of Array.from(el.children || [])) if (visit(c)) below = true;
+    if (!below) hits.push(el);
+    return true;
+  };
+  visit(document.body);
+  let first = null;
+  for (const el of hits) {
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+    if (!(r && r.width > 0 && r.height > 0) || r.height > vh * 1.5) continue;
+    try {
+      const st = getComputedStyle(el);
+      if (st.visibility === 'hidden' || st.display === 'none') continue;
+    } catch (e) { /* drawn: it has a box */ }
+    if (r.bottom > 0 && r.top < vh) return { show_report: true, in_view: true };
+    if (!first) first = el;
+  }
+  if (!first) return null;
+  try { first.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { return null; }
+  return { show_report: true, scrolled: true,
+    text: String(first.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80) };
+}
+async function showExpect(page, expect, text) {   // -> {scrolled,text} | {in_view} | null; never throws
+  if (!expect || !page || typeof page.evaluate !== 'function') return null;
+  // Only a match in the page's TEXT is a thing on the page to show: one in the
+  // title or the url has nothing to scroll to.
+  const re = expectRe(String(expect));
+  if (!re || !re.test(String(text || ''))) return null;
+  let r = null;
+  try { r = await page.evaluate(_showIn, { expect: String(expect), showOf: true }); } catch (e) { return null; }
+  if (!r || r.show_report !== true) return null;
+  if (r.scrolled) { try { await page.waitForTimeout(150); } catch (e) { /* the picture still runs */ } }
+  return r;
+}
+
 // A FAILED STEP'S ERROR, SHORT (DIVE-6795). Playwright appends a "Call log:" of
 // 30 lines of retries, which the agent read after every failed click on the
 // bench. Its first line says what failed; the one log line worth keeping is the
@@ -1693,7 +1753,7 @@ module.exports = { movedSince, INTERACTIVE, pageWalk, walk, snapshot, resolveRef
   isRef, render, REF_PREFIX,
   splitRef, frameList, frameFor, FRAME_PREFIX, ENTER_FRAME,
   typeDelay, typeRefusal, typeKeys, TYPE_DELAY_DEFAULT, TYPE_DELAY_MAX,
-  classifyLabel, stepRisk, pageAfter, stepErrorText, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER, OWNER_ALLOWED_PREFIX,
+  classifyLabel, stepRisk, pageAfter, showExpect, _showIn, stepErrorText, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER, OWNER_ALLOWED_PREFIX,
   STEP_FAILED_PREFIX, failedStep,
   redirectWhy, checkLanding, E_REDIRECTED,
   _payloadIn, cleanText, cleanPayload,

@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Fixed — browser 1.74.0 on the one-click install: the registry copy re-synced from 5dive-browser main (DIVE-8116)
+
+`browser@5dive-plugins` (the app's one-click card) was still 1.73.0 after 5dive-browser 1.74.0 merged (DIVE-8051, #145). `bash tests/browser_mirror.sh sync ac8743f5`; `check` reads `OK: plugins/browser 1.74.0 == 5dive-browser main ac8743f`.
+
+- **`plugins/browser`:** byte-for-byte 5dive-browser ac8743f. An act whose `--expect` matched below the fold scrolls the match into view before its screenshot, so the picture shows the proof; the use-browser skill says to `--expect` the proof, set filters on the page's own control, and never turn a named filter off.
+- **CI (`parity.yml`):** upstream's new `browser_act_show_expect_unit.sh` joins the harnesses run on this tree.
+- **No floor raise:** since DIVE-5645 the nightly converger moves official browser installs to the newest release; `_BS_PLUGIN_MIN` (1.25.0) is only a minimum.
+
 ### Fixed — teams 0.5.2: `connect --microsoft` works on a self-hosted box (DIVE-8111)
 
 Measured on a fresh install.5dive.ai box (DIVE-8107): the sign-in never opened unless connect ran as the app runs it (`SUDO_USER=claude`).

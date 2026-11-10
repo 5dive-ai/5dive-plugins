@@ -96,7 +96,7 @@ jobs:
           browser_plugin_unit.sh browser_connect_request_unit.sh browser_reflex_propose_unit.sh
           browser_tmpdir_unit.sh browser_input_drive_unit.sh browser_routine_delta_unit.sh
           browser_probe_timeout_unit.sh browser_served_probe_unit.sh browser_launch_env_unit.sh
-          browser_act_upload_unit.sh
+          browser_act_upload_unit.sh browser_act_show_expect_unit.sh
         env:
           BROWSER_UPSTREAM_DIR: ${{ runner.temp }}/5dive-browser
           BROWSER_MIRROR_BRANCH: ${{ github.head_ref || github.ref_name }}
