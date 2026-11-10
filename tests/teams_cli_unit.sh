@@ -23,7 +23,12 @@ mkdir -p "$W/home/agent-max/.claude" "$W/conn" "$W/pk" "$W/tmp"
 cat >"$W/5dive" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >>"$STUB_LOG"
+# DIVE-8111: who each browser call runs as (the browser drops to SUDO_USER).
+[[ "$1" == browser ]] && echo "browser-as ${SUDO_USER:-} $2" >>"$STUB_LOG"
 case "$1 $2" in
+  "browser --help") [[ -n "${STUB_NOBROWSER:-}" ]] && exit 1 ;;
+  "browser viewer") echo "/browser/viewer/$3/n0nce"; echo "local view: VNC on 127.0.0.1:5901 of this box only, one connection; its one-time password: sudo cat /x/.5dive-viewer.pw" >&2 ;;
+  "people ls") [[ -n "${STUB_KNOCKS:-}" ]] && printf '{"ok":true,"data":{"people":[],"knocks":%s}}\n' "$STUB_KNOCKS" ;;
   "agent info")
     [[ "$3" == max ]] || exit 4
     printf '{"ok":true,"data":{"name":"max","type":"%s","channels":"%s"}}\n' "${STUB_TYPE:-claude}" "$(cat "$STUB_CHANNELS")" ;;
@@ -99,6 +104,9 @@ cat >"$W/systemctl" <<'SC'
 case "$1" in is-active) [[ -e "$MS_DIR/active" ]] ;; stop) rm -f "$MS_DIR/active" ;; esac
 SC
 chmod +x "$W/msteams" "$W/systemd-run" "$W/systemctl"
+# DIVE-8111: the sign-in's prerequisites, faked: a Chrome and a Node 22.12.
+mkdir -p "$W/bin"; printf '#!/bin/sh\nexit 0\n' >"$W/bin/google-chrome"; printf '#!/bin/sh\necho 22.12.0\n' >"$W/bin/node"
+chmod +x "$W/bin/google-chrome" "$W/bin/node"
 mkdir -p "$W/mshome"
 
 run() {
@@ -109,7 +117,9 @@ run() {
     STUB_LOG="$W/log" STUB_CHANNELS="$W/channels" STUB_ROUTED="$W/routed" STUB_TYPE="${STUB_TYPE:-claude}" \
     TEAMS_5DIVE_BIN="$W/5dive" TEAMS_CONNECTORS_DIR="$W/conn" TEAMS_PROVISIONING="$W/prov.env" \
     FIVE_LOCAL_ONLY_FILE="$W/local-only" TEAMS_PACKAGES_DIR="$W/pk" AGENT_HOME_ROOT="$W/home" \
-    TMPDIR="$W/tmp" TEAMS_AGENT_USER="$ME" FIVEDIVE_JSON_MODE="${JSON:-0}" bash "$BIN" "$@" 2>&1
+    TMPDIR="$W/tmp" TEAMS_AGENT_USER="$ME" FIVEDIVE_JSON_MODE="${JSON:-0}" \
+    PATH="$W/bin:$PATH" TEAMS_CHROMES="${CHROMES:-$W/bin/google-chrome}" TEAMS_BROWSER_SEAT="$ME" \
+    STUB_NOBROWSER="${STUB_NOBROWSER:-}" STUB_KNOCKS="${STUB_KNOCKS:-}" SUDO_USER="${AS_SUDO_USER:-}" bash "$BIN" "$@" 2>&1
 }
 reset() { : >"$W/log"; echo telegram >"$W/channels"; rm -f "$W/routed" "$W/local-only" "$W/local-only.allow" "$W/conn/"* "$W/home/agent-max/.claude/channels/teams/"* 2>/dev/null; echo 'FIVE_DOMAIN=box.example.com' >"$W/prov.env"; }
 
@@ -219,8 +229,11 @@ out=$(JSON=1 run agent connect max --microsoft); rc=$?
 
 msreset
 out=$(run agent connect max --microsoft); rc=$?
-[[ $rc -eq 6 && "$out" == *"Sign in with Microsoft"* && "$out" == *"browser viewer login.microsoftonline.com --bind=local"* ]] \
-  && ok "without --json: exit 6 and how to see the page at a terminal" || bad "sign_in words (rc=$rc)" "$out"
+[[ $rc -eq 6 && "$out" == *"Sign in with Microsoft"* && "$out" == *"See the page from your computer: VNC on 127.0.0.1:5901"* && "$out" == *"Not now is fine"* ]] \
+  && grep -q "^browser viewer login.microsoftonline.com --bind=local$" "$W/log" \
+  && ok "without --json: exit 6, and connect itself makes the view and prints how to reach it" || bad "sign_in words (rc=$rc)" "$out"
+JSON=1 run agent connect max --microsoft >/dev/null; [[ "$(grep -c '^browser viewer' "$W/log")" == 1 ]] \
+  && ok "DIVE-8111: under --json (the app) no local view is made; the app mints its own" || bad "json view" "$(cat "$W/log")"
 
 msreset; STUB_NOPROFILE="$W/np"
 out=$(JSON=1 run agent connect max --microsoft); rc=$?
@@ -371,6 +384,49 @@ msreset; rm -f "$W/prov.env"
 out=$(JSON=1 run agent connect max --microsoft); rc=$?
 [[ $rc -eq 3 && "$out" == *"no public name"* ]] && ! grep -q "unit=" "$W/mslog" && ok "no public name: refuses before any sign-in" || bad "no domain (rc=$rc)" "$out"
 msreset
+# ─── DIVE-8111: a self-hosted box ───
+# A sudo user (or root at a terminal) runs connect: every browser call still goes
+# to the box seat, as the app's calls do.
+msreset; rm -f "$W/prov.env"
+out=$(AS_SUDO_USER=someone-else run agent connect max --microsoft --endpoint=https://example.invalid); rc=$?
+as=$(grep '^browser-as ' "$W/log" | awk '{print $2}' | sort -u)
+[[ $rc -eq 6 && "$as" == "$ME" ]] && grep -q "^browser serve login.microsoftonline.com --login" "$W/log" \
+  && ok "DIVE-8111: a sudo user's connect drives the box seat's browser, never its own (serve, viewer)" || bad "browser seat (rc=$rc, as=$as)" "$(cat "$W/log")"
+port=$(grep -o 'http://127.0.0.1:[0-9]*' <<<"$out" | head -1)
+[[ "$out" == *"Teams will post to https://example.invalid/api/messages. Point your tunnel or reverse proxy at http://127.0.0.1:"* && -n "$port" ]] \
+  && ok "DIVE-8111: the port to forward is printed before the sign-in" || bad "port before sign-in" "$out"
+out=$(JSON=1 run agent connect max --microsoft --endpoint=https://example.invalid); rc=$?
+jq -e --arg f "$port" '.data.state == "sign_in" and .data.forward == $f and (.data.port | test("^[0-9]+$"))' <<<"$out" >/dev/null \
+  && ok "DIVE-8111: --json sign_in carries port and forward too" || bad "json port" "$out"
+touch "$W/ms-in"
+out=$(run agent connect max --microsoft --endpoint=https://example.invalid); rc=$?
+[[ $rc -eq 0 && "$(jq -r .port "$cfg")" == "${port##*:}" && "$out" == *"Forward it to $port"* ]] \
+  && ok "DIVE-8111: the bot listens on exactly the port printed before the sign-in" || bad "same port (rc=$rc)" "$out $(jq -c 'del(.app_password)' "$cfg")"
+[[ "$out" == *"Someone new waits until you answer"* && "$out" == *"sudo 5dive people knock answer <number> allow"* ]] \
+  && ok "DIVE-8111: ready says a stranger's first message waits, and how to answer it" || bad "knock words" "$out"
+msreset; rm -f "$W/prov.env"
+out=$(run agent connect max --microsoft); rc=$?
+[[ $rc -eq 3 && "$out" == *"Point a tunnel or reverse proxy at http://127.0.0.1:"*"--endpoint="* ]] && ! grep -q "unit=" "$W/mslog" \
+  && ok "DIVE-8111: no domain and no --endpoint: the error names the port to point a tunnel at" || bad "no endpoint (rc=$rc)" "$out"
+
+# Prerequisites: one line, before anything is installed or started.
+msreset
+out=$(CHROMES="$W/bin/no-chrome" STUB_NOBROWSER=1 run agent connect max --microsoft); rc=$?
+[[ $rc -eq 3 && $(wc -l <<<"$out") -eq 1 && "$out" == *"missing: the browser plugin, Chrome)"* && "$out" == *"sudo 5dive plugin install browser && sudo 5dive browser setup"* ]] \
+  && ! grep -q "unit=" "$W/mslog" && ! grep -q "browser serve" "$W/log" \
+  && ok "DIVE-8111: no browser yet: one line names what is missing and the setup, nothing started" || bad "prereqs (rc=$rc)" "$out"
+msreset; touch "$W/ms-in"
+out=$(JSON=1 CHROMES="$W/bin/no-chrome" run agent connect max --microsoft); rc=$?
+[[ $rc -eq 0 ]] && jq -e '.data.state == "ready"' <<<"$(tail -1 <<<"$out")" >/dev/null \
+  && ok "DIVE-8111: already signed in, a box with no browser still makes the next agent's bot" || bad "signed-in no chrome (rc=$rc)" "$out"
+
+# Status names the messages held for the owner.
+out=$(STUB_KNOCKS='[{"id":7,"agent":"max","channel":"teams","name":"Kim","email":"kim@firm.example"},{"id":8,"agent":"zed","channel":"teams","name":"Other"}]' run agent status max); rc=$?
+[[ "$out" == *"waiting:    #7 Kim (kim@firm.example) wrote and waits for your answer"* && "$out" != *Other* && "$out" == *"people knock answer <number> allow"* ]] \
+  && ok "DIVE-8111: status lists this agent's waiting knocks and the answer" || bad "status knocks" "$out"
+out=$(JSON=1 STUB_KNOCKS='[{"id":7,"agent":"max","channel":"teams","name":"Kim","email":null}]' run agent status max); rc=$?
+jq -e '.data.waiting == [{"id":7,"name":"Kim","email":null}]' <<<"$out" >/dev/null && ok "DIVE-8111: status --json carries waiting" || bad "status json knocks" "$out"
+
 out=$(run agent connect max --microsoft --app-id=$APP); rc=$?
 [[ $rc -eq 2 ]] && ok "--microsoft with --app-id is a usage error" || bad "flag mix (rc=$rc)" "$out"
 msreset; touch "$W/local-only"
