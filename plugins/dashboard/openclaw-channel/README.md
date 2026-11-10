@@ -88,7 +88,7 @@ reads the same inbox.
 ```bash
 bun test src/spool.test.ts                       # spool and poll loop, no OpenClaw needed
 npm install && npx tsc -p tsconfig.json --noEmit # typecheck against openclaw 2026.11.1
-npm pack                                         # builds dist/ first (prepack), then packs
+npm pack                                         # builds dist/ first (prepare), then packs
 ```
 
 Built against the OpenClaw 2026.11.1 plugin SDK (`openclaw.compat.pluginApi`).

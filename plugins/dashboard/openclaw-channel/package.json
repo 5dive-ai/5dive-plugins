@@ -22,7 +22,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepack": "npm run build",
+    "prepare": "npm run build",
     "test": "bun test src/spool.test.ts"
   },
   "devDependencies": {
