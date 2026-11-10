@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Added — Pi and OpenCode chat packages, and dashboard 0.5.37 steps aside for them (DIVE-8146)
+
+5dive app chat on a Pi or OpenCode seat ran one headless turn per message, in a session of its own. The packages answer in the session the person has open.
+
+- **`@5dive/pi-chat`** (`plugins/dashboard/pi-chat`, a Pi package): while Pi runs with a UI (terminal or `--mode rpc`), a chat message waits for Pi to go idle, goes in as a user message, and the last text of the settled run goes back. `pi -p` never reads.
+- **`@5dive/opencode-chat`** (`plugins/dashboard/opencode-chat`, an OpenCode plugin): under the TUI or `opencode serve`, each message is answered in the "5dive web chat" session (the same session file the bridge keeps). `opencode run` never reads.
+- **Dashboard 0.5.37:** `clidispatch.ts` takes no message while `<spool>/reader.json` names a live process of that runtime (`readerActive`), so a message is never answered twice. A dead or reused pid does not count.
+
+Checked: live turn through each package (Pi 1.5.2 RPC, OpenCode 1.19.5 serve, OpenRouter claude-haiku-4.5); `bun test test/dive8146-pi-opencode-chat-packages.test.ts` 13/13 (stand-down arm red with the check removed); dive7348 15/15. Nothing is published to npm or listed upstream.
+
 ### Fixed — dashboard 0.5.36: a parked chat row no longer spins the long poll, and a removed agent's poller stops (DIVE-8138)
 
 Server 589: agent claudey made 560k polls a day for three days, and kept polling after it was removed from the box.

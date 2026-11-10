@@ -1,0 +1,24 @@
+{
+  "name": "@5dive/opencode-chat",
+  "version": "0.1.0",
+  "description": "Talk to OpenCode from the 5dive web and mobile chat.",
+  "license": "MIT",
+  "author": "5dive (https://5dive.ai)",
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/dashboard/opencode-chat",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/5dive-ai/5dive-plugins",
+    "directory": "plugins/dashboard/opencode-chat"
+  },
+  "keywords": ["opencode", "opencode-plugin", "5dive", "chat"],
+  "type": "module",
+  "main": "./index.ts",
+  "exports": { ".": "./index.ts" },
+  "files": ["index.ts", "src/", "!src/**/*.test.ts", "README.md"],
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": { "optional": true }
+  }
+}

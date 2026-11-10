@@ -237,12 +237,35 @@ export function cliTurn(o: CliTurnOptions): RunTurn {
   }
 }
 
+/**
+ * DIVE-8146: the 5dive chat package for Pi (`@5dive/pi-chat`) or OpenCode
+ * (`@5dive/opencode-chat`) answers the web chat inside the person's own running
+ * session, and marks the spool with `reader.json` ({"pid", "by"}) while it
+ * does. Two readers on one inbox would answer every message twice, so this
+ * dispatcher takes no message while that pid is alive AND is still that
+ * runtime (a pid reused by another program after a crash does not count; a
+ * process we cannot inspect does). A mark with no live owner is ignored.
+ */
+export function readerActive(stateDir: string, rt: CliRuntime): boolean {
+  let mark: { pid?: unknown; by?: unknown }
+  try { mark = JSON.parse(readFileSync(join(stateDir, 'reader.json'), 'utf8')) } catch { return false }
+  const pid = mark.pid
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1 || pid === process.pid || mark.by !== rt) return false
+  try { process.kill(pid, 0) } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'EPERM') return false }
+  let cmd = ''
+  try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8') } catch { return true }
+  // `node …/bin/pi --mode rpc`, `…/bin/opencode serve`: one argument is the runtime's own program.
+  return cmd.split('\0').some(a => (a.split('/').pop() ?? '') === rt)
+}
+
 export type CliDispatcherOptions = {
   runtime: CliRuntime
   inboxDir: string
   outboxDir: string
   run: RunTurn
   log?: (line: string) => void
+  /** True while another reader (the runtime's 5dive chat package) owns the inbox. */
+  standDown?: () => boolean
 }
 
 export function startCliDispatcher(o: CliDispatcherOptions): { stop(): void; idle(): Promise<void> } {
@@ -290,8 +313,12 @@ export function startCliDispatcher(o: CliDispatcherOptions): { stop(): void; idl
   // One turn at a time, in arrival order: they share one session.
   let chain = Promise.resolve()
   const seen = new Set<string>()
+  let away = false
   const ingest = (name: string) => {
     if (!name.endsWith('.json') || name.startsWith('.') || seen.has(name)) return
+    const off = o.standDown?.() ?? false
+    if (off !== away) { away = off; log(off ? `dashboard ${rt}: the ${LABEL[rt]} 5dive chat package is reading the web chat; standing down` : `dashboard ${rt}: web chat back on this bridge`) }
+    if (off) return
     const full = join(o.inboxDir, name)
     let msg: InboxMessage
     try { msg = JSON.parse(readFileSync(full, 'utf8')) } catch { return }   // mid-rename, or already taken

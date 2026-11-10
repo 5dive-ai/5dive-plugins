@@ -1,0 +1,22 @@
+{
+  "name": "@5dive/pi-chat",
+  "version": "0.1.0",
+  "description": "Talk to your Pi session from the 5dive web and mobile chat.",
+  "license": "MIT",
+  "author": "5dive (https://5dive.ai)",
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/dashboard/pi-chat",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/5dive-ai/5dive-plugins",
+    "directory": "plugins/dashboard/pi-chat"
+  },
+  "keywords": ["pi-package", "5dive", "chat"],
+  "type": "module",
+  "files": ["extensions/", "src/", "!src/**/*.test.ts", "README.md"],
+  "pi": {
+    "extensions": ["./extensions/5dive-chat.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
