@@ -52,6 +52,19 @@ It prints:
 
 On a 5dive cloud server, leave out `--endpoint`: the address is made for you.
 
+### Faster: one Microsoft sign-in
+
+Instead of steps 2 to 4, 5dive can make the bot for you after one Microsoft sign-in:
+
+```
+sudo 5dive agent teams connect <agent> --microsoft --endpoint=https://<your address>
+```
+
+- **Once per server**, set up its browser (the sign-in runs in it): `sudo 5dive plugin install browser && sudo 5dive browser setup`.
+- **First**, point your address at the port it names (`http://127.0.0.1:<port>`). Run it without `--endpoint` to see the port. Use a reverse proxy or a named tunnel: a quick tunnel's address changes on every restart.
+- **Sign in** through the view it prints. If Microsoft asks to secure your account, **Not now** is fine. Then run the same command again for the **Add to Teams** link.
+- **Only people you allow can write to the agent.** Someone new waits: `sudo 5dive people ls` shows them, `sudo 5dive people knock answer <number> allow` lets them in. Or add them first with `sudo 5dive people add`.
+
 ## 4. Point the bot at your server
 
 Set the bot's **Messaging endpoint** to the **Endpoint** from step 3 (Developer Portal: **Bot management** > the bot > **Configure**; Azure: **Configuration**).

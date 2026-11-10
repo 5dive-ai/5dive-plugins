@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Fixed — teams 0.5.2: `connect --microsoft` works on a self-hosted box (DIVE-8111)
+
+Measured on a fresh install.5dive.ai box (DIVE-8107): the sign-in never opened unless connect ran as the app runs it (`SUDO_USER=claude`).
+
+- **The box's browser, as the box seat.** Every browser call (`serve`, `auth`, `viewer`, `viewer-revoke`, `forget`) now runs with `SUDO_USER=<box seat>` (`claude`, or `FIVEDIVE_BROWSER_BOX_SEAT`), as the app's `sudo -n 5dive browser …` does. Root at a terminal used to reach root's own store ("mode 755, want 700"; Chrome refuses root), a sudo user its own (`runuser: … Permission denied`).
+- **A working view at a terminal.** Without `--json`, connect makes the `--bind=local` view itself and prints its VNC line and an ssh hint; the old printed `sudo 5dive browser viewer …` looked in the caller's store ("no browser is serving"). `--json` (the app) makes none: the app mints its own.
+- **Prerequisites in one line, first.** The browser plugin, Chrome, Node 22.12+ and the box seat are checked before anything is installed or started, and named together with `sudo 5dive plugin install browser && sudo 5dive browser setup`. A box already signed in does not need them.
+- **The port before the sign-in.** With `--endpoint`, the sign-in step (text and `--json`: `port`, `forward`) names `http://127.0.0.1:<port>`; without a public name, the error names it. It is the port the bot then listens on.
+- **Knocks are visible without Telegram.** `ready` says a stranger's first message waits and how to answer; `agent teams status` lists this agent's waiting knocks (`--json`: `waiting`). The IT guide gains a short one-sign-in section.
+
+Checked: `sudo bash tests/teams_cli_unit.sh` 80/80; 11 of its arms are red on the previous `bin/teams`.
+
 ### Fixed — browser 1.73.0: the registry copy is byte-for-byte 5dive-browser again, and CI keeps it that way (DIVE-8050)
 
 Box bug report 828 (witty-palm): `act` with an `upload` step said "'upload' is not an act step". 5dive-browser has had it since 1.64.0 (DIVE-7237); this copy was last synced on 10-02 (1.32.0) and took only hand ports after. 87 upstream commits never arrived, among them `act` upload and the rc-133 crash fix (DIVE-7432, report 604). Boxes keep landing here because the app's one-click install names `browser@5dive-plugins`.
