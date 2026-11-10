@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Fixed — dashboard 0.5.36: a parked chat row no longer spins the long poll, and a removed agent's poller stops (DIVE-8138)
+
+Server 589: agent claudey made 560k polls a day for three days, and kept polling after it was removed from the box.
+
+- **Nothing pushed paces like an empty poll.** A batch in which every row was parked, in backoff, already delivered live or unreadable returned `ok`, so the long poll asked again at once and the API answered at once (the row was still owed). It now returns `empty-fast`, which `runLongPoll` paces (at most every 8 backoff units). A failed ack (a 429 included) backs off like any failed call.
+- **A parked row is acked.** Left unacked it stayed owed forever unless the API's attempt cap was at or below the box's 3. Each ack hides it for the API's re-drain TTL and counts toward that cap, so the API retires it whatever the cap. It is never pushed again.
+- **The poller stops when its agent is gone** (`seatguard.ts`). If at boot this uid's passwd name was `$USER`, and two reads a minute apart later find no entry or another name (removed, or uid recycled), the process records `exit` and stops. Unreadable passwd never counts; a process faking `USER` never arms it.
+
+Checked: `bun test test/dive8138-dashboard-park-spin.test.ts` 6/6 (pre-fix server.ts: 3 red, 49–51 held polls in 8 s vs 6–7); dashboard-redelivery, dive7271, dive6816, collect-now, dive3809 drain-lock 26/26.
+
 ### Fixed — browser 1.74.0 on the one-click install: the registry copy re-synced from 5dive-browser main (DIVE-8116)
 
 `browser@5dive-plugins` (the app's one-click card) was still 1.73.0 after 5dive-browser 1.74.0 merged (DIVE-8051, #145). `bash tests/browser_mirror.sh sync ac8743f5`; `check` reads `OK: plugins/browser 1.74.0 == 5dive-browser main ac8743f`.

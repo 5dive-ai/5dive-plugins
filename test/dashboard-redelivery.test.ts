@@ -214,12 +214,14 @@ describe('dashboard retry record survives an ack (DIVE-5924)', () => {
       expect(pushes41().map(d => d.meta.delivery_attempt)).toEqual(['1', '2', '3'])
       expect(pushes41().map(d => d.meta.redelivery)).toEqual(['false', 'true', 'true'])
 
-      // The fourth offer parks: no push, no ack, one parked line.
+      // The fourth offer parks: no push, one parked line, and (DIVE-8138) an
+      // ack, so the control plane hides the row and retires it at its own cap
+      // instead of offering it to every poll.
       h.reoffer()
       await h.nudge()
       await h.nudge()
       expect(pushes41()).toHaveLength(3)
-      expect(h.hiddenIds()).not.toContain(41)
+      expect(await h.waitFor(() => h.hiddenIds().includes(41), 2_000)).toBe(true)
 
       const log = readFileSync(join(h.dir, 'lifecycle.log'), 'utf8')
       expect(log).toContain('pending message id=41 pushed attempt=2 redelivery=true')
