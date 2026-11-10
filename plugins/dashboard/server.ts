@@ -40,7 +40,7 @@ import { API_BASE_FILE_DEFAULT, readApiBaseFile, resolveApiBase } from './apibas
 import { DEFAULT_TIMINGS, startGrokDispatcher, tmuxPane } from './grokdispatch.ts'
 import { AGY_DEFAULT_TIMINGS, startAgyDispatcher } from './agydispatch.ts'
 import { openclawTurn, openclawTurnTimeoutS, startOpenclawDispatcher } from './openclawdispatch.ts'
-import { cliTurn, cliTurnTimeoutS, startCliDispatcher } from './clidispatch.ts'
+import { cliTurn, cliTurnTimeoutS, readerActive, startCliDispatcher } from './clidispatch.ts'
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
 import { replyTool, voicePlan, voiceSkippedNote, voiceFailedOnce } from './voicereply.ts'
@@ -1681,6 +1681,7 @@ if (!DISPATCHER_ADAPTER) {
       timeoutS: cliTurnTimeoutS(process.env.DASHBOARD_CLI_TURN_TIMEOUT_S),
       log: line => process.stderr.write(line + '\n'),
     }),
+    standDown: () => readerActive(DISPATCHER_STATE_DIR, runtime),
   })
 } else {
   process.stderr.write('dashboard channel: app-server dispatcher adapter active; native MCP delivery is not running\n')
