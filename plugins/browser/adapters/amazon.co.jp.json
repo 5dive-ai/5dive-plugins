@@ -1,0 +1,15 @@
+{
+  "_comment": "INPUT MODE (DIVE-7476, report 617). amazon.co.jp will not serve its pages to a driven read in the automated browser: on exact-swallow (2026-11-01, browser 1.66.0, the owner's own login behind a residential proxy) every snapshot of /dp/ and /s?k= pages through the served Playwright session came back as Amazon's generic error page (title \"ご迷惑をおかけしています！\"), while the owner's viewer loaded the same product page and Rakuten and eight other JP shops read fine in the SAME group Chrome. A headless read gets Amazon's bot interstitial instead. So this site is served as plain Chrome and driven through the screen, keyboard and mouse, like tiktok.com. There is no DOM probe here on purpose: nothing reads the page's DOM in this mode. In a sign-in group, the group's one browser is switched to input mode by an Amazon page verb and back by the next verb on a site that needs the automated browser (DIVE-7237).",
+  "site": "amazon.co.jp",
+  "drive": "input",
+  "fetch_when_refused": true,
+  "_comment_fetch": "DIVE-7688 (report 617): a bisect on exact-swallow, 2026-11-04, ran the product's own input-mode launch on a copy of the owner's profile and on an empty one, behind his residential relay and on the box IP, and on his profile minus only its Amazon cookies. Every arm got the error page; only an empty profile's FIRST page ever loaded. A plain HTTP GET with a Chrome user agent read the same /dp/ and /s? pages through the relay and direct. So when Amazon refuses the browser, `snapshot <url>` reads that page over plain HTTP through the seat's own route, signed out, and never touches the profile's cookies.",
+  "probe": {
+    "url": "https://www.amazon.co.jp/",
+    "challenge_when_title_matches": "robot check|just a moment|attention required|captcha|verify you are human|are you a robot|security check|unusual (activity|traffic)|verification required",
+    "refused_when_title_matches": "ご迷惑をおかけしています|sorry! something went wrong",
+    "_comment_refused": "DIVE-7528: \"ご迷惑をおかけしています！\" is Amazon's error page and \"Sorry! Something went wrong!\" its English twin. It is NOT a challenge: it has no checkbox, only a Continue shopping link, so a person has nothing to clear and a handoff cannot help. It is a stop named as Amazon refusing this read. Measured 2026-11-02: input mode behind the owner's relay got it too (1.66.2), and a stock server Chrome got it on most second pages whatever the navigation (goto, in-page, link click, search) and with JavaScript off, while curl from a Hetzner IP read the same /dp/ and /s?k= pages 8 of 8. So Amazon scores the server browser, not only the IP or the automation channel.",
+    "_comment_challenge": "The \"click the button below to keep shopping\" bot interstitial is titled plain \"Amazon.co.jp\", so no title can catch it: the agent sees it on the screenshot and hands the window to a person (`5dive browser handoff amazon.co.jp`)."
+  },
+  "actions": {}
+}

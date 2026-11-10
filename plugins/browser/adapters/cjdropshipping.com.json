@@ -1,0 +1,10 @@
+{
+  "_comment": "INPUT MODE (DIVE-7171). MEASURED on the DIVE-7163 rerun box (browser 1.59.0, 2026-10-28 07:30-07:58Z): in the automated browser, CJ's Authorization page never took a click — the 'API Stores' tab and 'Add API' timed out on every selector, and a snapshot of the page was refused as a sign-in form. With the box switched to input mode, the agent installed CJ's API app and made the key in under 5 minutes. So the site is served as plain Chrome and driven through the screen, keyboard and mouse; a standard seat no longer needs root to switch it. CJ shows a new key masked with only a Copy button: save it with `5dive browser clipboard cjdropshipping.com --to-secret=CJ_API_KEY`. PAY IN THIS MODE: there is no DOM to read a button from, so the owner's pay=ask stops only a step the agent marks \"kind\":\"pay\" (wallet top-up, paying an order). There is no DOM probe on purpose: nothing reads the page's DOM here, so `status` reads the window title.",
+  "site": "cjdropshipping.com",
+  "drive": "input",
+  "probe": {
+    "url": "https://cjdropshipping.com/",
+    "challenge_when_title_matches": "just a moment|attention required|captcha|verify you are human|are you a robot|security check|unusual (activity|traffic)|verification required|too many attempts"
+  },
+  "actions": {}
+}

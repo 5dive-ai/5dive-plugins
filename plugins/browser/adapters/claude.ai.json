@@ -1,0 +1,10 @@
+{
+  "_comment": "INPUT MODE (DIVE-6345). claude.ai is the browser an agent's Claude in Chrome runs in, opt-in per agent (5dive browser claude connect). It is plain Chrome because the automated launch disables extensions, and Claude in Chrome IS an extension, installed by the box's Chrome policy. Plain Chrome is also the live window the owner signs in through on their phone, with one Authorize tap for the agent's own login.",
+  "site": "claude.ai",
+  "drive": "input",
+  "probe": {
+    "url": "https://claude.ai/login",
+    "challenge_when_title_matches": "just a moment|attention required|captcha|verify you are human|are you a robot|security check"
+  },
+  "actions": {}
+}
