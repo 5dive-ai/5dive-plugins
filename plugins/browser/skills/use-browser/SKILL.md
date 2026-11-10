@@ -39,6 +39,8 @@ needs nothing connected.
    **A matched `--expect` IS the check for that step:** move on, never re-open the page to
    confirm it. Between steps, go by the text and refs the act printed, never the picture. Open
    the `page.png` once, at the end, only when no `--expect` matched, before you say the job worked.
+   **`--expect` the proof itself** (the price, the filter's chip, the result count): the picture
+   scrolls to what it matched, so the act that does the job also shows it.
 
 ## Before you say done: check EVERY part of the job
 
@@ -52,9 +54,12 @@ Agents stop early: right site, one filter missing. So before you report, and bef
    label, the field's value, the opened item. Use what the last act printed, or one
    `snapshot --interactive`. A part you set earlier counts only if the page still shows it:
    a later click can undo it (a price filter that resets the sort, a toggle clicked twice).
-3. **A part not shown: do it now**, then check again. A site's filter has more than one way
-   in: the filter panel, a "More filters" button, the sort menu, the search box, the result
-   page's own fields. Try another way before you call a part impossible.
+3. **A part not shown: do it now**, then check again. Set a filter on the page's own control
+   (the filter panel, "Narrow your search", a Level or Type dropdown, "More filters", the sort
+   menu), not by adding its words to the search box: a list you checked by reading is not
+   filtered. Try another way in before you call a part impossible.
+   **Never turn a named filter off**, not to compare and not because the list is empty: an
+   empty list with every filter on IS the answer. Turned one off? Set it back before you stop.
 4. **Say done only when every part is shown**, or when a part is truly not on this site (say
    which and why). The page must END on the result: the filtered list, the opened item, the
    chart drawn, not a menu or a home page.

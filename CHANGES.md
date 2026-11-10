@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Fixed — browser 1.74.0 on the one-click install: the registry copy re-synced from 5dive-browser main (DIVE-8116)
+
+`browser@5dive-plugins` (the app's one-click card) was still 1.73.0 after 5dive-browser 1.74.0 merged (DIVE-8051, #145). `bash tests/browser_mirror.sh sync ac8743f5`; `check` reads `OK: plugins/browser 1.74.0 == 5dive-browser main ac8743f`.
+
+- **`plugins/browser`:** byte-for-byte 5dive-browser ac8743f. An act whose `--expect` matched below the fold scrolls the match into view before its screenshot, so the picture shows the proof; the use-browser skill says to `--expect` the proof, set filters on the page's own control, and never turn a named filter off.
+- **CI (`parity.yml`):** upstream's new `browser_act_show_expect_unit.sh` joins the harnesses run on this tree.
+- **No floor raise:** since DIVE-5645 the nightly converger moves official browser installs to the newest release; `_BS_PLUGIN_MIN` (1.25.0) is only a minimum.
+
 ### Fixed — browser 1.73.0: the registry copy is byte-for-byte 5dive-browser again, and CI keeps it that way (DIVE-8050)
 
 Box bug report 828 (witty-palm): `act` with an `upload` step said "'upload' is not an act step". 5dive-browser has had it since 1.64.0 (DIVE-7237); this copy was last synced on 10-02 (1.32.0) and took only hand ports after. 87 upstream commits never arrived, among them `act` upload and the rc-133 crash fix (DIVE-7432, report 604). Boxes keep landing here because the app's one-click install names `browser@5dive-plugins`.
