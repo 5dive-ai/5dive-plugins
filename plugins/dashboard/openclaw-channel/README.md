@@ -39,18 +39,25 @@ This is the same contract as the 5dive Hermes plugin
 You only need this on a 5dive box; the bridge creates the spool. Then:
 
 ```bash
-openclaw plugins install @5dive/openclaw-channel
+openclaw plugins install @5dive/openclaw-channel   # asks you to allow the "channel: fivedive" capability
+openclaw config set channels.fivedive.spoolDir ~/.openclaw/channels/5dive
+openclaw config set channels.fivedive.enabled true
 ```
 
-and either set an environment variable for the gateway:
+and restart the gateway. The channel starts only when `channels.fivedive` is
+in the config: OpenClaw (2026.11.1) does not turn a channel on from
+environment variables alone unless the gateway runs with `--ambient-channels`,
+and a hot config reload does not start it either.
+
+Once it is configured, these environment variables override the config:
 
 | Variable                   | Meaning                                                    |
 | -------------------------- | ---------------------------------------------------------- |
-| `FIVEDIVE_SPOOL_DIR`       | The spool folder (required). On a 5dive OpenClaw seat it is `~/.openclaw/channels/5dive`. |
+| `FIVEDIVE_SPOOL_DIR`       | The spool folder. On a 5dive OpenClaw seat it is `~/.openclaw/channels/5dive`. |
 | `FIVEDIVE_ALLOWED_USERS`   | Comma-separated senders allowed in. Default: `5dive-app`.  |
 | `FIVEDIVE_ALLOW_ALL_USERS` | `true` to allow every sender in the spool.                 |
 
-or put the same in the OpenClaw config (the environment wins):
+The full config (the environment wins):
 
 ```json5
 {
