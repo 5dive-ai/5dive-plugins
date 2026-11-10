@@ -55,6 +55,14 @@ MSCLI_DIST="${TEAMS_MSCLI_DIST:-$MSCLI_PREFIX/lib/node_modules/@microsoft/teams.
 SYSTEMD_RUN="${TEAMS_SYSTEMD_RUN:-systemd-run}"
 SYSTEMCTL="${TEAMS_SYSTEMCTL:-systemctl}"
 SIGNIN_SITE="login.microsoftonline.com"
+# DIVE-8111: the box's browser belongs to the box seat. The app reaches it as
+# `sudo -n 5dive browser …`, root with SUDO_USER=claude, and the browser drops to
+# that seat's profile store. Root at a terminal (no SUDO_USER) or a sudo user (its
+# own SUDO_USER) would reach a store of its own instead: root's is refused ("mode
+# 755, want 700", and Chrome will not run as root), a sudo user cannot even run
+# the browser plugin. So every browser call here names the box seat, as the app does.
+BROWSER_SEAT="${TEAMS_BROWSER_SEAT:-${FIVEDIVE_BROWSER_BOX_SEAT:-claude}}"
+BROWSER_SETUP="sudo 5dive plugin install browser && sudo 5dive browser setup"
 SIGNIN_UNIT="5dive-teams-signin"
 SIGNIN_TTL=900
 SIGNIN_WAIT="${TEAMS_SIGNIN_WAIT:-30}"
@@ -332,9 +340,10 @@ _node_ok() {  # Node >= 22.12, which Microsoft's CLI needs
 # Installed once, pinned. libsecret-1-0: without it the CLI keeps its login in
 # memory only, so every later command is signed out again (measured, DIVE-7828).
 # npm 11 skips keytar's install script unless it is allowed by name.
+_mscli_installed() { "$MSCLI_BIN" --version 2>/dev/null | grep -qF "$MSCLI_VERSION"; }
 _mscli_ensure() {
   install -d -m 700 "$MSCLI_HOME"
-  "$MSCLI_BIN" --version 2>/dev/null | grep -qF "$MSCLI_VERSION" && return 0
+  _mscli_installed && return 0
   _node_ok || fail "$E_VALIDATION" "Microsoft's Teams tool needs Node.js 22.12 or newer on this server: sudo 5dive browser setup installs it"
   step "Installing Microsoft's Teams tool $MSCLI_VERSION (once)"
   if ! ldconfig -p 2>/dev/null | grep -q 'libsecret-1\.so\.0'; then
@@ -347,6 +356,31 @@ _mscli_ensure() {
     || fail "$E_VALIDATION" "could not install Microsoft's Teams tool"
   "$MSCLI_BIN" --version 2>/dev/null | grep -qF "$MSCLI_VERSION" \
     || fail "$E_VALIDATION" "Microsoft's Teams tool did not install as version $MSCLI_VERSION"
+}
+
+# The box's browser, as the box seat (see BROWSER_SEAT). connect runs as root only.
+_browser() {
+  SUDO_USER="$BROWSER_SEAT" SUDO_UID="$(id -u "$BROWSER_SEAT" 2>/dev/null)" SUDO_GID="$(id -g "$BROWSER_SEAT" 2>/dev/null)" \
+    "$FIVEDIVE_BIN" browser "$@"
+}
+
+# DIVE-8111: the one sign-in needs the box's browser (plugin, Chrome, the box
+# seat) and Node 22.12+. Missing any of them used to surface as two errors in a
+# row; now it is one line, before anything is installed or started.
+_chrome_ok() {
+  local c
+  for c in ${TEAMS_CHROMES:-google-chrome chromium chromium-browser google-chrome-stable}; do command -v "$c" >/dev/null 2>&1 && return 0; done
+  return 1
+}
+_signin_prereqs() {
+  local miss=()
+  _browser --help >/dev/null 2>&1 || miss+=("the browser plugin")
+  _chrome_ok || miss+=("Chrome")
+  _node_ok || miss+=("Node.js 22.12 or newer")
+  id -u "$BROWSER_SEAT" >/dev/null 2>&1 || miss+=("the user $BROWSER_SEAT, who owns this server's browser")
+  (( ${#miss[@]} == 0 )) && return 0
+  local what; what=$(printf '%s, ' "${miss[@]}"); what="${what%, }"
+  fail "$E_VALIDATION" "--microsoft signs in to Microsoft in this server's browser, which is not set up yet (missing: $what). Set it up once: $BROWSER_SETUP"
 }
 
 _signin_url_file() { printf '%s/signin.url' "$MSCLI_HOME"; }
@@ -363,13 +397,13 @@ _signin_url_ok() {
 _signin_show() {  # <url> <fresh: 1 = a new sign-in, so whatever tab is open is stale>
   local url="$1" fresh="$2" e rc=0
   e=$(mktemp)
-  (( fresh )) && { "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true; }
-  "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --login --url="$url" >/dev/null 2>"$e" || rc=$?
+  (( fresh )) && { _browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true; }
+  _browser serve "$SIGNIN_SITE" --login --url="$url" >/dev/null 2>"$e" || rc=$?
   if (( rc != 0 )) && grep -q 'no profile for' "$e"; then
-    rc=0; "$FIVEDIVE_BIN" browser auth "$SIGNIN_SITE" >/dev/null 2>"$e" || rc=$?
+    rc=0; _browser auth "$SIGNIN_SITE" >/dev/null 2>"$e" || rc=$?
     if (( rc == 0 )); then
-      "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true
-      "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --login --url="$url" >/dev/null 2>"$e" || rc=$?
+      _browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true
+      _browser serve "$SIGNIN_SITE" --login --url="$url" >/dev/null 2>"$e" || rc=$?
     fi
   fi
   local why; why=$(tail -1 "$e"); rm -f "$e"
@@ -397,16 +431,31 @@ _signin_start() {
   _signin_show "$url" "$fresh"
 }
 
+# DIVE-8111: at a terminal, a view of the sign-in page made here, by the seat that
+# owns the browser. The printed `sudo 5dive browser viewer …` could not work from
+# a sudo user or a root shell (it looked in their own store: "no browser is
+# serving"). The app (--json) mints its own view, bound to the owner's session.
+# Never fatal: the sign-in still waits, and a re-run makes a fresh view.
+_signin_view() {
+  local out err rc=0
+  err=$(mktemp)
+  out=$(_browser viewer "$SIGNIN_SITE" --bind=local 2>"$err") || rc=$?
+  SIGNIN_VIEW=$(grep -m1 '^local view:' "$err" || true)
+  (( rc == 0 )) && [[ -n "$out" ]] || { SIGNIN_VIEW=""; warn "could not make a view of the sign-in page: $(tail -1 "$err")"; }
+  rm -f "$err"
+  return 0
+}
+
 # Signed in: the page and the view are no longer needed. And the box's browser is
 # signed OUT of Microsoft again: its profile now holds the owner's Microsoft session
 # (an admin's, usually), and every agent on the box may use the box's browser logins.
 # Microsoft's tool keeps its own sign-in (MSCLI_HOME), which is all this needs.
 _signin_close() {
   [[ -e "$(_signin_url_file)" ]] || return 0
-  "$FIVEDIVE_BIN" browser viewer-revoke "$SIGNIN_SITE" >/dev/null 2>&1 || true
-  "$FIVEDIVE_BIN" browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true
-  "$FIVEDIVE_BIN" browser forget "$SIGNIN_SITE" >/dev/null 2>&1 \
-    || warn "could not sign this server's browser out of Microsoft: sudo 5dive browser forget $SIGNIN_SITE"
+  _browser viewer-revoke "$SIGNIN_SITE" >/dev/null 2>&1 || true
+  _browser serve "$SIGNIN_SITE" --stop >/dev/null 2>&1 || true
+  _browser forget "$SIGNIN_SITE" >/dev/null 2>&1 \
+    || warn "could not sign this server's browser out of Microsoft: sudo env SUDO_USER=$BROWSER_SEAT 5dive browser forget $SIGNIN_SITE"
   "$SYSTEMCTL" stop "$SIGNIN_UNIT" >/dev/null 2>&1 || true
   rm -f "$(_signin_url_file)"
 }
@@ -422,15 +471,27 @@ _ms_say() {  # <state> <agent> [<key> <value>]... — one JSON line, or words
   fi
   local -A v=(); while (($# >= 2)); do v[$1]="$2"; shift 2; done
   case "$state" in
-    sign_in) cat <<EOF
-Sign in with Microsoft to finish. The sign-in page is open in this server's browser.
-In the 5dive app: Connect Microsoft Teams shows it to you. At a terminal, open it with:
-  sudo 5dive browser viewer $SIGNIN_SITE --bind=local
-Then run the same command again.
-EOF
+    sign_in)
+      echo "Sign in with Microsoft to finish. The sign-in page is open in this server's browser."
+      if [[ -n "${v[forward]:-}" ]]; then
+        echo "Before you sign in: Teams will post to ${v[endpoint]}. Point your tunnel or reverse proxy at ${v[forward]}."
+      fi
+      if [[ -n "${SIGNIN_VIEW:-}" ]]; then
+        echo "See the page from your computer: ${SIGNIN_VIEW#local view: }"
+        echo "  For example: ssh -L 5900:127.0.0.1:<that port> <you>@<this server>, then a VNC viewer on localhost:5900."
+      else
+        echo "In the 5dive app: Connect Microsoft Teams shows it to you."
+      fi
+      echo "Microsoft may ask to secure your account first: Not now is fine. Signed in, run the same command again."
       ;;
     blocked) printf '%s\n' "${v[message]}" ;;
-    ready) printf '%s is ready for Microsoft Teams.\n\nAdd to Teams: %s\n' "${v[name]}" "${v[install_link]}" ;;
+    ready)
+      printf '%s is ready for Microsoft Teams.\n\nAdd to Teams: %s\n' "${v[name]}" "${v[install_link]}"
+      [[ -z "${v[forward]:-}" ]] || printf 'Teams posts to %s. Forward it to %s.\n' "${v[endpoint]}" "${v[forward]}"
+      # DIVE-8111: a new connection holds anyone not on the list, and a box with
+      # no Telegram told nobody. Say where the waiting message is, and the answer.
+      printf '\nOnly people you allow can write to %s. Someone new waits until you answer:\n  sudo 5dive people ls\n  sudo 5dive people knock answer <number> allow\nOr allow them first: sudo 5dive people add <id> --name=<name> --teams=<Entra object id> --agents=%s\n' "${v[name]}" "$agent"
+      ;;
   esac
 }
 
@@ -492,7 +553,9 @@ teams_connect_microsoft() {
       _mscli_ensure
       local st0; st0=$(_mscli status --json 2>/dev/null | sed -n '/^{/,$p') || st0=""
       if [[ "$(jq -r '.loggedIn // false' <<<"$st0" 2>/dev/null)" != true ]]; then
+        _signin_prereqs
         _signin_start
+        [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] || _signin_view
         teams_audit connect "$agent" --microsoft sign_in groups
         _ms_say sign_in "$agent" site "$SIGNIN_SITE"
         [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && return 0
@@ -509,23 +572,36 @@ teams_connect_microsoft() {
   [[ -z "$(_cfg_get "$agent" app_id)" ]] \
     || fail "$E_VALIDATION" "$agent is already in Teams through your IT's own bot. To switch to the one-sign-in way: sudo 5dive agent teams disconnect $agent, then connect again"
 
+  # DIVE-8111: the port the agent will listen on, known BEFORE the bot is made:
+  # a tunnel or proxy must point there first, because the bot is created with its
+  # public address. teams_connect picks the same one (same agent, same uid).
+  local port forward=""
+  port=$(_cfg_get "$agent" port)
+  [[ "$port" =~ ^[0-9]+$ ]] || port=$(_pick_port "$agent") || fail "$E_VALIDATION" "no free port in ${PORT_BASE}-$((PORT_BASE + PORT_SPAN - 1))"
+
   # Microsoft posts to the agent's public address, so the bot needs it now.
   local public domain
   if [[ -n "$endpoint" ]]; then
     [[ "$endpoint" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || fail "$E_VALIDATION" "--endpoint must be an https:// address"
     public="${endpoint%/}"; [[ "$public" == */api/messages ]] || public="$public/api/messages"
+    forward="http://127.0.0.1:$port"
   elif domain=$(_domain); then
     public="https://teams-$agent.$domain/api/messages"
   else
-    fail "$E_VALIDATION" "this server has no public name for Teams to reach. Give it one with --endpoint=https://<your name>, or use your IT's guide: $TEAMS_PLUGIN_ROOT/docs/IT-GUIDE.md"
+    fail "$E_VALIDATION" "this server has no public name for Teams to reach. Point a tunnel or reverse proxy at http://127.0.0.1:$port (where $agent will listen), then run this again with --endpoint=https://<its name>. Guide: $TEAMS_PLUGIN_ROOT/docs/IT-GUIDE.md"
   fi
 
+  # Not installed yet = the first run, which always signs in: say everything the
+  # sign-in needs in one line before installing anything.
+  _mscli_installed || _signin_prereqs
   _mscli_ensure
   local st; st=$(_mscli status --json 2>/dev/null | sed -n '/^{/,$p') || st=""
   if [[ "$(jq -r '.loggedIn // false' <<<"$st" 2>/dev/null)" != true ]]; then
+    _signin_prereqs
     _signin_start
+    [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] || _signin_view
     teams_audit connect "$agent" --microsoft sign_in
-    _ms_say sign_in "$agent" site "$SIGNIN_SITE"
+    _ms_say sign_in "$agent" site "$SIGNIN_SITE" endpoint "$public" port "$port" forward "$forward"
     [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && return 0
     exit "$E_AUTH_REQUIRED"
   fi
@@ -596,7 +672,7 @@ teams_connect_microsoft() {
   rm -f "$made"
   step "Letting $name join group chats and channels"
   _ms_groups "$agent" "$(_cfg_get "$agent" teams_app_id)" || true
-  _ms_say ready "$agent" name "$name" install_link "$link"
+  _ms_say ready "$agent" name "$name" install_link "$link" endpoint "$public" port "$port" forward "$forward"
 }
 
 teams_status() {
@@ -618,10 +694,16 @@ teams_status() {
   fi
   chans=$(_agent_json "$agent" | jq -r '.channels // "none"' 2>/dev/null || echo "?")
   [[ -r "$dir/messages.log" ]] && last=$(tail -1 "$dir/messages.log" | cut -f1,2)
+  # DIVE-8111: messages held for the owner's answer. On a box with no Telegram
+  # nobody was told, so status names them and the answer.
+  local knocks
+  knocks=$(FIVEDIVE_JSON_MODE=0 "$FIVEDIVE_BIN" people ls --json 2>/dev/null \
+    | jq -c --arg a "$agent" '[(.data.knocks // [])[] | select(.agent == $a and .channel == "teams") | {id, name, email}]' 2>/dev/null) || knocks=""
+  [[ "$knocks" == \[* ]] || knocks="[]"
   if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
     jq -n --arg a "$agent" --argjson c "$connected" --arg p "$port" --arg u "$public" --argjson l "$listening" \
-      --argjson h "$healthy" --arg r "$reachable" --arg ch "$chans" --arg last "$last" --arg link "$link" \
-      '{ok:true, data:{agent:$a, connected:$c, port:$p, endpoint:$u, listening:$l, healthy:$h, reachable_from_internet:$r, channels:$ch, last_message:$last, install_link:$link}}'
+      --argjson h "$healthy" --arg r "$reachable" --arg ch "$chans" --arg last "$last" --arg link "$link" --argjson k "$knocks" \
+      '{ok:true, data:{agent:$a, connected:$c, port:$p, endpoint:$u, listening:$l, healthy:$h, reachable_from_internet:$r, channels:$ch, last_message:$last, install_link:$link, waiting:$k}}'
     return 0
   fi
   echo "agent:      $agent"
@@ -633,6 +715,10 @@ teams_status() {
   echo "public:     $reachable"
   echo "last:       ${last:-"no message yet"}"
   [[ -z "$link" ]] || echo "add:        $link"
+  if [[ "$knocks" != "[]" ]]; then
+    jq -r '.[] | "waiting:    #\(.id) \(.name // "someone")\(if .email then " (" + .email + ")" else "" end) wrote and waits for your answer"' <<<"$knocks"
+    echo "answer:     sudo 5dive people knock answer <number> allow   (or admin, or no)"
+  fi
 }
 
 teams_disconnect() {
