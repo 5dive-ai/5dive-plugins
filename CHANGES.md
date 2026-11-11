@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.75.0: a Chrome that will not install says why; a person's setup exits 69 until ready (DIVE-8206)
+
+- `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8206-setup-apt-reason` (`tests/browser_mirror.sh sync`). Setup now shows the last lines apt printed when Chrome, the X packages or Node.js will not install, names low disk, an unfinished dpkg and a Signed-By conflict, and a person's run ends `browser NOT ready: missing …` with exit 69 instead of 0. Box bug report 886 (wry-rune).
+
 ### Fixed — the OpenClaw 5dive channel and the box's own OpenClaw reader no longer both answer (DIVE-8177)
 
 - **`@5dive/openclaw-channel`:** while the gateway runs the channel it writes `<spool>/reader.json` `{pid, by: "openclaw"}` and drops it on stop, the same mark the Pi and OpenCode packages use.

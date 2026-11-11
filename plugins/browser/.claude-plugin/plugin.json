@@ -1,6 +1,6 @@
 {
   "name": "browser",
-  "version": "1.74.0",
+  "version": "1.75.0",
   "description": "Browse and act on any website with nothing connected; where it must be you, persistent human-authenticated sessions you log into once by hand (several accounts per site). Paying stops for your approval by default; posting, sending and deleting go ahead and are logged for you; set careful and all four wait for your yes. Email codes, 2-step prompts and robot checks the agent clears itself; it asks you only when stuck, or where you turned a stop on (gate).",
   "author": {
     "name": "5dive",

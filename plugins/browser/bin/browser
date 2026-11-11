@@ -1816,10 +1816,13 @@ _seat_is_deregistered() {
 # without apt-get gets the named list and installs nothing; guessing a package
 # manager as root is worse than a sentence.
 #
-# NEVER FAILS SETUP. Every caller of setup wants the STORE (agent create runs it
+# NEVER STOPS SETUP. Every caller of setup wants the STORE (agent create runs it
 # for each new seat, DIVE-5478, and never fails the create on it), and a store on
 # a box missing x11vnc still serves `snapshot`. So a failed install is a named
-# line on stderr and the store is still made.
+# line on stderr, with the last lines apt printed under it, and the store is
+# still made. A PERSON's run then ends "browser NOT ready: missing …" and exits
+# $E_UNAVAILABLE (DIVE-8206): an exit 0 over a box with no Chrome sent the app's
+# "Finish setup" round in a loop. A hire's exit is unchanged (below).
 #
 # ONLY A PERSON INSTALLS (DIVE-6112). lodar, after DIVE-6089: "realy hiring does
 # all installs? ... is it good decision?" A hire runs setup for its new seat
@@ -1839,6 +1842,7 @@ STACK_NODE_FLOOR=20
 STACK_NODE_MAJOR=22
 _STACK_APT_UPDATED=0
 _STACK_INSTALLED=0   # set when this run installed the stack and it is now complete
+_STACK_STILL_MISSING=""   # what a person's setup could not put on the box (DIVE-8206)
 
 _stack_pkg_dir() { cd "$_SELF_DIR/.." && pwd; }
 # The pin this package declares; empty when it declares none. No jq and no node:
@@ -1879,8 +1883,64 @@ _stack_missing() {
   printf '%s\n' "${m[@]+"${m[@]}"}"
 }
 
-_stack_apt() { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y -q "$@" >/dev/null 2>&1; }
-_stack_apt_update() { (( _STACK_APT_UPDATED )) && return 0; _stack_apt update && _STACK_APT_UPDATED=1; }
+# DIVE-8206 — apt's stderr is KEPT, never thrown away. wry-rune (report 886) ran
+# setup, both Chrome installs failed, and all it printed was "could not install a
+# chrome": nobody (owner, agent, us) could see why. _STACK_APT_ERR holds what the
+# last FAILED apt-get printed on stderr (empty after a run that exited 0), and
+# _stack_apt_said shows its last lines under the line that names the failure.
+_STACK_APT_ERR=""
+_STACK_SIGNEDBY_SAID=0
+_stack_apt() {
+  local f rc
+  f=$(mktemp 2>/dev/null) || f=""
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -y -q "$@" >/dev/null 2>"${f:-/dev/null}"
+  rc=$?
+  _STACK_APT_ERR=""
+  if [[ -n "$f" ]]; then
+    (( rc )) && _STACK_APT_ERR=$(cat "$f" 2>/dev/null)
+    rm -f "$f"
+  fi
+  return "$rc"
+}
+# _stack_apt_tail [<err>] — the last 5 non-empty lines apt printed, or nothing.
+_stack_apt_tail() { grep -v '^[[:space:]]*$' <<<"${1-$_STACK_APT_ERR}" | tail -n 5; }
+# _stack_apt_said <what> [<err>] — "apt-get said:" and those lines, on stderr.
+_stack_apt_said() {
+  local t; t=$(_stack_apt_tail "${2-$_STACK_APT_ERR}")
+  [[ -n "$t" ]] || return 0
+  printf '  apt-get %s said:\n' "$1" >&2
+  sed 's/^/    /' <<<"$t" >&2
+}
+_stack_apt_update() {
+  (( _STACK_APT_UPDATED )) && return 0
+  _stack_apt update && { _STACK_APT_UPDATED=1; return 0; }
+  # Two sources for one repo that name different keys make EVERY apt-get refuse,
+  # so both Chrome installs fail on it (the hosted converger writes
+  # google-chrome-keyring.gpg, this file google-chrome.gpg, Chrome's deb a third).
+  if (( ! _STACK_SIGNEDBY_SAID )) && grep -q 'Conflicting values set for option Signed-By' <<<"$_STACK_APT_ERR"; then
+    _STACK_SIGNEDBY_SAID=1
+    _stack_warn "apt refuses every install here: two apt sources for the same repo name different signing keys (Signed-By). Keep one of them in /etc/apt/sources.list.d/, delete the other, then re-run: $SETUP_CMD"
+    _stack_apt_said update
+  fi
+  return 1
+}
+# _stack_preflight — the two box faults that make every apt install fail, named
+# BEFORE the installs instead of guessed after: under ~1 GB free where apt
+# unpacks, and a dpkg run left half-done. Silent on a healthy box.
+STACK_FREE_FLOOR_MB=1024
+_stack_preflight() {
+  local low a
+  if _have df; then
+    low=$(df -Pk / /var 2>/dev/null | awk -v floor="$STACK_FREE_FLOOR_MB" '
+      NR > 1 && $4 ~ /^[0-9]+$/ && !seen[$6]++ && int($4 / 1024) < floor { printf "%s%s (%d MB free)", sep, $6, int($4 / 1024); sep = ", " }')
+    [[ -z "$low" ]] || _stack_warn "low disk: $low. Chrome needs about 1 GB free to install, so apt will likely fail. Free some space, then re-run: $SETUP_CMD"
+  fi
+  if _have dpkg; then
+    a=$(dpkg --audit 2>/dev/null | grep -v '^[[:space:]]*$' | head -n 3)
+    [[ -z "$a" ]] || _stack_warn "dpkg has an unfinished install, so apt will refuse new ones. Finish it first: sudo dpkg --configure -a (dpkg --audit says: $(paste -sd' ' <<<"$a"))"
+  fi
+  return 0
+}
 _stack_say() { printf '  %s\n' "$*"; }
 _stack_step() { printf '\n== Step %s/4 — %s ==\n' "$1" "$2"; }
 STACK_HOSTED_CONVERGER="${FIVEDIVE_BROWSER_HOSTED_CONVERGER:-/usr/local/bin/5dive-browser-stack-install}"
@@ -1910,14 +1970,20 @@ _stack_install_x() {
   (( ${#pk[@]} )) || { _stack_say "already here: Xvfb, x11vnc, websockify"; return 0; }
   _stack_say "installing ${pk[*]} (apt)..."
   _stack_apt_update; _stack_apt install "${pk[@]}" || true
+  local err="$_STACK_APT_ERR" failed=0
   for p in "${pk[@]}"; do
-    case "$p" in xvfb) _have Xvfb ;; *) _have "$p" ;; esac \
-      && _stack_say "installed $p" || _stack_warn "could not install $p (apt-get install $p)"
+    if case "$p" in xvfb) _have Xvfb ;; *) _have "$p" ;; esac; then
+      _stack_say "installed $p"
+    else
+      _stack_warn "could not install $p (apt-get install $p)"; failed=1
+    fi
   done
+  (( failed )) && _stack_apt_said "install ${pk[*]}" "$err"
+  return 0
 }
 
 _stack_install_chrome() {
-  local c; c=$(_chrome) && { _stack_say "already here: $c"; return 0; }
+  local c g_err=""; c=$(_chrome) && { _stack_say "already here: $c"; return 0; }
   # Google ships amd64 only; anywhere else the fallback is the only candidate.
   if [[ "$(dpkg --print-architecture 2>/dev/null)" == amd64 ]] \
      && _stack_repo google-chrome https://dl.google.com/linux/linux_signing_key.pub \
@@ -1925,11 +1991,20 @@ _stack_install_chrome() {
     _stack_say "installing google-chrome-stable (Google's apt repo)..."
     _stack_apt_update; _stack_apt install google-chrome-stable
     _chrome >/dev/null && { _stack_say "installed google-chrome-stable"; return 0; }
+    g_err="$_STACK_APT_ERR"
   fi
-  _stack_say "installing chromium (apt, the fallback)..."
+  # Ubuntu's chromium deb is only a shim that installs the snap: with no snapd
+  # it cannot work, and that is worth one line rather than a silent try.
+  if grep -qs '^ID=ubuntu' "$STACK_ROOT/etc/os-release" && ! _have snap; then
+    _stack_say "installing chromium (apt, the fallback; on Ubuntu it is a snap and this box has no snapd, so it will likely fail)..."
+  else
+    _stack_say "installing chromium (apt, the fallback)..."
+  fi
   _stack_apt_update; _stack_apt install chromium
   _chrome >/dev/null && { _stack_say "installed chromium (fallback: no google-chrome-stable for this box)"; return 0; }
   _stack_warn "could not install a chrome (google-chrome-stable, or chromium as fallback)"
+  _stack_apt_said "install google-chrome-stable" "$g_err"
+  [[ "$_STACK_APT_ERR" == "$g_err" ]] || _stack_apt_said "install chromium"
   return 1
 }
 
@@ -1957,6 +2032,7 @@ _stack_install_node() {
     _stack_warn "Node.js $STACK_NODE_MAJOR may be in /usr/bin, but the node on PATH is $(command -v node) (v$now) and it comes first — remove it or put /usr/bin ahead of it"
   else
     _stack_warn "could not install Node.js >= $STACK_NODE_FLOOR (NodeSource $STACK_NODE_MAJOR)"
+    _stack_apt_said "install nodejs"
   fi
   return 1
 }
@@ -1982,11 +2058,13 @@ _stack_converge() {
   local missing; missing=$(_stack_missing)
   [[ -n "$missing" ]] || return 0
   local list; list=$(paste -sd, <<<"$missing" | sed 's/,/, /g')
+  _STACK_STILL_MISSING="$list"
   if ! _have apt-get; then
     _stack_warn "this box is missing $list, and it has no apt-get, so setup installs nothing. Install them once yourself, then re-run: $SETUP_CMD"
     return 1
   fi
   printf 'installing what the browser needs and this box lacks: %s\n' "$list"
+  _stack_preflight
   _stack_step 1 "virtual screen and VNC (xvfb, x11vnc, websockify)"
   _stack_install_x
   _stack_step 2 "Google Chrome"
@@ -1997,8 +2075,9 @@ _stack_converge() {
   _stack_install_pin || true
   printf '\n'
   missing=$(_stack_missing)
+  _STACK_STILL_MISSING=$(paste -sd, <<<"$missing" | sed 's/,/, /g')
   if [[ -n "$missing" ]]; then
-    _stack_warn "still missing after install: $(paste -sd, <<<"$missing" | sed 's/,/, /g'). The store is made anyway; re-run $SETUP_CMD once that is fixed."
+    _stack_warn "still missing after install: $_STACK_STILL_MISSING. The store is made anyway; re-run $SETUP_CMD once that is fixed."
     return 1
   fi
   printf '  browser stack ready\n'
@@ -2149,7 +2228,7 @@ cmd_setup() {
   # The stack first, and before the seat checks: it is box-wide. A person
   # installs it; a hire only names it (DIVE-6112, see "ONLY A PERSON INSTALLS").
   # Never fatal — see _stack_converge.
-  local seat hire_gap=""; seat="$(_seat)"
+  local seat hire_gap="" stack_ok=1; seat="$(_seat)"
   if _setup_is_hire; then
     hire_gap=$(_stack_hire_check)
     # DIVE-7432: before the box seat's own setup below, which would heal it unheard.
@@ -2157,7 +2236,6 @@ cmd_setup() {
     # DIVE-7156: agent create's setup is the one a self-hosted box always runs.
     [[ "$seat" == "$BOX_SEAT" ]] || _setup_box_seat_store || true
   else
-    local stack_ok=1
     _stack_converge || stack_ok=0
     # DIVE-7432: the box seat first, as report 604's was; before the store
     # steps below, whose own setups would heal it unheard.
@@ -2176,10 +2254,9 @@ cmd_setup() {
     if [[ "$seat" == root ]]; then
       if (( stack_ok )) || _stack_off; then
         printf 'browser ready: agents you hire get a browser\n'
-      else
-        printf 'browser NOT ready: the lines above name what did not install. Fix that, then re-run: %s\n' "$SETUP_CMD" >&2
+        return 0
       fi
-      return 0
+      _setup_not_ready; return "$E_UNAVAILABLE"
     fi
   fi
   # Reached only by FIVEDIVE_BROWSER_SEAT=root: a person running as root returned above.
@@ -2268,6 +2345,17 @@ cmd_setup() {
   # stack in, so a box that had it (every hosted VM) prints nothing new.
   (( _STACK_INSTALLED )) && printf 'browser ready: agents you hire get a browser\n'
   [[ -z "$hire_gap" ]] || die "$E_UNAVAILABLE" "$hire_gap"
+  # DIVE-8206: a person's run that left the stack short ends on it, non-zero, on
+  # this seat path too. It used to exit 0 here, so the app's "Finish setup" re-ran
+  # a setup that "succeeded" and connect failed again, forever (wry-rune, 886).
+  if ! _setup_is_hire && (( ! stack_ok )); then _setup_not_ready; return "$E_UNAVAILABLE"; fi
+  return 0
+}
+
+# _setup_not_ready — a person's setup's last line when the stack is still short.
+_setup_not_ready() {
+  printf 'browser NOT ready: missing %s. The lines above say why. Fix that, then re-run: %s\n' \
+    "${_STACK_STILL_MISSING:-part of the browser stack}" "$SETUP_CMD" >&2
 }
 
 # ------------------------------------------------------------------------ auth
