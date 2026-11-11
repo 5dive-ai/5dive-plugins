@@ -24,8 +24,10 @@ const outbox = (dir: string) => { try { return readdirSync(dir).filter(n => n.en
 // A live process whose program has the given name: a symlink to sleep.
 const liveNamed = (name: string) => {
   const d = tmp()
-  symlinkSync('/bin/sleep', join(d, name))
-  const p = spawn(join(d, name), ['30'], { stdio: 'ignore' })
+  // bash, not sleep: on ubuntu 26.04 sleep is a multi-call coreutils binary that dispatches on argv[0], so a
+  // renamed sleep exits at once ("unknown program"). `; :` keeps bash from exec'ing sleep in its own place.
+  symlinkSync('/bin/bash', join(d, name))
+  const p = spawn(join(d, name), ['-c', 'sleep 30; :'], { stdio: 'ignore' })
   cleanups.push(() => { try { p.kill('SIGKILL') } catch {} })
   // Until exec lands, /proc/<pid>/cmdline still shows the parent's program.
   const until = Date.now() + 3000
