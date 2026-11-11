@@ -8,7 +8,7 @@ import { channelReadyPatch, channelStoppedPatch } from "openclaw/plugin-sdk/gate
 import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
 import { CHANNEL_ID, CHANNEL_LABEL, type ResolvedFiveDiveAccount } from "./account.js";
 import { pollSpool } from "./poll.js";
-import { bodyFor, ensureSpool, localFiles, SENDER_ID, voiceLatchFor, writeOutbox, type SpoolMessage } from "./spool.js";
+import { bodyFor, claimReader, ensureSpool, localFiles, releaseReader, SENDER_ID, voiceLatchFor, writeOutbox, type SpoolMessage } from "./spool.js";
 
 /** Told to the agent with a voice note: its answer is spoken back. */
 export const VOICE_HINT =
@@ -105,6 +105,8 @@ export async function startFiveDiveGatewayAccount(ctx: ChannelGatewayContext<Res
 
   ctx.setStatus(channelReadyPatch({ accountId: account.accountId }));
   ctx.log?.info?.(`[${account.accountId}] 5dive app: reading ${spool}/inbox`);
+  // DIVE-8177: tell the box bridge this gateway is the reader, so it stands down.
+  claimReader(spool);
   try {
     await pollSpool({
       spool,
@@ -115,6 +117,7 @@ export async function startFiveDiveGatewayAccount(ctx: ChannelGatewayContext<Res
       onDrop: (name, why) => ctx.log?.warn?.(`[${account.accountId}] 5dive app: dropped an ${why} inbox file ${name}`),
     });
   } finally {
+    releaseReader(spool);
     if (activeSpools.get(account.accountId) === spool) activeSpools.delete(account.accountId);
     ctx.setStatus(channelStoppedPatch({ accountId: account.accountId }));
   }

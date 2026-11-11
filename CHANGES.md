@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — the OpenClaw 5dive channel and the box's own OpenClaw reader no longer both answer (DIVE-8177)
+
+- **`@5dive/openclaw-channel`:** while the gateway runs the channel it writes `<spool>/reader.json` `{pid, by: "openclaw"}` and drops it on stop, the same mark the Pi and OpenCode packages use.
+- **Dashboard 0.5.38:** `openclawdispatch.ts` takes no message while that mark names a live gateway (`readerActive(…, 'openclaw')`). The gateway renames its process to `openclaw-gateway` (measured on OpenClaw 2026.11.1), so that is the name it matches. A dead or reused pid does not count, so a crashed gateway never silences the chat.
+- This was the publish blocker found in DIVE-8145: before it, both readers could take the same message.
+
 ### Added — Pi and OpenCode chat packages, and dashboard 0.5.37 steps aside for them (DIVE-8146)
 
 5dive app chat on a Pi or OpenCode seat ran one headless turn per message, in a session of its own. The packages answer in the session the person has open.

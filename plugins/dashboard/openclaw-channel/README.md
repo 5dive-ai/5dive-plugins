@@ -72,9 +72,18 @@ The full config (the environment wins):
 }
 ```
 
-Run only one reader per spool. Before you turn this channel on for a seat,
-turn off the older one-turn-per-message bridge (`openclawdispatch.ts`), which
-reads the same inbox.
+One reader per spool, and nothing to switch off: while the gateway runs this
+channel it marks `<spool>/reader.json` with its pid, and the box's own
+one-turn-per-message reader (dashboard 0.5.38 or later) stands aside, so a
+message is never answered twice. Stop the gateway and the box answers the chat
+again on its own.
+
+## Publishing (maintainers)
+
+Build before you pack: `npm run build && npm pack`. A box with npm's
+`ignore-scripts=true` skips the `prepare` build on npm 11 (npm 10 still runs
+it), and a pack without `dist/` fails to load in OpenClaw with
+`runtime entry not found`. Check that the pack lists `dist/index.js`.
 
 ## Not included yet
 
