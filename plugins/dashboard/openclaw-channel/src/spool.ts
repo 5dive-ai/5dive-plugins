@@ -12,13 +12,17 @@
 //     {"source": "dashboard", "chat_id": "dashboard", "text": "...",
 //      "files": ["/abs/path"], "voice": true}
 //
+//   <spool>/reader.json                 written here while the gateway reads
+//     {"pid": 1234, "by": "openclaw"}   the bridge's own reader stands down
+//                                       while that pid is alive (DIVE-8177)
+//
 // Both sides write a temp name first and rename it to `*.json`, so a reader
 // never sees half a file. The spool is mode 0700 for the agent's own user:
 // anyone who can write into it is that user, which is why the channel needs
 // no token. Same contract as the Hermes plugin (plugins/dashboard/hermes/adapter.py).
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeSync, closeSync } from "node:fs";
+import { mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync, writeSync, closeSync } from "node:fs";
 import { basename, join } from "node:path";
 
 /** The one sender the bridge writes as: the person signed in to 5dive. */
@@ -227,4 +231,27 @@ export function localFiles(urls: ReadonlyArray<string | undefined | null>): stri
     if (path.startsWith("/") && !out.includes(path)) out.push(path);
   }
   return out;
+}
+
+export const readerFile = (spool: string) => join(spool, "reader.json");
+
+/**
+ * Mark this process as the spool's reader (DIVE-8177). The box bridge's own
+ * OpenClaw reader stands down while this pid is alive, so a message is never
+ * answered twice. A dead or reused pid does not count, so a crash cannot
+ * silence the chat: the bridge just takes it back.
+ */
+export function claimReader(spool: string, pid = process.pid): void {
+  mkdirSync(spool, { recursive: true, mode: 0o700 });
+  const tmp = join(spool, `.reader.${pid}.tmp`);
+  writeFileSync(tmp, JSON.stringify({ pid, by: "openclaw" }) + "\n", { mode: 0o600 });
+  renameSync(tmp, readerFile(spool));
+}
+
+/** Drop the mark, only if it is still ours. */
+export function releaseReader(spool: string, pid = process.pid): void {
+  try {
+    const cur = JSON.parse(readFileSync(readerFile(spool), "utf8")) as { pid?: unknown };
+    if (cur.pid === pid) unlinkSync(readerFile(spool));
+  } catch {}
 }

@@ -1661,6 +1661,8 @@ if (!DISPATCHER_ADAPTER) {
         openclawTurnTimeoutS(process.env.DASHBOARD_OPENCLAW_TURN_TIMEOUT_S)),
       // Test seam: shorten the boot-time retry.
       ...(process.env.DASHBOARD_OPENCLAW_RETRY_MS ? { retryMs: Number(process.env.DASHBOARD_OPENCLAW_RETRY_MS) } : {}),
+      // DIVE-8177: the OpenClaw 5dive channel answers inside the gateway and marks the spool; one reader only.
+      standDown: () => readerActive(DISPATCHER_STATE_DIR, 'openclaw'),
     })
   }
 } else if (CLI_RUNTIME) {

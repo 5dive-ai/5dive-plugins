@@ -245,8 +245,20 @@ export function cliTurn(o: CliTurnOptions): RunTurn {
  * dispatcher takes no message while that pid is alive AND is still that
  * runtime (a pid reused by another program after a crash does not count; a
  * process we cannot inspect does). A mark with no live owner is ignored.
+ *
+ * DIVE-8177: the OpenClaw channel (`@5dive/openclaw-channel`) marks the spool
+ * the same way from inside the gateway, so the OpenClaw dispatcher stands down
+ * too. The gateway renames its process: /proc/<pid>/cmdline is
+ * `openclaw-gateway` (measured on OpenClaw 2026.11.1), never `openclaw`.
  */
-export function readerActive(stateDir: string, rt: CliRuntime): boolean {
+export type SpoolReader = CliRuntime | 'openclaw'
+const READER_PROGRAMS: Record<SpoolReader, string[]> = {
+  pi: ['pi'],
+  opencode: ['opencode'],
+  openclaw: ['openclaw-gateway', 'openclaw', 'openclaw.mjs'],
+}
+
+export function readerActive(stateDir: string, rt: SpoolReader): boolean {
   let mark: { pid?: unknown; by?: unknown }
   try { mark = JSON.parse(readFileSync(join(stateDir, 'reader.json'), 'utf8')) } catch { return false }
   const pid = mark.pid
@@ -254,8 +266,9 @@ export function readerActive(stateDir: string, rt: CliRuntime): boolean {
   try { process.kill(pid, 0) } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'EPERM') return false }
   let cmd = ''
   try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8') } catch { return true }
-  // `node …/bin/pi --mode rpc`, `…/bin/opencode serve`: one argument is the runtime's own program.
-  return cmd.split('\0').some(a => (a.split('/').pop() ?? '') === rt)
+  // `node …/bin/pi --mode rpc`, `…/bin/opencode serve`, `openclaw-gateway`: one argument is the runtime's own program.
+  const programs = READER_PROGRAMS[rt]
+  return cmd.split('\0').some(a => programs.includes(a.split('/').pop() ?? ''))
 }
 
 export type CliDispatcherOptions = {

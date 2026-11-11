@@ -133,6 +133,8 @@ export type OpenclawDispatcherOptions = {
   // A turn refused before the gateway took it (still booting, restarting) is retried this often.
   retries?: number
   retryMs?: number
+  /** DIVE-8177: true while the OpenClaw 5dive channel (in the gateway) owns the inbox. */
+  standDown?: () => boolean
 }
 
 const NOT_RUNNING = /ECONNREFUSED|gateway (is )?not running|could not connect|connect failed|gateway closed|no gateway/i
@@ -197,8 +199,12 @@ export function startOpenclawDispatcher(o: OpenclawDispatcherOptions): { stop():
   // One turn at a time, in arrival order: they share one gateway session.
   let chain = Promise.resolve()
   const seen = new Set<string>()
+  let away = false
   const ingest = (name: string) => {
     if (!name.endsWith('.json') || name.startsWith('.') || seen.has(name)) return
+    const off = o.standDown?.() ?? false
+    if (off !== away) { away = off; log(off ? 'dashboard openclaw: the OpenClaw 5dive channel is reading the web chat; standing down' : 'dashboard openclaw: web chat back on this bridge') }
+    if (off) return
     const full = join(o.inboxDir, name)
     let msg: InboxMessage
     try { msg = JSON.parse(readFileSync(full, 'utf8')) } catch { return }   // mid-rename, or already taken
