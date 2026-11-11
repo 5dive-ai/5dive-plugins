@@ -27,6 +27,12 @@ const liveNamed = (name: string) => {
   symlinkSync('/bin/sleep', join(d, name))
   const p = spawn(join(d, name), ['30'], { stdio: 'ignore' })
   cleanups.push(() => { try { p.kill('SIGKILL') } catch {} })
+  // Until exec lands, /proc/<pid>/cmdline still shows the parent's program.
+  const until = Date.now() + 3000
+  while (Date.now() < until) {
+    try { if (readFileSync(`/proc/${p.pid}/cmdline`, 'utf8').split('\0')[0].endsWith(`/${name}`)) break } catch {}
+    Bun.sleepSync(5)
+  }
   return p.pid!
 }
 
