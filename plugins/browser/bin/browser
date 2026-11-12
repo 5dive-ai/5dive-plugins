@@ -253,6 +253,12 @@ usage() {
                                       # click / fill / type / select / press on refs, in
                                       # one tab under one lease. `type` goes key by key,
                                       # for a box whose suggestions open on keystrokes.
+                                      # BY POSITION (a ref covered, off screen or not in
+                                      # the map): {"op":"click_at","x":640,"y":212}, a
+                                      # pixel of page.png; hover_at; type_at (+ "value").
+                                      # A PAGE SCRIPT that only reads: {"op":"eval",
+                                      # "expr":"[...document.querySelectorAll('a')]
+                                      # .map(a=>a.textContent)"} prints its JSON.
                                       # --expect=<regex> grades the page the steps left,
                                       # re-read for up to --expect-wait ms (2000) so a
                                       # toast counts. It leaves page.md and tree.json
@@ -8223,7 +8229,12 @@ _inline_page() { # _inline_page <artifact dir> [<refs cap>]
 # a served (warm) browser the tab also survives between calls, so `act` with no
 # URL continues on the page the last call left; without one, the next call starts
 # from a fresh load.
-ACT_VOCAB='goto fill type click wait_for select press upload'
+#
+# BY POSITION AND BY PAGE SCRIPT (DIVE-8241): click_at, hover_at and type_at take a
+# pixel of page.png; eval reads the page with one expression, which Chrome runs in
+# side-effect-free mode (lib/point.cjs). Both are ACT steps only: an adapter's
+# recipe (ADAPTER_STEPS) keeps its closed vocabulary, and a routine never records them.
+ACT_VOCAB='goto fill type click wait_for select press upload click_at hover_at type_at eval'
 # DIVE-7237 (GAP-11): the most a DOM upload step carries. The file travels
 # inside the request to the browser (it reads as the caller, not as the browser's
 # seat), so it is capped; a Meta ad image is a few hundred KB.
@@ -8872,6 +8883,14 @@ cmd_act() {
   fi
   if [[ -n "$record" ]] && jq -e 'any(.[]; .op=="upload")' <<<"$steps" >/dev/null 2>&1; then
     die "$E_USAGE" "an act that uploads a file is not recorded as a routine (the file is this run's); run it without --record"
+  fi
+  # DIVE-8241: a position is this page's layout at this size, and a page script is
+  # the agent's own reading: neither is a step a routine replays.
+  if [[ -n "$record" ]] && jq -e 'any(.[]; .op=="click_at" or .op=="hover_at" or .op=="type_at" or .op=="eval")' <<<"$steps" >/dev/null 2>&1; then
+    die "$E_USAGE" "an act with a step by position or a page script is not recorded as a routine (a position is this page's layout); run it without --record"
+  fi
+  if jq -e 'any(.[]; has("saved")) and any(.[]; .op=="eval")' <<<"$steps" >/dev/null 2>&1; then
+    die "$E_USAGE" "a page script does not run in an act that types a saved login (it could read the value back). Nothing ran."
   fi
   # DIVE-6844: a SAVED login or detail, typed in by name. Checked before anything
   # opens: this seat cannot read the saved store, so the act goes once through

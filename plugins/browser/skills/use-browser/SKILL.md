@@ -34,12 +34,18 @@ a stop sign either: read, links, snapshot and act check each page for a sign-in 
    the browser is on. **An act prints what it changed**: the refs that appeared (`+ ref=…`), the
    ones that went and the new text. Act on those refs next; snapshot again only when the ref you
    need is not there.
+   **A ref click that is covered, off screen or not in the map: shot, then click by position.**
+   Open the act's `page.png`, then `{"op":"click_at","x":…,"y":…}` with a pixel of that picture
+   (also `hover_at`, and `type_at` with a `"value"`). The act prints what the point landed on.
+   **Hidden controls, embedded data, a long list: read them with a page script**,
+   `{"op":"eval","expr":"[...document.querySelectorAll('a.title')].map(a=>a.textContent)"}`. It
+   only reads: it prints JSON, and anything that would click, type or load is refused.
 3. **Verify** with `--expect=<regex>` only on the act that does the job (the save, the send,
    the search whose result you report): the words that prove it, matched on screen for up to
    2 s. A click that only opens a page or a menu needs no `--expect`: what it changed is printed.
    **A matched `--expect` IS the check for that step:** move on, never re-open the page to
-   confirm it. Between steps, go by the text and refs the act printed, never the picture. Open
-   the `page.png` once, at the end, only when no `--expect` matched, before you say the job worked.
+   confirm it. Between steps, go by the text and refs the act printed (the picture only to click by
+   position). Open the `page.png` once, at the end, only when no `--expect` matched, before you say the job worked.
    **`--expect` the proof itself** (the price, the filter's chip, the result count): the picture
    scrolls to what it matched, so the act that does the job also shows it.
 
