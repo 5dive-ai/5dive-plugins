@@ -144,13 +144,15 @@ not substitute the raw `viewer` command: it mints only one half of the relay cre
    Never poll `status` while `serve` is still running. Chromium holds the profile lock, so a
    second probe returns `UNKNOWN (served on :N …)` and cannot confirm the login. Stopping the
    browser preserves the profile and the login.
-6. **Read the terminal result.** `authenticated` makes the profile usable. `session expired`
-   or `CHALLENGE` still needs a person. `UNKNOWN (no adapter …)` means step 1 is incomplete.
+6. **Read the terminal result.** `authenticated` makes the profile usable, and so does
+   `connected`: the owner's Done on a site with no automatic check (DIVE-8263). `session expired`
+   or `CHALLENGE` still needs a person. `UNKNOWN (no adapter …)` or `unconfirmed` is NOT a stop
+   sign: read, links, snapshot and act still work and refuse a sign-in page themselves.
    When reflex is configured, the box drafts that login check itself (DIVE-4997). Once the line
    says a check is waiting, tell the owner to approve it: `sudo 5dive browser adapters pending`,
    then `adapters approve <site>`. Never approve one yourself; an agent seat's sudo is refused.
    Another `UNKNOWN` names a browser/box read failure and is not permission to act. Only after
-   `authenticated` may an agent use `run`, `snapshot`, `shot`, `read`, or `links` for that site.
+   `authenticated` or `connected` may an agent use `run` for that site.
 
 The view is ephemeral; the login profile is durable. Revoke promptly: a live viewer is a
 keyboard attached to the person's account.

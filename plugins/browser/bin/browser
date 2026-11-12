@@ -3129,7 +3129,7 @@ _input_probe() {  # <site> <dir>
   local out_t in_t; out_t=$(_input_title_marker "$site" logged_out); in_t=$(_input_title_marker "$site" logged_in)
   if [[ -z "$out_t" ]] && ! grep -qiE "$GENERIC_SIGNIN_URL" <<<"$url"; then out_t="$INPUT_SIGNIN_TITLE"; fi
   if [[ -n "$out_t" ]] && grep -qiE -- "$out_t" <<<"$title"; then
-    _signed_in_forget "$dir"; _stamp "$dir" expired
+    _signed_in_forget "$dir"; _owner_done_forget "$dir"; _stamp "$dir" expired
     echo "session expired — human action required (input mode: $url loaded as \"$title\")"
     return 1
   fi
@@ -3144,6 +3144,14 @@ _input_probe() {  # <site> <dir>
     echo "unverifiable — input mode: $url loaded as \"$title\", and a title cannot say whether this is signed in; last seen signed in $seen. A screen is the check: 5dive browser shot $site"
     return 0
   fi
+  # DIVE-8263: the owner's Done is the signed-in read a title cannot give. The
+  # sign-in title was tested just above, so this page is not one.
+  local odone
+  if odone=$(_owner_done_at "$dir"); then
+    _stamp "$dir" authenticated
+    echo "$(_owner_done_line "$site" "$odone" "input mode: $url loaded as \"$title\"")"
+    return 0
+  fi
   _stamp "$dir" unknown
   echo "unconfirmed (input mode: $url loaded as \"$title\", and a title cannot say whether this is signed in; it has not been seen signed in yet. A screen is the check: 5dive browser shot $site)"
   return 0
@@ -3151,6 +3159,8 @@ _input_probe() {  # <site> <dir>
 
 _probe() {
   local site="$1" dir="$2"
+  # DIVE-8263: the owner's Done, said by root's Done path only (_connect_done).
+  [[ "${FIVEDIVE_BROWSER_OWNER_DONE:-}" == 1 ]] && _owner_done_note "$dir"
   # A BROKERED SITE WHOSE GROUP'S BROWSER IS ON ANOTHER SITE, THE OTHER WAY
   # (DIVE-7346, report 594). bing.com (automated) shares one browser with
   # discord.gg (input): the probe below went into that input-mode browser, was
@@ -3379,6 +3389,10 @@ _probe() {
     fi
     [[ -n "$verdict" ]] && _maybe_propose "$site" "$dir"
   fi
+  # DIVE-8263: whether the page that loaded is a sign-in form, for the owner's
+  # Done below (a Done is evidence only for a page that is not one).
+  local signin_form=0
+  [[ -s "$dom" ]] && grep -qiE "$GENERIC_SIGNIN_MARKER" "$dom" && signin_form=1
   rm -f "$dom" "$dom.err"
   local via=headless; (( warm )) && via=served
   case "$verdict" in
@@ -3401,7 +3415,7 @@ _probe() {
       # DIVE-7881: the kind is in the words, for the page verbs (_challenge_state_kind).
       echo "CHALLENGE — a $ckind check is on the page (the agent clears it itself; it asks you first only where you turned that stop on: 5dive browser gate)"; return 1 ;;
     expired)
-      _signed_in_forget "$dir"
+      _signed_in_forget "$dir"; _owner_done_forget "$dir"
       _stamp "$dir" expired; echo "session expired — human action required${gwhy:+ (generic check: $gwhy)}"; return 1 ;;
     authenticated)
       _signed_in_note "$dir" "$via"
@@ -3418,8 +3432,30 @@ _probe() {
   # customer in front of a CAPTCHA still gets told to clear it rather than "we
   # cannot tell". Quiet (rc 0) like every other UNKNOWN: a state we cannot read
   # must not page a person. `run` still refuses on it — it accepts only
-  # `authenticated*` — which is the fail-closed half.
+  # `authenticated*` and the owner's `connected*` (DIVE-8263) — which is the
+  # fail-closed half.
   # DIVE-4997: a login with no adapter is exactly what reflex can draft one for.
+  # DIVE-8263: THE OWNER'S DONE CLOSES THE GAP. Reached only when the page was
+  # not a challenge and not (by the generic check) a sign-in, so with the
+  # owner's Done on record it reads `connected`; a sign-in form on it means the
+  # login is gone, whatever the Done said. Without a Done the line keeps its
+  # verdict and gains the one next step an agent needs: page verbs still work.
+  local odone=""
+  if [[ -z "$marker" && -z "$positive" && -z "$landed" ]] || (( generic )); then
+    odone=$(_owner_done_at "$dir") || odone=""
+    if [[ -n "$odone" ]] && (( signin_form )); then
+      _signed_in_forget "$dir"; _owner_done_forget "$dir"; _stamp "$dir" expired
+      echo "session expired — human action required (the page is a sign-in form; the owner's Done of $odone no longer holds)"
+      return 1
+    fi
+    if [[ -n "$odone" ]]; then
+      # The tile reads the stamp's word, and `authenticated` is the one it
+      # shows as Connected.
+      _stamp "$dir" authenticated
+      echo "$(_owner_done_line "$site" "$odone" "checked $(date -u +%Y-%m-%dT%H:%MZ)")"
+      return 0
+    fi
+  fi
   if (( generic )); then
     _maybe_propose "$site" "$dir"
     echo "unconfirmed (no adapter for $site; checked $(date -u +%Y-%m-%dT%H:%MZ))$(_pending_note "$site")"
@@ -3428,7 +3464,7 @@ _probe() {
   if [[ -z "$marker" && -z "$positive" && -z "$landed" ]]; then
     _stamp "$dir" unknown
     _maybe_propose "$site" "$dir"
-    echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $(_adapter_path "$site") with probe.logged_out_when_dom_matches)$(_pending_note "$site")"
+    echo "UNKNOWN (no adapter for $site — the page loaded, but nothing here can tell logged-in from logged-out; write $(_adapter_path "$site") with probe.logged_out_when_dom_matches)$(_pending_note "$site"). Not a stop sign: read, links, snapshot and act still work on $site and refuse a sign-in page themselves; 5dive browser shot $site shows the page. The owner's Connect and Done makes it read connected"
     return 0
   fi
   # A POSITIVE MARKER TURNS SILENCE INTO UNKNOWN, NOT INTO A LOGIN (DIVE-4794).
@@ -3485,6 +3521,55 @@ _signed_in_last() {  # <dir> [<via-alternation>] -> the iso, rc 1 when there is 
   [[ "$iso" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z$ ]] || return 1
   [[ -z "${2:-}" || "$via" =~ ^($2)$ ]] || return 1
   printf '%s\n' "$iso"
+}
+
+# THE OWNER'S DONE IS EVIDENCE (DIVE-8263). With no adapter, a loaded page that
+# is not a sign-in form used to read `unconfirmed`/`UNKNOWN (no adapter …)`
+# forever, even right after the owner signed in through Connect and tapped Done,
+# and agents stopped on it (box bug 902: kostya on instagram.com; lodar's
+# producthunt.com on chill-gorge, his avatar on the screen). The person who
+# holds the account looked at the page and said it is signed in: that is the
+# evidence the probe could not produce. Root's Done path (_connect_done) runs
+# the box seat's `status <site>` with FIVEDIVE_BROWSER_OWNER_DONE=1, and the
+# probe writes "<iso>" here. A later no-adapter check that finds no sign-in form
+# then says `connected`; one that finds a sign-in form says expired and forgets
+# it, so a signed-out landing page never reads connected on an old Done.
+# Kept beside the stamp, like .5dive-signed-in, because the stamp is overwritten
+# by every verdict. FAIL-CLOSED IS UNCHANGED where it matters: the page verbs
+# still run _signin_guard on every page they read.
+_owner_done_file() { _site_state "$1" .5dive-owner-done; }
+# ...AND BESIDE THE OFFER, FOR A SEAT THAT USES THE BOX LOGIN. A brokered seat
+# cannot open the owner's 0700 store (see the rendezvous), and agent-clicker on
+# chill-gorge is exactly such a seat. So the one fact is also published next to
+# <site>.offered, 0640 like it: "<site>.done" holding the time. It says no more
+# than the offer already does (the owner has a login here) plus when they last
+# said so.
+_owner_done_public() {  # <owner-seat> <dir>
+  printf '%s/%s.done\n' "$(_rv_dir "$1")" "$(basename "${2%/}")"
+}
+_owner_done_note() {  # <dir>
+  (( _SITE_BROKERED )) && return 0
+  local iso; iso=$(date -u +%Y-%m-%dT%H:%MZ)
+  ( umask 077; printf '%s\n' "$iso" > "$(_owner_done_file "$1")" ) 2>/dev/null || true
+  local d; d="$(_rv_dir "$(_seat)")"
+  [[ -d "$d" && -w "$d" ]] && { ( umask 037; printf '%s\n' "$iso" > "$(_owner_done_public "$(_seat)" "$1")" ) 2>/dev/null || true; }
+  return 0
+}
+_owner_done_forget() {
+  (( _SITE_BROKERED )) && return 0
+  rm -f -- "$(_owner_done_file "$1")" "$(_owner_done_public "$(_seat)" "$1")" 2>/dev/null || true
+}
+_owner_done_at() {  # <dir> -> the iso of the owner's Done, rc 1 when there is none
+  local f l
+  if (( _SITE_BROKERED )); then f=$(_owner_done_public "$_SITE_OWNER" "$1"); else f=$(_owner_done_file "$1"); fi
+  l=$(head -1 "$f" 2>/dev/null) || return 1
+  [[ "$l" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z$ ]] || return 1
+  printf '%s\n' "$l"
+}
+# The one line a site with no adapter reads after the owner's Done. Leads with
+# the verdict an agent acts on; the caveat is the guard, said once.
+_owner_done_line() {  # <site> <iso> [<how>]
+  printf 'connected (signed in by the owner %s%s; no automatic check for %s, and a sign-in form on a page would mean signed out). Agents: use it.' "$2" "${3:+, $3}" "$1"
 }
 
 cmd_probe_all() {
@@ -4212,7 +4297,10 @@ cmd_run() {
       die "$E_COLD" "$site is presenting a security challenge, and a saved routine cannot clear one. Clear it yourself first in the same browser (5dive browser act $site: type the code from the site's mail or the owner's saved .2fa, tick the robot check), then run this again. Ask your owner only if you cannot: 5dive browser connect-request $site --challenge --url=<the page you were on>" ;;
     session\ expired*)
       die "$E_COLD" "$site is logged out. Failing closed: no retry, no login attempt, no falling through to a generic click. A person clears this — 5dive browser auth $site" ;;
-    authenticated*)
+    authenticated*|connected*)
+      # DIVE-8263: `connected` is the owner's Done on a page that is not a
+      # sign-in form, the same evidence weight as the generic check's signed-in
+      # read, which has always passed here as `authenticated`.
       : ;;
     BROKEN*)
       die "$E_UNAVAILABLE" "$state. The session was never examined, so this says nothing about $site — a browser that will not start is a box fault, and logging in again cannot clear it." ;;
@@ -6951,16 +7039,27 @@ _page_open_probe() {
   local memo_age
   if (( _PG_GUARDED )) && memo_age=$(_generic_memo_age "$site"); then
     _GENERIC_UNCONFIRMED=1
-    printf '%s: unconfirmed (no adapter for %s; checked %ss ago, not again now) — no adapter confirmed the %s login; the page is checked for a sign-in form, so this proceeds.\n' "$PROG" "$site" "$memo_age" "$site" >&2
+    local modone
+    if modone=$(_owner_done_at "$dir"); then
+      printf '%s: connected (signed in by the owner %s; checked %ss ago, not again now) — the page is checked for a sign-in form, so this proceeds.\n' "$PROG" "$modone" "$memo_age" >&2
+    else
+      printf '%s: unconfirmed (no adapter for %s; checked %ss ago, not again now) — no adapter confirmed the %s login; the page is checked for a sign-in form, so this proceeds.\n' "$PROG" "$site" "$memo_age" "$site" >&2
+    fi
     return 0
   fi
   local state; state=$(_PROBE_GENERIC=1 _probe "$site" "$dir")
   case "$state" in
-    unconfirmed\ \(no\ adapter*) : ;;
+    unconfirmed\ \(no\ adapter*|connected\ \(signed\ in\ by\ the\ owner*) : ;;
     *) _generic_memo_drop "$site" ;;
   esac
   case "$state" in
     authenticated*) : ;;
+    connected*)
+      # DIVE-8263: the owner's Done, on a front page with no sign-in form. The
+      # page itself is still checked for one (_signin_guard), as for unconfirmed.
+      _GENERIC_UNCONFIRMED=1
+      _generic_memo_write "$site"
+      printf '%s: %s — the page is checked for a sign-in form, so this proceeds.\n' "$PROG" "$state" >&2 ;;
     unconfirmed*)
       # A CONNECTED SITE WITH NO ADAPTER (DIVE-4943 scope 2). The page was not a
       # sign-in form and not a challenge, so it proceeds — and says, every time,
@@ -12344,9 +12443,10 @@ _connect_as_seat() {  # <seat> <browser verb args...>
   [[ "${CONNECT_AS_TIMEOUT:-}" =~ ^[0-9]+$ ]] && bound=(timeout "$CONNECT_AS_TIMEOUT")
   if [[ $EUID -eq 0 ]]; then
     "${bound[@]}" runuser -u "$seat" -- env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
-      -u FIVEDIVE_BROWSER_SEAT FIVEDIVE_BROWSER_ON_BEHALF_OF="$CONNECT_CALLER" "$CONNECT_SELF" "$@"
+      -u FIVEDIVE_BROWSER_SEAT -u FIVEDIVE_BROWSER_OWNER_DONE FIVEDIVE_BROWSER_ON_BEHALF_OF="$CONNECT_CALLER" \
+      ${CONNECT_OWNER_DONE:+FIVEDIVE_BROWSER_OWNER_DONE=1} "$CONNECT_SELF" "$@"
   else
-    "${bound[@]}" "$CONNECT_SELF" "$@"
+    "${bound[@]}" env -u FIVEDIVE_BROWSER_OWNER_DONE ${CONNECT_OWNER_DONE:+FIVEDIVE_BROWSER_OWNER_DONE=1} "$CONNECT_SELF" "$@"
   fi
 }
 
@@ -12507,7 +12607,7 @@ _connect_done() {  # <caller> <code> <sender>
     [[ "$CONNECT_OWNER" == "$caller" || "$CONNECT_OWNER" == "$BOX_SEAT" ]] || die "$E_PERM" "the request names no usable seat"
     _connect_as_seat "$CONNECT_OWNER" viewer-revoke "$site" >/dev/null 2>&1 || true
     _connect_as_seat "$CONNECT_OWNER" handoff "$site" --close >/dev/null 2>&1 || true
-    rc=0; out=$(_connect_as_seat "$CONNECT_OWNER" status "$site" 2>&1) || rc=$?
+    rc=0; out=$(CONNECT_OWNER_DONE=1 _connect_as_seat "$CONNECT_OWNER" status "$site" 2>&1) || rc=$?
     local v; v=$(printf '%s\n' "$out" | awk -v s="$site" '$1 == s { sub(/^[ \t]+/, ""); sub(/[ \t]+/, " "); print; exit }')
     [[ -n "$v" ]] || v=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
     printf 'site=%s\nstatus_rc=%s\nstatus=%s\n' "$site" "$rc" "$v"
@@ -12524,7 +12624,8 @@ _connect_done() {  # <caller> <code> <sender>
   else
     _connect_as_box serve "$site" --stop >/dev/null 2>&1 || true
   fi
-  rc=0; out=$(_connect_as_box status "$site" 2>&1) || rc=$?
+  # DIVE-8263: the person tapped Done, so this status records it as evidence.
+  rc=0; out=$(CONNECT_OWNER_DONE=1 _connect_as_box status "$site" 2>&1) || rc=$?
   # THE VERDICT IS THE SITE'S OWN LINE, not the last line (DIVE-5638). A broken
   # launch ends `status` with a reproducer COMMAND, and the agent's channel got
   # that command string in place of "BROKEN (… why)". The last line stays the

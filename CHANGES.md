@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.78.0: a site the owner connected (Done) reads `connected`, not `unconfirmed` (DIVE-8263)
+
+- `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8263-owner-done-connected` (`tests/browser_mirror.sh sync`). The owner's Done on a Connect is recorded, and a site with no automatic check whose page is not a sign-in form then reads `connected … Agents: use it.` instead of `unconfirmed`, so agents stop refusing sites their owner signed in to. A sign-in form still reads expired. Sites with a built-in check (instagram.com, smmplanner.com, tilda.cc from 1.77.0) keep their own verdict.
+
 ### Fixed — browser 1.77.0: a connected Instagram, SMMplanner or Tilda reads signed in or signed out, not "unknown" (DIVE-8258)
 
 - `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8258-site-checks` (`tests/browser_mirror.sh sync`). Built-in login checks for instagram.com, smmplanner.com and tilda.cc, each read off the site's real signed-out page; before them a connected Instagram read UNKNOWN forever on a partner box (box bug 902).
