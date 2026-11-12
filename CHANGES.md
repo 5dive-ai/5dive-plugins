@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.80.0: `act --help` lists its step ops, upload included (DIVE-8287)
+
+- `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8287-act-help-steps` (`tests/browser_mirror.sh sync`). `5dive browser act --help` prints one JSON example per step op with its fields, e.g. `{"op":"upload","selector":"ref=…","path":"/abs/file"}` (up to 16 MB), walked from `ACT_VOCAB`. Agents read the help, saw no step ops, and filed "act has no upload step" while upload existed.
+
 ### Added — browser 1.79.0: an act clicks by position on a normal page, and reads the page with a script that cannot act (DIVE-8241)
 
 - `plugins/browser` synced byte-for-byte from 5dive-browser `dev/dive-8241-xy-eval` (`tests/browser_mirror.sh sync`). An act takes `click_at` / `hover_at` / `type_at` at a pixel of `page.png` on any page; the owner's pay/publish/send/delete stops are read off the element under the point, and a point nothing can be read under counts as pay. An act's `eval` returns JSON from a page expression under Chrome's side-effect check (no clicks, typing, navigation or network through it; cookies and filled passwords unreadable). Adapters keep their closed vocabulary.

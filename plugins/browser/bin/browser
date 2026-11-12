@@ -8239,6 +8239,28 @@ ACT_VOCAB='goto fill type click wait_for select press upload click_at hover_at t
 # inside the request to the browser (it reads as the caller, not as the browser's
 # seat), so it is capped; a Meta ad image is a few hundred KB.
 ACT_UPLOAD_MAX_BYTES="${FIVEDIVE_BROWSER_UPLOAD_MAX_BYTES:-16777216}"
+# THE STEPS `act --help` LISTS (DIVE-8287). Box agents read `act --help`, saw
+# no step ops, and filed "act has no upload step" twice (witty-palm on 11-09,
+# wry-rune on 11-12, both while upload existed). The list is walked from
+# ACT_VOCAB, so a new op shows up in the help the day it is added; an op with no
+# form here still prints its name.
+_act_step_form() {  # _act_step_form <op> -> one JSON example of that step
+  case "$1" in
+    goto)     printf '{"op":"goto","url":"https://…"}' ;;
+    fill)     printf '{"op":"fill","selector":"ref=textbox/Email","value":"…"}' ;;
+    type)     printf '{"op":"type","selector":"ref=combobox/Search","value":"…"}   (key by key)' ;;
+    click)    printf '{"op":"click","selector":"ref=button/Save"}' ;;
+    wait_for) printf '{"op":"wait_for","selector":"ref=…|css|text=…"}' ;;
+    select)   printf '{"op":"select","selector":"ref=combobox/Size","value":"M"}' ;;
+    press)    printf '{"op":"press","selector":"ref=…","key":"Enter"}' ;;
+    upload)   printf '{"op":"upload","selector":"ref=…","path":"/abs/file"}   (a regular file, up to %s MB)' "$(( ACT_UPLOAD_MAX_BYTES / 1048576 ))" ;;
+    click_at) printf '{"op":"click_at","x":640,"y":212}   (a pixel of page.png)' ;;
+    hover_at) printf '{"op":"hover_at","x":640,"y":212}' ;;
+    type_at)  printf '{"op":"type_at","x":640,"y":212,"value":"…"}' ;;
+    eval)     printf '{"op":"eval","expr":"document.title"}   (reads only; prints its JSON)' ;;
+    *)        printf '{"op":"%s"}' "$1" ;;
+  esac
+}
 ACT_MAX_STEPS=40
 # How long --expect is re-read after the last step before NOT VERIFIED
 # (DIVE-4983): a toast lands a second or two after the click that caused it.
@@ -8834,6 +8856,8 @@ cmd_act() {
         printf '%s act [<site>] <url> --steps=<json> [--expect=<regex>] [--expect-wait=<ms>] [--wait-for=<selector|ref=…|text=…>] [--interactive] [--approved=<id>] [--out=<dir>] [--json] [--record=<routine>] [--full]\n' "$PROG"
         printf '  A served browser answers with what the steps changed (new refs, new text) since you last\n'
         printf '  saw the page; --full derives page.md and prints the whole page instead.\n'
+        printf '  Steps (--steps is a JSON array of these, run in order):\n'
+        local _op; for _op in $ACT_VOCAB; do printf '    %s\n' "$(_act_step_form "$_op")"; done
         printf '  --record=<routine> saves these steps (never the values typed) for `5dive browser replay`.\n'
         printf '  A fill or type step can name a login the owner saved instead of carrying it:\n'
         printf '  {"op":"fill","selector":"ref=textbox/Password","saved":"<name>.password"}; <name>.login, and\n'
