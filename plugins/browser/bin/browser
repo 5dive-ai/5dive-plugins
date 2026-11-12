@@ -1926,20 +1926,65 @@ _stack_apt_update() {
 }
 # _stack_preflight — the two box faults that make every apt install fail, named
 # BEFORE the installs instead of guessed after: under ~1 GB free where apt
-# unpacks, and a dpkg run left half-done. Silent on a healthy box.
+# unpacks (named), and a dpkg run left half-done (finished, DIVE-8250). Silent
+# on a healthy box.
 STACK_FREE_FLOOR_MB=1024
 _stack_preflight() {
-  local low a
+  local low
   if _have df; then
     low=$(df -Pk / /var 2>/dev/null | awk -v floor="$STACK_FREE_FLOOR_MB" '
       NR > 1 && $4 ~ /^[0-9]+$/ && !seen[$6]++ && int($4 / 1024) < floor { printf "%s%s (%d MB free)", sep, $6, int($4 / 1024); sep = ", " }')
     [[ -z "$low" ]] || _stack_warn "low disk: $low. Chrome needs about 1 GB free to install, so apt will likely fail. Free some space, then re-run: $SETUP_CMD"
   fi
-  if _have dpkg; then
-    a=$(dpkg --audit 2>/dev/null | grep -v '^[[:space:]]*$' | head -n 3)
-    [[ -z "$a" ]] || _stack_warn "dpkg has an unfinished install, so apt will refuse new ones. Finish it first: sudo dpkg --configure -a (dpkg --audit says: $(paste -sd' ' <<<"$a"))"
-  fi
+  _have dpkg && _stack_dpkg_heal
   return 0
+}
+# DIVE-8250 — a dpkg run left half-done is FINISHED here, not just named. On a
+# box whose owner has no terminal (the app's Finish setup, the API's `plugin
+# setup --yes` through sudo), "run sudo dpkg --configure -a" was a dead end, and
+# the box stayed without Chrome for good. Only a person's (root) run gets here:
+# a hire never converges. `dpkg --configure -a` finishes the half-configured
+# packages; `apt-get -f install` then pulls what a run left unpacked without its
+# dependencies, which the first alone does not fix (5dive-setup-voice.sh
+# apt_ready, DIVE-5597/5618). Still unfinished after both: the old sentence
+# plus dpkg's own last lines, and the installs below fail into setup's exit 69.
+STACK_DPKG_TIMEOUT="${FIVEDIVE_BROWSER_DPKG_TIMEOUT:-300}"
+_stack_dpkg_audit() { dpkg --audit 2>/dev/null | grep -v '^[[:space:]]*$'; }
+_stack_dpkg_heal() {
+  local a out="" rc=1 end t
+  # Either sign: --audit names half-done packages, or dpkg's journal holds an
+  # unapplied update (what makes apt say "dpkg was interrupted").
+  a=$(_stack_dpkg_audit | head -n 3)
+  [[ -n "$a" ]] || compgen -G "$STACK_ROOT/var/lib/dpkg/updates/[0-9]*" >/dev/null || return 0
+  _stack_say "finishing an interrupted package install first (dpkg --configure -a)..."
+  # dpkg has no lock timeout of its own: the box's unattended upgrades may hold
+  # the lock, so retry while dpkg says it is locked, inside one deadline.
+  end=$(( SECONDS + STACK_DPKG_TIMEOUT ))
+  while :; do
+    t=$(( end - SECONDS )); (( t > 0 )) || break
+    out=$(DEBIAN_FRONTEND=noninteractive timeout "$t" dpkg --force-confdef --force-confold --configure -a 2>&1); rc=$?
+    (( rc )) && grep -qiE 'locked by another process|could not get lock' <<<"$out" || break
+    (( end - SECONDS > 5 )) || break
+    sleep 5
+  done
+  DEBIAN_FRONTEND=noninteractive timeout "$STACK_DPKG_TIMEOUT" apt-get -o DPkg::Lock::Timeout=300 \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y -q -f install >/dev/null 2>&1 || true
+  if (( rc == 0 )) && [[ -z "$(_stack_dpkg_audit)" ]]; then
+    _stack_say "finished the interrupted install"
+    return 0
+  fi
+  (( rc == 124 )) && out+=$'\n'"(stopped after ${STACK_DPKG_TIMEOUT}s)"
+  # dpkg --audit opens with a three-line preamble; the indented lines name the packages.
+  a=$(_stack_dpkg_audit | awk '/^[[:space:]]/ { print $1 }' | head -n 5 | paste -sd' ')
+  [[ -n "$a" ]] && a="names: $a" || a=$(_stack_dpkg_audit | head -n 3 | paste -sd' ')
+  [[ -z "$a" || "$a" == names:* ]] || a="says: $a"
+  _stack_warn "dpkg has an unfinished install, so apt will refuse new ones, and finishing it here failed. Finish it first: sudo dpkg --configure -a${a:+ (dpkg --audit $a)}"
+  out=$(grep -v '^[[:space:]]*$' <<<"$out" | tail -n 5)
+  if [[ -n "$out" ]]; then
+    printf '  dpkg --configure -a said:\n' >&2
+    sed 's/^/    /' <<<"$out" >&2
+  fi
+  return 1
 }
 _stack_say() { printf '  %s\n' "$*"; }
 _stack_step() { printf '\n== Step %s/4 — %s ==\n' "$1" "$2"; }

@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.76.0: setup finishes an interrupted package install itself (DIVE-8250)
+
+- `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8250-dpkg-heal` (`tests/browser_mirror.sh sync`). When dpkg was left half-done, a person's setup (and the app's Finish setup) now runs `dpkg --configure -a` and `apt-get -f install` before installing, instead of telling an owner with no terminal to run it. If that fails, it names the packages, shows dpkg's last lines and exits 69.
+
 ### Fixed — browser 1.75.0: a Chrome that will not install says why; a person's setup exits 69 until ready (DIVE-8206)
 
 - `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8206-setup-apt-reason` (`tests/browser_mirror.sh sync`). Setup now shows the last lines apt printed when Chrome, the X packages or Node.js will not install, names low disk, an unfinished dpkg and a Signed-By conflict, and a person's run ends `browser NOT ready: missing …` with exit 69 instead of 0. Box bug report 886 (wry-rune).
