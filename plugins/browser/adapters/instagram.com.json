@@ -1,0 +1,10 @@
+{
+  "_comment": "MEASURED, NOT GUESSED (DIVE-8258, dev2, 2026-11-12). Before this file a connected Instagram read UNKNOWN on every box, and on a partner box nobody could ever turn it green (box bug 902). Logged OUT, /accounts/edit/ is answered by the SERVER with a 302 to /accounts/login/?next=… — the cookie decides it, not JavaScript. That login page carries Meta's current-user record with account 0 in its server-sent bytes (curl: 2 matches; the rendered page in a real Chrome at 1.5 s and at 8 s: 1 match), and its rendered form has a password field (<input type=\"password\" name=\"pass\">, 1 match at 1.5 s and at 8 s). So the marker does not wait for the app to draw: a logged-out probe matches even on the bare shell.",
+  "site": "instagram.com",
+  "probe": {
+    "url": "https://www.instagram.com/accounts/edit/",
+    "logged_out_when_dom_matches": "CurrentUserInitialData\",\\[\\],\\{\"ACCOUNT_ID\":\"0\"|type=[\"']?password",
+    "_comment": "UNMEASURED HALF: no box or seat here holds an Instagram login, so the signed-in render of /accounts/edit/ was not observed. A signed-in page carries the viewer's own non-zero account id in the same record and the edit-profile form has no password field. If that ever proves wrong, status reads 'session expired' and names a person: it fails toward asking, never toward 'authenticated' on a logged-out page."
+  },
+  "actions": {}
+}
