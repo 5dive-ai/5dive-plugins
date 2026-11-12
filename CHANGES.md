@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Added — browser 1.79.0: an act clicks by position on a normal page, and reads the page with a script that cannot act (DIVE-8241)
+
+- `plugins/browser` synced byte-for-byte from 5dive-browser `dev/dive-8241-xy-eval` (`tests/browser_mirror.sh sync`). An act takes `click_at` / `hover_at` / `type_at` at a pixel of `page.png` on any page; the owner's pay/publish/send/delete stops are read off the element under the point, and a point nothing can be read under counts as pay. An act's `eval` returns JSON from a page expression under Chrome's side-effect check (no clicks, typing, navigation or network through it; cookies and filled passwords unreadable). Adapters keep their closed vocabulary.
+
 ### Fixed — browser 1.78.0: a site the owner connected (Done) reads `connected`, not `unconfirmed` (DIVE-8263)
 
 - `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8263-owner-done-connected` (`tests/browser_mirror.sh sync`). The owner's Done on a Connect is recorded, and a site with no automatic check whose page is not a sign-in form then reads `connected … Agents: use it.` instead of `unconfirmed`, so agents stop refusing sites their owner signed in to. A sign-in form still reads expired. Sites with a built-in check (instagram.com, smmplanner.com, tilda.cc from 1.77.0) keep their own verdict.

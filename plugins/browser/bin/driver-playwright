@@ -49,6 +49,7 @@ const path = require('path');
 // resolve code by walking ancestor node_modules, and a bare require('aria')
 // would reintroduce exactly that.
 const aria = require(path.join(__dirname, '..', 'lib', 'aria.cjs'));
+const point = require(path.join(__dirname, '..', 'lib', 'point.cjs'));   // DIVE-8241
 // DIVE-4951: the seat's own proxy, parsed in ONE place for both launch sites.
 const proxy = require(path.join(__dirname, '..', 'lib', 'proxy.cjs'));
 const totp = require(path.join(__dirname, '..', 'lib', 'totp.cjs'));
@@ -700,6 +701,11 @@ async function main() {
   // action that half happened. Resolve everything first, or refuse.
   const resolved = steps.map((s, i) => {
     const spec = STEPS[s && s.op];
+    // DIVE-8241: a click by position and a read-only page script are an act's
+    // (guarded) steps, never a recipe's: `run` keeps the closed vocabulary.
+    if (!spec && plan.guard === true && s && point.ACT_ONLY.has(s.op)) {
+      try { return point.validate(s, i + 1); } catch (e) { die(E_NOTHING_RAN, e.message); }
+    }
     if (!spec) {
       die(E_NOTHING_RAN, `step ${i + 1} uses '${s && s.op}', which is outside the fixed vocabulary ` +
         `(${Object.keys(STEPS).join(' ')}). The vocabulary is the point: an adapter that can express ` +
@@ -804,6 +810,27 @@ async function main() {
       }
       // DIVE-7168: the sign-in the guard allowed, said once per act for the owner's record.
       if (!signedIn) { const gg = await gsignin.stepGrant(page, s); if (gg) { signedIn = true; process.stderr.write(gsignin.GRANT_PREFIX + JSON.stringify(gg) + '\n'); } }
+      // DIVE-8241: BY POSITION, OR A PAGE SCRIPT (lib/point.cjs, shared by both loops).
+      // The owner's four are read off the element under the point; an eval only reads.
+      if (point.ACT_ONLY.has(s.op)) {
+        if (s.op === 'eval') {
+          const json = await point.evalStep(page, s);
+          process.stderr.write(`  ${where} = ${json}\n`);
+        } else {
+          if (plan.guard && !plan.approved) {
+            const risk = await point.pointRisk(page, s);
+            if (risk && Array.isArray(plan.allow_kinds) && plan.allow_kinds.includes(risk.cls)) {
+              process.stderr.write(aria.OWNER_ALLOWED_PREFIX + JSON.stringify({ ...risk, step: i + 1, op: s.op }) + '\n');
+            } else if (risk) { needsOwner = { ...risk, step: i + 1, op: s.op }; break; }
+          }
+          stepsRun++;
+          acted = true;
+          process.stderr.write(`  ${where}: ${await point.runPoint(page, s, { timeoutMs: stepMs })}\n`);
+        }
+        lastOp = s.op;
+        process.stderr.write(`  ${where} ok\n`);
+        continue;
+      }
       const { sel, retry: r } = await aria.resolveOrRepick(page, s, i + 1, { timeoutMs: stepMs });
       if (r) assertLease(where);
       retry = r;
@@ -838,6 +865,8 @@ async function main() {
       // no other (the page may have moved since the act began). Checked here,
       // not on the case lines, which older harnesses match byte for byte.
       if (s.op === 'fill' || s.op === 'type') savedHostCheck(page, s);
+      // DIVE-8241: a tab a saved value went into is one no page script reads.
+      if ((s.op === 'fill' || s.op === 'type') && s.host) point.markSaved(page);
       // DIVE-7237: an act's upload carries the file's bytes, read by the caller
       // (who may hold files this browser's seat cannot open); an adapter's names a path.
       if (s.op === 'upload' && s.file && typeof s.file.b64 === 'string') {

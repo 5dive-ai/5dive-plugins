@@ -355,7 +355,7 @@ function pageAccounts(html, text, s) {
   return pick.length ? pick : [...ids];
 }
 async function stepGrant(page, s) {
-  if (!s || !['click', 'press'].includes(s.op)) return null;
+  if (!s || !['click', 'press', 'click_at'].includes(s.op)) return null;
   let url = '';
   try { url = page.url(); } catch (e) { return null; }
   if (!isGooglePage(url)) return null;   // not Google's: nothing to record

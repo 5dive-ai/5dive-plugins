@@ -61,7 +61,7 @@ const CTX_DEFER_MS = 50;
 
 // The ops that can open a window. fill, type, select and upload do not, in any
 // page measured, and charging them the wait would slow every form.
-const OPENS = new Set(['click', 'press']);
+const OPENS = new Set(['click', 'press', 'click_at']);   // click_at: DIVE-8241
 
 function hostOf(u) {
   try { const x = new URL(String(u)); return x.host || x.href; } catch (e) { return String(u || ''); }
