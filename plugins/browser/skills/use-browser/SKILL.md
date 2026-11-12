@@ -8,7 +8,8 @@ description: Do something on a website in a real browser on the box — click, t
 `5dive browser <verb> <url>` drives a real Chrome on this box. The URL picks the profile: the
 owner's one login for that site, or the public profile (nothing logged in). **Start with the
 verb.** Never run `--help`, `status` or setup first: this page is the manual, and a public page
-needs nothing connected.
+needs nothing connected. A connected site that reads `connected` is usable; `unconfirmed` is not
+a stop sign either: read, links, snapshot and act check each page for a sign-in form themselves.
 
 ## The loop: ONE snapshot per decision
 

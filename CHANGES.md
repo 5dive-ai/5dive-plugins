@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.77.0: a site the owner connected (Done) reads `connected`, not `unconfirmed` (DIVE-8263)
+
+- `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8263-owner-done-connected` (`tests/browser_mirror.sh sync`). The owner's Done on a Connect is recorded, and a site with no automatic check whose page is not a sign-in form then reads `connected … Agents: use it.` instead of `unconfirmed`, so agents stop refusing sites their owner signed in to. A sign-in form still reads expired.
+
 ### Fixed — browser 1.76.0: setup finishes an interrupted package install itself (DIVE-8250)
 
 - `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8250-dpkg-heal` (`tests/browser_mirror.sh sync`). When dpkg was left half-done, a person's setup (and the app's Finish setup) now runs `dpkg --configure -a` and `apt-get -f install` before installing, instead of telling an owner with no terminal to run it. If that fails, it names the packages, shows dpkg's last lines and exits 69.
