@@ -1,0 +1,10 @@
+{
+  "_comment": "MEASURED, NOT GUESSED (DIVE-8258, dev2, 2026-11-12). Logged OUT, /projects/ is answered by the SERVER with a 302 to /login/, whose server-sent page is titled 'Sign in - Tilda' and has <div class=\"ts-page ts-page-login\"> (curl: 1 match; the rendered page in a real Chrome at 1.5 s: 1 match, and a password field). Tilda already read 'expired' through the generic header check; this file makes that a site check that does not depend on how the header is drawn.",
+  "site": "tilda.cc",
+  "probe": {
+    "url": "https://tilda.cc/projects/",
+    "logged_out_when_dom_matches": "ts-page-login",
+    "_comment": "UNMEASURED HALF: no Tilda login exists here, so the signed-in project list was not observed. The class names the sign-in page only; if a signed-in page ever carried it, status reads 'session expired' and asks a person — never 'authenticated' on a logged-out page."
+  },
+  "actions": {}
+}
