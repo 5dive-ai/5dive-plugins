@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.77.0: a connected Instagram, SMMplanner or Tilda reads signed in or signed out, not "unknown" (DIVE-8258)
+
+- `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8258-site-checks` (`tests/browser_mirror.sh sync`). Built-in login checks for instagram.com, smmplanner.com and tilda.cc, each read off the site's real signed-out page; before them a connected Instagram read UNKNOWN forever on a partner box (box bug 902).
+
 ### Fixed — browser 1.76.0: setup finishes an interrupted package install itself (DIVE-8250)
 
 - `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8250-dpkg-heal` (`tests/browser_mirror.sh sync`). When dpkg was left half-done, a person's setup (and the app's Finish setup) now runs `dpkg --configure -a` and `apt-get -f install` before installing, instead of telling an owner with no terminal to run it. If that fails, it names the packages, shows dpkg's last lines and exits 69.

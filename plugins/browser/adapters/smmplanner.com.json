@@ -1,0 +1,12 @@
+{
+  "_comment": "MEASURED, NOT GUESSED (DIVE-8258, dev2, 2026-11-12). Before this file a connected SMMplanner read UNKNOWN on every box (box bug 902). The app under /home/ is a single-page app: curl of any /home/ path returns the same 1257-byte shell with no login state in it. Rendered in a real Chrome, logged OUT, /home/posts sends you to /home/auth/signin ('SMMplanner | Sign in') with <input name=\"password\" type=\"password\"> on screen — present at 1.5 s and at 9 s.",
+  "site": "smmplanner.com",
+  "probe": {
+    "url": "https://smmplanner.com/home/posts",
+    "logged_out_when_dom_matches": "type=[\"']?password",
+    "_comment": "UNMEASURED HALF: no SMMplanner login exists here, so the signed-in render of /home/posts (the post list) was not observed; a post list has no password field. If one ever shows, status reads 'session expired' and asks a person — never 'authenticated' on a logged-out page.",
+    "challenge_when_dom_matches": "(hcaptcha|cf-challenge|/checkpoint/challenge|two-factor|verify-your-identity)",
+    "_comment_challenge": "NO BARE g-recaptcha HERE, same trap as reddit.com: the sign-in page loads Google's INVISIBLE reCAPTCHA (<textarea name=\"g-recaptcha-response\">, 6 matches on the plain logged-out page), and the probe tests challenge FIRST, so the default list would have read a plain sign-in page as a robot check. This is the default list minus g-recaptcha."
+  },
+  "actions": {}
+}
