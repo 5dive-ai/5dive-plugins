@@ -53,6 +53,8 @@ jq -r '.policies[] | "\(.id)\t\(.rule)"' plugins/mod/policy/guard.json
 | `checks[].allow_any` | values that are permitted. With `group`, this is what makes `1234567890` and `@example.com` pass and everything else fail. |
 | `checks[].require_all` | context the subject must also contain. This is what keeps *quoting* `smoke-verified` in a sentence from reading as *applying* the label. |
 | `checks[].require_flags` | optional regex flags for `require_all` (`i` for a case-blind name). Default none. |
+| `hosts` | optional. Regexes over the host's name (read once from `/etc/hostname`). The policy applies only on a matching host — how `heavy-local` refuses on poke-two and never on 5dive-ci, where CI runs the same commands. A name that will not read matches nothing: the policy is skipped. |
+| `checks[].unless_any` | optional. Context that cancels the check when the subject holds any of it (flags: `require_flags`). How `npx tsc -p .` sent over `ssh` to 5dive-ci is not read as running it here. |
 | `file_args` | optional. Regexes whose group 1 is a file the call reads its text from (`--ask-file=<path>`). The hook reads it (64 KB cap) and the policy judges that text with the call's own; a file that does not read is judged absent. |
 | `deny` | the reason handed to the model. `{found}`, `{path}` and `{rule}` are substituted. |
 
@@ -70,6 +72,7 @@ reason, not a report.
 | `destructive-outside-workdir` | `rm -r` of a host path or a seat's dotfiles; `git clean -f` | `FIVEDIVE_MOD_GUARD_ALLOW_DESTRUCTIVE` |
 | `external-reply` | `gh pr/issue comment|review|create --repo <owner we do not own>` | `FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED` |
 | `openrouter-key-mint` | creating or raising an OpenRouter key over the keys API (POST/PATCH) | `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT` |
+| `heavy-local` | **poke-two only** (`hosts`). A whole-project typecheck (`tsc` with no file, or `-p`/`--build`; `npm/bun run typecheck`), `next build`/`next dev` (bare, or `npm run build|dev` naming a Next app checkout), or a test runner with no test file after it (`npm test`, `bun test`, `node --test`, a `**` glob). `node --test <file>`, `bun test <file>`, `npm test -- <file>`, `tsc --noEmit <file>` and anything over `ssh` run | `FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL` |
 | `openrouter-spend-ask` | a `5dive task need`/`task add` whose text (or `--ask-file`/`--body-file`) asks to fund or raise OpenRouter; one that only names OpenRouter runs | `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT` |
 
 ## Turning it on
@@ -133,6 +136,11 @@ than one whose edges are written down.
   valid octet and which carries no `v` and no fifth part — `10.1.2.3` is both a private address
   and a plausible version, and no amount of pattern is going to separate them. That case is what
   `FIVEDIVE_MOD_GUARD_ALLOW_FIXTURE_ID` is for: one seat setting, recorded, for the one write.
+- **`heavy-local` reads the command line, not the working directory.** `npm run build` typed
+  inside the frontend checkout, with no path naming it, runs; so does 5dive-api's `npm run build`
+  (which is `tsc`). A runner flag whose value holds a letter (`bun test -t name`,
+  `--reporter junit`) reads as a test file. And a separator inside a quoted string
+  (`-m "x; npm test"`) reads as a command. Each is a widening of the regex in `policy/guard.json`.
 - **`external-reply` only sees an explicit `--repo`/`-R`.** `gh pr comment 4` run from inside a
   foreign checkout carries no owner on the command line, so nothing is refused.
 - **`pii-fixture` judges the path by NAME** (`test/`, `spec/`, `fixture`, `*.test.*`). A fixture

@@ -447,6 +447,175 @@ describe('engine: require_flags and file_args (DIVE-7673)', () => {
   })
 })
 
+// DIVE-8299 (lodar 11-12 13:53Z, after poke-two froze: «why quinn and dev didn't use ci server for tests - why
+// we have this issue again»). Two seats ran `npx tsc --noEmit -p .` on the frontend at once, ~1-1.4 GB each,
+// and every seat went silent 7 minutes. The prose banned full suites and next build, not tsc; prose has now
+// failed three times on this box. The mutants are the targeted forms the same rule TELLS a seat to use.
+describe('policy: heavy-local — whole-project typecheck, next build/dev and full suites on poke-two', () => {
+  const POKE = 'poke-two'
+  const on = (command: string, host: string = POKE, env = NO_ENV) =>
+    evaluate(SHIPPED, { ...bash(command), host }, env)?.policy ?? null
+  const checkOf = (command: string) => evaluate(SHIPPED, { ...bash(command), host: POKE }, NO_ENV)?.check ?? null
+
+  test("the incident's own command, both seats' spelling, is refused", () => {
+    expect(on('npx tsc --noEmit -p .')).toBe('heavy-local')
+    expect(on('cd /home/claude/projects/5dive/app && npx tsc --noEmit -p . 2>&1 | tail -30; echo tsc-done')).toBe('heavy-local')
+    expect(checkOf('npx tsc --noEmit -p .')).toBe('whole-project-tsc')
+  })
+
+  test('every whole-project typecheck spelling is refused', () => {
+    for (const c of [
+      'npx tsc --noEmit',
+      'tsc --noEmit',
+      'tsc',
+      'bunx tsc --noEmit',
+      'npx -y tsc --noEmit --pretty false',
+      './node_modules/.bin/tsc --noEmit -p tsconfig.json',
+      'npx tsc --project tsconfig.app.json',
+      'npx tsc -b',
+      'timeout 600 npx tsc --noEmit 2>&1 | tail -20',
+      'FIVEDIVE_KEEP_ALIVE=1 nice -n 19 npx tsc --noEmit -p . > /tmp/tsc.log',
+      'bash -c "npx tsc --noEmit"',
+      'set -e\ncd app\nnpx tsc --noEmit',
+      'npm run typecheck',
+      'npm --prefix app run type-check',
+      'bun run typecheck',
+      'pnpm typecheck',
+      'yarn tsc',
+    ]) {
+      expect([c, on(c)]).toEqual([c, 'heavy-local'])
+    }
+  })
+
+  test('next build and next dev are refused, bare or through a Next app\'s npm script', () => {
+    for (const c of [
+      'npx next build',
+      'next dev',
+      'cd app && npx next dev -p 3005',
+      'bunx next build',
+      'cd /home/claude/projects/5dive/app && npm run build',
+      'cd ~/wt/fe-8293 && npm run dev',
+      'npm --prefix /home/claude/projects/5dive/agent-profile run build',
+    ]) {
+      expect([c, on(c)]).toEqual([c, 'heavy-local'])
+    }
+  })
+
+  test('a full suite — a test runner with no test file after it — is refused', () => {
+    for (const c of [
+      'npm test',
+      'npm run test',
+      'npm t',
+      'bun test',
+      'bun test --timeout 20000',
+      'npm test -- --watch=false',
+      'npm test 2>&1 | tail -40',
+      'pnpm test',
+      'yarn test',
+      'node --test',
+      "node --import tsx --test 'src/**/*.test.ts'",
+      'cd x && bun run test',
+    ]) {
+      expect([c, on(c)]).toEqual([c, 'heavy-local'])
+    }
+  })
+
+  test('MUTANT: the targeted forms the rule tells a seat to use all run', () => {
+    for (const c of [
+      'node --test src/x.test.ts',
+      'node --import tsx --test src/lib/foo.test.ts',
+      'node --import tsx --experimental-test-module-mocks --test src/routes/a.test.ts src/routes/b.test.ts',
+      'npm test -- src/lib/x.test.ts',
+      'bun test test/mod-guard.test.ts',
+      'bun test test/mod-guard.test.ts test/mod-telemetry.test.ts 2>&1 | tail -5',
+      'tsc --noEmit src/one-file.ts',
+      'npx tsc --noEmit src/a.ts src/b.tsx',
+      'npx tsc --version',
+      'tsc -v',
+    ]) {
+      expect([c, on(c)]).toEqual([c, null])
+    }
+  })
+
+  test('MUTANT: reading, quoting or writing the words is not running them', () => {
+    for (const c of [
+      'grep -rn "npx tsc --noEmit -p ." docs/',
+      "cat package.json | jq -r '.scripts.build' # next build",
+      'echo "run npm test before you push"',
+      'git commit -m "CHECKED: npx tsc --noEmit -p . on CI, bun test green"',
+      '5dive task done DIVE-1 --result="ran npm test on 5dive-ci"',
+      'npm run test:unit -- src/x.test.ts',
+      'npm install && npm run lint',
+      'npm run build',
+    ]) {
+      expect([c, on(c)]).toEqual([c, null])
+    }
+  })
+
+  test('MUTANT: the same command sent to 5dive-ci over ssh runs — CI is where it belongs', () => {
+    expect(on("ssh 5dive-ci 'cd /srv/app && npx tsc --noEmit -p .'")).toBeNull()
+    expect(on('sudo -u claude ssh root@ci "cd app && npm test"')).toBeNull()
+  })
+
+  test('it is a poke-two rule: on 5dive-ci, a customer box, or a host it cannot name, it never fires', () => {
+    expect(on('npx tsc --noEmit -p .', '5dive-ci')).toBeNull()
+    expect(on('npm test', 'wavy-bloom')).toBeNull()
+    expect(on('next build', 'poke-two-old')).toBeNull()
+    expect(on('npx tsc --noEmit -p .', '')).toBeNull()
+    expect(verdict(bash('npx tsc --noEmit -p .'))).toBeNull()
+  })
+
+  test('the seat can open it deliberately, and only deliberately', () => {
+    expect(on('npm test', POKE, { FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL: '1' })).toBeNull()
+    expect(on('npm test', POKE, { FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL: '0' })).toBe('heavy-local')
+  })
+
+  test('the reason says CI runs it, and what to run locally instead', () => {
+    const r = evaluate(SHIPPED, { ...bash('npx tsc --noEmit -p .'), host: POKE }, NO_ENV)?.reason ?? ''
+    expect(r).toContain('CI runs this — push and let it')
+    expect(r).toContain('node --test <file>')
+    expect(r).toContain('FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL')
+  })
+})
+
+describe('engine: hosts and unless_any (DIVE-8299)', () => {
+  const doc = (extra: Record<string, unknown>, check: Record<string, unknown> = {}) => ({
+    v: POLICY_SCHEMA,
+    policies: [
+      {
+        id: 'p',
+        rule: 'r',
+        tools: ['Bash'],
+        text_keys: ['command'],
+        ...extra,
+        checks: [{ id: 'c', find: 'boom', say: 'boom', ...check }],
+        deny: '{found} [{rule}]',
+      },
+    ],
+  })
+
+  test('a policy without hosts applies on every host, the unnamed one included', () => {
+    const c = compile(doc({}))
+    expect(evaluate(c, bash('boom'), NO_ENV)?.policy).toBe('p')
+    expect(evaluate(c, { ...bash('boom'), host: 'anything' }, NO_ENV)?.policy).toBe('p')
+  })
+
+  test('hosts scopes it to the named hosts, and a bad hosts regex drops its policy', () => {
+    const c = compile(doc({ hosts: ['^a$'] }))
+    expect(evaluate(c, { ...bash('boom'), host: 'a' }, NO_ENV)?.policy).toBe('p')
+    expect(evaluate(c, { ...bash('boom'), host: 'b' }, NO_ENV)).toBeNull()
+    const bad = compile(doc({ hosts: ['('] }))
+    expect(bad.policies).toEqual([])
+    expect(bad.drops[0]?.policy).toBe('p')
+  })
+
+  test('unless_any cancels the check when the subject holds its context', () => {
+    const c = compile(doc({}, { unless_any: ['\\bssh\\s'] }))
+    expect(evaluate(c, bash('boom'), NO_ENV)?.policy).toBe('p')
+    expect(evaluate(c, bash('ssh x boom'), NO_ENV)).toBeNull()
+  })
+})
+
 describe('the evaluator itself', () => {
   test('the guard reads the event the engine actually sends', () => {
     // The observed Bash payload, verbatim from a 2.1.278 debug log, with nothing

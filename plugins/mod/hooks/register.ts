@@ -86,7 +86,7 @@ import { compile, envSet, evaluate, filesWanted, type Compiled, type Verdict } f
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.6.2'
+const VERSION = '0.6.3'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
@@ -1181,7 +1181,12 @@ let lastPinned = 0
 // no guard at all.
 
 /** Whether this session enforces policies, and which ones. */
-type Guard = { on: true; compiled: Compiled; env: Record<string, unknown> } | { on: false }
+type Guard =
+  | { on: true; compiled: Compiled; env: Record<string, unknown>; host: string }
+  | { on: false }
+
+/** DIVE-8299: where a host-scoped policy (`hosts` in policy/guard.json) reads the box's name. */
+const HOSTNAME_FILE = '/etc/hostname'
 
 /** DIVE-7673: how much of a named file the guard reads (an ask is 25 words; a body a page). */
 const GUARD_FILE_CAP = 64 * 1024
@@ -1230,7 +1235,13 @@ async function resolveGuard($: EngineInterface): Promise<Guard> {
         { to: 'debug' },
       )
     }
-    return { on: true, compiled, env: vars }
+    // DIVE-8299: the host's name, for policies scoped to one box. Unreadable reads as '',
+    // which no host-scoped policy matches: those rules are skipped, the rest still apply.
+    let host = ''
+    try {
+      host = String(await $.fs.read(HOSTNAME_FILE)).trim()
+    } catch {}
+    return { on: true, compiled, env: vars, host }
   } catch (err) {
     if (!guardFailureLogged) {
       guardFailureLogged = true
@@ -1259,12 +1270,12 @@ async function verdictFor($: EngineInterface, tool: string, input: unknown): Pro
     // DIVE-7673: a policy's `file_args` (an `--ask-file=<path>`) is judged on that file's
     // text too. A file that will not read is judged as absent: the call's own text still is.
     const files: Record<string, string> = {}
-    for (const f of filesWanted(g.compiled, { tool, input }, g.env)) {
+    for (const f of filesWanted(g.compiled, { tool, input, host: g.host }, g.env)) {
       try {
         files[f] = String(await $.fs.read(f)).slice(0, GUARD_FILE_CAP)
       } catch {}
     }
-    return evaluate(g.compiled, { tool, input, files }, g.env)
+    return evaluate(g.compiled, { tool, input, files, host: g.host }, g.env)
   } catch (err) {
     if (!guardFailureLogged) {
       guardFailureLogged = true
