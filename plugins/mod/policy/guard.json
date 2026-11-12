@@ -197,6 +197,55 @@
         }
       ],
       "deny": "{found}. Asking lodar to fund or raise OpenRouter for our own test or bench load is the same spend the key-mint rule refuses, and he has said no to it every time. Run the test on a Claude plan profile or the Anthropic test key (auth profile `emergency-api`), or on the product's own login (for Grok, Grok's own app on his plan). A gate or row that only names OpenRouter (a customer's bug, the OpenRouter option) stays open. Only lodar's own word opens this, through the seat's FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT setting. [{rule}]"
+    },
+    {
+      "id": "heavy-local",
+      "rule": "Never run a whole-project typecheck, next build/dev or a full test suite on poke-two — CI runs them on 5dive-ci (5dive/CLAUDE.md; poke-two froze 7 min 2026-11-12)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "hosts": ["^poke-two$"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL",
+      "checks": [
+        {
+          "id": "whole-project-tsc",
+          "find": "(?:^|[;&|({\\n]|\\$\\(|`|\\b(?:then|do|else|xargs)\\s|\\b(?:bash|sh)\\s+-l?c\\s+['\"])\\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\\S*|sudo(?:\\s+-u\\s+\\S+|\\s+-[A-Za-z]+)*|env(?:\\s+-\\S+)*|time|nohup|command|exec|nice(?:\\s+-n)?(?:\\s+-?\\d+)?|ionice(?:\\s+-\\S+)*|timeout(?:\\s+-\\S+)*\\s+\\d+[smhd]?)\\s+)*(?:(?:npx|pnpx)(?:\\s+(?:-y|--yes|--no-install|--no|-p\\s+\\S+|--package[=\\s]+\\S+))*\\s+|bunx(?:\\s+--bun)?\\s+|(?:pnpm|yarn)\\s+(?:exec\\s+|dlx\\s+)?|\\S*/)?tsc(?![\\w.-])(?:(?=[^;&|\\n)<>]*?\\s(?:-p|--project|-b|--build)(?![\\w-]))|(?![^;&|\\n)<>]*?\\s(?!-)[^\\s;&|)<>]*\\.[cm]?[jt]sx?(?![\\w.-]))(?![^;&|\\n)<>]*?\\s(?:-v|--version|-h|--help|--init|--showConfig|--listFilesOnly)(?![\\w-])))",
+          "flags": "",
+          "unless_any": ["\\bssh\\s"],
+          "say": "a whole-project typecheck (tsc with no file, or with -p/--build)"
+        },
+        {
+          "id": "typecheck-script",
+          "find": "(?:^|[;&|({\\n]|\\$\\(|`|\\b(?:then|do|else|xargs)\\s|\\b(?:bash|sh)\\s+-l?c\\s+['\"])\\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\\S*|sudo(?:\\s+-u\\s+\\S+|\\s+-[A-Za-z]+)*|env(?:\\s+-\\S+)*|time|nohup|command|exec|nice(?:\\s+-n)?(?:\\s+-?\\d+)?|ionice(?:\\s+-\\S+)*|timeout(?:\\s+-\\S+)*\\s+\\d+[smhd]?)\\s+)*(?:npm(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*\\s+run(?:-script)?|(?:pnpm|yarn)(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*(?:\\s+run)?|bun(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*\\s+run)\\s+(?:--?[\\w-]+\\s+)*(?:typecheck|type-check|tsc|check-types|types:check|check:types)(?![\\w:.-])",
+          "flags": "",
+          "unless_any": ["\\bssh\\s"],
+          "say": "a whole-project typecheck script"
+        },
+        {
+          "id": "next-build-dev",
+          "find": "(?:^|[;&|({\\n]|\\$\\(|`|\\b(?:then|do|else|xargs)\\s|\\b(?:bash|sh)\\s+-l?c\\s+['\"])\\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\\S*|sudo(?:\\s+-u\\s+\\S+|\\s+-[A-Za-z]+)*|env(?:\\s+-\\S+)*|time|nohup|command|exec|nice(?:\\s+-n)?(?:\\s+-?\\d+)?|ionice(?:\\s+-\\S+)*|timeout(?:\\s+-\\S+)*\\s+\\d+[smhd]?)\\s+)*(?:npx(?:\\s+-\\S+)*\\s+|bunx(?:\\s+--bun)?\\s+|(?:pnpm|yarn)\\s+(?:exec\\s+|dlx\\s+)?|\\S*/)?next\\s+(?:build|dev)(?![\\w:.-])",
+          "flags": "",
+          "unless_any": ["\\bssh\\s"],
+          "say": "a `next build` / `next dev`"
+        },
+        {
+          "id": "next-app-run-build-dev",
+          "find": "(?:^|[;&|({\\n]|\\$\\(|`|\\b(?:then|do|else|xargs)\\s|\\b(?:bash|sh)\\s+-l?c\\s+['\"])\\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\\S*|sudo(?:\\s+-u\\s+\\S+|\\s+-[A-Za-z]+)*|env(?:\\s+-\\S+)*|time|nohup|command|exec|nice(?:\\s+-n)?(?:\\s+-?\\d+)?|ionice(?:\\s+-\\S+)*|timeout(?:\\s+-\\S+)*\\s+\\d+[smhd]?)\\s+)*(?:npm(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*\\s+run(?:-script)?|(?:pnpm|yarn)(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*(?:\\s+run)?|bun(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*\\s+run)\\s+(?:build|dev)(?![\\w:.-])",
+          "flags": "",
+          "require_all": [
+            "(?:/projects/5dive/(?:app|agent-profile)(?![\\w.-])|\\b5dive-frontend\\b|\\bagent-profile\\b|/wt/(?:fe|frontend|app)(?:[-_.]?\\w[\\w.-]*)?(?![\\w.-]))"
+          ],
+          "unless_any": ["\\bssh\\s"],
+          "say": "a build or dev server of a Next app"
+        },
+        {
+          "id": "full-suite",
+          "find": "(?:^|[;&|({\\n]|\\$\\(|`|\\b(?:then|do|else|xargs)\\s|\\b(?:bash|sh)\\s+-l?c\\s+['\"])\\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\\S*|sudo(?:\\s+-u\\s+\\S+|\\s+-[A-Za-z]+)*|env(?:\\s+-\\S+)*|time|nohup|command|exec|nice(?:\\s+-n)?(?:\\s+-?\\d+)?|ionice(?:\\s+-\\S+)*|timeout(?:\\s+-\\S+)*\\s+\\d+[smhd]?)\\s+)*(?:npm(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*\\s+(?:run(?:-script)?\\s+)?(?:test|tst|t)|(?:pnpm|yarn)(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*\\s+(?:run\\s+)?test|bun(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+))*\\s+(?:run\\s+)?test|node(?:\\s+--?[\\w-]+(?:=\\S+|\\s+(?!-)[^\\s;&|]+)?)*?\\s+--test)(?![\\w:.-])(?![^;&|\\n)<>]*?\\s(?!-)(?![^\\s;&|)<>]*\\*\\*)[^\\s;&|)<>]*[A-Za-z])",
+          "flags": "",
+          "unless_any": ["\\bssh\\s"],
+          "say": "a full test suite (no test file named)"
+        }
+      ],
+      "deny": "{found}. CI runs this — push and let it. On poke-two it costs ~1-1.4 GB per run on the 4-core box that runs every seat; two at once froze every agent for 7 minutes on 2026-11-12. Locally run only the files you changed (`node --test <file>`, `bun test <file>`, `npm test -- <file>`, `tsc --noEmit <file>`), or run it on 5dive-ci over ssh. Only a recorded seat setting opens this: FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL. [{rule}]"
     }
   ]
 }

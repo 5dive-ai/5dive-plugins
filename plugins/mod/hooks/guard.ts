@@ -53,6 +53,12 @@ export type Check = {
    * "OPENROUTER" are one name). Default none, which is what every older check compiled with.
    */
   require_flags?: string
+  /**
+   * DIVE-8299: context that, when the subject contains ANY of it, cancels this check. This is
+   * what keeps `ssh 5dive-ci 'npx tsc -p .'` (the heavy work runs on the CI box, which is the
+   * point) from reading as running it here. Flags: `require_flags`.
+   */
+  unless_any?: string[]
   /** The human half of the deny, with `{match}` replaced by what was found. */
   say: string
 }
@@ -68,6 +74,14 @@ export type Policy = {
   path_any?: string[]
   /** A seat setting that, when set to a non-empty value other than "0", skips it. */
   unless_env?: string
+  /**
+   * DIVE-8299: regexes over the HOST's name. When present, the policy applies only on a host
+   * whose name matches one of them — a rule about one box's capacity (poke-two runs every seat
+   * and the prod-adjacent API on 4 cores) must not refuse the same command on the CI box built
+   * to run it. A host whose name could not be read matches nothing: the policy is skipped
+   * (fail open, like every other unreadable input here).
+   */
+  hosts?: string[]
   /**
    * DIVE-7673: regexes over the text whose group 1 is a FILE the call reads its text from
    * (`5dive task need --ask-file=<path>`). That file's text is judged with the call's own,
@@ -94,6 +108,7 @@ type CompiledCheck = {
   group?: number
   allow: RegExp[]
   require: RegExp[]
+  unless: RegExp[]
   say: string
 }
 
@@ -105,6 +120,7 @@ type CompiledPolicy = {
   textKeys: string[]
   pathAny: RegExp[]
   unlessEnv?: string
+  hostAny: RegExp[]
   fileArgs: RegExp[]
   checks: CompiledCheck[]
   deny: string
@@ -162,6 +178,7 @@ export function compile(doc: unknown): Compiled {
           ...(typeof c.group === 'number' ? { group: c.group } : {}),
           allow: (c.allow_any ?? []).map((s) => re(s, '')),
           require: (c.require_all ?? []).map((s) => re(s, c.require_flags ?? '')),
+          unless: (c.unless_any ?? []).map((s) => re(s, c.require_flags ?? '')),
           say: c.say,
         }
       })
@@ -173,6 +190,7 @@ export function compile(doc: unknown): Compiled {
         textKeys: p.text_keys ?? [],
         pathAny: (p.path_any ?? []).map((s) => re(s, '')),
         ...(typeof p.unless_env === 'string' ? { unlessEnv: p.unless_env } : {}),
+        hostAny: (p.hosts ?? []).map((s) => re(s, '')),
         fileArgs: (p.file_args ?? []).map((s) => re(s, 'g')),
         checks,
         deny: p.deny,
@@ -198,6 +216,14 @@ function str(input: unknown, key: string): string {
 export function envSet(env: Record<string, unknown>, key: string): boolean {
   const v = String(env[key] ?? '')
   return v !== '' && v !== '0' && v !== 'false'
+}
+
+/**
+ * DIVE-8299: whether a policy is in scope on this host. No `hosts` means every host; with
+ * them, the host's name must match one. An unread name ('') is in no policy's scope.
+ */
+function onHost(p: CompiledPolicy, host: string): boolean {
+  return p.hostAny.length === 0 || (host !== '' && p.hostAny.some((r) => r.test(host)))
 }
 
 /** Every match of `re` in `s`, as the whole match and the chosen group. */
@@ -243,10 +269,11 @@ function filePaths(p: CompiledPolicy, text: string): string[] {
  * DIVE-7673: the files the hook must read before `evaluate`, for the policies that apply
  * to this call (its tool, and not opened by their seat setting). Pure: paths only.
  */
-export function filesWanted(compiled: Compiled, call: { tool: string; input: unknown }, env: Record<string, unknown>): string[] {
+export function filesWanted(compiled: Compiled, call: { tool: string; input: unknown; host?: string }, env: Record<string, unknown>): string[] {
   const out: string[] = []
   for (const p of compiled.policies) {
     if (p.fileArgs.length === 0 || !p.tools.has(call.tool)) continue
+    if (!onHost(p, call.host ?? '')) continue
     if (p.unlessEnv !== undefined && envSet(env, p.unlessEnv)) continue
     const text = p.textKeys.map((k) => str(call.input, k)).join('\n')
     for (const f of filePaths(p, text)) if (!out.includes(f)) out.push(f)
@@ -263,17 +290,21 @@ export type Verdict = { policy: string; check: string; reason: string } | null
  * Returns the FIRST deny in file order and stops — the model gets one reason, not a
  * report, and the order in the file is the order ops sees in `jq`.
  *
+ * `call.host` is the host's name (DIVE-8299), read once by the hook; only a policy with
+ * `hosts` consults it.
+ *
  * `env` is the seat's settings `env` block: the same place the mod's own gates live,
  * so an escape hatch is a recorded seat setting rather than a flag on a command line
  * that nothing keeps.
  */
 export function evaluate(
   compiled: Compiled,
-  call: { tool: string; input: unknown; files?: Readonly<Record<string, string>> },
+  call: { tool: string; input: unknown; files?: Readonly<Record<string, string>>; host?: string },
   env: Record<string, unknown>,
 ): Verdict {
   for (const p of compiled.policies) {
     if (!p.tools.has(call.tool)) continue
+    if (!onHost(p, call.host ?? '')) continue
     if (p.unlessEnv !== undefined && envSet(env, p.unlessEnv)) continue
 
     const path = p.pathKeys.map((k) => str(call.input, k)).find((v) => v !== '') ?? ''
@@ -284,6 +315,7 @@ export function evaluate(
       const subject = c.on === 'path' ? path : text
       if (subject === '') continue
       if (!c.require.every((r) => r.test(subject))) continue
+      if (c.unless.some((r) => r.test(subject))) continue
       for (const h of hits(c, subject)) {
         if (c.allow.length > 0 && c.allow.some((r) => r.test(h.value))) continue
         const found = c.say.replace('{match}', h.value)
