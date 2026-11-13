@@ -224,7 +224,7 @@ describe('dispatcher-path activity stamps', () => {
 
   test('the outbox stamps dispatch-reply after a sent answer, not after silent commentary', () => {
     const body = fn('ingestDispatcherOutbox')
-    const sent = body.indexOf('await bot.api.sendMessage(')
+    const sent = body.indexOf('sendText: t => bot.api.sendMessage(')
     const stamp = body.indexOf("if (obj.notify !== false) try { writeFileSync(DISPATCH_REPLY_FILE, String(Date.now())) } catch {}")
     expect(sent).toBeGreaterThan(0)
     expect(stamp).toBeGreaterThan(sent)

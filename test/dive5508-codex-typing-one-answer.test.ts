@@ -141,11 +141,14 @@ describe('DIVE-5508: adapter wiring (server.ts is an entry point; bun test canno
   })
 
   test('files: .ogg/.oga/.opus via sendVoice with a document fallback; both send paths use it', () => {
-    expect(s).toContain("const VOICE_EXTS = new Set(['.ogg', '.oga', '.opus'])")
+    // DIVE-8328: the choice and its fallbacks live in outbox-send.ts (unit-tested there).
+    const core = readFileSync(join(import.meta.dir, '..', 'plugins', 'telegram-codex', 'outbox-send.ts'), 'utf8')
+    expect(core).toContain("export const VOICE_EXTS = new Set(['.ogg', '.oga', '.opus'])")
     const send = fn('sendFile')
-    expect(send).toMatch(/VOICE_EXTS\.has\(ext\)\) \{\s*\n\s*try \{\s*\n\s*return await bot\.api\.sendVoice/)
-    expect(send).toContain('return bot.api.sendDocument(chat_id, new InputFile(file), opts)')
-    expect(fn('ingestDispatcherOutbox')).toContain('for (const file of files) await sendFile(String(obj.chat_id), file, options)')
+    expect(send).toContain('return sendOneFile(file, {')
+    expect(send).toContain('sendVoice: f => bot.api.sendVoice(chat_id, new InputFile(f), opts)')
+    expect(send).toContain('sendDocument: f => bot.api.sendDocument(chat_id, new InputFile(f), opts)')
+    expect(fn('ingestDispatcherOutbox')).toContain('sendFile: f => sendFile(String(obj.chat_id), f, options)')
     // No send path bypasses it.
     expect(s.match(/bot\.api\.sendDocument\(/g)).toHaveLength(1)
     expect(s.match(/bot\.api\.sendPhoto\(/g)).toHaveLength(1)

@@ -130,12 +130,16 @@ describe('DIVE-6579: telegram-codex wiring (server.ts is an entry point; bun tes
 
   test('the outbox voices the answer after the text and its files went, and the file is gone', () => {
     const ingest = fn('ingestDispatcherOutbox')
-    const sent = ingest.indexOf('for (const file of files) await sendFile(String(obj.chat_id), file, options)')
+    // DIVE-8328: the outbox file goes as soon as the TEXT is out (textSent), so
+    // a failed file can never re-send the text; the files follow, then the voice.
+    const sent = ingest.indexOf('sendText: t => bot.api.sendMessage(String(obj.chat_id), t, options)')
     const unlinked = ingest.indexOf('try { unlinkSync(full) } catch {}', sent)
+    const files = ingest.indexOf('sendFile: f => sendFile(String(obj.chat_id), f, options)', unlinked)
     const voiced = ingest.indexOf('if (voicesReply(obj, files)) await sendSpokenReply(String(obj.chat_id), body, options, name)')
     expect(sent).toBeGreaterThan(0)
     expect(unlinked).toBeGreaterThan(sent)
-    expect(voiced).toBeGreaterThan(unlinked)
+    expect(files).toBeGreaterThan(unlinked)
+    expect(voiced).toBeGreaterThan(files)
     // A failed voice note is logged, never thrown into the outbox retry.
     expect(fn('sendSpokenReply')).toContain('voice note not sent')
   })
