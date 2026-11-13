@@ -67,10 +67,22 @@ Agents stop early: right site, one filter missing. So before you report, and bef
    filtered. Try another way in before you call a part impossible.
    **Never turn a named filter off**, not to compare and not because the list is empty: an
    empty list with every filter on IS the answer. Turned one off? Set it back before you stop.
-4. **Say done only when every part is shown**, or when a part is truly not on this site (say
+4. **A choice the job did not name and that harms no one: pick it, say it, finish.** A form
+   asks for condition, size, delivery or pickup, a sort order, a grade or a yes/no about the
+   item, and the job did not say: pick the most neutral option (Good, standard, the
+   site's default), go on, and name it in the answer: "assumed: Good condition, no
+   damage". Never stop to ask for these. **Never a default for money, a person or a send**:
+   a payment, a purchase, a price or amount you set, a name, email, address, phone or date
+   of birth, or anything posted or sent. Those stay the owner's (stop at that form, say what
+   it needs).
+5. **Not on this site? Try one other source before "not possible."** The site blocks you,
+   shows another country's data, or lacks the fact: get it from one other public site that
+   has it (the maker's own site, a well-known list or database), and name that source in
+   the answer.
+6. **Say done only when every part is shown**, or when a part is truly not on this site (say
    which and why). The page must END on the result: the filtered list, the opened item, the
    chart drawn, not a menu or a home page.
-5. **Asked for information? Answer with it**: the facts, numbers or names, copied from the
+7. **Asked for information? Answer with it**: the facts, numbers or names, copied from the
    page, not "I found the page".
 
 ## Reading pages
@@ -84,6 +96,9 @@ Agents stop early: right site, one filter missing. So before you report, and bef
   table), then the head of its text. Take a fact from the facts when it is there.
 - **Read a page once.** The whole page is in the `page.md` it names: grep that file for more,
   do not read the page again. `--full` prints all of it.
+- **Looking for a few lines in a big page** (one title in a list of 250, a price, a date)?
+  `read <url> --grep='trade-in value|\$[0-9]'` prints only the lines that match, with the
+  line around each, instead of the head of the page.
 - `snapshot --interactive` prints every ref (up to 300) and a small page's text; `cat page.md`
   only for a big one. `snapshot _public` with no URL reads the page the browser is on.
 - `links <url>` gives a page's links, `shot <url>` a picture of it.

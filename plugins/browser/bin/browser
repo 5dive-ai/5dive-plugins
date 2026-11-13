@@ -7533,12 +7533,16 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
       --out=*) out="${1#*=}" ;;
       --json) [[ "$kind" == read ]] || die "$E_USAGE" "--json belongs to browser read; browser links already prints JSON"; json=1 ;;
       --full) [[ "$kind" == read ]] || die "$E_USAGE" "--full belongs to browser read; browser links prints every link"; full=1 ;;
+      --grep=*) [[ "$kind" == read ]] || die "$E_USAGE" "--grep belongs to browser read"; READ_GREP="${1#*=}"
+         [[ -n "$READ_GREP" ]] || die "$E_USAGE" "--grep takes a regex (grep -E, any case), like --grep='price|total'"
+         grep -qiE -- "$READ_GREP" </dev/null; (( $? != 2 )) || die "$E_USAGE" "--grep: not a valid regex: $READ_GREP" ;;
       --wait=*) wait="${1#*=}" ;;
       --wait-for=*) wait_for="${1#*=}"; _wait_for_ok "$wait_for" || die "$E_USAGE" "--wait-for takes one CSS selector, ref=<role>/<name> or text=<words>" ;;
       -h|--help)
         if [[ "$kind" == read ]]; then
-          printf '%s read [<site>] <url> [<url>…] [--full] [--out=<dir>] [--json] [--wait=<ms>] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG"
+          printf '%s read [<site>] <url> [<url>…] [--full] [--grep=<regex>] [--out=<dir>] [--json] [--wait=<ms>] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG"
           printf '  Several urls load side by side in one browser (one call, not one per page). Each page prints its facts and the first %s characters of its text; --full prints all of it, and page.md in the artifacts directory always has all of it.\n' "$READ_PRINT_MAX"
+          printf '  --grep=<regex> prints only the lines of the page that match (grep -E, any case), each with its line number and the line around it, instead of the head of the text.\n'
         else
           printf '%s links <site> <url> [--out=<dir>] [--wait=<ms>] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG"
         fi
@@ -7683,8 +7687,41 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
 # fits, and one line says where the rest is. page.md on disk is always complete.
 READ_PRINT_MAX="${FIVEDIVE_BROWSER_READ_PRINT_MAX:-6000}"
 [[ "$READ_PRINT_MAX" =~ ^[0-9]{1,7}$ ]] && (( READ_PRINT_MAX >= 500 )) || READ_PRINT_MAX=6000
+# A READ CAN PRINT ONLY THE LINES THAT MATCH (DIVE-8281, BrowserOS's `grep`). The
+# skill says "grep page.md", which needs a shell; a harness that allows only
+# `5dive browser` verbs (the bench's fence refused 38 such greps in 7804) has none.
+# `read <url> --grep=<regex>` prints the front matter, then each matching line of
+# the text with its line number and one line around it, inside the same budget.
+READ_GREP=""
+_read_grep_print() {  # _read_grep_print <page.md> <path to name> <budget>
+  local md="$1" path="$2" max="$3"
+  awk 'NR == 1 && $0 == "---" { fm = 1; print; next } fm { print; if ($0 == "---") exit }' "$md"
+  local body n
+  body=$(awk 'NR == 1 && $0 == "---" { fm = 1; next } fm { if ($0 == "---") fm = 0; next } { printf "%d:%s\n", NR, $0 }' "$md")
+  n=$(cut -d: -f2- <<<"$body" | grep -ciE -- "$READ_GREP")
+  if (( n == 0 )); then
+    printf '[grep: no line of this page matches %s. The whole page is in %s.]\n' "$READ_GREP" "$path"; return 0
+  fi
+  # The regex goes in through the environment: awk -v would eat its backslashes.
+  RG_RE="$READ_GREP" awk -v max="$max" -v n="$n" -v path="$path" '
+    BEGIN { re = tolower(ENVIRON["RG_RE"]) }
+    { line[NR] = $0; t = $0; sub(/^[0-9]+:/, "", t); hit[NR] = (tolower(t) ~ re) }
+    END {
+      for (i = 1; i <= NR; i++) if (hit[i]) { want[i-1] = 1; want[i] = 1; want[i+1] = 1 }
+      last = 0
+      for (i = 1; i <= NR; i++) {
+        if (!want[i]) continue
+        out = (last && i > last + 1 ? "--\n" : "") line[i]
+        if (used + length(out) + 1 > max) { cut = 1; break }
+        print out; used += length(out) + 1; last = i; if (hit[i]) shown++
+      }
+      if (cut) printf "[grep: %d of %d matching lines shown, the budget is full. Narrow the regex; the whole page is in %s.]\n", shown, n, path
+      else printf "[grep: %d matching lines. The whole page is in %s.]\n", n, path
+    }' <<<"$body"
+}
 _read_print() {  # _read_print <page.md> <path to name> <full> <budget>
   local md="$1" path="$2" full="$3" max="$4"
+  if [[ -n "$READ_GREP" ]] && (( ! full )); then _read_grep_print "$md" "$path" "$max"; return 0; fi
   if (( full )) || (( $(wc -c < "$md") <= max )); then cat -- "$md"; return 0; fi
   awk -v max="$max" -v path="$path" '
     NR == 1 && $0 == "---" { fm = 1; print; next }

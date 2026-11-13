@@ -13,6 +13,10 @@
 - New policy `heavy-local`. Two seats ran `npx tsc --noEmit -p .` on the frontend at once and every seat on poke-two went silent for 7 minutes (2026-11-12). The refusal says "CI runs this — push and let it" and names the targeted forms, which still run: `node --test <file>`, `bun test <file>`, `npm test -- <file>`, `tsc --noEmit <file>`. Anything sent over `ssh` runs. Escape: the seat setting `FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL`.
 - The engine gains `hosts` (a policy applies only on a host whose name matches; read once from `/etc/hostname`) and `unless_any` (context that cancels a check). `heavy-local` is scoped to `^poke-two$`, so it never fires on 5dive-ci or a customer box.
 
+### Changed — browser 1.81.0: a harmless choice the job left open is picked and said, a blocked site gets a second source, and `read --grep` (DIVE-8281)
+
+- Registry copy synced byte-for-byte from 5dive-browser `dev/dive-8281-defaults` @ee5e553 (`tests/browser_mirror.sh sync`). The use-browser skill now sets a choice the job did not name and that harms no one (condition, size, delivery, sort order) to the neutral option and says so ("assumed: Good condition"); never for money, a person's details or anything sent. A site that blocks or lacks the fact gets one other public source, named, before "not possible". `read <url> --grep=<regex>` prints only the matching lines with their page.md line numbers. Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — browser 1.80.0: `act --help` lists its step ops, upload included (DIVE-8287)
 
 - `plugins/browser` synced byte-for-byte from 5dive-browser `dive-8287-act-help-steps` (`tests/browser_mirror.sh sync`). `5dive browser act --help` prints one JSON example per step op with its fields, e.g. `{"op":"upload","selector":"ref=…","path":"/abs/file"}` (up to 16 MB), walked from `ACT_VOCAB`. Agents read the help, saw no step ops, and filed "act has no upload step" while upload existed.
