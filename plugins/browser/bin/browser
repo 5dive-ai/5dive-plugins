@@ -767,6 +767,12 @@ _broker_ready() {  # _broker_ready <site> <profile-dir>
     printf '%s: %s was not being served; started the box browser for it as %s.\n' "$PROG" "$1" "$_SITE_OWNER" >&2
     return 0
   fi
+  # DIVE-8331: the two states root can name get their own words, not the advice
+  # below, whose `serve` would only answer "already serving" again.
+  case "$why" in
+    *"still open in the owner's sign-in window"*) die "$E_UNAVAILABLE" "$why" ;;
+    *"no warm session on this box:"*) die "$E_UNAVAILABLE" "$1: no warm session on this box:${why#*no warm session on this box:}" ;;
+  esac
   [[ -n "$why" ]] || why="it started, but no browser answers on its socket."
   die "$E_UNAVAILABLE" "$1 is logged in on this box under the '$_SITE_OWNER' seat, but nothing is serving that session right now, and starting it for '$(_seat)' did not work: $why
 '$(_seat)' cannot open the profile directly: it is mode 0700 to $_SITE_OWNER, which is what stops any seat here from replaying somebody else's login. A brokered seat acts THROUGH the running browser or not at all.
@@ -901,16 +907,45 @@ cmd_serve_offered() {
   # would count against that agent's memory limit. A transient scope outlives
   # this command for as long as the browser does (DIVE-5242 measured the same
   # shape on chill-gorge's hand route).
+  local rc=0
   if [[ $EUID -eq 0 && -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
     systemd-run --scope --quiet --collect --unit="5dive-browser-serve-${site//[^a-zA-Z0-9]/-}-$$" -- \
-      runuser -u "$BOX_SEAT" -- env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site" "${how[@]}" 9>&-
-    return $?
+      runuser -u "$BOX_SEAT" -- env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site" "${how[@]}" 9>&- || rc=$?
+  else
+    # 9>&- (DIVE-7237): the lock above is this command's, not the browser's. The
+    # daemon it starts lives for hours, and an inherited fd 9 held the lock with
+    # it, so every later on-demand start or switch sat out the 90 s wait.
+    _as_seat "$BOX_SEAT" env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site" "${how[@]}" 9>&- || rc=$?
   fi
-  # 9>&- (DIVE-7237): the lock above is this command's, not the browser's. The
-  # daemon it starts lives for hours, and an inherited fd 9 held the lock with
-  # it, so every later on-demand start or switch sat out the 90 s wait.
-  _as_seat "$BOX_SEAT" env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site" "${how[@]}" 9>&-
+  (( rc == 0 )) || return "$rc"
+  _serve_offered_cold "$site"
 }
+
+# >>> DIVE-8331 SAY WHY THE START LEFT NO WARM SESSION
+#
+# Box report 933 (wry-rune, 2026-11-13): the owner's Done for vk.com was cut in
+# half by an API deploy, so the sign-in browser stayed up with its view still
+# live. The agent's on-demand start ran `serve vk.com --no-switch`, which
+# answered "already serving" (a person's window is never swapped from under
+# them), exited 0, and left no daemon. The agent then got "it started, but no
+# browser answers on its socket", which names neither cause, so it could not
+# tell the owner what to do. Root can read the owner's pidfile; the caller
+# cannot (0700). So root says which state it is, and fails, instead of a 0 that
+# started nothing.
+_serve_offered_cold() {  # <site>; _SITE_DIR is the owner's profile
+  _daemon_live "$_SITE_DIR" && return 0
+  _serve_running "$_SITE_DIR" >/dev/null || return 0   # nothing up: the caller's own words stand
+  if [[ "$(_kv "$(_serve_pidfile "$_SITE_DIR")" login)" == 1 ]] && _viewer_live "$_SITE_DIR"; then
+    die "$E_UNAVAILABLE" "$1 is still open in the owner's sign-in window: ask them to press Done on $1, then try again. Until they do, that window is theirs and no browser for the agent can start beside it."
+  fi
+  local why=""
+  if [[ -n "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then why="the session daemon is turned off on this box (FIVEDIVE_BROWSER_NO_DAEMON)"
+  elif [[ ! -x "$(_daemon_bin)" ]]; then why="playwright-core is not installed, so there is no session daemon. Install it once:  npm install --prefix $(cd "$_SELF_DIR/.." && pwd)"
+  elif ! _have Xvfb; then why="Xvfb is not installed"; fi
+  [[ -z "$why" ]] || die "$E_UNAVAILABLE" "no warm session on this box: $why. $1 stays open as a plain browser only its owner can use."
+  return 0
+}
+# <<< DIVE-8331
 
 # >>> DIVE-7168 A NEW SITE JOINS THE BOX'S GOOGLE SIGN-IN, NOT ONLY THE SEAT'S OWN.
 #
