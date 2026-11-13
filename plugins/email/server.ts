@@ -146,8 +146,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
-// An inbound mail AWAITS this: a mail Claude never got stays in new/ (or unseen
-// in IMAP) and is tried again, instead of being marked read and lost.
+// An inbound mail AWAITS this: a mail that could not be written to Claude (the
+// connection is down) stays in new/ (or unseen in IMAP) and is tried again. A
+// resolved promise does NOT prove Claude saw it; the start delay covers that.
 class DeliverError extends Error {}
 // For notes that have nowhere to go back to (owner answers, bounces): log and move on.
 function tell(content: string, meta: Record<string, string>) { void deliver(content, meta).catch(() => {}) }
@@ -562,11 +563,13 @@ function start() {
 }
 
 installLifecycle({ channel: 'email', stateDir: STATE_DIR })
-// Read mail only once Claude is connected AND has had a moment to register its
+// Read mail only once Claude is connected AND has had time to register its
 // channel listener. Measured on a live box (DIVE-8315): starting before
 // connect delivered a waiting mail 40 ms after boot, Claude dropped it, and the
-// file was already marked read, so the sender's mail was lost.
+// file was already marked read, so the sender's mail was lost. 5 s is the
+// family's measured margin (wiki cc-mcp-channel-notification-race): a resolved
+// notification() is no proof Claude saw it, so no shorter wait can be checked.
 let started = false
 const startOnce = () => { if (!started) { started = true; start() } }
-mcp.oninitialized = () => { setTimeout(startOnce, 2_000) }
+mcp.oninitialized = () => { setTimeout(startOnce, 5_000) }
 await mcp.connect(new StdioServerTransport())
