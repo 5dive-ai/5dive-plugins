@@ -339,3 +339,24 @@ export function parseAnswer(raw: unknown, file: string): Answer | null {
   if (a.answer !== 'allow' && a.answer !== 'admin' && a.answer !== 'no') return null
   return { id, sender, answer: a.answer }
 }
+
+// ── voice messages (DIVE-8315, lodar 11-13: «send voice mails to your ai employee») ──
+// An audio attachment — a voicemail an office phone system mailed, or any
+// recorded memo — is heard ON THE BOX (5dive-transcribe --backend=local, never
+// the cloud fallback) and handed to the agent as a voice note with its text.
+const AUDIO_EXT = /\.(wav|mp3|m4a|mp4a|aac|ogg|oga|opus|amr|awb|flac|webm|wma|gsm)$/i
+export function isAudio(filename: string | undefined, contentType: string | undefined): boolean {
+  const ct = String(contentType ?? '').toLowerCase()
+  if (ct.startsWith('audio/')) return true
+  return AUDIO_EXT.test(String(filename ?? ''))
+}
+export const MAX_VOICE_NOTES = 3
+
+/** The lines the agent reads about one voice attachment. */
+export function voiceLine(name: string, heard: { text: string } | { why: string }): string {
+  if ('text' in heard) {
+    const t = heard.text.trim() || '(nothing could be heard in it)'
+    return `[Voice message "${name}" — transcript, heard on this server:]\n${t.length > 8000 ? t.slice(0, 8000) + ' [… cut]' : t}`
+  }
+  return `[Voice message "${name}" attached, not transcribed: ${heard.why}]`
+}

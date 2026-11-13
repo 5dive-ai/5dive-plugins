@@ -15,6 +15,10 @@ Two ways to give an agent an address:
    records for IT), then `sudo 5dive agent email connect mike --self-hosted`.
    Works with the internet off for mail inside the office.
 
+Voicemail: a mail with an audio file (an office phone system's voicemail, a
+recorded memo) reaches the agent with its transcript, heard on this server by
+the local speech-to-text; the audio never leaves it.
+
 Safety, on by default:
 
 - A first mail to an address that never wrote to the agent waits for the

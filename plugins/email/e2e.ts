@@ -13,6 +13,10 @@
 //   4. a new mail to a never-seen address is HELD and the owner is asked
 //   5. the owner's Allow sends it; 6. a No drops another and stays refused
 //   7. a mail that tries to send as another agent is refused at submission
+//   8. mail to another agent on this box is handed over locally
+//   9. a voicemail (an audio attachment) reaches the agent transcribed. With
+//      EMAIL_E2E_VOICE=<a spoken .wav> it is heard by the real local
+//      transcriber (5dive-transcribe --backend=local); without, a stand-in.
 // Each arm prints PASS/FAIL; the exit code is the number of failures.
 
 import { mkdtempSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs'
@@ -77,6 +81,12 @@ writeFileSync(fake, `#!/bin/sh\nn=$(cat "${dir}/kn" 2>/dev/null || echo 0); n=$(
 chmodSync(fake, 0o755)
 
 // The agent's channel, as Claude Code runs it.
+// The transcriber: the real one on a real clip, else a stand-in that prints a fixed line.
+const VOICE = process.env.EMAIL_E2E_VOICE || ''
+const fakeT = join(dir, 'fake-transcribe')
+writeFileSync(fakeT, '#!/bin/sh\n[ "$1" = --backend=local ] || exit 9\necho "stand-in transcript of $(basename "$2")"\n')
+chmodSync(fakeT, 0o755)
+const TRANSCRIBER = VOICE ? '/usr/local/bin/5dive-transcribe' : fakeT
 const state = join(dir, 'state')
 mkdirSync(state, { recursive: true })
 writeFileSync(join(state, 'config.json'), JSON.stringify({
@@ -87,7 +97,7 @@ writeFileSync(join(state, 'config.json'), JSON.stringify({
 const inbound: { content: string; meta: Record<string, string> }[] = []
 const client = new Client({ name: 'e2e', version: '0' }, { capabilities: {} })
 client.setNotificationHandler(z.object({ method: z.literal('notifications/claude/channel'), params: z.any() }), (n: any) => { inbound.push(n.params) })
-await client.connect(new StdioClientTransport({ command: 'bun', args: [join(import.meta.dir, 'server.ts')], env: { ...process.env, EMAIL_STATE_DIR: state, EMAIL_SUDO: fake, HOME: dir } as any, stderr: 'ignore' }))
+await client.connect(new StdioClientTransport({ command: 'bun', args: [join(import.meta.dir, 'server.ts')], env: { ...process.env, EMAIL_STATE_DIR: state, EMAIL_SUDO: fake, EMAIL_TRANSCRIBE: TRANSCRIBER, HOME: dir } as any, stderr: 'ignore' }))
 const call = async (name: string, args: any) => {
   const r: any = await client.callTool({ name, arguments: args })
   return { text: String(r.content?.[0]?.text ?? ''), err: !!r.isError }
@@ -158,6 +168,13 @@ try {
   await sleep(1000)
   const annNew = await until(() => { try { return require('node:fs').readdirSync(join(dir, 'maildir-ann', 'new')).length > 0 || undefined } catch { return undefined } }, 5000)
   check('8. mail to another agent on this box is handed over locally', r8.text.startsWith('sent') && !!annNew && relayed.length === before8, r8.text)
+
+  // 9
+  const clip = VOICE ? require('node:fs').readFileSync(VOICE) : Buffer.from('RIFF0000WAVEfmt ')
+  await outside.sendMail({ from: `Office phone <${BOB}>`, to: SELF, subject: 'Voicemail from +1 555 0100', text: 'You have a new voicemail.', attachments: [{ filename: 'voicemail.wav', content: clip, contentType: 'audio/wav' }] })
+  const m9 = await until(() => inbound.find(i => i.meta.voice === '1'), VOICE ? 120000 : 15000)
+  const heard = VOICE ? /forty|40/i.test(m9?.content ?? '') && /chair/i.test(m9?.content ?? '') : (m9?.content ?? '').includes('stand-in transcript of')
+  check(`9. a voicemail reaches the agent transcribed on the box (${VOICE ? 'real local transcriber' : 'stand-in transcriber'}), with the audio file`, !!m9 && heard && !!m9.meta.audio_path && require('node:fs').existsSync(m9.meta.audio_path), JSON.stringify(m9))
 } finally {
   await client.close().catch(() => {})
   srv.kill()

@@ -37,7 +37,7 @@ import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import {
   parseConfig, readState, trimState, remember, normAddr, threadRoot, chatIdOf, replySubject, nextReferences,
   renderInbound, gateFor, capLeft, countSent, afterAnswer, mayReach, SHUT_LINE, knockFileArgs, knockFiled,
-  parseAnswer, messageIds, type Config, type State, type Held, type Inbound,
+  parseAnswer, messageIds, isAudio, voiceLine, MAX_VOICE_NOTES, type Config, type State, type Held, type Inbound,
 } from './mail.ts'
 
 const STATE_DIR = process.env.EMAIL_STATE_DIR || join(homedir(), '.claude', 'channels', 'email')
@@ -101,7 +101,7 @@ const mcp = new Server(
     instructions: [
       'This is your own email address. The sender reads email, not this session: anything you want them to see must go through the reply tool.',
       '',
-      'Inbound arrives as <channel source="email" chat_id="..." message_id="..." user="..." user_id="<their address>" subject="..." ts="...">. One chat_id is one email thread. Answer with reply(chat_id, text): it goes in the same thread, from your address, to the person who wrote (reply_all: true to keep everyone on it). Use send(to, subject, text) only to start a NEW email. If the tag has file_path, Read it (an attachment); more_files lists the rest.',
+      'Inbound arrives as <channel source="email" chat_id="..." message_id="..." user="..." user_id="<their address>" subject="..." ts="...">. voice="N" means it carried a voice message (a voicemail or a recorded memo): its transcript is in the text, heard on this server, and audio_path is the original sound file. Answer it like any mail. One chat_id is one email thread. Answer with reply(chat_id, text): it goes in the same thread, from your address, to the person who wrote (reply_all: true to keep everyone on it). Use send(to, subject, text) only to start a NEW email. If the tag has file_path, Read it (an attachment); more_files lists the rest.',
       '',
       'Write like a person writing a business email: a greeting, short paragraphs, plain text, sign with your name. No markdown tables or headers. Do not quote their mail back.',
       '',
@@ -301,6 +301,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req: any) => {
 })
 
 // ── receiving ────────────────────────────────────────────────────────────────
+// A voice attachment, heard on this box only. --backend=local: the transcriber
+// never falls back to a cloud service, so the audio never leaves the server.
+const TRANSCRIBE = process.env.EMAIL_TRANSCRIBE || '/usr/local/bin/5dive-transcribe'
+async function hear(path: string): Promise<{ text: string } | { why: string }> {
+  if (!existsSync(TRANSCRIBE)) return { why: 'speech-to-text is not installed on this server. Ask your owner once whether to install it (it takes about 2 minutes and keeps voice on the server): sudo 5dive plugin auto-voice --on' }
+  try {
+    const p = Bun.spawn([TRANSCRIBE, '--backend=local', path], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' })
+    const timer = setTimeout(() => p.kill(), 5 * 60_000)
+    const [out, err] = [await new Response(p.stdout).text(), await new Response(p.stderr).text()]
+    const rc = await p.exited
+    clearTimeout(timer)
+    if (rc === 0) return { text: out }
+    if (rc === 75) return { why: 'speech-to-text is still being installed on this server; Read the file later or ask again in a few minutes' }
+    return { why: (err.trim().split('\n').pop() || `the transcriber stopped (${rc})`).slice(0, 300) }
+  } catch (e) {
+    return { why: String(e).slice(0, 300) }
+  }
+}
+
 const safeName = (s: string) => (s || 'file').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '').slice(0, 80) || 'file'
 
 async function takeMail(raw: Buffer) {
@@ -340,6 +359,7 @@ async function takeMail(raw: Buffer) {
   const known = state.threads[chat]
   const short = randomUUID().slice(0, 8)
   const files: string[] = []
+  const voices: { path: string; name: string }[] = []
   let note = ''
   for (const att of (p.attachments ?? []).slice(0, 10)) {
     if (!att?.content || att.size > MAX_FILE) {
@@ -350,7 +370,9 @@ async function takeMail(raw: Buffer) {
     const path = join(INBOX_DIR, `${Date.now()}-${short}-${safeName(att.filename)}`)
     writeFileSync(path, att.content, { mode: 0o600 })
     files.push(path)
+    if (isAudio(att.filename, att.contentType) && voices.length < MAX_VOICE_NOTES) voices.push({ path, name: safeName(att.filename) })
   }
+  for (const v of voices) note += `\n\n${voiceLine(v.name, await hear(v.path))}`
   const m: Inbound = {
     messageId: mid,
     from: { address: fromAddr, name: String(p.from?.value?.[0]?.name ?? '') },
@@ -370,7 +392,8 @@ async function takeMail(raw: Buffer) {
   remember(state.known, fromAddr)
   saveState()
   const { content, meta } = renderInbound(m, chat, short, self)
-  logLine('in', fromAddr, m.text.length, files.length)
+  if (voices.length) { meta.voice = String(voices.length); meta.audio_path = voices[0].path }
+  logLine('in', fromAddr, m.text.length, files.length, voices.length ? `voice=${voices.length}` : '')
   deliver(content + note, meta)
 }
 

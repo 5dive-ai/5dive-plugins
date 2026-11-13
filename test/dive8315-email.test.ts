@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import {
   parseConfig, normAddr, threadRoot, chatIdOf, replySubject, nextReferences, freshText, renderInbound,
   emptyState, readState, gateFor, capLeft, countSent, afterAnswer, mayReach, isPrivateAddress,
-  knockFileArgs, knockFiled, parseAnswer, type Config, type Held,
+  knockFileArgs, knockFiled, parseAnswer, isAudio, voiceLine, type Config, type Held,
 } from '../plugins/email/mail.ts'
 import { guardVerdict, newestSource } from '../plugins/email/guard.ts'
 
@@ -198,5 +198,21 @@ describe('the outside-mail guard (design 5)', () => {
   test('the owner\'s switch: roles check off, or a kind widened', () => {
     expect(guardVerdict('email', { check: 'off', membersMay: [] }, 'Bash', { command: 'sudo ls' }).ok).toBe(true)
     expect(guardVerdict('email', { check: 'on', membersMay: ['root'] }, 'Bash', { command: 'sudo ls' }).ok).toBe(true)
+  })
+})
+
+describe('voice messages (voicemail-to-email)', () => {
+  test('an audio attachment is known by its type or its name', () => {
+    expect(isAudio('voicemail.wav', 'application/octet-stream')).toBe(true)
+    expect(isAudio('msg', 'audio/mpeg')).toBe(true)
+    for (const n of ['a.mp3', 'b.M4A', 'c.ogg', 'd.opus', 'e.amr', 'f.flac']) expect(isAudio(n, '')).toBe(true)
+    expect(isAudio('invoice.pdf', 'application/pdf')).toBe(false)
+    expect(isAudio('photo.jpg', 'image/jpeg')).toBe(false)
+  })
+  test('the agent reads the transcript, or why there is none', () => {
+    expect(voiceLine('vm.wav', { text: 'Call me back.' })).toContain('transcript, heard on this server:]\nCall me back.')
+    expect(voiceLine('vm.wav', { text: '  ' })).toContain('(nothing could be heard in it)')
+    expect(voiceLine('vm.wav', { why: 'not installed' })).toBe('[Voice message "vm.wav" attached, not transcribed: not installed]')
+    expect(voiceLine('vm.wav', { text: 'x'.repeat(9000) }).length).toBeLessThan(8200)
   })
 })
