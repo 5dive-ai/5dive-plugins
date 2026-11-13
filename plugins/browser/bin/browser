@@ -12728,6 +12728,13 @@ _connect_done() {  # <caller> <code> <sender>
     printf 'site=%s\nstatus_rc=%s\nstatus=%s\n' "$site" "$rc" "$v"
     return 0
   fi
+  _connect_check_login "$site"
+}
+
+# The person's sign-in, checked the one way a Done checks it (the box seat's
+# browser). Prints site=, status_rc= (0: signed in) and status=.
+_connect_check_login() {  # <site>
+  local site="$1" out rc
   # revoke -> stop -> probe, in that order: a served profile cannot be probed
   # honestly, and only this last command may stamp the liveness file.
   _connect_as_box viewer-revoke "$site" >/dev/null 2>&1 || true
@@ -12800,12 +12807,42 @@ _connect_view_chat() {  # <seat> <msgs> <text> [<reply_markup json>]
   done
 }
 
+# >>> DIVE-8354 Done on a link no agent asked for
+#
+# The settings screen's Connect (and a partner cabinet's) mints its own link: no
+# ask, no Done code, nothing indexed here. Its Done answered "already finished"
+# while the site sat on its sign-in page, so the person closed the window and the
+# agent got an expired session (three Connect/Done cycles, 2026-11-13).
+#
+# Done here checks the sign-in exactly as the settings screen's own Done does
+# (revoke -> stop -> probe). Only for the window a person is in NOW: the site's
+# ticket still carries this bind and was redeemed (consumed), and nothing has
+# revoked or replaced it since. An ask's ended link is revoked by its Done, so
+# it still reads "already finished"; any other bind runs nothing. Nobody's chat
+# is edited and no agent is told: there is no ask.
+_connect_view_check() {  # <site> <bind>
+  local site="$1" bind="$2" tf out again
+  tf="$PROFILE_ROOT/$BOX_SEAT/$site/.5dive-viewer.ticket"
+  [[ "$(_kv "$tf" bind)" == "$bind" && "$(_kv "$tf" state)" == consumed ]] || { printf 'result=gone\n'; return 0; }
+  out=$(_connect_check_login "$site")
+  [[ "$(sed -n 's/^status_rc=//p' <<<"$out" | head -1)" == 0 ]] && { printf 'result=saved\n'; return 0; }
+  # Not signed in yet: the same window again, so the step can be finished there.
+  again=$( _connect_view_link "$site" >/dev/null 2>&1 || exit 1
+           printf 'https://%s%s' "$CONNECT_LINK_HOST" "$CONNECT_LINK_PATH" ) || again=""
+  printf 'result=notyet\n'
+  [[ -z "$again" ]] || printf 'again=%s\n' "$again"
+}
+# <<< DIVE-8354
+
 _connect_view_done() {  # <caller> <site> <bind>
   local caller="$1" site="$2" bind="$3" idx code df seat via kind url check msgs out rc=0
   local st src chk who text note result again="" kb="" new nf
   [[ "$caller" == "$BOX_SEAT" ]] || die "$E_PERM" "only the box's own viewer can press Done from the view"
   _valid_site "$site" && [[ "$bind" =~ ^[0-9a-f]{32}$ ]] || die "$E_USAGE" "_connect view-done <site> <bind>"
   idx=$(_connect_file "view:$site:$bind")
+  # DIVE-8354: no ask was ever filed under this bind (the settings screen's
+  # Connect, a partner cabinet's): the Done still checks the sign-in.
+  [[ -e "$idx" ]] || { _connect_view_check "$site" "$bind"; return 0; }
   [[ "$(_connect_field "$idx" op)" == view ]] || { printf 'result=gone\n'; return 0; }
   code=$(_connect_field "$idx" done); rm -f -- "$idx"
   df=$(_connect_file "${code:-x}")

@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.83.0: the viewer's Done on a sign-in no agent asked for checks the sign-in (DIVE-8354)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @e3808ba (`tests/browser_mirror.sh sync`). A viewer opened from the settings screen's Connect, with no agent ask behind it, used to answer Done with "This sign-in is already finished" while the site was still on its sign-in page. Done now checks the sign-in the way the settings screen's Done does: signed out reads "Not signed in yet." with an "Open it again" link; "already finished" shows only when an ask really ended. Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — telegram-codex 0.5.50: a file Telegram refuses no longer re-sends the answer forever, and the agent and owner are told (DIVE-8328)
 
 - Box report 930: a Codex agent named two PNGs in its answer; the owner got the text twice and no images. Any failed file re-ingested the whole outbox file, so every retry sent the text again. Now the text goes once and the outbox file is removed as soon as it is out; each file is tried on its own (`outbox-send.ts`).
