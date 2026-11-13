@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.141, dashboard 0.5.39: a seat on its weekly limit waits for the printed reset day instead of typing "continue" every few minutes (DIVE-8374)
+
+- The weekly wall prints a date (`resets Nov 17, 8am`) and the hook resolved it to the right time, about 88h out. The resume helper trusted a reset only up to 30h ahead, so it skipped the wait and typed `continue` at 5, 10, 20 minutes, each answered by the same weekly-limit line. It now trusts a reset up to 8 days out (the same bound the parser puts on a dated reset), parks once, and resumes at the printed time. Further out is still a stale line and still goes to the retry path.
+- A reset learned from the screen during retries keeps the 30h window: that wait counts against the 6h retry budget.
+- The decision is `planWait()` in `hooks/lib/resume-retry.ts`; the dashboard runs the same shared copy.
+
 ### Fixed — browser 1.83.0: the viewer's Done on a sign-in no agent asked for checks the sign-in (DIVE-8354)
 
 - Registry copy synced byte-for-byte from 5dive-browser main @e3808ba (`tests/browser_mirror.sh sync`). A viewer opened from the settings screen's Connect, with no agent ask behind it, used to answer Done with "This sign-in is already finished" while the site was still on its sign-in page. Done now checks the sign-in the way the settings screen's Done does: signed out reads "Not signed in yet." with an "Open it again" link; "already finished" shows only when an ask really ended. Detail in 5dive-browser's CHANGES.md.

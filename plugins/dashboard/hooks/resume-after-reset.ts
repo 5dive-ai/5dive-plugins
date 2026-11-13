@@ -35,7 +35,7 @@ import { unlinkSync, utimesSync } from 'fs'
 import { capturePaneFor, sendKeys, type TmuxCtx } from './lib/tmux'
 import { sendMessage } from './lib/telegram'
 import { captureBaseline, resolveLiveTranscript, resumedSinceBaseline, rotatedSince, type ResumeBaseline } from './lib/live-transcript'
-import { retryResume, type RetryLimits } from './lib/resume-retry'
+import { planWait, retryResume, type RetryLimits } from './lib/resume-retry'
 import { parseResetEpoch } from './lib/time'
 import { resumePrompt } from './lib/resume-prompt'
 import { isLite, recordOpsDetail } from './lib/lite'
@@ -48,10 +48,15 @@ const lockPath = process.argv[6] ?? ''
 const transcriptPath = process.argv[7] ?? ''
 
 // Split into two budgets so weekly-cap resets — where the API hands us a
-// real future epoch 12-24h out — don't get treated as untrustworthy and
+// real future epoch days out — don't get treated as untrustworthy and
 // bumped to the retry loop, where the retry loop's own 6h ceiling then
 // gives up before the limit actually lifts.
-const MAX_WAIT_SEC = 30 * 3600 // trust a future reset epoch up to 30h (5h rolling + weekly cap)
+// DIVE-8374: Phase 2 trusts a reset up to 8 days out (MAX_RESET_WAIT_SEC), so
+// a weekly wall parks once until its printed date instead of typing `continue`
+// every few minutes. A reset only LEARNED from the pane during Phase 3 keeps
+// the 30h window: that wait is spent inside the 6h retry budget, so a longer
+// one would end the loop on time right as the limit lifts.
+const LEARNED_MAX_WAIT_SEC = 30 * 3600
 const MAX_RETRY_SEC = 6 * 3600 // after wait/blind, poll-retry for this long before giving up
 const RETRY_INTERVAL_SEC = 300 // back-off before the 2nd blind resume attempt
 const RETRY_INTERVAL_MAX_SEC = 3600 // …doubling each miss, capped here
@@ -68,7 +73,7 @@ const RETRY_LIMITS: RetryLimits = {
   maxAttempts: MAX_RETRY_ATTEMPTS,
   intervalSec: RETRY_INTERVAL_SEC,
   intervalMaxSec: RETRY_INTERVAL_MAX_SEC,
-  maxWaitSec: MAX_WAIT_SEC,
+  maxWaitSec: LEARNED_MAX_WAIT_SEC,
 }
 // DIVE-122: when we have NO trustworthy reset epoch, hold the parked menu for
 // this long before the first "continue" attempt. Waking claude immediately into
@@ -227,13 +232,12 @@ try {
 
   // Phase 2 — precise wait only for a trustworthy epoch.
   {
-    const now = Math.floor(Date.now() / 1000)
-    const delta = resetEpoch - now
-    if (delta > 0 && delta <= MAX_WAIT_SEC) {
-      log(`phase2 sleeping ${delta + 30}s until reset`)
-      await sleepHeartbeat((delta + 30) * 1000)
-    } else if (resetEpoch > 0) {
-      log(`phase2 reset epoch out of trusted window (delta=${delta}s) — going to retry loop`)
+    const plan = planWait(resetEpoch, Math.floor(Date.now() / 1000))
+    if (plan.kind === 'wait') {
+      log(`phase2 sleeping ${plan.sec}s until reset`)
+      await sleepHeartbeat(plan.sec * 1000)
+    } else if (plan.kind === 'untrusted') {
+      log(`phase2 reset epoch out of trusted window (delta=${plan.delta}s) — going to retry loop`)
     } else {
       // DIVE-122: no trustworthy reset epoch. Don't fall straight into Phase 3's
       // "continue" (it wakes claude into the still-active limit → re-limit →
