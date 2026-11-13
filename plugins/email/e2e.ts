@@ -94,10 +94,18 @@ writeFileSync(join(state, 'config.json'), JSON.stringify({
   smtp: { host: '127.0.0.1', port: SUB, secure: false, user: SELF, pass: 'pw-mike' },
   approve_new: true, // free_domains defaults to example.com: colleagues are free
 }))
+// 0: a mail that landed while the agent was down waits in new/ — it must reach
+// the agent once Claude connects, not be marked read before anyone listens.
+mkdirSync(join(maildir, 'new'), { recursive: true })
+writeFileSync(join(maildir, 'new', '1000.waiting.mail'), `From: Dana <dana@outside.test>\r\nTo: ${SELF}\r\nSubject: Sent while you were down\r\nMessage-ID: <w0@outside.test>\r\n\r\nAre you there?\r\n`)
 const inbound: { content: string; meta: Record<string, string> }[] = []
 const client = new Client({ name: 'e2e', version: '0' }, { capabilities: {} })
-client.setNotificationHandler(z.object({ method: z.literal('notifications/claude/channel'), params: z.any() }), (n: any) => { inbound.push(n.params) })
 await client.connect(new StdioClientTransport({ command: 'bun', args: [join(import.meta.dir, 'server.ts')], env: { ...process.env, EMAIL_STATE_DIR: state, EMAIL_SUDO: fake, EMAIL_TRANSCRIBE: TRANSCRIBER, HOME: dir } as any, stderr: 'ignore' }))
+// Like Claude Code: the channel listener is registered a moment AFTER the
+// handshake (its log: "Successfully connected" then "Channel notifications
+// registered"); a notification sent in between is dropped.
+await sleep(500)
+client.setNotificationHandler(z.object({ method: z.literal('notifications/claude/channel'), params: z.any() }), (n: any) => { inbound.push(n.params) })
 const call = async (name: string, args: any) => {
   const r: any = await client.callTool({ name, arguments: args })
   return { text: String(r.content?.[0]?.text ?? ''), err: !!r.isError }
@@ -108,6 +116,10 @@ await sleep(800)
 const outside = nodemailer.createTransport({ host: '127.0.0.1', port: MX, secure: false, tls: { rejectUnauthorized: false } })
 
 try {
+  // 0
+  const m0 = await until(() => inbound.find(i => i.meta.user_id === 'dana@outside.test'))
+  check('0. a mail that waited while the agent was down reaches it after connect', !!m0 && m0.content.includes('Are you there?'), `inbound=${JSON.stringify(inbound)}`)
+
   // 1
   await outside.sendMail({ from: `Bob <${BOB}>`, to: SELF, subject: 'Quote for 40 chairs', text: 'Hi Mike, can you send a quote?', messageId: '<q1@outside.test>' })
   const m1 = await until(() => inbound.find(i => i.meta.user_id === BOB))

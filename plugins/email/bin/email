@@ -32,6 +32,7 @@ MAIL_ETC="${EMAIL_MAIL_ETC:-/etc/5dive/mail}"
 MAIL_SPOOL="${EMAIL_MAIL_SPOOL:-/var/lib/5dive/mail}"
 MAIL_OPT="${EMAIL_MAIL_OPT:-/opt/5dive/oamail}"
 SYSTEMCTL="${EMAIL_SYSTEMCTL:-systemctl}"
+MANAGED_SETTINGS="${EMAIL_MANAGED_SETTINGS:-/etc/claude-code/managed-settings.json}"
 UNIT="5dive-mail"
 
 readonly E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_AUTH_REQUIRED=6 E_PERMISSION=10
@@ -84,8 +85,31 @@ _install_cfg() {  # <agent> <json>
   rm -f "$tmp"
 }
 
+# Claude drops every message from a channel plugin that is not on the box's
+# allowlist, silently (measured on a live box, DIVE-8315: the mail was read and
+# marked seen, the agent never saw it). The installer adds email on its next
+# run; a box that got this plugin first would lose mail until then. Same merge
+# as install.sh: add our one entry, keep everything else, never touch a file
+# that is not valid JSON.
+_allow_channel() {
+  local f="$MANAGED_SETTINGS" tmp
+  [[ -e "$f" ]] || return 0   # no allowlist file: Claude's own rules apply, nothing to add to
+  if jq -e '.allowedChannelPlugins // [] | any(.plugin == "email" and .marketplace == "5dive-plugins")' "$f" >/dev/null 2>&1; then
+    return 0
+  fi
+  tmp=$(mktemp)
+  if jq '.channelsEnabled = true | .allowedChannelPlugins = ((.allowedChannelPlugins // []) + [{"plugin":"email","marketplace":"5dive-plugins"}])' "$f" >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    install -m "$(stat -c %a "$f")" "$tmp" "$f"; rm -f "$tmp"
+    step "Allowed the email channel in $f"
+  else
+    rm -f "$tmp"
+    warn "$f is not valid JSON: add {\"plugin\":\"email\",\"marketplace\":\"5dive-plugins\"} to allowedChannelPlugins by hand, or mail will not reach the agent"
+  fi
+}
+
 _channel_on() {  # <agent> <info json>
   local agent="$1" chans next
+  _allow_channel
   chans=$(jq -r '.channels // "none"' <<<"$2")
   if [[ ",$chans," != *",email,"* ]]; then
     step "Turning on the email channel for $agent (restarts it)"

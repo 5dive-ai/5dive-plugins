@@ -146,8 +146,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
-function deliver(content: string, meta: Record<string, string>) {
-  mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } }).catch((e: unknown) => say(`deliver failed: ${e}`))
+// An inbound mail AWAITS this: a mail Claude never got stays in new/ (or unseen
+// in IMAP) and is tried again, instead of being marked read and lost.
+class DeliverError extends Error {}
+// For notes that have nowhere to go back to (owner answers, bounces): log and move on.
+function tell(content: string, meta: Record<string, string>) { void deliver(content, meta).catch(() => {}) }
+function deliver(content: string, meta: Record<string, string>): Promise<void> {
+  return mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } }).catch((e: unknown) => {
+    say(`deliver failed: ${e}`)
+    throw new DeliverError(String(e))
+  })
 }
 
 // ── sending ──────────────────────────────────────────────────────────────────
@@ -343,7 +351,7 @@ async function takeMail(raw: Buffer) {
   // Our own server's "did not arrive" note (mailserver.ts) is for the agent: delivered as a note.
   if (fromAddr === `postmaster@${self.split('@')[1]}` && cfg!.mode === 'local') {
     logLine('in', fromAddr, 0, 0, 'bounce')
-    deliver(String(p.text ?? '').trim().slice(0, 2000), { chat_id: 'postmaster', message_id: randomUUID().slice(0, 8), user: 'mail server', user_id: fromAddr, sender_role: 'system', ts: new Date().toISOString() })
+    tell(String(p.text ?? '').trim().slice(0, 2000), { chat_id: 'postmaster', message_id: randomUUID().slice(0, 8), user: 'mail server', user_id: fromAddr, sender_role: 'system', ts: new Date().toISOString() })
     saveState()
     return
   }
@@ -394,7 +402,7 @@ async function takeMail(raw: Buffer) {
   const { content, meta } = renderInbound(m, chat, short, self)
   if (voices.length) { meta.voice = String(voices.length); meta.audio_path = voices[0].path }
   logLine('in', fromAddr, m.text.length, files.length, voices.length ? `voice=${voices.length}` : '')
-  deliver(content + note, meta)
+  await deliver(content + note, meta)
 }
 
 // mode "imap": the firm's mailbox.
@@ -434,6 +442,7 @@ async function imapLoop() {
                 await takeMail(g.source)
                 await client!.messageFlagsAdd(String(g.uid), ['\\Seen'], { uid: true }).catch(() => {})
               } catch (e) {
+                if (e instanceof DeliverError) break // not delivered: last_uid stays, the next pull retries
                 say(`mail uid ${g.uid} could not be read: ${e}`)
               }
               state.last_uid = Math.max(state.last_uid ?? 0, g.uid)
@@ -478,6 +487,7 @@ async function maildirLoop() {
         try {
           await takeMail(readFileSync(path))
         } catch (e) {
+          if (e instanceof DeliverError) break // Claude is not listening: keep it in new/, the next scan retries
           say(`mail ${f} could not be read: ${e}`)
         }
         try { mkdirSync(cur, { recursive: true, mode: 0o700 }); renameSync(path, join(cur, `${f}:2,S`)) } catch { try { rmSync(path) } catch {} }
@@ -515,14 +525,14 @@ async function checkAnswers() {
         if (next === 'drop') {
           delete state.held[h.id]
           logLine('dropped', a.sender, h.text.length, h.files.length, `held=${h.id} owner said no`)
-          deliver(`Your owner said no to mailing ${a.sender}. The mail "${h.subject}" was not sent. Do not send it another way.`, { chat_id: h.chat ?? `held-${h.id}`, message_id: `held-${h.id}`, user: 'owner', user_id: 'owner', sender_role: 'owner-answer', ts: new Date().toISOString() })
+          tell(`Your owner said no to mailing ${a.sender}. The mail "${h.subject}" was not sent. Do not send it another way.`, { chat_id: h.chat ?? `held-${h.id}`, message_id: `held-${h.id}`, user: 'owner', user_id: 'owner', sender_role: 'owner-answer', ts: new Date().toISOString() })
         } else if (next === 'send') {
           delete state.held[h.id]
           try {
             const chat = await sendNow(h)
-            deliver(`Your owner allowed it: the mail "${h.subject}" to ${h.to.join(', ')} is sent.`, { chat_id: chat, message_id: `held-${h.id}`, user: 'owner', user_id: 'owner', sender_role: 'owner-answer', ts: new Date().toISOString() })
+            tell(`Your owner allowed it: the mail "${h.subject}" to ${h.to.join(', ')} is sent.`, { chat_id: chat, message_id: `held-${h.id}`, user: 'owner', user_id: 'owner', sender_role: 'owner-answer', ts: new Date().toISOString() })
           } catch (e) {
-            deliver(`Your owner allowed the mail "${h.subject}" to ${h.to.join(', ')}, but sending failed: ${e}. You may send it again now.`, { chat_id: h.chat ?? `held-${h.id}`, message_id: `held-${h.id}`, user: 'owner', user_id: 'owner', sender_role: 'owner-answer', ts: new Date().toISOString() })
+            tell(`Your owner allowed the mail "${h.subject}" to ${h.to.join(', ')}, but sending failed: ${e}. You may send it again now.`, { chat_id: h.chat ?? `held-${h.id}`, message_id: `held-${h.id}`, user: 'owner', user_id: 'owner', sender_role: 'owner-answer', ts: new Date().toISOString() })
           }
         }
       }
@@ -552,5 +562,11 @@ function start() {
 }
 
 installLifecycle({ channel: 'email', stateDir: STATE_DIR })
-start()
+// Read mail only once Claude is connected AND has had a moment to register its
+// channel listener. Measured on a live box (DIVE-8315): starting before
+// connect delivered a waiting mail 40 ms after boot, Claude dropped it, and the
+// file was already marked read, so the sender's mail was lost.
+let started = false
+const startOnce = () => { if (!started) { started = true; start() } }
+mcp.oninitialized = () => { setTimeout(startOnce, 2_000) }
 await mcp.connect(new StdioServerTransport())

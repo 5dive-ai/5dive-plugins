@@ -36,6 +36,9 @@ echo telegram >"$W/channels"
 export STUB_LOG="$W/log" STUB_CHANNELS="$W/channels"
 export EMAIL_5DIVE_BIN="$W/5dive" EMAIL_CONNECTORS_DIR="$W/conn" AGENT_HOME_ROOT="$W/home" EMAIL_AGENT_USER="$ME"
 export EMAIL_MAIL_ETC="$W/etc" EMAIL_MAIL_SPOOL="$W/spool" FIVE_LOCAL_ONLY_FILE="$W/local-only"
+export EMAIL_MANAGED_SETTINGS="$W/managed-settings.json"
+printf '%s\n' '{"channelsEnabled":true,"own":1,"allowedChannelPlugins":[{"plugin":"teams","marketplace":"5dive-plugins"}]}' >"$EMAIL_MANAGED_SETTINGS"
+chmod 644 "$EMAIL_MANAGED_SETTINGS"
 CFG="$W/home/agent-max/.claude/channels/email/config.json"
 run() { : >"$STUB_LOG"; OUT=$(bash "$BIN" agent "$@" 2>&1); RC=$?; }
 
@@ -57,6 +60,10 @@ run connect max --address=$AU --provider=google --name=Max
    && "$(jq -c '[.address,.mode,.imap.host,.imap.port,.imap.secure,.smtp.host,.smtp.port,.smtp.secure,.smtp.pass]' "$CFG")" == "[\"$A\",\"imap\",\"imap.gmail.com\",993,true,\"smtp.gmail.com\",465,true,\"app-pw-1\"]" \
    && "$(cat "$W/channels")" == "telegram,email" ]] \
   && ok "C4 connect writes the agent's 0600 config (google preset, address lower-cased) and turns the channel on" || bad "C4 connect" "$RC $OUT $(cat "$CFG" 2>/dev/null)"
+[[ "$(jq -c '[.own, [.allowedChannelPlugins[] | .plugin]]' "$EMAIL_MANAGED_SETTINGS")" == '[1,["teams","email"]]' && "$(stat -c %a "$EMAIL_MANAGED_SETTINGS")" == 644 ]] \
+  && ok "A1 connect allows the email channel in the box's allowlist, keeping every other entry" || bad "A1 allowlist" "$(cat "$EMAIL_MANAGED_SETTINGS")"
+cp "$EMAIL_MANAGED_SETTINGS" "$W/ms.before"; run connect max --address=$AU --provider=google --name=Max
+cmp -s "$EMAIL_MANAGED_SETTINGS" "$W/ms.before" && ok "A2 a second connect leaves the allowlist as it is (no duplicate)" || bad "A2 allowlist dup" "$(cat "$EMAIL_MANAGED_SETTINGS")"
 [[ "$OUT" != *app-pw-1* ]] && ! grep -q app-pw-1 "$W/log" && ok "C4b the password is never printed or passed to core" || bad "C4b password leak"
 
 echo "the owner's switches"
