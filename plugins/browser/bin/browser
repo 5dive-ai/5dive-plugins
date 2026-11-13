@@ -767,6 +767,12 @@ _broker_ready() {  # _broker_ready <site> <profile-dir>
     printf '%s: %s was not being served; started the box browser for it as %s.\n' "$PROG" "$1" "$_SITE_OWNER" >&2
     return 0
   fi
+  # DIVE-8331: the two states root can name get their own words, not the advice
+  # below, whose `serve` would only answer "already serving" again.
+  case "$why" in
+    *"still open in the owner's sign-in window"*) die "$E_UNAVAILABLE" "$why" ;;
+    *"no warm session on this box:"*) die "$E_UNAVAILABLE" "$1: no warm session on this box:${why#*no warm session on this box:}" ;;
+  esac
   [[ -n "$why" ]] || why="it started, but no browser answers on its socket."
   die "$E_UNAVAILABLE" "$1 is logged in on this box under the '$_SITE_OWNER' seat, but nothing is serving that session right now, and starting it for '$(_seat)' did not work: $why
 '$(_seat)' cannot open the profile directly: it is mode 0700 to $_SITE_OWNER, which is what stops any seat here from replaying somebody else's login. A brokered seat acts THROUGH the running browser or not at all.
@@ -901,16 +907,45 @@ cmd_serve_offered() {
   # would count against that agent's memory limit. A transient scope outlives
   # this command for as long as the browser does (DIVE-5242 measured the same
   # shape on chill-gorge's hand route).
+  local rc=0
   if [[ $EUID -eq 0 && -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
     systemd-run --scope --quiet --collect --unit="5dive-browser-serve-${site//[^a-zA-Z0-9]/-}-$$" -- \
-      runuser -u "$BOX_SEAT" -- env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site" "${how[@]}" 9>&-
-    return $?
+      runuser -u "$BOX_SEAT" -- env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site" "${how[@]}" 9>&- || rc=$?
+  else
+    # 9>&- (DIVE-7237): the lock above is this command's, not the browser's. The
+    # daemon it starts lives for hours, and an inherited fd 9 held the lock with
+    # it, so every later on-demand start or switch sat out the 90 s wait.
+    _as_seat "$BOX_SEAT" env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site" "${how[@]}" 9>&- || rc=$?
   fi
-  # 9>&- (DIVE-7237): the lock above is this command's, not the browser's. The
-  # daemon it starts lives for hours, and an inherited fd 9 held the lock with
-  # it, so every later on-demand start or switch sat out the 90 s wait.
-  _as_seat "$BOX_SEAT" env FIVEDIVE_BROWSER_SEAT="$BOX_SEAT" "$0" serve "$site" "${how[@]}" 9>&-
+  (( rc == 0 )) || return "$rc"
+  _serve_offered_cold "$site"
 }
+
+# >>> DIVE-8331 SAY WHY THE START LEFT NO WARM SESSION
+#
+# Box report 933 (wry-rune, 2026-11-13): the owner's Done for vk.com was cut in
+# half by an API deploy, so the sign-in browser stayed up with its view still
+# live. The agent's on-demand start ran `serve vk.com --no-switch`, which
+# answered "already serving" (a person's window is never swapped from under
+# them), exited 0, and left no daemon. The agent then got "it started, but no
+# browser answers on its socket", which names neither cause, so it could not
+# tell the owner what to do. Root can read the owner's pidfile; the caller
+# cannot (0700). So root says which state it is, and fails, instead of a 0 that
+# started nothing.
+_serve_offered_cold() {  # <site>; _SITE_DIR is the owner's profile
+  _daemon_live "$_SITE_DIR" && return 0
+  _serve_running "$_SITE_DIR" >/dev/null || return 0   # nothing up: the caller's own words stand
+  if [[ "$(_kv "$(_serve_pidfile "$_SITE_DIR")" login)" == 1 ]] && _viewer_live "$_SITE_DIR"; then
+    die "$E_UNAVAILABLE" "$1 is still open in the owner's sign-in window: ask them to press Done on $1, then try again. Until they do, that window is theirs and no browser for the agent can start beside it."
+  fi
+  local why=""
+  if [[ -n "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then why="the session daemon is turned off on this box (FIVEDIVE_BROWSER_NO_DAEMON)"
+  elif [[ ! -x "$(_daemon_bin)" ]]; then why="playwright-core is not installed, so there is no session daemon. Install it once:  npm install --prefix $(cd "$_SELF_DIR/.." && pwd)"
+  elif ! _have Xvfb; then why="Xvfb is not installed"; fi
+  [[ -z "$why" ]] || die "$E_UNAVAILABLE" "no warm session on this box: $why. $1 stays open as a plain browser only its owner can use."
+  return 0
+}
+# <<< DIVE-8331
 
 # >>> DIVE-7168 A NEW SITE JOINS THE BOX'S GOOGLE SIGN-IN, NOT ONLY THE SEAT'S OWN.
 #
@@ -7533,12 +7568,16 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
       --out=*) out="${1#*=}" ;;
       --json) [[ "$kind" == read ]] || die "$E_USAGE" "--json belongs to browser read; browser links already prints JSON"; json=1 ;;
       --full) [[ "$kind" == read ]] || die "$E_USAGE" "--full belongs to browser read; browser links prints every link"; full=1 ;;
+      --grep=*) [[ "$kind" == read ]] || die "$E_USAGE" "--grep belongs to browser read"; READ_GREP="${1#*=}"
+         [[ -n "$READ_GREP" ]] || die "$E_USAGE" "--grep takes a regex (grep -E, any case), like --grep='price|total'"
+         grep -qiE -- "$READ_GREP" </dev/null; (( $? != 2 )) || die "$E_USAGE" "--grep: not a valid regex: $READ_GREP" ;;
       --wait=*) wait="${1#*=}" ;;
       --wait-for=*) wait_for="${1#*=}"; _wait_for_ok "$wait_for" || die "$E_USAGE" "--wait-for takes one CSS selector, ref=<role>/<name> or text=<words>" ;;
       -h|--help)
         if [[ "$kind" == read ]]; then
-          printf '%s read [<site>] <url> [<url>…] [--full] [--out=<dir>] [--json] [--wait=<ms>] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG"
+          printf '%s read [<site>] <url> [<url>…] [--full] [--grep=<regex>] [--out=<dir>] [--json] [--wait=<ms>] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG"
           printf '  Several urls load side by side in one browser (one call, not one per page). Each page prints its facts and the first %s characters of its text; --full prints all of it, and page.md in the artifacts directory always has all of it.\n' "$READ_PRINT_MAX"
+          printf '  --grep=<regex> prints only the lines of the page that match (grep -E, any case), each with its line number and the line around it, instead of the head of the text.\n'
         else
           printf '%s links <site> <url> [--out=<dir>] [--wait=<ms>] [--wait-for=<selector|ref=…|text=…>]\n' "$PROG"
         fi
@@ -7683,8 +7722,41 @@ _cmd_read_like() { # _cmd_read_like read|links <site> <url> [flags]
 # fits, and one line says where the rest is. page.md on disk is always complete.
 READ_PRINT_MAX="${FIVEDIVE_BROWSER_READ_PRINT_MAX:-6000}"
 [[ "$READ_PRINT_MAX" =~ ^[0-9]{1,7}$ ]] && (( READ_PRINT_MAX >= 500 )) || READ_PRINT_MAX=6000
+# A READ CAN PRINT ONLY THE LINES THAT MATCH (DIVE-8281, BrowserOS's `grep`). The
+# skill says "grep page.md", which needs a shell; a harness that allows only
+# `5dive browser` verbs (the bench's fence refused 38 such greps in 7804) has none.
+# `read <url> --grep=<regex>` prints the front matter, then each matching line of
+# the text with its line number and one line around it, inside the same budget.
+READ_GREP=""
+_read_grep_print() {  # _read_grep_print <page.md> <path to name> <budget>
+  local md="$1" path="$2" max="$3"
+  awk 'NR == 1 && $0 == "---" { fm = 1; print; next } fm { print; if ($0 == "---") exit }' "$md"
+  local body n
+  body=$(awk 'NR == 1 && $0 == "---" { fm = 1; next } fm { if ($0 == "---") fm = 0; next } { printf "%d:%s\n", NR, $0 }' "$md")
+  n=$(cut -d: -f2- <<<"$body" | grep -ciE -- "$READ_GREP")
+  if (( n == 0 )); then
+    printf '[grep: no line of this page matches %s. The whole page is in %s.]\n' "$READ_GREP" "$path"; return 0
+  fi
+  # The regex goes in through the environment: awk -v would eat its backslashes.
+  RG_RE="$READ_GREP" awk -v max="$max" -v n="$n" -v path="$path" '
+    BEGIN { re = tolower(ENVIRON["RG_RE"]) }
+    { line[NR] = $0; t = $0; sub(/^[0-9]+:/, "", t); hit[NR] = (tolower(t) ~ re) }
+    END {
+      for (i = 1; i <= NR; i++) if (hit[i]) { want[i-1] = 1; want[i] = 1; want[i+1] = 1 }
+      last = 0
+      for (i = 1; i <= NR; i++) {
+        if (!want[i]) continue
+        out = (last && i > last + 1 ? "--\n" : "") line[i]
+        if (used + length(out) + 1 > max) { cut = 1; break }
+        print out; used += length(out) + 1; last = i; if (hit[i]) shown++
+      }
+      if (cut) printf "[grep: %d of %d matching lines shown, the budget is full. Narrow the regex; the whole page is in %s.]\n", shown, n, path
+      else printf "[grep: %d matching lines. The whole page is in %s.]\n", n, path
+    }' <<<"$body"
+}
 _read_print() {  # _read_print <page.md> <path to name> <full> <budget>
   local md="$1" path="$2" full="$3" max="$4"
+  if [[ -n "$READ_GREP" ]] && (( ! full )); then _read_grep_print "$md" "$path" "$max"; return 0; fi
   if (( full )) || (( $(wc -c < "$md") <= max )); then cat -- "$md"; return 0; fi
   awk -v max="$max" -v path="$path" '
     NR == 1 && $0 == "---" { fm = 1; print; next }
