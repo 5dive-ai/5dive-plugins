@@ -57,7 +57,16 @@ export function loadRoles(path = process.env.FIVEDIVE_ROLES_FILE || '/etc/5dive/
 // The newest <channel source="…"> the session received. Read from the tail of
 // the transcript the hook is handed, so an owner's answer on Telegram, Teams or
 // the app (a different source) is seen the moment it arrives.
-const TAG_RX = /<channel source=\\?"([a-z0-9_-]+)\\?"/g
+// Claude Code writes the source two ways: the bare server name ("email", older
+// builds) and plugin:<plugin>:<server> ("plugin:email:email", 2.1.3xx — measured
+// on a live box, DIVE-8315: the bare-only pattern matched NEITHER the mail nor
+// the owner's reply there, so the guard never held anything). Both name the
+// same channel; channelName() folds them to the plugin's name.
+const TAG_RX = /<channel source=\\?"([a-z0-9_:@.-]+)\\?"/g
+export function channelName(source: string): string {
+  const m = /^(?:server:)?plugin:([a-z0-9_-]+)/.exec(source)
+  return m ? m[1] : source
+}
 export function newestSource(tail: string): string | null {
   let last: string | null = null
   for (const line of tail.split('\n')) {
@@ -67,7 +76,7 @@ export function newestSource(tail: string): string | null {
     if (!/"type"\s*:\s*"user"/.test(line) || line.includes('"tool_use_id"')) continue
     let m: RegExpExecArray | null
     TAG_RX.lastIndex = 0
-    while ((m = TAG_RX.exec(line))) last = m[1]
+    while ((m = TAG_RX.exec(line))) last = channelName(m[1])
   }
   return last
 }
