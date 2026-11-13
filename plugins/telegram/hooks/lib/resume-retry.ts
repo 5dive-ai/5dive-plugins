@@ -76,3 +76,30 @@ export async function retryResume(deps: RetryDeps, limits: RetryLimits): Promise
   deps.log(`phase3 giving up after ${Math.round(limits.maxRetrySec / 3600)}h of retries`)
   return { resumed: false, attempts, giveUp: 'time' }
 }
+
+// DIVE-8374: Phase 2's decision — wait for the printed reset, or not — lifted
+// out of resume-after-reset.ts so the window can be graded without a real wait.
+//
+// The window was 30h, sized for the 5-hour wall plus a weekly cap that resets
+// within a day. A weekly wall prints a DATE up to 7 days out (`resets Nov 17,
+// 8am`), and every such epoch over 30h away was called untrustworthy: the helper
+// skipped the wait and typed `continue` at 5, 10, 20… minutes into a wall that
+// had days left (Anton, 2026-11-13). Eight days is the same bound the parser
+// already puts on a dated reset (DATED_MAX_AHEAD_S in lib/time.ts): anything
+// further out is a stale or mis-parsed line, not this wall.
+export const MAX_RESET_WAIT_SEC = 8 * 86400
+
+export type WaitPlan =
+  // A reset in the trusted window: sleep this long (reset + 30s buffer), then resume.
+  | { kind: 'wait'; sec: number }
+  // An epoch we were given but do not trust (past, or beyond the window).
+  | { kind: 'untrusted'; delta: number }
+  // No epoch at all: the DIVE-122 blind park-hold.
+  | { kind: 'blind' }
+
+export function planWait(resetEpoch: number, nowSec: number, maxWaitSec: number = MAX_RESET_WAIT_SEC): WaitPlan {
+  if (!(resetEpoch > 0)) return { kind: 'blind' }
+  const delta = resetEpoch - nowSec
+  if (delta > 0 && delta <= maxWaitSec) return { kind: 'wait', sec: delta + 30 }
+  return { kind: 'untrusted', delta }
+}
