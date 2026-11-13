@@ -37,7 +37,7 @@
     },
     {
       "name": "email",
-      "description": "Email channel for Claude Code — each agent gets its own email address, in a mailbox the firm already runs (Microsoft 365, Google Workspace, any IMAP+SMTP server) or on the box's own mail server (OpenAgent Mail) for a domain the firm points at it. Mail arrives as a chat and the agent answers in the same thread. A first mail to a new outside address waits for the owner's tap. 5dive hosts no mail.",
+      "description": "Email channel for Claude Code — each agent gets its own email address, in a mailbox the firm already runs (Google Workspace or any IMAP+SMTP server) or on the box's own mail server (OpenAgent Mail) for a domain the firm points at it. Mail arrives as a chat and the agent answers in the same thread. A first mail to a new outside address waits for the owner's tap. 5dive hosts no mail.",
       "category": "productivity",
       "source": "./plugins/email",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/email"

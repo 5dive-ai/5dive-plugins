@@ -5,8 +5,8 @@ answers in the same thread, from its own address. 5dive hosts no mail.
 
 Two ways to give an agent an address:
 
-1. **A mailbox your firm already runs** (Microsoft 365, Google Workspace, any
-   IMAP + SMTP server). IT makes `mike@yourfirm.com`, then:
+1. **A mailbox your firm already runs** (Google Workspace or any IMAP + SMTP
+   server; Microsoft 365 needs a Microsoft sign-in that is not built yet). IT makes `mike@yourfirm.com`, then:
    `sudo 5dive agent email connect mike --address=mike@yourfirm.com --provider=google --task=<DIVE-N>`
    (the password comes through a one-time link, never on the command line).
 2. **Your server's own mail server** (OpenAgent Mail) for a domain or subdomain

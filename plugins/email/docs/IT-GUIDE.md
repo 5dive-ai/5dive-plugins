@@ -6,12 +6,12 @@
 2. Allow IMAP and SMTP sign-in for that one mailbox.
    - **Google Workspace:** turn on 2-step verification for the mailbox and make
      an app password (Google Account > Security > App passwords).
-   - **Microsoft 365:** Exchange admin center > the mailbox > Email apps: allow
-     IMAP and Authenticated SMTP. If your tenant blocks password sign-in for
-     IMAP (security defaults), wait for the Microsoft sign-in option.
+   - **Microsoft 365:** not yet. Microsoft turned off password sign-in for
+     IMAP in 2022, so it needs the Microsoft sign-in, which is not built yet.
+     Until then use B below with your Microsoft 365 as the relay for sending.
    - **Any other server:** IMAP on 993 (TLS) and SMTP submission on 587 or 465.
 3. The owner runs `sudo 5dive agent email connect <agent> --address=<a>
-   --provider=google|microsoft|other [--imap-host=… --smtp-host=…] --task=<DIVE-N>`
+   --provider=google|other [--imap-host=… --smtp-host=…] --task=<DIVE-N>`
    and pastes the password into the one-time link.
 
 On an offline (local-only) server, a mail server on your office network works

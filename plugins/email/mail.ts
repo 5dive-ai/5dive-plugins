@@ -14,8 +14,8 @@ import { dirname, join } from 'node:path'
 // `sudo 5dive agent email connect`. The password arrives through a one-time
 // secret link (or `secret write` at a terminal), never as an argument.
 //
-//   mode "imap"  — a mailbox the firm already runs (Microsoft 365 / Exchange,
-//                  Google Workspace, any IMAP+SMTP server): read over IMAP,
+//   mode "imap"  — a mailbox the firm already runs (Google Workspace, Exchange,
+//                  any IMAP+SMTP server): read over IMAP,
 //                  send through the firm's own SMTP.
 //   mode "local" — the box's own mail server (OpenAgent Mail, mailserver.ts):
 //                  mail lands in a maildir the agent owns, and goes out through

@@ -2,7 +2,7 @@
 //
 // One agent = one email address, in a mailbox the FIRM runs. We host no mail:
 //
-//   mode "imap"   the firm's Microsoft 365 / Exchange, Google Workspace or any
+//   mode "imap"   the firm's Google Workspace, on-site Exchange or any
 //                 IMAP+SMTP server. Mail is read over IMAP (IDLE, with a poll
 //                 behind it) and sent through the firm's SMTP.
 //   mode "local"  the box's own mail server (OpenAgent Mail, mailserver.ts) for

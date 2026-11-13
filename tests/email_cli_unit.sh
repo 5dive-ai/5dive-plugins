@@ -44,6 +44,8 @@ run connect max --address=$A --provider=google --password=hunter2
 [[ $RC == 3 && "$OUT" == *"never an argument"* && ! -e "$CFG" ]] && ok "C1 a password on the command line is refused, nothing written" || bad "C1 password argv" "$RC $OUT"
 run connect max --address=not-an-address --provider=google
 [[ $RC == 3 ]] && ok "C2 a bad address is refused" || bad "C2 bad address" "$RC $OUT"
+run connect max --address=$A --provider=microsoft
+[[ $RC == 3 && "$OUT" == *"Microsoft sign-in"* && ! -e "$CFG" ]] && ok "C2b Microsoft 365 is refused honestly (no password IMAP there since 2022), nothing written" || bad "C2b microsoft" "$RC $OUT"
 run connect max --address=$A --provider=google
 [[ $RC == 6 && "$OUT" == *"secret write EMAIL_PASSWORD --connector=email-max"* && ! -e "$CFG" ]] && ok "C3 no password on the box yet: refused with the secret-write line" || bad "C3 no secret" "$RC $OUT"
 run connect max --address=$A --provider=google --task=DIVE-1

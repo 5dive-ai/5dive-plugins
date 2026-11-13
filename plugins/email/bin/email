@@ -3,7 +3,7 @@
 # Published by the email plugin; core hands `5dive agent email <sub>` here as
 # `5dive email agent <sub>` (same shape as teams and buzz).
 #
-#   connect <agent> --address=<a> [--provider=microsoft|google|other]
+#   connect <agent> --address=<a> [--provider=google|other]   (microsoft: refused, see below)
 #           [--imap-host=<h>] [--imap-port=993] [--smtp-host=<h>] [--smtp-port=587]
 #           [--login=<user>] [--name=<shown name>] [--task=<DIVE-N>]
 #       A mailbox the FIRM already runs. The password (or app password) arrives
@@ -127,7 +127,7 @@ email_connect() {
       *) [[ -z "$agent" ]] && agent="$a" || fail "$E_USAGE" "one agent at a time" ;;
     esac
   done
-  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent email connect <agent> --address=<a> [--provider=microsoft|google|other] | --self-hosted"
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent email connect <agent> --address=<a> [--provider=google|other] | --self-hosted"
   [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent email connect $agent …"
   local info; info=$(_agent_check "$agent")
   [[ -n "$name" ]] || name="${agent^}"
@@ -138,7 +138,10 @@ email_connect() {
   _addr_ok "$address" || fail "$E_VALIDATION" "--address must be the agent's email address, like mike@yourfirm.com"
   local is=true ss=false
   case "$provider" in
-    microsoft) : "${ih:=outlook.office365.com}" "${sh:=smtp.office365.com}" ;;
+    # Microsoft retired password sign-in for IMAP in 2022 (any host typed for a
+    # Microsoft 365 mailbox ends there), so a config written here could never
+    # read mail. Say so, and name what works today.
+    microsoft) fail "$E_VALIDATION" "Microsoft 365 mailboxes need the Microsoft sign-in, which is not built yet. Today: Google Workspace, any IMAP mail server, or this server's own mail server (--self-hosted) sending through your Microsoft 365 as its relay." ;;
     google) : "${ih:=imap.gmail.com}" "${sh:=smtp.gmail.com}" "${sp:=465}" ;;
     ""|other) ;;
     *) fail "$E_VALIDATION" "--provider is microsoft, google or other" ;;
@@ -186,12 +189,6 @@ $name now reads and answers $address.
   Mail to $address reaches $name as a chat; $name answers in the same thread.
   A first mail to a new outside address waits for your tap (turn off: sudo 5dive agent email gate $agent off).
   Check it: 5dive agent email status $agent
-EOF
-  [[ "$provider" == microsoft ]] && cat <<'EOF'
-
-  Microsoft 365: the mailbox needs IMAP and SMTP AUTH allowed for it (Exchange
-  admin center > the mailbox > Email apps). Tenants that block password sign-in
-  for IMAP need the Microsoft sign-in, which comes in the next release.
 EOF
   return 0
 }
@@ -254,7 +251,7 @@ email_status() {
   fi
   echo "agent:      $agent"
   echo "connected:  $connected"
-  [[ "$connected" == true ]] || { echo "next:       sudo 5dive agent email connect $agent --address=<a> --provider=microsoft|google|other   (or --self-hosted)"; return 0; }
+  [[ "$connected" == true ]] || { echo "next:       sudo 5dive agent email connect $agent --address=<a> --provider=google|other   (or --self-hosted)"; return 0; }
   echo "address:    $address ($([[ "$mode" == local ]] && echo "this box's own mail server" || echo "the firm's mailbox"))"
   echo "channel on: $([[ ",$chans," == *",email,"* ]] && echo yes || echo "no (channels=$chans)")"
   echo "new people: $([[ "$gate" == on ]] && echo "a first mail to a new outside address waits for your tap" || echo "mails anyone (gate off)")"
@@ -463,7 +460,7 @@ _email_main() {
       cat >&2 <<'USAGE'
 5dive agent email — an agent with its own email address (plugin email@5dive-plugins)
 
-  sudo 5dive agent email connect <agent> --address=<a> --provider=microsoft|google|other
+  sudo 5dive agent email connect <agent> --address=<a> --provider=google|other
                                  [--imap-host=<h> --smtp-host=<h>] [--task=<DIVE-N>]
                                  a mailbox your firm already runs
   sudo 5dive agent email connect <agent> --self-hosted
