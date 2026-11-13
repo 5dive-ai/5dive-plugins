@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+# `5dive agent email …` — give an agent its own email address (DIVE-8315).
+# Published by the email plugin; core hands `5dive agent email <sub>` here as
+# `5dive email agent <sub>` (same shape as teams and buzz).
+#
+#   connect <agent> --address=<a> [--provider=microsoft|google|other]
+#           [--imap-host=<h>] [--imap-port=993] [--smtp-host=<h>] [--smtp-port=587]
+#           [--login=<user>] [--name=<shown name>] [--task=<DIVE-N>]
+#       A mailbox the FIRM already runs. The password (or app password) arrives
+#       through a one-time link (--task) or `sudo 5dive secret write
+#       EMAIL_PASSWORD --connector=email-<agent>`, never as an argument.
+#   connect <agent> --self-hosted [--name=<shown name>]
+#       <agent>@<domain> on this box's own mail server (run `server setup` first).
+#   status <agent>
+#   disconnect <agent>
+#   gate <agent> on|off       on (default): a first mail to a new outside address
+#                             waits for the owner's tap; off: the agent mails anyone
+#   cap <agent> <n>           mails a day (default 50)
+#   server setup --domain=<d> [--relay-host=<h> --relay-port=587 --relay-login=<u>] [--task=<DIVE-N>]
+#   server status
+#
+# We host no mail: the mailbox is the firm's, or the box's own server.
+set -euo pipefail
+
+EMAIL_PLUGIN_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+FIVEDIVE_BIN="${EMAIL_5DIVE_BIN:-/usr/local/bin/5dive}"
+CONNECTORS_DIR="${EMAIL_CONNECTORS_DIR:-/etc/5dive/connectors}"
+LOCAL_ONLY_FILE="${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}"
+LOCAL_ONLY_ALLOW_FILE="${FIVE_LOCAL_ONLY_ALLOW_FILE:-$(dirname "$LOCAL_ONLY_FILE")/local-only.allow}"
+HOME_ROOT="${AGENT_HOME_ROOT:-/home}"
+MAIL_ETC="${EMAIL_MAIL_ETC:-/etc/5dive/mail}"
+MAIL_SPOOL="${EMAIL_MAIL_SPOOL:-/var/lib/5dive/mail}"
+MAIL_OPT="${EMAIL_MAIL_OPT:-/opt/5dive/oamail}"
+SYSTEMCTL="${EMAIL_SYSTEMCTL:-systemctl}"
+UNIT="5dive-mail"
+
+readonly E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_AUTH_REQUIRED=6 E_PERMISSION=10
+
+fail() { local c="$1"; shift; echo "error: $*" >&2; exit "$c"; }
+step() { echo "==> $*" >&2; }
+warn() { echo "warn: $*" >&2; }
+
+email_audit() {
+  [[ $EUID -eq 0 ]] || return 0
+  jq -cn --arg ts "$(date -Iseconds)" --arg u "${SUDO_USER:-${USER:-root}}" --arg c "agent email" \
+    --args '{ts:$ts, user:$u, cmd:$c, args:$ARGS.positional, via:"email-plugin"}' -- "$@" 2>/dev/null \
+    | "$FIVEDIVE_BIN" _audit_append >/dev/null 2>&1 || true
+}
+
+_name_ok() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; }
+_addr_ok() { [[ "${#1}" -le 254 && "$1" =~ ^[a-z0-9.!#\$%\&\'*+/=?^_\`{|}~-]+@[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; }
+_host_ok() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; }
+_port_ok() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( $1 > 0 && $1 < 65536 )); }
+_domain_ok() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; }
+
+_agent_user() { printf '%s' "${EMAIL_AGENT_USER:-agent-$1}"; }
+_state_dir()  { printf '%s/agent-%s/.claude/channels/email' "$HOME_ROOT" "$1"; }
+_connector()  { printf '%s/email-%s.env' "$CONNECTORS_DIR" "$1"; }
+_cfg()        { printf '%s/config.json' "$(_state_dir "$1")"; }
+_agent_json() { "$FIVEDIVE_BIN" agent info "$1" --json 2>/dev/null | jq -e '.data // .' 2>/dev/null; }
+
+# KEY=value, or KEY_FILE=<path> for a multi-line value, as `secret write` stores it.
+_read_secret() {  # <file> <KEY>
+  local f="$1" k="$2" v p
+  [[ -r "$f" ]] || return 1
+  v=$(sed -n "s/^$k=//p" "$f" | tail -1)
+  if [[ -z "$v" ]]; then
+    p=$(sed -n "s/^${k}_FILE=//p" "$f" | tail -1)
+    [[ -n "$p" && -r "$p" ]] && v=$(head -c 4096 "$p" | tr -d '\n')
+  fi
+  v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
+}
+
+_offline() { [[ -e "$LOCAL_ONLY_FILE" ]] && ! grep -qxF email "$LOCAL_ONLY_ALLOW_FILE" 2>/dev/null; }
+
+_install_cfg() {  # <agent> <json>
+  local agent="$1" user dir tmp
+  user=$(_agent_user "$agent"); dir=$(_state_dir "$agent")
+  install -d -o "$user" -g "$(id -gn "$user")" -m 700 "$dir"
+  tmp=$(mktemp); printf '%s\n' "$2" >"$tmp"
+  install -o "$user" -g "$(id -gn "$user")" -m 600 "$tmp" "$dir/config.json"
+  rm -f "$tmp"
+}
+
+_channel_on() {  # <agent> <info json>
+  local agent="$1" chans next
+  chans=$(jq -r '.channels // "none"' <<<"$2")
+  if [[ ",$chans," != *",email,"* ]]; then
+    step "Turning on the email channel for $agent (restarts it)"
+    [[ "$chans" == none || -z "$chans" ]] && next=email || next="$chans,email"
+    "$FIVEDIVE_BIN" agent config "$agent" set channels="$next" >&2 \
+      || fail "$E_VALIDATION" "could not add the email channel (this server's 5dive may predate email: sudo 5dive self-update)"
+  else
+    "$FIVEDIVE_BIN" agent restart "$agent" >/dev/null 2>&1 || warn "restart $agent to load the new settings"
+  fi
+}
+
+_agent_check() {  # <agent> -> prints info json
+  local agent="$1" info type
+  _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
+  info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
+  type=$(jq -r '.type // empty' <<<"$info")
+  [[ "$type" == claude ]] || fail "$E_VALIDATION" "email is for Claude Code agents for now ('$agent' is $type)"
+  printf '%s' "$info"
+}
+
+email_connect() {
+  local agent="" address="" provider="" ih="" ip="" sh="" sp="" login="" name="" task="" self=0 a
+  for a in "$@"; do
+    case "$a" in
+      --json) FIVEDIVE_JSON_MODE=1 ;;
+      --self-hosted) self=1 ;;
+      --address=*) address="${a#*=}"; address="${address,,}" ;;
+      --provider=*) provider="${a#*=}" ;;
+      --imap-host=*) ih="${a#*=}" ;;
+      --imap-port=*) ip="${a#*=}" ;;
+      --smtp-host=*) sh="${a#*=}" ;;
+      --smtp-port=*) sp="${a#*=}" ;;
+      --login=*) login="${a#*=}" ;;
+      --name=*) name="${a#*=}" ;;
+      --task=*) task="${a#*=}" ;;
+      --password=*|--pass=*|--secret=*)
+        fail "$E_VALIDATION" "the mailbox password is never an argument (it would sit in the shell history and the audit log). Rerun with --task=<DIVE-N> for a one-time link, or at a terminal: sudo 5dive secret write EMAIL_PASSWORD --connector=email-<agent>" ;;
+      -*) fail "$E_USAGE" "unknown flag: $a" ;;
+      *) [[ -z "$agent" ]] && agent="$a" || fail "$E_USAGE" "one agent at a time" ;;
+    esac
+  done
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent email connect <agent> --address=<a> [--provider=microsoft|google|other] | --self-hosted"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent email connect $agent …"
+  local info; info=$(_agent_check "$agent")
+  [[ -n "$name" ]] || name="${agent^}"
+  name=$(printf '%s' "$name" | tr -d '\000-\037"' | cut -c1-64)
+  (( self )) && { _connect_self "$agent" "$name" "$info"; return; }
+
+  [[ -n "$address" ]] || address=$(jq -r '.address // empty' "$(_cfg "$agent")" 2>/dev/null || true)
+  _addr_ok "$address" || fail "$E_VALIDATION" "--address must be the agent's email address, like mike@yourfirm.com"
+  local is=true ss=false
+  case "$provider" in
+    microsoft) : "${ih:=outlook.office365.com}" "${sh:=smtp.office365.com}" ;;
+    google) : "${ih:=imap.gmail.com}" "${sh:=smtp.gmail.com}" "${sp:=465}" ;;
+    ""|other) ;;
+    *) fail "$E_VALIDATION" "--provider is microsoft, google or other" ;;
+  esac
+  : "${ip:=993}" "${sp:=587}" "${login:=$address}"
+  [[ -n "$ih" && -n "$sh" ]] || fail "$E_USAGE" "give the firm's mail servers: --imap-host=<h> --smtp-host=<h> (or --provider=microsoft|google)"
+  _host_ok "$ih" && _host_ok "$sh" || fail "$E_VALIDATION" "not a host name"
+  _port_ok "$ip" && _port_ok "$sp" || fail "$E_VALIDATION" "not a port"
+  [[ "$ip" == 143 ]] && is=false
+  [[ "$sp" == 465 ]] && ss=true
+  if _offline; then
+    local addrs; addrs=$(getent ahosts "$ih" "$sh" 2>/dev/null | awk '{print $1}' | sort -u)
+    if [[ -z "$addrs" ]] || grep -qvE '^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1$|f[cd])' <<<"$addrs"; then
+      fail "$E_PERMISSION" "this server is offline and $ih is not on the office network. Use the office's own mail server, the box's own (--self-hosted), or your IT opens email alone: sudo 5dive config local-only allow email"
+    fi
+  fi
+
+  local secret
+  if ! secret=$(_read_secret "$(_connector "$agent")" EMAIL_PASSWORD); then
+    if [[ -n "$task" ]]; then
+      step "Asking for the mailbox password through a one-time link (task $task)"
+      "$FIVEDIVE_BIN" task need "$task" --type=secret --secret-key=EMAIL_PASSWORD --connector="email-$agent" \
+        --ask="Paste the password (or app password) of the mailbox $address, for $name. It goes only to this server." \
+        || fail "$E_AUTH_REQUIRED" "could not open the secret request on $task"
+      echo "Waiting for the password. When it is in, run the same connect again." >&2
+      exit "$E_AUTH_REQUIRED"
+    fi
+    fail "$E_AUTH_REQUIRED" "the mailbox password is not on this server yet. Rerun with --task=<DIVE-N> for a one-time link, or at a terminal: sudo 5dive secret write EMAIL_PASSWORD --connector=email-$agent"
+  fi
+
+  step "Writing $agent's email settings ($address)"
+  local keep; keep=$(jq -c '{approve_new, daily_cap, free_domains} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
+  _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg ih "$ih" --argjson ip "$ip" --argjson is "$is" \
+      --arg sh "$sh" --argjson sp "$sp" --argjson ss "$ss" --arg u "$login" --arg pw "$secret" --argjson keep "$keep" '
+    {address:$a, name:$n, mode:"imap",
+     imap:{host:$ih, port:$ip, secure:$is, user:$u, pass:$pw},
+     smtp:{host:$sh, port:$sp, secure:$ss, user:$u, pass:$pw}} + $keep')"
+  unset secret
+  _channel_on "$agent" "$info"
+  email_audit connect "$agent" "--address=$address" "--imap-host=$ih" "--smtp-host=$sh"
+  cat <<EOF
+
+$name now reads and answers $address.
+
+  Mail to $address reaches $name as a chat; $name answers in the same thread.
+  A first mail to a new outside address waits for your tap (turn off: sudo 5dive agent email gate $agent off).
+  Check it: 5dive agent email status $agent
+EOF
+  [[ "$provider" == microsoft ]] && cat <<'EOF'
+
+  Microsoft 365: the mailbox needs IMAP and SMTP AUTH allowed for it (Exchange
+  admin center > the mailbox > Email apps). Tenants that block password sign-in
+  for IMAP need the Microsoft sign-in, which comes in the next release.
+EOF
+  return 0
+}
+
+_connect_self() {  # <agent> <name> <info>
+  local agent="$1" name="$2" info="$3" conf="$MAIL_ETC/server.json"
+  [[ -r "$conf" ]] || fail "$E_NOT_FOUND" "this box has no mail server yet. First: sudo 5dive agent email server setup --domain=<a domain or subdomain your firm points here>"
+  local domain; domain=$(jq -r .domain "$conf")
+  local user uid gid; user=$(_agent_user "$agent"); uid=$(id -u "$user"); gid=$(id -g "$user")
+  local address="$agent@$domain" pass hash box="$MAIL_SPOOL/boxes/$agent"
+  pass=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
+  hash=$(printf '%s' "$pass" | sha256sum | cut -d' ' -f1)
+  install -d -m 711 "$MAIL_SPOOL" "$MAIL_SPOOL/boxes"
+  install -d -o "$user" -g "$gid" -m 700 "$box" "$box/new" "$box/cur" "$box/tmp"
+  step "Adding $address to this box's mail server"
+  local tmp; tmp=$(mktemp)
+  jq --arg a "$agent" --arg m "$box" --argjson u "$uid" --argjson g "$gid" --arg h "$hash" \
+    '.agents[$a] = {maildir:$m, uid:$u, gid:$g, pass_sha256:$h}' "$conf" >"$tmp" && install -m 600 "$tmp" "$conf"
+  rm -f "$tmp"
+  local keep; keep=$(jq -c '{approve_new, daily_cap, free_domains} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
+  _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg m "$box" --arg pw "$pass" --argjson keep "$keep" '
+    {address:$a, name:$n, mode:"local", maildir:$m,
+     smtp:{host:"127.0.0.1", port:587, secure:false, user:$a, pass:$pw}} + $keep')"
+  unset pass
+  _channel_on "$agent" "$info"
+  email_audit connect "$agent" --self-hosted "--address=$address"
+  cat <<EOF
+
+$name's address is $address, on this box's own mail server.
+
+  Mail to $address reaches $name as a chat; $name answers in the same thread.
+  A first mail to a new outside address waits for your tap (turn off: sudo 5dive agent email gate $agent off).
+  DNS your IT sets once for $domain: sudo 5dive agent email server status
+EOF
+}
+
+email_status() {
+  local agent="${1:-}"
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent email status <agent>"
+  _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
+  local dir cfg connected=false address="" mode="" gate=on cap=50 chans last="" held=0 sent=0
+  dir=$(_state_dir "$agent"); cfg="$dir/config.json"
+  if [[ -r "$cfg" ]] && jq -e '.address and .mode and .smtp' "$cfg" >/dev/null 2>&1; then
+    connected=true
+    address=$(jq -r .address "$cfg"); mode=$(jq -r .mode "$cfg")
+    [[ "$(jq -r '.approve_new' "$cfg")" == false ]] && gate=off
+    cap=$(jq -r '.daily_cap // 50' "$cfg")
+  fi
+  chans=$(_agent_json "$agent" | jq -r '.channels // "none"' 2>/dev/null || echo "?")
+  [[ -r "$dir/messages.log" ]] && last=$(tail -1 "$dir/messages.log" | cut -f1,2)
+  if [[ -r "$dir/state.json" ]]; then
+    held=$(jq '.held // {} | length' "$dir/state.json" 2>/dev/null || echo 0)
+    sent=$(jq --arg d "$(date -u +%F)" 'if .sent.day == $d then .sent.n else 0 end' "$dir/state.json" 2>/dev/null || echo 0)
+  fi
+  if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
+    jq -n --arg a "$agent" --argjson c "$connected" --arg ad "$address" --arg m "$mode" --arg g "$gate" --arg cap "$cap" \
+      --arg ch "$chans" --arg last "$last" --argjson h "$held" --argjson s "$sent" \
+      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, gate:$g, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, channels:$ch, last_message:$last}}'
+    return 0
+  fi
+  echo "agent:      $agent"
+  echo "connected:  $connected"
+  [[ "$connected" == true ]] || { echo "next:       sudo 5dive agent email connect $agent --address=<a> --provider=microsoft|google|other   (or --self-hosted)"; return 0; }
+  echo "address:    $address ($([[ "$mode" == local ]] && echo "this box's own mail server" || echo "the firm's mailbox"))"
+  echo "channel on: $([[ ",$chans," == *",email,"* ]] && echo yes || echo "no (channels=$chans)")"
+  echo "new people: $([[ "$gate" == on ]] && echo "a first mail to a new outside address waits for your tap" || echo "mails anyone (gate off)")"
+  echo "today:      $sent of $cap mails sent"
+  (( held > 0 )) && echo "waiting:    $held mail(s) wait for your answer (5dive people ls)"
+  echo "last:       ${last:-"no mail yet"}"
+}
+
+email_disconnect() {
+  local agent="${1:-}"
+  [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive agent email disconnect <agent>"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent email disconnect $agent"
+  _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
+  local info chans next; info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
+  chans=$(jq -r '.channels // "none"' <<<"$info")
+  if [[ ",$chans," == *",email,"* ]]; then
+    next=$(tr ',' '\n' <<<"$chans" | grep -vx email | paste -sd, -)
+    step "Turning off the email channel for $agent"
+    "$FIVEDIVE_BIN" agent config "$agent" set channels="${next:-none}" >&2 || warn "could not change channels; do it by hand"
+  fi
+  if [[ -w "$MAIL_ETC/server.json" ]] && jq -e --arg a "$agent" '.agents[$a]' "$MAIL_ETC/server.json" >/dev/null 2>&1; then
+    local tmp; tmp=$(mktemp)
+    jq --arg a "$agent" 'del(.agents[$a])' "$MAIL_ETC/server.json" >"$tmp" && install -m 600 "$tmp" "$MAIL_ETC/server.json"; rm -f "$tmp"
+  fi
+  rm -f "$(_state_dir "$agent")/config.json" "$(_connector "$agent")"
+  email_audit disconnect "$agent"
+  echo "$agent is off email. The mailbox password is deleted from this server; mail already received stays in its files."
+}
+
+email_gate() {
+  local agent="${1:-}" v="${2:-}"
+  [[ -n "$agent" && "$v" =~ ^(on|off)$ ]] || fail "$E_USAGE" "usage: sudo 5dive agent email gate <agent> on|off"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent email gate $agent $v"
+  local cfg; cfg=$(_cfg "$agent"); [[ -r "$cfg" ]] || fail "$E_NOT_FOUND" "$agent has no email yet"
+  local tmp; tmp=$(mktemp)
+  jq --argjson on "$([[ "$v" == on ]] && echo true || echo false)" '.approve_new = $on' "$cfg" >"$tmp"
+  install -o "$(stat -c %u "$cfg")" -g "$(stat -c %g "$cfg")" -m 600 "$tmp" "$cfg"; rm -f "$tmp"
+  "$FIVEDIVE_BIN" agent restart "$agent" >/dev/null 2>&1 || warn "restart $agent to apply it"
+  email_audit gate "$agent" "$v"
+  [[ "$v" == on ]] && echo "$agent asks you before a first mail to a new outside address." || echo "$agent now mails anyone without asking (the daily limit still holds)."
+}
+
+email_cap() {
+  local agent="${1:-}" n="${2:-}"
+  [[ -n "$agent" && "$n" =~ ^[0-9]{1,4}$ ]] || fail "$E_USAGE" "usage: sudo 5dive agent email cap <agent> <mails a day>"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root"
+  local cfg; cfg=$(_cfg "$agent"); [[ -r "$cfg" ]] || fail "$E_NOT_FOUND" "$agent has no email yet"
+  local tmp; tmp=$(mktemp)
+  jq --argjson n "$n" '.daily_cap = $n' "$cfg" >"$tmp"
+  install -o "$(stat -c %u "$cfg")" -g "$(stat -c %g "$cfg")" -m 600 "$tmp" "$cfg"; rm -f "$tmp"
+  "$FIVEDIVE_BIN" agent restart "$agent" >/dev/null 2>&1 || true
+  echo "$agent may send $n mails a day."
+}
+
+# ── the box's own mail server (OpenAgent Mail) ──────────────────────────────
+_node_ok() { local v; v=$(node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.stdout.write(a>22||(a==22&&b>=6)?"1":"0")' 2>/dev/null); [[ "$v" == 1 ]]; }
+
+email_server() {
+  local sub="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    setup) _server_setup "$@" ;;
+    status) _server_status "$@" ;;
+    *) fail "$E_USAGE" "usage: 5dive agent email server setup --domain=<d> | status" ;;
+  esac
+}
+
+_server_setup() {
+  local domain="" rh="" rp=587 rl="" task="" a
+  for a in "$@"; do
+    case "$a" in
+      --domain=*) domain="${a#*=}"; domain="${domain,,}" ;;
+      --relay-host=*) rh="${a#*=}" ;;
+      --relay-port=*) rp="${a#*=}" ;;
+      --relay-login=*) rl="${a#*=}" ;;
+      --task=*) task="${a#*=}" ;;
+      *) fail "$E_USAGE" "unknown arg: $a" ;;
+    esac
+  done
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent email server setup --domain=<d>"
+  [[ -r "$MAIL_ETC/server.json" && -z "$domain" ]] && domain=$(jq -r .domain "$MAIL_ETC/server.json")
+  _domain_ok "$domain" || fail "$E_USAGE" "--domain=<a domain or subdomain your firm points at this box>, like ai.yourfirm.com"
+  local relay=null
+  if [[ -n "$rh" ]]; then
+    _host_ok "$rh" && _port_ok "$rp" || fail "$E_VALIDATION" "bad --relay-host or --relay-port"
+    local rpw=""
+    if [[ -n "$rl" ]] && ! rpw=$(_read_secret "$CONNECTORS_DIR/email-relay.env" EMAIL_RELAY_PASSWORD); then
+      if [[ -n "$task" ]]; then
+        "$FIVEDIVE_BIN" task need "$task" --type=secret --secret-key=EMAIL_RELAY_PASSWORD --connector=email-relay \
+          --ask="Paste the password for sending through your firm's mail server ($rh) as $rl. It goes only to this server." \
+          || fail "$E_AUTH_REQUIRED" "could not open the secret request on $task"
+        echo "Waiting for the password. When it is in, run the same setup again." >&2
+        exit "$E_AUTH_REQUIRED"
+      fi
+      fail "$E_AUTH_REQUIRED" "the relay password is not on this server yet: rerun with --task=<DIVE-N>, or: sudo 5dive secret write EMAIL_RELAY_PASSWORD --connector=email-relay"
+    fi
+    relay=$(jq -n --arg h "$rh" --argjson p "$rp" --argjson s "$([[ "$rp" == 465 ]] && echo true || echo false)" --arg u "$rl" --arg pw "$rpw" \
+      '{host:$h, port:$p, secure:$s, user:$u, pass:$pw}')
+    unset rpw
+  fi
+
+  step "Installing OpenAgent Mail into $MAIL_OPT"
+  install -d -m 755 "$MAIL_OPT"
+  install -m 644 "$EMAIL_PLUGIN_ROOT/mailserver.ts" "$EMAIL_PLUGIN_ROOT/mail.ts" "$EMAIL_PLUGIN_ROOT/package.json" "$MAIL_OPT/"
+  [[ -f "$EMAIL_PLUGIN_ROOT/bun.lock" ]] && install -m 644 "$EMAIL_PLUGIN_ROOT/bun.lock" "$MAIL_OPT/"
+  if [[ -d "$EMAIL_PLUGIN_ROOT/node_modules/smtp-server" ]]; then
+    rm -rf "$MAIL_OPT/node_modules"; cp -a "$EMAIL_PLUGIN_ROOT/node_modules" "$MAIL_OPT/node_modules"
+  else
+    (cd "$MAIL_OPT" && bun install --production --no-summary >&2) || fail "$E_VALIDATION" "could not install the mail server's parts (offline? copy the plugin's node_modules in)"
+  fi
+  install -d -m 700 "$MAIL_ETC"
+  install -d -m 711 "$MAIL_SPOOL"
+  install -d -m 700 "$MAIL_SPOOL/queue"
+  local key="$MAIL_ETC/dkim.key" sel="oa1"
+  if [[ ! -s "$key" ]]; then
+    step "Making the DKIM signing key"
+    (umask 077; openssl genrsa -out "$key" 2048 2>/dev/null) || fail "$E_VALIDATION" "openssl could not make the DKIM key"
+  fi
+  local host; host=$(hostname -f 2>/dev/null || hostname)
+  local tmp; tmp=$(mktemp)
+  local agents='{}'; [[ -r "$MAIL_ETC/server.json" ]] && agents=$(jq -c '.agents // {}' "$MAIL_ETC/server.json")
+  jq -n --arg d "$domain" --arg h "mail.$domain" --arg k "$key" --arg s "$sel" --argjson r "$relay" --argjson ag "$agents" \
+    '{domain:$d, hostname:$h, dkim:{selector:$s, key:$k}, agents:$ag} + (if $r == null then {} else {relay:$r} end)' >"$tmp"
+  install -m 600 "$tmp" "$MAIL_ETC/server.json"; rm -f "$tmp"
+
+  local exec
+  if _node_ok; then
+    exec="$(command -v node) --experimental-strip-types --no-warnings $MAIL_OPT/mailserver.ts"
+  else
+    warn "Node 22.6 or newer is not here; running on Bun, which cannot offer encrypted delivery (STARTTLS) to senders yet"
+    exec="$(command -v bun) $MAIL_OPT/mailserver.ts"
+  fi
+  cat >"/etc/systemd/system/$UNIT.service" <<EOF
+[Unit]
+Description=OpenAgent Mail (5dive) for $domain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$exec
+Environment=OAMAIL_CONFIG=$MAIL_ETC/server.json
+Environment=OAMAIL_SPOOL=$MAIL_SPOOL
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  "$SYSTEMCTL" daemon-reload
+  "$SYSTEMCTL" enable --now "$UNIT" >&2 || fail "$E_VALIDATION" "the mail server did not start: journalctl -u $UNIT"
+  "$SYSTEMCTL" restart "$UNIT"
+  email_audit server setup "--domain=$domain" ${rh:+"--relay-host=$rh"}
+  echo
+  echo "This box now takes mail for @$domain."
+  _server_dns "$domain" "$key" "$sel" "$rh"
+  echo
+  echo "Then give an agent its address: sudo 5dive agent email connect <agent> --self-hosted"
+}
+
+_server_dns() {  # <domain> <key> <selector> <relay host>
+  local domain="$1" key="$2" sel="$3" rh="$4" ip pub
+  ip=$(curl -fsS -m 4 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+  pub=$(openssl rsa -in "$key" -pubout 2>/dev/null | grep -v '^-----' | tr -d '\n')
+  cat <<EOF
+
+DNS records your IT sets once (at the provider of $domain):
+  A     mail.$domain                  $ip
+  MX    $domain                       10 mail.$domain
+  TXT   $domain                       "v=spf1 $( [[ -n "$rh" ]] && echo "include:<your mail provider's SPF>" || echo "a:mail.$domain") -all"
+  TXT   $sel._domainkey.$domain        "v=DKIM1; k=rsa; p=$pub"
+  TXT   _dmarc.$domain                "v=DMARC1; p=quarantine"
+  Reverse DNS (PTR) of $ip -> mail.$domain   (asked of whoever runs this server's network)
+Port 25 must reach this box from the internet (or only from the office network,
+for mail inside the office). $( [[ -n "$rh" ]] && echo "Outgoing mail goes through $rh." || echo "Outgoing mail goes straight out; many clouds block port 25 out, and a new server's mail may land in spam: a relay through your firm's mail server is safer (--relay-host=…).")
+EOF
+}
+
+_server_status() {
+  local conf="$MAIL_ETC/server.json"
+  [[ -r "$conf" ]] || { echo "no mail server on this box (sudo 5dive agent email server setup --domain=<d>)"; return 0; }
+  local domain active q n
+  domain=$(jq -r .domain "$conf"); active=$("$SYSTEMCTL" is-active "$UNIT" 2>/dev/null || true)
+  q=$(find "$MAIL_SPOOL/queue" -name '*.json' 2>/dev/null | wc -l); n=$(jq '.agents | length' "$conf")
+  echo "domain:     $domain"
+  echo "server:     ${active:-inactive}"
+  echo "agents:     $n ($(jq -r '.agents | keys | map(. + "@'"$domain"'") | join(", ")' "$conf"))"
+  echo "relay:      $(jq -r '.relay.host // "none (straight to the recipient)"' "$conf")"
+  echo "waiting:    $q outgoing mail(s) not delivered yet"
+  echo "MX now:     $(dig +short MX "$domain" 2>/dev/null | head -1 || echo '?')"
+  [[ -r "$MAIL_SPOOL/mail.log" ]] && echo "last:       $(tail -1 "$MAIL_SPOOL/mail.log" | cut -f1,2)"
+  _server_dns "$domain" "$(jq -r .dkim.key "$conf")" "$(jq -r .dkim.selector "$conf")" "$(jq -r '.relay.host // empty' "$conf")"
+}
+
+_email_main() {
+  [[ "${1:-}" == agent ]] && shift
+  local sub="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    connect) email_connect "$@" ;;
+    status) email_status "$@" ;;
+    disconnect) email_disconnect "$@" ;;
+    gate) email_gate "$@" ;;
+    cap) email_cap "$@" ;;
+    server) email_server "$@" ;;
+    ""|-h|--help|help)
+      cat >&2 <<'USAGE'
+5dive agent email — an agent with its own email address (plugin email@5dive-plugins)
+
+  sudo 5dive agent email connect <agent> --address=<a> --provider=microsoft|google|other
+                                 [--imap-host=<h> --smtp-host=<h>] [--task=<DIVE-N>]
+                                 a mailbox your firm already runs
+  sudo 5dive agent email connect <agent> --self-hosted
+                                 <agent>@<domain> on this box's own mail server
+  5dive agent email status <agent>
+  sudo 5dive agent email disconnect <agent>
+  sudo 5dive agent email gate <agent> on|off   ask before a first mail to someone new (default on)
+  sudo 5dive agent email cap <agent> <n>       mails a day (default 50)
+  sudo 5dive agent email server setup --domain=<d> [--relay-host=<h> --relay-login=<u>]
+  5dive agent email server status
+USAGE
+      [[ -n "$sub" ]] && return 0
+      return "$E_USAGE" ;;
+    *) fail "$E_USAGE" "unknown email command: $sub (connect|status|disconnect|gate|cap|server)" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _email_main "$@"
+fi

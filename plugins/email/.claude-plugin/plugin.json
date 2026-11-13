@@ -1,0 +1,27 @@
+{
+  "name": "email",
+  "description": "Email channel for Claude Code: each agent gets its own email address, in your firm's mailbox or on your server's own mail server. Mail arrives as a chat, the agent answers in the same thread, and a first mail to someone new waits for your tap.",
+  "version": "0.1.0",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/email",
+  "keywords": ["email", "imap", "smtp", "mail-server", "channel", "mcp"],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": ["channel", "verb"],
+    "verbs": [
+      {
+        "name": "email",
+        "summary": "give an agent its own email address",
+        "installs": "channel"
+      }
+    ],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    }
+  }
+}
