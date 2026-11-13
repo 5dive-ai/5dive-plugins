@@ -43,6 +43,7 @@ import { EFFORT_LEVELS, fmtTokens, type ControlOp } from './dispatcher-core.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
 import { createPollGuard, touchLastPoll } from './pollguard.ts'
 import { TurnAttachMemo, planOutboxAttachments, type OutboxAttachPlan } from './outbox-attach.ts'
+import { attachReceiptLine, deliverOutboxReply, recordAttachReceipt, sendOneFile } from './outbox-send.ts'
 import { attachedNames, autoAttachFooter, planAutoAttach } from './autoattach.ts'
 import { ProgressAcks } from './progress.ts'
 import { stripMarkdown } from './plain-text.ts'
@@ -68,6 +69,8 @@ const DISPATCHER_STATE_DIR = process.env.CODEX_DISPATCHER_STATE_DIR
   ?? join(homedir(), '.codex', 'channels', 'dispatcher')
 const DISPATCHER_INBOX_DIR = join(DISPATCHER_STATE_DIR, 'inbox')
 const DISPATCHER_OUTBOX_DIR = join(DISPATCHER_STATE_DIR, 'outbox', 'telegram')
+// DIVE-8328: what became of an answer's files, read by the dispatcher's next turn.
+const DISPATCHER_RECEIPTS_DIR = join(DISPATCHER_STATE_DIR, 'attach-receipts')
 
 // DIVE-4077: THE TMUX PANE IS NOT ALWAYS THE MODEL, and every liveness trick in
 // this file assumed it was. On a codex seat with a channel, 5dive-agent-start
@@ -817,21 +820,37 @@ function ingestDispatcherOutbox(name: string): void {
     // The answer is in (DIVE-5508): stop "typing…" as it lands, so the
     // indicator never outlives the reply. Silent commentary keeps it going.
     if (obj.notify !== false) stopTypingLoop(String(obj.chat_id))
-    await bot.api.sendMessage(String(obj.chat_id), text, options)
-    for (const file of files) await sendFile(String(obj.chat_id), file, options)
-    try { unlinkSync(full) } catch {}
-    outboxAttachPlans.delete(name)
+    // DIVE-8328: only a failed TEXT throws (and is retried: nothing reached the
+    // chat). Once it is out the outbox file goes, so a file that fails can never
+    // re-send the text; it costs one "couldn't send" line instead.
+    const result = await deliverOutboxReply(text, files, {
+      sendText: t => bot.api.sendMessage(String(obj.chat_id), t, options),
+      textSent: () => {
+        try { unlinkSync(full) } catch {}
+        outboxAttachPlans.delete(name)
+      },
+      sendFile: f => sendFile(String(obj.chat_id), f, options),
+      log: line => process.stderr.write(`telegram-codex: dispatcher reply ${name}: ${line}\n`),
+    })
     // The turn's answer, not its silent commentary, is what makes it "replied".
     if (obj.notify !== false) try { writeFileSync(DISPATCH_REPLY_FILE, String(Date.now())) } catch {}
-    logMessage(String(obj.chat_id), 'out', agentName(), plan!.receipt ? `${text}\n[${plan!.receipt}]` : text,
+    const receipt = result.sent.length ? `attached: ${result.sent.join(', ')}` : ''
+    const failedNote = result.failed.map(f => `couldn't send ${f.name}: ${f.reason}`).join('\n')
+    logMessage(String(obj.chat_id), 'out', agentName(), [text, failedNote, receipt ? `[${receipt}]` : ''].filter(Boolean).join('\n'),
       obj.message_thread_id ? { thread_id: String(obj.message_thread_id) } : {})
-    if (plan!.receipt) process.stderr.write(`telegram-codex: dispatcher reply ${name} ${plan!.receipt}\n`)
+    if (receipt || result.failed.length) {
+      process.stderr.write(`telegram-codex: dispatcher reply ${name} ${receipt || 'attached: none'}${result.failed.length ? `; not sent: ${result.failed.map(f => f.name).join(', ')}` : ''}\n`)
+    }
+    // The model's receipt rides its next turn on this chat (dispatcher-core).
+    recordAttachReceipt(DISPATCHER_RECEIPTS_DIR, String(obj.chat_id),
+      attachReceiptLine(result.sent, [...plan!.skipped, ...result.failed]))
     // DIVE-6579: after the text, so a voice note that fails costs the voice and
     // never the answer, and is never retried (the outbox file is gone).
     if (voicesReply(obj, files)) await sendSpokenReply(String(obj.chat_id), body, options, name)
   })().catch(err => {
+    // Only the text can land here: retry while its outbox file is still there.
     process.stderr.write(`telegram-codex: dispatcher reply failed for ${name}: ${err}\n`)
-    setTimeout(() => ingestDispatcherOutbox(name), 1_000).unref?.()
+    if (existsSync(full)) setTimeout(() => ingestDispatcherOutbox(name), 1_000).unref?.()
   }).finally(() => dispatcherOutboxBusy.delete(name))
 }
 
@@ -949,27 +968,19 @@ bot.api.config.use((prev, method, payload, signal) => {
 let botUsername = ''
 let shuttingDown = false
 
-const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'])
-// DIVE-5508: 5dive-speak writes OGG/Opus, which Telegram plays as a voice note
-// only through sendVoice; sendDocument leaves it a file to download.
-const VOICE_EXTS = new Set(['.ogg', '.oga', '.opus'])
-
 /**
- * Send one file the way Telegram shows it best: a photo inline, an OGG as a
- * voice note, anything else as a document. A voice upload Telegram refuses
- * (not Opus inside) falls back to a document rather than losing the file.
+ * Send one file the way Telegram shows it best (outbox-send.ts): a photo
+ * inline, an OGG as a voice note, anything else as a document. A photo or voice
+ * upload Telegram refuses falls back to a document rather than losing the file
+ * (DIVE-8328: a tall screenshot fails sendPhoto with PHOTO_INVALID_DIMENSIONS).
  */
 async function sendFile(chat_id: string, file: string, opts?: Record<string, unknown>): Promise<{ message_id: number }> {
-  const ext = extname(file).toLowerCase()
-  if (PHOTO_EXTS.has(ext)) return bot.api.sendPhoto(chat_id, new InputFile(file), opts)
-  if (VOICE_EXTS.has(ext)) {
-    try {
-      return await bot.api.sendVoice(chat_id, new InputFile(file), opts)
-    } catch (err) {
-      process.stderr.write(`telegram-codex: sendVoice refused ${file}, sending as a document: ${err}\n`)
-    }
-  }
-  return bot.api.sendDocument(chat_id, new InputFile(file), opts)
+  return sendOneFile(file, {
+    sendPhoto: f => bot.api.sendPhoto(chat_id, new InputFile(f), opts),
+    sendVoice: f => bot.api.sendVoice(chat_id, new InputFile(f), opts),
+    sendDocument: f => bot.api.sendDocument(chat_id, new InputFile(f), opts),
+    log: line => process.stderr.write(`telegram-codex: ${line}\n`),
+  })
 }
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 

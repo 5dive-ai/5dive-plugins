@@ -35,6 +35,11 @@ export type DispatchMessage = {
    * cap; the number is which rewrite it is (1, 2). Set by the dispatcher only.
    */
   cut?: number
+  /**
+   * DIVE-8328: the files the held reply attached. The rewrite's first answer
+   * gets any it dropped, so a shorter version never loses the file.
+   */
+  carry?: string[]
 }
 
 /**
@@ -223,6 +228,13 @@ export interface DispatchSink {
    * recent_messages itself. Best-effort; [] when there is no log.
    */
   transcript?(route: DispatchRoute): TranscriptRow[]
+  /**
+   * DIVE-8328: what became of the files of this chat's earlier answers, taken
+   * (and cleared) as the next turn starts: one `[5dive attachments] …` line per
+   * answer, '' when none. The model has no tool result on this path, so this is
+   * the only way it learns a file it named never arrived.
+   */
+  receipts?(route: DispatchRoute): string
 }
 
 export type TranscriptRow = { ts: string; dir: 'in' | 'out'; user: string; text: string }
@@ -331,6 +343,21 @@ export function hasAttachmentDirective(text: string): boolean {
 
 function routeKey(route: DispatchRoute): string {
   return `${route.source}:${route.chat_id}:${route.message_thread_id ?? ''}`
+}
+
+/** DIVE-8328: the attachment lines a rewrite must still carry, appended to its text. */
+function withCarried(text: string, carry: string[] | undefined): string {
+  if (!carry?.length) return text
+  const have = new Set(parseOutboundMessage(text).files)
+  const missing = carry.filter(f => !have.has(f))
+  return missing.length ? `${text}\n${missing.map(f => `[[5dive-attachment:${f}]]`).join('\n')}` : text
+}
+
+/** Told with the cut-it prompt, so "attach a file" is not read as "attach it again". */
+function carryNote(carry: string[]): string {
+  if (!carry.length) return ''
+  const names = carry.map(f => f.split('/').pop()).join(', ')
+  return `\n[Your ${carry.length === 1 ? 'file' : 'files'} ${names} will be sent with the new version; you do not need to attach ${carry.length === 1 ? 'it' : 'them'} again.]`
 }
 
 /**
@@ -509,11 +536,12 @@ function mergeSnapshot(prev: RateLimitSnapshot | undefined, next: RateLimitSnaps
   return out
 }
 
-function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?: string, transcript?: string): Array<Record<string, unknown>> {
+function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?: string, transcript?: string, receipts?: string): Array<Record<string, unknown>> {
   const input: Array<Record<string, unknown>> = []
   if (recovery) input.push({ type: 'text', text: recoveryLine(recovery), text_elements: [] })
   if (transcript) input.push({ type: 'text', text: transcript, text_elements: [] })
   if (handoff) input.push({ type: 'text', text: handoff, text_elements: [] })
+  if (receipts) input.push({ type: 'text', text: receipts, text_elements: [] })
   input.push({ type: 'text', text: message.text, text_elements: [] })
   const attached = attachmentInput(message.image_path)
   if (attached) input.push(attached)
@@ -1112,11 +1140,13 @@ export class ChannelDispatcher {
         // to rewrite it, next and ahead of the queue; a failed one sends it as
         // written, never silence.
         if (cut && params?.turn?.status === 'completed') {
+          const carry = parseOutboundMessage(cut.text).files
           this.state.pending.unshift({
             id: `cut-${turnId}`,
-            text: cutItPrompt(cut.refusal),
+            text: cutItPrompt(cut.refusal) + carryNote(carry),
             route: completed.route,
             cut: (completed.message.cut ?? 0) + 1,
+            ...(carry.length ? { carry } : {}),
           })
         } else if (cut) {
           await this.sink.publish(completed.route, cut.text, { turnId, itemId: cut.itemId, kind: 'message', notify: false })
@@ -1161,11 +1191,15 @@ export class ChannelDispatcher {
     if (recovery?.kind === 'thread-lost' && this.sink.transcript) {
       try { transcript = recoveryTranscript(this.sink.transcript(message.route), message.text) } catch {}
     }
+    let receipts = ''
+    if (message.route.source !== 'agent' && this.sink.receipts) {
+      try { receipts = this.sink.receipts(message.route) } catch {}
+    }
     const result = await this.rpc.request('turn/start', {
       threadId: this.requireThread(),
       clientUserMessageId: message.id,
       turnTrigger: `5dive:${message.route.source}`,
-      input: inputFor(message, recovery, handoff, transcript),
+      input: inputFor(message, recovery, handoff, transcript, receipts),
       // Every turn re-asserts the seat's choice. The resume override already
       // sets it; this makes the TURN the guarantee rather than one handshake.
       ...(this.configured.model ? { model: this.configured.model } : {}),
@@ -1209,8 +1243,11 @@ export class ChannelDispatcher {
    * (cutItPrompt); the rewrite is what the chat gets. Agent-to-agent turns are
    * not chat and are never capped; system notices never come through here.
    */
-  private async publishAnswer(route: DispatchRoute, text: string, meta: PublishMeta): Promise<void> {
+  private async publishAnswer(route: DispatchRoute, raw: string, meta: PublishMeta): Promise<void> {
     const active = this.state.active
+    // DIVE-8328: a rewrite's first answer carries the held reply's files.
+    const text = withCarried(raw, active?.message.carry)
+    if (active?.message.carry) active.message.carry = undefined
     const refusal = route.source === 'agent' || !active || (active.message.cut ?? 0) >= REPLY_CUT_TRIES
       ? null : replyTooLong(text)
     if (refusal && active) {

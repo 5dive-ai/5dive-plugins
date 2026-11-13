@@ -87,7 +87,7 @@ describe('wiring', () => {
   const server = readFileSync(join(root, 'telegram-codex', 'server.ts'), 'utf8')
   test('the outbox plans once per file (kept across retries) and the MCP reply auto-attaches with a receipt', () => {
     expect(server).toMatch(/let plan = outboxAttachPlans\.get\(name\)/)
-    expect(server).toContain('for (const file of files)')
+    expect(server).toContain('const result = await deliverOutboxReply(text, files, {')
     expect(server).toContain('const autoPlan = planAutoAttach(text, { already: files })')
     expect(server).toContain('for (const f of [...files, ...autoPlan.attach])')
     expect(server).toMatch(/autoNames \? `; \$\{autoNames\}` : ''/)

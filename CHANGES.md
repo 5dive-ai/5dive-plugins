@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.50: a file Telegram refuses no longer re-sends the answer forever, and the agent and owner are told (DIVE-8328)
+
+- Box report 930: a Codex agent named two PNGs in its answer; the owner got the text twice and no images. Any failed file re-ingested the whole outbox file, so every retry sent the text again. Now the text goes once and the outbox file is removed as soon as it is out; each file is tried on its own (`outbox-send.ts`).
+- A picture `sendPhoto` refuses (a tall screenshot fails with PHOTO_INVALID_DIMENSIONS) goes again as a document. A file that still fails costs one line in the chat: "couldn't send <name>: <reason>".
+- An explicit `[[5dive-attachment:…]]` now obeys the same 50 MB cap as auto-attach (a 479 MB video went straight to Telegram): it is not uploaded and the footer says "too large to send".
+- An answer over the word cap that carried files: its rewrite sends them, whether or not the rewrite repeats the attachment lines. `replycap.ts` is unchanged (no fork bump).
+- The model learns the outcome: its next turn on that chat starts with `[5dive attachments] sent a.png · not sent: c.mp4 (479 MB, over Telegram's 50 MB)`.
+
 ### Fixed — mod 0.6.3: on poke-two the guard refuses a whole-project typecheck, `next build`/`next dev` and a full test suite (DIVE-8299)
 
 - New policy `heavy-local`. Two seats ran `npx tsc --noEmit -p .` on the frontend at once and every seat on poke-two went silent for 7 minutes (2026-11-12). The refusal says "CI runs this — push and let it" and names the targeted forms, which still run: `node --test <file>`, `bun test <file>`, `npm test -- <file>`, `tsc --noEmit <file>`. Anything sent over `ssh` runs. Escape: the seat setting `FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL`.
