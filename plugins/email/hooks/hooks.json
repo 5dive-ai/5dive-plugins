@@ -1,0 +1,17 @@
+{
+  "description": "5dive email plugin (DIVE-8315): while the newest message is an outside email, a risky act (root, paying, deleting, sending outside, settings, keys, access) waits for the owner's yes on their own channel.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/mail-guard.ts",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

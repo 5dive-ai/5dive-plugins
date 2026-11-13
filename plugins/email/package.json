@@ -1,0 +1,16 @@
+{
+  "name": "@5dive/email-plugin",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": "./server.ts",
+  "scripts": {
+    "start": "test -f /etc/5dive/local-only -a -d node_modules || bun install --no-summary; bun start.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "imapflow": "^1.7.8",
+    "mailparser": "^3.14.3",
+    "nodemailer": "^6.10.1",
+    "smtp-server": "^3.21.4"
+  }
+}
