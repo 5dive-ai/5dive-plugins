@@ -40,6 +40,10 @@ a stop sign either: read, links, snapshot and act check each page for a sign-in 
    **Hidden controls, embedded data, a long list: read them with a page script**,
    `{"op":"eval","expr":"[...document.querySelectorAll('a.title')].map(a=>a.textContent)"}`. It
    only reads: it prints JSON, and anything that would click, type or load is refused.
+   **An act of page scripts only (with `goto`/`wait_for`) is read-only**: it prints each script's
+   answer and nothing else, and saves no page.md, page.html, tree.json or page.png. Use it when the
+   owner says what you may NOT read (a private inbox, a chat list): ask for exactly the field you
+   need, never `textContent` of a whole row.
 3. **Verify** with `--expect=<regex>` only on the act that does the job (the save, the send,
    the search whose result you report): the words that prove it, matched on screen for up to
    2 s. A click that only opens a page or a menu needs no `--expect`: what it changed is printed.
@@ -168,3 +172,4 @@ These files sit next to this one, in `references/`:
   a new API key shows only a Copy button, code to paste, or the box's window is stuck.
 - `references/paying.md`: the whole pay/post/send/delete rule, when an act exits 73.
 - `references/repeat.md`: a flow you will run again (`--record`, `replay`, `--delta`).
+- `references/telegram-web.md`: reading Telegram Web without reading messages (own account, muted chats).

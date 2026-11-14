@@ -518,7 +518,9 @@ async function serveMode(profile, sock, broker, input) {
         // API; bin/browser's file rewrite is that mode's only keep.
         let kept = 0;
         if (req.keep_session && typeof ctx.cookies === 'function') {
-          try { kept = await sessionKeep.keepSessionCookies(ctx); } catch (e) { /* a stop must not fail on this */ }
+          // DIVE-8367: a person's window is kept longer (keep_s, at most 30 days).
+          const ks = Number.isInteger(req.keep_s) && req.keep_s > 0 && req.keep_s <= 2592000 ? req.keep_s : undefined;
+          try { kept = await sessionKeep.keepSessionCookies(ctx, ks); } catch (e) { /* a stop must not fail on this */ }
           send({ t: 'out', data: `kept=${kept}\n` });
         }
         shuttingDown = true;
@@ -1487,6 +1489,13 @@ async function planRequest(ctx, req, send, end) {
 async function sendReport(page, req, send, { failed = false, watch = null, settled = false } = {}) {
   if (!req.report) return;
   const r = req.report;
+  // A READ-ONLY ACT (DIVE-8443): only where the page is. No text, document, refs,
+  // picture or look is read, so none of it reaches the caller.
+  if (r.bare) {
+    try { send({ t: 'out', data: JSON.stringify({ act_report: true, bare: true, url: page.url() }) + '\n' }); }
+    catch (e) { send({ t: 'err', msg: `the steps ran but where the page is could not be read: ${e.message}` }); }
+    return;
+  }
   try {
     // DIVE-4983: the same wait, --expect window and refs the cold driver's report takes,
     // and nothing waited for after a failed step (DIVE-6778, as the cold driver): a
