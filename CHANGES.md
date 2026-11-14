@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.88.0: an Instagram account not linked to Facebook no longer reads "sign in again" while signed in (DIVE-8477)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @0014691 (`tests/browser_mirror.sh sync`). 1.87.0 read Instagram's viewer record with account 0 as signed out, but that field is the Facebook account, and it is 0 for every Instagram account not linked to Facebook; the Instagram account sits in a second field of the same record. Signed out is now both fields at 0, or the login form; signed in is a real id in either. A partner's client, signed in, got "sign in again" on every Done. Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — telegram-codex 0.5.52: a Codex hire on a ChatGPT plan without Sol answers instead of failing every turn (DIVE-8462)
 
 - Box report, 2026-11-14: a partner client's new Codex hire answered every message with "Codex could not complete this turn: The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account." New Codex seats start on Sol, and that client's plan does not offer it.
