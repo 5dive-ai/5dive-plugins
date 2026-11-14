@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Added — teams 0.6.0 + telegram-codex 0.5.52: Microsoft Teams on every enterprise setup (DIVE-8464)
+
+- Teams now answers on Claude Code with the firm's own AI server: Claude Code turns channels off there, so the message is typed into the session (`plugins/teams/channelroute.ts`, a copy of the dashboard's DIVE-6000 router; an org policy is never typed around).
+- Teams now answers on Codex seats: the dispatcher runs it as an adapter (`codex-adapter.ts` + `dispatch.ts`: inbox in, `outbox/teams/` out, through the reply tool's own send). `hooks/codex-role-guard.ts` holds a member's risky ask on Codex. `bin/teams` accepts Codex agents.
+- telegram-codex: `CODEX_DISPATCHER_PLUGIN_ADAPTERS` starts any channel plugin as an adapter and accepts its name as an inbox source; unconfigured names stay refused.
+
 ### Fixed — browser 1.87.0: an Instagram sign-in no longer reads "sign in again" because the page has a password field (DIVE-8457)
 
 - Registry copy synced byte-for-byte from 5dive-browser main @3468e9c (`tests/browser_mirror.sh sync`). Instagram's check read any page holding a password field as signed out, so a signed-in page that carried one read "session expired" and Done reopened the sign-in window right after a real sign-in. Signed out is now Instagram's viewer record with account 0 or its login form; signed in is the same record with a real account; a page showing neither reads "could not tell" and Done hands the site over. Box reports 942/974 (partner client). Detail in 5dive-browser's CHANGES.md.

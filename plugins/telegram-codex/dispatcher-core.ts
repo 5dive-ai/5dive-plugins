@@ -1,7 +1,8 @@
 import { migrateState } from './compat.ts'
 import { cutItPrompt, replyTooLong, REPLY_CUT_TRIES } from './replycap.ts'
 
-export type DispatchSource = 'telegram' | 'dashboard' | 'agent'
+// DIVE-8464: or a channel plugin's adapter name (plugin-adapters.ts), e.g. 'teams'.
+export type DispatchSource = 'telegram' | 'dashboard' | 'agent' | (string & {})
 
 export type DispatchRoute = {
   source: DispatchSource

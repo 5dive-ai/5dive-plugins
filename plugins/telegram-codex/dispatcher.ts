@@ -14,6 +14,7 @@ import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { readMessages } from './msglog.ts'
 import { rolloutSizer } from './rollout.ts'
 import { takeAttachReceipts } from './outbox-send.ts'
+import { allowedSources, resolvePluginAdapters } from './plugin-adapters.ts'
 import { approvalAsk, approvalResult, askOnTelegram, isApprovalMethod, verdictLine } from './approvals.ts'
 import {
   HEALTH_HEARTBEAT_MS, HEALTH_SCHEMA, writeHealth,
@@ -32,6 +33,13 @@ const WORKDIR = process.env.CODEX_DISPATCHER_WORKDIR ?? process.cwd()
 const CODEX_BIN = process.env.CODEX_BIN ?? 'codex'
 const BUN_BIN = process.execPath
 const CHANNELS = new Set((process.env.CODEX_DISPATCHER_CHANNELS ?? 'telegram').split(',').filter(Boolean))
+// DIVE-8464: channel plugins (teams, email) run as adapters beside telegram/dashboard.
+const PLUGIN_ADAPTERS = (() => {
+  const r = resolvePluginAdapters({ raw: process.env.CODEX_DISPATCHER_PLUGIN_ADAPTERS, channels: CHANNELS, pluginDir: import.meta.dir })
+  for (const w of r.warnings) process.stderr.write(`codex-dispatcher: ${w}\n`)
+  return r.adapters
+})()
+const INBOX_SOURCES = allowedSources(PLUGIN_ADAPTERS)
 
 const BRIDGE_VERSION: string = (() => {
   try {
@@ -295,6 +303,8 @@ async function publish(route: DispatchRoute, text: string, meta: Record<string, 
   }
   if (!outbound.text) throw new Error('dispatcher reply has no text after attachment directives')
   const dir = join(OUTBOX_DIR, route.source)
+  // DIVE-8464: a plugin adapter's outbox may not exist yet (its child makes it at boot).
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
   const file = join(dir, `${Date.now()}-${process.pid}-${outSeq++}.json`)
   atomicJson(file, { ...route, text: outbound.text, ...(outbound.files.length ? { files: outbound.files } : {}), ...meta })
 }
@@ -430,7 +440,7 @@ function ingest(name: string): void {
     try { unlinkSync(full) } catch {}
     return
   }
-  if (!['telegram', 'dashboard', 'agent'].includes(msg.route.source)) {
+  if (!INBOX_SOURCES.has(msg.route.source)) {
     process.stderr.write(`codex-dispatcher: invalid inbox source ${name}\n`)
     try { unlinkSync(full) } catch {}
     return
@@ -555,4 +565,7 @@ if (CHANNELS.has('dashboard')) {
       // runtime. Reusing it lets a Codex adapter recover drops made offline.
       ?? join(homedir(), '.claude', 'channels', 'dashboard'),
   })
+}
+for (const [name, entry] of Object.entries(PLUGIN_ADAPTERS)) {
+  startAdapter(entry, name, { CODEX_DISPATCHER_ADAPTER: name })
 }

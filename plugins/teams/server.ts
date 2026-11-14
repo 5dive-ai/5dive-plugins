@@ -19,7 +19,9 @@
 // `5dive agent teams connect`:
 //   { app_id, tenant_id, app_password, port, public_url?, allowed_users? }
 
-import { readFileSync, writeFileSync, mkdirSync, statSync, appendFileSync, renameSync, watch } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, statSync, appendFileSync, renameSync, watch, existsSync } from 'node:fs'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { homedir } from 'node:os'
 import { join, basename, extname } from 'node:path'
 import { lookup } from 'node:dns/promises'
@@ -35,9 +37,17 @@ import { splitTrailingOptions, choiceCard, answeredCard, fileConsentCard, fileIn
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { teamsShut, assertTeamsOpen, SHUT_LINE } from './offline.ts'
 import { loadRoles, roleOf, writeMark, readMark, applyRole, type Mark } from './roles.ts'
+import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
+import { writeDispatchInbox, startOutbox } from './dispatch.ts'
 import { readAccess, isKnockMode, needsKnock, readKnockState, onStranger, applyAnswers, type KnockState, type HeldItem, type Where } from './knock.ts'
 
 const STATE_DIR = process.env.TEAMS_STATE_DIR || join(homedir(), '.claude', 'channels', 'teams')
+// DIVE-8464: on a Codex seat (the "Online on a ChatGPT account" setup) this
+// server runs as a child of the telegram-codex dispatcher instead of as Claude
+// Code's MCP server: inbound goes to the dispatcher's inbox, the model's answer
+// comes back through its outbox (dispatch.ts). Every check below is the same.
+const DISPATCHER_ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'teams'
+const DISPATCHER_STATE_DIR = process.env.CODEX_DISPATCHER_STATE_DIR || join(homedir(), '.codex', 'channels', 'dispatcher')
 const CONFIG_PATH = join(STATE_DIR, 'config.json')
 const STATE_PATH = join(STATE_DIR, 'state.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
@@ -268,9 +278,33 @@ async function onConsent(conv: string, c: ConsentInvoke) {
   logLine('out', conv, 'agent', 0, 1, 'file-uploaded')
 }
 
+// The reply tool's whole send: text in chunks, a trailing numbered list as tap
+// buttons, then files. Also the Codex dispatcher's outbox path (DIVE-8464).
+async function sendReply(conv: string, text: string, files: string[]): Promise<string[]> {
+  if (!cfg) throw new Error('Teams is not connected for this agent. The owner runs: sudo 5dive agent teams connect <agent>')
+  const ids: string[] = []
+  const { body, options } = splitTrailingOptions(text)
+  const pieces = chunkText(body)
+  for (let i = 0; i < pieces.length; i++) {
+    const last = i === pieces.length - 1
+    if (last && options.length) {
+      const cardId = randomUUID()
+      const id = await sendActivity(conv, { attachments: [choiceCard(pieces[i], options, cardId)] })
+      state.cards[cardId] = { conv, activityId: id, body: pieces[i] }
+      saveState()
+      ids.push(id)
+    } else if (pieces[i]) {
+      ids.push(await sendActivity(conv, { text: pieces[i], textFormat: 'markdown' }))
+    }
+  }
+  for (const f of files) ids.push(await sendFile(conv, f))
+  logLine('out', conv, 'agent', text.length, files.length, options.length ? `buttons=${options.length}` : '')
+  return ids
+}
+
 // ── MCP ────────────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'teams', version: '0.5.1' },
+  { name: 'teams', version: '0.6.0' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions: [
@@ -339,25 +373,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req: any) => {
   try {
     if (!cfg) throw new Error('Teams is not connected for this agent. The owner runs: sudo 5dive agent teams connect <agent>')
     if (name === 'reply') {
-      const conv = String(a.chat_id ?? '')
-      const ids: string[] = []
-      const { body, options } = splitTrailingOptions(String(a.text ?? ''))
-      const pieces = chunkText(body)
-      for (let i = 0; i < pieces.length; i++) {
-        const last = i === pieces.length - 1
-        if (last && options.length) {
-          const cardId = randomUUID()
-          const id = await sendActivity(conv, { attachments: [choiceCard(pieces[i], options, cardId)] })
-          state.cards[cardId] = { conv, activityId: id, body: pieces[i] }
-          saveState()
-          ids.push(id)
-        } else if (pieces[i]) {
-          ids.push(await sendActivity(conv, { text: pieces[i], textFormat: 'markdown' }))
-        }
-      }
       const files: string[] = Array.isArray(a.files) ? a.files.map(String) : []
-      for (const f of files) ids.push(await sendFile(conv, f))
-      logLine('out', conv, 'agent', String(a.text ?? '').length, files.length, options.length ? `buttons=${options.length}` : '')
+      const ids = await sendReply(String(a.chat_id ?? ''), String(a.text ?? ''), files)
       return { content: [{ type: 'text', text: `sent (id: ${ids.filter(Boolean).join(', ') || '?'})` }] }
     }
     if (name === 'ask_admin') {
@@ -403,10 +420,73 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req: any) => {
   }
 })
 
+// DIVE-8464: where an inbound goes. Same router as the dashboard and Telegram
+// plugins (channelroute.ts): when this session ASKED Claude Code for the teams
+// channel and Claude Code REFUSED it (a seat on the firm's own AI server never
+// gets the flag), a channel notification is dropped unheard, so the message is
+// typed into the seat's own pane instead. Bound, org policy (the org's explicit
+// choice, never typed around), any other skip, no decision: the notification.
+const ROUTE_BOOT_MS = Date.now()
+const ROUTE_MARKER = `teams channel: route-marker ${process.pid}.${ROUTE_BOOT_MS}`
+if (!DISPATCHER_ADAPTER) process.stderr.write(`${ROUTE_MARKER}\n`)
+const inboundRoute = makeRouteProbe({
+  marker: ROUTE_MARKER,
+  bootPpid: process.ppid,
+  cacheRoot: join(homedir(), '.cache', 'claude-cli-nodejs'),
+  bootMs: ROUTE_BOOT_MS,
+})
+let lastRouteNoted = ''
+
+let sessionInjector: ((text: string) => Promise<void>) | null = null
+function injectIntoSession(text: string): Promise<void> {
+  if (!sessionInjector) {
+    const user = process.env.USER ?? process.env.LOGNAME ?? ''
+    const execFileP = promisify(execFile)
+    sessionInjector = makeSessionInjector({
+      tmuxBin: ['/usr/bin/tmux', '/usr/local/bin/tmux', '/bin/tmux'].find(p => existsSync(p)) ?? 'tmux',
+      socket: (process.env.TMUX ?? '').split(',')[0] ?? '',
+      target: process.env.TMUX_PANE || (user.startsWith('agent-') ? `${user}:0` : ''),
+      exec: (bin, args) => execFileP(bin, args),
+    })
+  }
+  return sessionInjector(text)
+}
+
+async function deliverToSession(content: string, meta: Record<string, string>): Promise<void> {
+  let route = inboundRoute.route()
+  // A message that beats Claude Code's gate decision at boot waits for it (bounded).
+  for (let i = 0; i < 20 && route === 'mcp' && inboundRoute.pending(); i++) {
+    await new Promise(r => setTimeout(r, 500))
+    route = inboundRoute.route()
+  }
+  const why = `${route} (${inboundRoute.describe()})`
+  if (why !== lastRouteNoted) {
+    lastRouteNoted = why
+    process.stderr.write(`teams channel: inbound route ${why}\n`)
+    recordLifecycle(STATE_DIR, 'delivery', 'teams', `inbound route ${why}`)
+  }
+  if (route === 'inject') {
+    try {
+      await injectIntoSession(formatInjection(content, meta))
+      return
+    } catch (err) {
+      process.stderr.write(`teams channel: session inject failed, falling back to the channel notification: ${err}\n`)
+    }
+  }
+  await mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } })
+}
+
 function deliver(content: string, meta: Record<string, string>) {
-  mcp
-    .notification({ method: 'notifications/claude/channel', params: { content, meta } })
-    .catch((e: unknown) => process.stderr.write(`teams deliver failed: ${e}\n`))
+  if (DISPATCHER_ADAPTER) {
+    try {
+      const m = writeDispatchInbox(DISPATCHER_STATE_DIR, String(meta.chat_id ?? ''), content, meta)
+      process.stderr.write(`teams: queued ${m.id} for the Codex dispatcher\n`)
+    } catch (e) {
+      process.stderr.write(`teams deliver to the Codex dispatcher failed: ${e}\n`)
+    }
+    return
+  }
+  deliverToSession(content, meta).catch((e: unknown) => process.stderr.write(`teams deliver failed: ${e}\n`))
 }
 
 // ── the endpoint ───────────────────────────────────────────────────────────
@@ -610,6 +690,20 @@ function startEndpoint() {
   watchKnocks()
 }
 
-installLifecycle({ channel: 'teams', stateDir: STATE_DIR })
-startEndpoint()
-await mcp.connect(new StdioServerTransport())
+if (DISPATCHER_ADAPTER) {
+  // No MCP parent and no stdin: the dispatcher supervises this child and stops
+  // it with SIGTERM, so the stdin-EOF/orphan watchdog would only kill it at boot.
+  process.stderr.write(`teams: Codex dispatcher adapter active, spool ${DISPATCHER_STATE_DIR}\n`)
+  recordLifecycle(STATE_DIR, 'start', 'teams', `codex dispatcher adapter, spool ${DISPATCHER_STATE_DIR}`)
+  startEndpoint()
+  startOutbox({
+    dir: join(DISPATCHER_STATE_DIR, 'outbox', 'teams'),
+    send: async (chat, text, files) => { await sendReply(chat, text, files) },
+    log: line => process.stderr.write(line + '\n'),
+  })
+  process.on('SIGTERM', () => process.exit(0))
+} else {
+  installLifecycle({ channel: 'teams', stateDir: STATE_DIR })
+  startEndpoint()
+  await mcp.connect(new StdioServerTransport())
+}

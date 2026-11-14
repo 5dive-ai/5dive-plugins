@@ -1,7 +1,7 @@
 {
   "name": "teams",
-  "description": "Microsoft Teams channel for Claude Code: each agent is its own contact in your company's Teams. Messages go between Microsoft and your own server only. DMs, files both ways, and tap buttons for questions.",
-  "version": "0.5.2",
+  "description": "Microsoft Teams channel: each agent is its own contact in your company's Teams. Messages go between Microsoft and your own server only. DMs, files both ways, and tap buttons for questions. Works on Claude Code (a Claude plan, or your own AI server) and Codex.",
+  "version": "0.6.0",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com"
@@ -32,6 +32,8 @@
       "publisher": "5dive",
       "did": "did:key:5dive",
       "review": "official"
-    }
+    },
+    "codex_adapter": "codex-adapter.ts",
+    "codex_hook": "hooks/codex-role-guard.ts"
   }
 }

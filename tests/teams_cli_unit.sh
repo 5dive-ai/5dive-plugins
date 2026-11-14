@@ -147,9 +147,17 @@ reset
 out=$(run agent connect max --app-id=nope --tenant-id=$TEN); rc=$?
 [[ $rc -eq 3 ]] && ok "a bad app id is refused" || bad "bad app id (rc=$rc)" "$out"
 
+reset; STUB_TYPE=hermes
+out=$(run agent connect max --app-id=$APP --tenant-id=$TEN); rc=$?
+[[ $rc -eq 3 && "$out" == *"Claude Code and Codex agents"* ]] && ok "other harnesses are refused for now" || bad "hermes refusal (rc=$rc)" "$out"
+STUB_TYPE=claude
+
+# DIVE-8464: a Codex agent passes the type check and reaches the same next step
+# a Claude agent does (no secret yet).
 reset; STUB_TYPE=codex
 out=$(run agent connect max --app-id=$APP --tenant-id=$TEN); rc=$?
-[[ $rc -eq 3 && "$out" == *"Claude Code agents"* ]] && ok "non-Claude agents are refused for now" || bad "codex refusal (rc=$rc)" "$out"
+[[ $rc -eq 6 && "$out" == *"secret write TEAMS_APP_PASSWORD --connector=teams-max"* ]] \
+  && ok "a Codex agent is accepted (DIVE-8464)" || bad "codex accepted (rc=$rc)" "$out"
 STUB_TYPE=claude
 
 reset
