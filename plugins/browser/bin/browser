@@ -936,7 +936,13 @@ _serve_offered_cold() {  # <site>; _SITE_DIR is the owner's profile
   _daemon_live "$_SITE_DIR" && return 0
   _serve_running "$_SITE_DIR" >/dev/null || return 0   # nothing up: the caller's own words stand
   if [[ "$(_kv "$(_serve_pidfile "$_SITE_DIR")" login)" == 1 ]] && _viewer_live "$_SITE_DIR"; then
-    die "$E_UNAVAILABLE" "$1 is still open in the owner's sign-in window: ask them to press Done on $1, then try again. Until they do, that window is theirs and no browser for the agent can start beside it."
+    # DIVE-8450 (box report 975): a Done that never arrives (a lost tap, an
+    # update that restarted the viewer, a Done that reopened this window) left
+    # "ask them to press Done" as the agent's only words, again and again. The
+    # admin stop is the way out that needs nobody at the window: since 1.84.0 a
+    # person's window stops WITH its login kept (DIVE-8367), so the next command
+    # starts the agent's browser on it.
+    die "$E_UNAVAILABLE" "$1 is still open in the owner's sign-in window: ask them to press Done on $1, then try again. Until they do, that window is theirs and no browser for the agent can start beside it. If they already pressed Done, or nobody is at that window, close it without them (the login is kept, and your next command starts your browser):  sudo 5dive browser serve $1 --stop"
   fi
   local why=""
   if [[ -n "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then why="the session daemon is turned off on this box (FIVEDIVE_BROWSER_NO_DAEMON)"
@@ -12848,8 +12854,35 @@ _connect_check_login() {  # <site>
   local verdict
   verdict=$(printf '%s\n' "$out" | awk -v s="$site" '$1 == s { sub(/^[ \t]+/, ""); sub(/[ \t]+/, " "); print; exit }')
   [[ -n "$verdict" ]] || verdict=$(printf '%s\n' "$out" | grep -v '^$' | tail -1)
-  printf 'site=%s\nstatus_rc=%s\nstatus=%s\n' "$site" "$rc" "$verdict"
+  local so=0; _connect_signed_out "$rc" "$verdict" && so=1
+  printf 'site=%s\nstatus_rc=%s\nstatus=%s\nsigned_out=%s\n' "$site" "$rc" "$verdict" "$so"
 }
+
+# >>> DIVE-8450 only a sign-out the box SAW reopens the owner's window
+#
+# Box report 975 (wry-rune, 2026-11-14): app.chatplace.io was signed in (the
+# agent had read its canvas), the owner pressed Done, and the agent was then
+# refused with "still open in the owner's sign-in window: ask them to press
+# Done". A Done whose check did not return 0 reopened the window, and the broker
+# refuses every agent call while it is up (DIVE-8331). A check that cannot
+# confirm a site (no adapter's verdict, a bot check shown to the headless probe,
+# a browser that would not start) said nothing about the login, yet locked the
+# agent out of a session the owner had just made, with no end to the loop.
+#
+# SIGNED OUT means the box saw it: the adapter's signed-out marker, a sign-in
+# form or password field, a landing on a sign-in address, a sign-in window
+# title. Each of those reads "session expired". A "Log in"/"Sign up" control in
+# the page HEADER also reads expired for the tile, but an app's header offers
+# those while signed in too, so after the owner's own Done it is not enough.
+# Anything else is NOT CONFIRMED: the window stays closed and the session is the
+# agent's. Its page verbs still refuse a sign-in page themselves (_signin_guard),
+# so its first real act is the test.
+_connect_signed_out() {  # <status_rc> <verdict>; rc 0 when the box saw a sign-out
+  [[ "$1" != 0 && "$2" == *"session expired — human action required"* ]] || return 1
+  [[ "$2" == *'(generic check: a "'*'" control in the page header)'* ]] && return 1
+  return 0
+}
+# <<< DIVE-8450
 
 # >>> DIVE-7675 Done in the viewer itself
 #
@@ -12919,7 +12952,10 @@ _connect_view_check() {  # <site> <bind>
   [[ "$(_kv "$tf" bind)" == "$bind" && "$(_kv "$tf" state)" == consumed ]] || { printf 'result=gone\n'; return 0; }
   out=$(_connect_check_login "$site")
   [[ "$(sed -n 's/^status_rc=//p' <<<"$out" | head -1)" == 0 ]] && { printf 'result=saved\n'; return 0; }
-  # Not signed in yet: the same window again, so the step can be finished there.
+  # DIVE-8450: not confirmed is not signed out. The window is already closed;
+  # the session is the agent's, and nothing reopens over it.
+  [[ "$(sed -n 's/^signed_out=//p' <<<"$out" | head -1)" == 1 ]] || { printf 'result=saved\n'; return 0; }
+  # Signed out: the same window again, so the step can be finished there.
   again=$( _connect_view_link "$site" >/dev/null 2>&1 || exit 1
            printf 'https://%s%s' "$CONNECT_LINK_HOST" "$CONNECT_LINK_PATH" ) || again=""
   printf 'result=notyet\n'
@@ -12950,6 +12986,7 @@ _connect_view_done() {  # <caller> <site> <bind>
   (( rc == 0 )) || { printf 'result=gone\n'; return 0; }
   st=$(sed -n 's/^status=//p' <<<"$out" | head -1); src=$(sed -n 's/^status_rc=//p' <<<"$out" | head -1)
   chk=$(sed -n 's/^check=//p' <<<"$out" | head -1)
+  local sout; sout=$(sed -n 's/^signed_out=//p' <<<"$out" | head -1)
   who="${seat#agent-}"
   # The words are the chat Done's, letter for letter (the telegram plugin's
   # renderConnectVerdict and connectAgentNote), so the agent cannot tell which
@@ -12964,9 +13001,16 @@ _connect_view_done() {  # <caller> <site> <bind>
     note+="then re-read the page you were stopped on (5dive browser snapshot <that url>) and continue from that step. "
     note+="If a check is still on the page, say so once and stop; never try to solve it."
   else
-    if [[ "$src" == 0 ]]; then result=saved text="✅ $site is connected. The agent can use it now."
-    else result=notyet text="⚠️ $site is not confirmed logged in: ${st:-no verdict}."; fi
     note="[browser connect] The owner finished logging in to $site. \`5dive browser status $site\` said: ${st:-nothing}"
+    if [[ "$src" == 0 ]]; then result=saved text="✅ $site is connected. The agent can use it now."
+    elif [[ "$sout" == 1 ]]; then result=notyet text="⚠️ $site is not confirmed logged in: ${st:-no verdict}."
+    else
+      # DIVE-8450: the box could not tell, which is not "signed out". The window
+      # stays closed and the agent tries the site; a sign-in page it meets is
+      # refused by its own page verbs, and it asks again only then.
+      result=saved text="✅ $site is connected, not confirmed: the box could not check the login itself. The agent will try it now."
+      note+=". That is not a sign-out the box saw, so the owner's window is closed and $site is yours: carry on now (5dive browser snapshot <the page you need>). If a page you open is a sign-in, ask once more: 5dive browser connect-request $site"
+    fi
   fi
   # Not signed in yet: the same window again, under a fresh Done (a Telegram ask;
   # an ask in the login shell or the app chat is asked again from there).
