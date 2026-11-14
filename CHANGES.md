@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.142: a photo that cannot be saved still reaches the agent (DIVE-8489)
+
+- Box report 994 (partner client): owner photos reached the agent as a bare `(photo)`, with no file and no file id, so the photo was lost and nobody was told. Any failure to save a photo (Telegram unreachable, disk full, an unwritable inbox, a non-200 download) now delivers it as an attachment: `attachment_kind=photo`, `attachment_file_id` and a short `attachment_error` in meta, so the agent can retry with `download_attachment`. A non-200 download is no longer saved as a `.jpg`, and the reason never carries the bot token.
+
 ### Fixed — browser 1.89.0: a signed-out site whose Log in button is only an icon no longer reads connected (DIVE-8483)
 
 - Registry copy synced byte-for-byte from 5dive-browser main @03d2794 (`tests/browser_mirror.sh sync`). The generic sign-in check counted header controls with no words and no label as a signed-in header, so chatplace.io's signed-out home page (its Log in is an icon) read connected on Done. Such a link is now read by its address: a log-in, sign-in or sign-up path reads signed out. Detail in 5dive-browser's CHANGES.md.
