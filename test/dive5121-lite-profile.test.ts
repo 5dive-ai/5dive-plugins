@@ -93,7 +93,7 @@ describe('no profile set = the plugin as it is today', () => {
     expect(renderHelpBody(COMMAND_REGISTRY, true)).not.toContain('/council')
   })
 
-  test('the default MCP instructions block is byte-identical to the 0.5.64 release plus the DIVE-5171 tap line and the DIVE-7429 reply-context line', () => {
+  test('the default MCP instructions block is byte-identical to the 0.5.64 release plus the DIVE-5171 tap line, the DIVE-7429 reply-context line and the DIVE-8489 attachment_error clause', () => {
     // Extracted exactly as tests/telegram_instructions_unit.sh extracts it.
     // DIVE-5171 (0.5.68) added one sentence on purpose — a via="button" inbound
     // is the user's real answer — so the pin moved with it. 0.5.64's block was
@@ -122,13 +122,17 @@ describe('no profile set = the plugin as it is today', () => {
     // speaks, only owner speaks for the owner, and a non-owner's group message
     // arrives fenced as data. 0.5.137's block was
     // d60cd6365124253cd2cf5984372ab83a789ed0a0ac392f9d3f6015093c0f4044.
+    // DIVE-8489 (0.5.142) added one clause on purpose: attachment_error means
+    // the photo could not be saved, so retry it with download_attachment.
+    // 0.5.141's block was
+    // 58292327248fb928e05a5b6eddbf800b690b928766dbbfa851c929ea0ea43325.
     const lines = SERVER.split('\n')
     const start = lines.indexOf('    instructions: [')
     const end = lines.findIndex((l, i) => i > start && /^    \]\.join/.test(l))
     expect(start).toBeGreaterThan(0)
     expect(end).toBeGreaterThan(start)
     const block = lines.slice(start + 1, end).join('\n') + '\n'
-    expect(sha(block)).toBe('58292327248fb928e05a5b6eddbf800b690b928766dbbfa851c929ea0ea43325')
+    expect(sha(block)).toBe('419f91d0ba0ba760117ce97efdebb08fdc6a3237328341529adcc42f8cbad041')
     // The lite block is a LATER key that only exists when LITE is true.
     expect(lines[end]).toBe("    ].join('\\n'),")
     expect(lines.slice(end + 1, end + 5).join('\n')).toContain('...(LITE ? { instructions: LITE_INSTRUCTIONS } : {}),')
