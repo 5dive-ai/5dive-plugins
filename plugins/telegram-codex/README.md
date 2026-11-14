@@ -40,6 +40,14 @@ restart switches the EXISTING conversation, history intact. `health.json`
 records `threadModel`/`threadEffort` as the app-server reports them, and
 `/status` prints a `conversation:` line whenever that differs from the config.
 
+A ChatGPT plan that does not offer the seat's model (DIVE-8462: "The
+'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.")
+no longer fails every turn. The dispatcher asks the app-server for the
+account's `model/list`, picks the first listed model no refusal has ruled out,
+writes it as `model` in `config.toml`, says so once in the chat and runs the
+same message again on it. A message is re-run at most 3 times; refused models
+are kept in `state.json` `refusedModels`.
+
 Context controls (DIVE-5502). `/context` shows how much the live thread
 carries, the last model call's input (and how much of it was cached) and the
 number of calls, as `thread/tokenUsage/updated` reported them, with two buttons:
@@ -380,6 +388,7 @@ relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
 - v0.5.47 — DIVE-7730: a chat attachment that is not a picture (png, jpg, gif, webp, bmp) goes to the model as a text line with its path, not as an image, so the agent opens it with its own tools.
 - v0.5.48 — DIVE-7811: a chat reply over 70 words is not sent. The Telegram reply and edit tools refuse it with the same cut-it error as Claude Code (same `replycap.ts`), and the web chat dispatcher holds a long answer, asks the agent to cut it and sends only the rewrite (after 2 tries the last version goes as written). `FIVEDIVE_REPLY_MAX_WORDS` overrides; 0 turns it off.
 - v0.5.49 — DIVE-7825: a Telegram poll that gets no answer is cut off at its 30 s window plus 15 s and retried, instead of waiting the client's 500 s default (after a Telegram outage the channel went deaf for ~8 min with no log line). Each failure writes one stderr line (then at most one a minute), the first success after it says so, and every completed poll touches `bot.lastpoll` in the state dir, which `5dive liveness` reads to report a stalled poll. Uploads keep the long timeout. Same `pollguard.ts` as telegram 0.5.136.
+- v0.5.52 — DIVE-8462: a plan refusal of the seat model switches the seat to the first model the account lists that it allows (written to `config.toml`), tells the chat once, and answers the same message on it. Box report: a partner client's Codex hire on a ChatGPT plan without Sol failed every turn.
 - v0.5.51 — DIVE-8414: a Codex lead woken by a teammate can reach its owner. A teammate turn starts with a `[5dive teammate]` line; a message carrying `[[5dive-to-owner]]` goes to the owner's chat with its files (paired owner from `access.json`, else the last private Telegram chat served, else the last dashboard chat; kept in `state.json` `lastChats`). The thread instructions no longer say every answer is routed back. Box reports 958/960: before, the lead's answer to the owner went only to the dispatcher's stdout.
 - v0.5.50 — DIVE-8328: a file in a dispatcher answer that Telegram refuses no longer re-sends the answer's text forever. The text goes once; each file is tried on its own; a picture `sendPhoto` refuses (e.g. a tall screenshot) goes again as a document; a file that still fails costs one "couldn't send <name>: <reason>" line. An explicit `[[5dive-attachment:…]]` obeys the 50 MB cap ("too large to send"). An over-cap answer's rewrite keeps the held answer's files. The model's next turn on that chat starts with `[5dive attachments] sent … · not sent: …` (`outbox-send.ts`).
 - v0.5.45 — DIVE-7506: a one-time browser viewer link in any send keeps its copy-only code span and previews off, and gets an "Open the browser" inline URL button under the message (one tap; Telegram never previews a URL button, so the tap spends the ticket). A reply keyboard, a path-only link or a raw-IP/http link keeps the code span alone. Same guard as telegram 0.5.130.
