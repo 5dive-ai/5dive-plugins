@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.51: a Codex lead woken by a teammate can hand its owner the result (DIVE-8414)
+
+- Box reports 958/960: a Codex lead routed "write 3 headlines" to a teammate, got them back by `5dive agent send`, wrote its answer to the owner, and the owner got nothing until he wrote again. A teammate's message runs as an `agent` turn, its answers went only to the dispatcher's log, and the thread's instructions told the model every answer goes back to the chat.
+- A teammate turn now starts with a `[5dive teammate]` line: the answer goes to that agent only, and a message with a separate `[[5dive-to-owner]]` line also goes to the owner's chat, files included, with a notification. The owner is the one paired in the Telegram access file, else the last private Telegram chat the dispatcher served (kept across restarts), else the last dashboard chat.
+- Nothing is forwarded without the line, so teammate chatter never reaches the owner. The thread instructions no longer promise a route that does not exist. The grok, agy, pi and opencode forks have no dispatcher (they reply with the `reply` tool like Claude) and are unchanged.
+
 ### Fixed — telegram 0.5.141, dashboard 0.5.39: a seat on its weekly limit waits for the printed reset day instead of typing "continue" every few minutes (DIVE-8374)
 
 - The weekly wall prints a date (`resets Nov 17, 8am`) and the hook resolved it to the right time, about 88h out. The resume helper trusted a reset only up to 30h ahead, so it skipped the wait and typed `continue` at 5, 10, 20 minutes, each answered by the same weekly-limit line. It now trusts a reset up to 8 days out (the same bound the parser puts on a dated reset), parks once, and resumes at the printed time. Further out is still a stale line and still goes to the retry path.

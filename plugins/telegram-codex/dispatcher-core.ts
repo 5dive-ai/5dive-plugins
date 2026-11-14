@@ -164,6 +164,12 @@ export type DispatcherState = {
    * as one message on the next chat route that has one (DIVE-5918).
    */
   notice?: string
+  /**
+   * DIVE-8414: the last Telegram private chat and the last dashboard chat a
+   * turn came from, kept across restarts. Where a teammate turn's
+   * [[5dive-to-owner]] message goes when the host names no paired owner.
+   */
+  lastChats?: { telegram?: DispatchRoute; dashboard?: DispatchRoute }
 }
 
 /** A model choice. `effort` is a Codex reasoning effort (`low`, `high`, …). */
@@ -216,6 +222,10 @@ export type PublishMeta = {
   notify?: boolean
   /** Tool steps so far, on progress events. */
   steps?: number
+  /** DIVE-8414: a teammate turn's message the model addressed to its owner. */
+  toOwner?: boolean
+  /** DIVE-8414: it asked for the owner and no owner chat is known; the host logs it. */
+  ownerUnreachable?: boolean
 }
 
 export interface DispatchSink {
@@ -235,6 +245,12 @@ export interface DispatchSink {
    * the only way it learns a file it named never arrived.
    */
   receipts?(route: DispatchRoute): string
+  /**
+   * DIVE-8414: the seat owner's chat as the host knows it (the paired owner in
+   * the Telegram access file). Undefined when there is none; the dispatcher
+   * then falls back to the last owner-facing chat it served.
+   */
+  ownerRoute?(): DispatchRoute | undefined
 }
 
 export type TranscriptRow = { ts: string; dir: 'in' | 'out'; user: string; text: string }
@@ -324,16 +340,50 @@ export const ROLLOUT_RESUME_CAP_BYTES = 200 * 1024 * 1024
 /** At a turn boundary a rollout over this rotates first, so it never grows to the boot cap. */
 export const ROLLOUT_ROTATE_BYTES = 100 * 1024 * 1024
 const ATTACHMENT_LINE = /^\[\[5dive-attachment:(\/[^\]\r\n]+)\]\]$/
+/**
+ * DIVE-8414: a teammate turn's answer goes back to that agent only. This line,
+ * on its own, sends the message (files included) to the seat's owner instead
+ * of dropping it. Removed from the text on every route.
+ */
+export const OWNER_DIRECTIVE = '[[5dive-to-owner]]'
+const OWNER_LINE = /^\[\[5dive-to-owner\]\]$/i
 
-export function parseOutboundMessage(raw: string): { text: string; files: string[] } {
+export function parseOutboundMessage(raw: string): { text: string; files: string[]; toOwner?: true } {
   const files: string[] = []
+  let toOwner = false
   const lines = raw.split(/\r?\n/).filter(line => {
+    if (OWNER_LINE.test(line.trim())) { toOwner = true; return false }
     const match = line.trim().match(ATTACHMENT_LINE)
     if (!match) return true
     if (files.length < 10 && !files.includes(match[1]!)) files.push(match[1]!)
     return false
   })
-  return { text: lines.join('\n').trim(), files }
+  return { text: lines.join('\n').trim(), files, ...(toOwner ? { toOwner: true as const } : {}) }
+}
+
+/**
+ * DIVE-8414: the line a teammate's message is prefixed with. Without it a Codex
+ * lead woken by `agent send` believed its answer reached the owner (the thread's
+ * instructions said every answer is routed back to "the originating channel")
+ * and the owner never got the result.
+ */
+export const DEVELOPER_INSTRUCTIONS = 'Messages arrive from 5dive channels (your owner\'s chat) or from teammate agents. Respond normally in assistant messages: the answer to a chat message goes back to that chat. '
+  + `A message from a teammate starts with [5dive teammate]; your answer to it goes to that agent only, so to reach your owner from such a turn add a separate ${OWNER_DIRECTIVE} line. `
+  + 'Do not call wait_for_message or channel reply tools. A report, image, PDF or log you name by absolute path in a reply is attached automatically (once per turn; credential files never). '
+  + 'For any other file, include a separate [[5dive-attachment:/absolute/path]] line after a non-empty caption; the dispatcher removes the directive and sends the file with that message.'
+
+/** DIVE-8414: the seat's owner chats, as the Claude plugin's hooks/lib/owners.ts reads them. */
+export function ownerChatIds(access: { owners?: unknown; allowFrom?: unknown }): string[] {
+  const allow = Array.isArray(access.allowFrom) ? access.allowFrom.map(String) : []
+  const owners = Array.isArray(access.owners) ? access.owners.map(String) : allow
+  return owners.filter(id => allow.includes(id) && /^[1-9]\d*$/.test(id))
+}
+
+export function teammateLine(): string {
+  return '[5dive teammate] This message is from another agent on your team (5dive agent send), not from your owner. '
+    + 'Your answer goes back to that agent only: your owner sees nothing of this turn. '
+    + `To give your owner a result, or to ask them something, put a separate line ${OWNER_DIRECTIVE} in that message: `
+    + 'it goes to their chat, with any files you attach. Leave it out of replies meant only for the teammate.'
 }
 
 /** Whether <text> asks for a file to be attached: the ack cannot carry one. */
@@ -542,6 +592,7 @@ function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?
   if (transcript) input.push({ type: 'text', text: transcript, text_elements: [] })
   if (handoff) input.push({ type: 'text', text: handoff, text_elements: [] })
   if (receipts) input.push({ type: 'text', text: receipts, text_elements: [] })
+  if (message.route.source === 'agent') input.push({ type: 'text', text: teammateLine(), text_elements: [] })
   input.push({ type: 'text', text: message.text, text_elements: [] })
   const attached = attachmentInput(message.image_path)
   if (attached) input.push(attached)
@@ -1008,7 +1059,7 @@ export class ChannelDispatcher {
       cwd: this.cwd,
       serviceName: '5dive-channel-dispatcher',
       developerInstructions:
-        'Messages arrive from 5dive channels. Respond normally in assistant messages; the dispatcher routes those messages back to the originating channel. Do not call wait_for_message or channel reply tools. A report, image, PDF or log you name by absolute path in a reply is attached automatically (once per turn; credential files never). For any other file, include a separate [[5dive-attachment:/absolute/path]] line after a non-empty caption; the dispatcher removes the directive and sends the file only to the originating channel.',
+        DEVELOPER_INSTRUCTIONS,
     })
     const id = started?.thread?.id
     if (typeof id !== 'string' || !id) throw new Error('thread/start returned no thread id')
@@ -1232,6 +1283,7 @@ export class ChannelDispatcher {
     // that threw leaves the context in state for the retry.
     if (recovery) this.state.recovery = undefined
     if (handoff) this.state.handoff = undefined
+    this.noteChat(message.route)
     this.remember(message)
     this.markSeen(message.id)
     this.persist()
@@ -1255,7 +1307,43 @@ export class ChannelDispatcher {
       this.cut = { turnId: active.turnId, refusal, text, itemId: String(meta.itemId ?? '') }
       return
     }
-    await this.sink.publish(route, text, meta)
+    await this.sink.publish(route, text, await this.publishToOwner(route, text, meta))
+  }
+
+  /**
+   * DIVE-8414: remember where the owner talks, for a teammate turn's
+   * [[5dive-to-owner]] message when the host names no paired owner. A Telegram
+   * route counts only for a private chat (a group's id is negative), and
+   * without its topic or voice flag: the owner gets a plain message.
+   */
+  private noteChat(route: DispatchRoute): void {
+    const chats = { ...(this.state.lastChats ?? {}) }
+    if (route.source === 'telegram' && /^[1-9]\d*$/.test(route.chat_id)) chats.telegram = { source: 'telegram', chat_id: route.chat_id }
+    else if (route.source === 'dashboard') chats.dashboard = { source: 'dashboard', chat_id: route.chat_id }
+    else return
+    this.state.lastChats = chats
+  }
+
+  /** The owner's chat: the paired owner, else the last owner-facing chat served. */
+  ownerRoute(): DispatchRoute | undefined {
+    let paired: DispatchRoute | undefined
+    try { paired = this.sink.ownerRoute?.() } catch {}
+    return paired ?? this.state.lastChats?.telegram ?? this.state.lastChats?.dashboard
+  }
+
+  /**
+   * DIVE-8414: a teammate turn's message that carries [[5dive-to-owner]] goes
+   * to the owner's chat too, notifying: it is the one thing in that turn the
+   * owner is meant to read. The teammate route still gets it (the host prints
+   * agent answers; nothing else reads them). Without the line nothing is
+   * forwarded: worker-lead chatter must not reach the owner.
+   */
+  private async publishToOwner(route: DispatchRoute, text: string, meta: PublishMeta): Promise<PublishMeta> {
+    if (route.source !== 'agent' || !parseOutboundMessage(text).toOwner) return meta
+    const owner = this.ownerRoute()
+    if (!owner) return { ...meta, ownerUnreachable: true }
+    await this.sink.publish(owner, text, { ...meta, notify: true, toOwner: true })
+    return meta
   }
 
   /** Progress is decoration: a failed write must never fail the turn. */

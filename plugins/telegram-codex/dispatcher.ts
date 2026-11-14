@@ -7,7 +7,8 @@ import {
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
-  CONTROL_OPS, ChannelDispatcher, isEffortLevel, parseOutboundMessage, type DispatchMessage, type DispatchRoute, type UsageSample,
+  CONTROL_OPS, ChannelDispatcher, isEffortLevel, ownerChatIds, parseOutboundMessage,
+  type DispatchMessage, type DispatchRoute, type UsageSample,
 } from './dispatcher-core.ts'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
 import { readMessages } from './msglog.ts'
@@ -285,7 +286,13 @@ async function publish(route: DispatchRoute, text: string, meta: Record<string, 
     health.lastOutboundAt = new Date().toISOString()
     process.stdout.write(`${outbound.text}\n`)
   }
-  if (route.source === 'agent') return
+  if (route.source === 'agent') {
+    // DIVE-8414: the dispatcher copied a [[5dive-to-owner]] message to the
+    // owner's chat; this one is the teammate's copy. Unreachable is said here,
+    // where an operator reading the seat's log will look for it.
+    if (meta.ownerUnreachable) process.stderr.write('codex-dispatcher: a message for the owner was dropped: no paired Telegram owner and no chat served yet\n')
+    return
+  }
   if (!outbound.text) throw new Error('dispatcher reply has no text after attachment directives')
   const dir = join(OUTBOX_DIR, route.source)
   const file = join(dir, `${Date.now()}-${process.pid}-${outSeq++}.json`)
@@ -319,7 +326,25 @@ function attachReceipts(route: DispatchRoute): string {
   return route.source === 'telegram' ? takeAttachReceipts(RECEIPTS_DIR, route.chat_id) : ''
 }
 
-const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, usage: recordUsageSample, transcript: chatTranscript, receipts: attachReceipts }, WORKDIR, configuredModel, rolloutSize)
+// DIVE-8414: the owner of this seat, for a teammate turn's [[5dive-to-owner]]
+// message. The Telegram access file names them (`owners`, else the paired
+// `allowFrom`, private chats only: the same reading as the Claude plugin's
+// hooks/lib/owners.ts). Read per message, so a pairing made after boot counts.
+const TELEGRAM_ACCESS_FILE = join(TELEGRAM_STATE_DIR, 'access.json')
+/** {} when the file is missing or unreadable: an owner lookup never throws. */
+function readAccessForOwner(file: string): { owners?: unknown; allowFrom?: unknown } {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch { return {} }
+}
+function pairedOwnerRoute(): DispatchRoute | undefined {
+  if (!CHANNELS.has('telegram')) return undefined
+  const chat = ownerChatIds(readAccessForOwner(TELEGRAM_ACCESS_FILE))[0]
+  return chat ? { source: 'telegram', chat_id: chat } : undefined
+}
+
+const dispatcher = new ChannelDispatcher(rpc, stateStore(), { publish, ownerRoute: pairedOwnerRoute, usage: recordUsageSample, transcript: chatTranscript, receipts: attachReceipts }, WORKDIR, configuredModel, rolloutSize)
 
 // ── approvals (DIVE-5504) ───────────────────────────────────────────────────
 //

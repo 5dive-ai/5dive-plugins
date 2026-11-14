@@ -44,6 +44,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 - v0.5.47 — DIVE-7730: a non-picture chat attachment goes to the model as its path, not as an image.
 - v0.5.48 — DIVE-7811: a chat reply over 70 words goes back to the agent to cut; only the rewrite is sent (shared `replycap.ts`).
 - v0.5.49 — DIVE-7825: a Telegram poll with no answer is cut off at 45 s and retried, logged, and recorded in `bot.lastpoll` (shared `pollguard.ts`).
+- v0.5.51 — DIVE-8414: teammate turns are labelled; `[[5dive-to-owner]]` copies a message to the owner's chat (paired owner, else last private chat, else dashboard). Residual: an owner message from a teammate turn is not held to the chat word cap.
 - v0.5.50 — DIVE-8328: a refused file never re-sends the text; photo→document fallback; 50 MB cap on explicit directives; rewrite keeps files; next-turn `[5dive attachments]` receipt (`outbox-send.ts`).
 - v0.5.45 — DIVE-7506: a one-time browser viewer link keeps its code span and gets an "Open the browser" URL button under the message.
 - v0.5.38 — DIVE-6988: a '?' inside quotes no longer costs a yes/no question its buttons (shared `tna.ts`).
