@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.85.0: an act of page scripts only saves nothing of the page (DIVE-8443)
+
+- Registry copy synced byte-for-byte from 5dive-browser branch dive-8443-act-read-only @6bfbc46 (`tests/browser_mirror.sh sync`). An act whose steps are only `eval` (after a `goto` or `wait_for`) now prints each script's answer and nothing else: no page.md, page.html, tree.json or page.png, and no page text. Box report 970: an owner could not let his agent read only which Telegram chats are muted, because every act also saved the chat list's text. The use-browser skill gains notes for Telegram Web (own account, muted chats). Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — devteam 0.4.1: a graded PR no longer merges while its CI is still running or red (DIVE-8435)
 
 - On 11-13, 4 of the 10 bot merges on the private api and frontend repos landed seconds after a seat's PASS, with the PR's test job still running (3) or already red (1). Main went red three times; one prod deploy failed. Only CI-graded rows waited for checks; a seat-graded row merged on the premise its grader had read CI. Private repos get no branch protection, so nothing else caught it.

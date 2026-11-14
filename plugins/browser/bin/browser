@@ -6014,10 +6014,11 @@ cmd_serve() {
     # lost that way on chill-gorge (2026-10-02). So the wait keys on what the
     # stop is protecting — a person was admitted to THIS serve's browser — and
     # runs BEFORE the daemon is asked to go, whichever process holds the Chrome.
-    local hpid=""
+    local hpid="" person=0
     if [[ -n "$cpid" ]] && _pid_live "$cpid"; then hpid="$cpid"
     elif [[ -n "$dpid" ]] && _pid_live "$dpid"; then hpid="$dpid"; fi
     if [[ -n "$hpid" ]] && { [[ -n "$cpid" && "$(_kv "$f" login)" == 1 ]] || _viewer_admitted_since "$dir" "$(_kv "$f" started_at)"; }; then
+      person=1
       local cs="${FIVEDIVE_BROWSER_COOKIE_SETTLE:-24}"; [[ "$cs" =~ ^[0-9]+$ ]] || cs=24
       local sref; sref=$(mktemp "${TMPDIR:-/tmp}/5dive-stop.XXXXXX" 2>/dev/null) || sref=""
       if [[ -n "$sref" ]] && (( cs > 0 )); then
@@ -6043,7 +6044,9 @@ cmd_serve() {
     if [[ -n "$dpid" ]] && _pid_live "$dpid"; then
       # A swap asks the automated browser to keep the session-only logins first
       # (DIVE-7314: lib/session-keep.cjs, Chrome stores them itself).
+      # And so does the stop of a person's window (DIVE-8367), for SESSION_KEEP_SAVED_S.
       local sreq='{"op":"shutdown"}'; [[ "${_SERVE_SWAP:-}" == 1 ]] && sreq='{"op":"shutdown","keep_session":true}'
+      (( person )) && sreq='{"op":"shutdown","keep_session":true,"keep_s":'"$SESSION_KEEP_SAVED_S"'}'
       _daemon_call "$dir" "$sreq" >/dev/null 2>&1 || true
       local w=0
       while (( w < 100 )) && _pid_live "$dpid"; do sleep 0.05; w=$(( w + 1 )); done
@@ -6066,7 +6069,15 @@ cmd_serve() {
     # A swap (cmd_serve's own stop-and-start) keeps the session-only logins:
     # the daemon's keep above for the automated browser, and this file rewrite for
     # a plain Chrome's, which only helps when that Chrome wrote them to disk.
-    [[ "${_SERVE_SWAP:-}" == 1 ]] && { _session_cookies_keep "$dir" >/dev/null || true; }
+    # THE STOP OF A PERSON'S WINDOW KEEPS THEM TOO (DIVE-8367). Done stops the
+    # window and then checks the sign-in on a fresh Chrome, which drops every
+    # cookie with no expiry, so a site whose login is such a cookie read "still on
+    # the sign-in page" after every finished sign-in. Closing that window is the
+    # person saving the login, not the person closing a browser, so the login is
+    # kept for SESSION_KEEP_SAVED_S, whoever stops it (Done, the dashboard's close,
+    # the idle sweep). The automated browser's own stop still ends them.
+    if (( person )); then _session_cookies_keep "$dir" "$SESSION_KEEP_SAVED_S" >/dev/null || true
+    elif [[ "${_SERVE_SWAP:-}" == 1 ]]; then _session_cookies_keep "$dir" >/dev/null || true; fi
     local ssock; ssock="$(_kv "$f" sock)"
     rm -f "$f" "${ssock:-$dir/.5dive-session.sock}" "$(_viewer_admitted_file "$dir")"
     _rv_alias_sweep
@@ -6383,9 +6394,22 @@ cmd_serve() {
   local errlog; errlog="$dir/.5dive-serve.err"
   ( umask 077; : > "$errlog" ) 2>/dev/null || true
   _mark_clean_exit "$dir"
+  # A PERSON'S SIGN-IN WINDOW WRITES ITS SESSION-ONLY LOGINS TO DISK (DIVE-8367).
+  # Chrome keeps a cookie with no expiry in memory only, unless it was started to
+  # restore the last session, so the stop below had nothing on disk to keep and
+  # the check after Done read the site signed out (a site whose login cookie has no expiry).
+  # --restore-last-session makes this Chrome store them; the stop then gives them
+  # an expiry (_session_cookies_keep). The tabs of an earlier session are deleted
+  # first, so the person sees one tab, the sign-in page, and none pile up.
+  local -a keepargs=()
+  if (( plain )); then
+    keepargs=(--restore-last-session)
+    rm -rf -- "$dir/Default/Sessions" "$dir/Default/Current Session" "$dir/Default/Current Tabs" \
+      "$dir/Default/Last Session" "$dir/Default/Last Tabs" 2>/dev/null || true
+  fi
   DISPLAY=":$disp" _tmp_exec "$chrome" --user-data-dir="$dir" --no-first-run \
       --no-default-browser-check --window-size=1280,800 --hide-crash-restore-bubble \
-      --disable-features=TranslateUI "$start_url" >/dev/null 2>"$errlog" &
+      --disable-features=TranslateUI "${keepargs[@]}" "$start_url" >/dev/null 2>"$errlog" &
   local cpid=$!
 
   # WAIT FOR THE BROWSER BEFORE ADVERTISING IT. `serve` used to print success
@@ -6457,16 +6481,24 @@ _chrome_no_password_offer() {  # <profile-dir>  (no Chrome running on it)
 # the browser closing, so the cookies with no expiry are given one (SESSION_KEEP_S
 # from now) and kept: by the automated browser itself before it closes
 # (lib/session-keep.cjs, the route that works on real Chrome), and here, in the
-# file, for a plain Chrome that wrote them to disk. Only a swap does this: a real stop
-# (Done, the idle reaper, `serve --stop`) still ends them, as closing a browser
-# does. Cookies that already have an expiry are not touched.
+# file, for a plain Chrome that wrote them to disk. A swap does this, and so does
+# the stop of a window a person was in (DIVE-8367, see cmd_serve --stop): the
+# automated browser's own stop (the idle sweep, `serve --stop`) still ends them,
+# as closing a browser does. Cookies that already have an expiry are not touched.
+#
+# A PERSON'S SAVED LOGIN IS KEPT FOR 30 DAYS, NOT 12 HOURS (DIVE-8367). The keep
+# gives the cookie a fixed end, and no later swap moves it (only a cookie with no
+# expiry is kept), so 12 h would have signed the owner out every day. The cost:
+# a cookie the site meant to end when the browser closes lasts up to 30 days, in
+# the seat's 0700 profile. The site's own server-side session end still applies.
 SESSION_KEEP_S=43200
-_session_cookies_keep() {  # <profile-dir>  (its Chrome has exited) -> how many kept, on stdout
-  local d="$1" db n total=0
+SESSION_KEEP_SAVED_S=2592000
+_session_cookies_keep() {  # <profile-dir> [<seconds>]  (its Chrome has exited) -> how many kept, on stdout
+  local d="$1" keep="${2:-$SESSION_KEEP_S}" db n total=0
   command -v python3 >/dev/null 2>&1 || { printf '%s: no python3 here, so a login that lasts only while the browser runs is lost on this restart.\n' "$PROG" >&2; return 1; }
   for db in "$d/Default/Network/Cookies" "$d/Default/Cookies"; do
     [[ -f "$db" ]] || continue
-    n=$(python3 - "$db" "$SESSION_KEEP_S" 2>/dev/null <<'PY'
+    n=$(python3 - "$db" "$keep" 2>/dev/null <<'PY'
 import sqlite3, sys, time
 db, keep = sys.argv[1], int(sys.argv[2])
 c = sqlite3.connect(db, timeout=5)
@@ -8901,7 +8933,7 @@ _act_upload_stage() {  # <steps-file> <stage>
 cmd_act() {
   local site="" url="" steps="" expect="" approved="" out="" json=0 wait="no" settle="" shot=1
   local wait_for="" interactive=0 expect_wait="${FIVEDIVE_BROWSER_EXPECT_WAIT_MS:-$ACT_EXPECT_WAIT_DEFAULT}" record=""
-  _ACT_FULL=0; _ACT_LOOK=0
+  _ACT_FULL=0; _ACT_LOOK=0; _ACT_RO=0
   local -a act_argv=("$@")
   while (($#)); do
     case "$1" in
@@ -8940,6 +8972,9 @@ cmd_act() {
         printf '  already ON <url> is not reloaded (a goto step of your own does reload). An act on the public\n'
         printf '  profile starts a served browser for it, so its page survives to the next act.\n'
         printf '  --expect is re-read for up to --expect-wait ms (default %s) before NOT VERIFIED.\n' "$ACT_EXPECT_WAIT_DEFAULT"
+        printf '  READ-ONLY: an act whose steps are only eval (with goto/wait_for) prints each script'"'"'s answer\n'
+        printf '  and nothing else. No page.md, page.html, tree.json or page.png is written and no page text is\n'
+        printf '  printed, so a script can read one thing (a flag, an id) off a private page. --full reads the page.\n'
         return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
       *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$url" ]]; then url="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
@@ -8987,6 +9022,23 @@ cmd_act() {
   fi
   if jq -e 'any(.[]; has("saved")) and any(.[]; .op=="eval")' <<<"$steps" >/dev/null 2>&1; then
     die "$E_USAGE" "a page script does not run in an act that types a saved login (it could read the value back). Nothing ran."
+  fi
+  # A READ-ONLY ACT (DIVE-8443): steps that are only page scripts (after a goto or a
+  # wait_for) leave nothing of the page behind. Box report 970: an owner let his
+  # agent read ONE flag per chat (muted or not) off his Telegram, and every act
+  # also wrote page.md, page.html, tree.json and page.png, and printed "what
+  # changed", which on a chat list is every chat's last message. The agent asked
+  # for one expression; it gets that expression's answer and nothing else. --full
+  # is the agent asking for the page, so it keeps the page read.
+  if (( ! _ACT_FULL )) && jq -e 'any(.[]; .op=="eval") and all(.[]; .op=="eval" or .op=="wait_for" or .op=="goto")' <<<"$steps" >/dev/null 2>&1; then
+    _ACT_RO=1; shot=0
+    [[ -z "$expect" ]] || die "$E_USAGE" "--expect reads the page's text, and an act of page scripts only reads what the scripts return. Check it inside the expression instead (e.g. document.body.innerText.includes(\"…\")), or add --full to read the page. Nothing ran."
+    # --wait-for waits before the page is re-read; here nothing is re-read, so the
+    # wait goes where it does its job: before the first page script.
+    if [[ -n "$wait_for" ]]; then
+      steps=$(jq -c --arg w "$wait_for" '(map(.op == "eval") | index(true)) as $i | .[:$i] + [{op:"wait_for", selector:$w}] + .[$i:]' <<<"$steps")
+      wait_for=""
+    fi
   fi
   # DIVE-6844: a SAVED login or detail, typed in by name. Checked before anything
   # opens: this seat cannot read the saved store, so the act goes once through
@@ -9054,7 +9106,8 @@ cmd_act() {
     _page_open_probe "$site" "$_SITE_DIR"
   fi
 
-  out="$(_read_output_dir "$site" "$out" "$_PG_DIR")" || exit $?
+  # A read-only act makes no artifact directory of its own: there is nothing to put in it.
+  if (( ! _ACT_RO )) || [[ -n "$out" ]]; then out="$(_read_output_dir "$site" "$out" "$_PG_DIR")" || exit $?; fi
   local stage; stage="$(mktemp -d /tmp/5dive-browser-read.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the act's re-read"
   _READ_STAGE="$stage"; trap '_read_cleanup' EXIT
   # WHERE A FILE THE STEPS DOWNLOAD LANDS FIRST (DIVE-5751): this seat's own 0700
@@ -9090,8 +9143,10 @@ cmd_act() {
         --arg h "$stage/page.html" --arg m "$stage/after.json" --arg sh "$png" \
         --arg t "$stage/tree.json" --argjson r "$report" --argjson ak "$allow_kinds" \
         --argjson gt "$(_gates_json "$site")" --argjson lj "$(_landing_json "$site" "$may")" --arg dl "$stage/downloads" --argjson sm "$ACT_STEP_MS" \
+        --argjson ro "$_ACT_RO" \
         '$sf[0] as $s | {profile:$p, steps:$s, args:{}, literal:true, guard:true, approved:$a, allow_kinds:$ak, step_ms:$sm,
-          report:({html:$h, meta:$m, tree:$t, shot:(if $sh=="" then null else $sh end), downloads:$dl} + $r)} + $lj + $gt')
+          report:(if $ro == 1 then {meta:$m, bare:true}
+                  else ({html:$h, meta:$m, tree:$t, shot:(if $sh=="" then null else $sh end), downloads:$dl} + $r) end)} + $lj + $gt')
     FIVEDIVE_BROWSER_PROFILE="$_PG_DIR" FIVEDIVE_BROWSER_CHROME="$chrome" \
       FIVEDIVE_BROWSER_RUN_SETTLE_MS="${settle:-${FIVEDIVE_BROWSER_RUN_SETTLE_MS:-$SNAP_SETTLE_DEFAULT}}" \
       FIVEDIVE_BROWSER_LEASE="$(_lease_meta "$_LEASE_DIR")" \
@@ -9121,7 +9176,8 @@ cmd_act() {
     _act_saved_scrub "$stage" <<<"$saved_json"
     rm -f -- "$stage/page.png"
   fi
-  cat "$errf" >&2
+  # A read-only act's answers are its output (stdout); the executor's other lines stay on stderr.
+  if (( _ACT_RO )); then grep -v '^  step [0-9]* (eval) = ' "$errf" >&2; else cat "$errf" >&2; fi
   _shot_restore
   _lease_release
 
@@ -9135,6 +9191,35 @@ cmd_act() {
 
   if (( drc == 70 )); then
     die "$E_UNAVAILABLE" "the executor refused before it ran a single step, so nothing happened on the page (its own reason is above)."
+  fi
+
+  # A READ-ONLY ACT ENDS HERE (DIVE-8443). Nothing of the page is installed, read
+  # for a verdict or printed: only the scripts' answers, which the agent asked for.
+  # The stage is wiped too, in case an older served browser sent the page anyway.
+  if (( _ACT_RO )); then
+    local ro_final ro_fstep ro_rc=0 ro_v=executed ro_n
+    ro_final=$(jq -r '.url // ""' "$stage/after.json" 2>/dev/null)
+    rm -f -- "$stage/page.html" "$stage/page.png" "$stage/tree.json" "$stage/after.json" "$stage/daemon.out"
+    _page_read_mark "${ro_final:-$url}"   # the answers are page data: a send after them asks
+    ro_fstep=$(grep -o '5dive-step-failed: {.*}' "$errf" 2>/dev/null | tail -1 | sed 's/^5dive-step-failed: //' | jq -c . 2>/dev/null)
+    (( drc == 0 )) || { ro_v=step_failed; ro_rc=1; }
+    if (( json )); then
+      grep '^  step [0-9]* (eval) = ' "$errf" | jq -Rnc --arg v "$ro_v" --arg u "$ro_final" --argjson d "$drc" \
+        --argjson fs "$([[ "$ro_v" == step_failed && -n "$ro_fstep" ]] && echo "$ro_fstep" || echo null)" \
+        '[inputs | capture("^  step (?<step>[0-9]+) \\(eval\\) = (?<raw>.*)$") | {step:(.step|tonumber), value:(.raw as $r | try ($r|fromjson) catch $r)}] as $e
+         | {verdict:$v, url:$u, executor_rc:$d, failed_step:$fs, read_only:true, evals:$e}'
+      return "$ro_rc"
+    fi
+    grep '^  step [0-9]* (eval) = ' "$errf" | sed 's/^  //'
+    ro_n=$(grep -c '^  step [0-9]* (eval) = ' "$errf")
+    if (( ro_rc )); then
+      local why="a step failed (the executor exited $drc)"
+      [[ -n "$ro_fstep" ]] && why=$(jq -r '"step \(.index) (\(.op)) failed: \(.error | split(". ")[0])"' <<<"$ro_fstep")
+      printf '%s: %s. Read-only: nothing of the page was saved or printed.\n' "$PROG" "$why" >&2
+    else
+      printf 'done: %s page script(s) ran; their answers are above. Read-only: nothing of the page was saved or printed.\n' "$ro_n" >&2
+    fi
+    return "$ro_rc"
   fi
 
   local f
@@ -9335,17 +9420,25 @@ _act_session() {  # <site> <steps-file> <approved> <shot> <settle> <report> <all
   fi
   # The page text is derived only for --full (DIVE-6795); otherwise the look says what changed.
   if (( _ACT_FULL )); then xs="$(_extract_sha)"; fi
-  plan=$(jq -nc --slurpfile sf "$steps_file" --argjson a "$is_approved" --argjson sh "$shot" \
+  plan=$(jq -nc --slurpfile sf "$steps_file" --argjson a "$is_approved" --argjson sh "$shot" --argjson ro "${_ACT_RO:-0}" \
       --argjson l "$(_daemon_lease_json)" --argjson st "$(_settle_json "$settle")" --argjson r "$report" \
       --argjson ak "$allow_kinds" --argjson gt "$(_gates_json "$site")" --argjson lj "$(_landing_json "$site" 0)" --argjson stay "$_ACT_STAY" \
       --argjson sm "$ACT_STEP_MS" --arg xs "$xs" \
       '$sf[0] as $s | {op:"plan", steps:$s, args:{}, literal:true, guard:true, approved:$a, allow_kinds:$ak, stay:($stay==1), step_ms:$sm,
-        look:true, split:true, report:({shot:($sh==1), tree:true, downloads:true} + $r)}
+        look:($ro != 1), split:true,
+        report:(if $ro == 1 then {bare:true} else ({shot:($sh==1), tree:true, downloads:true} + $r) end)}
        + (if $xs == "" then {} else {extract:$xs} end) + $st + $l + $lj + $gt')
   # To a FILE, not a variable: a download comes back in this payload (DIVE-5751).
   _daemon_call "$_PG_DIR" "$plan" >"$payload" 2>>"$errf" || rc=$?
   _act_downloads_unpack "$payload" "$stage/downloads"
   rep=$(grep -F '"act_report":true' "$payload" | tail -1)
+  # A READ-ONLY ACT (DIVE-8443) keeps the url and nothing else, whatever came back
+  # (a served browser older than 1.85.0 sends the whole page whatever it is asked).
+  if (( ${_ACT_RO:-0} )); then
+    [[ -n "$rep" ]] && jq -c '{url}' <<<"$rep" > "$stage/after.json"
+    rm -f -- "$payload"
+    return "$rc"
+  fi
   if [[ -n "$rep" ]] && grep -q '^{"act_html_b64":"' "$payload"; then
     # THE SPLIT REPORT (DIVE-6795): the document, the picture and the refs each
     # arrived on a line of their own, so nothing here parses the HTML as JSON.

@@ -597,6 +597,13 @@ async function downloadMode(plan) {
 }
 
 async function writeReport(page, report, pop, { failed = false } = {}) {
+  // A READ-ONLY ACT (DIVE-8443): only where the page is. Its text, document, refs
+  // and picture are never read, so none of them can land anywhere.
+  if (report.bare) {
+    try { if (report.meta) fs.writeFileSync(report.meta, JSON.stringify({ url: page.url() }), { mode: 0o600 }); }
+    catch (e) { process.stderr.write(`${PROG}: the steps ran but where the page is could not be read: ${e.message}\n`); }
+    return;
+  }
   try {
     // AFTER A FAILED STEP NOTHING IS WAITED FOR (DIVE-6778): the run fails whatever
     // --expect or --wait-for would find (DIVE-4990), so polling for them only
