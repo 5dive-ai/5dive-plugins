@@ -1,5 +1,10 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.52: a Codex hire on a ChatGPT plan without Sol answers instead of failing every turn (DIVE-8462)
+
+- Box report, 2026-11-14: a partner client's new Codex hire answered every message with "Codex could not complete this turn: The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account." New Codex seats start on Sol, and that client's plan does not offer it.
+- On that refusal the dispatcher reads the account's own model list, switches the seat to the first model not yet refused (written to `config.toml`, so a restart keeps it), says so once in the chat, and runs the same message again. An already-pinned seat is fixed on its next message. Any other error is reported as before; a message is re-run at most 3 times.
+
 ### Fixed — browser 1.87.0: an Instagram sign-in no longer reads "sign in again" because the page has a password field (DIVE-8457)
 
 - Registry copy synced byte-for-byte from 5dive-browser main @3468e9c (`tests/browser_mirror.sh sync`). Instagram's check read any page holding a password field as signed out, so a signed-in page that carried one read "session expired" and Done reopened the sign-in window right after a real sign-in. Signed out is now Instagram's viewer record with account 0 or its login form; signed in is the same record with a real account; a page showing neither reads "could not tell" and Done hands the site over. Box reports 942/974 (partner client). Detail in 5dive-browser's CHANGES.md.

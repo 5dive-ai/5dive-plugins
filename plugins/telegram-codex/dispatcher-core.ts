@@ -40,6 +40,11 @@ export type DispatchMessage = {
    * gets any it dropped, so a shorter version never loses the file.
    */
   carry?: string[]
+  /**
+   * DIVE-8462: how many times this message was re-run on another model after
+   * the seat's ChatGPT plan refused the one it asked for. Set by the dispatcher.
+   */
+  planRetry?: number
 }
 
 /**
@@ -170,7 +175,26 @@ export type DispatcherState = {
    * [[5dive-to-owner]] message goes when the host names no paired owner.
    */
   lastChats?: { telegram?: DispatchRoute; dashboard?: DispatchRoute }
+  /**
+   * DIVE-8462: models this seat's ChatGPT plan refused, so a fallback never
+   * picks one of them again (kept across restarts).
+   */
+  refusedModels?: string[]
 }
+
+/**
+ * DIVE-8462: the model a ChatGPT plan refused, from a failed turn's error, or
+ * null when the error is anything else. The refusal Codex reports (a partner's box report,
+ * 2026-11-14): "The 'gpt-6.1-sol' model is not supported when using
+ * Codex with a ChatGPT account."
+ */
+export function planRefusedModel(detail: string): string | null {
+  const m = /The '([^']+)' model is not supported when using Codex with a ChatGPT account/.exec(detail)
+  return m ? m[1]! : null
+}
+
+/** How many models one message may be re-run on before the error goes out. */
+export const MAX_PLAN_RETRIES = 3
 
 /** A model choice. `effort` is a Codex reasoning effort (`low`, `high`, …). */
 export type ModelSelection = { model?: string; effort?: string }
@@ -1169,6 +1193,13 @@ export class ChannelDispatcher {
         if (!this.state.active || this.state.active.turnId !== turnId) return
         const completed = this.state.active
         const progress = this.progress?.turnId === turnId ? this.progress : undefined
+        // DIVE-8462: the plan refused the seat's model. Switch to one it allows
+        // and run the same message again, instead of failing every turn.
+        const failedDetail = params?.turn?.status !== 'completed'
+          ? String(params?.turn?.error?.message ?? params?.turn?.status ?? 'unknown app-server error') : ''
+        const refused = failedDetail && !completed.message.control
+          && (completed.message.planRetry ?? 0) < MAX_PLAN_RETRIES ? planRefusedModel(failedDetail) : null
+        const fallback = refused ? await this.planFallback(refused) : null
         // The held message was the turn's last: it notifies, unless an error follows.
         if (progress) await this.flushHeld(params?.turn?.status === 'completed', completed.route)
         // A turn that only ever wrote commentary still owes the chat an answer:
@@ -1184,7 +1215,9 @@ export class ChannelDispatcher {
           const took = fmtElapsed(Date.now() - progress.startedAt)
           const steps = progress.steps ? ` · ${progress.steps} step${progress.steps === 1 ? '' : 's'}` : ''
           await this.publishProgress(completed.route, params?.turn?.status === 'completed'
-            ? `✅ Done in ${took}${steps}` : `⚠️ Stopped after ${took}${steps}`, { turnId, kind: 'progress-done', steps: progress.steps })
+            ? `✅ Done in ${took}${steps}`
+            : fallback ? `🔁 Switching to ${fallback.model}` : `⚠️ Stopped after ${took}${steps}`,
+          { turnId, kind: 'progress-done', steps: progress.steps })
         }
         this.state.active = undefined
         // DIVE-7811: the reply was over the cap. A finished turn gets the model
@@ -1204,8 +1237,17 @@ export class ChannelDispatcher {
         }
         const compaction = completed.message.control === 'compact' ? this.state.compacting : undefined
         if (compaction) this.state.compacting = undefined
-        if (params?.turn?.status !== 'completed') {
-          const detail = String(params?.turn?.error?.message ?? params?.turn?.status ?? 'unknown app-server error')
+        if (fallback) {
+          // Said once, when the seat switches: the config now names the new
+          // model, so a restart does not refuse (or announce) it again.
+          const kept = fallback.persisted ? '' : ' (until this agent restarts)'
+          await this.sink.publish(completed.route,
+            `ℹ️ This ChatGPT plan can't run ${refused}, so this agent now uses ${fallback.model}${kept}. Answering your message on it.`,
+            { turnId, kind: 'control' })
+          const { planRetry, ...message } = completed.message
+          this.state.pending.unshift({ ...message, planRetry: (planRetry ?? 0) + 1 })
+        } else if (params?.turn?.status !== 'completed') {
+          const detail = failedDetail
           await this.sink.publish(completed.route, compaction
             ? `Could not compact this session: ${detail}`
             : `Codex could not complete this turn: ${detail}`, {
@@ -1414,6 +1456,37 @@ export class ChannelDispatcher {
         ...(window ? { window } : {}),
       })
     } catch {}
+  }
+
+  /**
+   * DIVE-8462: the seat's ChatGPT plan refused `refused`. Pick the first model
+   * the account's own list offers (Codex lists newest first) that no refusal
+   * has ruled out, make it the seat's model in config.toml (so a restart keeps
+   * it) and in every turn from now. Null when the list has nothing left.
+   */
+  private async planFallback(refused: string): Promise<{ model: string; persisted: boolean } | null> {
+    const ruled = [...new Set([...(this.state.refusedModels ?? []), refused])].slice(-20)
+    this.state.refusedModels = ruled
+    this.persist()
+    let models: any[] = []
+    try {
+      const listed = await this.rpc.request('model/list', {})
+      models = Array.isArray(listed?.data) ? listed.data : []
+    } catch {
+      return null
+    }
+    const pick = models
+      .filter(m => m && !m.hidden)
+      .map(m => String(m.model ?? m.id ?? '').trim())
+      .find(id => id && !ruled.includes(id))
+    if (!pick) return null
+    let persisted = false
+    try {
+      const res = await this.rpc.request('config/value/write', { keyPath: 'model', value: pick, mergeStrategy: 'replace' })
+      persisted = res?.status === 'ok' || res?.status === 'okOverridden'
+    } catch {}
+    this.configured = { ...this.configured, model: pick }
+    return { model: pick, persisted }
   }
 
   private async loadConfigured(): Promise<ModelSelection> {
