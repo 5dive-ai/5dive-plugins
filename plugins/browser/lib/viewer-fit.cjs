@@ -38,6 +38,17 @@ function phone(spec) {
   return { w, h };
 }
 
+// THE WINDOW FILLS THE PHONE (DIVE-8487). The page draws the window scaled to
+// the smaller of its two fits, so a window cut to the screen's height on a
+// phone taller than the screen (430x888 under a 1280x800 screen) left a black
+// band under it. Cut to the screen, the window keeps the phone's shape instead:
+// a little narrower, drawn a little larger, and it fills the page both ways.
+function fitSize(p, sw, sh) {
+  if (!p) return null;
+  if (!(sh > 0) || p.h <= sh) return { w: p.w, h: p.h };
+  return { w: Math.max(MIN_W, Math.round(p.w * sh / p.h)), h: sh };
+}
+
 async function fit(display, spec, state) {
   const p = phone(spec);
   if (!p) return;
@@ -53,7 +64,7 @@ async function fit(display, spec, state) {
       saved = { win: win.id, ...win.g };
       fs.writeFileSync(state, JSON.stringify(saved) + '\n', { mode: 0o600 });
     }
-    const want = { x: 0, y: 0, w: p.w, h: Math.min(p.h, x.height) };
+    const want = { x: 0, y: 0, ...fitSize(p, x.width, x.height) };
     await x.configure(win.id, want);
     // Read it back after Chrome has had its turn: the page is told what the
     // window IS, not what was asked for.
@@ -109,4 +120,4 @@ async function main(argv) {
 
 if (require.main === module) main(process.argv.slice(2)).catch(e => { process.stderr.write(`viewer-fit: ${e.message}\n`); process.exit(1); });
 
-module.exports = { phone, PHONE_MAX_W };
+module.exports = { phone, fitSize, PHONE_MAX_W };

@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.90.0: the sign-in window is the site, one tab, filling the phone (DIVE-8487)
+
+- Registry copy synced byte-for-byte from 5dive-browser branch dive-8487-signin-window-2 @3fb28d9 (`tests/browser_mirror.sh sync`). A person's sign-in window opens the site as a Chrome app window: no tabs, no address bar, no toolbar (`FIVEDIVE_BROWSER_LOGIN_WINDOW=tab` gives back the old window). Connect in the automated browser reuses a blank tab and closes other blank tabs and second tabs of the site. A phone taller than the box's screen keeps its shape, so no black band under the window. Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — browser 1.89.0: a signed-out site whose Log in button is only an icon no longer reads connected (DIVE-8483)
 
 - Registry copy synced byte-for-byte from 5dive-browser main @03d2794 (`tests/browser_mirror.sh sync`). The generic sign-in check counted header controls with no words and no label as a signed-in header, so chatplace.io's signed-out home page (its Log in is an icon) read connected on Done. Such a link is now read by its address: a log-in, sign-in or sign-up path reads signed out. Detail in 5dive-browser's CHANGES.md.

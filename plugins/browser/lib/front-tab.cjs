@@ -33,6 +33,34 @@ function pick(pages, host, driven) {
   return open.find((p) => onSite(p.url(), host)) || null;
 }
 
+// ONE TAB PER CONNECT (DIVE-8487). The QA walk's second Connect for a site showed
+// two tabs of it (and a blank one is what a fresh browser opens first). A tab
+// with nothing in it, or a second tab of the same site, is never something the
+// person needs to see, so before the window is shown:
+//   keep   the tab pick() chose, as before
+//   reuse  when no tab is on the site: a blank tab, which the caller sends to
+//          the site instead of opening one more (the driven tab first)
+//   close  every other blank tab and every other tab on the site
+// Tabs of other sites of the group are never closed. `spare(p)` true leaves a tab
+// out of all three: the daemon passes the tabs a request opened for itself (a
+// status check of the site runs in one), which are neither shown nor closed.
+function isBlank(url) {
+  return /^(about:blank|chrome:\/\/new-?tab(-page)?\/?|chrome-search:\/\/local-ntp\/.*)?$/i.test(String(url || ''));
+}
+
+function plan(pages, host, driven, spare = () => false) {
+  const open = pages.filter((p) => !(typeof p.isClosed === 'function' && p.isClosed()) && !spare(p));
+  const keep = pick(open, host, driven);
+  let reuse = null;
+  if (!keep) {
+    reuse = (driven && open.includes(driven) && isBlank(driven.url())) ? driven
+      : (open.find((p) => isBlank(p.url())) || null);
+  }
+  const shown = keep || reuse;
+  const close = open.filter((p) => p !== shown && (isBlank(p.url()) || onSite(p.url(), host)));
+  return { keep, reuse, close };
+}
+
 // INPUT MODE (DIVE-7674). Plain Chrome has no channel that lists its tabs, so
 // the window used to be shown as it was: Connect for business.facebook.com
 // showed cjdropshipping.com, another login's live session, because CJ's input
@@ -64,4 +92,4 @@ async function inputFront(be, url, io) {
   return { host, moved: true, opened: true, was };
 }
 
-module.exports = { hostOf, onSite, pick, inputFront };
+module.exports = { hostOf, onSite, pick, isBlank, plan, inputFront };
