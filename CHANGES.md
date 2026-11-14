@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.89.0: a signed-out site whose Log in button is only an icon no longer reads connected (DIVE-8483)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @03d2794 (`tests/browser_mirror.sh sync`). The generic sign-in check counted header controls with no words and no label as a signed-in header, so chatplace.io's signed-out home page (its Log in is an icon) read connected on Done. Such a link is now read by its address: a log-in, sign-in or sign-up path reads signed out. Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — browser 1.88.0: an Instagram account not linked to Facebook no longer reads "sign in again" while signed in (DIVE-8477)
 
 - Registry copy synced byte-for-byte from 5dive-browser main @0014691 (`tests/browser_mirror.sh sync`). 1.87.0 read Instagram's viewer record with account 0 as signed out, but that field is the Facebook account, and it is 0 for every Instagram account not linked to Facebook; the Instagram account sits in a second field of the same record. Signed out is now both fields at 0, or the login form; signed in is a real id in either. A partner's client, signed in, got "sign in again" on every Done. Detail in 5dive-browser's CHANGES.md.
