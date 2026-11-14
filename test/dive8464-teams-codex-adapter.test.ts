@@ -210,6 +210,10 @@ describe('the Codex role guard', () => {
   test('Codex shell names read as Bash; apply_patch reads as a write per file', () => {
     expect(asGuardCalls('shell', { command: ['bash', '-lc', 'sudo rm -rf /srv'] })).toEqual([{ tool: 'Bash', input: { command: 'bash -lc sudo rm -rf /srv' } }])
     expect(asGuardCalls('exec_command', { cmd: 'ls' })).toEqual([{ tool: 'Bash', input: { command: 'ls' } }])
+    // Codex 0.169 code mode, seen live: one `exec` tool with a JS string input.
+    expect(asGuardCalls('exec', 'text(await tools.exec_command({cmd:"sudo touch /root/x"}))')).toEqual([{ tool: 'Bash', input: { command: 'sudo touch /root/x' } }])
+    expect(asGuardCalls('exec', { input: 'await tools.exec_command({cmd: ["sudo", "rm", "/x"]})' })).toEqual([{ tool: 'Bash', input: { command: 'sudo rm /x' } }])
+    expect(asGuardCalls('exec', 'const c = "x"; await tools.exec_command({cmd: c})')[0]!.input.command).toContain('exec_command')
     expect(asGuardCalls('apply_patch', { input: '*** Begin Patch\n*** Update File: /etc/hosts\n*** Add File: notes.md\n*** End Patch' }))
       .toEqual([{ tool: 'Write', input: { file_path: '/etc/hosts' } }, { tool: 'Write', input: { file_path: 'notes.md' } }])
   })

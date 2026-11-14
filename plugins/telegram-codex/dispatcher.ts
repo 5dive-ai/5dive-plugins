@@ -15,6 +15,7 @@ import { readMessages } from './msglog.ts'
 import { rolloutSizer } from './rollout.ts'
 import { takeAttachReceipts } from './outbox-send.ts'
 import { allowedSources, resolvePluginAdapters } from './plugin-adapters.ts'
+import { parseTrustList, trustWiredHooks } from './hook-trust.ts'
 import { approvalAsk, approvalResult, askOnTelegram, isApprovalMethod, verdictLine } from './approvals.ts'
 import {
   HEALTH_HEARTBEAT_MS, HEALTH_SCHEMA, writeHealth,
@@ -402,6 +403,18 @@ async function initialize(): Promise<void> {
     health.codex.tested = checkCodex(served).tested
   }
   rpc.notify('initialized', {})
+  // DIVE-8464: app-server has no --dangerously-bypass-hook-trust, so the
+  // hooks 5dive wired (a channel's guard) run only once trusted (hook-trust.ts).
+  try {
+    const n = await trustWiredHooks(rpc, {
+      wired: parseTrustList(process.env.CODEX_DISPATCHER_TRUST_HOOKS),
+      configPath: join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'config.toml'),
+      cwd: WORKDIR,
+    })
+    if (n) process.stderr.write(`codex-dispatcher: trusted ${n} hook(s) 5dive wired\n`)
+  } catch (err) {
+    process.stderr.write(`codex-dispatcher: could not trust the hooks 5dive wired: ${err}\n`)
+  }
   await dispatcher.initialize()
   // BOUND means a live Codex thread, not "the process started". Everything
   // above can succeed and still leave the bridge unable to run a turn.

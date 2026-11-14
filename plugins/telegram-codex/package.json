@@ -46,6 +46,7 @@
     "viewer-link.ts",
     "rollout.ts",
     "plugin-adapters.ts",
+    "hook-trust.ts",
     "pair.ts",
     "release.sh",
     "hooks/",

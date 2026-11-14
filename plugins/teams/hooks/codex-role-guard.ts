@@ -48,8 +48,41 @@ export function asGuardCalls(tool: string, input: any): Array<{ tool: string; in
     const paths = [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map(m => m[1]!.trim())
     return paths.map(p => ({ tool: 'Write', input: { file_path: p } }))
   }
+  // Codex "code mode" (seen live on 0.169, DIVE-8464): every shell command and
+  // patch rides one custom tool, `exec`, whose input is a JS string such as
+  // `text(await tools.exec_command({cmd:"sudo …"}))`. Read the commands and
+  // the patched files out of it, so the role rule sees what it would run.
+  const script = typeof input === 'string' ? input : [i.input, i.code, i.script].find((v: unknown) => typeof v === 'string')
+  if (typeof script === 'string' && (tool === 'exec' || typeof input === 'string')) {
+    const out: Array<{ tool: string; input: Record<string, unknown> }> = scriptCommands(script).map(command => ({ tool: 'Bash', input: { command } }))
+    for (const m of script.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)) out.push({ tool: 'Write', input: { file_path: m[1]!.trim() } })
+    return out.length ? out : [{ tool, input: i }]
+  }
   return [{ tool, input: i }]
 }
+
+// The commands a code-mode script would run (same reading as the email
+// plugin's codex.ts, DIVE-8464): every `cmd:`/`command:` string literal, each
+// its own command; a script that calls a shell but whose command cannot be
+// read is returned whole, because unread is not safe.
+export function scriptCommands(script: string): string[] {
+  const out: string[] = []
+  const lit = '"(?:[^"\\\\]|\\\\.)*"|\'(?:[^\'\\\\]|\\\\.)*\'|`(?:[^`\\\\]|\\\\.)*`'
+  const unq = (q: string): string => {
+    const body = q.slice(1, -1)
+    try { return q[0] === '"' ? JSON.parse(q) : body.replace(/\\(.)/g, '$1') } catch { return body }
+  }
+  // A computed command or a variable is not read here: the fallback below then
+  // returns the whole script for the per-command rules.
+  const re = new RegExp(`\\b(?:cmd|command)\\s*:\\s*(${lit}|\\[(?:\\s*(?:${lit})\\s*,?)*\\])`, 'g')
+  for (const m of script.matchAll(re)) {
+    const v = m[1]!
+    out.push(v.startsWith('[') ? [...v.matchAll(new RegExp(lit, 'g'))].map(x => unq(x[0])).join(' ') : unq(v))
+  }
+  if (!out.length && /exec_command|\bshell\b|spawn|execSync|child_process/.test(script)) out.push(script)
+  return out
+}
+
 
 /** The running turn's source, or null when the dispatcher record is missing or unreadable. */
 export function activeSource(stateFile: string): string | null {
