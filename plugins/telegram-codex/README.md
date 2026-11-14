@@ -76,6 +76,14 @@ a separate `[[5dive-attachment:/absolute/path]]` line. The directive is removed
 from chat text and up to ten files are sent only on the response's source
 channel.
 
+A message from a teammate (`5dive agent send`) is answered to that agent only:
+nobody in a chat sees it. The turn starts with a `[5dive teammate]` line saying
+so. A message in that turn that carries a separate `[[5dive-to-owner]]` line
+also goes to the seat owner's chat, files included, with a notification: the
+owner paired in the Telegram access file, else the last private Telegram chat
+the dispatcher served, else the last dashboard chat. Without the line nothing
+is forwarded, so teammate chatter never reaches the owner.
+
 ## MCP polling fallback
 
 Run `bun run start:mcp-fallback` and wire `server.ts` into Codex only when the
@@ -372,6 +380,7 @@ relay (no `wait_for_message`, no watchdog, no hooks) rather than an MCP server.
 - v0.5.47 — DIVE-7730: a chat attachment that is not a picture (png, jpg, gif, webp, bmp) goes to the model as a text line with its path, not as an image, so the agent opens it with its own tools.
 - v0.5.48 — DIVE-7811: a chat reply over 70 words is not sent. The Telegram reply and edit tools refuse it with the same cut-it error as Claude Code (same `replycap.ts`), and the web chat dispatcher holds a long answer, asks the agent to cut it and sends only the rewrite (after 2 tries the last version goes as written). `FIVEDIVE_REPLY_MAX_WORDS` overrides; 0 turns it off.
 - v0.5.49 — DIVE-7825: a Telegram poll that gets no answer is cut off at its 30 s window plus 15 s and retried, instead of waiting the client's 500 s default (after a Telegram outage the channel went deaf for ~8 min with no log line). Each failure writes one stderr line (then at most one a minute), the first success after it says so, and every completed poll touches `bot.lastpoll` in the state dir, which `5dive liveness` reads to report a stalled poll. Uploads keep the long timeout. Same `pollguard.ts` as telegram 0.5.136.
+- v0.5.51 — DIVE-8414: a Codex lead woken by a teammate can reach its owner. A teammate turn starts with a `[5dive teammate]` line; a message carrying `[[5dive-to-owner]]` goes to the owner's chat with its files (paired owner from `access.json`, else the last private Telegram chat served, else the last dashboard chat; kept in `state.json` `lastChats`). The thread instructions no longer say every answer is routed back. Box reports 958/960: before, the lead's answer to the owner went only to the dispatcher's stdout.
 - v0.5.50 — DIVE-8328: a file in a dispatcher answer that Telegram refuses no longer re-sends the answer's text forever. The text goes once; each file is tried on its own; a picture `sendPhoto` refuses (e.g. a tall screenshot) goes again as a document; a file that still fails costs one "couldn't send <name>: <reason>" line. An explicit `[[5dive-attachment:…]]` obeys the 50 MB cap ("too large to send"). An over-cap answer's rewrite keeps the held answer's files. The model's next turn on that chat starts with `[5dive attachments] sent … · not sent: …` (`outbox-send.ts`).
 - v0.5.45 — DIVE-7506: a one-time browser viewer link in any send keeps its copy-only code span and previews off, and gets an "Open the browser" inline URL button under the message (one tap; Telegram never previews a URL button, so the tap spends the ticket). A reply keyboard, a path-only link or a raw-IP/http link keeps the code span alone. Same guard as telegram 0.5.130.
 - v0.5.34 — DIVE-5894: a channel adapter that exits no longer takes the dispatcher down. It is respawned after 5s, doubling up to 10 minutes (a run that lasted 10 minutes starts the count over), while the dispatcher keeps serving its inbox and other channels; `health.json` names the channel that is down. Before, one dead adapter (the dashboard one, on every standard seat after DIVE-5690) stopped the inbox and the run-loop restarted the whole dispatcher every 5 minutes. The dashboard adapter (dashboard 0.4.5) reaches the control plane through the CLI's root relay on a seat that cannot read the box token.
