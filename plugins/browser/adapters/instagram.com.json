@@ -3,8 +3,9 @@
   "site": "instagram.com",
   "probe": {
     "url": "https://www.instagram.com/accounts/edit/",
-    "logged_out_when_dom_matches": "CurrentUserInitialData\",\\[\\],\\{\"ACCOUNT_ID\":\"0\"|type=[\"']?password",
-    "_comment": "UNMEASURED HALF: no box or seat here holds an Instagram login, so the signed-in render of /accounts/edit/ was not observed. A signed-in page carries the viewer's own non-zero account id in the same record and the edit-profile form has no password field. If that ever proves wrong, status reads 'session expired' and names a person: it fails toward asking, never toward 'authenticated' on a logged-out page."
+    "logged_out_when_dom_matches": "CurrentUserInitialData\",\\[\\],\\{\"ACCOUNT_ID\":\"0\"|id=[\"']?login_form",
+    "logged_in_when_dom_matches": "CurrentUserInitialData\",\\[\\],\\{[^}]*\"ACCOUNT_ID\":\"[1-9]",
+    "_comment": "UNMEASURED HALF: no box or seat here holds an Instagram login, so the signed-in render of /accounts/edit/ was not observed. DIVE-8457 (box reports 942/974, partner client): the old marker's second half was any `type=password` input anywhere in the page, so a signed-in page that carried one read 'session expired' and the owner's Done reopened the sign-in window after a real sign-in. The signed-out reading is now the current-user record with account 0 (measured on every logged-out render) or the login form's own id (id=\"login_form\", measured), never a bare password field. The signed-in reading is the same record with a non-zero account id, so a page that shows neither (a checkpoint, a 'browser not supported' page, a slow render) reads UNKNOWN and Done hands the site over as 'connected, not confirmed' (1.86.0) instead of asking for the sign-in again."
   },
   "actions": {}
 }
