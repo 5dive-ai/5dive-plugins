@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.87.0: an Instagram sign-in no longer reads "sign in again" because the page has a password field (DIVE-8457)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @3468e9c (`tests/browser_mirror.sh sync`). Instagram's check read any page holding a password field as signed out, so a signed-in page that carried one read "session expired" and Done reopened the sign-in window right after a real sign-in. Signed out is now Instagram's viewer record with account 0 or its login form; signed in is the same record with a real account; a page showing neither reads "could not tell" and Done hands the site over. Box reports 942/974 (partner client). Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — browser 1.86.0: a Done that cannot confirm the sign-in no longer locks the agent out (DIVE-8450)
 
 - Registry copy synced byte-for-byte from 5dive-browser main @c678b61 (`tests/browser_mirror.sh sync`). A Done whose login check cannot confirm a site (no adapter, an unknown reading) now hands the session to the agent and closes the owner's window, reading "connected, not confirmed"; only a positive signed-out reading reopens it. The agent's "still open in the owner's sign-in window" refusal now names the admin stop as a way out. Box reports 974/975: an owner pressed Done on ChatPlace again and again while the agent stayed locked out. Detail in 5dive-browser's CHANGES.md.
