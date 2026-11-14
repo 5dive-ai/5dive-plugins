@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.86.0: a Done that cannot confirm the sign-in no longer locks the agent out (DIVE-8450)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @c678b61 (`tests/browser_mirror.sh sync`). A Done whose login check cannot confirm a site (no adapter, an unknown reading) now hands the session to the agent and closes the owner's window, reading "connected, not confirmed"; only a positive signed-out reading reopens it. The agent's "still open in the owner's sign-in window" refusal now names the admin stop as a way out. Box reports 974/975: an owner pressed Done on ChatPlace again and again while the agent stayed locked out. Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — browser 1.85.0: an act of page scripts only saves nothing of the page (DIVE-8443)
 
 - Registry copy synced byte-for-byte from 5dive-browser branch dive-8443-act-read-only @6bfbc46 (`tests/browser_mirror.sh sync`). An act whose steps are only `eval` (after a `goto` or `wait_for`) now prints each script's answer and nothing else: no page.md, page.html, tree.json or page.png, and no page text. Box report 970: an owner could not let his agent read only which Telegram chats are muted, because every act also saved the chat list's text. The use-browser skill gains notes for Telegram Web (own account, muted chats). Detail in 5dive-browser's CHANGES.md.
