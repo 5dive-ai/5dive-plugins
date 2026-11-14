@@ -2963,6 +2963,133 @@ _merge_disp_probe() {
     "$repo"
 }
 
+# DIVE-8435: A SEAT GRADE IS NOT A CI READ. The merge reads the checks itself.
+#
+# On 2026-11-13, 4 of the 10 merges 5dive-bot made on lodar/5dive-api and
+# lodar/5dive-frontend landed within ~12 s of a quinn PASS over a PR check that
+# was still RUNNING (3) or already RED (1, fe#1180), and each one turned main red
+# (api#756, fe#1180, fe#1186, fe#1187; a failed prod deploy, a blocked row).
+# `_merge_do` ran the disposition probe for CI-graded rows only, on the premise
+# "its grader read CI already". Under deliver-on-push a grader usually CANNOT
+# have read it: the PR's full job is still running when the grade lands. And on
+# a private repo GitHub offers no branch protection, so nothing downstream of
+# this verb would have caught it.
+#
+# THE ROLLUP, NOT mergeStateStatus. On those repos a running and a red check
+# both read UNSTABLE (audit, 11-13: merge-hold-reassigned reason=merge-state-
+# UNSTABLE on DIVE-8333 while src-tests was running and on DIVE-8382 with
+# app-tests already red), but "not CLEAN" carries no check name and no
+# pending/red split, and a repo that later grows a protection rule may read a
+# non-required red as something else again. The per-check states at the head are
+# the fact itself, so that is what is read.
+
+# _MERGE_ROLLUP_JQ — gh's `statusCheckRollup` -> [{name, bucket}] in gh's own
+# `pr checks` bucket vocabulary (pass|skipping|pending|fail|cancel), so the
+# merge verb and the merge tick classify a check the same way. A check NAME that
+# appears twice (a re-run, or the push and pull_request events both firing) is
+# read at its LATEST start: the older red of a re-run that went green is history,
+# and the older green of a re-run still going is not a reading of this head.
+readonly _MERGE_ROLLUP_JQ='
+  [ (.statusCheckRollup // [])[]?
+    | { name: ((.name // .context // "") | tostring),
+        at:   ((.startedAt // .createdAt // "") | tostring),
+        bucket: (
+          if (.__typename // "") == "StatusContext" or (has("state") and (has("status") | not)) then
+            ( (.state // "" | ascii_upcase) as $s
+              | if $s == "SUCCESS" then "pass"
+                elif ($s == "PENDING" or $s == "EXPECTED") then "pending"
+                else "fail" end )
+          else
+            ( (.status // "" | ascii_upcase) as $st | (.conclusion // "" | ascii_upcase) as $c
+              | if $st != "COMPLETED" then "pending"
+                elif ($c == "SUCCESS" or $c == "NEUTRAL") then "pass"
+                elif $c == "SKIPPED" then "skipping"
+                elif $c == "CANCELLED" then "cancel"
+                else "fail" end )
+          end ) } ]
+  | group_by(.name) | map(sort_by(.at) | last | {name, bucket})'
+
+# _merge_checks_decide <buckets-json> -> green | pending:<names> | red:<names> | unreadable
+#
+# PURE. Input is a JSON array of {name, bucket}. Green is every check passed or
+# skipped (gh maps NEUTRAL into pass). RED BEFORE PENDING: a head with one check
+# red and another still running cannot become mergeable by waiting, so the answer
+# that names the red is the useful one. An empty array is green — a repo with no
+# CI at all is a repo this rail has nothing to read for (residual: a head pushed
+# seconds ago whose checks have not registered yet also reads empty; a grade
+# lands minutes after the push, so the window is the grade's own latency).
+_merge_checks_decide() {
+  local j="${1:-}" red pend
+  jq -e 'type == "array"' <<<"$j" >/dev/null 2>&1 || { printf 'unreadable'; return 0; }
+  red=$(jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name' <<<"$j" 2>/dev/null | sort -u | paste -sd, -)
+  if [[ -n "$red" ]]; then printf 'red:%s' "$red"; return 0; fi
+  pend=$(jq -r '.[] | select(.bucket != "pass" and .bucket != "skipping") | .name' <<<"$j" 2>/dev/null | sort -u | paste -sd, -)
+  if [[ -n "$pend" ]]; then printf 'pending:%s' "$pend"; return 0; fi
+  printf 'green'
+}
+
+# _merge_checks_probe <pr> [<graded_sha>] -> green | pending:<names> | red:<names>
+#                                          | head-moved:<head> | unreadable
+#
+# IMPURE, one read. The rollup GitHub returns is the HEAD's, so a head that is
+# not the graded sha is answered as that — the checks of a commit nobody graded
+# say nothing about the one that was. A read that fails for any reason is
+# `unreadable`, never green: an unread check is not a passed one.
+_merge_checks_probe() {
+  local pr="${1:-}" graded="${2:-}" tok raw head checks
+  [[ -n "$pr" ]] || { printf 'unreadable'; return 0; }
+  tok=$(_gate_gh_token 2>/dev/null || printf '')
+  raw=$(_gate_gh "$tok" 20 pr view "$pr" --json headRefOid,statusCheckRollup 2>/dev/null) || raw=""
+  jq -e 'type == "object"' <<<"$raw" >/dev/null 2>&1 || { printf 'unreadable'; return 0; }
+  head=$(jq -r '.headRefOid // ""' <<<"$raw" 2>/dev/null); head="${head,,}"; graded="${graded,,}"
+  [[ -n "$head" ]] || { printf 'unreadable'; return 0; }
+  if [[ -n "$graded" && "$head" != "$graded"* && "$graded" != "$head"* ]]; then
+    printf 'head-moved:%s' "${head:0:12}"; return 0
+  fi
+  checks=$(jq -c "$_MERGE_ROLLUP_JQ" <<<"$raw" 2>/dev/null) || checks=""
+  _merge_checks_decide "$checks"
+}
+
+# _merge_do_checks_gate <ident> <pr> <graded_sha> [<companion-pr> ...]
+#
+# The DIVE-8435 refusal, in its own function so a harness can EXECUTE it over a
+# stubbed `_gate_gh` (cmd_task_merge_do is root-only behind sudo and cannot be
+# run by one). Returns 0 when every pull request this call would merge reads
+# green at the head it would merge; otherwise prints one sentence naming the
+# pull request and the checks, and returns 1. It writes NOTHING to the row: a
+# pending check is a wait, not a defect, so the row keeps its grade and its
+# merge standing, and the merge tick (or the next `task merge`) merges it once
+# the checks are green. A red check is the maker's, and the merge tick bounces
+# it to the maker as it already does for a required red (DIVE-7120).
+_merge_do_checks_gate() {
+  local ident="$1" pr="$2" graded="${3:-}"; shift 3 || true
+  local p d g
+  for p in "$@" "$pr"; do
+    [[ -n "$p" ]] || continue
+    # A companion's head is a different commit from the graded one (DIVE-6543),
+    # so it is read at its own head.
+    g=""; [[ "$p" == "$pr" ]] && g="$graded"
+    d=$(_merge_checks_probe "$p" "$g")
+    [[ "$d" == green ]] && continue
+    case "$d" in
+      pending:*)
+        printf '%s: NOTHING MERGED — %s has CI checks still running at the head (%s). A grade is not a CI read (DIVE-8435): the merge waits for them. The row is NOT bounced and keeps its grade; the merge tick merges it once every check is green, or run task merge again then.\n' \
+          "$ident" "$p" "${d#pending:}" ;;
+      red:*)
+        printf '%s: NOTHING MERGED — %s has a RED CI check at the head (%s). Merging it would turn main red (DIVE-8435). The maker fixes it and re-delivers; the merge tick bounces it to the maker.\n' \
+          "$ident" "$p" "${d#red:}" ;;
+      head-moved:*)
+        printf '%s: NOTHING MERGED — the head of %s is %s, not the graded sha %s, so its checks are not the graded commit'"'"'s. Re-grade or re-deliver (DIVE-8435).\n' \
+          "$ident" "$p" "${d#head-moved:}" "${graded:0:12}" ;;
+      *)
+        printf '%s: NOTHING MERGED — the CI checks of %s could not be read, and an unread check is not a passed one (DIVE-8435). Try again; it merges once GitHub answers and every check is green.\n' \
+          "$ident" "$p" ;;
+    esac
+    return 1
+  done
+  return 0
+}
+
 # _merge_disp_read <rc> <out> — THE ONE READER of the rail's disposition marker.
 # `_merge_do` achieves one of two different things on a success, and they are not
 # interchangeable: an ENQUEUE is a request the queue may still eject, a MERGE is
@@ -3916,7 +4043,8 @@ cmd_task_merge_do() {
   # for the reading: the disposition must say `merge` — the PR head is the
   # graded sha, GitHub reads CLEAN (required checks green), and no path needs a
   # person's look. Anything else, including a read that failed, refuses here and
-  # merges nothing. A seat-graded row is untouched: its grader read CI already.
+  # merges nothing. A seat-graded row skips THIS probe (its risk holds are the
+  # grader's call) but not the checks: DIVE-8435 reads them below, for every row.
   local _mdo_gb; _mdo_gb=$(db "SELECT COALESCE(graded_by,'') FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')
   if [[ "$_mdo_gb" == ci:* ]]; then
     local _mdo_gsha _mdo_disp
@@ -3978,6 +4106,18 @@ cmd_task_merge_do() {
   # not short-circuit this call before the credential is read.
   local _MDO_COMPANIONS_OPEN="${#_mdo_comp[@]}"
   _merge_do_already_landed "$pr" && return 0
+
+  # DIVE-8435: EVERY CHECK GREEN AT THE HEAD, for every row, before anything
+  # merges — companions included, since they land first. AFTER the landed
+  # short-circuit on purpose: a pull request the maintainer already merged owes
+  # no CI reading from us, and refusing it here would re-open DIVE-549's
+  # closable-by-nobody row. BEFORE the credential, so the refusal names the
+  # check rather than a missing connector.
+  local _mdo_ck
+  _mdo_ck=$(_merge_do_checks_gate "$ident" "$pr" \
+              "$(_gate_graded_sha "$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null || printf '')")" \
+              "${_mdo_comp[@]}") \
+    || fail "$E_CONFLICT" "${_mdo_ck:-${ident}: NOTHING MERGED — CI checks not green (DIVE-8435).}"
 
   [[ -r "$_GH_BOT_ENV" ]] \
     || fail "$E_GENERIC" "machine-account credential missing ($_GH_BOT_ENV) — 5dive secret write ${_GH_BOT_KEY} --connector=github-bot"
@@ -4245,6 +4385,20 @@ _merge_tick_read() {
   # JSON still on stdout, so its exit status is not the read's. An EMPTY answer is
   # the read failing; `[]` is a pull request with no required checks.
   checks=$(_gate_gh "$tok" 20 pr checks "$pr" --required --json name,bucket 2>/dev/null) || true
+  # DIVE-8435: A REPO THAT CANNOT REQUIRE A CHECK. A private repo on a free plan
+  # gets no branch protection, so it has no required checks, and gh answers
+  # `--required` there with an error ("no required checks reported") and no
+  # JSON. Read as unreadable, that skipped every lodar/* row on this tick
+  # forever — so the merge waited on a seat, and the seat merged over a running
+  # check. With nothing required, EVERY check at the head is the gate, read from
+  # the rollup and classified exactly as `_merge_do` classifies it.
+  if ! jq -e 'type == "array" and length > 0' <<<"$checks" >/dev/null 2>&1; then
+    local _mtr_roll
+    _mtr_roll=$(_gate_gh "$tok" 20 pr view "$pr" --json statusCheckRollup 2>/dev/null) || _mtr_roll=""
+    if jq -e 'type == "object"' <<<"$_mtr_roll" >/dev/null 2>&1; then
+      checks=$(jq -c "$_MERGE_ROLLUP_JQ" <<<"$_mtr_roll" 2>/dev/null) || checks=""
+    fi
+  fi
   jq -e 'type == "array"' <<<"$checks" >/dev/null 2>&1 || return 1
   red=$(jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name' <<<"$checks" 2>/dev/null | sort -u | paste -sd, -)
   pending=$(jq -r 'if any(.[]; .bucket == "pending") then 1 else 0 end' <<<"$checks" 2>/dev/null) || return 1
