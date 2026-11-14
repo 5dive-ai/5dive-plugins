@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — devteam 0.4.1: a graded PR no longer merges while its CI is still running or red (DIVE-8435)
+
+- On 11-13, 4 of the 10 bot merges on the private api and frontend repos landed seconds after a seat's PASS, with the PR's test job still running (3) or already red (1). Main went red three times; one prod deploy failed. Only CI-graded rows waited for checks; a seat-graded row merged on the premise its grader had read CI. Private repos get no branch protection, so nothing else caught it.
+- `_merge_do` now reads every check at the PR head (the rollup, not `mergeStateStatus`) for every row, companions included. Pending or red merges nothing and names the check. The row is not bounced: it keeps its grade, and the merge tick or the next `task merge` merges it once green. An already-merged PR is still recorded, not refused.
+- The merge tick read only required checks, and on a repo with none (`gh` errors there) it skipped every row forever. It now reads all checks there: green merges, running waits, red goes back to the maker.
+
 ### Fixed — telegram-codex 0.5.51: a Codex lead woken by a teammate can hand its owner the result (DIVE-8414)
 
 - Box reports 958/960: a Codex lead routed "write 3 headlines" to a teammate, got them back by `5dive agent send`, wrote its answer to the owner, and the owner got nothing until he wrote again. A teammate's message runs as an `agent` turn, its answers went only to the dispatcher's log, and the thread's instructions told the model every answer goes back to the chat.
