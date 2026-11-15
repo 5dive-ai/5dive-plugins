@@ -60,7 +60,7 @@ describe('a Russian-language owner adds the agent on a regular box', () => {
     ])
   })
 
-  test('the Russian region variant reads the same', () => {
+  test('a language code with a country suffix reads the same', () => {
     expect(joinLang('ru-RU')).toBe('ru')
     expect(joinLang('RU')).toBe('ru')
   })
@@ -90,7 +90,7 @@ describe('every language the app ships', () => {
   test('the list matches the app: en ru zh tr es ar pt de fr ja ko', () => {
     expect([...JOIN_LANGS]).toEqual(['en', 'ru', 'zh', 'tr', 'es', 'ar', 'pt', 'de', 'fr', 'ja', 'ko'])
   })
-  test("Telegram's region codes map to the base language", () => {
+  test("Telegram's longer language codes map to the base language", () => {
     expect(joinLang('pt-br')).toBe('pt')
     expect(joinLang('zh-hans')).toBe('zh')
     expect(joinLang('de_AT')).toBe('de')
