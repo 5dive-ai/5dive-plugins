@@ -294,8 +294,17 @@ function sandboxWanted() {
 function launchArgs(sandbox) {
   const extra = (process.env.FIVEDIVE_BROWSER_CHROME_ARGS || '').split(/\s+/).filter(Boolean);
   // DIVE-7204: no "Restore pages?" bubble after a serve that was stopped, not closed.
+  // DIVE-8523: the automated served browser opens at the same 1280x800 window as
+  // input mode and the sign-in window. Without it Chrome took its default 800x600
+  // (viewport 800x457) while shot/read render at 1280x800, so a point read off a
+  // shot was refused as outside the window and menus collapsed to a narrow layout.
+  // An operator's own --window-size/--window-position in the extra args wins.
+  const win = [
+    ...(extra.some(a => /^--window-size=/.test(a)) ? [] : ['--window-size=1280,800']),
+    ...(extra.some(a => /^--window-position=/.test(a)) ? [] : ['--window-position=0,0']),
+  ];
   const args = [...(sandbox ? [] : ['--no-sandbox']), '--disable-gpu', '--hide-crash-restore-bubble',
-    ...aria.unmarkedArgs(extra), ...extra];
+    ...win, ...aria.unmarkedArgs(extra), ...extra];
   const bad = args.filter(a => /^--remote-debugging/.test(a));
   if (bad.length) {
     die(E_NOTHING_RAN, `refusing to launch with ${bad.join(' ')}. The daemon holds CDP over the child's ` +
