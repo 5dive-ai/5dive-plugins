@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.90.0: the sign-in window is the site, one tab, filling the phone (DIVE-8487)
+
+- Registry copy synced byte-for-byte from 5dive-browser branch dive-8487-signin-window-2 @3fb28d9 (`tests/browser_mirror.sh sync`). A person's sign-in window opens the site as a Chrome app window: no tabs, no address bar, no toolbar (`FIVEDIVE_BROWSER_LOGIN_WINDOW=tab` gives back the old window). Connect in the automated browser reuses a blank tab and closes other blank tabs and second tabs of the site. A phone taller than the box's screen keeps its shape, so no black band under the window. Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — telegram 0.5.142: a photo that cannot be saved still reaches the agent (DIVE-8489)
 
 - Box report 994 (partner client): owner photos reached the agent as a bare `(photo)`, with no file and no file id, so the photo was lost and nobody was told. Any failure to save a photo (Telegram unreachable, disk full, an unwritable inbox, a non-200 download) now delivers it as an attachment: `attachment_kind=photo`, `attachment_file_id` and a short `attachment_error` in meta, so the agent can retry with `download_attachment`. A non-200 download is no longer saved as a `.jpg`, and the reason never carries the bot token.

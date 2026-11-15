@@ -5936,6 +5936,25 @@ _now_ms() {
   if [[ -n "$t" ]]; then printf '%s\n' "$(( t / 1000 ))"; else date +%s%3N; fi
 }
 
+# THE SIGN-IN WINDOW IS THE PAGE, NOT A DESKTOP BROWSER (DIVE-8487). The QA walk
+# opened it on a phone and saw Chrome's tab strip, address bar and extension
+# icons over the site, and a second tab of the site after a second Connect. A
+# person's sign-in window (the plain Chrome of `serve --login`) is opened as an
+# app window (--app=<url>): one page, no tabs, no address bar, no toolbar, so
+# nothing stacks and the whole window is the site. Window size and position are
+# the same as before (1280x800 at 0,0); the phone fit (lib/viewer-fit.cjs) sizes
+# it as it did the tabbed one. A link the site opens in a new tab opens in a
+# normal Chrome window, as it would from any app window.
+# FIVEDIVE_BROWSER_LOGIN_WINDOW=tab is the way back to the tabbed window.
+# Agents' browsers (the warm session, input mode) are not this launch.
+_login_window_args() {  # <url> -> chrome args that open it, one per line
+  if [[ "${FIVEDIVE_BROWSER_LOGIN_WINDOW:-app}" == tab ]]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s\n' "--app=$1" --window-position=0,0
+  fi
+}
+
 cmd_serve() {
   local site="" stop=0 login=0 start_url="" private=0 switch=0 restart=0 noswitch=0
   while (($#)); do
@@ -6407,15 +6426,16 @@ cmd_serve() {
   # --restore-last-session makes this Chrome store them; the stop then gives them
   # an expiry (_session_cookies_keep). The tabs of an earlier session are deleted
   # first, so the person sees one tab, the sign-in page, and none pile up.
-  local -a keepargs=()
+  local -a keepargs=() pageargs=("$start_url")
   if (( plain )); then
     keepargs=(--restore-last-session)
     rm -rf -- "$dir/Default/Sessions" "$dir/Default/Current Session" "$dir/Default/Current Tabs" \
       "$dir/Default/Last Session" "$dir/Default/Last Tabs" 2>/dev/null || true
+    mapfile -t pageargs < <(_login_window_args "$start_url")
   fi
   DISPLAY=":$disp" _tmp_exec "$chrome" --user-data-dir="$dir" --no-first-run \
       --no-default-browser-check --window-size=1280,800 --hide-crash-restore-bubble \
-      --disable-features=TranslateUI "${keepargs[@]}" "$start_url" >/dev/null 2>"$errlog" &
+      --disable-features=TranslateUI "${keepargs[@]}" "${pageargs[@]}" >/dev/null 2>"$errlog" &
   local cpid=$!
 
   # WAIT FOR THE BROWSER BEFORE ADVERTISING IT. `serve` used to print success

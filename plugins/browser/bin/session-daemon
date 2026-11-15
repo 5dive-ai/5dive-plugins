@@ -63,6 +63,10 @@ const downloads = require(path.join(__dirname, '..', 'lib', 'downloads.cjs'));
 const gsignin = require(path.join(__dirname, '..', 'lib', 'google-signin.cjs'));
 const popup = require(path.join(__dirname, '..', 'lib', 'popup.cjs'));
 const frontTab = require(path.join(__dirname, '..', 'lib', 'front-tab.cjs'));
+// A tab a request opened for itself (probe, totp, render, read). `front` never
+// closes one (DIVE-8487): a status check of the site runs in a tab on the site.
+const scratchTabs = new WeakSet();
+const scratch = (p) => { try { if (p && typeof p === 'object') scratchTabs.add(p); } catch (e) { /* not a page */ } return p; };
 const cleanExit = require(path.join(__dirname, '..', 'lib', 'clean-exit.cjs'));
 const sessionKeep = require(path.join(__dirname, '..', 'lib', 'session-keep.cjs'));
 // What each tab looked like when the agent last saw it, so an act can answer with
@@ -572,7 +576,7 @@ async function serveMode(profile, sock, broker, input) {
             while (busy && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
             if (!busy) { busy = { op: 'front', seat: behalf, since: Date.now() }; held = true; }
           }
-          await frontRequest(ctx, input, req, send, end, input && !held);
+          await frontRequest(ctx, input, req, send, end, input && !held, !input && !busy);
         }
         catch (e) { send({ t: 'err', msg: e && e.message ? e.message : String(e) }); end(E_FAILED); }
         finally { if (held) busy = null; }
@@ -659,15 +663,17 @@ async function pageOf(ctx) {
 // A SITE OF A GROUP SHOWS ITS OWN TAB (DIVE-7257). The sites of a sign-in group
 // share this one window, so the viewer for bing.com showed the Google Play tab
 // that was in front. Before the window is handed to a person: a tab on the
-// site comes to the front (lib/front-tab.cjs picks it), or a new tab opens on the
-// site's URL when none is on it. No other tab is navigated or closed.
+// site comes to the front (lib/front-tab.cjs picks it), or a blank tab is sent to
+// the site's URL, or a new tab opens on it when there is neither. Since DIVE-8487
+// the other blank tabs and second tabs of the same site are closed (one tab per
+// Connect); tabs of the group's other sites are never navigated or closed.
 //
 // INPUT MODE (DIVE-7674): no automation channel lists the tabs, so the window's
 // own record decides (lib/front-tab.cjs inputFront): a window last sent to
 // another site gets one new tab on this site's URL, typed through the keyboard;
 // a window already on this site is left as it is. It was "nothing moves" until
 // report 688: Connect for business.facebook.com showed CJ's live session.
-async function frontRequest(ctx, input, req, send, end, inUse) {
+async function frontRequest(ctx, input, req, send, end, inUse, tidy = false) {
   const url = String(req.url || '');
   if (!/^https?:\/\/[^\s]+$/i.test(url) || url.length > 2000) {
     send({ t: 'err', msg: 'front needs the site\'s http(s) url' }); return end(E_NOTHING_RAN);
@@ -682,10 +688,16 @@ async function frontRequest(ctx, input, req, send, end, inUse) {
     }));
     return end(0);
   }
-  let page = frontTab.pick(ctx.pages(), host, driven || ctx.pages()[0]);
-  const opened = !page;
-  if (opened) {
-    page = popup.mine(await ctx.newPage());
+  // ONE TAB PER CONNECT (DIVE-8487): a blank tab is sent to the site rather than
+  // a new one opened, and the other blank tabs and second tabs of the site are
+  // closed once the shown tab is in front. Only while no other request runs
+  // (`tidy`), and never a tab a request opened for itself or a popup.
+  const pages = ctx.pages();
+  const pl = frontTab.plan(pages, host, driven || pages[0], (p) => scratchTabs.has(p));
+  let page = pl.keep || pl.reuse;
+  const opened = !pl.keep && !pl.reuse;
+  if (!pl.keep) {
+    if (opened) page = popup.mine(await ctx.newPage());
     // Not awaited, as the start URL is not: the person must not wait on a slow
     // site, and a tab they can see loading beats a viewer that never opens.
     page.goto(url, { waitUntil: 'domcontentloaded' })
@@ -693,7 +705,17 @@ async function frontRequest(ctx, input, req, send, end, inUse) {
   }
   await page.bringToFront();
   driven = page;
-  out({ host, moved: true, opened, tab: ctx.pages().indexOf(page) });
+  let closed = 0;
+  if (tidy) {
+    for (const p of pl.close) {
+      if (typeof p.close !== 'function') continue;
+      let opener = null;
+      try { opener = typeof p.opener === 'function' ? await p.opener() : null; } catch (e) { opener = null; }
+      if (opener) continue;                         // a popup: its flow may still need it
+      try { await p.close(); closed++; } catch (e) { /* gone already */ }
+    }
+  }
+  out({ host, moved: true, opened, ...(pl.reuse ? { reused: true } : {}), ...(closed ? { closed } : {}), tab: ctx.pages().indexOf(page) });
   return end(0);
 }
 
@@ -833,7 +855,7 @@ async function probeRequest(ctx, req, send, end) {
   const urlNow = () => { try { return page.url(); } catch (e) { return ''; } };
   const said = (html) => (html !== null && marks.some(r => r.test(html))) || (!!landed && landed.test(urlNow()));
   const work = (async () => {
-    page = popup.mine(await ctx.newPage());
+    page = scratch(popup.mine(await ctx.newPage()));
     if (over) return null;
     page.setDefaultTimeout(Math.max(1, Math.min(Number(process.env.FIVEDIVE_BROWSER_PROBE_TIMEOUT || 20000), left())));
     // A REDIRECT THAT INTERRUPTS THE LOAD IS THE LOAD (DIVE-6795's goTo), which
@@ -897,7 +919,7 @@ async function totpRequest(ctx, profile, req, send, end) {
   let page;
   try {
     assertLease(req, 'totp');
-    page = popup.mine(await ctx.newPage());
+    page = scratch(popup.mine(await ctx.newPage()));
     page.setDefaultTimeout(STEP_TIMEOUT);
     const r = await totp.fill(page, profile, { url: req.url, base: req.host,
       settleMs: Number(process.env.FIVEDIVE_BROWSER_RUN_SETTLE_MS || 1500) });
@@ -931,7 +953,7 @@ async function renderRequest(ctx, req, send, end) {
   let page;
   try {
     assertLease(req, 'render');
-    page = popup.mine(await ctx.newPage());
+    page = scratch(popup.mine(await ctx.newPage()));
     page.setDefaultTimeout(Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || STEP_TIMEOUT));
     const w = Number(req.width) || 1280, h = Number(req.height) || 800;
     if (typeof page.setViewportSize === 'function') {
@@ -1022,7 +1044,7 @@ async function readRequest(ctx, req, send, end) {
         if (shown && (inPopup(shown, url) || isOn(shown, url))) {
           return { url, ok: true, html: await shown.content(), shown: true };
         }
-        page = popup.mine(await ctx.newPage());
+        page = scratch(popup.mine(await ctx.newPage()));
         page.setDefaultTimeout(Number(process.env.FIVEDIVE_BROWSER_STEP_TIMEOUT || STEP_TIMEOUT));
         // The default settle ends when this tab is quiet (DIVE-6778); a --wait is waited in full.
         const watch = !Number(req.wait) && typeof page.context === 'function' ? aria.requestWatch(page) : null;
