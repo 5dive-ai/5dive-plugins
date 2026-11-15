@@ -27,6 +27,7 @@
 // classify first, with its own (adapter or default) marker: a challenge page
 // often carries a sign-in form, and this must never be the one to decide it.
 const fs = require('fs');
+const { classify: signinForm } = require('./signin-form.cjs');
 
 const SIGNIN_TEXT = new RegExp('^(?:' + [
   'log ?in', 'login', 'sign ?in', 'signin', 'sign ?up', 'signup',
@@ -109,8 +110,10 @@ function controls(region) {
 
 function classify(html) {
   const doc = strip(html);
+  // DIVE-8523: the regex is the candidate; a change-password dialog on a signed-in
+  // page (wappi.pro's cabinet) or a hidden autofill decoy is not a sign-in form.
   const pw = PASSWORD.exec(doc);
-  if (pw) return { verdict: 'out', why: `a sign-in form on the page (${pw[0].slice(0, 60)})` };
+  if (pw && signinForm(html).signin) return { verdict: 'out', why: `a sign-in form on the page (${pw[0].slice(0, 60)})` };
   const found = regions(doc);
   let any = 0;
   for (const r of found) {

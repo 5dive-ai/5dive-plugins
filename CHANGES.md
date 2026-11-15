@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.91.0: a signed-in page with a change-password form no longer reads as a sign-in; the agent's browser opens at 1280x800 (DIVE-8523)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @8888ccf (`tests/browser_mirror.sh sync`). Box report 1004: on a site with no adapter, a signed-in page carrying a change-password dialog or a hidden password decoy made act, read and snapshot stop with "sign in" (exit 75); a real login form is still caught. The automated browser window now opens at 1280x800 instead of Chrome's 800x600, so a point taken from a shot lands inside it. Detail in 5dive-browser's CHANGES.md.
+
 ### Fixed — telegram 0.5.143: an agent's group-join lines speak the adder's language on every box (DIVE-8513)
 
 - On the default profile the three lines an agent posts when it is added to a group (the hello, the "I'll stay quiet until my owner approves this group" line, and the Group Privacy hint) were English only; lite already followed the adder's Telegram language. They now follow it in every language the 5dive app ships (en, ru, zh, tr, es, ar, pt, de, fr, ja, ko), keeping the emoji, the group id, the app's own menu names in that language and the @BotFather path. An unknown or missing language gets the English lines, unchanged. Lite is untouched.
