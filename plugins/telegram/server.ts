@@ -7210,6 +7210,7 @@ bot.on('my_chat_member', async ctx => {
   const lines = groupJoinLines({
     lite: LITE,
     lang: liteLang(ctx.from?.language_code),
+    code: ctx.from?.language_code,
     name: ctx.me?.first_name || botUsername,
     username: botUsername,
     title: entry.title,
