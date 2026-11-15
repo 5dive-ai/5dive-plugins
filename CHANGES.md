@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.143: an agent's group-join lines speak the adder's language on every box (DIVE-8513)
+
+- On the default profile the three lines an agent posts when it is added to a group (the hello, the "I'll stay quiet until my owner approves this group" line, and the Group Privacy hint) were English only; lite already followed the adder's Telegram language. They now follow it in every language the 5dive app ships (en, ru, zh, tr, es, ar, pt, de, fr, ja, ko), keeping the emoji, the group id, the app's own menu names in that language and the @BotFather path. An unknown or missing language gets the English lines, unchanged. Lite is untouched.
+
 ### Fixed — browser 1.90.0: the sign-in window is the site, one tab, filling the phone (DIVE-8487)
 
 - Registry copy synced byte-for-byte from 5dive-browser branch dive-8487-signin-window-2 @3fb28d9 (`tests/browser_mirror.sh sync`). A person's sign-in window opens the site as a Chrome app window: no tabs, no address bar, no toolbar (`FIVEDIVE_BROWSER_LOGIN_WINDOW=tab` gives back the old window). Connect in the automated browser reuses a blank tab and closes other blank tabs and second tabs of the site. A phone taller than the box's screen keeps its shape, so no black band under the window. Detail in 5dive-browser's CHANGES.md.
