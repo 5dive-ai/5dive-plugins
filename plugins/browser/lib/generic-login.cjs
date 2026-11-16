@@ -27,6 +27,7 @@
 // classify first, with its own (adapter or default) marker: a challenge page
 // often carries a sign-in form, and this must never be the one to decide it.
 const fs = require('fs');
+const { classify: signinForm } = require('./signin-form.cjs');
 
 const SIGNIN_TEXT = new RegExp('^(?:' + [
   'log ?in', 'login', 'sign ?in', 'signin', 'sign ?up', 'signup',
@@ -60,6 +61,16 @@ function attr(tag, name) {
 const hidden = (tag) => /\shidden(?:[\s>=]|$)/i.test(tag) || attr(tag, 'aria-hidden') === 'true'
   || /display\s*:\s*none|visibility\s*:\s*hidden/i.test(attr(tag, 'style') || '');
 
+// DIVE-8483: a header control with NO words of its own (an icon: a person
+// silhouette, an arrow) is named only by where it goes. chatplace.io's
+// signed-out header (2026-11-14) offers its sign-in as an empty
+// <a class="ButtonLogin" href="https://app.chatplace.io/auth/sign-in/…">, so the
+// text rule saw 7 controls and none a sign-in, and read the page SIGNED IN. Only
+// a wordless control is read by its address: a worded one already said what it
+// is ("Add another account" -> /login inside a signed-in menu is not this), and
+// /logout never matches (log-?in needs the "in").
+const SIGNIN_HREF = /^(?:[a-z]+:)?(?:\/\/[^/?#]*)?(?:\/[^?#]*)?\/(?:log-?in|sign-?in|signin|sign_in|sign-?up|signup)(?:[/?#.]|$)/i;
+
 // The body of every header/nav/banner/navigation element, each up to ITS close
 // tag, counting nested elements of the same name. No parser: the probe reads a
 // dumped DOM, which Chrome has already normalised. A region nested inside one
@@ -92,15 +103,17 @@ function controls(region) {
   while ((m = re.exec(region))) {
     const open = '<' + (m[1] || m[4]) + (m[2] ?? m[5]) + '>';
     if (hidden(open)) continue;
-    out.push({ text: text(m[3] ?? m[6]), label: attr(open, 'aria-label') || attr(open, 'title') || '' });
+    out.push({ text: text(m[3] ?? m[6]), label: attr(open, 'aria-label') || attr(open, 'title') || '', href: attr(open, 'href') || '' });
   }
   return out;
 }
 
 function classify(html) {
   const doc = strip(html);
+  // DIVE-8523: the regex is the candidate; a change-password dialog on a signed-in
+  // page (wappi.pro's cabinet) or a hidden autofill decoy is not a sign-in form.
   const pw = PASSWORD.exec(doc);
-  if (pw) return { verdict: 'out', why: `a sign-in form on the page (${pw[0].slice(0, 60)})` };
+  if (pw && signinForm(html).signin) return { verdict: 'out', why: `a sign-in form on the page (${pw[0].slice(0, 60)})` };
   const found = regions(doc);
   let any = 0;
   for (const r of found) {
@@ -109,12 +122,15 @@ function classify(html) {
       for (const s of [c.text, c.label]) {
         if (s && SIGNIN_TEXT.test(s)) return { verdict: 'out', why: `a "${s.slice(0, 40)}" control in the page header` };
       }
+      if (!c.text && !c.label && c.href && SIGNIN_HREF.test(c.href.replace(/&amp;/gi, '&'))) {
+        return { verdict: 'out', why: `a sign-in link in the page header (${c.href.split(/[?#]/)[0].slice(0, 60)})` };
+      }
     }
   }
   return any ? { verdict: 'in', why: `${any} header control(s), none of them a sign-in` } : { verdict: 'none', why: 'no header or navigation with controls in it' };
 }
 
-module.exports = { classify, SIGNIN_TEXT };
+module.exports = { classify, SIGNIN_TEXT, SIGNIN_HREF };
 
 if (require.main === module) {
   let html = '';

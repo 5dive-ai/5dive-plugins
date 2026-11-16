@@ -2962,6 +2962,20 @@ _chrome_launch_error() {
 GENERIC_SIGNIN_MARKER='type=["'"'"']?password|autocomplete=["'"'"']?current-password|<form[^>]*action=["'"'"'][^"'"'"']*(log-?in|sign-?in|sign_in|/session|/auth)'
 GENERIC_SIGNIN_URL='[/.](log-?in|sign-?in|signin|sign_in|auth|sso|session|account/login|accounts/login)([/?#.]|$)'
 
+# _page_signin_form <html-file> — 0 when the page carries a SIGN-IN form (DIVE-8523).
+# GENERIC_SIGNIN_MARKER is only the candidate: a signed-in page with a change-
+# password dialog (wappi.pro's cabinet, box report 1004) or a hidden anti-autofill
+# decoy matches it too. lib/signin-form.cjs decides: a visible password box that
+# is not part of a change or set-password form, or a visible form posting to a
+# login path. No node or no lib: the grep stands (fail closed).
+_page_signin_form() {
+  local f="$1" v
+  [[ -s "$f" ]] && grep -qiE "$GENERIC_SIGNIN_MARKER" "$f" || return 1
+  _have node && [[ -r "$_SELF_DIR/../lib/signin-form.cjs" ]] || return 0
+  v=$(node "$_SELF_DIR/../lib/signin-form.cjs" "$f" 2>/dev/null | head -1)
+  [[ "$v" != none ]]
+}
+
 # _signin_guard <html-file> [<final-url>] — the render itself, re-checked, for a
 # site whose login no adapter confirmed. The probe looked at the site's front page;
 # the page the agent asked for can still redirect to a sign-in, and handing that
@@ -2980,7 +2994,7 @@ _signin_guard() {
     _generic_memo_drop "$_PG_SITE"   # DIVE-7722: the next page verb checks the front page again
     die "$E_COLD" "$(_cic_route)the page redirected to a sign-in ($u). Refusing rather than handing back the sign-in page as if it were the page you asked for; no evidence was written. If this account should be signed in, a person logs in again: 5dive browser auth $_PG_SITE"
   fi
-  if [[ -s "$f" ]] && grep -qiE "$GENERIC_SIGNIN_MARKER" "$f"; then
+  if _page_signin_form "$f"; then
     _signin_google_offer "$f" "$u" && return 0
     _signin_verify_offer "$f" "$u" && return 0
     _generic_memo_drop "$_PG_SITE"   # DIVE-7722
@@ -3346,7 +3360,9 @@ _probe() {
       ckind=$(_challenge_kind "$dom" "$(sed -n 's/^5dive-probe-final-url: //p' "$dom.err" 2>/dev/null | tail -1)")
       verdict=challenge; break
     fi
-    if [[ -n "$marker" ]] && grep -qiE "$marker" "$dom"; then verdict=expired; break; fi
+    # The generic marker is a candidate only (DIVE-8523): a change-password
+    # dialog on a signed-in page matches it too.
+    if [[ -n "$marker" ]] && grep -qiE "$marker" "$dom" && { (( ! generic )) || _page_signin_form "$dom"; }; then verdict=expired; break; fi
     if [[ -n "$positive" ]] && grep -qiE "$positive" "$dom"; then verdict=authenticated; break; fi
     # THE ADDRESS A SIGNED-IN SESSION LANDS ON (DIVE-7648), served probe only (the
     # cold one is not told where it landed). Reached only when neither the
@@ -3439,7 +3455,7 @@ _probe() {
   # DIVE-8263: whether the page that loaded is a sign-in form, for the owner's
   # Done below (a Done is evidence only for a page that is not one).
   local signin_form=0
-  [[ -s "$dom" ]] && grep -qiE "$GENERIC_SIGNIN_MARKER" "$dom" && signin_form=1
+  _page_signin_form "$dom" && signin_form=1
   rm -f "$dom" "$dom.err"
   local via=headless; (( warm )) && via=served
   case "$verdict" in
@@ -5936,6 +5952,25 @@ _now_ms() {
   if [[ -n "$t" ]]; then printf '%s\n' "$(( t / 1000 ))"; else date +%s%3N; fi
 }
 
+# THE SIGN-IN WINDOW IS THE PAGE, NOT A DESKTOP BROWSER (DIVE-8487). The QA walk
+# opened it on a phone and saw Chrome's tab strip, address bar and extension
+# icons over the site, and a second tab of the site after a second Connect. A
+# person's sign-in window (the plain Chrome of `serve --login`) is opened as an
+# app window (--app=<url>): one page, no tabs, no address bar, no toolbar, so
+# nothing stacks and the whole window is the site. Window size and position are
+# the same as before (1280x800 at 0,0); the phone fit (lib/viewer-fit.cjs) sizes
+# it as it did the tabbed one. A link the site opens in a new tab opens in a
+# normal Chrome window, as it would from any app window.
+# FIVEDIVE_BROWSER_LOGIN_WINDOW=tab is the way back to the tabbed window.
+# Agents' browsers (the warm session, input mode) are not this launch.
+_login_window_args() {  # <url> -> chrome args that open it, one per line
+  if [[ "${FIVEDIVE_BROWSER_LOGIN_WINDOW:-app}" == tab ]]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s\n' "--app=$1" --window-position=0,0
+  fi
+}
+
 cmd_serve() {
   local site="" stop=0 login=0 start_url="" private=0 switch=0 restart=0 noswitch=0
   while (($#)); do
@@ -6407,15 +6442,16 @@ cmd_serve() {
   # --restore-last-session makes this Chrome store them; the stop then gives them
   # an expiry (_session_cookies_keep). The tabs of an earlier session are deleted
   # first, so the person sees one tab, the sign-in page, and none pile up.
-  local -a keepargs=()
+  local -a keepargs=() pageargs=("$start_url")
   if (( plain )); then
     keepargs=(--restore-last-session)
     rm -rf -- "$dir/Default/Sessions" "$dir/Default/Current Session" "$dir/Default/Current Tabs" \
       "$dir/Default/Last Session" "$dir/Default/Last Tabs" 2>/dev/null || true
+    mapfile -t pageargs < <(_login_window_args "$start_url")
   fi
   DISPLAY=":$disp" _tmp_exec "$chrome" --user-data-dir="$dir" --no-first-run \
       --no-default-browser-check --window-size=1280,800 --hide-crash-restore-bubble \
-      --disable-features=TranslateUI "${keepargs[@]}" "$start_url" >/dev/null 2>"$errlog" &
+      --disable-features=TranslateUI "${keepargs[@]}" "${pageargs[@]}" >/dev/null 2>"$errlog" &
   local cpid=$!
 
   # WAIT FOR THE BROWSER BEFORE ADVERTISING IT. `serve` used to print success

@@ -1,10 +1,39 @@
 ## Unreleased
 
-### Added — teams 0.6.0 + telegram-codex 0.5.52: Microsoft Teams on every enterprise setup (DIVE-8464)
+### Added — teams 0.6.0 + telegram-codex 0.5.53: Microsoft Teams on every enterprise setup (DIVE-8464)
 
 - Teams now answers on Claude Code with the firm's own AI server: Claude Code turns channels off there, so the message is typed into the session (`plugins/teams/channelroute.ts`, a copy of the dashboard's DIVE-6000 router; an org policy is never typed around).
 - Teams now answers on Codex seats: the dispatcher runs it as an adapter (`codex-adapter.ts` + `dispatch.ts`: inbox in, `outbox/teams/` out, through the reply tool's own send). `hooks/codex-role-guard.ts` holds a member's risky ask on Codex. `bin/teams` accepts Codex agents.
 - telegram-codex: `CODEX_DISPATCHER_PLUGIN_ADAPTERS` starts any channel plugin as an adapter and accepts its name as an inbox source; unconfigured names stay refused.
+
+### Fixed — browser 1.91.0: a signed-in page with a change-password form no longer reads as a sign-in; the agent's browser opens at 1280x800 (DIVE-8523)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @8888ccf (`tests/browser_mirror.sh sync`). Box report 1004: on a site with no adapter, a signed-in page carrying a change-password dialog or a hidden password decoy made act, read and snapshot stop with "sign in" (exit 75); a real login form is still caught. The automated browser window now opens at 1280x800 instead of Chrome's 800x600, so a point taken from a shot lands inside it. Detail in 5dive-browser's CHANGES.md.
+
+### Fixed — telegram 0.5.143: an agent's group-join lines speak the adder's language on every box (DIVE-8513)
+
+- On the default profile the three lines an agent posts when it is added to a group (the hello, the "I'll stay quiet until my owner approves this group" line, and the Group Privacy hint) were English only; lite already followed the adder's Telegram language. They now follow it in every language the 5dive app ships (en, ru, zh, tr, es, ar, pt, de, fr, ja, ko), keeping the emoji, the group id, the app's own menu names in that language and the @BotFather path. An unknown or missing language gets the English lines, unchanged. Lite is untouched.
+
+### Fixed — browser 1.90.0: the sign-in window is the site, one tab, filling the phone (DIVE-8487)
+
+- Registry copy synced byte-for-byte from 5dive-browser branch dive-8487-signin-window-2 @3fb28d9 (`tests/browser_mirror.sh sync`). A person's sign-in window opens the site as a Chrome app window: no tabs, no address bar, no toolbar (`FIVEDIVE_BROWSER_LOGIN_WINDOW=tab` gives back the old window). Connect in the automated browser reuses a blank tab and closes other blank tabs and second tabs of the site. A phone taller than the box's screen keeps its shape, so no black band under the window. Detail in 5dive-browser's CHANGES.md.
+
+### Fixed — telegram 0.5.142: a photo that cannot be saved still reaches the agent (DIVE-8489)
+
+- Box report 994 (partner client): owner photos reached the agent as a bare `(photo)`, with no file and no file id, so the photo was lost and nobody was told. Any failure to save a photo (Telegram unreachable, disk full, an unwritable inbox, a non-200 download) now delivers it as an attachment: `attachment_kind=photo`, `attachment_file_id` and a short `attachment_error` in meta, so the agent can retry with `download_attachment`. A non-200 download is no longer saved as a `.jpg`, and the reason never carries the bot token.
+
+### Fixed — browser 1.89.0: a signed-out site whose Log in button is only an icon no longer reads connected (DIVE-8483)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @03d2794 (`tests/browser_mirror.sh sync`). The generic sign-in check counted header controls with no words and no label as a signed-in header, so chatplace.io's signed-out home page (its Log in is an icon) read connected on Done. Such a link is now read by its address: a log-in, sign-in or sign-up path reads signed out. Detail in 5dive-browser's CHANGES.md.
+
+### Fixed — browser 1.88.0: an Instagram account not linked to Facebook no longer reads "sign in again" while signed in (DIVE-8477)
+
+- Registry copy synced byte-for-byte from 5dive-browser main @0014691 (`tests/browser_mirror.sh sync`). 1.87.0 read Instagram's viewer record with account 0 as signed out, but that field is the Facebook account, and it is 0 for every Instagram account not linked to Facebook; the Instagram account sits in a second field of the same record. Signed out is now both fields at 0, or the login form; signed in is a real id in either. A partner's client, signed in, got "sign in again" on every Done. Detail in 5dive-browser's CHANGES.md.
+
+### Fixed — telegram-codex 0.5.52: a Codex hire on a ChatGPT plan without Sol answers instead of failing every turn (DIVE-8462)
+
+- Box report, 2026-11-14: a partner client's new Codex hire answered every message with "Codex could not complete this turn: The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account." New Codex seats start on Sol, and that client's plan does not offer it.
+- On that refusal the dispatcher reads the account's own model list, switches the seat to the first model not yet refused (written to `config.toml`, so a restart keeps it), says so once in the chat, and runs the same message again. An already-pinned seat is fixed on its next message. Any other error is reported as before; a message is re-run at most 3 times.
 
 ### Fixed — browser 1.87.0: an Instagram sign-in no longer reads "sign in again" because the page has a password field (DIVE-8457)
 

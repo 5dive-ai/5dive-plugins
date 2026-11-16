@@ -395,8 +395,9 @@ without a scheduled probe the agent finds out **mid-publish**. So:
 - **With no adapter, the generic check reads the page header** (DIVE-5388,
   `lib/generic-login.cjs`). Signed out: a Log in / Sign in / Sign up control (link, button or
   `role=button`, by its whole text or `aria-label`) inside `<header>`, `<nav>`, `role=banner` or
-  `role=navigation`; a password field or a form posting to a login path anywhere; or, through a
-  served browser, a landing on a sign-in path. Signed in: a header WITH controls and none of them
+  `role=navigation`; a visible password field or a form posting to a login path anywhere, except
+  one that is part of a change or set-password form (DIVE-8523, `lib/signin-form.cjs`, which also
+  backs the page verbs' guard); or, through a served browser, a landing on a sign-in path. Signed in: a header WITH controls and none of them
   a sign-in. Anything else is still `UNKNOWN`. A page that merely loaded is never `authenticated`
   (the DIVE-4426 rule): the header has to have rendered and chosen not to offer a sign-in. The
   challenge marker is tested first, as always. The page verbs' gate keeps its narrower check.
