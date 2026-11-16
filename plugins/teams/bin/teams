@@ -176,7 +176,8 @@ teams_connect() {
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
   local info; info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
   local type; type=$(jq -r '.type // empty' <<<"$info")
-  [[ "$type" == claude ]] || fail "$E_VALIDATION" "Teams is for Claude Code agents for now ('$agent' is $type)"
+  # DIVE-8464: Codex seats too (the dispatcher runs this plugin as an adapter).
+  [[ "$type" == claude || "$type" == codex ]] || fail "$E_VALIDATION" "Teams is for Claude Code and Codex agents for now ('$agent' is $type)"
 
   # Re-running connect keeps what it already knows.
   [[ -n "$app_id" ]] || app_id=$(_cfg_get "$agent" app_id)
@@ -541,7 +542,8 @@ teams_connect_microsoft() {
   [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive agent teams connect $agent --microsoft"
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
   local info; info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
-  [[ "$(jq -r '.type // empty' <<<"$info")" == claude ]] || fail "$E_VALIDATION" "Teams is for Claude Code agents for now"
+  local atype; atype=$(jq -r '.type // empty' <<<"$info")
+  [[ "$atype" == claude || "$atype" == codex ]] || fail "$E_VALIDATION" "Teams is for Claude Code and Codex agents for now ('$agent' is $atype)"
   [[ -n "$name" ]] || name="${agent^}"
 
   # Already in Teams this way: the same link again, nothing new made. A bot made

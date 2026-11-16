@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Added — teams 0.6.0 + telegram-codex 0.5.53: Microsoft Teams on every enterprise setup (DIVE-8464)
+
+- Teams now answers on Claude Code with the firm's own AI server: Claude Code turns channels off there, so the message is typed into the session (`plugins/teams/channelroute.ts`, a copy of the dashboard's DIVE-6000 router; an org policy is never typed around).
+- Teams now answers on Codex seats: the dispatcher runs it as an adapter (`codex-adapter.ts` + `dispatch.ts`: inbox in, `outbox/teams/` out, through the reply tool's own send). `hooks/codex-role-guard.ts` holds a member's risky ask on Codex. `bin/teams` accepts Codex agents.
+- telegram-codex: `CODEX_DISPATCHER_PLUGIN_ADAPTERS` starts any channel plugin as an adapter and accepts its name as an inbox source; unconfigured names stay refused.
+
 ### Fixed — browser 1.91.0: a signed-in page with a change-password form no longer reads as a sign-in; the agent's browser opens at 1280x800 (DIVE-8523)
 
 - Registry copy synced byte-for-byte from 5dive-browser main @8888ccf (`tests/browser_mirror.sh sync`). Box report 1004: on a site with no adapter, a signed-in page carrying a change-password dialog or a hidden password decoy made act, read and snapshot stop with "sign in" (exit 75); a real login form is still caught. The automated browser window now opens at 1280x800 instead of Chrome's 800x600, so a point taken from a shot lands inside it. Detail in 5dive-browser's CHANGES.md.

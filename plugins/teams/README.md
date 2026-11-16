@@ -1,6 +1,6 @@
 # @5dive/teams-plugin
 
-Microsoft Teams channel for Claude Code. Each agent is its own contact in the customer's Microsoft 365 tenant, the way each agent is its own Telegram bot (DIVE-7658).
+Microsoft Teams channel for Claude Code and Codex agents. Each agent is its own contact in the customer's Microsoft 365 tenant, the way each agent is its own Telegram bot (DIVE-7658).
 
 ```
 Teams ──HTTPS──▶ box Caddy (teams-<agent>.<box domain>) ──▶ 127.0.0.1:<port>/api/messages  (server.ts)
@@ -24,11 +24,17 @@ No 5dive server is on the path. Shut on a local-only (offline) box until its IT 
 - The bot token is only ever sent to Microsoft's Bot Framework hosts; file uploads only to SharePoint/OneDrive; downloads only from those, after a private-address check (`hosts.ts`).
 - A reply goes only to a chat that has written to the agent.
 
+## Works on
+
+- **A Claude plan** (Claude Code with channels on). A Claude Team or Enterprise org's admin must allow channels.
+- **Claude Code on your own AI server** (Ollama, LM Studio, vLLM, or any custom base URL). Claude Code turns channels off there, so the message is typed into the agent's session instead, and the agent answers with the same `reply` tool (`channelroute.ts`, DIVE-8464). An org that turned channels off on purpose is never typed around.
+- **Codex on a ChatGPT account**. The Codex seat's dispatcher runs this plugin beside it (`codex-adapter.ts`, `dispatch.ts`). The message starts a Codex turn and the answer goes back to the same Teams chat. A member's risky ask is held by `hooks/codex-role-guard.ts`. Codex has no `ask_admin` button yet: it waits until an admin messages it on Teams.
+
 ## Not yet
 
 - Background chatter in groups and channels (messages that do not @mention the agent): needs the RSC permissions `ChannelMessage.Read.Group` / `ChatMessage.Read.Chat` and a policy for when to speak.
-- The typed fallback the Telegram and dashboard plugins have for seats where Claude Code refuses channels (API-billed seats). A Claude Team/Enterprise org also needs channels allowed by its admin.
-- Other harnesses (Codex, Hermes, OpenClaw...). OpenClaw has its own `@openclaw/msteams`.
+- Other harnesses (Hermes, OpenClaw...). OpenClaw has its own `@openclaw/msteams`.
+- On Codex: the `ask_admin` card and `edit_message`.
 
 ## Credits
 
