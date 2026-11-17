@@ -1,5 +1,10 @@
 ## Unreleased
 
+### Added — dashboard 0.5.41: a test version of faster voice answers, on one box only (DIVE-8649)
+
+- A box with `/var/lib/5dive/voice/labs` gets it; no box has that file, so every other box runs exactly as before. The file holds words: `timing` logs one line per voice reply to `voice-timing.log` beside `lifecycle.log` (stage durations and the chat id only, never the text or audio); `fast` also starts `5dive-speak` when the agent calls reply, instead of after the text is posted. A text that fails to post throws its early speech away, unposted. The file is read on every voice reply (no restart), and no installer or nightly writes that directory.
+- Harness: `test/dive8649-dashboard-voice-fast.test.ts` (8 arms: the switch's parse, the clock, the line holds no text, the bounded log; the real adapter with no file (order and no log unchanged), `fast` (speech starts before the text post ends), `fast` with a refused text (no voice note, no file left), `timing` from a real voice note's hand-over).
+
 ### Fixed — dashboard 0.5.40: when the AI server does not have the agent's model, the office chat says so instead of "Working…" forever (DIVE-8610)
 
 - An office box moved its AI server to another model and the agents kept asking for the old one (the CLI half of DIVE-8610 moves them now). The server answered 404, Claude Code showed "There's an issue with the selected model", and the person in the web chat got no line at all. `classifyFailure` (telegram's `hooks/lib/failure.ts`, synced to the dashboard copy) has a refused-model kind: Claude Code's own sentence, an Anthropic-shape `not_found_error`, `API Error: 404`, and a server's "model … not found / does not exist"; on the pane only Claude Code's status line counts. The dashboard StopFailure hook posts one plain line (`MODEL_NOTICE`, en/ru, no model name or code) in the chat the person wrote in, and starts no resume helper: retrying cannot fix it. Telegram's hook is unchanged (the owner DM still carries the technical line).

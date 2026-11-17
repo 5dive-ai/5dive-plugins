@@ -44,6 +44,7 @@ import { cliTurn, cliTurnTimeoutS, readerActive, startCliDispatcher } from './cl
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
 import { replyTool, voicePlan, voiceSkippedNote, voiceFailedOnce } from './voicereply.ts'
+import { VOICE_LABS_FILE_DEFAULT, appendVoiceTiming, makeVoiceClock, readVoiceLabs, voiceTimingLine, type VoiceLab } from './voicefast.ts'
 import { audioSeconds, inboundAttachment, isAudioPath, isVoiceInbound, replyBody, voicesReply, webPlayable, withLengthName, type Probe, type Run } from './voicenote.ts'
 import {
   loadPendingRetryState,
@@ -651,6 +652,8 @@ async function deliverInbound(id: string, text: string, meta: Record<string, unk
     if (answerPendingQuestion(chatId, text)) return
     await deliverToSession(text, meta)
     workStatus.inbound(chatId)
+    // DIVE-8649: the start of a voice reply's clock (voicefast.ts).
+    if (isVoiceInbound(text, meta)) voiceClock.heard(chatId, Date.now())
     return
   }
   const seq = `${Date.now()}-${process.pid}-${dispatcherInboxSeq++}`
@@ -1368,31 +1371,103 @@ type ReplyArgs = { chat_id?: unknown; text?: unknown; files?: unknown; voice?: u
 // is told to drop voice. A failure: one text line, then a cooldown in which a
 // voice request is skipped (voicereply.ts), so a small model cannot loop on it.
 let voiceFailedAt = 0
-async function speakReply(text: string, chatId: string): Promise<string> {
+
+// DIVE-8649: lodar's test version (voicefast.ts). Off unless this box's labs
+// file says so; then the speech can start before the text is posted, and each
+// voice reply's stage timings go to voice-timing.log beside lifecycle.log.
+const VOICE_LABS_FILE = process.env.DASHBOARD_VOICE_LABS ?? VOICE_LABS_FILE_DEFAULT
+const VOICE_TIMING_FILE = join(STATE_DIR, 'voice-timing.log')
+const voiceClock = makeVoiceClock()
+
+/** A spoken reply's file, or the tool-result line for one that was not made. */
+type Speech = { ogg: string } | { skip: string }
+
+/** One voice reply in flight: its text, when each stage began, and its speech once started. */
+type VoiceReply = {
+  text: string
+  chat: string
+  labs: Set<VoiceLab>
+  heardAt: number | null
+  replyAt: number
+  speakAt: number
+  speech: Promise<Speech> | null
+}
+
+function makeSpeech(text: string): Promise<Speech> {
   const plan = voicePlan(existsSync(SPEAK), voiceFailedAt, Date.now())
-  if (plan !== 'speak') return voiceSkippedNote(plan)
-  let ogg = ''
-  try {
-    const { stdout } = await promisify(execFile)(SPEAK, ['--', text], { timeout: 90_000 })
-    ogg = stdout.trim().split('\n').pop() ?? ''
-    if (!ogg.startsWith('/') || !existsSync(ogg)) throw new Error('5dive-speak made no file')
-  } catch (err) {
-    const e = err as { code?: unknown; stderr?: unknown; message?: unknown }
-    // Exit 3: the owner switched voice replies off. Text only, and no apology.
-    if (e.code === 3) return 'voice replies are switched off on this server: the text went, say nothing about voice.'
-    voiceFailedAt = Date.now()
-    const why = String(e.stderr || e.message || err).trim().split('\n').pop() ?? 'unknown'
-    return voiceFailedOnce(why)
+  if (plan !== 'speak') return Promise.resolve({ skip: voiceSkippedNote(plan) })
+  return (async (): Promise<Speech> => {
+    try {
+      const { stdout } = await promisify(execFile)(SPEAK, ['--', text], { timeout: 90_000 })
+      const ogg = stdout.trim().split('\n').pop() ?? ''
+      if (!ogg.startsWith('/') || !existsSync(ogg)) throw new Error('5dive-speak made no file')
+      return { ogg }
+    } catch (err) {
+      const e = err as { code?: unknown; stderr?: unknown; message?: unknown }
+      // Exit 3: the owner switched voice replies off. Text only, and no apology.
+      if (e.code === 3) return { skip: 'voice replies are switched off on this server: the text went, say nothing about voice.' }
+      voiceFailedAt = Date.now()
+      const why = String(e.stderr || e.message || err).trim().split('\n').pop() ?? 'unknown'
+      return { skip: voiceFailedOnce(why) }
+    }
+  })()
+}
+
+/** A voice reply's start, or null for any other reply. With `fast` on, its speech starts here. */
+function startVoiceReply(args: ReplyArgs): VoiceReply | null {
+  const text = typeof args.text === 'string' ? args.text : ''
+  if (args.voice !== true || !text.trim()) return null
+  const chat = typeof args.chat_id === 'string' && args.chat_id ? args.chat_id : 'dashboard'
+  const now = Date.now()
+  const labs = readVoiceLabs(VOICE_LABS_FILE)
+  const v: VoiceReply = { text, chat, labs, heardAt: voiceClock.take(chat, now), replyAt: now, speakAt: 0, speech: null }
+  if (labs.has('fast')) {
+    v.speakAt = now
+    v.speech = makeSpeech(text)
   }
+  return v
+}
+
+/** A voice reply whose text was not sent: its early speech is thrown away, never posted. */
+function dropVoiceReply(v: VoiceReply | null): void {
+  void v?.speech?.then(s => { if ('ogg' in s) { try { unlinkSync(s.ogg) } catch {} } })
+}
+
+// DIVE-6549: `voice: true` speaks the reply here, so answering a voice note is
+// one tool call where it was three model rounds (reply, run 5dive-speak, reply
+// again with the file), each 2-3 s on a big model. The text has already gone
+// when this runs, so a voice note that fails costs the voice and never the
+// answer; the agent is told so it can say one line about it (DIVE-6440).
+// DIVE-7603: never invites a retry. No 5dive-speak: not tried, and the agent
+// is told to drop voice. A failure: one text line, then a cooldown in which a
+// voice request is skipped (voicereply.ts), so a small model cannot loop on it.
+async function speakReply(v: VoiceReply): Promise<string> {
+  const textAt = Date.now()
+  if (!v.speech) {
+    v.speakAt = textAt
+    v.speech = makeSpeech(v.text)
+  }
+  const s = await v.speech
+  const spokeAt = Date.now()
+  let sentAt: number | null = null
+  const timed = () => {
+    if (!v.labs.size) return
+    appendVoiceTiming(VOICE_TIMING_FILE, voiceTimingLine({
+      chat: v.chat, fast: v.labs.has('fast'), heardAt: v.heardAt, replyAt: v.replyAt, textAt, speakAt: v.speakAt, spokeAt, sentAt,
+    }))
+  }
+  if ('skip' in s) { timed(); return s.skip }
   try {
-    const sent = `voice note ${await sendDashboardReply({ chat_id: chatId, files: [ogg] })}`
+    const sent = `voice note ${await sendDashboardReply({ chat_id: v.chat, files: [s.ogg] })}`
+    sentAt = Date.now()
     voiceFailedAt = 0
     return sent
   } catch (err) {
     voiceFailedAt = Date.now()
     return voiceFailedOnce(String(err))
   } finally {
-    try { unlinkSync(ogg) } catch {}
+    try { unlinkSync(s.ogg) } catch {}
+    timed()
   }
 }
 
@@ -1443,6 +1518,16 @@ async function postReply(chatId: string, body: string, files: string[], q: ChatQ
 }
 
 async function sendDashboardReply(args: ReplyArgs): Promise<string> {
+  const voice = startVoiceReply(args)
+  try {
+    return await sendReplyAndVoice(args, voice)
+  } catch (err) {
+    dropVoiceReply(voice)
+    throw err
+  }
+}
+
+async function sendReplyAndVoice(args: ReplyArgs, voice: VoiceReply | null): Promise<string> {
   const rawText = typeof args.text === 'string' ? args.text : ''
   const chatId = typeof args.chat_id === 'string' && args.chat_id ? args.chat_id : 'dashboard'
   // Attached files must be readable by the dashboard's file server, which
@@ -1511,8 +1596,8 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
     }
     const j = (await res.json().catch(() => null)) as { id?: number } | null
     const sentLine = `sent encrypted (id: ${j?.id ?? '?'})`
-    if (args.voice !== true || !rawText.trim()) return sentLine
-    return `${sentLine}\n${await speakReply(rawText, chatId)}`
+    if (!voice) return sentLine
+    return `${sentLine}\n${await speakReply(voice)}`
   }
   // DIVE-6816: on a chat-only box the API cannot read this box's outbox, so
   // every copy there (a voice note's OGG and its MP3 too) is posted first; the
@@ -1542,8 +1627,8 @@ async function sendDashboardReply(args: ReplyArgs): Promise<string> {
   }
   const j = (await res.json().catch(() => null)) as { id?: number } | null
   const sentLine = `sent (id: ${j?.id ?? '?'})`
-  if (args.voice !== true || !rawText.trim()) return sentLine
-  return `${sentLine}\n${await speakReply(rawText, chatId)}`
+  if (!voice) return sentLine
+  return `${sentLine}\n${await speakReply(voice)}`
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
