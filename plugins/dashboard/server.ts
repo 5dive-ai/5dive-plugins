@@ -44,7 +44,7 @@ import { cliTurn, cliTurnTimeoutS, readerActive, startCliDispatcher } from './cl
 import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
 import { makeOrgPolicyNotifier, orgPolicyText } from './orgpolicy.ts'
 import { replyTool, voicePlan, voiceSkippedNote, voiceFailedOnce } from './voicereply.ts'
-import { VOICE_LABS_FILE_DEFAULT, appendVoiceTiming, makeVoiceClock, readVoiceLabs, voiceTimingLine, type VoiceLab } from './voicefast.ts'
+import { VOICE_LABS_FILE_DEFAULT, appendVoiceTiming, makeVoiceClock, readVoiceLabs, splitFirstSentence, voiceTimingLine, type VoiceLab, type VoicePart } from './voicefast.ts'
 import { audioSeconds, inboundAttachment, isAudioPath, isVoiceInbound, replyBody, voicesReply, webPlayable, withLengthName, type Probe, type Run } from './voicenote.ts'
 import {
   loadPendingRetryState,
@@ -1349,9 +1349,16 @@ function ensureLongPoll(): void {
 // DIVE-7347: Grok gets no tools here. Its plain-text answer IS the reply, so a
 // reply tool would only let it answer twice.
 // DIVE-7603: voice is offered only where 5dive-speak exists (voicereply.ts).
+// DIVE-8649 `loaded` (labs file): the reply tool is never deferred behind tool
+// search, so a new session's first answer does not search for it first.
 mcp.setRequestHandler(ListToolsRequestSchema, async () => GROK ? { tools: [] } : ({
-  tools: [replyTool(existsSync(SPEAK))],
+  tools: [withAlwaysLoad(replyTool(existsSync(SPEAK)), readVoiceLabs(VOICE_LABS_FILE).has('loaded'))],
 }))
+
+/** Claude Code reads a tool's `_meta` "anthropic/alwaysLoad": true keeps it out of tool search. Off: the tool as it was. */
+function withAlwaysLoad<T extends object>(tool: T, on: boolean): T {
+  return on ? { ...tool, _meta: { 'anthropic/alwaysLoad': true } } : tool
+}
 
 const FFMPEG = process.env.DASHBOARD_FFMPEG ?? (['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'].find(p => existsSync(p)) ?? 'ffmpeg')
 const runFile: Run = async (bin, args, timeoutMs) => { await promisify(execFile)(bin, args, { timeout: timeoutMs }) }
@@ -1360,7 +1367,7 @@ const FFPROBE = process.env.DASHBOARD_FFPROBE ?? FFMPEG.replace(/ffmpeg$/, 'ffpr
 const probeFile: Probe = async (bin, args, timeoutMs) => (await promisify(execFile)(bin, args, { timeout: timeoutMs })).stdout
 const SPEAK = process.env.DASHBOARD_SPEAK ?? '/usr/local/bin/5dive-speak'
 
-type ReplyArgs = { chat_id?: unknown; text?: unknown; files?: unknown; voice?: unknown; question?: ChatQuestion | null }
+type ReplyArgs = { chat_id?: unknown; text?: unknown; files?: unknown; voice?: unknown; question?: ChatQuestion | null; part?: VoicePart }
 
 // DIVE-6549: `voice: true` speaks the reply here, so answering a voice note is
 // one tool call where it was three model rounds (reply, run 5dive-speak, reply
@@ -1391,6 +1398,8 @@ type VoiceReply = {
   replyAt: number
   speakAt: number
   speech: Promise<Speech> | null
+  /** `split`: the reply spoken in parts, first sentence first; each part's speech starts once the one before is made. */
+  parts: Promise<Speech>[] | null
 }
 
 function makeSpeech(text: string): Promise<Speech> {
@@ -1420,8 +1429,14 @@ function startVoiceReply(args: ReplyArgs): VoiceReply | null {
   const chat = typeof args.chat_id === 'string' && args.chat_id ? args.chat_id : 'dashboard'
   const now = Date.now()
   const labs = readVoiceLabs(VOICE_LABS_FILE)
-  const v: VoiceReply = { text, chat, labs, heardAt: voiceClock.take(chat, now), replyAt: now, speakAt: 0, speech: null }
-  if (labs.has('fast')) {
+  const v: VoiceReply = { text, chat, labs, heardAt: voiceClock.take(chat, now), replyAt: now, speakAt: 0, speech: null, parts: null }
+  const pieces = labs.has('split') ? splitFirstSentence(text) : null
+  if (pieces) {
+    v.speakAt = now
+    const first = makeSpeech(pieces[0])
+    // One at a time, so the first part has the box to itself; no second try after a part that was not made.
+    v.parts = [first, first.then(s => ('ogg' in s ? makeSpeech(pieces[1]) : s))]
+  } else if (labs.has('fast') || labs.has('split')) {
     v.speakAt = now
     v.speech = makeSpeech(text)
   }
@@ -1430,7 +1445,18 @@ function startVoiceReply(args: ReplyArgs): VoiceReply | null {
 
 /** A voice reply whose text was not sent: its early speech is thrown away, never posted. */
 function dropVoiceReply(v: VoiceReply | null): void {
-  void v?.speech?.then(s => { if ('ogg' in s) { try { unlinkSync(s.ogg) } catch {} } })
+  for (const p of [v?.speech, ...(v?.parts ?? [])]) void p?.then(dropSpeech)
+}
+
+function dropSpeech(s: Speech): void {
+  if ('ogg' in s) { try { unlinkSync(s.ogg) } catch {} }
+}
+
+/** An encrypted chat keeps no part tags (the API keeps its envelope only): its parts are dropped and the reply is spoken whole. */
+function unsplitVoiceReply(v: VoiceReply | null): void {
+  if (!v?.parts) return
+  for (const p of v.parts) void p.then(dropSpeech)
+  v.parts = null
 }
 
 // DIVE-6549: `voice: true` speaks the reply here, so answering a voice note is
@@ -1443,6 +1469,7 @@ function dropVoiceReply(v: VoiceReply | null): void {
 // voice request is skipped (voicereply.ts), so a small model cannot loop on it.
 async function speakReply(v: VoiceReply): Promise<string> {
   const textAt = Date.now()
+  if (v.parts) return speakParts(v, v.parts, textAt)
   if (!v.speech) {
     v.speakAt = textAt
     v.speech = makeSpeech(v.text)
@@ -1453,7 +1480,7 @@ async function speakReply(v: VoiceReply): Promise<string> {
   const timed = () => {
     if (!v.labs.size) return
     appendVoiceTiming(VOICE_TIMING_FILE, voiceTimingLine({
-      chat: v.chat, fast: v.labs.has('fast'), heardAt: v.heardAt, replyAt: v.replyAt, textAt, speakAt: v.speakAt, spokeAt, sentAt,
+      chat: v.chat, fast: v.labs.has('fast') || v.labs.has('split'), heardAt: v.heardAt, replyAt: v.replyAt, textAt, speakAt: v.speakAt, spokeAt, sentAt,
     }))
   }
   if ('skip' in s) { timed(); return s.skip }
@@ -1472,6 +1499,46 @@ async function speakReply(v: VoiceReply): Promise<string> {
 }
 
 /**
+ * DIVE-8649 `split`: each part is posted as soon as it is made, in order, tagged
+ * with its turn so the app plays them one after the other and drops a late part
+ * of an older turn. A part that is not made or not posted ends the reply there;
+ * the parts after it are thrown away, never posted out of order.
+ */
+async function speakParts(v: VoiceReply, parts: Promise<Speech>[], textAt: number): Promise<string> {
+  const turn = randomUUID().replace(/-/g, '').slice(0, 12)
+  let spokeAt = 0
+  let firstSentAt: number | null = null
+  let sentAt: number | null = null
+  let out = ''
+  let i = 0
+  for (; i < parts.length; i++) {
+    const s = await parts[i]
+    if (i === 0) spokeAt = Date.now()
+    if ('skip' in s) { out = s.skip; break }
+    try {
+      await sendDashboardReply({ chat_id: v.chat, files: [s.ogg], part: { turn, n: i + 1, of: parts.length } })
+      sentAt = Date.now()
+      if (i === 0) firstSentAt = sentAt
+      voiceFailedAt = 0
+    } catch (err) {
+      voiceFailedAt = Date.now()
+      out = voiceFailedOnce(String(err))
+      break
+    } finally {
+      dropSpeech(s)
+    }
+  }
+  for (const p of parts.slice(i + 1)) void p.then(dropSpeech)
+  if (v.labs.size) {
+    appendVoiceTiming(VOICE_TIMING_FILE, voiceTimingLine({
+      chat: v.chat, fast: true, heardAt: v.heardAt, replyAt: v.replyAt, textAt, speakAt: v.speakAt, spokeAt, sentAt, firstSentAt, parts: parts.length,
+    }))
+  }
+  if (out) return out
+  return `voice note sent in ${parts.length} parts`
+}
+
+/**
  * POST one outbound message. `e2e`: the body is an envelope (DIVE-6876), the
  * metadata says so, and the relay gets its own op, so a relay without it
  * refuses rather than posting the envelope as a plain message.
@@ -1482,7 +1549,7 @@ const REPLY_RETRY_MS = (() => {
   return process.env.DASHBOARD_REPLY_RETRY_MS !== undefined && Number.isFinite(n) && n >= 0 ? n : REPLY_RETRY_BUDGET_MS
 })()
 
-async function postReply(chatId: string, body: string, files: string[], q: ChatQuestion | null, e2e: boolean): Promise<Response> {
+async function postReply(chatId: string, body: string, files: string[], q: ChatQuestion | null, e2e: boolean, part: VoicePart | null = null): Promise<Response> {
   // DIVE-7713: one key for every try of this reply, so a retry after a 5xx the
   // server had in fact stored answers that row instead of posting it twice.
   const replyKey = RELAY ? '' : `r-${randomUUID().replace(/-/g, '')}`
@@ -1500,6 +1567,7 @@ async function postReply(chatId: string, body: string, files: string[], q: ChatQ
         ...(q ? { question: q } : {}),
         ...(e2e ? { e2e: { v: 1 } } : {}),
         ...(replyKey ? { reply_key: replyKey } : {}),
+        ...(part ? { voice_part: part } : {}),
       },
     }),
   }
@@ -1597,6 +1665,7 @@ async function sendReplyAndVoice(args: ReplyArgs, voice: VoiceReply | null): Pro
     const j = (await res.json().catch(() => null)) as { id?: number } | null
     const sentLine = `sent encrypted (id: ${j?.id ?? '?'})`
     if (!voice) return sentLine
+    unsplitVoiceReply(voice)
     return `${sentLine}\n${await speakReply(voice)}`
   }
   // DIVE-6816: on a chat-only box the API cannot read this box's outbox, so
@@ -1619,7 +1688,7 @@ async function sendReplyAndVoice(args: ReplyArgs, voice: VoiceReply | null): Pro
   // question then goes as numbered lines, which the person answers by typing.
   let res: Response
   try {
-    res = await postReply(chatId, text, sent, question, false)
+    res = await postReply(chatId, text, sent, question, false, args.part ?? null)
   } catch (err) {
     if (!question || !RELAY || !/allows only/.test(String(err))) throw err
     process.stderr.write(`dashboard channel: this relay has no ask op (5dive self-update brings it); question sent as text\n`)

@@ -7,6 +7,12 @@
 //   timing  log one line of timings per voice reply (no text, no audio)
 //   fast    start speaking the reply while its text is still being posted,
 //           instead of after (and log, as with timing)
+//   split   speak the first sentence as a note of its own, then the rest, so
+//           the first words play sooner (implies fast). Needs the app's player
+//           queue (frontend DIVE-8649 it2): an older app plays part one only.
+//   loaded  keep the reply tool always loaded, so a new session's first
+//           answer does not pay a tool search for it (read when a session
+//           starts its tool list, so it applies from the next session)
 // It sits beside the voice engine's own config, in a directory no installer
 // and no nightly rewrites, so turning it on survives the nightly; it is read
 // on every voice reply, so turning it on or off needs no restart.
@@ -19,7 +25,8 @@ export const VOICE_TIMING_KEEP = 500
 /** A voice note heard longer ago than this is not the one being answered. */
 export const VOICE_TURN_MAX_MS = 10 * 60_000
 
-export type VoiceLab = 'timing' | 'fast'
+export type VoiceLab = 'timing' | 'fast' | 'split' | 'loaded'
+const LABS: readonly string[] = ['timing', 'fast', 'split', 'loaded']
 
 /** The labs this box has on. A missing or unreadable file: none. Unknown words are ignored. */
 export function readVoiceLabs(file: string): Set<VoiceLab> {
@@ -28,7 +35,7 @@ export function readVoiceLabs(file: string): Set<VoiceLab> {
   const on = new Set<VoiceLab>()
   for (const line of raw.split('\n')) {
     for (const w of line.replace(/#.*/, '').split(/[\s,]+/)) {
-      if (w === 'timing' || w === 'fast') on.add(w)
+      if (LABS.includes(w)) on.add(w as VoiceLab)
     }
   }
   return on
@@ -62,8 +69,12 @@ export type VoiceReplyMarks = {
   speakAt: number
   /** 5dive-speak finished. */
   spokeAt: number
-  /** The voice note was posted (null: it was not). */
+  /** The voice note was posted (null: it was not). Split: its last part. */
   sentAt: number | null
+  /** Split: the first part was posted (null: it was not; absent: not split). */
+  firstSentAt?: number | null
+  /** Split: how many parts the reply was spoken in. */
+  parts?: number
 }
 
 const span = (from: number | null, to: number | null): number | null =>
@@ -83,6 +94,8 @@ export function voiceTimingLine(m: VoiceReplyMarks, now: Date = new Date()): str
     voice_ms: span(m.spokeAt, m.sentAt),
     box_ms: span(m.heardAt, m.sentAt),
     reply_ms: span(m.replyAt, m.sentAt),
+    // Split: from the agent's reply to its first spoken part posted, the wait the user hears.
+    ...(m.parts ? { parts: m.parts, first_ms: span(m.replyAt, m.firstSentAt ?? null), first_box_ms: span(m.heardAt, m.firstSentAt ?? null) } : {}),
     ok: m.sentAt !== null,
   })
 }
@@ -95,4 +108,34 @@ export function appendVoiceTiming(file: string, line: string, keep = VOICE_TIMIN
     const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
     if (lines.length > keep * 2) writeFileSync(file, lines.slice(-keep).join('\n') + '\n')
   } catch {}
+}
+
+// --- split: the first sentence first --------------------------------------
+
+/** A spoken part's tag in its message's metadata (`voice_part`): the app plays a turn's parts in order. */
+export type VoicePart = { turn: string; n: number; of: number }
+
+export const SPLIT_MIN_FIRST = 12
+export const SPLIT_MAX_FIRST = 240
+export const SPLIT_MIN_REST = 12
+
+/**
+ * The reply's first sentence and the rest, or null: one sentence, a first
+ * sentence too long to play sooner, or a rest too short to be worth a second
+ * note. A sentence ends at . ! ? or … followed by a space, or at a line break.
+ * Too short a first piece ("Ok.", "Hi!") runs on to the next sentence.
+ */
+export function splitFirstSentence(text: string): [string, string] | null {
+  const t = text.trim()
+  const end = /(?:[.!?\u2026]+["'\u00bb\u201d)\]]*[ \t]+|\s*\n+\s*)/g
+  let m: RegExpExecArray | null
+  while ((m = end.exec(t))) {
+    const cut = m.index + m[0].length
+    const first = t.slice(0, cut).trim()
+    if (first.length < SPLIT_MIN_FIRST) continue
+    if (first.length > SPLIT_MAX_FIRST) return null
+    const rest = t.slice(cut).trim()
+    return rest.length >= SPLIT_MIN_REST ? [first, rest] : null
+  }
+  return null
 }

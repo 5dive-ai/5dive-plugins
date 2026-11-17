@@ -7,6 +7,10 @@
 //   - `fast`: the speech starts BEFORE the text is posted, not after;
 //   - `fast` and the text fails: no voice note goes, and its file is removed;
 //   - `timing`: one line per voice reply, timed from the voice note's hand-over.
+// it2 (the API path, a Bun.serve stand-in that keeps each post's metadata):
+//   - `split`: the text, then the first sentence's note, then the rest's, each
+//     tagged { turn, n, of }; a one-sentence reply is one untagged note;
+//   - `loaded`: the reply tool is listed with anthropic/alwaysLoad; off: no _meta.
 
 import { describe, test, expect } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, mkdirSync, renameSync } from 'node:fs'
@@ -17,6 +21,7 @@ import {
   appendVoiceTiming,
   makeVoiceClock,
   readVoiceLabs,
+  splitFirstSentence,
   voiceTimingLine,
 } from '../plugins/dashboard/voicefast.ts'
 import { VOICE_ONLY_BODY } from '../plugins/dashboard/voicenote.ts'
@@ -45,6 +50,8 @@ describe('voicefast.ts', () => {
       expect([...readVoiceLabs(f)]).toEqual(['timing'])
       writeFileSync(f, 'timing, fast  # DIVE-8649 lodar only\nturbo\n')
       expect([...readVoiceLabs(f)].sort()).toEqual(['fast', 'timing'])
+      writeFileSync(f, 'timing split loaded\n')
+      expect([...readVoiceLabs(f)].sort()).toEqual(['loaded', 'split', 'timing'])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -71,6 +78,30 @@ describe('voicefast.ts', () => {
     expect(unsent.agent_ms).toBeNull()
     expect(unsent.box_ms).toBeNull()
     expect(unsent.ok).toBe(false)
+  })
+
+  test('split: the first sentence and the rest; too short a first piece runs on; one sentence is not split', () => {
+    expect(splitFirstSentence('Yes, Friday at ten works. I have put it in the calendar and told Anna.'))
+      .toEqual(['Yes, Friday at ten works.', 'I have put it in the calendar and told Anna.'])
+    // Russian must split the same way.
+    expect(splitFirstSentence('Да, в пятницу в десять подходит. Я уже добавил это в календарь.'))
+      .toEqual(['Да, в пятницу в десять подходит.', 'Я уже добавил это в календарь.'])
+    expect(splitFirstSentence('Ok. Sure! The meeting is on Friday at ten. Anna is coming too.'))
+      .toEqual(['Ok. Sure! The meeting is on Friday at ten.', 'Anna is coming too.'])
+    expect(splitFirstSentence('Here is the plan for Friday\nAnna comes at ten, Bob at noon.'))
+      .toEqual(['Here is the plan for Friday', 'Anna comes at ten, Bob at noon.'])
+    expect(splitFirstSentence('Friday at ten works for me.')).toBeNull()
+    expect(splitFirstSentence('Friday at ten works for me. Bye.')).toBeNull()
+    expect(splitFirstSentence('The price is 3.5 euros per month for that.')).toBeNull()
+    expect(splitFirstSentence('x'.repeat(300) + '. And then the rest of it.')).toBeNull()
+  })
+
+  test('a split reply logs its parts and when the first one went', () => {
+    const t = JSON.parse(voiceTimingLine({ chat: '33', fast: true, heardAt: 1_000, replyAt: 4_000, textAt: 4_300, speakAt: 4_000, spokeAt: 4_800, sentAt: 6_000, firstSentAt: 4_900, parts: 2 }))
+    expect(t.parts).toBe(2)
+    expect(t.first_ms).toBe(900)
+    expect(t.first_box_ms).toBe(3_900)
+    expect('parts' in JSON.parse(voiceTimingLine({ chat: '33', fast: true, heardAt: null, replyAt: 0, textAt: 0, speakAt: 0, spokeAt: 0, sentAt: 0 }))).toBe(false)
   })
 
   test('the log keeps the newest lines', () => {
@@ -282,4 +313,156 @@ describe('the test version, on and off (DIVE-8649)', () => {
       expect(t.box_ms).toBeGreaterThanOrEqual(t.agent_ms + t.speak_ms)
     })
   }, 30_000)
+})
+
+// --- it2: the API path keeps each post's metadata ----------------------------
+
+const API_TOKEN = 'tok-voice-fast-abcdef'
+
+// A stand-in 5dive-speak that writes a new file per call, named after its text's first word.
+function writeSpeakEach(dir: string): string {
+  const file = join(dir, '5dive-speak')
+  writeFileSync(file, `#!/usr/bin/env bash
+w=$(printf '%s' "$2" | tr -cd 'A-Za-z' | head -c 12)
+out=${JSON.stringify(dir)}/speak-$w-$RANDOM.ogg
+echo "speak $w $(date +%s%3N)" >> ${JSON.stringify(join(dir, 'speaks.log'))}
+sleep 0.3
+printf 'OggS' > "$out"
+echo "$out"
+`)
+  chmodSync(file, 0o755)
+  return file
+}
+
+type Posted = { agent: string; body: string; metadata: Record<string, unknown> }
+
+async function runApi(labs: string | null, body: (dir: string, a: { posted: Posted[]; results: string[]; tools: unknown[]; reply: (text: string) => void }) => Promise<void>) {
+  const dir = mkdtempSync(join(tmpdir(), 'dash-fast-api-'))
+  const posted: Posted[] = []
+  let pendingAsked = false
+  const api = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url)
+      if (req.headers.get('authorization') !== `Bearer ${API_TOKEN}`) return new Response('unauthorized', { status: 401 })
+      if (url.pathname === '/server/messages/pending') { pendingAsked = true; return Response.json({ pending: [] }) }
+      if (url.pathname === '/server/messages/pending/ack') return Response.json({ ok: true, acked: 0 })
+      if (url.pathname === '/server/messages/event') {
+        const b = (await req.json()) as Posted
+        // The text takes a while to post, so a part made before it lands would show up first.
+        if (b.body !== VOICE_ONLY_BODY) await Bun.sleep(400)
+        posted.push(b)
+        return Response.json({ id: 100 + posted.length })
+      }
+      return new Response('not found', { status: 404 })
+    },
+  })
+  mkdirSync(join(dir, 'outbox'), { recursive: true })
+  const labsFile = join(dir, 'labs')
+  if (labs !== null) writeFileSync(labsFile, labs)
+  const proc = Bun.spawn(['bun', SERVER], {
+    env: {
+      ...process.env,
+      DASHBOARD_STATE_DIR: join(dir, 'state'),
+      DASHBOARD_OUTBOX: join(dir, 'outbox'),
+      DASHBOARD_CHAT_UPLOADS: join(dir, 'uploads'),
+      DASHBOARD_CHAT_ONLY_MARKER: join(dir, 'no-chat-only'),
+      DASHBOARD_CHAT_E2E_DIR: join(dir, 'box'),
+      DASHBOARD_API_BASE: `http://127.0.0.1:${api.port}`,
+      DASHBOARD_FFMPEG: writeFfmpeg(dir),
+      DASHBOARD_SPEAK: writeSpeakEach(dir),
+      DASHBOARD_VOICE_LABS: labsFile,
+      DASHBOARD_REPLY_RETRY_MS: '0',
+      CONNECTORD_TOKEN: API_TOKEN,
+      USER: 'agent-theo',
+    },
+    stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+  })
+  const results: string[] = []
+  const tools: unknown[] = []
+  const send = (m: unknown) => { proc.stdin.write(JSON.stringify(m) + '\n'); proc.stdin.flush() }
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'fast-api-test', version: '0' } } })
+  void (async () => {
+    const reader = proc.stdout.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return
+      buf += dec.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          const msg = JSON.parse(line)
+          if (msg.id === 1) { send({ jsonrpc: '2.0', method: 'notifications/initialized' }); send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) }
+          if (msg.id === 2) tools.push(...(msg.result?.tools ?? []))
+          if (typeof msg.id === 'number' && msg.id >= 7) results.push(JSON.stringify(msg.result ?? msg.error))
+        } catch {}
+      }
+    }
+  })()
+  const reply = (text: string) => send({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'reply', arguments: { chat_id: '33', text, voice: true } } })
+  try {
+    expect(await waitFor(() => pendingAsked && tools.length > 0, BOOT_MS + 8_000)).toBe(true)
+    await body(dir, { posted, results, tools, reply })
+  } finally {
+    proc.kill()
+    await proc.exited
+    api.stop(true)
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+const speaks = (dir: string) => existsSync(join(dir, 'speaks.log')) ? readFileSync(join(dir, 'speaks.log'), 'utf8').split('\n').filter(Boolean).map(l => l.split(' ')) : []
+
+describe('the test version, it2: first sentence first, and the tool always loaded (DIVE-8649)', () => {
+  test('split: text, then the first sentence, then the rest, each part tagged with one turn; no file left', async () => {
+    await runApi('split\n', async (dir, a) => {
+      a.reply('Yes, Friday at ten works. I have put it in the calendar and told Anna.')
+      expect(await waitFor(() => a.results.length >= 1, 15_000)).toBe(true)
+      expect(a.results[0]).toContain('voice note sent in 2 parts')
+      expect(a.posted.map(p => p.body)).toEqual(['Yes, Friday at ten works. I have put it in the calendar and told Anna.', VOICE_ONLY_BODY, VOICE_ONLY_BODY])
+      const tags = a.posted.map(p => p.metadata.voice_part as { turn: string; n: number; of: number } | undefined)
+      expect(tags[0]).toBeUndefined()
+      expect(tags[1]).toMatchObject({ n: 1, of: 2 })
+      expect(tags[2]).toMatchObject({ n: 2, of: 2, turn: tags[1]!.turn })
+      // Each part was spoken from its own text, the first sentence first, and the first began before the text was posted.
+      expect(speaks(dir).map(s => s[1])).toEqual(['YesFridayatt', 'Ihaveputitin'])
+      expect((a.posted[1].metadata.files as string[])[0]).toEndWith('.mp3')
+      expect(readFileSync(join(dir, 'state', 'voice-timing.log'), 'utf8')).not.toContain('Friday')
+      const t = JSON.parse(readFileSync(join(dir, 'state', 'voice-timing.log'), 'utf8').trim())
+      expect(t.parts).toBe(2)
+      expect(t.first_ms).toBeLessThan(t.reply_ms)
+      expect(require('node:fs').readdirSync(dir).filter((f: string) => f.endsWith('.ogg'))).toEqual([])
+    })
+  }, 40_000)
+
+  test('split, one sentence: one voice note with no part tag, started early', async () => {
+    await runApi('split\n', async (dir, a) => {
+      a.reply('Friday at ten works for me.')
+      expect(await waitFor(() => a.results.length >= 1, 15_000)).toBe(true)
+      expect(a.posted.map(p => p.body)).toEqual(['Friday at ten works for me.', VOICE_ONLY_BODY])
+      expect(a.posted.every(p => !('voice_part' in p.metadata))).toBe(true)
+      expect(speaks(dir).length).toBe(1)
+    })
+  }, 40_000)
+
+  test('no labs file: one untagged voice note on the API path too, and the tool has no _meta', async () => {
+    await runApi(null, async (_dir, a) => {
+      expect((a.tools[0] as { name: string; _meta?: unknown }).name).toBe('reply')
+      expect('_meta' in (a.tools[0] as object)).toBe(false)
+      a.reply('Yes, Friday at ten works. I have put it in the calendar and told Anna.')
+      expect(await waitFor(() => a.results.length >= 1, 15_000)).toBe(true)
+      expect(a.posted.map(p => p.body)).toEqual(['Yes, Friday at ten works. I have put it in the calendar and told Anna.', VOICE_ONLY_BODY])
+      expect(a.posted.every(p => !('voice_part' in p.metadata))).toBe(true)
+    })
+  }, 40_000)
+
+  test('loaded: the reply tool is listed always-loaded', async () => {
+    await runApi('loaded\n', async (_dir, a) => {
+      expect(a.tools[0]).toMatchObject({ name: 'reply', _meta: { 'anthropic/alwaysLoad': true } })
+    })
+  }, 40_000)
 })
