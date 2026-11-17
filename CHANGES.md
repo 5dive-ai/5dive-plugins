@@ -1,5 +1,10 @@
 ## Unreleased
 
+### Added — dashboard 0.5.42: lodar's test version, part two: first sentence first, and the reply tool always loaded (DIVE-8649)
+
+- Two more words for the same one-box labs file (`/var/lib/5dive/voice/labs`, absent on every box). `split`: a voice reply of two or more sentences is spoken as two notes, the first sentence first, posted in order and tagged `voice_part: { turn, n, of }` in the message metadata, so the first words play while the rest is still being made (implies `fast`; a one-sentence reply stays one untagged note; an encrypted chat is spoken whole, as its metadata keeps no tag). Needs the app's player queue (frontend, same row); an older app plays part one only. `loaded`: the reply tool is listed with `_meta["anthropic/alwaysLoad"]: true`, so a new session's first answer does not pay Claude Code's tool search for it (from the next session on). The timing line gains `parts`, `first_ms` and `first_box_ms` for a split reply.
+- Harness: `test/dive8649-dashboard-voice-fast.test.ts` +6 arms (14): the split rule (English, Russian, short first pieces, decimals, a too-long first sentence), the split timing line, and through a stand-in API that keeps metadata: `split` (text, then part 1, then part 2, one turn, no file left), `split` with one sentence (one untagged note), no file (one untagged note, no `_meta`), `loaded` (`_meta` set).
+
 ### Added — dashboard 0.5.41: a test version of faster voice answers, on one box only (DIVE-8649)
 
 - A box with `/var/lib/5dive/voice/labs` gets it; no box has that file, so every other box runs exactly as before. The file holds words: `timing` logs one line per voice reply to `voice-timing.log` beside `lifecycle.log` (stage durations and the chat id only, never the text or audio); `fast` also starts `5dive-speak` when the agent calls reply, instead of after the text is posted. A text that fails to post throws its early speech away, unposted. The file is read on every voice reply (no restart), and no installer or nightly writes that directory.
