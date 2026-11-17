@@ -15,6 +15,7 @@
 //      from the notice outbox.
 //      DIVE-6979: an empty AI balance gets its own notice the same way, and no
 //      recovery: retrying cannot clear it, only a top-up does.
+//      DIVE-8610: so does an AI server that does not have the agent's model.
 //   2. Recovery: when the seat ALSO runs the telegram plugin, its hook owns the
 //      resume (one helper per pane, one lock). Otherwise this hook takes the same
 //      lock and runs the same helper, telling it to answer the waiting message.
@@ -51,17 +52,18 @@ const raw = JSON.stringify(payload)
 const msg = failureMessage(payload)
 const pane = capturePane()
 const kind = classifyFailure(payload, raw, pane)
-if (!kind.isRateLimit && !kind.isTransientApiError && !kind.isOutOfCredit) {
-  log('not a usage limit, a transient error or an empty balance — nothing to do here')
+if (!kind.isRateLimit && !kind.isTransientApiError && !kind.isOutOfCredit && !kind.isModelRefused) {
+  log('not a usage limit, a transient error, an empty balance or a refused model — nothing to do here')
   process.exit(0)
 }
-const noticeKind = kind.isOutOfCredit ? 'credit' : kind.isRateLimit ? 'ratelimit' : 'transient'
+const noticeKind = kind.isOutOfCredit ? 'credit' : kind.isModelRefused ? 'model' : kind.isRateLimit ? 'ratelimit' : 'transient'
 // DIVE-6979: on a partner box a 402 can be the client's own used-up allowance
 // (the box key's cap, DIVE-5111); that one keeps the limit line, as Telegram's does.
 const lite = isLite()
 const allowance = lite && kind.isOutOfCredit ? await readAllowance() : null
 const ownCapUsedUp = allowance?.kind === 'capped' && allowance.pctLeft === 0
 if (lite && kind.isOutOfCredit) recordOpsDetail('stopfailure', `out of AI credit: ${msg}`)
+if (lite && kind.isModelRefused) recordOpsDetail('stopfailure', `AI server refused the model: ${msg}`)
 
 const transcriptPath = payload.transcript_path
 // inboundWindow: the notice goes to the newest web-chat message, which may
@@ -105,6 +107,10 @@ if (claim.send) {
 // --- 2. recovery --------------------------------------------------------------
 if (kind.isOutOfCredit) {
   log('out of AI credit — nothing to resume until it is topped up')
+  process.exit(0)
+}
+if (kind.isModelRefused) {
+  log('the AI server refused the model — nothing to resume until the model is fixed')
   process.exit(0)
 }
 if (!tmuxCtx) {

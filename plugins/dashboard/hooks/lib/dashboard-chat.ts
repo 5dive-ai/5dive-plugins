@@ -10,7 +10,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { A2A_ENVELOPE_RE, entryTexts, refusedTooLongIds } from './transcript'
 import { textLang } from './terms'
-import { CREDIT_NOTICE } from './failure'
+import { CREDIT_NOTICE, MODEL_NOTICE } from './failure'
 import type { Lang } from './lite'
 import type { TranscriptEntry } from './types'
 
@@ -68,7 +68,7 @@ function inLang(lang: Lang, secs: number): string {
   return m ? `${h} ${hu} ${m} ${mu}` : `${h} ${hu}`
 }
 
-export type NoticeKind = 'ratelimit' | 'transient' | 'credit'
+export type NoticeKind = 'ratelimit' | 'transient' | 'credit' | 'model'
 
 /**
  * The one line the person sees. Plain words, no percentages, no raw error.
@@ -79,6 +79,8 @@ export type NoticeKind = 'ratelimit' | 'transient' | 'credit'
 export function noticeText(kind: NoticeKind, resetEpoch: number | null, nowSec: number, lang: Lang, lite = false): string {
   // DIVE-6979: no reset to name; who tops it up depends on who reads (failure.ts).
   if (kind === 'credit') return CREDIT_NOTICE[lite ? 'client' : 'owner'][lang]
+  // DIVE-8610: no reset either; only someone who runs the AI server can fix it.
+  if (kind === 'model') return MODEL_NOTICE[lang]
   if (kind === 'transient') {
     return lang === 'ru'
       ? 'Сервис ИИ сейчас перегружен, поэтому я остановился. Пробую снова и скоро отвечу.'
