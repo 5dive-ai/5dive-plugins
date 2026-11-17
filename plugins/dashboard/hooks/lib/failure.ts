@@ -21,6 +21,9 @@ export type FailureKind = {
   isTransientApiError: boolean
   /** DIVE-6979: the AI account has no money left (402). Nothing lifts it but a top-up. */
   isOutOfCredit: boolean
+  /** DIVE-8610: the AI server does not have the model the agent is set to (404).
+   *  Retrying cannot clear it; someone has to point the agent at a model it has. */
+  isModelRefused: boolean
 }
 
 // DIVE-6979: an exhausted balance. The OpenRouter texts seen live (DIVE-6833):
@@ -38,6 +41,17 @@ const OUT_OF_CREDIT_RE =
 // "> …" prompt), and a pane-only hit never overrides a usage limit the payload
 // itself reports.
 const PANE_402_RE = /^[ \t⎿●⏺]*API Error:\s*402\b/m
+
+// DIVE-8610: the AI server refused the MODEL. Seen live on an office box moved
+// to another model (DIVE-8608 e2e): Ollama answered 404 to every turn, Claude
+// Code drew "There's an issue with the selected model (…)", and the web chat
+// stayed on "Working…" with no line at all. The payload texts: Claude Code's own
+// sentence, the Anthropic-shape not_found_error, "API Error: 404", and the
+// servers' own "model \"x\" not found" / "does not exist". On the pane only
+// Claude Code's own status line counts (the same rule as PANE_402_RE).
+const MODEL_REFUSED_RE =
+  /issue with the selected model|"type\\?":\s*\\?"not_found_error|API Error:\s*404\b|\bmodel\s+\\?["'`][^"'`\\]{1,200}\\?["'`]\s+(?:not found|does not exist)/i
+const PANE_MODEL_RE = /^[ \t⎿●⏺]*(?:API Error:\s*404\b|There's an issue with the selected model)/m
 
 // A transient server-side 429 ("Server is temporarily limiting requests · Rate
 // limited") is explicitly NOT a usage limit — but its text literally contains
@@ -64,7 +78,10 @@ export function classifyFailure(payload: HookPayload, raw: string, pane: string)
     !isOutOfCredit &&
     (isTransientRateLimit ||
       /overloaded|API Error:\s*(?:5(?:0[234]|29))\b|"type":\s*"(?:overloaded|api)_error"/i.test(`${raw}\n${pane}`))
-  return { isTransientRateLimit, isRateLimit, isTermsNotAccepted, isTransientApiError, isOutOfCredit }
+  const isModelRefused =
+    !isTermsNotAccepted && !isOutOfCredit && !isRateLimit && !isTransientApiError &&
+    (MODEL_REFUSED_RE.test(raw) || PANE_MODEL_RE.test(pane))
+  return { isTransientRateLimit, isRateLimit, isTermsNotAccepted, isTransientApiError, isOutOfCredit, isModelRefused }
 }
 
 /**
@@ -82,6 +99,16 @@ export const CREDIT_NOTICE: Record<'client' | 'owner', Record<Lang, string>> = {
     en: "My AI credit ran out, so I stopped. Top up the AI account I run on and I'll answer.",
     ru: 'У меня закончился баланс ИИ, поэтому я остановился. Пополните аккаунт ИИ, на котором я работаю, и я отвечу.',
   },
+}
+
+/**
+ * DIVE-8610: the one line a chat gets when the AI server does not have the
+ * agent's model. No model name and no error code: the person in the chat cannot
+ * fix it, so it says who can.
+ */
+export const MODEL_NOTICE: Record<Lang, string> = {
+  en: "I can't answer: the AI server I run on doesn't have the model I'm set to use. Ask whoever looks after your AI server to fix my model.",
+  ru: 'Не могу ответить: на сервере ИИ, на котором я работаю, нет модели, которая у меня выбрана. Попросите того, кто отвечает за ваш сервер ИИ, поправить мою модель.',
 }
 
 /** The payload's own text fields, joined — the hook's one-line `msg`. */
