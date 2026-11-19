@@ -1,5 +1,5 @@
 // DIVE-8800 — a partner client whose weekly AI allowance ran out was told to
-// "sign in again" (OINOA client, copper-aspen, 2026-11-13 and 2026-11-19).
+// "sign in again" (reported 2026-11-13 and 2026-11-19).
 // OpenRouter refuses a capped key with 403 "Key limit exceeded (weekly limit)"
 // and Claude Code files that under `authentication_failed`, which the sign-in
 // matcher read as a revoked login. A key's cap is a limit, never a sign-in:
@@ -154,7 +154,7 @@ describe('DIVE-8800 the Stop hook, driven', () => {
     expect(s.some(m => m.text === SIGNIN_NOTICE.client.en || /key limit|openrouter/i.test(m.text))).toBe(false)
   }, T)
 
-  test('in Russian on a Russian box', async () => {
+  test('in Russian when the chat language is ru', async () => {
     writeFileSync(join(home, 'state', 'lite-lang'), 'ru\n')
     run(STOP, [inbound('привет'), apiError(CAP)], {}, LITE_ENV)
     expect(sent().map(m => m.text)).toEqual([LITE_STRINGS.ru.limitReached(null)])
