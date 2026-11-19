@@ -43,7 +43,8 @@ import { readPayload } from './lib/payload'
 import { readEntries, readEntriesFrom, transcriptSize, analyzeTurn, hadTelegramToolCallAfter } from './lib/transcript'
 import { sendMessage, getToken } from './lib/telegram'
 import { isLite, readLiteLang, readAllowance, liteLimitText, recordOpsDetail, LITE_STRINGS, liteAccountUrl, readChannelEnv } from './lib/lite'
-import { endedOnSigninRefusal, SIGNIN_NOTICE } from './lib/signin'
+import { endedOnSigninRefusal, endedOnKeyLimit, KEY_LIMIT_NOTICE, SIGNIN_NOTICE } from './lib/signin'
+import { onDemoAccount, readDemoKey, claimDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
 import { inboundLang } from './lib/terms'
 
 // DIVE-5121: on a lite (partner-client) box every line this hook sends is the
@@ -51,7 +52,7 @@ import { inboundLang } from './lib/terms'
 // profile: false, and each send below is what it was.
 const LITE = isLite()
 import { emitBlock } from './lib/output'
-import { TG_TOOL_PREFIX, signalTurnEnded } from './lib/paths'
+import { TG_TOOL_PREFIX, signalTurnEnded, stateDir } from './lib/paths'
 import { getCallerChat, type CallerChat } from './lib/access'
 import { parseResetEpoch } from './lib/time'
 import type { HookPayload, TranscriptEntry, TranscriptContentBlock } from './lib/types'
@@ -276,6 +277,33 @@ if (a.hadSend) process.exit(0)
 // kept relaying `(auto-relay) …` on top of the 👍. A react on an OLDER message
 // does not set reactedNewest and falls through to the relay below, unchanged.
 if (a.reactedNewest) process.exit(0)
+
+// DIVE-8800: the turn ended on an OpenRouter key's own cap ("Key limit
+// exceeded", filed by Claude Code under authentication_failed, so the sign-in
+// check below used to claim it and told a partner's client to sign in again).
+// A partner's client hears her allowance line with its reset day; an agent on a
+// my.5dive box's free key the once-per-key demo notice (the stamp StopFailure
+// and the server share); an owner that their key hit its limit.
+if (endedOnKeyLimit(entries)) {
+  const lang = inboundLang(entries) ?? readLiteLang()
+  let text: string | null
+  let markup: unknown = undefined
+  if (onDemoAccount()) {
+    const demo = await readDemoKey({ sawKeyLimit: true })
+    const claimed = demo.kind === 'used-up' && claimDemoNotice(stateDir(), demo.fingerprint)
+    text = claimed ? demoNoticeText(readLiteLang()) : null
+    if (claimed) markup = demoNoticeMarkup(demoNoticeButtons(readLiteLang(), demoAccountUrl()))
+  } else if (LITE) {
+    recordOpsDetail('stop-reply-check', `key limit: ${a.texts.join(' ').slice(0, 200)}`)
+    text = liteLimitText(readLiteLang(), await readAllowance())
+    const accountUrl = liteAccountUrl(readChannelEnv('TELEGRAM_ACCOUNT_URL'))
+    if (accountUrl) markup = { inline_keyboard: [[{ text: LITE_STRINGS[readLiteLang()].accountButton, url: accountUrl }]] }
+  } else {
+    text = KEY_LIMIT_NOTICE[lang]
+  }
+  if (text) await sendMessage(chatId, text, threadId, markup)
+  process.exit(0)
+}
 
 // DIVE-7835: the turn ended on Claude Code's own sign-in refusal ("OAuth token
 // revoked · Please run /login"). That is not the agent's answer, and the raw

@@ -13,12 +13,18 @@
 // isApiErrorMessage entry, or the payload's own error fields, are read.
 // An invalid API key or an empty balance is another fix (a key, a top-up), not
 // a sign-in.
+// DIVE-8800: nor is an OpenRouter key's own spending cap. OpenRouter answers it
+// with 403 "Key limit exceeded (weekly limit)", which Claude Code files under
+// `authentication_failed`, so a partner client whose weekly allowance ran out
+// was told to "sign in again" — she has no sign-in. That text always wins over
+// the error code: it is the key's limit, and endedOnKeyLimit says so instead.
 
 import type { TranscriptEntry, TranscriptContentBlock } from './types'
 import type { Lang } from './lite'
 
 const SIGNIN_RE = /oauth token (?:has expired|revoked)|please run \/login|not logged in/i
-const NOT_SIGNIN_RE = /invalid api key|credit balance|billing_error/i
+const NOT_SIGNIN_RE = /invalid api key|credit balance|billing_error|key limit exceeded/i
+const KEY_LIMIT_RE = /key limit exceeded/i
 
 /** One line of Claude Code's: is it a sign-in refusal? */
 export function isSigninRefusalText(text: string | null | undefined, error?: string | null): boolean {
@@ -36,19 +42,30 @@ function entryText(e: TranscriptEntry): string {
     .join(' ')
 }
 
+/** The turn's NEWEST assistant entry, when it is Claude Code's API-error message. */
+function endingApiError(entries: TranscriptEntry[]): TranscriptEntry | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]
+    if (e.type !== 'assistant') continue
+    return e.isApiErrorMessage ? e : null
+  }
+  return null
+}
+
 /**
  * The turn ended on a sign-in refusal: the NEWEST assistant entry is Claude
  * Code's API-error message, and it is a sign-in refusal. An older refusal
  * followed by a real answer is a sign-in that has since worked.
  */
 export function endedOnSigninRefusal(entries: TranscriptEntry[]): boolean {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i]
-    if (e.type !== 'assistant') continue
-    if (!e.isApiErrorMessage) return false
-    return isSigninRefusalText(entryText(e), typeof e.error === 'string' ? e.error : null)
-  }
-  return false
+  const e = endingApiError(entries)
+  return !!e && isSigninRefusalText(entryText(e), typeof e.error === 'string' ? e.error : null)
+}
+
+/** DIVE-8800: the turn ended on an OpenRouter key's own cap ("Key limit exceeded"). */
+export function endedOnKeyLimit(entries: TranscriptEntry[]): boolean {
+  const e = endingApiError(entries)
+  return !!e && KEY_LIMIT_RE.test(entryText(e))
 }
 
 type SigninPayload = { error?: unknown; error_details?: unknown; message?: unknown; reason?: unknown; last_assistant_message?: unknown }
@@ -56,8 +73,10 @@ type SigninPayload = { error?: unknown; error_details?: unknown; message?: unkno
 /** A StopFailure payload whose own fields carry a sign-in refusal (same fields isTermsWall reads). */
 export function isSigninPayload(payload: SigninPayload): boolean {
   const err = typeof payload.error === 'string' ? payload.error : null
-  if (err === 'authentication_failed') return true
   const own = [payload.error_details, payload.message, payload.reason]
+  // DIVE-8800: a key's cap or balance in any field outranks the error code.
+  if ([...own, payload.last_assistant_message].some(v => typeof v === 'string' && NOT_SIGNIN_RE.test(v))) return false
+  if (err === 'authentication_failed') return true
   if (own.some(v => typeof v === 'string' && isSigninRefusalText(v))) return true
   const last = payload.last_assistant_message
   return typeof last === 'string' && /^\s*API Error\b/i.test(last) && isSigninRefusalText(last)
@@ -77,6 +96,18 @@ export const SIGNIN_NOTICE: Record<'owner' | 'client', Record<Lang, string>> = {
     en: "My AI sign-in stopped working, so I can't answer right now. Sign in again in your account.",
     ru: 'Мой вход в ИИ перестал работать, поэтому я сейчас не могу ответить. Войдите снова в личном кабинете.',
   },
+}
+
+/**
+ * DIVE-8800: the owner's own AI key hit the spending limit set on it. Not a
+ * sign-in (/login cannot help) and not the agent's fault: the owner raises the
+ * key's limit or adds credit where the key came from. A partner's client never
+ * gets this line: she hears her allowance line (liteLimitText), and an agent on
+ * a my.5dive box's free key hears the demo notice (demo-key.ts).
+ */
+export const KEY_LIMIT_NOTICE: Record<Lang, string> = {
+  en: "My AI key hit its spending limit, so I can't answer right now. Raise the key's limit or add credit where you got the key.",
+  ru: 'Мой ключ ИИ упёрся в свой лимит расходов, поэтому я сейчас не могу ответить. Поднимите лимит ключа или пополните баланс там, где вы его получили.',
 }
 
 // The on-box profile names the CLI accepts (cmd_auth.sh valid_profile_name).
