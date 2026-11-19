@@ -73,6 +73,8 @@ reason, not a report.
 | `external-reply` | `gh pr/issue comment|review|create --repo <owner we do not own>` | `FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED` |
 | `openrouter-key-mint` | creating or raising an OpenRouter key over the keys API (POST/PATCH) | `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT` |
 | `heavy-local` | **poke-two only** (`hosts`). A whole-project typecheck (`tsc` with no file, or `-p`/`--build`; `npm/bun run typecheck`), `next build`/`next dev` (bare, or `npm run build|dev` naming a Next app checkout), or a test runner with no test file after it (`npm test`, `bun test`, `node --test`, a `**` glob). `node --test <file>`, `bun test <file>`, `npm test -- <file>`, `tsc --noEmit <file>` and anything over `ssh` run | `FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL` |
+| `heavy-local-chrome` | **poke-two only.** Starting Chrome/Chromium/headless_shell directly, or running a 5dive-browser harness (`tests/browser_*.sh`, one at a time or in a `for` loop), which starts Chrome through `bin/browser`. `--version`, `which`, `killall`, reading a harness, `browser_mirror.sh check`, `ci-browser` and anything over `ssh` run | `FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL` |
+| `heavy-local-install` | **poke-two only.** A full dependency install (`npm ci`, bare `npm install`/`npm i`, `bun install`, `pnpm install`, `yarn install`) on a command line that names a Next app (the frontend or agent-profile checkout, an `fe-*` worktree, `cd app`, `--prefix app`). Installing one package, another repo's install, and anything over `ssh` run | `FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL` |
 | `openrouter-spend-ask` | a `5dive task need`/`task add` whose text (or `--ask-file`/`--body-file`) asks to fund or raise OpenRouter; one that only names OpenRouter runs | `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT` |
 
 ## Turning it on
@@ -141,6 +143,12 @@ than one whose edges are written down.
   (which is `tsc`). A runner flag whose value holds a letter (`bun test -t name`,
   `--reporter junit`) reads as a test file. And a separator inside a quoted string
   (`-m "x; npm test"`) reads as a command. Each is a widening of the regex in `policy/guard.json`.
+- **`heavy-local-install` reads the command line too, and the hook has no working directory.** A
+  bare `npm ci` typed in a scratch dir that a lockfile was copied into by an EARLIER command
+  names no Next app on its own line and runs. `heavy-local-chrome` cannot see a Chrome started
+  through a variable (`"$REAL_CHROME"`), through playwright/puppeteer from a script, or by a
+  harness that is not named `tests/browser_*.sh`; nor a `--checked=` command the 5dive CLI
+  re-runs itself. The backstop for all of these is poke-two's root-cron RAM reaper (DIVE-8804).
 - **`external-reply` only sees an explicit `--repo`/`-R`.** `gh pr comment 4` run from inside a
   foreign checkout carries no owner on the command line, so nothing is refused.
 - **`pii-fixture` judges the path by NAME** (`test/`, `spec/`, `fixture`, `*.test.*`). A fixture

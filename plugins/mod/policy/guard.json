@@ -246,6 +246,59 @@
         }
       ],
       "deny": "{found}. CI runs this — push and let it. On poke-two it costs ~1-1.4 GB per run on the 4-core box that runs every seat; two at once froze every agent for 7 minutes on 2026-11-12. Locally run only the files you changed (`node --test <file>`, `bun test <file>`, `npm test -- <file>`, `tsc --noEmit <file>`), or run it on 5dive-ci over ssh. Only a recorded seat setting opens this: FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL. [{rule}]"
+    },
+    {
+      "id": "heavy-local-chrome",
+      "rule": "Never start Chrome on poke-two — browser harnesses run in browser-tests.yml, a screenshot or real-web check runs on 5dive-ci with ci-browser (5dive/CLAUDE.md; poke-two ran out of RAM 2026-11-19, DIVE-8804)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "hosts": ["^poke-two$"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL",
+      "checks": [
+        {
+          "id": "chrome-binary",
+          "find": "(?:^|[;&|({\\n]|\\$\\(|`|\\b(?:then|do|else|xargs)\\s|\\b(?:bash|sh)\\s+-l?c\\s+['\"])\\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\\S*|sudo(?:\\s+-u\\s+\\S+|\\s+-[A-Za-z]+)*|env(?:\\s+-\\S+)*|time|nohup|command|exec|nice(?:\\s+-n)?(?:\\s+-?\\d+)?|ionice(?:\\s+-\\S+)*|timeout(?:\\s+-\\S+)*\\s+\\d+[smhd]?|xvfb-run(?:\\s+-\\S+)*)\\s+)*[\\\"']?(?:\\S*/)?(?:google-chrome(?:-stable|-beta|-unstable|-canary)?|chromium(?:-browser)?|chrome|chrome-headless-shell|headless_shell)[\\\"']?(?![\\w.-])(?![^;&|\\n)<>]*?\\s(?:--?version|--?help|-h)(?![\\w-]))",
+          "flags": "",
+          "unless_any": ["\\bssh\\s"],
+          "say": "starting Chrome/Chromium directly"
+        },
+        {
+          "id": "browser-harness",
+          "find": "(?:^|[;&|({\\n]|\\$\\(|`|\\b(?:then|do|else|xargs)\\s|\\b(?:bash|sh)\\s+-l?c\\s+['\"])\\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\\S*|sudo(?:\\s+-u\\s+\\S+|\\s+-[A-Za-z]+)*|env(?:\\s+-\\S+)*|time|nohup|command|exec|nice(?:\\s+-n)?(?:\\s+-?\\d+)?|ionice(?:\\s+-\\S+)*|timeout(?:\\s+-\\S+)*\\s+\\d+[smhd]?|xvfb-run(?:\\s+-\\S+)*)\\s+)*(?:(?:bash|sh)(?:\\s+-[A-Za-z]+)*\\s+)?[\\\"']?(?:\\S*/)?tests/browser_(?:(?!registry_unit\\.sh|mirror\\.sh)[\\w.*-]*\\.sh|mirror\\.sh(?!\\s+(?:check|sync)\\b))(?![\\w.-])",
+          "flags": "",
+          "unless_any": ["\\bssh\\s"],
+          "say": "running a 5dive-browser harness (tests/browser_*.sh), which starts Chrome through bin/browser"
+        },
+        {
+          "id": "browser-harness-loop",
+          "find": "\\bfor\\s+\\w+\\s+in\\s+[^;\\n]*?tests/browser_[\\w.*-]*\\.sh[^;\\n]*[;\\n]\\s*do\\s+(?:[A-Za-z_]\\w*=\\S*\\s+)*(?:(?:timeout\\s+\\d+[smhd]?|bash|sh)\\s+)*[\\\"']?\\$",
+          "flags": "",
+          "unless_any": ["\\bssh\\s"],
+          "say": "running 5dive-browser harnesses (tests/browser_*.sh) in a loop"
+        }
+      ],
+      "deny": "{found}. Every Chrome on poke-two takes RAM from the box that runs every seat, and the harnesses do not reap the Chrome they start: about 40 orphans filled RAM and swap on 2026-11-19 and froze every agent until lodar killed them by hand. Push and let browser-tests.yml run the harness; for a screenshot or a real-web check use `ci-browser shot <url> -o out.png` or `ci-browser eval <url> '<js>'` (5dive-ci). Only a recorded seat setting opens this: FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL. [{rule}]"
+    },
+    {
+      "id": "heavy-local-install",
+      "rule": "Never install a Next app's whole dependency tree on poke-two — grade by reading CI at the graded head (5dive/CLAUDE.md; a 3.3 GB install helped run poke-two out of RAM 2026-11-19, DIVE-8804)",
+      "tools": ["Bash"],
+      "text_keys": ["command"],
+      "hosts": ["^poke-two$"],
+      "unless_env": "FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL",
+      "checks": [
+        {
+          "id": "next-app-full-install",
+          "find": "(?:^|[;&|({\\n]|\\$\\(|`|\\b(?:then|do|else|xargs)\\s|\\b(?:bash|sh)\\s+-l?c\\s+['\"])\\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\\S*|sudo(?:\\s+-u\\s+\\S+|\\s+-[A-Za-z]+)*|env(?:\\s+-\\S+)*|time|nohup|command|exec|nice(?:\\s+-n)?(?:\\s+-?\\d+)?|ionice(?:\\s+-\\S+)*|timeout(?:\\s+-\\S+)*\\s+\\d+[smhd]?|xvfb-run(?:\\s+-\\S+)*)\\s+)*(?:npm(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace|registry|cache|omit|include|loglevel)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+(?:=\\S+)?))*\\s+(?:ci|clean-install|install-clean)(?![\\w:.-])|(?:npm(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace|registry|cache|omit|include|loglevel)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+(?:=\\S+)?))*\\s+(?:install|i|in|isntall)|(?:bun|pnpm)(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace|registry|cache|omit|include|loglevel)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+(?:=\\S+)?))*\\s+(?:install|i)|yarn(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace|registry|cache|omit|include|loglevel)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+(?:=\\S+)?))*\\s+install)(?![\\w:.-])(?:\\s+(?:--(?:prefix|cwd|dir|filter|workspace|registry|cache|omit|include|loglevel)[=\\s]+\\S+|-[Cw]\\s+\\S+|--?[\\w-]+(?:=\\S+)?))*\\s*(?=$|[;&|)\\n<>]|\\d+>))",
+          "flags": "",
+          "require_all": [
+            "(?:/projects/5dive/(?:app|agent-profile)(?![\\w.-])|\\b5dive-frontend\\b|\\bagent-profile\\b|/wt/(?:fe|frontend|app)(?:[-_.]?\\w[\\w.-]*)?(?![\\w.-])|\\bcd\\s+[\\\"']?(?:\\./)?(?:app|agent-profile)/?[\\\"']?(?=\\s|$|[;&|)])|--prefix[=\\s]+[\\\"']?(?:\\./)?app/?[\\\"']?(?=\\s|$|[;&|)]))"
+          ],
+          "unless_any": ["\\bssh\\s"],
+          "say": "a full dependency install of a Next app (5dive-frontend or agent-profile)"
+        }
+      ],
+      "deny": "{found}. The whole frontend tree is over a gigabyte to install and its node grew to 3.3 GB on poke-two on 2026-11-19, the morning every seat froze. A grader reads CI at the graded head (5dive/CLAUDE.md) instead of installing; anything that truly needs the tree runs on 5dive-ci over ssh. Only a recorded seat setting opens this: FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL. [{rule}]"
     }
   ]
 }

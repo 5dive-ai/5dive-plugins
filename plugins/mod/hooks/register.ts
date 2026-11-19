@@ -86,7 +86,7 @@ import { compile, envSet, evaluate, filesWanted, type Compiled, type Verdict } f
 const SCHEMA = 1
 
 /** The plugin's own version; kept in step with plugin.json by test/mod-telemetry.test.ts. */
-const VERSION = '0.6.3'
+const VERSION = '0.6.4'
 
 /**
  * The Claude Code build this file was written and verified against. Recorded on every
