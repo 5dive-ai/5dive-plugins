@@ -578,6 +578,140 @@ describe('policy: heavy-local — whole-project typecheck, next build/dev and fu
   })
 })
 
+describe('policy: heavy-local-chrome — Chrome and the browser harnesses on poke-two (DIVE-8804)', () => {
+  const POKE = 'poke-two'
+  const on = (command: string, host: string = POKE, env = NO_ENV) =>
+    evaluate(SHIPPED, { ...bash(command), host }, env)?.policy ?? null
+  const checkOf = (command: string) => evaluate(SHIPPED, { ...bash(command), host: POKE }, NO_ENV)?.check ?? null
+
+  test("the incident's own harness runs, ops' and dev's, are refused", () => {
+    expect(on('cd ~/wt/dive-8486 && bash tests/browser_probe_ua_unit.sh 2>&1 | tail -20')).toBe('heavy-local-chrome')
+    expect(on('bash tests/browser_broker_login_open_unit.sh')).toBe('heavy-local-chrome')
+    expect(on('cd ~/wt/browser-8793 && tests/browser_plugin_unit.sh')).toBe('heavy-local-chrome')
+    expect(checkOf('bash tests/browser_plugin_unit.sh')).toBe('browser-harness')
+  })
+
+  test('every way of starting Chrome or a browser harness is refused', () => {
+    for (const c of [
+      'google-chrome --headless --screenshot=/tmp/x.png https://5dive.com',
+      '/usr/bin/google-chrome-stable --headless=new --dump-dom https://example.com',
+      'chromium --headless --disable-gpu https://example.com',
+      'nohup chromium-browser --remote-debugging-port=9222 &',
+      'timeout 60 google-chrome --headless https://example.com',
+      'xvfb-run -a google-chrome https://example.com',
+      '~/.cache/ms-playwright/chromium_headless_shell-1200/chrome-linux/headless_shell --remote-debugging-pipe',
+      './tests/browser_probe_ua_unit.sh',
+      'PROBE_UA_SKIP_LIVE=1 bash tests/browser_probe_ua_unit.sh',
+      'timeout 900 bash -x /home/agent-dev/wt/browser-8793/tests/browser_plugin_unit.sh > /tmp/h.log 2>&1',
+      'bash tests/browser_mirror.sh run',
+      'for f in tests/browser_*_unit.sh; do bash "$f" || echo "FAIL $f"; done',
+      'for t in tests/browser_act_*.sh; do timeout 300 "$t"; done',
+    ]) {
+      expect([c, on(c)]).toEqual([c, 'heavy-local-chrome'])
+    }
+  })
+
+  test('MUTANT: looking at Chrome, killing it, reading a harness, ci-browser and a named node test all run', () => {
+    for (const c of [
+      'ci-browser shot https://5dive.com -o out.png',
+      "ci-browser eval https://5dive.com 'document.title'",
+      'node --test src/lib/x.test.ts',
+      'google-chrome --version',
+      'which google-chrome chromium',
+      'command -v google-chrome',
+      'killall chrome',
+      'pkill -f headless_shell',
+      'ps aux | grep -c chrome',
+      'ls /tmp/com.google.Chrome.*',
+      'cat tests/browser_probe_ua_unit.sh',
+      'sed -n 1,40p tests/browser_broker_login_open_unit.sh',
+      'grep -lE "google-chrome|_chrome_capped" tests/*.sh',
+      'git diff HEAD~1 -- tests/browser_plugin_unit.sh',
+      'for f in tests/browser_*.sh; do grep -c chrome "$f"; done',
+      'bash tests/browser_mirror.sh check',
+      'bash tests/browser_registry_unit.sh',
+      'echo "push and let browser-tests.yml run tests/browser_plugin_unit.sh"',
+    ]) {
+      expect([c, on(c)]).toEqual([c, null])
+    }
+  })
+
+  test('MUTANT: the same run sent to 5dive-ci over ssh runs', () => {
+    expect(on("ssh 5dive-ci 'cd /srv/browser && bash tests/browser_plugin_unit.sh'")).toBeNull()
+    expect(on("ssh root@ci 'google-chrome --headless https://example.com'")).toBeNull()
+  })
+
+  test('a poke-two rule, opened only by the heavy-local setting', () => {
+    expect(on('bash tests/browser_plugin_unit.sh', '5dive-ci')).toBeNull()
+    expect(on('google-chrome --headless https://x', '')).toBeNull()
+    expect(on('bash tests/browser_plugin_unit.sh', POKE, { FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL: '1' })).toBeNull()
+    expect(on('bash tests/browser_plugin_unit.sh', POKE, { FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL: '0' })).toBe('heavy-local-chrome')
+  })
+
+  test('the reason says where it runs instead', () => {
+    const r = evaluate(SHIPPED, { ...bash('bash tests/browser_plugin_unit.sh'), host: POKE }, NO_ENV)?.reason ?? ''
+    expect(r).toContain('browser-tests.yml')
+    expect(r).toContain('ci-browser shot')
+    expect(r).toContain('FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL')
+  })
+})
+
+describe('policy: heavy-local-install — a Next app\'s whole dependency tree on poke-two (DIVE-8804)', () => {
+  const POKE = 'poke-two'
+  const on = (command: string, host: string = POKE, env = NO_ENV) =>
+    evaluate(SHIPPED, { ...bash(command), host }, env)?.policy ?? null
+
+  test("the incident's shape — the frontend lockfile copied out and installed — is refused", () => {
+    expect(
+      on('cp /home/claude/projects/5dive/app/package.json /home/claude/projects/5dive/app/package-lock.json "$S"/ && cd "$S" && npm ci --ignore-scripts'),
+    ).toBe('heavy-local-install')
+  })
+
+  test('every full install of a Next app is refused', () => {
+    for (const c of [
+      'cd /home/claude/projects/5dive/app && npm ci',
+      'cd ~/wt/fe-8764 && npm install',
+      'cd ~/wt/fe-8764 && npm i 2>&1 | tail -5',
+      'npm --prefix /home/claude/projects/5dive/agent-profile ci',
+      'cd app && bun install',
+      'cd /home/claude/projects/5dive/app && pnpm install --frozen-lockfile',
+      'git -C ~/wt/5dive-frontend-x show HEAD:package-lock.json > lock.json && npm ci --ignore-scripts',
+      'npm ci --prefix app',
+      'cd agent-profile; yarn install',
+    ]) {
+      expect([c, on(c)]).toEqual([c, 'heavy-local-install'])
+    }
+  })
+
+  test('MUTANT: one package, another repo, reading the lockfile and a named node test all run', () => {
+    for (const c of [
+      'cd /home/claude/projects/5dive/app && npm install left-pad',
+      'cd ~/wt/fe-8764 && npm i -D @types/node',
+      'cd ~/wt/dive-8775-api && npm ci',
+      'cd /home/claude/projects/5dive/5dive-api && npm install',
+      'jq .packages /home/claude/projects/5dive/app/package-lock.json | head',
+      'cd /home/claude/projects/5dive/app && npm ls next',
+      'cd /home/claude/projects/5dive/app && node --test src/lib/x.test.ts',
+      'ci-browser shot https://5dive.com -o out.png',
+      'echo "do not npm ci in /home/claude/projects/5dive/app"',
+    ]) {
+      expect([c, on(c)]).toEqual([c, null])
+    }
+  })
+
+  test('MUTANT: the same install over ssh on 5dive-ci runs, and it never fires off poke-two', () => {
+    expect(on("ssh 5dive-ci 'cd /srv/5dive-frontend && npm ci'")).toBeNull()
+    expect(on('cd /home/claude/projects/5dive/app && npm ci', '5dive-ci')).toBeNull()
+    expect(on('cd /home/claude/projects/5dive/app && npm ci', POKE, { FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL: '1' })).toBeNull()
+  })
+
+  test('the reason says to read CI at the graded head', () => {
+    const r = evaluate(SHIPPED, { ...bash('cd /home/claude/projects/5dive/app && npm ci'), host: POKE }, NO_ENV)?.reason ?? ''
+    expect(r).toContain('reads CI at the graded head')
+    expect(r).toContain('FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL')
+  })
+})
+
 describe('engine: hosts and unless_any (DIVE-8299)', () => {
   const doc = (extra: Record<string, unknown>, check: Record<string, unknown> = {}) => ({
     v: POLICY_SCHEMA,
