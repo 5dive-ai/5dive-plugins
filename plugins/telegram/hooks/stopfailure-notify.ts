@@ -28,7 +28,7 @@ import { wallRotate, readActiveAccount, type Run } from './lib/wall-rotate'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
 import { inboundLang, TERMS_NOTICE } from './lib/terms'
 import { classifyFailure, failureMessage, resolveResetEpoch, CREDIT_NOTICE } from './lib/failure'
-import { endedOnSigninRefusal, isSigninPayload, SIGNIN_NOTICE } from './lib/signin'
+import { endedOnSigninRefusal, endedOnKeyLimit, isSigninPayload, KEY_LIMIT_NOTICE, SIGNIN_NOTICE } from './lib/signin'
 import { RESUME_LOCK_TTL_MS, resumeLogDir as makeResumeLogDir, tryAcquireResumeLock } from './lib/resume-lock'
 import { onDemoAccount, readDemoKey, isKeyLimitText, claimDemoNotice, releaseDemoNotice, demoNoticeText, demoNoticeButtons, demoNoticeMarkup, demoAccountUrl } from './lib/demo-key'
 
@@ -81,8 +81,13 @@ let isRateLimit = kind.isRateLimit
 let isTransientApiError = kind.isTransientApiError
 // DIVE-7835: the account turned the turn away for its sign-in (revoked or
 // expired). Not a limit, not a blip: nothing clears it but signing in again.
+// DIVE-8800: an OpenRouter key's own cap ("Key limit exceeded", which Claude
+// Code files under authentication_failed) is a limit, never a sign-in.
+const isKeyLimit =
+  !isTermsNotAccepted && !isOutOfCredit && !isRateLimit &&
+  (isKeyLimitText(raw) || endedOnKeyLimit(entries))
 const isSigninRefused =
-  !isTermsNotAccepted && !isOutOfCredit && !isRateLimit && !isTransientApiError &&
+  !isTermsNotAccepted && !isOutOfCredit && !isRateLimit && !isTransientApiError && !isKeyLimit &&
   (isSigninPayload(payload) || endedOnSigninRefusal(entries))
 
 // Memoized active-account cache for resolveActiveAccount(). Declared here at
@@ -163,6 +168,9 @@ if (isTermsNotAccepted) {
   } else {
     text = 'Usage limit hit — waiting for reset.'
   }
+} else if (isKeyLimit) {
+  // DIVE-8800: the owner's key hit its own cap. A lite client's line is set below.
+  text = KEY_LIMIT_NOTICE[inboundLang(entries) ?? readLiteLang()]
 } else if (isSigninRefused) {
   // DIVE-7835: never the raw "Please run /login"; /login here signs in this agent's own account.
   text = SIGNIN_NOTICE.owner[inboundLang(entries) ?? readLiteLang()]
@@ -234,7 +242,7 @@ if (LITE && isTermsNotAccepted) {
 // generic line above). Any other agent or failure: untouched.
 let demoFingerprint: string | null = null
 if (onDemoAccount()) {
-  const demo = await readDemoKey({ sawKeyLimit: isKeyLimitText(raw) })
+  const demo = await readDemoKey({ sawKeyLimit: isKeyLimit })
   if (demo.kind === 'used-up') {
     if (!claimDemoNotice(stateDir(), demo.fingerprint)) {
       console.error('[stopfailure-notify] demo key used up — notice already sent for this key, staying quiet')
@@ -358,7 +366,7 @@ if (needsRecovery && isRateLimit && tmuxCtx && lockPath) {
 // respawn storm collapses to one DM per cooldown window. Kept message-independent
 // (like the usage-limit key already was): distinct errors of the same kind within
 // the window collapse — an acceptable tradeoff against a 550-message storm.
-const notifyKind = isTermsNotAccepted ? 'terms' : isOutOfCredit ? 'credit' : isRateLimit ? 'ratelimit' : isTransientApiError ? 'transient' : isSigninRefused ? 'signin' : 'stop'
+const notifyKind = isTermsNotAccepted ? 'terms' : isOutOfCredit ? 'credit' : isRateLimit ? 'ratelimit' : isKeyLimit ? 'keylimit' : isTransientApiError ? 'transient' : isSigninRefused ? 'signin' : 'stop'
 let shouldSend = true
 {
   const dir = resumeLogDir || makeResumeLogDir()
