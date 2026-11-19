@@ -9,6 +9,8 @@
 // an intercept nobody wanted with a green suite.
 import { test, expect, describe } from 'bun:test'
 import { parseGateReply, resolveGateReply, gateAlertIdent, GATE_REPLY_RE } from '../plugins/telegram/gatereply'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 // Reserved fakes only (repo rule): chat id 1234567890, never a real one.
 const CHAT = '1234567890'
@@ -242,21 +244,34 @@ describe('gateAlertIdent — the reply_to half of the narrowing', () => {
   // that let the over-broad intercept ship green.
   const BOT = 'local_Dr3bot'
   test('reads the ident out of our own alert', () => {
-    expect(gateAlertIdent(BOT, '🙋 [DIVE-2818] needs you — approve the push?', BOT)).toBe('DIVE-2818')
+    expect(gateAlertIdent(BOT, '🙋 [DIVE-2818] needs you — approve the push?', BOT, true)).toBe('DIVE-2818')
   })
   test('a reply to someone ELSE quoting the alert text is not our alert', () => {
     // Otherwise anyone could mint the signal by pasting the alert into a message
     // and getting the human to reply to it.
-    expect(gateAlertIdent('someone_else', '🙋 [DIVE-2818] needs you', BOT)).toBeNull()
+    expect(gateAlertIdent('someone_else', '🙋 [DIVE-2818] needs you', BOT, true)).toBeNull()
   })
   test('a reply to one of our OTHER messages is not a gate alert', () => {
-    expect(gateAlertIdent(BOT, 'deploy finished, 441 pass', BOT)).toBeNull()
+    expect(gateAlertIdent(BOT, 'deploy finished, 441 pass', BOT, true)).toBeNull()
   })
   test('not a reply at all', () => {
-    expect(gateAlertIdent(undefined, undefined, BOT)).toBeNull()
+    expect(gateAlertIdent(undefined, undefined, BOT, true)).toBeNull()
   })
   test('unknown bot username fails closed rather than matching everything', () => {
-    expect(gateAlertIdent(BOT, '🙋 [DIVE-2818] needs you', undefined)).toBeNull()
+    expect(gateAlertIdent(BOT, '🙋 [DIVE-2818] needs you', undefined, true)).toBeNull()
+  })
+  test('DIVE-8803: a non-owner replying to our alert in a group does not answer it', () => {
+    // A gate alert can sit in a group; any member can reply to it there.
+    expect(gateAlertIdent(BOT, '🙋 [DIVE-7] needs you — which supplier?', BOT, false)).toBeNull()
+    expect(gateAlertIdent(BOT, '🙋 [DIVE-7] needs you — which supplier?', BOT, true)).toBe('DIVE-7')
+  })
+  test('DIVE-8803: server.ts passes whether the SENDER is an owner', () => {
+    // server.ts long-polls on boot and cannot be imported, so its one call site
+    // is read as text: a constant `true` here would reopen the hole.
+    const src = readFileSync(join(import.meta.dir, '../plugins/telegram/server.ts'), 'utf8')
+    const calls = src.match(/gateAlertIdent\([^\n]*\)/g) ?? []
+    expect(calls.length).toBe(1)
+    expect(calls[0]).toContain('isOwner(access, String(from.id))')
   })
 })
 

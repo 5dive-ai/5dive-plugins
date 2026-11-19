@@ -1,5 +1,10 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.145: in a group, only an owner's reply answers a gate (DIVE-8803)
+
+- A gate alert can sit in a group: a bot with no owner DM, or a group bound to a topic. Its buttons already took a tap only from someone in allowFrom, but a typed reply to a manual gate («🙋 [DIVE-N] needs you») was taken from anyone in the group and cleared the gate with their words. `gateAlertIdent` now takes whether the sender is an owner (`isOwner`), and a reply from anyone else goes to the agent as ordinary chat. DMs are unchanged. The CLI half of the same row stops sending a gate to a group at all when the owner has a DM.
+- Harness: `test/gatereply.test.ts` +2 arms (a non-owner's reply to the alert is not an answer, an owner's is; server.ts passes `isOwner` for the sender).
+
 ### Added — dashboard 0.5.42: lodar's test version, part two: first sentence first, and the reply tool always loaded (DIVE-8649)
 
 - Two more words for the same one-box labs file (`/var/lib/5dive/voice/labs`, absent on every box). `split`: a voice reply of two or more sentences is spoken as two notes, the first sentence first, posted in order and tagged `voice_part: { turn, n, of }` in the message metadata, so the first words play while the rest is still being made (implies `fast`; a one-sentence reply stays one untagged note; an encrypted chat is spoken whole, as its metadata keeps no tag). Needs the app's player queue (frontend, same row); an older app plays part one only. `loaded`: the reply tool is listed with `_meta["anthropic/alwaysLoad"]: true`, so a new session's first answer does not pay Claude Code's tool search for it (from the next session on). The timing line gains `parts`, `first_ms` and `first_box_ms` for a split reply.

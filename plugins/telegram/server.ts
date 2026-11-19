@@ -7503,7 +7503,7 @@ async function handleInbound(
   // down. One read, two consumers.
   const repliedMsg = ctx.message?.reply_to_message
   // DIVE-5121: a lite client is never sent a gate, so nothing it writes is a gate answer.
-  const alertIdent = LITE ? null : gateAlertIdent(repliedMsg?.from?.username, repliedMsg?.text ?? repliedMsg?.caption, botUsername)
+  const alertIdent = LITE ? null : gateAlertIdent(repliedMsg?.from?.username, repliedMsg?.text ?? repliedMsg?.caption, botUsername, isOwner(access, String(from.id)))
 
   // DMs only. `_gate_channel_proof_ok` takes `^[0-9]+$` and a group id is
   // negative, so no group message can ever produce a citation that attests —

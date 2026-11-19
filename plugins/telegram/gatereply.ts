@@ -99,11 +99,17 @@ export interface ParsedGateReply { ident: string; value: string }
  * server.ts now feeds both consumers from this one call. Two copies of "is this a
  * reply to our alert" is the drift this avoids.
  */
+// `senderIsOwner`: DIVE-8803. A gate alert can sit in a group (a group-only bot,
+// a bound topic), where any member may reply to it. A typed reply answers the
+// gate only from an owner of the bot (isOwner: `owners`, else allowFrom); anyone
+// else's reply is ordinary chat and goes to the agent as before.
 export function gateAlertIdent(
   fromUsername: string | undefined,
   replyText: string | undefined,
   botUsername: string | undefined,
+  senderIsOwner: boolean,
 ): string | null {
+  if (!senderIsOwner) return null
   if (!fromUsername || !replyText || !botUsername) return null
   if (fromUsername !== botUsername) return null
   const m = /\[DIVE-(\d+)\]\s+needs you/.exec(replyText)
