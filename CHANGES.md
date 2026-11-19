@@ -1,5 +1,10 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.145: in a group, only an owner's reply answers a gate (DIVE-8803)
+
+- A gate alert can sit in a group: a bot with no owner DM, or a group bound to a topic. Its buttons already took a tap only from someone in allowFrom, but a typed reply to a manual gate («🙋 [DIVE-N] needs you») was taken from anyone in the group and cleared the gate with their words. `gateAlertIdent` now takes whether the sender is an owner (`isOwner`), and a reply from anyone else goes to the agent as ordinary chat. DMs are unchanged. The CLI half of the same row stops sending a gate to a group at all when the owner has a DM.
+- Harness: `test/gatereply.test.ts` +2 arms (a non-owner's reply to the alert is not an answer, an owner's is; server.ts passes `isOwner` for the sender).
+
 ### Fixed — mod 0.6.4: on poke-two the guard refuses starting Chrome and a full install of a Next app (DIVE-8804)
 
 - poke-two ran out of RAM on 2026-11-19 (swap full, load 217, every seat stalled) from ~40 orphaned headless Chromes left by local runs of 5dive-browser harnesses, plus a whole-frontend `npm ci` whose node reached 3.3 GB. Two new policies, poke-two only, same escape as `heavy-local` (`FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL`), and anything over `ssh` runs: `heavy-local-chrome` refuses starting Chrome/Chromium/headless_shell directly and running a `tests/browser_*.sh` harness (alone or in a loop), and says to push and let browser-tests.yml run it or use `ci-browser`; `heavy-local-install` refuses `npm ci`, bare `npm install`/`npm i`, `bun install`, `pnpm install` or `yarn install` on a line that names a Next app, and says to read CI at the graded head.
