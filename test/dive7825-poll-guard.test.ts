@@ -7,10 +7,10 @@
 // queued messages, one stderr line names the failure, and bot.lastpoll stops
 // advancing during the hang and moves again after it.
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createPollGuard, pollDeadlineMs, touchLastPoll, POLL_SLACK_MS } from '../plugins/telegram/pollguard.ts'
+import { createPollGuard, localRivalPollers, pollDeadlineMs, touchLastPoll, POLL_SLACK_MS } from '../plugins/telegram/pollguard.ts'
 
 const ROOT = join(import.meta.dir, '..')
 const FORKS = ['telegram-codex', 'telegram-grok', 'telegram-agy', 'telegram-opencode', 'telegram-pi']
@@ -125,6 +125,80 @@ describe('pollguard: a getUpdates with no answer is cut off, logged and retried'
     await guard(prev, 'sendMessage', { chat_id: 1, text: 'hi' })
     expect(st.signals).toEqual([sig, undefined])
     expect(existsSync(join(dir, 'lp'))).toBe(false)
+  })
+})
+
+// DIVE-8896: a 409 comes BACK (ok:false); grammY throws only after the transformer.
+describe('pollguard: a 409 from a second getUpdates consumer is a deaf window, not a poll', () => {
+  const CONFLICT = { ok: false, error_code: 409, description: 'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running' }
+
+  test('409: lastpoll stays put, the log says another poller has the messages, bot.conflict records it; a good poll clears it', async () => {
+    const dir = tmp()
+    const lastPollFile = join(dir, 'bot.lastpoll')
+    const conflictFile = join(dir, 'bot.conflict')
+    let clock = 1_000
+    const lines: string[] = []
+    const guard = createPollGuard({ lastPollFile, log: l => lines.push(l), now: () => clock, rivals: () => ['pid 77 (ppid 1): bun /x/telegram-agy/server.ts'] })
+    touchLastPoll(lastPollFile, 1)
+
+    for (let i = 0; i < 5; i++) { clock += 3_000; expect(await guard(() => Promise.resolve(CONFLICT), 'getUpdates', { timeout: 30 })).toEqual(CONFLICT) }
+    expect(readFileSync(lastPollFile, 'utf8')).toBe('1') // red before DIVE-8896: every 409 touched it
+    expect(lines[0]).toMatch(/^getUpdates failed \(1 in a row\): 409 Conflict, another process is polling this bot token and owner messages go to it, not here \(Conflict: terminated/)
+    expect(lines[1]).toBe('getUpdates 409: other local pollers on this box: pid 77 (ppid 1): bun /x/telegram-agy/server.ts')
+    expect(lines.length).toBe(2) // rate-limited, not one line per retry
+    const rec = JSON.parse(readFileSync(conflictFile, 'utf8'))
+    expect(rec).toMatchObject({ since: 4_000, last: 16_000, count: 5, local_rivals: ['pid 77 (ppid 1): bun /x/telegram-agy/server.ts'] })
+
+    clock += 3_000
+    await guard(() => Promise.resolve({ ok: true, result: [] }), 'getUpdates', { timeout: 30 })
+    expect(readFileSync(lastPollFile, 'utf8')).toBe(String(clock))
+    expect(existsSync(conflictFile)).toBe(false)
+    expect(lines.slice(2)).toEqual(['getUpdates 409 cleared: this bridge could not receive messages for 15s', 'getUpdates recovered after 5 failed attempts'])
+  })
+
+  test('409 with no local rival says the token is used elsewhere', async () => {
+    const lines: string[] = []
+    const guard = createPollGuard({ lastPollFile: join(tmp(), 'lp'), log: l => lines.push(l), rivals: () => [] })
+    await guard(() => Promise.resolve(CONFLICT), 'getUpdates', { timeout: 30 })
+    expect(lines[1]).toBe('getUpdates 409: no other poller on this box, so the token is in use somewhere else')
+  })
+
+  test('any other ok:false answer is a failure too: logged, lastpoll untouched, no bot.conflict', async () => {
+    const dir = tmp()
+    const lines: string[] = []
+    const guard = createPollGuard({ lastPollFile: join(dir, 'lp'), log: l => lines.push(l), rivals: () => { throw new Error('not for a 502') } })
+    await guard(() => Promise.resolve({ ok: false, error_code: 502, description: 'Bad Gateway' }), 'getUpdates', { timeout: 30 })
+    expect(lines).toEqual(['getUpdates failed (1 in a row): 502 Bad Gateway; retrying in 3s'])
+    expect(existsSync(join(dir, 'lp'))).toBe(false)
+    expect(existsSync(join(dir, 'bot.conflict'))).toBe(false)
+  })
+
+  test('a bot.conflict left by a process that died mid-conflict goes on the first good poll', async () => {
+    const dir = tmp()
+    writeFileSync(join(dir, 'bot.conflict'), '{"since":1}')
+    const guard = createPollGuard({ lastPollFile: join(dir, 'bot.lastpoll'), log: () => {} })
+    await guard(() => Promise.resolve({ ok: true, result: [] }), 'getUpdates', { timeout: 30 })
+    expect(existsSync(join(dir, 'bot.conflict'))).toBe(false)
+  })
+
+  test('localRivalPollers names other bridges, the team-bot listener and telegram-discover, never itself or an unrelated process', () => {
+    const proc = tmp()
+    const mk = (pid: number, argv: string[], ppid: number) => {
+      mkdirSync(join(proc, String(pid)))
+      writeFileSync(join(proc, String(pid), 'cmdline'), argv.join('\0') + '\0')
+      writeFileSync(join(proc, String(pid), 'stat'), `${pid} (bun) S ${ppid} 1 1 0`)
+    }
+    mk(10, ['bun', '/home/a/.gemini/extensions/telegram-agy/server.ts'], 1)
+    mk(11, ['bun', '/home/a/.gemini/extensions/telegram-agy/server.ts'], 5)
+    mk(12, ['bun', '/usr/lib/5dive/team-bot-listener.ts'], 1)
+    mk(13, ['bash', '/usr/bin/5dive', 'agent', 'telegram-discover', 'aisha'], 9)
+    mk(14, ['bun', '/srv/app/server.ts'], 1)
+    mkdirSync(join(proc, 'self'))
+    expect(localRivalPollers(11, proc)).toEqual([
+      'pid 10 (ppid 1): bun /home/a/.gemini/extensions/telegram-agy/server.ts',
+      'pid 12 (ppid 1): bun /usr/lib/5dive/team-bot-listener.ts',
+      'pid 13 (ppid 9): bash /usr/bin/5dive agent telegram-discover aisha',
+    ])
   })
 })
 
