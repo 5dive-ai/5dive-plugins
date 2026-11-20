@@ -4,9 +4,10 @@ The engine behind «Check my setup» (stage 1, DIVE-8897). `seccheck` is one sta
 binary that checks a **sealed, throwaway clone** of an owner's server from the outside
 and writes a plain report: what is open, how serious it is, how to close it.
 
-The 5dive control plane makes the clone, scrubs its credentials, uploads `seccheck` and a
-`scope.json` to the owner's live box, runs it there against the clone's IP, and reads the
-report files back. The live box is never a target. Clean-room code: ARTEX was a design
+The 5dive control plane (lodar/5dive-api `src/lib/security-check/`) makes the clone, scrubs
+its credentials, writes a `scope.json` and runs `seccheck` on the control plane itself (the
+only address the clone's firewall admits) against the clone's IP, then reads the report files
+back. Nothing is uploaded to or run on the owner's live box. The live box is never a target. Clean-room code: ARTEX was a design
 reference only. Plan: `community/wiki/security-self-check-plugin-staged-plan.md`.
 
 ## The three hard requirements
