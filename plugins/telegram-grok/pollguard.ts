@@ -57,7 +57,7 @@ export const CONFLICT_FILE_NAME = 'bot.conflict'
 /**
  * Other local processes that look like a getUpdates consumer: a Telegram bridge
  * server.ts, the team-bot listener, or a `telegram-discover` poll. Best effort and
- * read-only: it names candidates for the log, it never signals them. The real
+ * read-only: it names candidates for the log (bot tokens redacted), it never signals them. The real
  * rival may be on another machine using the same token; then this list is empty.
  */
 export function localRivalPollers(selfPid: number = process.pid, procDir = '/proc'): string[] {
@@ -75,9 +75,14 @@ export function localRivalPollers(selfPid: number = process.pid, procDir = '/pro
       const st = readFileSync(join(procDir, d, 'stat'), 'utf8')
       ppid = st.slice(st.lastIndexOf(')') + 2).split(' ')[1] ?? '?'
     } catch {}
-    out.push(`pid ${pid} (ppid ${ppid}): ${cmd.slice(0, 160)}`)
+    out.push(`pid ${pid} (ppid ${ppid}): ${redactTokens(cmd).slice(0, 160)}`)
   }
   return out
+}
+
+// A poller may carry a bot token on its command line; never copy one into a log.
+export function redactTokens(text: string): string {
+  return text.replace(/(?<!\d)\d{5,}:[A-Za-z0-9_-]{20,}/g, '<bot-token>')
 }
 
 type ApiErr = { ok: false; error_code?: number; description?: string }

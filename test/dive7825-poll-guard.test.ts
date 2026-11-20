@@ -193,11 +193,13 @@ describe('pollguard: a 409 from a second getUpdates consumer is a deaf window, n
     mk(12, ['bun', '/usr/lib/5dive/team-bot-listener.ts'], 1)
     mk(13, ['bash', '/usr/bin/5dive', 'agent', 'telegram-discover', 'aisha'], 9)
     mk(14, ['bun', '/srv/app/server.ts'], 1)
+    mk(15, ['curl', 'https://api.telegram.org/bot123456789:AAHfake_token-value_abcdefghijk/getUpdates', 'telegram-discover'], 9)
     mkdirSync(join(proc, 'self'))
     expect(localRivalPollers(11, proc)).toEqual([
       'pid 10 (ppid 1): bun /home/a/.gemini/extensions/telegram-agy/server.ts',
       'pid 12 (ppid 1): bun /usr/lib/5dive/team-bot-listener.ts',
       'pid 13 (ppid 9): bash /usr/bin/5dive agent telegram-discover aisha',
+      'pid 15 (ppid 9): curl https://api.telegram.org/bot<bot-token>/getUpdates telegram-discover',
     ])
   })
 })
