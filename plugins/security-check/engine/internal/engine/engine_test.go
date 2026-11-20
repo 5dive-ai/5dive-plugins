@@ -1,0 +1,267 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/lodar/5dive-plugins/plugins/security-check/engine/internal/llm"
+	"github.com/lodar/5dive-plugins/plugins/security-check/engine/internal/model"
+	"github.com/lodar/5dive-plugins/plugins/security-check/engine/internal/report"
+	"github.com/lodar/5dive-plugins/plugins/security-check/engine/internal/scope"
+	"github.com/lodar/5dive-plugins/plugins/security-check/engine/internal/store"
+	"github.com/lodar/5dive-plugins/plugins/security-check/engine/internal/testnet"
+	"github.com/lodar/5dive-plugins/plugins/security-check/engine/internal/tools"
+)
+
+func testScope() *scope.Scope {
+	return &scope.Scope{RunID: "run-1", Targets: []scope.Target{{Kind: "ip", Value: "127.0.0.1"}}, HostNames: []string{"box.example.com"}, Depth: "shallow"}
+}
+
+// leakySite is a small web app with its .git folder exposed.
+func leakySite(t *testing.T) (*httptest.Server, int) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.git/HEAD" {
+			fmt.Fprint(w, "ref: refs/heads/main\n")
+			return
+		}
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, "<html>hello</html>")
+	}))
+	t.Cleanup(srv.Close)
+	return srv, srv.Listener.Addr().(*net.TCPAddr).Port
+}
+
+func newConfig(t *testing.T, ports []int) (Config, *testnet.Recorder) {
+	t.Helper()
+	testnet.TrapDNS(t)
+	rec := testnet.NewRecorder(t)
+	s := testScope()
+	st, err := store.Open(filepath.Join(t.TempDir(), "e.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return Config{
+		Scope: s, Store: st, Approval: AutoSafe, MaxDuration: time.Minute, MaxTokens: 100000, Version: "test",
+		Env: &tools.Env{
+			Scope: s, Dial: scope.NewGuard(s, rec.Dial).DialContext, Ports: ports,
+			ConnectTimeout: 500 * time.Millisecond, IOTimeout: 2 * time.Second,
+		},
+	}, rec
+}
+
+func findingChecks(rep *report.Report) map[string]model.Finding {
+	m := map[string]model.Finding{}
+	for _, f := range rep.Findings {
+		m[f.ID[:strings.LastIndex(f.ID, "-")]] = f
+	}
+	return m
+}
+
+func assertOnlyLoopbackDialed(t *testing.T, rec *testnet.Recorder) {
+	t.Helper()
+	for _, a := range rec.Seen() {
+		if !strings.HasPrefix(a, "127.0.0.1:") {
+			t.Errorf("dialed outside scope: %q", a)
+		}
+	}
+}
+
+func TestDeterministicRunEndToEnd(t *testing.T) {
+	_, port := leakySite(t)
+	cfg, rec := newConfig(t, []int{port})
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.StoppedReason != report.StopDone {
+		t.Fatalf("stopped %s", rep.StoppedReason)
+	}
+	got := findingChecks(rep)
+	for _, c := range []string{"open-ports", "git-exposed", "missing-safety-headers", "no-https"} {
+		if _, ok := got[c]; !ok {
+			t.Errorf("missing %s; got %v", c, rep.Findings)
+		}
+	}
+	if rep.Summary.High != 1 {
+		t.Errorf("summary %+v", rep.Summary)
+	}
+	tools := map[string]bool{}
+	for _, a := range rep.Approvals {
+		if a.Decision != "approved" {
+			t.Errorf("denied in a clean run: %+v", a)
+		}
+		tools[a.Tool] = true
+	}
+	for _, want := range []string{"port_scan", "banner", "http_probe", "exposure_probe"} {
+		if !tools[want] {
+			t.Errorf("planner never ran %s", want)
+		}
+	}
+	assertOnlyLoopbackDialed(t, rec)
+
+	// The exploration graph: one goal, and every finding hangs off an intent.
+	db := cfg.Store.DB()
+	for kind, min := range map[string]int{"goal": 1, "intent": 4, "fact": 2, "finding": 4} {
+		var n int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE run_id = 'run-1' AND kind = ?`, kind).Scan(&n)
+		if n < min {
+			t.Errorf("%d %s nodes, want >= %d", n, kind, min)
+		}
+	}
+	var orphan int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM nodes f JOIN nodes p ON p.id = f.parent_id
+		WHERE f.kind = 'finding' AND p.kind NOT IN ('intent','goal')`).Scan(&orphan)
+	if orphan != 0 {
+		t.Errorf("%d findings not under an intent", orphan)
+	}
+	var assets int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM assets`).Scan(&assets)
+	if assets < 3 {
+		t.Errorf("only %d assets", assets)
+	}
+}
+
+func TestGateDeniesIntrusiveTools(t *testing.T) {
+	s, cat := testScope(), tools.Catalog()
+	guess := model.Intent{Tool: "ssh_password_guess", Target: "127.0.0.1:22"}
+	for _, mode := range []string{AutoSafe, DenyAll} {
+		if d := Gate(s, cat, mode, guess); d.Approved {
+			t.Errorf("%s approved an intrusive tool", mode)
+		}
+	}
+	probe := model.Intent{Tool: "ssh_probe", Target: "127.0.0.1:22"}
+	if d := Gate(s, cat, AutoSafe, probe); !d.Approved {
+		t.Errorf("auto-safe denied a safe probe: %s", d.Reason)
+	}
+	if d := Gate(s, cat, DenyAll, probe); d.Approved {
+		t.Errorf("deny-all approved a probe")
+	}
+	if d := Gate(s, cat, AutoSafe, model.Intent{Tool: "rm_rf", Target: "127.0.0.1"}); d.Approved {
+		t.Errorf("unknown tool approved")
+	}
+	if d := Gate(s, cat, AutoSafe, model.Intent{Tool: "port_scan", Target: "127.0.0.1:80"}); d.Approved {
+		t.Errorf("port_scan with ip:port approved")
+	}
+}
+
+// fakeLLM is an Anthropic-shaped provider that proposes the given intents.
+func fakeLLM(t *testing.T, plan string, tokensPerCall int) *llm.Client {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"content":[{"type":"text","text":%q}],"stop_reason":"end_turn","usage":{"input_tokens":%d,"output_tokens":0}}`, plan, tokensPerCall)
+	}))
+	t.Cleanup(srv.Close)
+	return llm.NewClient([]llm.Provider{{Kind: "anthropic", BaseURL: srv.URL, Model: "fake", APIKeyEnv: "K"}},
+		func(string) string { return "key" })
+}
+
+// An LLM that proposes an out-of-scope IP, a host name as target, a foreign Host
+// header and an intrusive tool gets every one refused and recorded, and nothing
+// outside the scope is ever dialed or looked up.
+func TestLLMOutOfScopeIntentsAreRefusedAndRecorded(t *testing.T) {
+	_, port := leakySite(t)
+	cfg, rec := newConfig(t, []int{port})
+	p := strconv.Itoa(port)
+	cfg.LLM = fakeLLM(t, `Sure. {"intents":[
+		{"tool":"http_probe","target":"10.9.9.9:80","why":"x"},
+		{"tool":"port_scan","target":"box.example.com","why":"x"},
+		{"tool":"http_probe","target":"127.0.0.1:`+p+`","args":{"host":"live.example.net"},"why":"x"},
+		{"tool":"ssh_password_guess","target":"127.0.0.1:22","why":"x"},
+		{"tool":"http_probe","target":"127.0.0.1:`+p+`","args":{"scheme":"http","host":"box.example.com"},"why":"in scope"}
+	],"done":false}`, 10)
+
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := map[string]string{}
+	for _, a := range rep.Approvals {
+		if a.Decision == "denied" {
+			denied[a.Tool+" "+a.Target] = a.Reason
+		}
+	}
+	for key, reason := range map[string]string{
+		"http_probe 10.9.9.9:80":          "out of scope",
+		"port_scan box.example.com":       "names are never resolved",
+		"http_probe 127.0.0.1:" + p:       "live.example.net",
+		"ssh_password_guess 127.0.0.1:22": "intrusive",
+	} {
+		if !strings.Contains(denied[key], reason) {
+			t.Errorf("%s: denial %q, want it to mention %q", key, denied[key], reason)
+		}
+	}
+	var stored int
+	_ = cfg.Store.DB().QueryRow(`SELECT COUNT(*) FROM approvals WHERE decision = 'denied'`).Scan(&stored)
+	if stored != len(denied) || stored != 4 {
+		t.Errorf("%d denials in sqlite, %d in report, want 4", stored, len(denied))
+	}
+	if rep.Budget.TokensUsed == 0 {
+		t.Errorf("LLM tokens not counted")
+	}
+	assertOnlyLoopbackDialed(t, rec)
+}
+
+func TestLLMFailureFallsBackToDeterministic(t *testing.T) {
+	_, port := leakySite(t)
+	cfg, _ := newConfig(t, []int{port})
+	cfg.LLM = fakeLLM(t, "I'm sorry, but I can't help with that.", 7)
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := findingChecks(rep)["git-exposed"]; !ok {
+		t.Fatalf("fallback planner missed the exposed .git: %v", rep.Findings)
+	}
+	if rep.Budget.TokensUsed != 7 {
+		t.Errorf("tokens %d, want 7 (one refused call, then no more LLM calls)", rep.Budget.TokensUsed)
+	}
+}
+
+func TestBudgetStops(t *testing.T) {
+	_, port := leakySite(t)
+	cfg, rec := newConfig(t, []int{port})
+	cfg.MaxDuration = time.Nanosecond
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.StoppedReason != report.StopBudgetTime || len(rec.Seen()) != 0 {
+		t.Fatalf("stopped %s after %d dials", rep.StoppedReason, len(rec.Seen()))
+	}
+
+	cfg2, rec2 := newConfig(t, []int{port})
+	cfg2.LLM = fakeLLM(t, `{"intents":[],"done":true}`, 500)
+	cfg2.MaxTokens = 100
+	rep, err = Run(context.Background(), cfg2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.StoppedReason != report.StopBudgetTokens || rep.Budget.TokensUsed != 500 || len(rec2.Seen()) != 0 {
+		t.Fatalf("stopped %s tokens %d dials %d", rep.StoppedReason, rep.Budget.TokensUsed, len(rec2.Seen()))
+	}
+	var reason string
+	_ = cfg2.Store.DB().QueryRow(`SELECT stopped_reason FROM runs WHERE id = 'run-1'`).Scan(&reason)
+	if reason != report.StopBudgetTokens {
+		t.Errorf("runs.stopped_reason %q", reason)
+	}
+}
+
+func TestScopeLockNamesTargetsAndRules(t *testing.T) {
+	lock := ScopeLock(testScope())
+	for _, want := range []string{"authorized", "127.0.0.1", "box.example.com", "never looked up", "read-only"} {
+		if !strings.Contains(lock, want) {
+			t.Errorf("scope lock lacks %q", want)
+		}
+	}
+}
