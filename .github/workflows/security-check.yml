@@ -1,0 +1,54 @@
+name: security-check
+
+# DIVE-8897. Vets, tests and cross-builds the seccheck engine (pure Go, static).
+# The two binaries are uploaded as workflow artifacts for the control plane.
+
+on:
+  push:
+    paths:
+      - 'plugins/security-check/**'
+      - '.github/workflows/security-check.yml'
+  pull_request:
+    paths:
+      - 'plugins/security-check/**'
+      - '.github/workflows/security-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/security-check/engine
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache-dependency-path: plugins/security-check/engine/go.sum
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - name: build linux/amd64 + linux/arm64
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.Version=0.1.0+${GITHUB_SHA::7}" \
+              -o dist/seccheck-linux-$arch ./cmd/seccheck
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seccheck-linux-amd64
+          path: plugins/security-check/engine/dist/seccheck-linux-amd64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seccheck-linux-arm64
+          path: plugins/security-check/engine/dist/seccheck-linux-arm64
+          if-no-files-found: error
