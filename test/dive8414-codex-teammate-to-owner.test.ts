@@ -6,7 +6,7 @@
 // a message carrying a `[[5dive-to-owner]]` line goes to the owner's chat with
 // its files. Without the line nothing is forwarded (worker-lead chatter).
 import { describe, expect, test } from 'bun:test'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -199,10 +199,16 @@ createInterface({ input: process.stdin }).on('line', line => {
       const inbox = join(stateDir, 'inbox')
       const deadline = Date.now() + 10_000
       while (Date.now() < deadline && !existsSync(join(stateDir, 'health.json'))) await Bun.sleep(50)
-      // The CLI's own shape (cmd_agent_runtime.sh _agent_dispatch_inbox_send).
-      writeFileSync(join(inbox, '5dive-1.json'), JSON.stringify({
+      // The CLI's own shape (cmd_agent_runtime.sh _agent_dispatch_inbox_send),
+      // written the CLI's way too: a dot-prefixed .part, then a rename. A plain
+      // write into the watched inbox can be read half-written; the dispatcher
+      // drops that as invalid JSON and the message is gone (DIVE-8896: red on
+      // fast CI runners, where the watcher is up before this write lands).
+      const part = join(inbox, '.5dive-1.json.part')
+      writeFileSync(part, JSON.stringify({
         id: '5dive-1', text: 'result: 3 headlines in /tmp/headlines.md', route: { source: 'agent', chat_id: '5dive-cli' }, received_at: new Date().toISOString(),
       }))
+      renameSync(part, join(inbox, '5dive-1.json'))
       let health: any = null
       while (Date.now() < deadline) {
         try { health = JSON.parse(readFileSync(join(stateDir, 'health.json'), 'utf8')) } catch {}
