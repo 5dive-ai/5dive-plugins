@@ -2,7 +2,10 @@ package engine
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -131,6 +134,82 @@ func TestDeterministicRunEndToEnd(t *testing.T) {
 	if assets < 3 {
 		t.Errorf("only %d assets", assets)
 	}
+}
+
+// DIVE-8908, prod check 3: a site answering plain HTTP on two ports is ONE
+// unencrypted website, so one no-https finding per host, not one per port.
+func TestNoHTTPSOncePerHost(t *testing.T) {
+	_, p1 := leakySite(t)
+	_, p2 := leakySite(t)
+	cfg, _ := newConfig(t, []int{p1, p2})
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, f := range rep.Findings {
+		if strings.HasPrefix(f.ID, "no-https-") {
+			n++
+			if f.Asset != "127.0.0.1" {
+				t.Errorf("no-https asset %q, want the host", f.Asset)
+			}
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d no-https findings, want 1: %+v", n, rep.Findings)
+	}
+}
+
+// sniOnlySite serves TLS only for the owner's domain, as every 5dive box does:
+// a hello without that SNI gets alert 80.
+func sniOnlySite(t *testing.T, name string) int {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "<html>hello</html>")
+	}))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	cert := srv.TLS.Certificates[0]
+	srv.TLS.Certificates = nil
+	srv.TLS.GetCertificate = func(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if h.ServerName != name {
+			return nil, fmt.Errorf("no certificate for %q", h.ServerName)
+		}
+		return &cert, nil
+	}
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().(*net.TCPAddr).Port
+}
+
+// DIVE-8908, prod check 3: the clone of a box with valid HTTPS for its domain was
+// reported "not encrypted" because the bare-IP hello had no SNI. With plain HTTP
+// on one port and SNI-only TLS on another, there is no no-https finding, and the
+// certificate is checked under the owner's domain.
+func TestSNIOnlyTLSIsNotReportedUnencrypted(t *testing.T) {
+	_, plain := leakySite(t)
+	tlsPort := sniOnlySite(t, "box.example.com")
+	cfg, rec := newConfig(t, []int{plain, tlsPort})
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, ok := findingChecks(rep)["no-https"]; ok {
+		t.Errorf("false no-https on an SNI-only TLS site: %+v", f)
+	}
+	sniProbed := false
+	for _, a := range rep.Approvals {
+		if a.Tool == "tls_probe" && a.Target == "127.0.0.1:"+strconv.Itoa(tlsPort) && a.Decision == "approved" {
+			sniProbed = true
+		}
+	}
+	if !sniProbed {
+		t.Errorf("tls_probe never ran on the TLS port: %+v", rep.Approvals)
+	}
+	for _, f := range rep.Findings {
+		if strings.Contains(f.Asset, "127.0.0.1:"+strconv.Itoa(tlsPort)) && !strings.Contains(f.Asset, "box.example.com") {
+			t.Errorf("TLS-port finding not under the owner's domain: %+v", f)
+		}
+	}
+	assertOnlyLoopbackDialed(t, rec)
 }
 
 func TestGateDeniesIntrusiveTools(t *testing.T) {
