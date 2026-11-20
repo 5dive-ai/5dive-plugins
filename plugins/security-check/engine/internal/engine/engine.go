@@ -7,7 +7,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -295,28 +297,36 @@ func (r *run) addFinding(f model.Finding, parent int64) error {
 
 // finish adds whole-run findings and fills the report.
 func (r *run) finish(reason string) {
-	plain, tls := map[string]bool{}, false
+	// One no-https finding per host, not per port: :80 and :443 answering plain
+	// HTTP is one unencrypted website (DIVE-8908).
+	plain, tls := map[string][]string{}, false
 	for _, f := range r.facts {
 		if f.Kind == "service" && f.Data["proto"] == "http" {
-			plain[f.Target] = true
+			host, port, err := net.SplitHostPort(f.Target)
+			if err != nil {
+				host = f.Target
+			}
+			plain[host] = append(plain[host], port)
 		}
 		if f.Kind == "service" && f.Data["proto"] == "tls" {
 			tls = true
 		}
 	}
 	if len(plain) > 0 && !tls {
-		targets := make([]string, 0, len(plain))
-		for t := range plain {
-			targets = append(targets, t)
+		hosts := make([]string, 0, len(plain))
+		for h := range plain {
+			hosts = append(hosts, h)
 		}
-		sort.Strings(targets)
-		for _, t := range targets {
-			_ = r.addFinding(model.NewFinding("no-https", model.Medium, t,
+		sort.Strings(hosts)
+		for _, h := range hosts {
+			ports := plain[h]
+			sort.Strings(ports)
+			_ = r.addFinding(model.NewFinding("no-https", model.Medium, h,
 				"Your website is not encrypted",
 				"Your server answers web requests only without encryption (plain HTTP, no HTTPS).",
 				"Anything visitors send, such as passwords or form contents, can be read or changed by anyone on the network path.",
 				"Turn on HTTPS with a free Let's Encrypt certificate: `sudo apt install certbot` then `sudo certbot --nginx` (or `--apache`), and redirect HTTP to HTTPS.",
-				fmt.Sprintf("HTTP answered on %s; no TLS service found on any scanned port", t)), r.goal)
+				fmt.Sprintf("HTTP answered on %s port(s) %s; no TLS service found on any scanned port, with or without the site's name (SNI)", h, strings.Join(ports, ", "))), r.goal)
 		}
 	}
 	for _, id := range r.order {

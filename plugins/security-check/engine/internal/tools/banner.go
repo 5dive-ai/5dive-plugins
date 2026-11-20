@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
+	"net"
 	"strings"
 	"time"
 
@@ -28,7 +30,12 @@ func bannerGrab(ctx context.Context, env *Env, in model.Intent) (Result, error) 
 	case greeting == "" && speaksTLS(ctx, env, in.Target):
 		proto = "tls"
 	case greeting == "":
-		if resp := sendHTTPHead(ctx, env, in.Target); strings.HasPrefix(resp, "HTTP/") {
+		resp := sendHTTPHead(ctx, env, in.Target)
+		switch {
+		case strings.Contains(resp, "plain HTTP request was sent to HTTPS port"):
+			// nginx's 400 for plain HTTP on a TLS listener: the port is HTTPS.
+			proto = "tls"
+		case strings.HasPrefix(resp, "HTTP/"):
 			proto, greeting = "http", resp
 		}
 	}
@@ -51,15 +58,39 @@ func readGreeting(ctx context.Context, env *Env, target string) (string, error) 
 	return string(bytes.ToValidUTF8(buf[:n], nil)), nil
 }
 
+// speaksTLS asks "is this TLS" with no SNI first, then with each of the owner's
+// host names (max 5). A 5dive box serves TLS only for its domain: a no-SNI hello
+// gets a TLS alert, which already proves the port speaks TLS. Some servers just
+// drop a hello for a name they do not serve, which is what the SNI retries are for.
 func speaksTLS(ctx context.Context, env *Env, target string) bool {
+	names := env.Scope.HostNames
+	if len(names) > 5 {
+		names = names[:5]
+	}
+	for _, sni := range append([]string{""}, names...) {
+		if err := tlsHello(ctx, env, target, sni); err == nil || isTLSAlert(err) {
+			return true
+		}
+	}
+	return false
+}
+
+func tlsHello(ctx context.Context, env *Env, target, sni string) error {
 	c, err := env.Dial(ctx, "tcp", target)
 	if err != nil {
-		return false
+		return err
 	}
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(env.IOTimeout))
-	tc := tls.Client(c, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // only asking "is this TLS"
-	return tc.HandshakeContext(ctx) == nil
+	tc := tls.Client(c, &tls.Config{ServerName: sni, InsecureSkipVerify: true}) //nolint:gosec // only asking "is this TLS"
+	return tc.HandshakeContext(ctx)
+}
+
+// isTLSAlert reports whether the peer answered the hello with a TLS alert record.
+// crypto/tls returns that as a *net.OpError with Op "remote error".
+func isTLSAlert(err error) bool {
+	var oe *net.OpError
+	return errors.As(err, &oe) && oe.Op == "remote error"
 }
 
 func sendHTTPHead(ctx context.Context, env *Env, target string) string {

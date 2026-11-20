@@ -266,6 +266,89 @@ func TestBannerTellsProtocolsApart(t *testing.T) {
 	}
 }
 
+// sniOnlyTLSServer serves TLS only for name, like a 5dive box: a hello without
+// that SNI gets alert 80 (internal_error), or, when drop is set, a closed
+// connection with no answer at all.
+func sniOnlyTLSServer(t *testing.T, name string, drop bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	cert := srv.TLS.Certificates[0]
+	srv.TLS.Certificates = nil
+	srv.TLS.GetConfigForClient = func(h *tls.ClientHelloInfo) (*tls.Config, error) {
+		if h.ServerName != name && drop {
+			h.Conn.Close()
+			return nil, fmt.Errorf("no site for %q", h.ServerName)
+		}
+		return nil, nil
+	}
+	srv.TLS.GetCertificate = func(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if h.ServerName != name {
+			return nil, fmt.Errorf("no certificate for %q", h.ServerName)
+		}
+		return &cert, nil
+	}
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// DIVE-8908: a TLS port that serves only the owner's domain is TLS, whether a
+// no-SNI hello gets an alert or is dropped. Before, both fell through to the
+// plain-HTTP HEAD and the port was reported as an unencrypted website.
+func TestBannerSeesSNIOnlyTLS(t *testing.T) {
+	env, _ := testEnv(t)
+	for _, drop := range []bool{false, true} {
+		srv := sniOnlyTLSServer(t, "box.example.com", drop)
+		target := hostPort(t, srv.URL)
+		if err := tlsHello(context.Background(), env, target, ""); err == nil {
+			t.Fatalf("drop=%v: fixture answered a no-SNI hello; it must refuse it", drop)
+		} else if isTLSAlert(err) == drop {
+			t.Fatalf("drop=%v: no-SNI hello error %v, alert=%v", drop, err, isTLSAlert(err))
+		}
+		res, err := bannerGrab(context.Background(), env, model.Intent{Tool: "banner", Target: target})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.Facts[0].Data["proto"]; got != "tls" {
+			t.Errorf("drop=%v: proto %q, want tls", drop, got)
+		}
+	}
+}
+
+// nginx answers plain HTTP on a TLS listener with a 400 that names the cause.
+func TestBannerReadsNginxPlainHTTPOnTLSPort(t *testing.T) {
+	env, _ := testEnv(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				buf := make([]byte, 1)
+				if _, err := c.Read(buf); err != nil || buf[0] == 0x16 {
+					return // a TLS hello: hang up without an alert
+				}
+				io.WriteString(c, "HTTP/1.1 400 Bad Request\r\nServer: nginx\r\n\r\n<center>The plain HTTP request was sent to HTTPS port</center>")
+			}()
+		}
+	}()
+	res, err := bannerGrab(context.Background(), env, model.Intent{Tool: "banner", Target: ln.Addr().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Facts[0].Data["proto"]; got != "tls" {
+		t.Errorf("proto %q, want tls", got)
+	}
+}
+
 func TestPortScanFlagsDatabasePort(t *testing.T) {
 	env, _ := testEnv(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
