@@ -24,6 +24,25 @@ var TopPorts = []int{
 	50000, 50070,
 }
 
+// AllPorts is every TCP port, for the deep sweep.
+func AllPorts() []int {
+	out := make([]int, 65535)
+	for i := range out {
+		out[i] = i + 1
+	}
+	return out
+}
+
+// scanParallel is how many ports are tried at once. A firewall that drops
+// (rather than refuses) makes each closed port cost the full connect timeout,
+// so the all-ports sweep needs more in flight to fit its time budget.
+func scanParallel(ports int) int {
+	if ports > 1000 {
+		return 256
+	}
+	return 64
+}
+
 // riskyPort describes a service that should not face the internet.
 type riskyPort struct {
 	name, severity, why, fix string
@@ -55,7 +74,7 @@ func portScan(ctx context.Context, env *Env, in model.Intent) (Result, error) {
 		mu   sync.Mutex
 		open []int
 		wg   sync.WaitGroup
-		sem  = make(chan struct{}, 64)
+		sem  = make(chan struct{}, scanParallel(len(env.Ports)))
 	)
 	for _, p := range env.Ports {
 		if ctx.Err() != nil {
@@ -105,7 +124,7 @@ func portScan(ctx context.Context, env *Env, in model.Intent) (Result, error) {
 	if len(open) == 0 {
 		r.Findings = append(r.Findings, model.NewFinding("no-open-ports", model.Info, ip.String(),
 			"No open ports answered",
-			fmt.Sprintf("None of the %d common ports we tried answered.", len(env.Ports)),
+			fmt.Sprintf("None of the %d ports we tried answered.", len(env.Ports)),
 			"Either the server is well locked down, or the copy we checked was not reachable. If you run a website, this check could not see it.",
 			"Nothing to do if you expect the server to be closed.",
 			fmt.Sprintf("0 of %d ports open", len(env.Ports))))

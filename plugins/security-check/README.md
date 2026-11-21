@@ -37,15 +37,19 @@ Exit codes: `0` done · `1` other error · `2` scope refused (before any network
 ```
 
 `host_names` are used only as the HTTP Host header and TLS SNI value when connecting to a target IP.
+`depth` is `shallow` (the default: about 100 common ports) or `deep` (the owner's opt-in
+deeper sweep: every TCP port, same probes and gate). Any other value is refused.
 
 Outputs in `--out`:
 
-- `report.json` has `run_id, started_at, finished_at, engine_version, scope, summary{critical,high,medium,low,info}, findings[{id,severity,title,what,why,fix,proof,asset,source,evidence[{proto,target,request,response}]}], budget{tokens_used,seconds,max_tokens,max_seconds}, approvals[{step,tool,target,decision,reason}], stopped_reason (done|budget_time|budget_tokens|error)`. A finding `id` is stable for the same check on the same asset across runs. `evidence` is the recorded traffic behind the finding (at most 4 exchanges; HTTPS is recorded above TLS, so it reads as plain HTTP), with credential values in it replaced by `[hidden]`; every exchange of the run is in the sqlite `traffic` table.
+- `report.json` has `run_id, started_at, finished_at, engine_version, scope, summary{critical,high,medium,low,info}, findings[{id,severity,title,what,why,fix,proof,asset,source,evidence[{proto,target,request,response}]}], budget{tokens_used,seconds,max_tokens,max_seconds}, approvals[{step,tool,target,decision,reason}], stopped_reason (done|budget_time|budget_tokens|error), changes{earlier_runs,since,new_assets[{kind,key,data}],new_findings}`. `changes` is absent on a server's first run; otherwise a finding no earlier run (check or retest) of the same `--db` reported carries `"new": true`, and `new_assets` lists what this run was the first to see. «New» means never seen before, not «absent last time», and there is no «gone» list: the LLM looks in different places each run, so not finding something does not prove it was removed. A finding `id` is stable for the same check on the same asset across runs. `evidence` is the recorded traffic behind the finding (at most 4 exchanges; HTTPS is recorded above TLS, so it reads as plain HTTP), with credential values in it replaced by `[hidden]`; every exchange of the run is in the sqlite `traffic` table.
 - `report.md` is plain and short, most serious first, and opens with a line like `3 things to fix, 1 urgent`.
 - `findings.csv` has one row per finding, with the same columns as `findings[]` (minus `source`; `evidence` as text: `>>` sent, `<<` received).
 
 `--db` (sqlite) holds two graphs: `assets` is shared across runs (host, port, service, url
-and cert, with `first_seen`/`last_seen`), and the per-run exploration graph is `runs`
+and cert, with `first_seen`/`last_seen` and the run that first saw it). Each run scans a new
+clone at a new IP, so an asset is keyed with its IP replaced by `server` (`server:22/tcp`);
+opening a database an older engine wrote re-keys its assets the same way. The per-run exploration graph is `runs`
 plus `nodes` (goal, intent, fact, finding, with `parent_id`), along with `approvals` and
 `findings`. The schema is created idempotently. A retried `run_id` replaces its earlier attempt.
 
@@ -64,7 +68,7 @@ round. Wall-clock and token budgets are checked between steps.
 - **Gate.** Safe tools are read-only probes and are auto-approved under `auto-safe`.
   Intrusive tools (password guessing, payloads) are denied in stage 1 under every mode.
   `deny-all` runs nothing.
-- **Probes.** TCP connect scan of about 100 common ports. Database and admin ports open to
+- **Probes.** TCP connect scan of about 100 common ports (every port at depth `deep`). Database and admin ports open to
   the internet are reported as high (the Docker API port is critical). The probes also
   grab banners, check HTTP version leaks and missing safety headers, look for files that
   should not be public (with content checks against false positives), check TLS versions

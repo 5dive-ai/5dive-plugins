@@ -473,3 +473,87 @@ func TestSameBoxAtTwoIPsGivesTheSameFindingIDs(t *testing.T) {
 		t.Errorf("same box, different ids:\n 127.0.0.1 %v\n 127.0.0.2 %v", a, b)
 	}
 }
+
+// DIVE-8925: two checks of the same server, each on a NEW clone with a new IP,
+// sharing the server's database. The second check opened one more port: only
+// that port (and what was found on it) is «new»; the first check says nothing,
+// since on a server's first check everything would be.
+func TestNewSinceLastCheckAcrossTwoClones(t *testing.T) {
+	listen := func() int {
+		ln, err := net.Listen("tcp", "0.0.0.0:0") // answers on 127.0.0.1 and 127.0.0.2
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/.git/HEAD" {
+				fmt.Fprint(w, "ref: refs/heads/main\n")
+				return
+			}
+			fmt.Fprint(w, "<html>hello</html>")
+		}))
+		srv.Listener.Close()
+		srv.Listener = ln
+		srv.Start()
+		t.Cleanup(srv.Close)
+		return ln.Addr().(*net.TCPAddr).Port
+	}
+	old, added := listen(), listen()
+
+	cfg, _ := newConfig(t, []int{old})
+	check := func(runID, ip string, ports []int) *report.Report {
+		cfg.Scope.RunID = runID
+		cfg.Scope.Targets = []scope.Target{{Kind: "ip", Value: ip}}
+		cfg.Env.Ports = ports
+		rep, err := Run(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rep
+	}
+
+	first := check("run-1", "127.0.0.1", []int{old})
+	if first.Changes != nil {
+		t.Fatalf("first check compares with nothing, got %+v", first.Changes)
+	}
+	for _, f := range first.Findings {
+		if f.New {
+			t.Errorf("first check marks %s new", f.ID)
+		}
+	}
+
+	second := check("run-2", "127.0.0.2", []int{old, added})
+	c := second.Changes
+	if c == nil || c.EarlierRuns != 1 || !strings.HasPrefix(c.Since, strings.TrimSuffix(first.StartedAt, "Z")) {
+		t.Fatalf("second check: changes %+v", c)
+	}
+	addedPort := fmt.Sprintf("server:%d/tcp", added)
+	var keys []string
+	for _, a := range c.NewAssets {
+		keys = append(keys, a.Kind+" "+a.Key)
+		if strings.Contains(a.Key, "127.0.0.") {
+			t.Errorf("new asset keyed on the clone IP: %+v", a)
+		}
+		if strings.Contains(a.Key, fmt.Sprintf(":%d", old)) {
+			t.Errorf("the port both checks saw reads as new: %+v", a)
+		}
+	}
+	if !strings.Contains(strings.Join(keys, ","), "port "+addedPort) {
+		t.Errorf("new assets %v miss %s", keys, addedPort)
+	}
+	newCount := 0
+	for _, f := range second.Findings {
+		onAdded := strings.Contains(f.Asset, fmt.Sprintf(":%d", added))
+		if onAdded && !f.New {
+			t.Errorf("finding on the added port not marked new: %s %s", f.ID, f.Asset)
+		}
+		if strings.Contains(f.Asset, fmt.Sprintf(":%d", old)) && f.New {
+			t.Errorf("finding on the old port marked new: %s %s", f.ID, f.Asset)
+		}
+		if f.New {
+			newCount++
+		}
+	}
+	if newCount == 0 || newCount != c.NewFindings {
+		t.Errorf("new findings: %d marked, summary says %d", newCount, c.NewFindings)
+	}
+}

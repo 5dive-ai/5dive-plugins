@@ -41,14 +41,15 @@ const (
 type deps struct {
 	getenv   func(string) string
 	dial     scope.DialFunc // nil = plain dialer with DNS disabled
-	ports    []int
+	ports    []int          // a shallow scope's ports
+	deep     []int          // a deep scope's ports
 	lookPath func(string) (string, error)
 }
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Stderr, deps{getenv: os.Getenv, ports: tools.TopPorts, lookPath: exec.LookPath}))
+	os.Exit(run(ctx, os.Args[1:], os.Stderr, deps{getenv: os.Getenv, ports: tools.TopPorts, deep: tools.AllPorts(), lookPath: exec.LookPath}))
 }
 
 func run(ctx context.Context, args []string, stderr io.Writer, d deps) int {
@@ -118,11 +119,15 @@ func run(ctx context.Context, args []string, stderr io.Writer, d deps) int {
 		}
 	}
 	nmapPath, _ := d.lookPath("nmap")
+	ports := d.ports
+	if sc.Depth == scope.Deep {
+		ports = d.deep
+	}
 
 	env := &tools.Env{
 		Scope:          sc,
 		Dial:           scope.NewGuard(sc, d.dial).DialContext,
-		Ports:          d.ports,
+		Ports:          ports,
 		ConnectTimeout: time.Second,
 		IOTimeout:      5 * time.Second,
 		NmapPath:       nmapPath,

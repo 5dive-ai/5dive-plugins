@@ -84,6 +84,9 @@ type Finding struct {
 	// Evidence is the traffic behind the finding: what the probe sent and what came
 	// back, recorded on the wire with secrets masked (DIVE-8921).
 	Evidence []Exchange `json:"evidence,omitempty"`
+	// New marks a finding that no earlier check of the same server reported
+	// (DIVE-8925). Only set when there was an earlier check: see report.Changes.
+	New bool `json:"new,omitempty"`
 }
 
 // Exchange is one recorded conversation with the target: one connection, or one
@@ -117,6 +120,17 @@ func NewFinding(check, severity, asset, title, what, why, fix, proof string) Fin
 		Proof:    Clip(proof, 600),
 		Asset:    asset,
 	}
+}
+
+// FindingKey is a finding's identity across runs: its check and its clone-free asset.
+// It also matches findings stored by engines older than DIVE-8917, whose id hashed
+// the clone IP: the check name is the id up to its last "-", the asset is re-keyed.
+func FindingKey(id, asset string) string {
+	check := id
+	if i := strings.LastIndex(id, "-"); i > 0 {
+		check = id[:i]
+	}
+	return check + "\x00" + StableAsset(asset)
 }
 
 // addrLike matches a run of characters an IP address (with or without a port) is made of.

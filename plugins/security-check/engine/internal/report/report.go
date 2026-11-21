@@ -35,6 +35,21 @@ type Report struct {
 	Budget        Budget          `json:"budget"`
 	Approvals     []Approval      `json:"approvals"`
 	StoppedReason string          `json:"stopped_reason"`
+	// Changes is what this run saw that no earlier run on the same server did;
+	// nil on a server's first run, where everything would read «new» (DIVE-8925).
+	Changes *Changes `json:"changes,omitempty"`
+}
+
+// Changes compares a run with every earlier run (check or retest) of the same
+// server. «New» means never seen before, not «absent last time»: the LLM planner
+// looks in different places each run, so «absent last time» would flag a thing
+// the previous run simply did not look at. For the same reason there is no «gone»
+// list: not finding something is not proof it was removed (a retest answers that).
+type Changes struct {
+	EarlierRuns int           `json:"earlier_runs"`
+	Since       string        `json:"since"` // when the latest earlier run started
+	NewAssets   []model.Asset `json:"new_assets"`
+	NewFindings int           `json:"new_findings"` // findings marked "new": true
 }
 
 // Summary counts findings per severity.
