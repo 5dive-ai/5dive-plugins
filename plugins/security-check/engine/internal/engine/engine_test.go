@@ -344,3 +344,54 @@ func TestScopeLockNamesTargetsAndRules(t *testing.T) {
 		}
 	}
 }
+
+// DIVE-8917 Retest: a retest re-runs the baseline with no LLM, so it can only
+// answer «fixed» for a finding the baseline reaches on its own. Every finding of
+// a deterministic run is baseline; one the LLM opened the door to (a port only
+// it probed), even when the baseline ran the later steps, is planner.
+func TestFindingSourceFollowsTheWholeChain(t *testing.T) {
+	_, portA := leakySite(t)
+	_, portB := leakySite(t)
+	cfg, rec := newConfig(t, []int{portA}) // the baseline only knows port A
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Findings) == 0 {
+		t.Fatal("no findings")
+	}
+	for _, f := range rep.Findings {
+		if f.Source != model.SourceBaseline {
+			t.Errorf("deterministic run: %s has source %q, want baseline", f.ID, f.Source)
+		}
+	}
+
+	cfg2, rec2 := newConfig(t, []int{portA})
+	b := strconv.Itoa(portB)
+	cfg2.LLM = fakeLLM(t, `{"intents":[{"tool":"banner","target":"127.0.0.1:`+b+`","why":"an uncommon port"}],"done":false}`, 10)
+	rep2, err := Run(context.Background(), cfg2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := map[string]string{} // git-exposed asset port -> source
+	for _, f := range rep2.Findings {
+		if strings.HasPrefix(f.ID, "git-exposed-") {
+			for _, p := range []string{strconv.Itoa(portA), b} {
+				if strings.Contains(f.Asset, ":"+p) {
+					src[p] = f.Source
+				}
+			}
+		}
+		if strings.HasPrefix(f.ID, "no-https-") && f.Source != model.SourceBaseline {
+			t.Errorf("no-https rests on baseline port %d too, got %q", portA, f.Source)
+		}
+	}
+	if src[strconv.Itoa(portA)] != model.SourceBaseline {
+		t.Errorf("port A finding: %q, want baseline (findings %+v)", src[strconv.Itoa(portA)], rep2.Findings)
+	}
+	if src[b] != model.SourcePlanner {
+		t.Errorf("port B finding (LLM-opened): %q, want planner (findings %+v)", src[b], rep2.Findings)
+	}
+	assertOnlyLoopbackDialed(t, rec)
+	assertOnlyLoopbackDialed(t, rec2)
+}

@@ -75,7 +75,17 @@ type Finding struct {
 	Fix      string `json:"fix"`
 	Proof    string `json:"proof"`
 	Asset    string `json:"asset"`
+	// Source says what planned the step that found it: SourceBaseline (the fixed
+	// recon chain, which a re-run without an LLM repeats) or SourcePlanner (only the
+	// LLM proposed it). A retest can confirm «fixed» only for a baseline finding.
+	Source string `json:"source,omitempty"`
 }
+
+// Finding sources.
+const (
+	SourceBaseline = "baseline"
+	SourcePlanner  = "planner"
+)
 
 // NewFinding builds a finding whose id is stable for the same check on the same asset,
 // so later runs can tell a finding that stayed from one that is new.
