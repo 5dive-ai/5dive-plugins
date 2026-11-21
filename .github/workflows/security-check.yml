@@ -2,6 +2,14 @@ name: security-check
 
 # DIVE-8897. Vets, tests and cross-builds the seccheck engine (pure Go, static).
 # The two binaries are uploaded as workflow artifacts for the control plane.
+#
+# DIVE-8916: a push to main also publishes them as the release
+# `seccheck-<full sha>` with a `.sha256` beside each. The API repo pins one of
+# those releases by tag AND sha256 (5dive-api: scripts/seccheck-engine.pin), and
+# its deploy downloads, verifies and installs it. Until this, every engine merge
+# was a hand copy to the API host. A release is never overwritten: a re-run on
+# a sha that already has one leaves it alone, because a rebuild is not
+# byte-identical and would break the sha256 the API pinned.
 
 on:
   push:
@@ -52,3 +60,37 @@ jobs:
           name: seccheck-linux-arm64
           path: plugins/security-check/engine/dist/seccheck-linux-arm64
           if-no-files-found: error
+
+  publish:
+    needs: engine
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: seccheck-${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seccheck-linux-*
+          merge-multiple: true
+          path: dist
+      - name: publish release seccheck-<sha>
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already published; a release is never overwritten"
+            exit 0
+          fi
+          for a in amd64 arm64; do
+            sha256sum "seccheck-linux-$a" > "seccheck-linux-$a.sha256"
+          done
+          cat ./*.sha256
+          gh release create "$TAG" --target "$GITHUB_SHA" --latest=false \
+            --title "seccheck engine ${GITHUB_SHA::7}" \
+            --notes "seccheck engine built from $GITHUB_SHA. Pin it in 5dive-api scripts/seccheck-engine.pin (tag + sha256 of seccheck-linux-amd64)." \
+            seccheck-linux-amd64 seccheck-linux-amd64.sha256 \
+            seccheck-linux-arm64 seccheck-linux-arm64.sha256
