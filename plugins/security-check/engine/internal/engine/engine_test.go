@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -555,5 +556,76 @@ func TestNewSinceLastCheckAcrossTwoClones(t *testing.T) {
 	}
 	if newCount == 0 || newCount != c.NewFindings {
 		t.Errorf("new findings: %d marked, summary says %d", newCount, c.NewFindings)
+	}
+}
+
+// drainAt closes drain the first time the run logs a line containing mark.
+type drainAt struct {
+	mark  string
+	drain chan struct{}
+	once  sync.Once
+}
+
+func (d *drainAt) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), d.mark) {
+		d.once.Do(func() { close(d.drain) })
+	}
+	return len(p), nil
+}
+
+// A drain lets the running step finish, starts nothing after it, and keeps
+// what that step found in a report that says "stopped" (DIVE-8940).
+func TestDrainStopsAndKeepsWhatItFound(t *testing.T) {
+	_, port := leakySite(t)
+	cfg, _ := newConfig(t, []int{port})
+	d := &drainAt{mark: "step 1: run port_scan", drain: make(chan struct{})}
+	cfg.Drain, cfg.Log = d.drain, d
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.StoppedReason != report.StopStopped {
+		t.Fatalf("stopped %q, want %q", rep.StoppedReason, report.StopStopped)
+	}
+	if len(rep.Approvals) != 1 || rep.Approvals[0].Tool != "port_scan" {
+		t.Fatalf("steps after the drain: %+v", rep.Approvals)
+	}
+	got := findingChecks(rep)
+	if _, ok := got["open-ports"]; !ok {
+		t.Errorf("the running step's result was dropped: %v", rep.Findings)
+	}
+	if _, ok := got["git-exposed"]; ok {
+		t.Errorf("a step ran after the drain: %v", rep.Findings)
+	}
+	if md := report.Markdown(rep); !strings.Contains(md, "was stopped before it finished") {
+		t.Errorf("report.md does not say it was stopped:\n%s", md)
+	}
+}
+
+// A step that would run long (a deep sweep of every port) is cancelled once
+// the drain's grace is up, and a cut sweep never claims no port answered.
+func TestDrainCancelsARunningStepAfterItsGrace(t *testing.T) {
+	cfg, _ := newConfig(t, []int{1, 2, 3, 4, 5, 6, 7, 8})
+	hang := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	cfg.Env.Dial = scope.NewGuard(cfg.Scope, hang).DialContext
+	cfg.Env.ConnectTimeout = 20 * time.Second
+	d := &drainAt{mark: "step 1: run port_scan", drain: make(chan struct{})}
+	cfg.Drain, cfg.Log, cfg.DrainGrace = d.drain, d, 100*time.Millisecond
+	start := time.Now()
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("drain took %s; the grace did not cancel the running step", took)
+	}
+	if rep.StoppedReason != report.StopStopped {
+		t.Fatalf("stopped %q", rep.StoppedReason)
+	}
+	if _, ok := findingChecks(rep)["no-open-ports"]; ok {
+		t.Errorf("a cut sweep claimed no port answered: %v", rep.Findings)
 	}
 }
