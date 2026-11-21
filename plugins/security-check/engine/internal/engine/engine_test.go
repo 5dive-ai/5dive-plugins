@@ -559,6 +559,43 @@ func TestNewSinceLastCheckAcrossTwoClones(t *testing.T) {
 	}
 }
 
+// A rate-limited round runs the baseline only and keeps the LLM for the next
+// round (a refusal turns it off for the run); the report names each profile's spend.
+func TestRateLimitedRoundKeepsTheLLM(t *testing.T) {
+	_, port := leakySite(t)
+	cfg, _ := newConfig(t, []int{port})
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		fmt.Fprint(w, `{"content":[{"type":"text","text":"{\"intents\":[],\"done\":false}"}],"stop_reason":"end_turn","usage":{"input_tokens":9,"output_tokens":0}}`)
+	}))
+	t.Cleanup(srv.Close)
+	cfg.LLM = llm.NewClient([]llm.Provider{{Kind: "anthropic", BaseURL: srv.URL, Model: "fake", APIKeyEnv: "K", MaxTokens: 1000}},
+		func(string) string { return "key" })
+	clk := time.Unix(0, 0)
+	cfg.LLM.Now = func() time.Time { clk = clk.Add(2 * time.Second); return clk }
+
+	rep, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls < 2 {
+		t.Fatalf("LLM asked %d time(s): a rate limit switched it off for the run", calls)
+	}
+	want := report.ProviderSpend{Provider: "anthropic:fake", Tokens: 9 * (calls - 1), MaxTokens: 1000}
+	if len(rep.LLMSpend) != 1 || rep.LLMSpend[0] != want {
+		t.Errorf("spend %+v, want %+v", rep.LLMSpend, want)
+	}
+	if _, ok := findingChecks(rep)["git-exposed"]; !ok {
+		t.Errorf("baseline missed the exposed .git: %v", rep.Findings)
+	}
+}
+
 // drainAt closes drain the first time the run logs a line containing mark.
 type drainAt struct {
 	mark  string

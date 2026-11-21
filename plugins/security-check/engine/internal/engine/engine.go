@@ -5,6 +5,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -209,6 +210,10 @@ func (r *run) plan(ctx context.Context) ([]model.Intent, error) {
 		"planner": "llm", "attempts": attempts, "tokens": used,
 	}); nerr != nil {
 		return nil, nerr
+	}
+	if errors.Is(err, llm.ErrNoneReady) {
+		r.logf("llm planner: %v; this round runs the deterministic planner only", err)
+		return out, nil
 	}
 	if err != nil {
 		r.llmOff = true
@@ -500,6 +505,11 @@ func (r *run) finish(reason string) {
 	r.rep.Budget = report.Budget{
 		TokensUsed: r.tokens, Seconds: int(end.Sub(r.start).Round(time.Second) / time.Second),
 		MaxTokens: r.cfg.MaxTokens, MaxSeconds: int(r.cfg.MaxDuration / time.Second),
+	}
+	if r.cfg.LLM != nil {
+		for _, sp := range r.cfg.LLM.Spent() {
+			r.rep.LLMSpend = append(r.rep.LLMSpend, report.ProviderSpend(sp))
+		}
 	}
 	r.rep.Finalize()
 }

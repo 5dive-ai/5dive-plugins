@@ -35,6 +35,8 @@ type Report struct {
 	Summary       Summary         `json:"summary"`
 	Findings      []model.Finding `json:"findings"`
 	Budget        Budget          `json:"budget"`
+	// LLMSpend is each LLM profile's tokens against its own budget (absent with no LLM).
+	LLMSpend      []ProviderSpend `json:"llm_spend,omitempty"`
 	Approvals     []Approval      `json:"approvals"`
 	StoppedReason string          `json:"stopped_reason"`
 	// Changes is what this run saw that no earlier run on the same server did;
@@ -69,6 +71,13 @@ type Budget struct {
 	Seconds    int `json:"seconds"`
 	MaxTokens  int `json:"max_tokens"`
 	MaxSeconds int `json:"max_seconds"`
+}
+
+// ProviderSpend is one LLM profile's tokens; max_tokens absent = no own budget.
+type ProviderSpend struct {
+	Provider  string `json:"provider"`
+	Tokens    int    `json:"tokens"`
+	MaxTokens int    `json:"max_tokens,omitempty"`
 }
 
 // Approval is one gate decision.
