@@ -27,11 +27,6 @@ updates:
     schedule: { interval: weekly }
     open-pull-requests-limit: 0
     commit-message: { prefix: "fix(deps)" }
-  - package-ecosystem: gomod
-    directory: /plugins/security-check/engine
-    schedule: { interval: weekly }
-    open-pull-requests-limit: 0
-    commit-message: { prefix: "fix(deps)" }
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
