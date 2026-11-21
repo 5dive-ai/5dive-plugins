@@ -5,7 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +18,7 @@ import (
 
 type httpTarget struct {
 	scheme, vhost, label string
+	ip                   netip.Addr
 	port                 int
 	client               *http.Client
 	base                 string
@@ -42,7 +46,7 @@ func newHTTPTarget(env *Env, in model.Intent) (*httpTarget, error) {
 		label = vh + " (" + in.Target + ")"
 	}
 	return &httpTarget{
-		scheme: scheme, vhost: vh, port: port, label: scheme + "://" + label,
+		scheme: scheme, vhost: vh, ip: ip, port: port, label: scheme + "://" + label,
 		client: httpClient(env, vh),
 		base:   scheme + "://" + joinTarget(ip, port),
 		rec:    env.Rec,
@@ -107,32 +111,116 @@ func httpProbe(ctx context.Context, env *Env, in model.Intent) (Result, error) {
 		}
 	}
 
-	if status < 400 {
-		var missing []string
-		if t.scheme == "https" && hdr.Get("Strict-Transport-Security") == "" {
-			missing = append(missing, "Strict-Transport-Security (always use the encrypted site)")
-		}
-		csp := hdr.Get("Content-Security-Policy")
-		if csp == "" {
-			missing = append(missing, "Content-Security-Policy (limits which scripts may run)")
-		}
-		if hdr.Get("X-Frame-Options") == "" && !strings.Contains(csp, "frame-ancestors") {
-			missing = append(missing, "X-Frame-Options (stops other sites embedding yours)")
-		}
-		if !strings.EqualFold(hdr.Get("X-Content-Type-Options"), "nosniff") {
-			missing = append(missing, "X-Content-Type-Options: nosniff (stops browsers guessing file types)")
-		}
-		if len(missing) > 0 {
-			r.Findings = append(r.Findings, model.NewFinding("missing-safety-headers", model.Low, t.label,
-				fmt.Sprintf("Your site is missing %d browser safety setting(s)", len(missing)),
-				"Your site does not send these settings to visitors' browsers: "+strings.Join(missing, "; ")+".",
-				"These settings make browsers block common tricks, such as another site showing yours inside a hidden frame or slipping in its own scripts.",
-				"Add the missing headers in your web server or app config. Most sites can start with: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, and on HTTPS `Strict-Transport-Security: max-age=31536000`.",
-				fmt.Sprintf("GET / -> %d; missing: %s", status, strings.Join(headerNames(missing), ", "))))
-		}
+	if f, ok := t.headersFinding(ctx, status, hdr, ev); ok {
+		r.Findings = append(r.Findings, f)
 	}
 	withEvidence(r.Findings, ev)
 	return r, nil
+}
+
+// safetyHeader is one browser safety setting: how to tell it is missing, and the
+// line that adds it.
+type safetyHeader struct {
+	name, does, line string
+	httpsOnly        bool
+	present          func(hdr http.Header) bool
+}
+
+var safetyHeaders = []safetyHeader{
+	{"Strict-Transport-Security", "always use the encrypted site", "`Strict-Transport-Security: max-age=31536000`", true,
+		func(h http.Header) bool { return h.Get("Strict-Transport-Security") != "" }},
+	{"Content-Security-Policy", "limits which scripts may run", "`Content-Security-Policy: object-src 'none'; base-uri 'self'` (a safe start; tighten it later)", false,
+		func(h http.Header) bool { return h.Get("Content-Security-Policy") != "" }},
+	{"X-Frame-Options", "stops other sites embedding yours", "`X-Frame-Options: SAMEORIGIN`", false,
+		func(h http.Header) bool {
+			return h.Get("X-Frame-Options") != "" || strings.Contains(h.Get("Content-Security-Policy"), "frame-ancestors")
+		}},
+	{"X-Content-Type-Options", "stops browsers guessing file types", "`X-Content-Type-Options: nosniff`", false,
+		func(h http.Header) bool { return strings.EqualFold(h.Get("X-Content-Type-Options"), "nosniff") }},
+}
+
+// headersFinding judges the safety headers on the page a browser actually shows,
+// never on a redirect: a site's automatic http -> https redirect carries none, and
+// the https page it points to gets its own probe on its own port.
+func (t *httpTarget) headersFinding(ctx context.Context, status int, hdr http.Header, ev []model.Exchange) (model.Finding, bool) {
+	status, hdr, trail, ev := t.followSameSite(ctx, status, hdr, ev)
+	if status >= 300 {
+		return model.Finding{}, false
+	}
+	var missing []safetyHeader
+	for _, h := range safetyHeaders {
+		if (!h.httpsOnly || t.scheme == "https") && !h.present(hdr) {
+			missing = append(missing, h)
+		}
+	}
+	if len(missing) == 0 {
+		return model.Finding{}, false
+	}
+	var whats, names, lines []string
+	for _, h := range missing {
+		whats = append(whats, h.name+" ("+h.does+")")
+		names = append(names, h.name)
+		lines = append(lines, h.line)
+	}
+	f := model.NewFinding("missing-safety-headers", model.Low, t.label,
+		fmt.Sprintf("Your site is missing %d browser safety setting(s)", len(missing)),
+		"Your site does not send these settings to visitors' browsers: "+strings.Join(whats, "; ")+".",
+		"These settings make browsers block common tricks, such as another site showing yours inside a hidden frame or slipping in its own scripts.",
+		"Add these headers to your site in your web server or app config: "+strings.Join(lines, ", ")+".",
+		fmt.Sprintf("%s; missing: %s", strings.Join(trail, "; "), strings.Join(names, ", ")))
+	f.Evidence = ev
+	return f, true
+}
+
+// maxHops caps the same-site redirects followed to reach the rendered page.
+const maxHops = 3
+
+// followSameSite follows redirects that stay on this probe's scheme, host and port
+// (such as / -> /login) to the page a browser shows, and returns its status and
+// headers, the GET trail, and every recorded exchange. It stops at a redirect that
+// leaves: to https, to another port, or to another site.
+func (t *httpTarget) followSameSite(ctx context.Context, status int, hdr http.Header, ev []model.Exchange) (int, http.Header, []string, []model.Exchange) {
+	path := "/"
+	trail := []string{fmt.Sprintf("GET / -> %d", status)}
+	for hop := 0; hop < maxHops && status >= 300 && status < 400; hop++ {
+		next, ok := t.sameSite(path, hdr.Get("Location"))
+		if !ok {
+			break
+		}
+		s, h, _, more, err := t.get(ctx, next)
+		ev = append(ev, more...)
+		if err != nil {
+			break
+		}
+		path, status, hdr = next, s, h
+		trail = append(trail, fmt.Sprintf("GET %s -> %d", next, status))
+	}
+	return status, hdr, trail, ev
+}
+
+// sameSite resolves a Location against path, as a browser would, and returns the
+// path to request when it stays on this probe's scheme, host and port.
+func (t *httpTarget) sameSite(path, location string) (string, bool) {
+	if location == "" {
+		return "", false
+	}
+	host := t.vhost
+	if host == "" {
+		host = t.ip.String()
+	}
+	cur := &url.URL{Scheme: t.scheme, Host: net.JoinHostPort(host, strconv.Itoa(t.port)), Path: path}
+	loc, err := cur.Parse(location)
+	if err != nil || !strings.EqualFold(loc.Scheme, t.scheme) || !strings.EqualFold(loc.Hostname(), host) {
+		return "", false
+	}
+	port := loc.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[t.scheme]
+	}
+	if port != strconv.Itoa(t.port) {
+		return "", false
+	}
+	return loc.RequestURI(), true
 }
 
 // withEvidence gives every finding without evidence of its own the exchanges ev.
@@ -150,14 +238,6 @@ func nonEmpty(ss ...string) []string {
 		if s != "" {
 			out = append(out, s)
 		}
-	}
-	return out
-}
-
-func headerNames(missing []string) []string {
-	out := make([]string, len(missing))
-	for i, m := range missing {
-		out[i] = strings.Fields(m)[0]
 	}
 	return out
 }
