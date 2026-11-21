@@ -147,7 +147,13 @@ PUBLIC_SITE="_public"
 # would approve whatever the page became.
 APPROVAL_TTL=1800
 
-die() { printf '%s: %s\n' "$PROG" "$2" >&2; exit "$1"; }
+die() {
+  local msg="$2"
+  # DIVE-8546: any refusal that carries snap-confine's words says what they mean.
+  [[ "$msg" == *"not a snap cgroup"* && "$msg" != *"is a snap, which cannot start"* ]] \
+    && msg+=" [this box's Chromium is a snap, which cannot start from an agent. Fix: sudo 5dive browser setup]"
+  printf '%s: %s\n' "$PROG" "$msg" >&2; exit "$1"
+}
 
 # as_root <what needs root> — DIVE-7183 (DIVE-7172's voice fix): a box-wide
 # change is root's, and the reader of a refusal is an AGENT whose owner has no
@@ -300,9 +306,12 @@ usage() {
                                       # owner was handed (their Telegram Approve button).
   5dive browser approvals policy [--json]   # the four kinds, and mode: standard|yolo|careful|custom
   sudo 5dive browser approvals policy set standard|yolo|careful
-  sudo 5dive browser approvals policy set <pay|publish|send|delete>=ask|allow
+  sudo 5dive browser approvals policy set <pay|publish|send|delete>=ask|allow|always
                                       # the owner's standing answer per kind: allow (the
-                                      # step runs and is logged) or ask (73). standard =
+                                      # step runs and is logged; send and publish still
+                                      # ask right after a page was read), always (runs
+                                      # even then: send=always lets agents answer
+                                      # messages while paying asks) or ask (73). standard =
                                       # the default: paying stops for your approval,
                                       # posting, sending and deleting go ahead and are
                                       # logged. yolo = all allow, careful = all ask.
@@ -935,14 +944,29 @@ cmd_serve_offered() {
 _serve_offered_cold() {  # <site>; _SITE_DIR is the owner's profile
   _daemon_live "$_SITE_DIR" && return 0
   _serve_running "$_SITE_DIR" >/dev/null || return 0   # nothing up: the caller's own words stand
-  if [[ "$(_kv "$(_serve_pidfile "$_SITE_DIR")" login)" == 1 ]] && _viewer_live "$_SITE_DIR"; then
+  local pf; pf="$(_serve_pidfile "$_SITE_DIR")"
+  if [[ "$(_kv "$pf" login)" == 1 ]] && _viewer_live "$_SITE_DIR"; then
     # DIVE-8450 (box report 975): a Done that never arrives (a lost tap, an
     # update that restarted the viewer, a Done that reopened this window) left
     # "ask them to press Done" as the agent's only words, again and again. The
     # admin stop is the way out that needs nobody at the window: since 1.84.0 a
     # person's window stops WITH its login kept (DIVE-8367), so the next command
     # starts the agent's browser on it.
-    die "$E_UNAVAILABLE" "$1 is still open in the owner's sign-in window: ask them to press Done on $1, then try again. Until they do, that window is theirs and no browser for the agent can start beside it. If they already pressed Done, or nobody is at that window, close it without them (the login is kept, and your next command starts your browser):  sudo 5dive browser serve $1 --stop"
+    #
+    # DIVE-8793 (box report 1173): in a group every site shares one profile, so
+    # the window may be ANOTHER site's Connect. Naming the agent's site sent the
+    # owner to press Done on a window that did not exist. The pidfile records
+    # the window's own site; that is the one the owner and the stop must name.
+    local win; win=$(_kv "$pf" site); [[ -n "$win" ]] || win="$1"
+    local head="$1 is still open in the owner's sign-in window"
+    [[ "$win" == "$1" ]] || head="$1 shares its browser with $win, and $win is still open in the owner's sign-in window"
+    # A link nobody opened is a different wait from a person mid-sign-in.
+    local tf unopened="" exp; tf="$(_viewer_ticket "$_SITE_DIR")"
+    if [[ "$(_kv "$tf" state)" == open && ! -f "$(_viewer_admitted_file "$_SITE_DIR")" ]]; then
+      exp=$(_kv "$tf" expires_at)
+      [[ "$exp" =~ ^[0-9]+$ ]] && unopened=" The sign-in link for it was never opened; it expires at $(date -u -d "@$exp" +%H:%MZ 2>/dev/null)."
+    fi
+    die "$E_UNAVAILABLE" "$head: ask them to press Done on $win, then try again.$unopened Until they do, that window is theirs and no browser for the agent can start beside it. If they already pressed Done, or nobody is at that window, close it without them (the login is kept, and your next command starts your browser):  sudo 5dive browser serve $win --stop"
   fi
   local why=""
   if [[ -n "${FIVEDIVE_BROWSER_NO_DAEMON:-}" ]]; then why="the session daemon is turned off on this box (FIVEDIVE_BROWSER_NO_DAEMON)"
@@ -2085,13 +2109,15 @@ _stack_install_chrome() {
     _chrome >/dev/null && { _stack_say "installed google-chrome-stable"; return 0; }
     g_err="$_STACK_APT_ERR"
   fi
-  # Ubuntu's chromium deb is only a shim that installs the snap: with no snapd
-  # it cannot work, and that is worth one line rather than a silent try.
-  if grep -qs '^ID=ubuntu' "$STACK_ROOT/etc/os-release" && ! _have snap; then
-    _stack_say "installing chromium (apt, the fallback; on Ubuntu it is a snap and this box has no snapd, so it will likely fail)..."
-  else
-    _stack_say "installing chromium (apt, the fallback)..."
+  # Ubuntu's chromium deb is only a shim that installs the snap, and a snap cannot
+  # start from an agent (DIVE-8546, see _chrome), so on Ubuntu it is not a fallback.
+  if grep -qs '^ID=ubuntu' "$STACK_ROOT/etc/os-release"; then
+    local arch; arch=$(dpkg --print-architecture 2>/dev/null)
+    _stack_warn "$([[ "$arch" == amd64 ]] && echo "could not install google-chrome-stable" || echo "Google Chrome has no build for this box (${arch:-unknown})"), and $(_chrome_snap_only && echo "$SNAP_CHROME_LINE" || echo "Ubuntu's Chromium is a snap, which cannot start from an agent, so it is not installed instead")"
+    _stack_apt_said "install google-chrome-stable" "$g_err"
+    return 1
   fi
+  _stack_say "installing chromium (apt, the fallback)..."
   _stack_apt_update; _stack_apt install chromium
   _chrome >/dev/null && { _stack_say "installed chromium (fallback: no google-chrome-stable for this box)"; return 0; }
   _stack_warn "could not install a chrome (google-chrome-stable, or chromium as fallback)"
@@ -2451,12 +2477,47 @@ _setup_not_ready() {
 }
 
 # ------------------------------------------------------------------------ auth
+# A SNAP IS NOT A CHROME HERE (DIVE-8546). On Ubuntu `chromium` is /snap/bin/chromium
+# (a link to /usr/bin/snap) and `chromium-browser` is a deb shim script that execs
+# it. A seat's service runs in system.slice with no user session bus, so `snap run`
+# cannot move Chrome into its snap.chromium scope and snap-confine refuses every
+# launch: "<cgroup> is not a snap cgroup for tag snap.chromium.chromium" (rapid-
+# cedar, box bug 1025). Counting one as "a chrome" meant setup said "already here:
+# chromium" and google-chrome-stable was never installed. So a snap is skipped, and
+# Google's names come first. The order and the skip are browser-stack.sh
+# `_bs_chrome` in 5dive-api, word for word: the health row and this refusal must
+# be the same fact.
+SNAP_CHROME_LINE="this box's Chromium is a snap, which cannot start from an agent"
+_chrome_is_snap() {  # <name on PATH> -> 0 when it is the snap, or a shim onto it
+  local p r
+  p=$(command -v "$1" 2>/dev/null) || return 1
+  r=$(readlink -f -- "$p" 2>/dev/null) || r="$p"
+  case "$r" in /snap/*|*/bin/snap) return 0 ;; esac
+  [[ -f "$r" && "$(head -c 2 -- "$r" 2>/dev/null)" == '#!' ]] \
+    && head -c 8192 -- "$r" 2>/dev/null | grep -qE '/snap/bin/|snap run'
+}
 _chrome() {
   local c
-  for c in google-chrome chromium chromium-browser google-chrome-stable; do
-    command -v "$c" >/dev/null 2>&1 && { echo "$c"; return 0; }
+  for c in google-chrome google-chrome-stable chromium chromium-browser; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    _chrome_is_snap "$c" && continue
+    echo "$c"; return 0
   done
   return 1
+}
+# _chrome_snap_only — 0 when this box has no usable chrome and a snap one is why.
+_chrome_snap_only() {
+  local c
+  _chrome >/dev/null && return 1
+  for c in chromium chromium-browser google-chrome google-chrome-stable; do
+    _chrome_is_snap "$c" && return 0
+  done
+  return 1
+}
+# _chrome_none_why — the plain reason a box has no chrome to launch.
+_chrome_none_why() {
+  if _chrome_snap_only; then printf '%s. Fix: %s' "$SNAP_CHROME_LINE" "$SETUP_CMD"
+  else printf 'no chrome on this box'; fi
 }
 
 # A HEADLESS LAUNCH ALWAYS HAS A WALL-CLOCK CAP (DIVE-5375). --virtual-time-budget
@@ -2475,6 +2536,27 @@ _chrome_capped() {  # <budget-ms> <chrome> <args...>
   local slack="${FIVEDIVE_BROWSER_CHROME_SLACK_S:-30}"
   [[ "$slack" =~ ^[0-9]{1,4}$ ]] || slack=30
   timeout -k 5 "$(( (ms + 999) / 1000 + slack ))" "$@"
+}
+# A COLD CHECK LOOKS LIKE THE BROWSER THE PERSON SIGNED IN WITH (DIVE-8486).
+# The sign-in window is a plain Chrome; the check after Done is a headless one on
+# the same profile, and headless Chrome says "HeadlessChrome/<n>" where the window
+# said "Chrome/<n>". A site that binds its login to the browser it was made in
+# reads that as a different browser, answers signed out and deletes the login
+# cookies itself (Tilda's signed-out /projects/ sends Set-Cookie …=deleted for
+# every login cookie), so the check would end the very login it was reading.
+# This is the user-agent string the window's Chrome sends (Chrome's reduced form:
+# Linux is always "X11; Linux x86_64", the version is <major>.0.0.0). The major
+# is read from the profile's own "Last Version" file, which Chrome writes at every
+# start: the version the window ran, and no extra Chrome launched to ask. A profile
+# no Chrome has opened yet has no login to protect, and keeps the headless string.
+# FIVEDIVE_BROWSER_PROBE_UA=off sends Chrome's own headless string again.
+_probe_ua_args() {  # <profile-dir> -> "--user-agent=…" on stdout, or nothing
+  [[ "${FIVEDIVE_BROWSER_PROBE_UA:-}" == off ]] && return 0
+  local v="" maj
+  [[ -f "$1/Last Version" ]] && v=$(head -c 64 "$1/Last Version" 2>/dev/null)
+  maj="${v%%.*}"
+  [[ "$maj" =~ ^[0-9]{2,4}$ ]] || return 0
+  printf -- '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36\n' "$maj"
 }
 _chrome_cap_s() {  # <budget-ms> — the N _chrome_capped used, for a message
   local ms="$1" slack="${FIVEDIVE_BROWSER_CHROME_SLACK_S:-30}"
@@ -2699,7 +2781,7 @@ cmd_auth() {
 ' \
     "$site" "$(_group_name "$joined")" "$site" >&2
 
-  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no Chrome or Chromium on this box — auth hands a real browser to a human and there is nothing to hand over."
+  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "$(_chrome_none_why) — auth hands a real browser to a human and there is nothing to hand over."
 
   # NOT headless, and no automation flags: this window is for a PERSON. What this
   # capability IS, in the words the decision landed on (lodar, 2026-09-07): a
@@ -3138,8 +3220,10 @@ _input_probe() {  # <site> <dir>
     # DIVE-7237 (GAP-6b): the group's browser is up as the automated one for
     # another site. A status check does not take it from them; a page verb does.
     if _daemon_live "$dir"; then
+      local why="the browser $site shares with its group is serving another site as the automated browser, and a status check does not switch it"
+      _input_unchecked_done "$site" "$dir" "$why" && return 0
       local last=""; (( _SITE_BROKERED )) || last=$(_signed_in_last "$dir" 2>/dev/null) || last=""
-      echo "unconfirmed (input mode: not checked now — the browser $site shares with its group is serving another site as the automated browser, and a status check does not switch it${last:+; last seen signed in $last}. A page verb on $site switches it: 5dive browser shot $site)"
+      echo "unconfirmed (input mode: not checked now — $why${last:+; last seen signed in $last}. A page verb on $site switches it: 5dive browser shot $site)"
       return 0
     fi
     echo "UNKNOWN (input mode, and no input-mode browser is serving $site — nothing loads a page to check it; 5dive browser serve $site)"
@@ -3179,12 +3263,26 @@ _input_probe() {  # <site> <dir>
     return 1
   fi
   if (( ! looked )); then
-    echo "unconfirmed (input mode: not checked now — $why; the window shows \"$title\"; a screen is the check: 5dive browser shot $site)"
+    # DIVE-8595: the window is whatever tab is in front, often not this site. A
+    # sign-in title there still wins over the Done (fail-closed); anything else
+    # says nothing either way, so the owner's Done stands.
+    local front_out; front_out=$(_input_title_marker "$site" logged_out); front_out="${front_out:-$INPUT_SIGNIN_TITLE}"
+    if ! grep -qiE -- "$front_out" <<<"$title"; then
+      _input_unchecked_done "$site" "$dir" "$why; the window shows \"$title\"" && return 0
+    fi
+    local last=""; (( _SITE_BROKERED )) || last=$(_signed_in_last "$dir" 2>/dev/null) || last=""
+    echo "unconfirmed (input mode: not checked now — $why; the window shows \"$title\"${last:+; last seen signed in $last}; a screen is the check: 5dive browser shot $site)"
     return 0
   fi
   # DIVE-7572: a title that is still the address says nothing about the login.
   if [[ "$(jq -r 'if .loaded == false then "no" else "yes" end' <<<"$t" 2>/dev/null)" == no ]]; then
-    echo "unconfirmed (input mode: $url did not finish loading, its title is still its address \"$title\", so the login was not checked; a screen is the check: 5dive browser shot $site)"
+    # DIVE-8595: ...so the owner's Done stands, unless that address is a sign-in
+    # page the probe url is not (the site redirected it to its sign-in).
+    if ! { grep -qiE "$GENERIC_SIGNIN_URL" <<<"$title" && ! grep -qiE "$GENERIC_SIGNIN_URL" <<<"$url"; }; then
+      _input_unchecked_done "$site" "$dir" "$url did not finish loading, its title is still its address \"$title\"" && return 0
+    fi
+    local last=""; (( _SITE_BROKERED )) || last=$(_signed_in_last "$dir" 2>/dev/null) || last=""
+    echo "unconfirmed (input mode: $url did not finish loading, its title is still its address \"$title\", so the login was not checked${last:+; last seen signed in $last}; a screen is the check: 5dive browser shot $site)"
     return 0
   fi
   local out_t in_t; out_t=$(_input_title_marker "$site" logged_out); in_t=$(_input_title_marker "$site" logged_in)
@@ -3287,7 +3385,7 @@ _probe() {
   fi
   local chrome=""
   if (( ! warm )); then
-    chrome=$(_chrome) || { echo "UNKNOWN (no chrome on this box)"; return 0; }
+    chrome=$(_chrome) || { echo "UNKNOWN ($(_chrome_none_why))"; return 0; }
   fi
   local url; url=$(_site_url "$site")
   local marker; marker=$(_site_logged_out_marker "$site")
@@ -3322,6 +3420,8 @@ _probe() {
   # An adapter's own wait (DIVE-7648) is spent in the served browser's one tab;
   # the cold loop below launches a Chrome per look, so it keeps the box budget.
   local awaitms=""; (( warm )) && awaitms=$(_site_probe_wait_ms "$site")
+  # The cold check presents the person's own browser, not HeadlessChrome (DIVE-8486).
+  local -a uaa=(); (( warm )) || mapfile -t uaa < <(_probe_ua_args "$dir")
   local total="${FIVEDIVE_BROWSER_PROBE_WAIT_MS:-$awaitms}" poll="${FIVEDIVE_BROWSER_PROBE_POLL_MS:-400}"
   total="${total:-8000}"
   [[ "$total" =~ ^[0-9]{1,7}$ ]] || total=8000
@@ -3346,7 +3446,7 @@ _probe() {
       rc=$?
     else
       _chrome_capped 8000 "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
-            --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
+            "${uaa[@]}" --virtual-time-budget=8000 --dump-dom "$url" >"$dom" 2>"$dom.err"
       rc=$?
     fi
     (( rc != 0 )) && break
@@ -3628,6 +3728,17 @@ _owner_done_at() {  # <dir> -> the iso of the owner's Done, rc 1 when there is n
   l=$(head -1 "$f" 2>/dev/null) || return 1
   [[ "$l" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z$ ]] || return 1
   printf '%s\n' "$l"
+}
+# DIVE-8595 (box report 1071, google.com): an input-mode check that could not
+# look NOW (the group's browser is on another site, someone is driving, no tab
+# opened, the page did not finish loading) used to say `unconfirmed` minutes
+# after the owner's Done, and the agent stopped. Not looking is not a sign-out:
+# with a Done on file it leads with the Done and says why nothing was checked.
+# Nothing is stamped (the last real verdict stands) and nothing is forgotten.
+# rc 1 when there is no Done, so the caller says what it said before.
+_input_unchecked_done() {  # <site> <dir> <why>
+  local odone; odone=$(_owner_done_at "$2") || return 1
+  printf 'connected (signed in by the owner %s; not checked now — %s; a sign-in form on a page would mean signed out). Agents: use it.\n' "$odone" "$3"
 }
 # The one line a site with no adapter reads after the owner's Done. Leads with
 # the verdict an agent acts on; the caveat is the guard, said once.
@@ -4050,6 +4161,25 @@ _lease_and_serve_release() { _lease_release; _shot_restore; }
 # side: the daemon serialises one request at a time anyway, and a fair queue
 # needs a ticket file in the same unreachable directory. A brokered caller that
 # loses the race retries on the same one-second cadence and says who has it.
+# A daemon call's stderr, as one line of reason: the client's own prefix off,
+# blank lines dropped, the last three kept.
+_broker_err() {  # _broker_err <stderr-file>
+  local e; e=$(grep -v '^[[:space:]]*$' "$1" 2>/dev/null | tail -n 3)
+  e="${e//"session-daemon: "/}"; printf '%s' "${e//$'\n'/ }"
+}
+
+# DIVE-8696: the box browser said its install was updated away and is stepping
+# aside. Wait for its socket to go (it goes after Chrome has written the profile
+# out), then start the current version the way any brokered verb does.
+_broker_restart_after_update() {  # <site> <dir>
+  local i=0
+  while _daemon_live "$2" && (( i < ${FIVEDIVE_BROWSER_STEP_ASIDE_WAIT:-30} )); do sleep 1; i=$(( i + 1 )); done
+  _daemon_live "$2" && { echo "the old browser has not stopped after ${i}s."; return 1; }
+  local why; why=$(_broker_wake "$1") || { printf '%s\n' "$why"; return 1; }
+  _daemon_live "$2" || { echo "it started, but no browser answers on its socket."; return 1; }
+  printf '%s: %s was updated; started the current box browser for it as %s.\n' "$PROG" "$1" "$_SITE_OWNER" >&2
+}
+
 _lease_take_brokered() {  # <site> <dir> <purpose> <wait> <ttl>
   local site="$1" d="$2" purpose="$3" wait="$4" ttl="$5" token="" waited=0 req
   # THE ANCHOR IS THIS PROCESS (DIVE-4927). The lease is written by a
@@ -4061,15 +4191,35 @@ _lease_take_brokered() {  # <site> <dir> <purpose> <wait> <ttl>
   # KERNEL says belongs to the connected seat, so this cannot pin someone else.
   req=$(jq -nc --arg p "$purpose" --argjson t "$ttl" --argjson a "$$" \
         '{op:"lease", act:"acquire", purpose:$p, ttl:$t, anchor:$a}')
+  local ef rc err restarted=0 why
   while :; do
-    token=$(_daemon_call "$d" "$req" 2>/dev/null) || token=""
+    ef=$(mktemp); rc=0
+    token=$(_daemon_call "$d" "$req" 2>"$ef") || { rc=$?; token=""; }
+    err=$(_broker_err "$ef"); rm -f "$ef"
     [[ -n "$token" ]] && break
+    # THE BOX BROWSER OUTLIVED ITS OWN INSTALL (DIVE-8696): it has stepped aside,
+    # so start the current version and ask again, once.
+    if [[ "$err" == *"updated away"* ]] && (( ! restarted )); then
+      restarted=1
+      why=$(_broker_restart_after_update "$site" "$d") \
+        || die "$E_UNAVAILABLE" "the $site box browser did not answer: $err
+Starting the current version for '$(_seat)' did not work: $why"
+      continue
+    fi
+    # NOT AN ANSWER IS NOT "BUSY" (DIVE-8696). A lease refusal names its holder;
+    # a daemon call that failed with nothing to say, or with a reason that is not
+    # a holder, is a browser that did not answer, and it is said as one.
+    if [[ "$err" != *"busy: "* ]]; then
+      die "$E_UNAVAILABLE" "the $site box browser did not answer with a lease: ${err:-no reason given (exit $rc)}
+Nothing was taken. Stop it and let the next call start it again:  sudo 5dive browser serve $site --stop"
+    fi
     [[ "$wait" == no ]] && break
     (( waited >= wait )) && break
     sleep 1; waited=$(( waited + 1 ))
   done
   if [[ -z "$token" ]]; then
     local who; who=$(_daemon_call "$d" '{"op":"lease","act":"status"}' 2>/dev/null)
+    [[ -n "$who" ]] || who="$err"
     die "$E_UNAVAILABLE" "${who:-busy: somebody else holds it}$(_lease_own_note "$who")
 Another caller holds the $site browser on this box. Refusing rather than joining them in it: two callers in
 one logged-in profile overwrite each other's drafts and read as site flakiness, not as a collision.
@@ -4141,8 +4291,16 @@ cmd_lease() {
   if (( _SITE_BROKERED )); then
     case "$action" in
       status)
-        local bl; bl=$(_daemon_call "$dir" '{"op":"lease","act":"status"}' 2>/dev/null)
+        local bl brc=0 bef berr; bef=$(mktemp)
+        bl=$(_daemon_call "$dir" '{"op":"lease","act":"status"}' 2>"$bef") || brc=$?
+        berr=$(_broker_err "$bef"); rm -f "$bef"
         [[ -n "$bl" ]] && { printf '%s' "$bl"; return 0; }
+        # FREE ONLY WHEN THE DAEMON SAID SO (DIVE-8696): the owner's status exits
+        # 1 with nothing to say when no lease is live. Anything else is a browser
+        # that did not answer, which an empty answer used to read as "free".
+        if (( brc > 1 )) || [[ -n "$berr" ]]; then
+          die "$E_UNAVAILABLE" "the $site box browser did not answer: ${berr:-no reason given (exit $brc)}"
+        fi
         printf 'free: nothing holds the %s browser (the box login, held by %s)\n' "$site" "$_SITE_OWNER"
         return 0 ;;
       release)
@@ -4163,8 +4321,13 @@ cmd_lease() {
 That holder is still alive. Not releasing it: the lease is the only thing keeping a second caller out
 of that browser, and a forced release puts one there. Stop the holding process, or wait for its TTL."
       fi
-      _lease_reap "$dir"
-      printf 'released the stale %s lease\n' "$site"; return 0 ;;
+      # SAY WHAT HAPPENED (DIVE-8696): "released the stale lease" with no lease
+      # there sent box 1134's operator looking for a lease that never existed.
+      if [[ ! -e "$(_lease_dir "$dir")" ]]; then
+        printf 'nothing to release: no lease is held on the %s browser\n' "$site"
+      elif _lease_reap "$dir"; then printf 'released the stale %s lease\n' "$site"
+      else printf 'nothing released: another release of the %s lease is in progress\n' "$site"; fi
+      return 0 ;;
     take)
       _lease_take "$site" "$dir" "$purpose" "${wait:-no}"
       printf 'holding the %s browser as %s until %s\n' "$site" "$(_seat)" \
@@ -4411,7 +4574,7 @@ cmd_run() {
     return $?
   fi
 
-  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — an action needs the same browser the profile was logged in with."
+  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "$(_chrome_none_why) — an action needs the same browser the profile was logged in with."
   # PLAYWRIGHT TAKES A PATH, NOT A NAME. _chrome answers with whatever `command -v`
   # found first — the bare word `google-chrome` — which bash resolves through PATH
   # at every exec and Playwright's executablePath does not. Measured on
@@ -4700,9 +4863,18 @@ cmd_tree() {
   # not a reason for the next caller to wait.
   _shot_restore; _lease_release; trap - EXIT
 
+  # A TREE THAT DOES NOT PARSE IS A FAILURE, IN BOTH BRANCHES (DIVE-8903). This
+  # script runs without -e, so a jq that refused the document used to be followed
+  # by a footer with an empty count, and its printf made the verb exit 0: box
+  # report 1256 got two jq errors, no refs and a success. --json used to pass the
+  # bytes through unchecked, so the caller's own jq was the first thing to fail.
+  local n
+  n=$(jq -er '.nodes | length' <<<"$out") \
+    || die "$E_UNAVAILABLE" "the page's tree did not parse as JSON (jq's reason is above); nothing was printed."
   if (( json )); then printf '%s\n' "$out"; return 0; fi
-  jq -r '.nodes[] | "  \(.role)  \"\(.name)\"\n      ref=\(.ref)"' <<<"$out"
-  printf '\n%s: %s addressable node(s) on %s\n' "$PROG" "$(jq -r '.nodes|length' <<<"$out")" "$url" >&2
+  jq -r '.nodes[] | "  \(.role)  \"\(.name)\"\n      ref=\(.ref)"' <<<"$out" \
+    || die "$E_UNAVAILABLE" "the page's tree could not be printed (jq refused it above)."
+  printf '\n%s: %s addressable node(s) on %s\n' "$PROG" "$n" "$url" >&2
   printf 'Use one as a selector, in an adapter step or on the command line: ref=<role>/<name>\n' >&2
   printf 'A ref is re-derived from the page each time, so it still works after a reload.\n' >&2
 }
@@ -4884,7 +5056,7 @@ cmd_capture() {
   local dir="$_SITE_DIR"
   [[ -n "$url" ]] || url="$(_site_url "$site")"
   [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || die "$E_USAGE" "--url must be an http(s) URL"
-  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box"
+  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "$(_chrome_none_why)"
   local served=0
   if _serve_running "$dir" >/dev/null; then
     _daemon_live "$dir" || die "$E_UNAVAILABLE" "$site is served and its browser holds the profile, but no session daemon answers to render through. Stop it first:  5dive browser serve $site --stop"
@@ -4896,12 +5068,13 @@ cmd_capture() {
   chmod 700 "$out" 2>/dev/null || true
   [[ -z "$(ls -A "$out" 2>/dev/null)" ]] || die "$E_USAGE" "$out is not empty; a capture never overwrites one"
   local cold orc=0 k f
+  local -a cuaa=(); mapfile -t cuaa < <(_probe_ua_args "$dir")   # DIVE-8486: both halves as the person's browser
   for k in 1 2; do
     f="$out/signed-out.html"; (( k == 2 )) && f="$out/signed-out-2.html"
     cold=$(mktemp -d) || die "$E_UNAVAILABLE" "mktemp failed"
     ( umask 077
       _chrome_capped 8000 "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$cold" \
-        --virtual-time-budget=8000 --dump-dom "$url" >"$f" 2>/dev/null ) || orc=$?
+        "${cuaa[@]}" --virtual-time-budget=8000 --dump-dom "$url" >"$f" 2>/dev/null ) || orc=$?
     rm -rf "$cold"
     (( orc == 0 )) || break
   done
@@ -4919,7 +5092,7 @@ cmd_capture() {
     how=cold
     ( umask 077
       _chrome_capped 8000 "$chrome" --headless --no-sandbox --disable-gpu --user-data-dir="$dir" \
-        --virtual-time-budget=8000 --dump-dom "$url" >"$out/signed-in.html" 2>/dev/null )
+        "${cuaa[@]}" --virtual-time-budget=8000 --dump-dom "$url" >"$out/signed-in.html" 2>/dev/null )
     irc=$?
     _lock_clear_dead "$dir"
   fi
@@ -5881,7 +6054,7 @@ _wait_listening() {  # _wait_listening <port> <pid>
 _serve_requires() {
   local missing=()
   _have Xvfb || missing+=("Xvfb (xvfb)")
-  _chrome >/dev/null || missing+=("chromium")
+  _chrome >/dev/null || { if _chrome_snap_only; then missing+=("a chrome that can start ($SNAP_CHROME_LINE)"); else missing+=("chromium"); fi; }
   (( ${#missing[@]} == 0 )) && return 0
   die "$E_UNAVAILABLE" "this box cannot run a server-mode browser: missing $(printf "%s, " "${missing[@]}" | sed "s/, $//"). A managed 5dive box installs these at provision time; on a self-hosted box install them once."
 }
@@ -6117,7 +6290,13 @@ cmd_serve() {
     # person saving the login, not the person closing a browser, so the login is
     # kept for SESSION_KEEP_SAVED_S, whoever stops it (Done, the dashboard's close,
     # the idle sweep). The automated browser's own stop still ends them.
-    if (( person )); then _session_cookies_keep "$dir" "$SESSION_KEEP_SAVED_S" >/dev/null || true
+    # THE KEEP IS RECORDED (DIVE-8486): how many session-only cookies a person's
+    # stop gave an expiry, so a sign-in that reads signed out after Done says
+    # which half lost it — 0 kept (the window never wrote it to disk) or some kept
+    # and the check then lost them (the site's own signed-out answer).
+    if (( person )); then
+      local kept; kept=$(_session_cookies_keep "$dir" "$SESSION_KEEP_SAVED_S" 2>/dev/null) || kept=failed
+      _audit_row "$dir" session_keep "a person's window stopped: ${kept:-0} session-only cookies kept for ${SESSION_KEEP_SAVED_S}s"
     elif [[ "${_SERVE_SWAP:-}" == 1 ]]; then _session_cookies_keep "$dir" >/dev/null || true; fi
     local ssock; ssock="$(_kv "$f" sock)"
     rm -f "$f" "${ssock:-$dir/.5dive-session.sock}" "$(_viewer_admitted_file "$dir")"
@@ -7064,7 +7243,7 @@ _page_open() {  # _page_open <site> <url>
     return 0
   fi
 
-  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "no chrome on this box — a render needs the same browser the profile was logged in with."
+  local chrome; chrome=$(_chrome) || die "$E_UNAVAILABLE" "$(_chrome_none_why) — a render needs the same browser the profile was logged in with."
 
   # THE WARM SESSION IS NOT CYCLED (DIVE-4621). The stop-render-restart below
   # exists for one reason — Chrome allows one instance per --user-data-dir, so a
@@ -7509,9 +7688,11 @@ _look_page_md() {  # <after.json>
 # just read can be an injected order to post or message as the owner, so after a
 # page was read (any capture that wrote page.md, within PAGE_READ_WINDOW seconds,
 # the length of a working turn) `publish` and `send` ask the owner first, even
-# where the policy lets them run. The owner's one tap answers it (owner-ask). Only
-# the owner's `yolo` (all four go ahead) opts out: that is the owner saying
-# nothing asks. The mark is the seat's own file, so this is a guard against a
+# where the policy lets them run. The owner's one tap answers it (owner-ask). The
+# owner's `yolo` (all four go ahead) opts out: that is the owner saying nothing
+# asks. So does `always` on one kind (DIVE-8641): `send=always` is the owner
+# saying "messages go ahead even right after a page was read", while pay keeps
+# asking. Only `allow` is turned to ask; `always` never is. The mark is the seat's own file, so this is a guard against a
 # page steering an honest agent, not against an agent set on getting around it.
 PAGE_READ_KINDS="publish send"
 PAGE_READ_WINDOW="${FIVEDIVE_BROWSER_PAGE_READ_WINDOW:-1800}"
@@ -8444,7 +8625,9 @@ _grant_uid() { printf '%s\n' "${FIVEDIVE_BROWSER_GRANT_UID:-0}"; }
 _sudo_is_seat() { [[ "${SUDO_USER:-}" == agent-* ]]; }
 
 # THE OWNER'S POLICY PER KIND (DIVE-4982): "allow" (the step runs and is logged)
-# or "ask" (it stops, exit 73, until the owner says yes). THE DEFAULT IS PER KIND
+# or "ask" (it stops, exit 73, until the owner says yes), or "always" (DIVE-8641:
+# runs and is logged like allow, AND a page read this turn does not turn it to
+# ask, see _page_read_recent). THE DEFAULT IS PER KIND
 # (DIVE-5148): pay asks, publish, send and delete run and are logged. DIVE-5006
 # had made all four "allow", because an owner with no dashboard and no shell could
 # neither approve a step nor relax the policy and every send stopped dead; the
@@ -8469,9 +8652,9 @@ _policy_owned() {  # the owner's file as an object, {} when there is no file tha
 }
 _policy_json() {
   jq -nc --argjson c "$(_policy_owned)" --argjson d "$APPROVAL_DEFAULTS" \
-    '$d | with_entries(.value = (if $c[.key] == "ask" or $c[.key] == "allow" then $c[.key] else $d[.key] end))'
+    '$d | with_entries(.value = (if $c[.key] == "ask" or $c[.key] == "allow" or $c[.key] == "always" then $c[.key] else $d[.key] end))'
 }
-_policy_allowed() { _policy_effective | jq -c '[to_entries[] | select(.value == "allow") | .key]'; }
+_policy_allowed() { _policy_effective | jq -c '[to_entries[] | select(.value == "allow" or .value == "always") | .key]'; }
 # What an act is held to: the owner's policy, with publish and send turned to ask
 # when a page was read this turn (DIVE-7972, see _page_read_recent). The owner's
 # own view and the setter keep reading _policy_json, so this never gets written
@@ -8490,9 +8673,9 @@ _policy_effective() {
   printf '%s\n' "$eff"
 }
 # standard (the per-kind default: pay asks, the other three allow), yolo (all four
-# allow), careful (all four ask), or custom — computed, never stored.
+# allow, or always: nothing asks), careful (all four ask), or custom — computed, never stored.
 _policy_mode() { jq -r --argjson d "$APPROVAL_DEFAULTS" \
-  'if . == $d then "standard" elif ([.[]] | all(. == "allow")) then "yolo" elif ([.[]] | all(. == "ask")) then "careful" else "custom" end'; }
+  'if . == $d then "standard" elif ([.[]] | all(. == "allow" or . == "always")) then "yolo" elif ([.[]] | all(. == "ask")) then "careful" else "custom" end'; }
 
 # One line an owner can read for a request's payload, in a fixed order; empty when
 # the page gave none, and the caller then SAYS so rather than showing the label.
@@ -8605,13 +8788,13 @@ _policy_log() {  # <site> <stderr-file> <page> <screenshot>
   own="$(_policy_owned)"
   while IFS= read -r line; do
     cls="$(jq -r .cls <<<"$line")"; by=default
-    [[ "$(jq -r --arg k "$cls" '.[$k] // ""' <<<"$own")" == allow ]] && by=policy
+    case "$(jq -r --arg k "$cls" '.[$k] // ""' <<<"$own")" in allow|always) by=policy ;; esac
     jq -c --arg seat "$(_seat)" --arg site "$site" --arg page "$page" --arg shot "$shot" --argjson at "$(date +%s)" --arg by "$by" \
       '{at:$at, seat:$seat, site:$site, class:.cls, label:.label, payload:(.payload // {}), step:.step, page:$page, screenshot:$shot, allowed_by:$by}' \
       <<<"$line" >> "$ad/allowed.jsonl" 2>/dev/null || continue
     if [[ "$by" == policy ]]; then
-      printf '%s: ALLOWED by the owner'"'"'s policy (%s=allow): step %s, %s — logged in %s/allowed.jsonl\n' "$PROG" \
-        "$cls" "$(jq -r .step <<<"$line")" "$(_payload_line "$(jq -c '.payload // {}' <<<"$line")")" "$ad" >&2
+      printf '%s: ALLOWED by the owner'"'"'s policy (%s=%s): step %s, %s — logged in %s/allowed.jsonl\n' "$PROG" \
+        "$cls" "$(jq -r --arg k "$cls" '.[$k]' <<<"$own")" "$(jq -r .step <<<"$line")" "$(_payload_line "$(jq -c '.payload // {}' <<<"$line")")" "$ad" >&2
     else
       printf '%s: ALLOWED (default standard): %s, step %s, %s — logged in %s/allowed.jsonl\n' "$PROG" \
         "$cls" "$(jq -r .step <<<"$line")" "$(_payload_line "$(jq -c '.payload // {}' <<<"$line")")" "$ad" >&2
@@ -9974,28 +10157,28 @@ cmd_approvals() {
 #          -> {"pay":"ask","publish":"allow","send":"allow","delete":"allow","mode":"standard"}
 #          mode is standard (the default: pay asks, the other three allow), yolo (all four allow),
 #          careful (all four ask) or custom, computed from the four
-#   write: sudo 5dive browser approvals policy set standard|yolo|careful [<kind>=ask|allow ...]   (the owner only)
-#          sudo 5dive browser approvals policy set <kind>=ask|allow [...]
+#   write: sudo 5dive browser approvals policy set standard|yolo|careful [<kind>=ask|allow|always ...]   (the owner only)
+#          sudo 5dive browser approvals policy set <kind>=ask|allow|always [...]
 # The 5dive CLI strips --json before a plugin verb runs and sets FIVEDIVE_JSON_MODE=1,
 # so that variable is JSON too, not only the literal flag.
 cmd_approval_policy() {
   local json=0 set=0 preset="" a
   [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && json=1
   local -a pairs=()
-  local usage="approvals policy [--json] | approvals policy set standard|yolo|careful | approvals policy set <kind>=ask|allow"
+  local usage="approvals policy [--json] | approvals policy set standard|yolo|careful | approvals policy set <kind>=ask|allow|always"
   for a in "$@"; do
     case "$a" in
       --json) json=1 ;;
       set) set=1 ;;
       standard|yolo|careful) [[ -z "$preset" ]] || die "$E_USAGE" "approvals policy set takes one preset: standard, yolo or careful"; preset="$a" ;;
       *=*) pairs+=("$a") ;;
-      -h|--help) printf 'usage: 5dive browser approvals policy [--json]\n       sudo 5dive browser approvals policy set standard|yolo|careful\n       sudo 5dive browser approvals policy set <%s>=ask|allow ...\n\n       standard (the default): paying stops for your approval; posting, sending and\n       deleting go ahead and are logged. yolo: all four go ahead. careful: all four ask.\n' "${APPROVAL_KINDS// /|}"; return 0 ;;
+      -h|--help) printf 'usage: 5dive browser approvals policy [--json]\n       sudo 5dive browser approvals policy set standard|yolo|careful\n       sudo 5dive browser approvals policy set <%s>=ask|allow|always ...\n\n       standard (the default): paying stops for your approval; posting, sending and\n       deleting go ahead and are logged. yolo: all four go ahead. careful: all four ask.\n       allow: goes ahead, but asks right after the agent read a page this turn (a page can\n       carry hidden orders). always: goes ahead even then, e.g. send=always to let agents\n       answer private messages while paying still asks.\n' "${APPROVAL_KINDS// /|}"; return 0 ;;
       *) die "$E_USAGE" "approvals policy: unexpected '$a' — usage: $usage" ;;
     esac
   done
-  (( set )) || [[ -z "$preset" && ${#pairs[@]} -eq 0 ]] || die "$E_USAGE" "a preset or <kind>=ask|allow goes after set — usage: $usage"
+  (( set )) || [[ -z "$preset" && ${#pairs[@]} -eq 0 ]] || die "$E_USAGE" "a preset or <kind>=ask|allow|always goes after set — usage: $usage"
   if (( set )); then
-    [[ -n "$preset" ]] || (( ${#pairs[@]} )) || die "$E_USAGE" "approvals policy set standard|yolo|careful or <kind>=ask|allow — kinds: $APPROVAL_KINDS"
+    [[ -n "$preset" ]] || (( ${#pairs[@]} )) || die "$E_USAGE" "approvals policy set standard|yolo|careful or <kind>=ask|allow|always — kinds: $APPROVAL_KINDS"
     [[ "$(id -u)" == "$(_grant_uid)" ]] || die "$E_PERM" "only the box owner sets the approval policy: sudo 5dive browser approvals policy set ${preset:-${pairs[0]}}"
     _sudo_is_seat && die "$E_PERM" "an agent seat ($SUDO_USER) cannot change what it has to ask about. The owner sets it, from their own shell or the dashboard."
     local cur k v; cur="$(_policy_json)"
@@ -10007,7 +10190,7 @@ cmd_approval_policy() {
     for a in "${pairs[@]}"; do
       k="${a%%=*}"; v="${a#*=}"
       [[ " $APPROVAL_KINDS " == *" $k "* ]] || die "$E_USAGE" "'$k' is not a kind; the kinds are: $APPROVAL_KINDS"
-      [[ "$v" == ask || "$v" == allow ]] || die "$E_USAGE" "$k=$v: the value is ask or allow"
+      [[ "$v" == ask || "$v" == allow || "$v" == always ]] || die "$E_USAGE" "$k=$v: the value is ask, allow or always (always: goes ahead even right after a page was read)"
       cur=$(jq -c --arg k "$k" --arg v "$v" '.[$k] = $v' <<<"$cur")
     done
     local f d tmp; f="$(_policy_file)"; d="$(dirname "$f")"
@@ -10532,7 +10715,7 @@ _cic_connect() {
   local cl chrome; cl=$(command -v claude) || die "$E_UNAVAILABLE" "no claude command for this seat; Claude in Chrome is a Claude Code feature. Nothing changed."
   _have script || die "$E_UNAVAILABLE" "the 'script' command (util-linux) is missing, and the agent's login needs a terminal to run in. Nothing changed."
   [[ -d "$(_seat_dir)" ]] || die "$E_UNAVAILABLE" "this seat has no browser store yet. Create it once: $SETUP_CMD"
-  chrome=$(_chrome) && chrome=$(command -v "$chrome") || die "$E_UNAVAILABLE" "no Chrome on this box. Nothing changed."
+  chrome=$(_chrome) && chrome=$(command -v "$chrome") || die "$E_UNAVAILABLE" "$(_chrome_none_why). Nothing changed."
   local dir; dir="$(_own_site_dir "$CIC_SITE")"
   _ensure_profile_dir "$dir"
   _cic_link_home "$dir"
@@ -10922,7 +11105,7 @@ _totp_fill() {  # <site> <dir> [<url>]
   else
     (( ! _SITE_BROKERED )) && [[ ! -f "$dir/$TOTP_FILE_NAME" ]] && { printf '{"filled":false,"why":"no-seed"}\n'; return 1; }
     local chrome; chrome=$(_chrome) && chrome=$(command -v "$chrome" 2>/dev/null) \
-      || die "$E_UNAVAILABLE" "no chrome on this box to type the authenticator code in"
+      || die "$E_UNAVAILABLE" "$(_chrome_none_why) — nothing to type the authenticator code in"
     local driver="${FIVEDIVE_BROWSER_DRIVER:-$_SELF_DIR/driver-playwright}"
     jq -nc --arg p "$dir" --arg u "$url" --arg h "$host" '{mode:"totp", profile:$p, url:$u, host:$h}' \
       | FIVEDIVE_BROWSER_PROFILE="$dir" FIVEDIVE_BROWSER_CHROME="$chrome" \
@@ -11239,6 +11422,13 @@ _connect_page_ok() {  # <site> <url>
 # back in the browser it hands over. What the box saw decides the words.
 # A title that is the site saying "no such page" while answering 200.
 CONNECT_ERROR_TITLE='(^|[^0-9])(404|410)([^0-9]|$)|page not found|^not found|that.s an error|page (does not|doesn.t) exist|page (can.t|cannot) be found'
+# Whether <seat> can open <site> as a profile: its own, or the box's offered
+# one (the two places _route_site and _resolve_site read). DIVE-9003.
+_connect_has_profile() {  # <seat> <site>
+  _is_public "$2" && return 1
+  [[ -d "$PROFILE_ROOT/$1/$2" ]] && return 0
+  [[ "$1" != "$BOX_SEAT" && -f "$(_rv_offer "$BOX_SEAT" "$2")" ]]
+}
 # Returns 1 when the page could not be loaded (LOOK_WHY says why), 2 when the
 # look ran out of time: that is not an answer about the page either way.
 _connect_look() {  # <seat> <site> <seconds> <snapshot args...>  -> LOOK_{HTTP,TITLE,PAGE,CHECK,WHY}
@@ -11913,7 +12103,14 @@ _connect_request() {  # <caller> <site> <reason> [challenge <url> | handoff]
   # DIVE-6725: look at the page before anyone is asked. An error page is not
   # sent at all; a page with no check on it is not called a captcha.
   if [[ "$kind" == challenge ]]; then
-    local lrc=0; _connect_look "$caller" "$site" "$CONNECT_LOOK_TIMEOUT" "$url" || lrc=$?
+    # DIVE-9003: the look runs in the named site's profile when the asking seat
+    # has one. A bare URL is routed by host, and two saved logins covering it
+    # (example.com + studio.example.com) refuse it as "2 connected accounts", which
+    # dropped the site the agent named and killed the ask. A site with no saved
+    # login keeps the bare URL: snapshot refuses a profile name it does not have.
+    local -a look=("$url")
+    _connect_has_profile "$caller" "$site" && look=("$site" "$url")
+    local lrc=0; _connect_look "$caller" "$site" "$CONNECT_LOOK_TIMEOUT" "${look[@]}" || lrc=$?
     (( lrc == 1 )) \
       && die "$E_UNAVAILABLE" "nothing was sent: the box browser could not open $url ($LOOK_WHY). The owner would only have seen an error. Check the address, open it yourself (5dive browser snapshot <url>), then ask again."
     # A look that ran out of time is most often a check the load sat waiting on,
@@ -13406,6 +13603,10 @@ _tmp_reap_cfg() {
 # launches get, its owner, and whether the per-launch claim worked and if not
 # why — so the next report carries the cause. Nothing for any other failure.
 _crash_note() {  # <chrome's words> [<status>] -> a sentence to append, or nothing
+  # DIVE-8546: snap-confine's refusal is not Chrome's words; say what it means.
+  if [[ "$1" == *"not a snap cgroup"* ]]; then
+    printf ' [%s. Fix: %s]' "$SNAP_CHROME_LINE" "$SETUP_CMD"; return 0
+  fi
   [[ "$1" == *"--database is required"* || "${2:-}" == 133 ]] || return 0
   local where e owner claim
   if [[ -z "$_TMP_CLAIM_WHY" ]]; then claim="the per-launch dir was claimed"

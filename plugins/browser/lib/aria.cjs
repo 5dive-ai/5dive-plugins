@@ -50,6 +50,21 @@ const INTERACTIVE = [
   'slider', 'spinbutton', 'tab', 'treeitem', 'clickable',
 ];
 
+// A CUT AT N CHARACTERS KEEPS WHOLE CHARACTERS (DIVE-8903). A JS string is
+// UTF-16, so `.slice(0, 200)` on a name whose 200th unit is the first half of an
+// emoji keeps a lone surrogate. JSON.stringify writes it as `\ud83d`, and jq 1.7
+// refuses the WHOLE document ("Invalid \uXXXX\uXXXX surrogate pair escape"):
+// one mail subject took down a customer's entire webmail tree (box report
+// 1256). So a cut drops a trailing high surrogate, and a lone half the page drew
+// itself becomes U+FFFD. The page-side functions below cannot close over this
+// one (page.evaluate serialises them), so each carries a two-line copy named
+// `cut`; the harness grades every copy with the same emoji.
+function cutUnits(s, n) {
+  s = String(s == null ? '' : s);
+  if (s.length > n) { s = s.slice(0, n); var c = s.charCodeAt(s.length - 1); if (c >= 0xD800 && c <= 0xDBFF) s = s.slice(0, -1); }
+  return typeof s.toWellFormed === 'function' ? s.toWellFormed() : s;
+}
+
 // THE PAGE-SIDE WALK. Serialized into the browser by page.evaluate, so it may
 // close over nothing: everything it needs arrives in `opts`.
 //
@@ -142,9 +157,13 @@ function pageWalk(opts) {
   // bench. An option is named by its own text, never its list's label, and no name
   // runs past NAME_MAX characters (a ref is copied by the agent; 200 is a long one).
   var NAME_MAX = 200;
+  function cut(s, n) { s = String(s == null ? '' : s);  // cutUnits, in the page (DIVE-8903)
+    if (s.length > n) { s = s.slice(0, n); var c = s.charCodeAt(s.length - 1); if (c >= 0xD800 && c <= 0xDBFF) s = s.slice(0, -1); }
+    return typeof s.toWellFormed === 'function' ? s.toWellFormed() : s; }
   function nameOf(el) {
     var n = fullName(el);
-    return n.length > NAME_MAX ? n.slice(0, NAME_MAX).trim() : n;
+    var c = cut(n, NAME_MAX);
+    return n.length > NAME_MAX ? c.trim() : c;
   }
   function fullName(el) {
     var byId = el.getAttribute('aria-labelledby');
@@ -364,7 +383,7 @@ function splitRef(ref) {  // 'frame:A >> button/Go' -> { frames: ['A'], el: 'but
 }
 const framePrefix = (chain) => chain.map((l) => FRAME_PREFIX + l + FRAME_SEP).join('');
 // A label can hold neither the separator nor a slash (stepRisk reads the ref's name after the first one).
-const frameLabel = (l) => String(l || '').replace(/>>/g, '>').replace(/\//g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+const frameLabel = (l) => cutUnits(String(l || '').replace(/>>/g, '>').replace(/\//g, ' ').replace(/\s+/g, ' ').trim(), 60);
 
 function settled(p, ms) {  // p's value, or null when it fails or takes longer than ms
   let timer;
@@ -874,14 +893,17 @@ function classifyLabel(label) {
 }
 // In the page. Kept tiny and free of closures: page.evaluate serialises it.
 function _labelIn(arg) {
+  function cut(s, n) { s = String(s == null ? '' : s);  // cutUnits, in the page (DIVE-8903)
+  if (s.length > n) { s = s.slice(0, n); var c = s.charCodeAt(s.length - 1); if (c >= 0xD800 && c <= 0xDBFF) s = s.slice(0, -1); }
+  return typeof s.toWellFormed === 'function' ? s.toWellFormed() : s; }
   const el = document.querySelector(arg.sel);
   if (!el) return '';
   // A field's value is what was typed into it, not its label (DIVE-7670): only a
   // button-shaped input carries its label in value.
   const btnValue = (n) => String(n.tagName || '').toLowerCase() === 'input'
     && /^(submit|button|reset|image)$/i.test(String((n.getAttribute && n.getAttribute('type')) || n.type || ''));
-  const txt = (n) => n ? [n.getAttribute && n.getAttribute('aria-label'), n.innerText, btnValue(n) ? n.value : '', n.title]
-    .filter((x) => typeof x === 'string' && x.trim()).join(' ').slice(0, 160) : '';
+  const txt = (n) => n ? cut([n.getAttribute && n.getAttribute('aria-label'), n.innerText, btnValue(n) ? n.value : '', n.title]
+    .filter((x) => typeof x === 'string' && x.trim()).join(' '), 160) : '';
   if (arg.op !== 'press') return txt(el);
   const form = el.form || (el.closest && el.closest('form'));
   if (!form) return '';
@@ -942,6 +964,9 @@ function _composerIn(arg) {
 // page did not show it — it never fills the gap with the button's label.
 // In the page, so it closes over nothing.
 function _payloadIn(arg) {
+  function cut(s, n) { s = String(s == null ? '' : s);  // cutUnits, in the page (DIVE-8903)
+  if (s.length > n) { s = s.slice(0, n); var c = s.charCodeAt(s.length - 1); if (c >= 0xD800 && c <= 0xDBFF) s = s.slice(0, -1); }
+  return typeof s.toWellFormed === 'function' ? s.toWellFormed() : s; }
   function norm(x) { return String(x || '').replace(/\s+/g, ' ').trim(); }
   function text(n) { return n ? norm(n.innerText || n.textContent || n.value || '') : ''; }
   function all(root, q) { try { return Array.prototype.slice.call(root.querySelectorAll(q)); } catch (e) { return []; } }
@@ -969,7 +994,7 @@ function _payloadIn(arg) {
     for (var i = 0; i < body.length; i++) {
       var raw = String(body[i].innerText || body[i].value || body[i].textContent || '');
       var line = raw.split(/\r?\n/).map(norm).filter(Boolean)[0] || '';
-      if (line) { out.first_line = line.slice(0, 200); break; }
+      if (line) { out.first_line = cut(line, 200); break; }
     }
   } else if (arg.cls === 'pay') {
     var money = /(?:[$€£¥₽₹]|\b(?:USD|EUR|GBP|RUB|INR|JPY|CAD|AUD)\b)\s?\d(?:[\d.,]*\d)?|\d(?:[\d.,]*\d)?\s?(?:[$€£¥₽₹]|\b(?:USD|EUR|GBP|RUB|INR|JPY|CAD|AUD)\b)/;
@@ -982,11 +1007,11 @@ function _payloadIn(arg) {
     out.payee = payee || String((document.location && document.location.hostname) || '');
   } else if (arg.cls === 'publish') {
     var t = first('[role=textbox],[contenteditable=true],textarea');
-    if (t) out.text = t.slice(0, 280);
+    if (t) out.text = cut(t, 280);
   } else if (arg.cls === 'delete') {
     var item = el && el.closest ? el.closest('tr,li,[role=row],[role=listitem],article') : null;
     var name = item ? text(item) : first('[role=dialog] h1,[role=dialog] h2,dialog h1,dialog h2,[role=dialog] [role=heading]');
-    if (name) out.item = name.slice(0, 160);
+    if (name) out.item = cut(name, 160);
   }
   return out;
 }
@@ -1035,7 +1060,7 @@ async function stepRisk(page, step, sel) {
     const refName = isRef(step.selector) ? refBody(step.selector).replace(/^[^/]*\//, '').replace(/#\d+$/, '') : '';
     let live = '';
     try { live = await at.evaluate(_labelIn, { sel: inSel, op: step.op, riskOf: true }); } catch (e) { live = ''; }
-    label = [refName, live].filter(Boolean).join(' | ').slice(0, 200);
+    label = cutUnits([refName, live].filter(Boolean).join(' | '), 200);
     cls = classifyLabel(label);
   }
   if (!cls) return null;
@@ -1183,8 +1208,8 @@ async function resolveOrRepick(page, step, n, opts = {}) {
   const from = step.selector;
   const { role, name } = refParts(refBody(from));
   const op = REPICK_OP[step.op];
-  const intent = (typeof step.intent === 'string' && step.intent.trim()
-    ? step.intent.trim() : (name ? `${role} named ${name}` : role)).slice(0, 200);
+  const intent = cutUnits(typeof step.intent === 'string' && step.intent.trim()
+    ? step.intent.trim() : (name ? `${role} named ${name}` : role), 200);
   const args = [`--op=${op}`, `--intent=${intent}`];
   if (op === 'fill' || op === 'select') args.push('--value={value}');
   if (op === 'press') args.push(`--key=${step.key}`);
@@ -1223,7 +1248,7 @@ async function resolveOrRepick(page, step, n, opts = {}) {
   } else {
     // Off: the name match alone, and a miss it cannot settle reads exactly as before.
     const why = r.reflex === 'off' ? ''
-      : ` Reflex could not pick one (${cleanText(r.why || r.error || 'no answer').slice(0, 160)}).`;
+      : ` Reflex could not pick one (${cutUnits(cleanText(r.why || r.error || 'no answer'), 160)}).`;
     const hits = nameMatches(miss.nodes, refBody(from));
     if (hits.length !== 1) throw failAs(why);
     pick = { ref: hits[0].ref, line: `name match picked ref=${hits[0].ref}`,
@@ -1503,7 +1528,7 @@ function movedSince(page, after) {
   if (!was || !now || was === now) return null;
   const strip = (u) => u.replace(/#.*$/, '');
   if (strip(was) === strip(now)) return null;
-  return `${was.slice(0, 120)} -> ${now.slice(0, 120)}`;
+  return `${cutUnits(was, 120)} -> ${cutUnits(now, 120)}`;
 }
 
 async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 30000,
@@ -1563,6 +1588,9 @@ async function pageAfter(page, { settleMs = 0, waitFor = null, waitTimeoutMs = 3
 // parent); one taller than 1.5 screens is a page section, not a proof, and is
 // skipped. Self-contained: it runs in the page.
 function _showIn(arg) {
+  function cut(s, n) { s = String(s == null ? '' : s);  // cutUnits, in the page (DIVE-8903)
+  if (s.length > n) { s = s.slice(0, n); var c = s.charCodeAt(s.length - 1); if (c >= 0xD800 && c <= 0xDBFF) s = s.slice(0, -1); }
+  return typeof s.toWellFormed === 'function' ? s.toWellFormed() : s; }
   const src = String((arg && arg.expect) || '');
   if (!src || typeof document === 'undefined' || !document.body) return null;
   let re;
@@ -1596,7 +1624,7 @@ function _showIn(arg) {
   if (!first) return null;
   try { first.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { return null; }
   return { show_report: true, scrolled: true,
-    text: String(first.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80) };
+    text: cut(String(first.textContent || '').replace(/\s+/g, ' ').trim(), 80) };
 }
 async function showExpect(page, expect, text) {   // -> {scrolled,text} | {in_view} | null; never throws
   if (!expect || !page || typeof page.evaluate !== 'function') return null;
@@ -1714,7 +1742,7 @@ async function checkLanding(page, requested, landing, { mayRetry = false } = {})
     try { title = String(await page.title()); } catch (e) { title = ''; }
     try { text = String(await page.evaluate(_textIn, { textOf: true }) || ''); } catch (e) { text = ''; }
     const r = await reflexLanding(site, { requested_url: requested, landed_url: landed, landed_title: title,
-      page_excerpt: text.replace(/\s+/g, ' ').trim().slice(0, 300) });
+      page_excerpt: cutUnits(text.replace(/\s+/g, ' ').trim(), 300) });
     const conf = Number(r.confidence) || 0;
     if (r.reflex === 'ok' && r.choice === 'login_wall') {
       out.loginWall = `the page is a login wall (reflex, ${conf}): log in first: 5dive browser auth ${site}`;
@@ -1756,6 +1784,6 @@ module.exports = { movedSince, INTERACTIVE, pageWalk, walk, snapshot, resolveRef
   classifyLabel, stepRisk, pageAfter, showExpect, _showIn, stepErrorText, NEEDS_OWNER_PREFIX, E_NEEDS_OWNER, OWNER_ALLOWED_PREFIX,
   STEP_FAILED_PREFIX, failedStep,
   redirectWhy, checkLanding, E_REDIRECTED,
-  _payloadIn, cleanText, cleanPayload,
+  _payloadIn, _labelIn, cleanText, cleanPayload, cutUnits,
   INTERSTITIAL_TITLE, waitInterstitial, waitForPast, unmarkedArgs, fieldRoleMatch,
   waitForVisible, _visibleIn, _textIn, _valuesIn, _scopeIn };
