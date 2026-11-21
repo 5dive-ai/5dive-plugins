@@ -130,8 +130,118 @@ func TestHTTPProbeHeadersAndVersionLeak(t *testing.T) {
 	if p := got["missing-safety-headers"].Proof; strings.Contains(p, "X-Content-Type-Options") || !strings.Contains(p, "Content-Security-Policy") {
 		t.Errorf("headers proof wrong: %s", p)
 	}
+	if fix := got["missing-safety-headers"].Fix; strings.Contains(fix, "nosniff") || !strings.Contains(fix, "Content-Security-Policy") || strings.Contains(fix, "Strict-Transport-Security") {
+		t.Errorf("fix must name only the missing headers (no HSTS on http): %s", fix)
+	}
 	if len(res.Facts) != 1 || res.Facts[0].Data["server"] != "nginx/1.14.0" {
 		t.Errorf("facts: %+v", res.Facts)
+	}
+}
+
+// secureHeaders sets every browser safety header the check looks for.
+func secureHeaders(w http.ResponseWriter) {
+	w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	w.Header().Set("Content-Security-Policy", "object-src 'none'")
+	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+func headersProbe(t *testing.T, env *Env, rawURL, scheme string) []model.Finding {
+	t.Helper()
+	res, err := httpProbe(context.Background(), env, model.Intent{Tool: "http_probe", Target: hostPort(t, rawURL), Args: map[string]string{"scheme": scheme, "host": "box.example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.Findings
+}
+
+// Caddy's automatic port-80 answer is a bare 308 to https. No browser renders it,
+// so it is never graded: the https page gets its own probe (DIVE-8956).
+func TestHTTPProbeNeverGradesTheHTTPSRedirect(t *testing.T) {
+	env, rec := testEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://box.example.com/")
+		w.WriteHeader(http.StatusPermanentRedirect)
+	}))
+	defer srv.Close()
+	if f, ok := checks(headersProbe(t, env, srv.URL, "http"))["missing-safety-headers"]; ok {
+		t.Fatalf("graded the redirect: %+v", f)
+	}
+	if n := len(rec.Seen()); n != 1 {
+		t.Errorf("want one dial (the redirect is not followed off the port), got %d: %v", n, rec.Seen())
+	}
+}
+
+// Headers on the https site, as the advice says, clear the finding; an https site
+// without them gets it, and the advice names each missing header.
+func TestHTTPProbeGradesTheHTTPSPage(t *testing.T) {
+	env, _ := testEnv(t)
+	set := true
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if set {
+			secureHeaders(w)
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	defer srv.Close()
+	if f, ok := checks(headersProbe(t, env, srv.URL, "https"))["missing-safety-headers"]; ok {
+		t.Fatalf("flagged a site that sends every header: %+v", f)
+	}
+	set = false
+	f, ok := checks(headersProbe(t, env, srv.URL, "https"))["missing-safety-headers"]
+	if !ok {
+		t.Fatal("no finding on an https site without headers")
+	}
+	for _, h := range []string{"Strict-Transport-Security", "Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options"} {
+		if !strings.Contains(f.Fix, h) || !strings.Contains(f.Proof, h) {
+			t.Errorf("%s missing from fix or proof:\nfix: %s\nproof: %s", h, f.Fix, f.Proof)
+		}
+	}
+}
+
+// A redirect that stays on the site (/ -> /login) is followed: the login page is
+// what a browser shows, so its headers are the ones graded.
+func TestHTTPProbeFollowsSameSiteRedirect(t *testing.T) {
+	env := recordingEnv(t)
+	secure := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		if secure {
+			secureHeaders(w)
+		}
+		fmt.Fprint(w, "login")
+	}))
+	defer srv.Close()
+	f, ok := checks(headersProbe(t, env, srv.URL, "http"))["missing-safety-headers"]
+	if !ok {
+		t.Fatal("the login page has no headers but no finding")
+	}
+	if !strings.Contains(f.Proof, "GET / -> 302; GET /login -> 200") || len(f.Evidence) != 2 {
+		t.Errorf("proof/evidence should show both hops: %s (%d exchanges)", f.Proof, len(f.Evidence))
+	}
+	secure = true
+	if f, ok := checks(headersProbe(t, env, srv.URL, "http"))["missing-safety-headers"]; ok {
+		t.Errorf("login page sends every header, still flagged: %+v", f)
+	}
+}
+
+// A redirect to another site is neither graded nor followed.
+func TestHTTPProbeStopsAtForeignRedirect(t *testing.T) {
+	env, rec := testEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://elsewhere.example.net/", http.StatusFound)
+	}))
+	defer srv.Close()
+	if f, ok := checks(headersProbe(t, env, srv.URL, "http"))["missing-safety-headers"]; ok {
+		t.Fatalf("graded a redirect to another site: %+v", f)
+	}
+	if n := len(rec.Seen()); n != 1 {
+		t.Errorf("want one dial, got %d: %v", n, rec.Seen())
 	}
 }
 
