@@ -35,6 +35,11 @@ type Config struct {
 	Workers     int // parallel workers per round (default 4)
 	MaxRounds   int // planner rounds (default 8)
 	Log         io.Writer
+	// Drain, once closed, stops the run early and keeps what it found: no new
+	// step starts, the running ones get DrainGrace (default 30 s) to finish and
+	// are then cancelled, and the report says "stopped". nil = never.
+	Drain      <-chan struct{}
+	DrainGrace time.Duration
 }
 
 type run struct {
@@ -69,6 +74,9 @@ func Run(ctx context.Context, cfg Config) (*report.Report, error) {
 	if cfg.MaxRounds <= 0 {
 		cfg.MaxRounds = 8
 	}
+	if cfg.DrainGrace <= 0 {
+		cfg.DrainGrace = 30 * time.Second
+	}
 	if cfg.Log == nil {
 		cfg.Log = io.Discard
 	}
@@ -97,8 +105,13 @@ func Run(ctx context.Context, cfg Config) (*report.Report, error) {
 
 func (r *run) logf(format string, a ...any) { fmt.Fprintf(r.cfg.Log, format+"\n", a...) }
 
-// overBudget is checked between steps.
+// overBudget is checked between steps; a drain counts as one.
 func (r *run) overBudget() string {
+	select {
+	case <-r.cfg.Drain:
+		return report.StopStopped
+	default:
+	}
 	if r.cfg.MaxTokens > 0 && r.tokens > r.cfg.MaxTokens {
 		return report.StopBudgetTokens
 	}
@@ -122,6 +135,22 @@ func (r *run) loop(parent context.Context) (string, error) {
 	r.goal = goal
 	ctx, cancel := context.WithDeadline(parent, r.start.Add(cfg.MaxDuration))
 	defer cancel()
+	// A drain cancels the steps still running once its grace is up, so a stop
+	// lands in about DrainGrace even inside a deep sweep of every port.
+	go func() {
+		select {
+		case <-cfg.Drain:
+		case <-ctx.Done():
+			return
+		}
+		t := time.NewTimer(cfg.DrainGrace)
+		defer t.Stop()
+		select {
+		case <-t.C:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	for round := 1; round <= cfg.MaxRounds; round++ {
 		if stop := r.overBudget(); stop != "" {

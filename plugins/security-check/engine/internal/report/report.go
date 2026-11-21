@@ -21,6 +21,8 @@ const (
 	StopBudgetTime   = "budget_time"
 	StopBudgetTokens = "budget_tokens"
 	StopError        = "error"
+	// StopStopped: someone asked the run to stop (a drain); what it found is kept.
+	StopStopped = "stopped"
 )
 
 // Report is report.json.
@@ -195,6 +197,7 @@ var stoppedNote = map[string]string{
 	StopBudgetTime:   "This check hit its time limit and stopped early, so it may have missed things.",
 	StopBudgetTokens: "This check hit its usage limit and stopped early, so it may have missed things.",
 	StopError:        "This check stopped early because of an error, so it may have missed things.",
+	StopStopped:      "This check was stopped before it finished, so it may have missed things.",
 }
 
 // Markdown renders report.md: short, plain, most serious first.

@@ -135,3 +135,31 @@ func TestDepthPicksThePortList(t *testing.T) {
 		}
 	}
 }
+
+// SIGUSR1's drain: exit 3 with a report that says "stopped" (DIVE-8940).
+func TestDrainExits3WithAStoppedReport(t *testing.T) {
+	testnet.TrapDNS(t)
+	dir := t.TempDir()
+	rec := testnet.NewRecorder(t)
+	d := testDeps(t, rec, nil)
+	drain := make(chan struct{})
+	close(drain)
+	d.drain = drain
+	var stderr bytes.Buffer
+	code := run(context.Background(), []string{"run",
+		"--scope", writeScope(t, dir, `{"run_id":"r10","owner":{"server_id":1,"domain":"box.example.com"},"targets":[{"kind":"ip","value":"127.0.0.1"}],"host_names":["box.example.com"],"depth":"shallow"}`),
+		"--db", filepath.Join(dir, "e.sqlite"), "--out", filepath.Join(dir, "out")}, &stderr, d)
+	if code != exitBudget {
+		t.Fatalf("exit %d, want 3 (%s)", code, stderr.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "out", "report.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep struct {
+		StoppedReason string `json:"stopped_reason"`
+	}
+	if err := json.Unmarshal(raw, &rep); err != nil || rep.StoppedReason != "stopped" {
+		t.Fatalf("report %s (%v)", raw, err)
+	}
+}

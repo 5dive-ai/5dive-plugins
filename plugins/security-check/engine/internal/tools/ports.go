@@ -121,7 +121,9 @@ func portScan(ctx context.Context, env *Env, in model.Intent) (Result, error) {
 	for _, p := range open {
 		names = append(names, strconv.Itoa(p))
 	}
-	if len(open) == 0 {
+	// A sweep cut short (budget or stop) did not try every port, so it must not
+	// say none answered.
+	if len(open) == 0 && ctx.Err() == nil {
 		r.Findings = append(r.Findings, model.NewFinding("no-open-ports", model.Info, ip.String(),
 			"No open ports answered",
 			fmt.Sprintf("None of the %d ports we tried answered.", len(env.Ports)),

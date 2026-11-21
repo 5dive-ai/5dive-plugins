@@ -4,7 +4,11 @@
 //	seccheck run --scope scope.json --db evidence.sqlite --out dir [--max-seconds 900] [--max-tokens 150000] [--approval auto-safe|deny-all]
 //	seccheck version
 //
-// Exit codes: 0 done, 1 other error, 2 scope refused, 3 budget exhausted (report written).
+// SIGUSR1 stops the run early and keeps what it found (a drain): no new step
+// starts, running ones get 30 s, the report says "stopped" and the exit is 3.
+// SIGINT/SIGTERM still abort.
+//
+// Exit codes: 0 done, 1 other error, 2 scope refused, 3 stopped early by a budget or SIGUSR1 (report written).
 package main
 
 import (
@@ -44,12 +48,20 @@ type deps struct {
 	ports    []int          // a shallow scope's ports
 	deep     []int          // a deep scope's ports
 	lookPath func(string) (string, error)
+	drain    <-chan struct{} // closed = stop early, keep what was found
 }
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Stderr, deps{getenv: os.Getenv, ports: tools.TopPorts, deep: tools.AllPorts(), lookPath: exec.LookPath}))
+	drain := make(chan struct{})
+	usr1 := make(chan os.Signal, 1)
+	signal.Notify(usr1, syscall.SIGUSR1)
+	go func() {
+		<-usr1
+		close(drain)
+	}()
+	os.Exit(run(ctx, os.Args[1:], os.Stderr, deps{getenv: os.Getenv, ports: tools.TopPorts, deep: tools.AllPorts(), lookPath: exec.LookPath, drain: drain}))
 }
 
 func run(ctx context.Context, args []string, stderr io.Writer, d deps) int {
@@ -135,7 +147,7 @@ func run(ctx context.Context, args []string, stderr io.Writer, d deps) int {
 	rep, runErr := engine.Run(ctx, engine.Config{
 		Scope: sc, Store: st, Env: env, LLM: client, Approval: *approval,
 		MaxDuration: time.Duration(*maxSeconds) * time.Second, MaxTokens: *maxTokens,
-		Version: Version, Log: stderr,
+		Version: Version, Log: stderr, Drain: d.drain,
 	})
 	if err := report.Write(*outDir, rep); err != nil {
 		fmt.Fprintf(stderr, "write report: %v\n", err)
@@ -147,7 +159,7 @@ func run(ctx context.Context, args []string, stderr io.Writer, d deps) int {
 			fmt.Fprintf(stderr, "run failed: %v\n", runErr)
 		}
 		return exitError
-	case rep.StoppedReason == report.StopBudgetTime || rep.StoppedReason == report.StopBudgetTokens:
+	case rep.StoppedReason == report.StopBudgetTime || rep.StoppedReason == report.StopBudgetTokens || rep.StoppedReason == report.StopStopped:
 		return exitBudget
 	}
 	return exitDone
