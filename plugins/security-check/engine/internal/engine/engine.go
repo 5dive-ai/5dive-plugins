@@ -55,6 +55,8 @@ type run struct {
 	baseProps map[string][]int64
 	factBy    map[int64]string
 	foundBy   map[string][]string
+	// traffic is what each intent sent and got back (the evidence proxy, DIVE-8921).
+	traffic map[string][]model.Exchange
 }
 
 // Run executes the scan and returns the report (also on budget stops). The error
@@ -73,6 +75,7 @@ func Run(ctx context.Context, cfg Config) (*report.Report, error) {
 		cfg: cfg, catalog: tools.Catalog(), start: time.Now(),
 		seen: map[string]bool{}, findings: map[string]model.Finding{},
 		baseProps: map[string][]int64{}, factBy: map[int64]string{}, foundBy: map[string][]string{},
+		traffic: map[string][]model.Exchange{},
 	}
 	r.rep = &report.Report{
 		RunID: cfg.Scope.RunID, StartedAt: r.start.UTC().Format(time.RFC3339),
@@ -191,6 +194,7 @@ type outcome struct {
 	in   model.Intent
 	res  tools.Result
 	err  error
+	ex   []model.Exchange
 }
 
 // execute gates every intent, runs the approved ones (one worker per intent, at
@@ -235,9 +239,13 @@ func (r *run) execute(ctx context.Context, intents []model.Intent) (string, erro
 		sem <- struct{}{}
 		go func(node int64, in model.Intent) {
 			defer func() { <-sem; wg.Done() }()
-			res, err := runTool(ctx, r.catalog[in.Tool], cfg.Env, in)
+			// Each worker records through its own proxy, so its traffic is its own.
+			rec := tools.NewRecorder()
+			env := *cfg.Env
+			env.Rec, env.Dial = rec, rec.Dial(cfg.Env.Dial)
+			res, err := runTool(ctx, r.catalog[in.Tool], &env, in)
 			mu.Lock()
-			outcomes = append(outcomes, outcome{node, in, res, err})
+			outcomes = append(outcomes, outcome{node, in, res, err, rec.Exchanges()})
 			mu.Unlock()
 		}(node, in)
 	}
@@ -263,6 +271,10 @@ func runTool(ctx context.Context, t tools.Tool, env *tools.Env, in model.Intent)
 
 func (r *run) absorb(o outcome) error {
 	st, id := r.cfg.Store, r.cfg.Scope.RunID
+	r.traffic[o.in.Key()] = append(r.traffic[o.in.Key()], o.ex...)
+	if err := st.AddTraffic(id, o.node, o.ex); err != nil {
+		return err
+	}
 	if o.err != nil {
 		r.logf("%s %s: %v", o.in.Tool, o.in.Target, o.err)
 		_, err := st.AddNode(id, o.node, "fact", map[string]string{"tool": o.in.Tool, "target": o.in.Target, "error": o.err.Error()})
@@ -283,12 +295,46 @@ func (r *run) absorb(o outcome) error {
 		}
 	}
 	for _, f := range o.res.Findings {
+		if len(f.Evidence) == 0 {
+			f.Evidence = evidenceFor(f.Asset, o.ex)
+		}
 		r.foundBy[f.ID] = append(r.foundBy[f.ID], o.in.Key())
 		if err := r.addFinding(f, o.node); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// maxEvidence caps the exchanges one finding carries; the full trail is in the store.
+const maxEvidence = 4
+
+// evidenceFor picks a finding's evidence from its step's traffic: the exchanges
+// with the address the finding is about, else all of them; a bare connect only
+// when nothing else was said.
+func evidenceFor(asset string, ex []model.Exchange) []model.Exchange {
+	var hit []model.Exchange
+	for _, e := range ex {
+		if e.Target != "" && strings.Contains(asset, e.Target) {
+			hit = append(hit, e)
+		}
+	}
+	if len(hit) == 0 {
+		hit = ex
+	}
+	var talk []model.Exchange
+	for _, e := range hit {
+		if !tools.ConnectOnly(e) {
+			talk = append(talk, e)
+		}
+	}
+	if len(talk) > 0 {
+		hit = talk
+	}
+	if len(hit) > maxEvidence {
+		hit = hit[:maxEvidence]
+	}
+	return hit
 }
 
 // baselineReach returns the intents a run WITHOUT an LLM would also run: the
@@ -366,6 +412,11 @@ func (r *run) finish(reason string) {
 				"Turn on HTTPS with a free Let's Encrypt certificate: `sudo apt install certbot` then `sudo certbot --nginx` (or `--apache`), and redirect HTTP to HTTPS.",
 				fmt.Sprintf("HTTP answered on %s port(s) %s; no TLS service found on any scanned port, with or without the site's name (SNI)", h, strings.Join(ports, ", ")))
 			r.foundBy[f.ID] = plainBy[h]
+			var ex []model.Exchange
+			for _, k := range plainBy[h] {
+				ex = append(ex, r.traffic[k]...)
+			}
+			f.Evidence = evidenceFor(h, ex)
 			_ = r.addFinding(f, r.goal)
 		}
 	}

@@ -81,6 +81,18 @@ type Finding struct {
 	// recon chain, which a re-run without an LLM repeats) or SourcePlanner (only the
 	// LLM proposed it). A retest can confirm «fixed» only for a baseline finding.
 	Source string `json:"source,omitempty"`
+	// Evidence is the traffic behind the finding: what the probe sent and what came
+	// back, recorded on the wire with secrets masked (DIVE-8921).
+	Evidence []Exchange `json:"evidence,omitempty"`
+}
+
+// Exchange is one recorded conversation with the target: one connection, or one
+// command for a tool that runs outside the engine's dialer (nmap).
+type Exchange struct {
+	Proto    string `json:"proto"`  // tcp | http | https | tls | exec
+	Target   string `json:"target"` // ip:port dialled (ip for exec)
+	Request  string `json:"request"`
+	Response string `json:"response"`
 }
 
 // Finding sources.

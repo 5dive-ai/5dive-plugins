@@ -68,6 +68,22 @@ CREATE TABLE IF NOT EXISTS findings (
 	node_id    INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
 	UNIQUE (run_id, finding_id)
 );
+CREATE TABLE IF NOT EXISTS traffic (
+	id       INTEGER PRIMARY KEY,
+	run_id   TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+	node_id  INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+	proto    TEXT NOT NULL,
+	target   TEXT NOT NULL,
+	request  TEXT NOT NULL,
+	response TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS traffic_run ON traffic(run_id);
+CREATE TABLE IF NOT EXISTS finding_evidence (
+	run_id     TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+	finding_id TEXT NOT NULL,
+	evidence   TEXT NOT NULL,
+	UNIQUE (run_id, finding_id)
+);
 `
 
 // Store wraps the sqlite database.
@@ -143,7 +159,23 @@ func (s *Store) AddApproval(runID string, step int, tool, target, decision, reas
 func (s *Store) AddFinding(runID string, f model.Finding, node int64) error {
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO findings (run_id, finding_id, severity, title, what, why, fix, proof, asset, node_id)
 		VALUES (?,?,?,?,?,?,?,?,?,?)`, runID, f.ID, f.Severity, f.Title, f.What, f.Why, f.Fix, f.Proof, f.Asset, nullID(node))
+	if err != nil || len(f.Evidence) == 0 {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT OR IGNORE INTO finding_evidence (run_id, finding_id, evidence) VALUES (?,?,?)`,
+		runID, f.ID, toJSON(f.Evidence))
 	return err
+}
+
+// AddTraffic records every exchange one step had with the target, under its intent node.
+func (s *Store) AddTraffic(runID string, node int64, ex []model.Exchange) error {
+	for _, e := range ex {
+		if _, err := s.db.Exec(`INSERT INTO traffic (run_id, node_id, proto, target, request, response) VALUES (?,?,?,?,?,?)`,
+			runID, nullID(node), e.Proto, e.Target, e.Request, e.Response); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UpsertAsset adds an asset or refreshes its last_seen and data.
