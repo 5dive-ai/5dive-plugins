@@ -29,6 +29,9 @@ func nmapScan(ctx context.Context, env *Env, in model.Intent) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("nmap: %w", err)
 	}
+	// nmap dials on its own, outside the recorder: its command and output are the trail.
+	env.Rec.Add(model.Exchange{Proto: "exec", Target: ip.String(),
+		Request: strings.Join(cmd.Args, " "), Response: render(out, len(out), maxResponse, "no output")})
 	return parseNmapXML(out)
 }
 

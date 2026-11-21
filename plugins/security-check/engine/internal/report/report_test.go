@@ -84,7 +84,7 @@ func TestWriteShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(rows[0], ",") != "id,severity,title,what,why,fix,proof,asset" || len(rows) != 5 || rows[1][6] != "p\nline2" {
+	if strings.Join(rows[0], ",") != "id,severity,title,what,why,fix,proof,asset,evidence" || len(rows) != 5 || rows[1][6] != "p\nline2" {
 		t.Errorf("csv %q", rows)
 	}
 

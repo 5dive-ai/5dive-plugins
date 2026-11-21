@@ -40,9 +40,9 @@ Exit codes: `0` done · `1` other error · `2` scope refused (before any network
 
 Outputs in `--out`:
 
-- `report.json` has `run_id, started_at, finished_at, engine_version, scope, summary{critical,high,medium,low,info}, findings[{id,severity,title,what,why,fix,proof,asset}], budget{tokens_used,seconds,max_tokens,max_seconds}, approvals[{step,tool,target,decision,reason}], stopped_reason (done|budget_time|budget_tokens|error)`. A finding `id` is stable for the same check on the same asset across runs.
+- `report.json` has `run_id, started_at, finished_at, engine_version, scope, summary{critical,high,medium,low,info}, findings[{id,severity,title,what,why,fix,proof,asset,source,evidence[{proto,target,request,response}]}], budget{tokens_used,seconds,max_tokens,max_seconds}, approvals[{step,tool,target,decision,reason}], stopped_reason (done|budget_time|budget_tokens|error)`. A finding `id` is stable for the same check on the same asset across runs. `evidence` is the recorded traffic behind the finding (at most 4 exchanges; HTTPS is recorded above TLS, so it reads as plain HTTP), with credential values in it replaced by `[hidden]`; every exchange of the run is in the sqlite `traffic` table.
 - `report.md` is plain and short, most serious first, and opens with a line like `3 things to fix, 1 urgent`.
-- `findings.csv` has one row per finding, with the same columns as `findings[]`.
+- `findings.csv` has one row per finding, with the same columns as `findings[]` (minus `source`; `evidence` as text: `>>` sent, `<<` received).
 
 `--db` (sqlite) holds two graphs: `assets` is shared across runs (host, port, service, url
 and cert, with `first_seen`/`last_seen`), and the per-run exploration graph is `runs`

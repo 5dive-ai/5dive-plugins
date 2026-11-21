@@ -31,6 +31,9 @@ type Env struct {
 	ConnectTimeout time.Duration // port scan connect timeout
 	IOTimeout      time.Duration // per-probe read/handshake timeout
 	NmapPath       string        // "" when nmap is not installed
+	// Rec records this worker's traffic as evidence; nil records nothing. Dial
+	// already goes through it when set (the engine wires both, DIVE-8921).
+	Rec *Recorder
 }
 
 // Result is what one tool run produced.
@@ -101,10 +104,24 @@ func vhost(env *Env, in model.Intent, key string, ip netip.Addr) (string, error)
 // httpClient talks to a target IP. Proxies are off, redirects are not followed
 // (a redirect could name the live box), and every dial goes through env.Dial.
 func httpClient(env *Env, sni string) *http.Client {
+	tlsCfg := &tls.Config{ServerName: sni, InsecureSkipVerify: true} //nolint:gosec // certificate health is tls_probe's job
 	tr := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           env.Dial,
-		TLSClientConfig:       &tls.Config{ServerName: sni, InsecureSkipVerify: true}, //nolint:gosec // certificate health is tls_probe's job
+		Proxy:       nil,
+		DialContext: env.Dial,
+		// Our own TLS dial, so the recorder keeps the HTTPS request and response
+		// rather than the ciphertext under them. HTTP/1.1 only, as before.
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			raw, err := env.Dial(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tc := tls.Client(raw, tlsCfg)
+			if err := tc.HandshakeContext(ctx); err != nil {
+				raw.Close()
+				return nil, err
+			}
+			return recordTLS(raw, tc, "https"), nil
+		},
 		DisableKeepAlives:     true,
 		TLSHandshakeTimeout:   env.IOTimeout,
 		ResponseHeaderTimeout: env.IOTimeout,

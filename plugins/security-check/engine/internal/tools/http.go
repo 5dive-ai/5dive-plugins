@@ -18,6 +18,7 @@ type httpTarget struct {
 	port                 int
 	client               *http.Client
 	base                 string
+	rec                  *Recorder
 }
 
 func newHTTPTarget(env *Env, in model.Intent) (*httpTarget, error) {
@@ -44,11 +45,19 @@ func newHTTPTarget(env *Env, in model.Intent) (*httpTarget, error) {
 		scheme: scheme, vhost: vh, port: port, label: scheme + "://" + label,
 		client: httpClient(env, vh),
 		base:   scheme + "://" + joinTarget(ip, port),
+		rec:    env.Rec,
 	}, nil
 }
 
-// get fetches path and returns status, headers and up to 64 KiB of body.
-func (t *httpTarget) get(ctx context.Context, path string) (int, http.Header, []byte, error) {
+// get fetches path and returns status, headers, up to 64 KiB of body, and the
+// recorded exchange as evidence.
+func (t *httpTarget) get(ctx context.Context, path string) (int, http.Header, []byte, []model.Exchange, error) {
+	mark := t.rec.Mark()
+	status, hdr, body, err := t.fetch(ctx, path)
+	return status, hdr, body, t.rec.Since(mark), err
+}
+
+func (t *httpTarget) fetch(ctx context.Context, path string) (int, http.Header, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.base+path, nil)
 	if err != nil {
 		return 0, nil, nil, err
@@ -71,7 +80,7 @@ func httpProbe(ctx context.Context, env *Env, in model.Intent) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	status, hdr, _, err := t.get(ctx, "/")
+	status, hdr, _, ev, err := t.get(ctx, "/")
 	if err != nil {
 		return Result{}, err
 	}
@@ -122,7 +131,17 @@ func httpProbe(ctx context.Context, env *Env, in model.Intent) (Result, error) {
 				fmt.Sprintf("GET / -> %d; missing: %s", status, strings.Join(headerNames(missing), ", "))))
 		}
 	}
+	withEvidence(r.Findings, ev)
 	return r, nil
+}
+
+// withEvidence gives every finding without evidence of its own the exchanges ev.
+func withEvidence(fs []model.Finding, ev []model.Exchange) {
+	for i := range fs {
+		if len(fs[i].Evidence) == 0 {
+			fs[i].Evidence = ev
+		}
+	}
 }
 
 func nonEmpty(ss ...string) []string {
@@ -210,25 +229,29 @@ func exposureProbe(ctx context.Context, env *Env, in model.Intent) (Result, erro
 		if ctx.Err() != nil {
 			return r, ctx.Err()
 		}
-		status, _, body, err := t.get(ctx, e.path)
+		status, _, body, ev, err := t.get(ctx, e.path)
 		if err != nil || status != http.StatusOK || !e.match(body) {
 			continue
 		}
-		r.Findings = append(r.Findings, model.NewFinding(e.check, e.severity, t.label+e.path, e.title,
+		f := model.NewFinding(e.check, e.severity, t.label+e.path, e.title,
 			fmt.Sprintf("%s%s can be opened by anyone.", t.label, e.path), e.why, e.fix,
-			fmt.Sprintf("GET %s -> 200; body starts: %q", e.path, model.Clip(string(body), 120))))
+			fmt.Sprintf("GET %s -> 200; body starts: %q", e.path, model.Clip(Redact(string(body)), 120)))
+		f.Evidence = ev
+		r.Findings = append(r.Findings, f)
 	}
 	for _, p := range dirListingPaths {
-		status, _, body, err := t.get(ctx, p)
+		status, _, body, ev, err := t.get(ctx, p)
 		if err != nil || status != http.StatusOK || !isDirListing(body) {
 			continue
 		}
-		r.Findings = append(r.Findings, model.NewFinding("dir-listing", model.Medium, t.label+p,
+		f := model.NewFinding("dir-listing", model.Medium, t.label+p,
 			"A folder on your website lists all its files",
 			fmt.Sprintf("Opening %s%s shows a list of every file in that folder.", t.label, p),
 			"Visitors can find and download files you never meant to share, such as backups or uploads.",
 			"Turn off folder listings: nginx `autoindex off;`, Apache `Options -Indexes`.",
-			fmt.Sprintf("GET %s -> 200; body contains a directory index", p)))
+			fmt.Sprintf("GET %s -> 200; body contains a directory index", p))
+		f.Evidence = ev
+		r.Findings = append(r.Findings, f)
 	}
 	return r, nil
 }

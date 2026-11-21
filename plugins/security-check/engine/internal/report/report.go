@@ -109,15 +109,25 @@ func Write(dir string, r *Report) error {
 	}
 	var b strings.Builder
 	w := csv.NewWriter(&b)
-	_ = w.Write([]string{"id", "severity", "title", "what", "why", "fix", "proof", "asset"})
+	_ = w.Write([]string{"id", "severity", "title", "what", "why", "fix", "proof", "asset", "evidence"})
 	for _, f := range r.Findings {
-		_ = w.Write([]string{f.ID, f.Severity, f.Title, f.What, f.Why, f.Fix, f.Proof, f.Asset})
+		_ = w.Write([]string{f.ID, f.Severity, f.Title, f.What, f.Why, f.Fix, f.Proof, f.Asset, EvidenceText(f.Evidence)})
 	}
 	w.Flush()
 	if err := w.Error(); err != nil {
 		return err
 	}
 	return writeFile(filepath.Join(dir, "findings.csv"), []byte(b.String()))
+}
+
+// EvidenceText is a finding's evidence as plain text: each exchange's target,
+// then ">>" what we sent and "<<" what came back.
+func EvidenceText(ex []model.Exchange) string {
+	parts := make([]string, len(ex))
+	for i, e := range ex {
+		parts[i] = fmt.Sprintf("%s %s\n>> %s\n<< %s", e.Proto, e.Target, e.Request, e.Response)
+	}
+	return strings.Join(parts, "\n---\n")
 }
 
 // writeFile writes atomically so a reader never sees half a report.

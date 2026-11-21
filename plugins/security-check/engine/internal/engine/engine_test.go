@@ -100,15 +100,15 @@ func TestDeterministicRunEndToEnd(t *testing.T) {
 	if rep.Summary.High != 1 {
 		t.Errorf("summary %+v", rep.Summary)
 	}
-	tools := map[string]bool{}
+	ran := map[string]bool{}
 	for _, a := range rep.Approvals {
 		if a.Decision != "approved" {
 			t.Errorf("denied in a clean run: %+v", a)
 		}
-		tools[a.Tool] = true
+		ran[a.Tool] = true
 	}
 	for _, want := range []string{"port_scan", "banner", "http_probe", "exposure_probe"} {
-		if !tools[want] {
+		if !ran[want] {
 			t.Errorf("planner never ran %s", want)
 		}
 	}
@@ -133,6 +133,38 @@ func TestDeterministicRunEndToEnd(t *testing.T) {
 	_ = db.QueryRow(`SELECT COUNT(*) FROM assets`).Scan(&assets)
 	if assets < 3 {
 		t.Errorf("only %d assets", assets)
+	}
+
+	// DIVE-8921: every finding carries the traffic behind it, and the full trail is stored.
+	for _, f := range rep.Findings {
+		if len(f.Evidence) == 0 {
+			t.Errorf("%s has no evidence", f.ID)
+		}
+		for _, e := range f.Evidence {
+			if e.Target == "" || e.Request == "" || e.Response == "" {
+				t.Errorf("%s evidence incomplete: %+v", f.ID, e)
+			}
+		}
+	}
+	if f := got["git-exposed"]; len(f.Evidence) != 1 || !strings.HasPrefix(f.Evidence[0].Request, "GET /.git/HEAD ") ||
+		!strings.Contains(f.Evidence[0].Response, "ref: refs/heads/main") {
+		t.Errorf("git-exposed evidence: %+v", f.Evidence)
+	}
+	plainAnswer := false
+	for _, e := range got["no-https"].Evidence {
+		plainAnswer = plainAnswer || (e.Proto == "http" && strings.HasPrefix(e.Response, "HTTP/1."))
+		if tools.ConnectOnly(e) {
+			t.Errorf("no-https evidence carries a bare connect beside real exchanges: %+v", e)
+		}
+	}
+	if !plainAnswer {
+		t.Errorf("no-https evidence should include the plain HTTP answer: %+v", got["no-https"].Evidence)
+	}
+	var traffic, stored int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM traffic t JOIN nodes n ON n.id = t.node_id WHERE t.run_id = 'run-1' AND n.kind = 'intent'`).Scan(&traffic)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM finding_evidence WHERE run_id = 'run-1'`).Scan(&stored)
+	if traffic < 10 || stored != len(rep.Findings) {
+		t.Errorf("stored %d exchanges under intents, %d finding evidence rows for %d findings", traffic, stored, len(rep.Findings))
 	}
 }
 
