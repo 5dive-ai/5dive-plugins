@@ -395,3 +395,49 @@ func TestFindingSourceFollowsTheWholeChain(t *testing.T) {
 	assertOnlyLoopbackDialed(t, rec)
 	assertOnlyLoopbackDialed(t, rec2)
 }
+
+// DIVE-8917: a retest scans a NEW clone with a new IP. The same site with the same
+// holes, reached at two different IPs, must report the same finding ids, or a retest
+// reads «fixed» for a problem that is still there.
+func TestSameBoxAtTwoIPsGivesTheSameFindingIDs(t *testing.T) {
+	ln, err := net.Listen("tcp", "0.0.0.0:0") // answers on 127.0.0.1 and 127.0.0.2
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.git/HEAD" {
+			fmt.Fprint(w, "ref: refs/heads/main\n")
+			return
+		}
+		fmt.Fprint(w, "<html>hello</html>")
+	}))
+	srv.Listener.Close()
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	ids := func(ip string) []string {
+		cfg, _ := newConfig(t, []int{port})
+		cfg.Scope.Targets = []scope.Target{{Kind: "ip", Value: ip}}
+		rep, err := Run(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, f := range rep.Findings {
+			if !strings.Contains(f.Asset, ip) && f.ID[:strings.LastIndex(f.ID, "-")] != "open-ports" {
+				t.Errorf("asset %q does not name the scanned IP %s", f.Asset, ip)
+			}
+			out = append(out, f.ID)
+		}
+		return out
+	}
+	a, b := ids("127.0.0.1"), ids("127.0.0.2")
+	if len(a) < 3 {
+		t.Fatalf("too few findings to compare: %v", a)
+	}
+	if strings.Join(a, ",") != strings.Join(b, ",") {
+		t.Errorf("same box, different ids:\n 127.0.0.1 %v\n 127.0.0.2 %v", a, b)
+	}
+}
