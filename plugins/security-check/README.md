@@ -62,9 +62,14 @@ round. Wall-clock and token budgets are checked between steps.
 - **Planner.** It always uses the deterministic shallow sequence: port scan, then banner,
   then SSH, HTTP, exposure and TLS probes, plus nmap when it is on PATH. When
   `SECCHECK_LLM_PROVIDERS` is set
-  (`[{"kind":"anthropic"|"openai","base_url":"…","model":"…","api_key_env":"NAME"}]`), an
-  LLM can add steps on top. The LLM never removes baseline steps. If a provider refuses or
-  errors, the next one is tried. If they all fail, the rest of the run is deterministic.
+  (`[{"kind":"anthropic"|"openai","base_url":"…","model":"…","api_key_env":"NAME","max_tokens":N}]`),
+  an LLM can add steps on top. The LLM never removes baseline steps. The engine stays on
+  the provider that last answered and rotates to the next when it refuses, errors, is
+  rate-limited (HTTP 429/529, rested for its `Retry-After`, at most 5 minutes) or has spent
+  its own `max_tokens` (optional; the run's token budget always applies). A round where
+  every usable provider is resting runs the baseline only and the LLM comes back next
+  round. Once every provider has refused, failed or spent its budget, the rest of the run
+  is deterministic. `report.json` carries each provider's spend as `llm_spend`.
 - **Gate.** Safe tools are read-only probes and are auto-approved under `auto-safe`.
   Intrusive tools (password guessing, payloads) are denied in stage 1 under every mode.
   `deny-all` runs nothing.

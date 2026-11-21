@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const goodPlan = `{"intents":[],"done":true}`
@@ -112,5 +113,156 @@ func TestParseProviders(t *testing.T) {
 		if _, err := ParseProviders(bad); err == nil {
 			t.Errorf("accepted %s", bad)
 		}
+	}
+}
+
+// scripted answers each call with the next status/text in turn (the last repeats)
+// and counts its calls.
+type scripted struct {
+	srv   *httptest.Server
+	calls int
+}
+
+func newScripted(t *testing.T, answers ...string) *scripted {
+	s := &scripted{}
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := answers[min(s.calls, len(answers)-1)]
+		s.calls++
+		switch a {
+		case "429", "529":
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(map[string]int{"429": 429, "529": 529}[a])
+		case "refuse":
+			fmt.Fprint(w, `{"content":[],"stop_reason":"refusal","usage":{"input_tokens":5,"output_tokens":0}}`)
+		default:
+			fmt.Fprintf(w, `{"content":[{"type":"text","text":%q}],"stop_reason":"end_turn","usage":{"input_tokens":%s,"output_tokens":0}}`, goodPlan, a)
+		}
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time { return c.t }
+
+func rotating(clk *clock, ps ...Provider) *Client {
+	c := NewClient(ps, env)
+	c.Now = clk.now
+	return c
+}
+
+func outcomes(as []Attempt) string {
+	var b []string
+	for _, a := range as {
+		b = append(b, a.Provider+"="+a.Outcome)
+	}
+	return strings.Join(b, " ")
+}
+
+func ask(t *testing.T, c *Client) ([]Attempt, error) {
+	t.Helper()
+	_, _, as, err := c.Complete(context.Background(), "SCOPE-LOCK", "plan", accept)
+	return as, err
+}
+
+// The client stays on the provider that answered and only moves on when it lets
+// the run down: a refusal moves the NEXT call's start too, so a refusing provider
+// is not asked first every round.
+func TestRotationStaysOnTheProviderThatAnswered(t *testing.T) {
+	a := newScripted(t, "refuse", "10")
+	b := newScripted(t, "10")
+	clk := &clock{time.Unix(0, 0)}
+	c := rotating(clk,
+		Provider{Kind: "anthropic", BaseURL: a.srv.URL, Model: "a", APIKeyEnv: "KA"},
+		Provider{Kind: "anthropic", BaseURL: b.srv.URL, Model: "b", APIKeyEnv: "KA"})
+	for i, want := range []string{
+		"anthropic:a=refused anthropic:b=ok",
+		"anthropic:b=ok",
+		"anthropic:b=ok",
+	} {
+		as, err := ask(t, c)
+		if err != nil || outcomes(as) != want {
+			t.Fatalf("call %d: %q err=%v, want %q", i, outcomes(as), err, want)
+		}
+	}
+	if a.calls != 1 || b.calls != 3 {
+		t.Errorf("calls a=%d b=%d, want 1 and 3", a.calls, b.calls)
+	}
+}
+
+// A 429 (or Anthropic's 529 overloaded) rests that provider for its Retry-After;
+// while every usable provider rests the answer is ErrNoneReady, not ErrAllFailed,
+// and the provider is asked again once the wait is over.
+func TestRateLimitRestsTheProviderThenComesBack(t *testing.T) {
+	a := newScripted(t, "429", "10")
+	b := newScripted(t, "529", "10")
+	clk := &clock{time.Unix(0, 0)}
+	c := rotating(clk,
+		Provider{Kind: "anthropic", BaseURL: a.srv.URL, Model: "a", APIKeyEnv: "KA"},
+		Provider{Kind: "anthropic", BaseURL: b.srv.URL, Model: "b", APIKeyEnv: "KA"})
+
+	as, err := ask(t, c)
+	if !errors.Is(err, ErrNoneReady) || outcomes(as) != "anthropic:a=rate_limited anthropic:b=rate_limited" {
+		t.Fatalf("first: %q err=%v", outcomes(as), err)
+	}
+	clk.t = clk.t.Add(30 * time.Second)
+	as, err = ask(t, c)
+	if !errors.Is(err, ErrNoneReady) || outcomes(as) != "anthropic:a=skipped anthropic:b=skipped" || a.calls+b.calls != 2 {
+		t.Fatalf("resting: %q err=%v calls=%d", outcomes(as), err, a.calls+b.calls)
+	}
+	clk.t = clk.t.Add(31 * time.Second)
+	as, err = ask(t, c)
+	if err != nil || outcomes(as) != "anthropic:a=ok" {
+		t.Fatalf("after the wait: %q err=%v", outcomes(as), err)
+	}
+}
+
+// Each profile has its own token budget: a spent one is skipped and the run goes
+// on with the others; once all are spent the LLM is done for the run.
+func TestPerProfileBudget(t *testing.T) {
+	a := newScripted(t, "60")
+	b := newScripted(t, "40")
+	clk := &clock{time.Unix(0, 0)}
+	c := rotating(clk,
+		Provider{Kind: "anthropic", BaseURL: a.srv.URL, Model: "a", APIKeyEnv: "KA", MaxTokens: 100},
+		Provider{Kind: "anthropic", BaseURL: b.srv.URL, Model: "b", APIKeyEnv: "KA", MaxTokens: 50})
+	for i, want := range []string{
+		"anthropic:a=ok",                          // a: 60
+		"anthropic:a=ok",                          // a: 120, over its 100
+		"anthropic:a=skipped anthropic:b=ok",      // b: 40
+		"anthropic:b=ok",                          // b: 80, over its 50
+		"anthropic:b=skipped anthropic:a=skipped", // both spent
+	} {
+		as, err := ask(t, c)
+		if outcomes(as) != want {
+			t.Fatalf("call %d: %q err=%v, want %q", i, outcomes(as), err, want)
+		}
+		if i == 4 && !errors.Is(err, ErrAllFailed) {
+			t.Fatalf("all spent: err=%v, want ErrAllFailed", err)
+		}
+	}
+	got := c.Spent()
+	if len(got) != 2 || got[0] != (Spend{"anthropic:a", 120, 100}) || got[1] != (Spend{"anthropic:b", 80, 50}) {
+		t.Errorf("spent %+v", got)
+	}
+}
+
+func TestRetryAfter(t *testing.T) {
+	now := time.Date(2026, 11, 21, 4, 0, 0, 0, time.UTC)
+	for h, want := range map[string]time.Duration{
+		"":                              defaultCooldown,
+		"junk":                          defaultCooldown,
+		"7":                             7 * time.Second,
+		"0":                             time.Second,
+		"86400":                         maxCooldown,
+		"Sat, 21 Nov 2026 04:00:20 GMT": 20 * time.Second,
+	} {
+		if got := retryAfter(h, now); got != want {
+			t.Errorf("Retry-After %q: %s, want %s", h, got, want)
+		}
+	}
+	if _, err := ParseProviders(`[{"kind":"openai","model":"x","api_key_env":"K","max_tokens":-1}]`); err == nil {
+		t.Errorf("negative max_tokens accepted")
 	}
 }
