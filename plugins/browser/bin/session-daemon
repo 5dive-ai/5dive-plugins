@@ -69,6 +69,14 @@ const scratchTabs = new WeakSet();
 const scratch = (p) => { try { if (p && typeof p === 'object') scratchTabs.add(p); } catch (e) { /* not a page */ } return p; };
 const cleanExit = require(path.join(__dirname, '..', 'lib', 'clean-exit.cjs'));
 const sessionKeep = require(path.join(__dirname, '..', 'lib', 'session-keep.cjs'));
+// DIVE-8696: the version this daemon was started from, read once while its
+// install is still there, so a daemon outliving it can say which one it was.
+const OWN_VERSION = (() => {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, '..', '.claude-plugin', 'plugin.json'), 'utf8')).version || '?'; }
+  catch (e) { return '?'; }
+})();
+// The words a caller keys on to start the current version and try once more.
+const UPDATED_AWAY = 'updated away';
 // What each tab looked like when the agent last saw it, so an act can answer with
 // what changed instead of the whole page (DIVE-6795, lib/look.cjs).
 const look = require(path.join(__dirname, '..', 'lib', 'look.cjs'));
@@ -394,6 +402,40 @@ async function serveMode(profile, sock, broker, input) {
     if (behalf) env.FIVEDIVE_BROWSER_ON_BEHALF_OF = behalf;
     return cp.spawnSync(selfBrowser, args, { env, encoding: 'utf8' });
   };
+
+  // AN INSTALL THAT HAS BEEN UPDATED AWAY (DIVE-8696). The plugin is reached
+  // through `enabled/<plugin>`, a link the nightly update moves to the new
+  // version; node resolved it at start, so `selfBrowser` is in the VERSIONED
+  // directory, and the box keeps only the last few. Once this daemon's version
+  // is pruned every brokerCall is ENOENT with no output at all: other seats
+  // read "busy: somebody else holds it" while `lease --status` read free, for
+  // days (box report 1134), and the owner's own path never noticed. A daemon
+  // whose own code is gone cannot be patched in place (the link now names
+  // NEWER bin/browser, which must not drive this older daemon), so it steps
+  // aside the way a swap does and the caller's on-demand serve starts the
+  // current version.
+  const installGone = () => !fs.existsSync(selfBrowser);
+  let steppingAside = false;
+  const stepAside = async (send, end) => {
+    send({ t: 'err', msg: `${UPDATED_AWAY}: this browser was started by plugin ${OWN_VERSION}, which has been ` +
+      `updated away, so it cannot take a lease or log a request any more. It is restarting; the next ` +
+      `request starts the current version. Nothing ran.` });
+    end(E_UNAVAILABLE);
+    if (steppingAside) return;
+    steppingAside = true;
+    process.stderr.write(`${PROG}: plugin ${OWN_VERSION} was updated away; stepping aside\n`);
+    if (typeof ctx.cookies === 'function') {
+      try { await sessionKeep.keepSessionCookies(ctx); } catch (e) { /* a stop must not fail on this */ }
+    }
+    // The socket goes LAST, after Chrome has written the profile out: a caller
+    // waits for it to vanish before starting the new browser in that profile.
+    shuttingDown = true;
+    try { await ctx.close(); } catch (e) { /* going anyway */ }
+    cleanup(); process.exit(0);
+  };
+  // A brokerCall that failed for any other reason says so instead of nothing.
+  const brokerFailed = (r) => (r.error ? `the browser plugin could not be run as the owner: ${r.error.message}` :
+    r.status === null ? `the browser plugin was stopped by ${r.signal || 'a signal'} while answering` : '');
   const chrome = process.env.FIVEDIVE_BROWSER_CHROME;
   if (!chrome) die(E_UNAVAILABLE, 'no chrome named for this daemon — a session must be held in the same ' +
     'browser the profile was logged in with, so the executable is passed in rather than guessed here.');
@@ -554,8 +596,11 @@ async function serveMode(profile, sock, broker, input) {
           send({ t: 'err', msg: `the lease anchor ${req.anchor} is not a process of the calling seat, so it cannot hold this browser. Nothing was taken.` });
           return end(E_PERM);
         }
+        if (installGone()) return stepAside(send, end);
         const r = brokerCall(['_broker-lease', site, act,
           String(req.purpose || 'brokered'), String(req.ttl || ''), String(req.token || ''), anchor], behalf);
+        const failed = brokerFailed(r);
+        if (failed) send({ t: 'err', msg: failed });
         if (r.stderr) send({ t: 'err', msg: String(r.stderr).trim() });
         if (r.stdout) send({ t: 'out', data: String(r.stdout) });
         return end(r.status === null ? E_UNAVAILABLE : r.status);
@@ -603,6 +648,7 @@ async function serveMode(profile, sock, broker, input) {
       // re-reads the lease file before each step (assertLease), so a request
       // that waited behind somebody else's still refuses if the lease moved.
       // Bounded, and a refusal after the bound says what is in flight.
+      if (behalf && installGone()) return stepAside(send, end);
       if (busy) {
         const until = Date.now() + BUSY_WAIT_MS;
         while (busy && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
