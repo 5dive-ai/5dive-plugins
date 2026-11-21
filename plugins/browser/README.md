@@ -110,7 +110,9 @@ Telegram for the owner. Why the odd one out: a page the agent reads can carry hi
 and a post or a delete can be undone or apologised for — money charged to your card cannot. The
 owner changes it with a preset, `sudo 5dive browser approvals policy set standard` (this default),
 `set yolo` (all four allow) or `set careful` (all four ask: the exit-73 stop), and per kind with
-`set <kind>=ask|allow`, on top of any of them. `mode` is computed from the four: `standard`,
+`set <kind>=ask|allow|always`, on top of any of them. `allow` still asks for `send` and `publish` right
+after the agent read a page this turn (a page can carry hidden orders, DIVE-7972); `always` goes ahead even
+then: `set send=always` lets agents answer private messages while paying keeps asking (DIVE-8641). `mode` is computed from the four: `standard`,
 `yolo`, `careful`, or `custom`. The file lives at `/var/lib/5dive/browser-profiles/.approval-policy.json`, root-owned
 `0644`: every seat reads it, none writes it (a seat's `set` is refused, 77), and one the granting
 uid does not own is ignored, so the default applies and a seat can neither loosen nor tighten
