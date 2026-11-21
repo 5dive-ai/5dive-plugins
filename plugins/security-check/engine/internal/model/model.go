@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/netip"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -75,12 +77,24 @@ type Finding struct {
 	Fix      string `json:"fix"`
 	Proof    string `json:"proof"`
 	Asset    string `json:"asset"`
+	// Source says what planned the step that found it: SourceBaseline (the fixed
+	// recon chain, which a re-run without an LLM repeats) or SourcePlanner (only the
+	// LLM proposed it). A retest can confirm «fixed» only for a baseline finding.
+	Source string `json:"source,omitempty"`
 }
 
+// Finding sources.
+const (
+	SourceBaseline = "baseline"
+	SourcePlanner  = "planner"
+)
+
 // NewFinding builds a finding whose id is stable for the same check on the same asset,
-// so later runs can tell a finding that stayed from one that is new.
+// so later runs can tell a finding that stayed from one that is new. Every run scans a
+// NEW clone with a new IP, so the id hashes the asset with its IP address replaced by
+// a fixed word: the same open port is the same finding on any clone (DIVE-8917).
 func NewFinding(check, severity, asset, title, what, why, fix, proof string) Finding {
-	sum := sha256.Sum256([]byte(check + "\x00" + asset))
+	sum := sha256.Sum256([]byte(check + "\x00" + StableAsset(asset)))
 	return Finding{
 		ID:       fmt.Sprintf("%s-%s", check, hex.EncodeToString(sum[:4])),
 		Severity: severity,
@@ -91,6 +105,24 @@ func NewFinding(check, severity, asset, title, what, why, fix, proof string) Fin
 		Proof:    Clip(proof, 600),
 		Asset:    asset,
 	}
+}
+
+// addrLike matches a run of characters an IP address (with or without a port) is made of.
+var addrLike = regexp.MustCompile(`[0-9A-Fa-f:.]+`)
+
+// StableAsset replaces every IP address in an asset label with "server", keeping the
+// port and everything else: "203.0.113.10:5432" -> "server:5432",
+// "https://example.com (203.0.113.10:443)" -> "https://example.com (server:443)".
+func StableAsset(asset string) string {
+	return addrLike.ReplaceAllStringFunc(asset, func(s string) string {
+		if _, err := netip.ParseAddr(s); err == nil {
+			return "server"
+		}
+		if ap, err := netip.ParseAddrPort(s); err == nil && !ap.Addr().Is6() {
+			return fmt.Sprintf("server:%d", ap.Port())
+		}
+		return s
+	})
 }
 
 // Asset is a node of the cross-run asset graph.

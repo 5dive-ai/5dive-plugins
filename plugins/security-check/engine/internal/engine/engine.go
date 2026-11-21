@@ -49,6 +49,12 @@ type run struct {
 	order    []string
 	rep      *report.Report
 	llmOff   bool
+	// What decides a finding's Source at finish (baselineReach): every parent
+	// the baseline proposed each intent from, the intent behind each fact, and
+	// the intents behind each finding.
+	baseProps map[string][]int64
+	factBy    map[int64]string
+	foundBy   map[string][]string
 }
 
 // Run executes the scan and returns the report (also on budget stops). The error
@@ -66,6 +72,7 @@ func Run(ctx context.Context, cfg Config) (*report.Report, error) {
 	r := &run{
 		cfg: cfg, catalog: tools.Catalog(), start: time.Now(),
 		seen: map[string]bool{}, findings: map[string]model.Finding{},
+		baseProps: map[string][]int64{}, factBy: map[int64]string{}, foundBy: map[string][]string{},
 	}
 	r.rep = &report.Report{
 		RunID: cfg.Scope.RunID, StartedAt: r.start.UTC().Format(time.RFC3339),
@@ -149,6 +156,9 @@ func (r *run) loop(parent context.Context) (string, error) {
 // LLM is configured and has not failed, whatever the LLM adds.
 func (r *run) plan(ctx context.Context) ([]model.Intent, error) {
 	out := baseline(r.cfg.Scope, r.cfg.Env.NmapPath != "", r.facts)
+	for _, in := range out {
+		r.baseProps[in.Key()] = append(r.baseProps[in.Key()], in.ParentNode)
+	}
 	if r.cfg.LLM == nil || r.llmOff {
 		return out, nil
 	}
@@ -264,6 +274,7 @@ func (r *run) absorb(o outcome) error {
 			return err
 		}
 		f.Node = n
+		r.factBy[n] = o.in.Key()
 		r.facts = append(r.facts, f)
 	}
 	for _, a := range o.res.Assets {
@@ -272,11 +283,37 @@ func (r *run) absorb(o outcome) error {
 		}
 	}
 	for _, f := range o.res.Findings {
+		r.foundBy[f.ID] = append(r.foundBy[f.ID], o.in.Key())
 		if err := r.addFinding(f, o.node); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// baselineReach returns the intents a run WITHOUT an LLM would also run: the
+// baseline proposed them from the goal, or from a fact that such an intent
+// produced. The baseline is stateless and also proposes from facts only an LLM
+// step found (a port the LLM scanned), so being proposed by it is not enough:
+// the whole chain back to the goal must be baseline. Resolved at finish because
+// the LLM can reach an intent a round before the baseline does.
+func (r *run) baselineReach() map[string]bool {
+	reach := map[string]bool{}
+	for changed := true; changed; {
+		changed = false
+		for k, parents := range r.baseProps {
+			if reach[k] {
+				continue
+			}
+			for _, p := range parents {
+				if p == 0 || reach[r.factBy[p]] {
+					reach[k], changed = true, true
+					break
+				}
+			}
+		}
+	}
+	return reach
 }
 
 func (r *run) addFinding(f model.Finding, parent int64) error {
@@ -299,7 +336,7 @@ func (r *run) addFinding(f model.Finding, parent int64) error {
 func (r *run) finish(reason string) {
 	// One no-https finding per host, not per port: :80 and :443 answering plain
 	// HTTP is one unencrypted website (DIVE-8908).
-	plain, tls := map[string][]string{}, false
+	plain, plainBy, tls := map[string][]string{}, map[string][]string{}, false
 	for _, f := range r.facts {
 		if f.Kind == "service" && f.Data["proto"] == "http" {
 			host, port, err := net.SplitHostPort(f.Target)
@@ -307,6 +344,7 @@ func (r *run) finish(reason string) {
 				host = f.Target
 			}
 			plain[host] = append(plain[host], port)
+			plainBy[host] = append(plainBy[host], r.factBy[f.Node])
 		}
 		if f.Kind == "service" && f.Data["proto"] == "tls" {
 			tls = true
@@ -321,16 +359,27 @@ func (r *run) finish(reason string) {
 		for _, h := range hosts {
 			ports := plain[h]
 			sort.Strings(ports)
-			_ = r.addFinding(model.NewFinding("no-https", model.Medium, h,
+			f := model.NewFinding("no-https", model.Medium, h,
 				"Your website is not encrypted",
 				"Your server answers web requests only without encryption (plain HTTP, no HTTPS).",
 				"Anything visitors send, such as passwords or form contents, can be read or changed by anyone on the network path.",
 				"Turn on HTTPS with a free Let's Encrypt certificate: `sudo apt install certbot` then `sudo certbot --nginx` (or `--apache`), and redirect HTTP to HTTPS.",
-				fmt.Sprintf("HTTP answered on %s port(s) %s; no TLS service found on any scanned port, with or without the site's name (SNI)", h, strings.Join(ports, ", "))), r.goal)
+				fmt.Sprintf("HTTP answered on %s port(s) %s; no TLS service found on any scanned port, with or without the site's name (SNI)", h, strings.Join(ports, ", ")))
+			r.foundBy[f.ID] = plainBy[h]
+			_ = r.addFinding(f, r.goal)
 		}
 	}
+	reach := r.baselineReach()
 	for _, id := range r.order {
-		r.rep.Findings = append(r.rep.Findings, r.findings[id])
+		f := r.findings[id]
+		f.Source = model.SourcePlanner
+		for _, k := range r.foundBy[id] {
+			if reach[k] {
+				f.Source = model.SourceBaseline
+				break
+			}
+		}
+		r.rep.Findings = append(r.rep.Findings, f)
 	}
 	end := time.Now()
 	r.rep.FinishedAt = end.UTC().Format(time.RFC3339)
