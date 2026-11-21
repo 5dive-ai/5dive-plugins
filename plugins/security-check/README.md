@@ -27,7 +27,12 @@ seccheck version
 ```
 
 Exit codes: `0` done · `1` other error · `2` scope refused (before any network I/O) ·
-`3` budget exhausted (the report is still written).
+`3` stopped early by a budget or by `SIGUSR1` (the report is still written).
+
+Stopping a check early (`kill -USR1 <pid>`): no new step starts, the running steps get 30 s
+to finish and are then cancelled, and `report.json` says `stopped_reason: "stopped"` with
+everything found so far. `SIGINT`/`SIGTERM` still abort (exit 1). Send `SIGUSR1` only to an
+engine built with it: an older one dies on it (Go's default) and writes no report.
 
 `scope.json` (written only by the control plane):
 
@@ -42,7 +47,7 @@ deeper sweep: every TCP port, same probes and gate). Any other value is refused.
 
 Outputs in `--out`:
 
-- `report.json` has `run_id, started_at, finished_at, engine_version, scope, summary{critical,high,medium,low,info}, findings[{id,severity,title,what,why,fix,proof,asset,source,evidence[{proto,target,request,response}]}], budget{tokens_used,seconds,max_tokens,max_seconds}, approvals[{step,tool,target,decision,reason}], stopped_reason (done|budget_time|budget_tokens|error), changes{earlier_runs,since,new_assets[{kind,key,data}],new_findings}`. `changes` is absent on a server's first run; otherwise a finding no earlier run (check or retest) of the same `--db` reported carries `"new": true`, and `new_assets` lists what this run was the first to see. «New» means never seen before, not «absent last time», and there is no «gone» list: the LLM looks in different places each run, so not finding something does not prove it was removed. A finding `id` is stable for the same check on the same asset across runs. `evidence` is the recorded traffic behind the finding (at most 4 exchanges; HTTPS is recorded above TLS, so it reads as plain HTTP), with credential values in it replaced by `[hidden]`; every exchange of the run is in the sqlite `traffic` table.
+- `report.json` has `run_id, started_at, finished_at, engine_version, scope, summary{critical,high,medium,low,info}, findings[{id,severity,title,what,why,fix,proof,asset,source,evidence[{proto,target,request,response}]}], budget{tokens_used,seconds,max_tokens,max_seconds}, approvals[{step,tool,target,decision,reason}], stopped_reason (done|budget_time|budget_tokens|stopped|error), changes{earlier_runs,since,new_assets[{kind,key,data}],new_findings}`. `changes` is absent on a server's first run; otherwise a finding no earlier run (check or retest) of the same `--db` reported carries `"new": true`, and `new_assets` lists what this run was the first to see. «New» means never seen before, not «absent last time», and there is no «gone» list: the LLM looks in different places each run, so not finding something does not prove it was removed. A finding `id` is stable for the same check on the same asset across runs. `evidence` is the recorded traffic behind the finding (at most 4 exchanges; HTTPS is recorded above TLS, so it reads as plain HTTP), with credential values in it replaced by `[hidden]`; every exchange of the run is in the sqlite `traffic` table.
 - `report.md` is plain and short, most serious first, and opens with a line like `3 things to fix, 1 urgent`.
 - `findings.csv` has one row per finding, with the same columns as `findings[]` (minus `source`; `evidence` as text: `>>` sent, `<<` received).
 
