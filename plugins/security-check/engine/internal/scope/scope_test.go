@@ -32,7 +32,7 @@ func TestLoadRefusesBadScopes(t *testing.T) {
 		"cidr":            `{"run_id":"r1","targets":[{"kind":"ip","value":"203.0.113.0/24"}]}`,
 		"unspecified":     `{"run_id":"r1","targets":[{"kind":"ip","value":"0.0.0.0"}]}`,
 		"bad host name":   `{"run_id":"r1","targets":[{"kind":"ip","value":"203.0.113.7"}],"host_names":["evil.com:443"]}`,
-		"deep depth":      `{"run_id":"r1","targets":[{"kind":"ip","value":"203.0.113.7"}],"depth":"deep"}`,
+		"unknown depth":   `{"run_id":"r1","targets":[{"kind":"ip","value":"203.0.113.7"}],"depth":"exploit"}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -44,6 +44,20 @@ func TestLoadRefusesBadScopes(t *testing.T) {
 	}
 	if _, err := scope.Load(filepath.Join(t.TempDir(), "missing.json")); !errors.Is(err, scope.ErrRefused) {
 		t.Fatalf("missing file: want ErrRefused, got %v", err)
+	}
+}
+
+// DIVE-8925: the depth dial. Deep is accepted; an older control plane that
+// never sends a depth still gets shallow.
+func TestDepthDial(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"run_id":"r1","targets":[{"kind":"ip","value":"203.0.113.7"}],"depth":"deep"}`: scope.Deep,
+		`{"run_id":"r1","targets":[{"kind":"ip","value":"203.0.113.7"}]}`:                scope.Shallow,
+	} {
+		s, err := scope.Load(writeScope(t, body))
+		if err != nil || s.Depth != want {
+			t.Fatalf("%s: depth %v, err %v; want %s", body, s, err, want)
+		}
 	}
 }
 

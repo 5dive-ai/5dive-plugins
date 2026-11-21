@@ -19,6 +19,7 @@ func testDeps(t *testing.T, rec *testnet.Recorder, env map[string]string) deps {
 		getenv:   func(k string) string { return env[k] },
 		dial:     rec.Dial,
 		ports:    []int{1}, // never the real top-100 list against this host's loopback
+		deep:     []int{1, 2},
 		lookPath: func(string) (string, error) { return "", fmt.Errorf("no nmap in tests") },
 	}
 }
@@ -113,5 +114,24 @@ func TestDenyAllRunsNothing(t *testing.T) {
 		"--db", filepath.Join(dir, "e.sqlite"), "--out", dir, "--approval", "deny-all"}, &bytes.Buffer{}, testDeps(t, rec, nil))
 	if code != exitDone || len(rec.Seen()) != 0 {
 		t.Fatalf("exit %d dials %v", code, rec.Seen())
+	}
+}
+
+// DIVE-8925: a deep scope sweeps the deep port list, a shallow one the common list.
+func TestDepthPicksThePortList(t *testing.T) {
+	testnet.TrapDNS(t)
+	for depth, want := range map[string]int{"shallow": 1, "deep": 2} {
+		dir := t.TempDir()
+		rec := testnet.NewRecorder(t)
+		var stderr bytes.Buffer
+		body := fmt.Sprintf(`{"run_id":"r-%s","targets":[{"kind":"ip","value":"127.0.0.1"}],"depth":%q}`, depth, depth)
+		code := run(context.Background(), []string{"run", "--scope", writeScope(t, dir, body),
+			"--db", filepath.Join(dir, "e.sqlite"), "--out", filepath.Join(dir, "out")}, &stderr, testDeps(t, rec, nil))
+		if code != exitDone {
+			t.Fatalf("%s: exit %d (%s)", depth, code, stderr.String())
+		}
+		if got := len(rec.Seen()); got != want {
+			t.Errorf("%s: dialed %d ports %v, want %d", depth, got, rec.Seen(), want)
+		}
 	}
 }

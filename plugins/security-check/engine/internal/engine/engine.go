@@ -113,7 +113,7 @@ func (r *run) loop(parent context.Context) (string, error) {
 		return "", err
 	}
 	goal, err := cfg.Store.AddNode(cfg.Scope.RunID, 0, "goal", map[string]any{
-		"goal": "shallow self-check of the owner's cloned server", "targets": cfg.Scope.Targets, "depth": "shallow",
+		"goal": cfg.Scope.Depth + " self-check of the owner's cloned server", "targets": cfg.Scope.Targets, "depth": cfg.Scope.Depth,
 	})
 	if err != nil {
 		return "", err
@@ -378,6 +378,36 @@ func (r *run) addFinding(f model.Finding, parent int64) error {
 	return nil
 }
 
+// changes marks what no earlier run on this server saw: findings by check and
+// clone-free asset, assets by their clone-free key (DIVE-8925). On failure the
+// report simply has no comparison; the findings themselves are unaffected.
+func (r *run) changes() error {
+	st, id := r.cfg.Store, r.cfg.Scope.RunID
+	n, since, err := st.EarlierRuns(id)
+	if err != nil || n == 0 {
+		return err
+	}
+	seen, err := st.EarlierFindings(id)
+	if err != nil {
+		return err
+	}
+	assets, err := st.NewAssets(id)
+	if err != nil {
+		return err
+	}
+	c := &report.Changes{EarlierRuns: n, Since: since, NewAssets: assets}
+	for _, fid := range r.order {
+		f := r.findings[fid]
+		if !seen[model.FindingKey(f.ID, f.Asset)] {
+			f.New = true
+			r.findings[fid] = f
+			c.NewFindings++
+		}
+	}
+	r.rep.Changes = c
+	return nil
+}
+
 // finish adds whole-run findings and fills the report.
 func (r *run) finish(reason string) {
 	// One no-https finding per host, not per port: :80 and :443 answering plain
@@ -419,6 +449,9 @@ func (r *run) finish(reason string) {
 			f.Evidence = evidenceFor(h, ex)
 			_ = r.addFinding(f, r.goal)
 		}
+	}
+	if err := r.changes(); err != nil {
+		r.logf("what is new since the last check: %v", err)
 	}
 	reach := r.baselineReach()
 	for _, id := range r.order {

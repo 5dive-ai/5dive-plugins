@@ -29,6 +29,13 @@ type Scope struct {
 	Depth     string   `json:"depth"`
 }
 
+// Depths. Deep is the owner's opt-in deeper sweep (DIVE-8925): every TCP port
+// instead of the common ones. Same tools, same gate, same scope: deeper, not wider.
+const (
+	Shallow = "shallow"
+	Deep    = "deep"
+)
+
 // Owner names the server the clone was made from.
 type Owner struct {
 	ServerID int64  `json:"server_id"`
@@ -63,13 +70,13 @@ func Load(path string) (*Scope, error) {
 		s.HostNames = []string{}
 	}
 	if s.Depth == "" {
-		s.Depth = "shallow"
+		s.Depth = Shallow
 	}
 	return &s, nil
 }
 
 // Validate refuses a scope that is empty, names a non-IP target, or asks for a
-// depth stage 1 does not have.
+// depth the engine does not have.
 func (s *Scope) Validate() error {
 	refuse := func(format string, a ...any) error {
 		return fmt.Errorf("%w: %s", ErrRefused, fmt.Sprintf(format, a...))
@@ -98,9 +105,9 @@ func (s *Scope) Validate() error {
 		}
 	}
 	switch s.Depth {
-	case "", "shallow":
+	case "", Shallow, Deep:
 	default:
-		return refuse("depth %q is not available (only \"shallow\")", s.Depth)
+		return refuse("depth %q is not available (only \"shallow\" or \"deep\")", s.Depth)
 	}
 	return nil
 }
