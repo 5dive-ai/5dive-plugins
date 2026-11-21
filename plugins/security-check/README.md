@@ -88,6 +88,6 @@ go test ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o seccheck ./cmd/seccheck
 ```
 
-Go 1.22. The only dependencies are `modernc.org/sqlite` and `golang.org/x/crypto`. CI:
+Go 1.25 (golang.org/x/crypto needs it). The only dependencies are `modernc.org/sqlite` and `golang.org/x/crypto`. CI:
 `.github/workflows/security-check.yml` uploads the amd64 and arm64 binaries.
 `bin/security-check` only launches the binary that sits next to it.
