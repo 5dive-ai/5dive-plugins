@@ -110,30 +110,40 @@ describe('reply text', () => {
 })
 
 describe('the box reader stands down while a package reads (DIVE-8146)', () => {
-  // A live process whose program is named `pi`: a symlink to sleep.
-  const liveNamed = (name: string) => {
+  // A live process whose program is named `pi`: bash under that name, which,
+  // unlike multi-call sleep on ubuntu-26.04, runs whatever it is called (`; :`
+  // keeps bash from exec'ing sleep in its place). spawn() returns before the
+  // child has exec'd, so wait until /proc shows the name before handing it out.
+  const liveNamed = async (name: string) => {
     const d = tmp()
-    symlinkSync('/bin/sleep', join(d, name))
-    const p = spawn(join(d, name), ['30'], { stdio: 'ignore' })
+    symlinkSync('/bin/bash', join(d, name))
+    const p = spawn(join(d, name), ['-c', 'sleep 30; :'], { stdio: 'ignore' })
     cleanups.push(() => { try { p.kill('SIGKILL') } catch {} })
-    return p.pid!
+    const deadline = Date.now() + 2_000
+    for (;;) {
+      let argv0 = ''
+      try { argv0 = readFileSync(`/proc/${p.pid}/cmdline`, 'utf8').split('\0')[0] } catch {}
+      if (argv0.split('/').pop() === name) return p.pid!
+      if (Date.now() > deadline) throw new Error(`${name} (pid ${p.pid}) never showed in /proc: ${JSON.stringify(argv0)}`)
+      await Bun.sleep(10)
+    }
   }
 
-  test('only a live process of that runtime holds the inbox', () => {
+  test('only a live process of that runtime holds the inbox', async () => {
     const s = tmp()
     expect(readerActive(s, 'pi')).toBe(false)                         // no mark
-    const pi = liveNamed('pi')
+    const pi = await liveNamed('pi')
     spool.claimReader(s, 'pi', pi)
     expect(readerActive(s, 'pi')).toBe(true)
     expect(readerActive(s, 'opencode')).toBe(false)                   // marked for the other runtime
-    const other = liveNamed('sleepy')
+    const other = await liveNamed('sleepy')
     spool.claimReader(s, 'pi', other)
     expect(readerActive(s, 'pi')).toBe(false)                         // a reused pid, another program
     spool.claimReader(s, 'pi', 2 ** 22 + 7)
     expect(readerActive(s, 'pi')).toBe(false)                         // dead pid (above pid_max)
     writeFileSync(spool.readerFile(s), '{nope')
     expect(readerActive(s, 'pi')).toBe(false)                         // unreadable mark
-    const oc = liveNamed('opencode')
+    const oc = await liveNamed('opencode')
     spool.claimReader(s, 'opencode', oc)
     expect(readerActive(s, 'opencode')).toBe(true)
   })
