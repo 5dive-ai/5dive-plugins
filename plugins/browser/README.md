@@ -593,6 +593,49 @@ directory (`<profile-root>/<seat>/.routines/<site>/`), keyed by host on the publ
 Measured on en.wikipedia.org with real Chrome in CI (`tests/browser_routine_bench.sh`, the
 `routine-bench` job): the run-1-vs-run-3 table is in that job's summary and on the PR.
 
+### `mint` — a site task, kept as a tool every agent here can call (DIVE-9033)
+
+```
+5dive browser mint <url-with-{{input}}> <tool> --task="<plain words>" --inputs='{…}' --outputs='{…}' --example='{…}'
+                   [--steps='[…]' | --from-routine=<routine>] [--write] [--private] [--no-trial] [--json]
+5dive browser mint <site> <tool> --url=<url-with-{{input}}> …        # a site the box is signed in to
+5dive browser replay <site> <tool> --input='{"name":"value"}' [--approved=<id>] [--json]
+5dive browser tools [ls] [<site>] [--json] | show <site> <tool> [--json] | forget <site> <tool>
+```
+
+A routine replays fixed steps with positional values. A **tool** is the same acts with **named,
+typed inputs** and **typed outputs**: a `{{name}}` placeholder in the URL (percent-encoded) or in
+a step's value (as typed) is an input, and each output is one read-only page script (the `eval`
+step: Chrome's side-effect check, cookies off) run at the end of the last act. The idea is
+Pomerado's (github.com/Pomerado/pomerado, MIT): do the example once, generalize it into an
+operation with an input and an output schema, serve it as a tool, run it with no model. No code
+of theirs is copied. Their minter is an OpenAI model that writes a code module; here the agent
+that already explored the site (the box's own Claude) names what varies, and what is saved is
+data, never a program.
+
+- **The example is the test.** `mint` runs the tool once with `--example` and saves it only if
+  every output came back and matched its type (a required string must not be empty). The
+  example's values are never saved. `--no-trial` is for a `--write` tool only.
+- **Every run is an `act`**, as replay's are: lease, scope, login gate, the owner's policy and
+  approvals. The host of a URL is never a placeholder, and a run whose filled URL changed host is
+  refused, so no input points a tool at another site. A re-picked ref is written back (the
+  self-heal), only into a tool file the running seat owns.
+- **Read or write.** A read tool (the default) takes no `--approved`; if it reaches a pay, post,
+  send or delete step it stops (exit 73) and says it was minted wrong. A `--write` tool stops
+  for the owner like any act, and one that fails after it began acting reports
+  `possible_commit: true`.
+- **Where.** The box's shelf, `/var/lib/5dive-browser-tools` (root, 1777 and sticky, made by
+  `setup`): any seat adds a tool, only its owner replaces or forgets it, and a file anyone else
+  can write is not run. `--private`, or a box with no shelf yet, keeps it under the seat's own
+  0700 directory beside its routines; a seat's own tool wins a name. `tools` lists both, with
+  who minted each and the line that calls it.
+- **Not yet:** a second model reviewing each step while it is minted (Pomerado's Guardian), and
+  serving tools over MCP. A tool does not type a saved login: connect the site, then mint the
+  steps after the sign-in.
+
+The live arm (the `mint` step of the `routine-bench` job) mints one read tool on en.wikipedia.org
+in real Chrome and replays it with two other inputs, 0 model calls.
+
 ### `browser read` — Markdown and provenance from the authenticated page
 
 ```

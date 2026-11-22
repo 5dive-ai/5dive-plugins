@@ -298,6 +298,14 @@ usage() {
                                       # element moved is re-picked (reflex) and the cache
                                       # updated; one that cannot be stops the replay.
   5dive browser routine ls [<site>] | show <site> <name> | forget <site> <name> [--from=<k>]
+  5dive browser mint <url-with-{{input}}> <tool> --task="…" --inputs='{…}' --outputs='{…}' --example='{…}' [--write]
+                                      # turn a site task you did once into a TOOL:
+                                      # named, typed inputs and outputs, tried once with
+                                      # the example, then callable by every agent here
+                                      # with no model: replay <site> <tool> --input='{…}'
+  5dive browser tools [<site>] | show <site> <tool> | forget <site> <tool>
+                                      # the tools minted on this box: look here before
+                                      # you explore a site
   sudo 5dive browser approvals        # the owner: what agents are waiting to be allowed,
                                       # with what each would send, pay, post or delete
   sudo 5dive browser approve <id> [--deny] [--human-proof=<nonce>]
@@ -2442,6 +2450,8 @@ cmd_setup() {
   [[ -n "$wgroup" ]] || wgroup="$agroup"
   local wake_ok=0
   (( rv_ok )) && _install_wake_grant "$wgroup" && wake_ok=1
+  # DIVE-9033: the box's tool shelf, where a minted tool is callable by every seat.
+  _tool_shelf_make || printf '  no tool shelf at %s — a minted tool stays with the seat that minted it.\n' "$TOOLS_SHARED_DIR" >&2
   printf 'profile store ready\n  %s  (root, 0711 — traverse, not list)\n  %s  (%s, 0700)\n  liveness probe: every ~6h (a served site is checked through its own browser)\n' \
     "$PROFILE_ROOT" "$PROFILE_ROOT/$seat" "$seat"
   if (( rv_ok )); then
@@ -8510,8 +8520,9 @@ INLINE_REFS_MAX="${FIVEDIVE_BROWSER_INLINE_REFS_MAX:-60}"
 # for exactly to get them, and past 60 the agent Read tree.json instead, 20-42 KB
 # of JSON per page on the bench, where the refs alone are a line each.
 INLINE_SNAP_REFS_MAX="${FIVEDIVE_BROWSER_INLINE_SNAP_REFS_MAX:-300}"
-_inline_page() { # _inline_page <artifact dir> [<refs cap>]
-  local out="$1" body n refs_max="${2:-$INLINE_REFS_MAX}"
+_inline_page() { # _inline_page <artifact dir> [<refs cap>]: a cap given prints the first ones past it
+  local out="$1" body n refs_max="${2:-$INLINE_REFS_MAX}" cut=0
+  [[ -n "${2:-}" ]] && cut=1
   [[ "$INLINE_MD_MAX" =~ ^[0-9]{1,7}$ && "$refs_max" =~ ^[0-9]{1,5}$ ]] || return 0
   if [[ -s "$out/page.md" ]]; then
     # The body without the front matter: url and title are already the two lines above.
@@ -8525,6 +8536,17 @@ _inline_page() { # _inline_page <artifact dir> [<refs cap>]
     if (( n > 0 && n <= refs_max )); then
       printf '  --- refs (tree.json: act on these) ---\n'
       jq -r '.nodes[] | "  ref=\(.ref)"' "$out/tree.json" 2>/dev/null
+    elif (( n > refs_max && cut )); then
+      # A BIG PAGE'S REFS ARE CUT, NOT DROPPED (DIVE-9011). Past the cap this
+      # printed nothing and said nothing: on the DIVE-9006 bench every snapshot of
+      # recreation.gov's campground page (512-2,087 refs) came back with no refs at
+      # all, and the runs that failed answered the site-wide policy instead of the
+      # "Rules & Cancellations" tab they never saw. The first refs in page order are
+      # the header, the tabs and the filters;
+      # the rest is one line away.
+      printf '  --- refs (tree.json: act on these), the first %s of %s ---\n' "$refs_max" "$n"
+      jq -r --argjson m "$refs_max" '.nodes[:$m][] | "  ref=\(.ref)"' "$out/tree.json" 2>/dev/null
+      printf '  … %s more: jq -r '"'"'.nodes[].ref'"'"' %s/tree.json | grep -i '"'"'<word>'"'"'\n' "$(( n - refs_max ))" "$out"
     fi
   fi
   return 0
@@ -10027,10 +10049,11 @@ cmd_routine() {
 }
 
 cmd_replay() {
-  local site="" name="" values="[]" json=0 from=1 approved="" wait=""
+  local site="" name="" values="[]" json=0 from=1 approved="" wait="" input=""
   while (($#)); do
     case "$1" in
       --values=*) values="${1#*=}" ;;
+      --input=*) input="${1#*=}" ;;
       --from=*) from="${1#*=}"; [[ "$from" =~ ^[1-9][0-9]{0,2}$ ]] || die "$E_USAGE" "--from takes an act number (1 is the first); got: $from" ;;
       --approved=*) approved="${1#*=}" ;;
       --wait|--wait=*) wait="$1" ;;
@@ -10039,6 +10062,8 @@ cmd_replay() {
         printf '%s replay <site> <routine> [--values=<json array>] [--from=<act>] [--approved=<id>] [--json]\n' "$PROG"
         printf '  Runs a routine recorded with act --record=<routine>: every step from the cache, no snapshot, one call.\n'
         printf '  --approved applies to the FIRST act replayed: after an exit 73 on act k, re-run with --from=k --approved=<id>.\n'
+        printf '%s replay <site> <tool> --input=<json object> [--approved=<id>] [--json]\n' "$PROG"
+        printf '  Runs a tool minted with `5dive browser mint`: named inputs in, its typed outputs back, no model.\n'
         return 0 ;;
       -*) die "$E_USAGE" "unknown flag: $1" ;;
       *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$name" ]]; then name="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
@@ -10049,6 +10074,15 @@ cmd_replay() {
   _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
   _valid_routine "$name" || die "$E_USAGE" "'$name' is not a routine name"
   command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to read the routine"
+  # A MINTED TOOL by this name (DIVE-9033) is run as one: named inputs, typed outputs.
+  local toolf
+  if toolf="$(_tool_find "$site" "$name")"; then
+    [[ "$values" == "[]" ]] || die "$E_USAGE" "$name on $site is a tool: it takes named inputs, --input='$(jq -c '.inputs.properties | with_entries(.value = "…")' "$toolf")', not --values"
+    (( from == 1 )) || die "$E_USAGE" "--from is for a routine; a tool runs whole"
+    [[ -n "$input" ]] || input='{}'
+    _tool_run "$toolf" "$input" "$json" "$approved"; return
+  fi
+  [[ -z "$input" ]] || die "$E_USAGE" "no tool '$name' for $site (5dive browser tools $site). --input is a tool's; a routine takes --values"
   local file; file="$(_routine_file "$site" "$name")"
   [[ -s "$file" ]] || die "$E_USAGE" "no routine '$name' for $site. Record one: 5dive browser act <url> --steps=… --record=$name$(f=$(_seat_dir)/$ROUTINE_SUBDIR/$site; ls "$f" 2>/dev/null | sed -n 's/\.json$//p' | tr '\n' ' ' | sed 's/^./ (recorded for this site: &/; s/ $/)/')"
   jq -e 'type == "array" and all(.[]; type == "string")' <<<"$values" >/dev/null 2>&1 \
@@ -10125,6 +10159,473 @@ cmd_replay() {
   printf '  the last page: %s\n  %s\n' "$(jq -r '.url // ""' <<<"$res")" "$(jq -r '.artifacts // ""' <<<"$res")"
   [[ "$(jq -r '.verdict' <<<"$res")" == executed ]] && printf '  nothing re-graded the last act (it was recorded without --expect): read page.png before you report success.\n'
   return 0
+}
+
+# MINTED TOOLS (DIVE-9033): a site task, done once, kept as a TOOL with named,
+# typed inputs and typed outputs, that any agent on the box calls again with new
+# inputs and no model. The idea is Pomerado's (github.com/Pomerado/pomerado,
+# MIT): a minter does your example once and generalizes it into an operation
+# with an input schema and an output schema, served as its own tool. Nothing of
+# its code is copied: theirs writes a code module with an OpenAI model; ours is
+# the agent that already explored the site (the box's own Claude) handing this
+# script the parts that vary, so what is saved is DATA, never a program.
+#
+#   5dive browser mint <url-with-{{input}}> <tool> --task="<plain words>"
+#        --inputs='{"topic":"the article"}' --outputs='{"title":"<read-only JS expression>"}'
+#        --example='{"topic":"Python"}' [--steps='[…]'] [--from-routine=<r>] [--write] [--private]
+#   5dive browser replay <site> <tool> --input='{"topic":"Rust"}' [--json]
+#   5dive browser tools [ls] [<site>] | show <site> <tool> | forget <site> <tool>
+#
+# WHAT A TOOL IS: the acts of a routine (the same steps `act --record` keeps),
+# where a value that varies is a {{name}} placeholder instead of a numbered
+# slot, plus READS: one read-only page script per output, run as eval steps at
+# the end of the last act (lib/point.cjs evalStep: no side effect, cookies off).
+# An input fills a placeholder in a step's value as typed, and in a URL
+# percent-encoded, in one pass. A URL's host is never a placeholder, so no input
+# can point a tool at another site.
+#
+# THE EXAMPLE IS THE TEST: mint runs the tool once with --example, and saves it
+# only if every output came back and matched its type. The example's values are
+# not saved, as an act --record never saves a typed value.
+#
+# EVERY RUN IS AN `act` (as replay's are): lease, scope, login gate, the owner's
+# policy and approvals are the act's. A READ tool never takes --approved: if one
+# stops for the owner (pay, post, send, delete), it was never a read tool, and
+# it says so. A WRITE tool that fails after it began acting reports
+# possible_commit, so the caller checks the site before calling it again.
+#
+# WHERE: the box's shelf (TOOLS_SHARED_DIR, root-owned, sticky, 1777: any seat
+# adds a file, only its owner replaces or removes it), so every agent here can
+# call it; --private, or a box whose shelf does not exist yet, keeps it in the
+# seat's own 0700 directory beside its routines. A seat's own copy wins a name.
+TOOL_SUBDIR=".tools"
+TOOLS_SHARED_DIR="${FIVEDIVE_BROWSER_TOOLS_DIR:-/var/lib/5dive-browser-tools}"
+TOOL_MAX_FIELDS=16
+TOOL_NAME_RE='^[a-z][a-z0-9_]{0,31}$'
+TOOL_STEP_OPS='goto fill type click wait_for select press'
+
+_tool_own_file()    { printf '%s/%s/%s/%s.json\n' "$(_seat_dir)" "$TOOL_SUBDIR" "$1" "$2"; }
+_tool_shared_file() { printf '%s/%s+%s.json\n' "$TOOLS_SHARED_DIR" "$1" "$2"; }
+# The shelf is used only as it was made: a real directory, sticky and 1777, and
+# root's (a test names its own with FIVEDIVE_BROWSER_TOOLS_DIR).
+_tool_shelf_ok() {
+  [[ -d "$TOOLS_SHARED_DIR" && ! -L "$TOOLS_SHARED_DIR" ]] || return 1
+  local s; s=$(stat -c '%u %a' -- "$TOOLS_SHARED_DIR" 2>/dev/null) || return 1
+  [[ "${s#* }" == 1777 ]] || return 1
+  [[ "${s% *}" == 0 || -n "${FIVEDIVE_BROWSER_TOOLS_DIR:-}" ]]
+}
+_tool_shelf_make() {
+  _tool_shelf_ok && return 0
+  [[ -e "$TOOLS_SHARED_DIR" ]] && return 1
+  (umask 000; mkdir -m 1777 -- "$TOOLS_SHARED_DIR") 2>/dev/null \
+    || sudo -n install -d -m 1777 -o root -g root -- "$TOOLS_SHARED_DIR" 2>/dev/null || true
+  _tool_shelf_ok
+}
+# A tool file is read only when nobody but its owner can change it.
+_tool_file_ok() {  # <file>
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  local m; m=$(stat -c %a -- "$1" 2>/dev/null) || return 1
+  (( (8#$m & 8#022) == 0 ))
+}
+_tool_find() {  # <site> <name>  -> the file: the seat's own first, then the shelf
+  local f; f="$(_tool_own_file "$1" "$2")"
+  _tool_file_ok "$f" && { printf '%s\n' "$f"; return 0; }
+  _tool_shelf_ok || return 1
+  f="$(_tool_shared_file "$1" "$2")"
+  _tool_file_ok "$f" && { printf '%s\n' "$f"; return 0; }
+  return 1
+}
+_tool_owner() { stat -c %U -- "$1" 2>/dev/null || echo '?'; }
+
+# jq: {{name}} placeholders, filled in ONE pass ($enc: percent-encode, for URLs).
+_TOOL_JQ_FILL='def fill($i; $enc): gsub("\\{\\{(?<k>[a-z][a-z0-9_]*)\\}\\}"; ($i[.k] | if type == "string" then . else tojson end) | if $enc then @uri else . end);
+def host: capture("^(?<h>https?://[^/?#]*)").h // "";'
+
+# Inputs against the tool's schema: an object, every required name, nothing
+# else, each of its type. Prints the reason and fails, or prints nothing.
+_tool_check_inputs() {  # <tool-json> <inputs-json>
+  jq -r --argjson t "$1" '
+    def ok($ty): if $ty == "integer" then (type == "number" and . == floor)
+                 else type == $ty end;
+    if type != "object" then "the inputs are a JSON object of name: value"
+    else (keys - ($t.inputs.properties | keys)) as $x
+    | ($t.inputs.required - keys) as $m
+    | if ($x | length) > 0 then "\($x[0]) is not an input of \($t.name); its inputs: \($t.inputs.properties | keys | join(", "))"
+      elif ($m | length) > 0 then "\($t.name) needs \($m | join(", ")); it got \(keys | join(", ") | if . == "" then "none" else . end)"
+      else ([to_entries[] | select(.key as $k | .value | ok($t.inputs.properties[$k].type) | not)
+             | "\(.key) is a \($t.inputs.properties[.key].type), got \(.value | tojson)"] | first) // empty
+      end
+    end' <<<"$2" 2>/dev/null || echo "the inputs are not JSON"
+}
+
+# Outputs against the schema, as above; a required string must not be empty
+# (an empty title is the wrong page, not an answer).
+_tool_check_outputs() {  # <tool-json> <outputs-json>
+  jq -r --argjson t "$1" --argjson o "$2" '
+    def ok($ty): if $ty == "integer" then (type == "number" and . == floor)
+                 elif $ty == "string" then (type == "string" and length > 0)
+                 else type == $ty end;
+    [ $t.outputs.properties | to_entries[] as $p
+      | select(($t.outputs.required | index($p.key)) != null)
+      | select(($o[$p.key] // null) as $v | ($v | ok($p.value.type)) | not)
+      | "\($p.key) should be a\(if $p.value.type == "integer" or $p.value.type == "array" or $p.value.type == "object" then "n" else "" end) \($p.value.type) and read \($o[$p.key] // null | tojson | .[:120])" ] | first // empty' \
+    <<<'null' 2>/dev/null || echo "the outputs did not parse"
+}
+
+# RUN A TOOL: <file> <inputs> <json 0|1> [<approved>]. Exits as the act did;
+# 1 when an output is missing or of the wrong type.
+_tool_run() {
+  local file="$1" inputs="$2" json="$3" approved="${4:-}" t why
+  t="$(jq -c . "$file" 2>/dev/null)" && [[ "$(jq -r '.kind // ""' <<<"$t")" == tool ]] \
+    || die "$E_USAGE" "$file is not a tool this version can run"
+  why="$(_tool_check_inputs "$t" "$inputs")"
+  [[ -z "$why" ]] || die "$E_USAGE" "$why. Call: 5dive browser replay $(jq -r '.site' <<<"$t") $(jq -r '.name' <<<"$t") --input='$(jq -c '.inputs.properties | with_entries(.value = "…")' <<<"$t")'"
+  local name site access profile acts
+  name=$(jq -r .name <<<"$t"); site=$(jq -r .site <<<"$t"); access=$(jq -r '.access // "read"' <<<"$t")
+  profile=$(jq -r '.profile // .site' <<<"$t"); acts=$(jq '.acts | length' <<<"$t")
+  [[ "$access" == read && -n "$approved" ]] && die "$E_USAGE" "$name is a read tool: it never needs the owner's yes, so it takes no --approved"
+  # Fill every placeholder, and refuse a URL whose host is not the one minted.
+  local plan
+  plan=$(jq -c --argjson i "$inputs" "$_TOOL_JQ_FILL"'
+    [.acts[] | (.url // "" | host) as $h0
+      | .url = (if .url then (.url | fill($i; true)) else null end)
+      | .steps = [.steps[] | if .value then .value |= fill($i; false) else . end
+                           | if .op == "goto" and .url then .url |= fill($i; true) else . end]
+      | select(.url == null or (.url | host) == $h0)]' <<<"$t") || die "$E_UNAVAILABLE" "cannot fill $name's inputs"
+  (( $(jq length <<<"$plan") == acts )) || die "$E_USAGE" "an input changed the site $name opens; nothing ran"
+  # The reads go at the end of the last act. A last act of goto/wait_for only is
+  # a read-only act, which takes no --expect: there, the reads are the check.
+  local nreads; nreads=$(jq '.reads | length' <<<"$t")
+  plan=$(jq -c --argjson r "$(jq -c '[.reads[] | {op:"eval", expr}]' <<<"$t")" \
+    '.[-1].steps += $r | if (.[-1].steps | all(.op == "goto" or .op == "wait_for" or .op == "eval")) then .[-1].expect = null else . end' <<<"$plan")
+
+  local self="${BASH_SOURCE[0]}" k seg steps url expect wf errf res rc=0 picks models=0 healed=0 acted=0 own=0
+  [[ -O "$file" ]] && own=1
+  local t0; t0=$(_now_ms)
+  errf="$(mktemp /tmp/5dive-browser-tool.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the tool run"
+  for (( k = 1; k <= acts; k++ )); do
+    seg=$(jq -c --argjson i "$((k - 1))" '.[$i]' <<<"$plan")
+    steps=$(jq -c '.steps' <<<"$seg")
+    url=$(jq -r '.url // ""' <<<"$seg"); expect=$(jq -r '.expect // ""' <<<"$seg"); wf=$(jq -r '.wait_for // ""' <<<"$seg")
+    local -a a=(act "$profile")
+    [[ -n "$url" ]] && a+=("$url")
+    a+=("--steps=$steps" --json)
+    [[ -n "$expect" ]] && a+=("--expect=$expect")
+    [[ -n "$wf" ]] && a+=("--wait-for=$wf")
+    (( k == 1 )) && [[ -n "$approved" ]] && a+=("--approved=$approved")
+    rc=0; res=$("$self" "${a[@]}" 2>"$errf") || rc=$?
+    picks=$(_routine_picks "$errf" | wc -l | tr -d ' ')
+    models=$(( models + $(grep -cE '^ *step [0-9]+: .* matched nothing; reflex picked ref=.*; retried: ok$' "$errf" 2>/dev/null || true) ))
+    if (( picks > 0 && own )); then
+      # The self-heal, as replay's: a re-picked ref is written back (only into a
+      # file this seat owns; another seat's tool is theirs to change).
+      local off=0 fixed tmp; [[ -n "$url" ]] && off=1
+      fixed=$(_routine_patch "$(jq -c --argjson i "$((k - 1))" '.acts[$i].steps' <<<"$t")" "$off" "$errf")
+      tmp="$(mktemp "${file%/*}/.mint.XXXXXX")" && jq -c --argjson i "$((k - 1))" --argjson s "$fixed" '.acts[$i].steps = $s' "$file" > "$tmp" \
+        && chmod --reference="$file" "$tmp" && mv -f -- "$tmp" "$file"
+    fi
+    healed=$(( healed + picks ))
+    if (( rc != 0 )); then
+      (( acted )) || jq -e 'any(.[]; .op != "goto" and .op != "wait_for" and .op != "eval")' <<<"$steps" >/dev/null 2>&1 && acted=1
+      local verdict=stopped commit=false
+      if (( rc == E_NEEDS_OWNER )); then
+        verdict=needs_owner
+        if [[ "$access" == read ]]; then
+          printf '%s: read tool %s stopped for the owner at act %s: it reached a step that pays, posts, sends or deletes. A read tool never does; it was minted wrong. Re-mint it with --write, or fix its steps.\n' "$PROG" "$name" "$k" >&2
+        else
+          printf '%s: tool %s stopped at act %s for the owner (above). On their yes: 5dive browser replay %s %s --input='"'"'…'"'"' --approved=<id>\n' "$PROG" "$name" "$k" "$site" "$name" >&2
+        fi
+      else
+        [[ "$access" == write ]] && (( acted || k > 1 )) && commit=true
+        printf '%s: tool %s STOPPED at act %s (exit %s): the page is not the one it was minted on.%s\n' "$PROG" "$name" "$k" "$rc" \
+          "$([[ $commit == true ]] && printf ' It may have acted before it stopped (possible_commit): look at the site before you call it again.')" >&2
+      fi
+      grep -v '^  step [0-9]* (eval) = ' "$errf" >&2
+      rm -f -- "$errf"
+      (( json )) && jq -nc --arg n "$name" --arg s "$site" --arg a "$access" --arg v "$verdict" --argjson k "$k" --argjson rc "$rc" \
+        --argjson pc "$commit" --argjson m "$models" --argjson ms "$(( $(_now_ms) - t0 ))" \
+        '{tool:$n, site:$s, access:$a, verdict:$v, stopped_at:$k, exit:$rc, possible_commit:$pc, model_calls:$m, wall_ms:$ms}'
+      return "$rc"
+    fi
+    jq -e 'any(.[]; .op != "goto" and .op != "wait_for" and .op != "eval")' <<<"$steps" >/dev/null 2>&1 && acted=1
+  done
+  # The answers, in the reads' order: a read-only act hands them back in .evals;
+  # any other act leaves them on its stderr, one `step N (eval) = <json>` each.
+  local vals
+  if jq -e '.evals | type == "array"' <<<"$res" >/dev/null 2>&1; then
+    vals=$(jq -c '[.evals[].value]' <<<"$res")
+  else
+    vals=$(sed -nE 's/^  step [0-9]+ \(eval\) = (.*)$/\1/p' "$errf" | jq -Rnc '[inputs | (try fromjson catch .)]')
+  fi
+  local lasturl; lasturl=$(jq -r '.url // .final_url // ""' <<<"$res" 2>/dev/null)
+  grep -v '^  step [0-9]* (eval) = ' "$errf" >"$errf.x" 2>/dev/null; rm -f -- "$errf"
+  local outputs; outputs=$(jq -c --argjson v "${vals:-[]}" '[.reads | to_entries[] | {key:.value.name, value:($v[.key] // null)}] | from_entries' <<<"$t")
+  local ms=$(( $(_now_ms) - t0 ))
+  why="$(_tool_check_outputs "$t" "$outputs")"
+  if [[ -n "$why" ]]; then
+    cat -- "$errf.x" >&2; rm -f -- "$errf.x"
+    printf '%s: tool %s ran, and its answer does not match: %s. The page has changed, or the read is wrong for it.\n' "$PROG" "$name" "$why" >&2
+    (( json )) && jq -nc --arg n "$name" --arg s "$site" --arg a "$access" --arg w "$why" --argjson o "$outputs" --argjson m "$models" --argjson ms "$ms" \
+      '{tool:$n, site:$s, access:$a, verdict:"output_mismatch", why:$w, outputs:$o, model_calls:$m, wall_ms:$ms}'
+    return 1
+  fi
+  rm -f -- "$errf.x"
+  if (( own )); then
+    local tmp; tmp="$(mktemp "${file%/*}/.mint.XXXXXX")" && jq -c --argjson now "$(date +%s)" '.runs = ((.runs // 0) + 1) | .last_run = $now' "$file" > "$tmp" \
+      && chmod --reference="$file" "$tmp" && mv -f -- "$tmp" "$file"
+  fi
+  if (( json )); then
+    jq -nc --arg n "$name" --arg s "$site" --arg a "$access" --argjson o "$outputs" --argjson m "$models" --argjson h "$healed" \
+      --argjson ms "$ms" --arg u "$lasturl" --argjson acts "$acts" \
+      '{tool:$n, site:$s, access:$a, verdict:"ok", outputs:$o, acts:$acts, model_calls:$m, repicked:$h, wall_ms:$ms, url:$u}'
+    return 0
+  fi
+  jq -r 'to_entries[] | "\(.key): \(.value | if type == "string" then . else tojson end)"' <<<"$outputs"
+  printf 'ran tool %s on %s: %s act(s) in %s ms, %s model call(s)%s\n' "$name" "$site" "$acts" "$ms" "$models" \
+    "$( (( healed )) && printf ' — %s step(s) re-picked%s' "$healed" "$( (( own )) && printf ' and written back')" || printf ' — every step from the tool')" >&2
+  return 0
+}
+
+# --inputs / --outputs, normalized: a bare string is the description of a string
+# input, or the expression of a string output.
+_tool_norm_fields() {  # <inputs|outputs> <json>
+  local kind="$1" types
+  [[ "$kind" == inputs ]] && types='["string","number","integer","boolean"]' || types='["string","number","integer","boolean","array","object"]'
+  jq -c --arg kind "$kind" --argjson types "$types" --arg re "$TOOL_NAME_RE" --argjson max "$TOOL_MAX_FIELDS" '
+    if type != "object" then error("--\($kind) is a JSON object of name: …") else . end
+    | if length > $max then error("at most \($max) \($kind)") else . end
+    | to_entries | map(
+        if (.key | test($re)) | not then error("\(.key) is not a usable \($kind) name (lowercase letters, digits, _; a letter first)") else . end
+        | .value = (if .value | type == "string" then
+                      (if $kind == "inputs" then {type:"string", description:.value} else {type:"string", read:.value} end)
+                    elif .value | type == "object" then .value
+                    else error("\(.key): give a string, or {\"type\":…}") end)
+        | .value.type = (.value.type // "string")
+        | .value.type as $ty | if ($types | index($ty)) == null then error("\(.key): type \($ty) is not one of \($types | join(", "))") else . end
+        | if $kind == "outputs" then
+            .value.read = (.value.read // .value.expr // null)
+            | if (.value.read | type) != "string" or (.value.read | length) == 0 then error("output \(.key) needs a read: a read-only JS expression for its value") else . end
+            | if (.value.read | length) > 2000 then error("output \(.key): the read is over 2000 characters") else . end
+          else . end) | from_entries' <<<"$2" 2>&1
+}
+
+cmd_mint() {
+  local target="" name="" task="" url="" steps="" inputs='{}' outputs="" example="" access=read
+  local expect="" wait_for="" from_routine="" private=0 trial=1 json=0
+  while (($#)); do
+    case "$1" in
+      --task=*)    task="${1#*=}" ;;
+      --url=*)     url="${1#*=}" ;;
+      --steps=*)   steps="${1#*=}" ;;
+      --inputs=*)  inputs="${1#*=}" ;;
+      --outputs=*) outputs="${1#*=}" ;;
+      --example=*) example="${1#*=}" ;;
+      --expect=*)  expect="${1#*=}"; expect="${expect#'(?i)'}" ;;
+      --wait-for=*) wait_for="${1#*=}"; _wait_for_ok "$wait_for" || die "$E_USAGE" "--wait-for takes one CSS selector, ref=<role>/<name> or text=<words>" ;;
+      --from-routine=*) from_routine="${1#*=}"; _valid_routine "$from_routine" || die "$E_USAGE" "'$from_routine' is not a routine name" ;;
+      --write)     access=write ;;
+      --private)   private=1 ;;
+      --no-trial)  trial=0 ;;
+      --json)      json=1 ;;
+      -h|--help)
+        printf '%s mint <url-with-{{input}}> <tool> --task="<plain words>" --inputs=<json> --outputs=<json> --example=<json> [--steps=<json>] [--write] [--private] [--json]\n' "$PROG"
+        printf '%s mint <site> <tool> --url=<url-with-{{input}}> …          # a site you are signed in to: name its profile\n' "$PROG"
+        printf '%s mint <site> <tool> --from-routine=<routine> --inputs=… …  # a recorded routine: its value slots, in order, become the inputs\n' "$PROG"
+        printf '  Turns a site task you have already done once into a TOOL any agent on this box calls again\n'
+        printf '  with new inputs and NO model: 5dive browser replay <site> <tool> --input='"'"'{"name":"value"}'"'"'.\n'
+        printf '  --inputs   {"topic":"what it is"} or {"n":{"type":"integer","description":"…"}}; a {{topic}} in --url\n'
+        printf '             (percent-encoded) or in a step'"'"'s value (as typed) is where it goes. A host is never an input.\n'
+        printf '  --outputs  {"title":"document.querySelector(\\"h1\\").innerText"} or {"n":{"type":"number","read":"…"}}:\n'
+        printf '             one read-only page script per output, run at the end. Types: string number integer boolean array object.\n'
+        printf '  --example  the inputs of one real run. mint runs it, and saves the tool only if every output\n'
+        printf '             came back and matched its type. The example is not saved.\n'
+        printf '  --write    the tool posts, sends, buys or changes something. A read tool (the default) that\n'
+        printf '             reaches a pay, post, send or delete step stops and says it was minted wrong.\n'
+        printf '  --private  keep it for this seat only (default: the box'"'"'s shelf, callable by every agent here).\n'
+        return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$target" ]]; then target="$1"; elif [[ -z "$name" ]]; then name="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac; shift
+  done
+  command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is required to mint a tool"
+  [[ -n "$target" && -n "$name" ]] || die "$E_USAGE" "usage: 5dive browser mint <url-with-{{input}}> <tool> --task=\"…\" --inputs='{…}' --outputs='{…}' --example='{…}' (see --help)"
+  _valid_routine "$name" || die "$E_USAGE" "'$name' is not a tool name: lowercase letters, digits, . _ - (up to 64)"
+  [[ -n "$task" ]] || die "$E_USAGE" "--task says in plain words what the tool does; the next agent reads it to pick the tool"
+  (( ${#task} <= 500 )) || die "$E_USAGE" "--task is over 500 characters; say what it does in a sentence"
+  [[ -n "$outputs" ]] || die "$E_USAGE" "--outputs names what the tool reads back, e.g. --outputs='{\"title\":\"document.querySelector(\\\"h1\\\").innerText\"}'"
+  local profile
+  if [[ "$target" =~ ^https?:// ]]; then
+    [[ -z "$url" ]] || die "$E_USAGE" "give the URL once: as the first argument, or as --url with a site's profile"
+    url="$target"; profile="$PUBLIC_SITE"
+  else
+    _valid_site "$target" || die "$E_USAGE" "'$target' is not a usable profile name"
+    profile="$target"
+  fi
+  [[ -n "$url" || -n "$from_routine" ]] || die "$E_USAGE" "a tool starts at a URL: mint <url> <tool> …, or mint <site> <tool> --url=<url>"
+  if [[ -n "$url" ]]; then
+    [[ "$url" =~ ^https?://[^/?#{}]+([/?#].*)?$ ]] || die "$E_USAGE" "the URL's host is fixed (no {{input}} in it): got $url"
+  fi
+  local in_n out_n
+  in_n="$(_tool_norm_fields inputs "$inputs")" && jq -e 'type == "object"' <<<"$in_n" >/dev/null 2>&1 \
+    || die "$E_USAGE" "--inputs: $(sed -E 's/^jq: error( \(at [^)]*\))?: //' <<<"$in_n" | head -1)"
+  out_n="$(_tool_norm_fields outputs "$outputs")" && jq -e 'type == "object" and length > 0' <<<"$out_n" >/dev/null 2>&1 \
+    || die "$E_USAGE" "--outputs: $( [[ "$out_n" == '{}' ]] && echo 'name at least one output' || sed -E 's/^jq: error( \(at [^)]*\))?: //' <<<"$out_n" | head -1)"
+
+  # THE ACTS: one from --url (+ --steps), or a recorded routine's, its slots named.
+  local acts site
+  if [[ -n "$from_routine" ]]; then
+    [[ -z "$steps" ]] || die "$E_USAGE" "--from-routine brings its own steps; give --steps or --from-routine, not both"
+    local rkey rf; rkey="$(_routine_key "$profile" "${url:-$target}")"
+    [[ "$target" =~ ^https?:// ]] || rkey="$profile"
+    rf="$(_routine_file "$rkey" "$from_routine")"
+    [[ -s "$rf" ]] || die "$E_USAGE" "no routine '$from_routine' for $rkey (5dive browser routine ls)"
+    profile="$(jq -r '.profile // .site' "$rf")"
+    local nslots; nslots=$(jq '.slots // 0' "$rf")
+    (( nslots <= $(jq length <<<"$in_n") )) \
+      || die "$E_USAGE" "routine $from_routine has $nslots value slot(s); --inputs names $(jq length <<<"$in_n"). Name one input per slot, in order: $(jq -r '[.acts[].steps[] | select(.slot) | "\(.slot)=\(.op) \(.selector // "")"] | join("; ")' "$rf")"
+    acts=$(jq -c --argjson names "$(jq -c 'keys_unsorted' <<<"$in_n")" --arg u "$url" '
+      [.acts[] | .steps = [.steps[] | if .slot then (del(.slot) + {value:("{{" + $names[.slot - 1] + "}}")}) else . end]]
+      | if $u != "" then .[0].url = $u else . end' "$rf")
+  else
+    [[ -n "$steps" ]] || steps='[]'
+    jq -e 'type == "array"' <<<"$steps" >/dev/null 2>&1 || die "$E_USAGE" "--steps is a JSON array of act steps"
+    acts=$(jq -nc --arg u "$url" --argjson s "$steps" --arg e "$expect" --arg w "$wait_for" \
+      '[{url:$u, steps:$s, expect:(if $e == "" then null else $e end), wait_for:(if $w == "" then null else $w end)}]')
+  fi
+  local bad
+  bad=$(jq -r --arg v " $TOOL_STEP_OPS " '[.[].steps[] | (.op // "") as $o | select(($v | contains(" " + $o + " ")) | not) | $o] | first // empty' <<<"$acts")
+  [[ -z "$bad" ]] || die "$E_USAGE" "'$bad' is not a step a tool keeps (it keeps: $TOOL_STEP_OPS; the outputs are its page scripts)"
+  jq -e 'any(.[].steps[]; has("saved"))' <<<"$acts" >/dev/null 2>&1 \
+    && die "$E_USAGE" "a tool does not type a saved login: connect the site first (it then runs signed in), and mint the steps after the sign-in"
+  local over; over=$(jq -r --argjson r "$(jq length <<<"$out_n")" --argjson max "$ACT_MAX_STEPS" \
+    '(.[-1].steps | length) + $r + 1 | select(. > $max)' <<<"$acts")
+  [[ -z "$over" ]] || die "$E_USAGE" "the last act's steps plus one read per output is $over, over one act ($ACT_MAX_STEPS)"
+  # Every placeholder is an input, and every input is used.
+  local used; used=$(jq -c '[.[] | (.url // ""), (.steps[] | (.value // ""), (if .op == "goto" then .url // "" else "" end))]
+    | map(scan("\\{\\{([a-z][a-z0-9_]*)\\}\\}") | .[0]) | unique' <<<"$acts")
+  bad=$(jq -r --argjson u "$used" '($u - keys) | first // empty' <<<"$in_n")
+  [[ -z "$bad" ]] || die "$E_USAGE" "{{$bad}} is used and is not in --inputs"
+  bad=$(jq -r --argjson u "$used" '(keys - $u) | first // empty' <<<"$in_n")
+  [[ -z "$bad" ]] || die "$E_USAGE" "input $bad is not used: put {{$bad}} in the URL or a step's value, or drop it"
+  jq -e 'any(.[].steps[]; (.op == "fill" or .op == "type" or .op == "select") and ((.value // "") | test("\\{\\{") | not))' <<<"$acts" >/dev/null 2>&1 \
+    && printf '%s: note: a fill/type/select value with no {{input}} is typed the same on every run.\n' "$PROG" >&2
+
+  site="$(_routine_key "$profile" "$(jq -r '.[0].url // ""' <<<"$acts")")"
+  _valid_site "$site" || die "$E_USAGE" "cannot file a tool under '$site'"
+  local tool
+  tool=$(jq -nc --arg n "$name" --arg s "$site" --arg p "$profile" --arg task "$task" --arg a "$access" \
+    --argjson in "$in_n" --argjson out "$out_n" --argjson acts "$acts" --arg by "$(_seat)" --argjson now "$(date +%s)" '
+    {version:1, kind:"tool", name:$n, site:$s, profile:$p, task:$task, access:$a,
+     inputs:{type:"object", properties:($in | map_values({type, description:(.description // null)} | del(..|nulls))), required:($in | keys_unsorted)},
+     outputs:{type:"object", properties:($out | map_values({type, description:(.description // null)} | del(..|nulls))), required:($out | keys_unsorted)},
+     reads:[$out | to_entries[] | {name:.key, expr:.value.read}],
+     acts:$acts, by:$by, minted:$now, runs:0}')
+
+  # WHERE IT GOES, decided before the trial so a refusal costs no run.
+  local dest shelf=0
+  if (( ! private )) && _tool_shelf_make; then
+    shelf=1; dest="$(_tool_shared_file "$site" "$name")"
+    if [[ -e "$dest" && ! -O "$dest" ]]; then
+      die "$E_USAGE" "$site already has a tool named $name, minted by $(_tool_owner "$dest"). Pick another name (5dive browser tools $site)"
+    fi
+  else
+    dest="$(_tool_own_file "$site" "$name")"
+  fi
+
+  local trial_out="" trial_ms=0
+  if (( trial )); then
+    [[ -n "$example" ]] || die "$E_USAGE" "--example is one real run's inputs (e.g. --example='{\"topic\":\"Python\"}'): mint runs it and keeps the tool only if it works. A --write tool you cannot run now: --no-trial"
+    local why; why="$(_tool_check_inputs "$tool" "$example")"
+    [[ -z "$why" ]] || die "$E_USAGE" "--example: $why"
+    local tf rc=0; tf="$(mktemp /tmp/5dive-browser-mint.XXXXXXXX)" || die "$E_UNAVAILABLE" "cannot stage the trial"
+    chmod 600 "$tf"; printf '%s\n' "$tool" > "$tf"
+    printf '%s: trying %s once with the example…\n' "$PROG" "$name" >&2
+    trial_out=$(_tool_run "$tf" "$example" 1) || rc=$?
+    rm -f -- "$tf"
+    if (( rc != 0 )); then
+      printf '%s: NOT minted: the example run did not give every output (%s). Nothing was saved.\n' "$PROG" \
+        "$(jq -r '.why // .verdict // "it stopped"' <<<"$trial_out" 2>/dev/null)" >&2
+      (( json )) && printf '%s\n' "${trial_out:-null}" | jq -c '{minted:false, trial:.}' 2>/dev/null
+      return "$rc"
+    fi
+    trial_ms=$(jq -r '.wall_ms // 0' <<<"$trial_out")
+    tool=$(jq -c '.trial = true' <<<"$tool")
+  else
+    [[ "$access" == write ]] || die "$E_USAGE" "--no-trial is for a --write tool only; a read tool is always tried with its --example"
+    tool=$(jq -c '.trial = false' <<<"$tool")
+  fi
+
+  local dir="${dest%/*}" tmp
+  if (( ! shelf )); then (umask 077; mkdir -p -- "$dir") || die "$E_UNAVAILABLE" "cannot create $dir"; fi
+  tmp="$(mktemp "$dir/.mint.XXXXXX")" || die "$E_UNAVAILABLE" "cannot write into $dir"
+  printf '%s\n' "$tool" > "$tmp"
+  if (( shelf )); then chmod 644 "$tmp"; else chmod 600 "$tmp"; fi
+  mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; die "$E_UNAVAILABLE" "cannot save $dest"; }
+  local call; call="5dive browser replay $site $name --input='$(jq -c '.inputs.properties | with_entries(.value = "…")' <<<"$tool")'"
+  if (( json )); then
+    jq -nc --argjson t "$tool" --arg f "$dest" --argjson sh "$shelf" --arg c "$call" --argjson tr "${trial_out:-null}" \
+      '{minted:true, tool:$t.name, site:$t.site, access:$t.access, shared:($sh == 1), file:$f, call:$c,
+        inputs:$t.inputs, outputs:$t.outputs, trial:$tr}'
+    return 0
+  fi
+  (( trial )) && jq -r '.outputs | to_entries[] | "  \(.key): \(.value | if type == "string" then .[:160] else tojson end)"' <<<"$trial_out"
+  printf 'minted %s tool %s on %s (%s)%s.\n  call: %s\n' "$access" "$name" "$site" \
+    "$( (( shelf )) && printf 'every agent on this box can call it' || printf 'this seat only%s' "$( (( private )) || printf ': the box shelf %s is not set up — sudo 5dive browser setup' "$TOOLS_SHARED_DIR")")" \
+    "$( (( trial )) && printf '; the example ran in %s ms and every output matched' "$trial_ms")" "$call"
+  return 0
+}
+
+cmd_tools() {
+  local sub="ls"
+  case "${1:-}" in ls|show|forget) sub="$1"; shift ;; esac
+  local site="" name="" json=0 f
+  while (($#)); do
+    case "$1" in
+      --json) json=1 ;;
+      -h|--help) printf '%s tools [ls] [<site>] [--json] | show <site> <tool> [--json] | forget <site> <tool>\n' "$PROG"; return 0 ;;
+      -*) die "$E_USAGE" "unknown flag: $1" ;;
+      *) if [[ -z "$site" ]]; then site="$1"; elif [[ -z "$name" ]]; then name="$1"; else die "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac; shift
+  done
+  [[ "$site" =~ ^https?:// ]] && site="$(_routine_key "$PUBLIC_SITE" "$site")"
+  [[ -z "$site" ]] || _valid_site "$site" || die "$E_USAGE" "'$site' is not a usable profile name"
+  [[ -z "$name" ]] || _valid_routine "$name" || die "$E_USAGE" "'$name' is not a tool name"
+  case "$sub" in
+    ls)
+      local -A seen=(); local any=0 key own
+      local -a files=()
+      for f in "$(_seat_dir)/$TOOL_SUBDIR"/${site:-*}/*.json; do files+=("$f"); done
+      if _tool_shelf_ok; then for f in "$TOOLS_SHARED_DIR"/${site:-*}+*.json; do files+=("$f"); done; fi
+      for f in "${files[@]}"; do
+        _tool_file_ok "$f" || continue
+        key=$(jq -r '"\(.site)/\(.name)"' "$f" 2>/dev/null) || continue
+        [[ -z "${seen[$key]:-}" ]] || continue; seen[$key]=1; any=1
+        own=$(_tool_owner "$f")
+        if (( json )); then
+          jq -c --arg by "$own" '{site, name, access, task, inputs:(.inputs.properties | map_values(.type)), outputs:(.outputs.properties | map_values(.type)), by:$by, runs:(.runs // 0),
+            call:("5dive browser replay \(.site) \(.name) --input=" + (.inputs.properties | with_entries(.value = "…") | tojson))}' "$f"
+        else
+          jq -r --arg by "$own" '"\(.site)  \(.name)  [\(.access)]  \(.task)",
+            "    in: \(.inputs.properties | to_entries | map("\(.key):\(.value.type)") | join(", ") | if . == "" then "none" else . end)   out: \(.outputs.properties | to_entries | map("\(.key):\(.value.type)") | join(", "))   by \($by), run \(.runs // 0)x",
+            "    5dive browser replay \(.site) \(.name) --input='"'"'\(.inputs.properties | with_entries(.value = "…") | tojson)'"'"'"' "$f"
+        fi
+      done
+      (( any || json )) || printf 'no tools%s yet. Did a site task once? Mint it: 5dive browser mint --help\n' "${site:+ for $site}" ;;
+    show)
+      [[ -n "$site" && -n "$name" ]] || die "$E_USAGE" "usage: 5dive browser tools show <site> <tool>"
+      f="$(_tool_find "$site" "$name")" || die "$E_USAGE" "no tool '$name' for $site (5dive browser tools $site)"
+      if (( json )); then jq -c --arg by "$(_tool_owner "$f")" '. + {owner:$by}' "$f"; return 0; fi
+      jq -r --arg by "$(_tool_owner "$f")" '"tool \(.name) on \(.site) [\(.access)], by \($by), run \(.runs // 0)x: \(.task)",
+        "inputs:", (.inputs.properties | to_entries[] | "  \(.key) (\(.value.type))\(if .value.description then ": " + .value.description else "" end)"),
+        "outputs:", (.reads[] as $r | "  \($r.name) (\(.outputs.properties[$r.name].type)) <- \($r.expr | .[:160])"),
+        (.acts | to_entries[] | "act \(.key + 1): \(.value.url // "(continues on the page)")",
+          (.value.steps[] | "    \(.op) \(.selector // .url // "")\(if .value then "  = \(.value)" else "" end)\(if .key then "  key=\(.key)" else "" end)"))' "$f" ;;
+    forget)
+      [[ -n "$site" && -n "$name" ]] || die "$E_USAGE" "usage: 5dive browser tools forget <site> <tool>"
+      f="$(_tool_find "$site" "$name")" || die "$E_USAGE" "no tool '$name' for $site"
+      [[ -O "$f" ]] || die "$E_PERM" "tool $name on $site was minted by $(_tool_owner "$f"); only that seat can forget it"
+      rm -f -- "$f" && printf 'forgot tool %s (%s)\n' "$name" "$site" ;;
+  esac
 }
 
 # THE OWNER'S YES (DIVE-4943). Root only — see _grant_uid. It prints what is being
@@ -14445,7 +14946,7 @@ esac
 # DIVE-7237: the page verbs, and only they, re-serve a group's browser the way
 # their site needs (_drive_fit).
 case "${1:-}" in
-  shot|snapshot|act|tree|read|links|download|run|capture|replay|handoff) _DRIVE_FIT=1 ;;
+  shot|snapshot|act|tree|read|links|download|run|capture|replay|mint|handoff) _DRIVE_FIT=1 ;;
 esac
 
 # INPUT MODE TAKES THE PAGE VERBS (DIVE-5287). After the URL routing above, so
@@ -14490,6 +14991,8 @@ case "${1:-}" in
   act)   shift; cmd_act "$@" ;;
   replay) shift; cmd_replay "$@" ;;
   routine) shift; cmd_routine "$@" ;;
+  mint)  shift; cmd_mint "$@" ;;
+  tools|tool) shift; cmd_tools "$@" ;;
   approve) shift; cmd_approve "$@" ;;
   approvals) shift; cmd_approvals "$@" ;;
   gate|gates) shift; cmd_gate "$@" ;;

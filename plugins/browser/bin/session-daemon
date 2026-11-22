@@ -1226,7 +1226,8 @@ async function snapshotRequest(ctx, req, send, end) {
       // does); it SAYS so instead (DIVE-7303), so the agent knows a late part may
       // still come and can look again, as Claude in Chrome's agent does.
       const settle = settleOf(req, stay ? 0 : TREE_SETTLE_MS);
-      if (settle > 0) loading = !(await aria.settleQuiet(page, settle, watch)) && !!watch;
+      // Still busy at the bound: up to SNAP_BUSY_MS more, ending at quiet (DIVE-9011).
+      if (settle > 0) loading = !(await aria.settleQuiet(page, settle, watch)) && !!watch && !(await aria.settleBusy(page, watch));
     } finally { if (watch) watch.stop(); }
     const snap = await aria.snapshot(page, { interactiveOnly: !!req.interactive });
     // The agent has now seen this tab: the next act on it says what changed since.
