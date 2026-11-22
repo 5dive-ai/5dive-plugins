@@ -118,9 +118,15 @@ describe('voicefast.ts', () => {
   })
 })
 
-// The root-relay stand-in. A text event waits EVENT_DELAY_MS before it answers,
-// so a speech started before it is visible; `event` answers 500 when FAIL_TEXT is set.
-function writeRelay(dir: string, opts: { delayMs?: number; failText?: boolean } = {}): string {
+// The root-relay stand-in. A text event waits delayMs before it answers, so a
+// speech started before it is visible; `event` answers 500 when failText is set.
+// holdForSpeechMs: the text post also stays in flight until the speech has
+// started (or that ceiling passes), so "speech starts while the text is being
+// posted" is an order the test reads, not a race against a loaded runner's
+// process start-up. A sequential adapter never starts the speech while the
+// text is held, so it still lands after text-done and the order check fails.
+type RelayOpts = { delayMs?: number; failText?: boolean; holdForSpeechMs?: number }
+function writeRelay(dir: string, opts: RelayOpts = {}): string {
   const file = join(dir, 'relay.ts')
   writeFileSync(file, `
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
@@ -129,6 +135,13 @@ const raw = await new Response(Bun.stdin.stream()).text()
 const op = raw.split('\\0').slice(0, -1)
 if (op[0] === 'event' && op[2] !== ${JSON.stringify(VOICE_ONLY_BODY)}) {
   appendFileSync(dir + '/marks.log', 'text-start ' + Date.now() + '\\n')
+  const holdUntil = Date.now() + ${opts.holdForSpeechMs ?? 0}
+  while (Date.now() < holdUntil) {
+    let m = ''
+    try { m = readFileSync(dir + '/marks.log', 'utf8') } catch {}
+    if (m.includes('speak-start ')) break
+    await Bun.sleep(10)
+  }
   await Bun.sleep(${opts.delayMs ?? 0})
   if (${opts.failText ? 'true' : 'false'}) { appendFileSync(dir + '/ops.log', JSON.stringify(['failed', ...op]) + '\\n'); process.stdout.write('500\\n{"error":"down"}'); process.exit(0) }
   appendFileSync(dir + '/marks.log', 'text-done ' + Date.now() + '\\n')
@@ -240,7 +253,7 @@ function startAdapter(dir: string, relay: string, labs: string | null) {
 
 const timingFile = (dir: string) => join(dir, 'state', 'voice-timing.log')
 
-async function run(labs: string | null, opts: { delayMs?: number; failText?: boolean } = {}, body?: (dir: string, a: ReturnType<typeof startAdapter>) => Promise<void>) {
+async function run(labs: string | null, opts: RelayOpts = {}, body?: (dir: string, a: ReturnType<typeof startAdapter>) => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), 'dash-fast-'))
   const a = startAdapter(dir, writeRelay(dir, opts), labs)
   try {
@@ -267,7 +280,7 @@ describe('the test version, on and off (DIVE-8649)', () => {
   }, 30_000)
 
   test('fast: the speech starts while the text is still being posted, and the same two posts go', async () => {
-    await run('fast\n', { delayMs: 400 }, async (dir, a) => {
+    await run('fast\n', { delayMs: 400, holdForSpeechMs: 5_000 }, async (dir, a) => {
       a.reply('Friday at ten.')
       expect(await waitFor(() => a.results.length >= 1, 10_000)).toBe(true)
       const events = ops(dir).filter(o => o[0] === 'event')
