@@ -1292,16 +1292,34 @@ const sentTo = new WeakMap();
 // and a second call that found the browser already there. When the page did land
 // on the site it was sent to, that is the load; anywhere else, or still on the
 // page it left (a same-site download aborts too), the error stands.
+// ...AND THE START LOAD IS NOT AWAITED, SO IT CAN BE ON EITHER SIDE (DIVE-9042).
+// The FIRST mint on lodar's box died here: "page.goto: net::ERR_ABORTED at
+// https://en.wikipedia.org/wiki/Grace_Hopper", on the act that "started a served
+// browser for the public profile"; the same call a minute later minted. The act's
+// goto and the start URL's (fired, not awaited, at daemon start) raced on one tab.
+// Two shapes escaped the check above: (a) the start load had already committed, so
+// the tab was ON the url before this goto ("never left its page" read as a
+// download); (b) it had not committed yet, so the tab still showed about:blank,
+// which counts as loaded, and was judged at once. So: wait (bounded) for the
+// tab to reach the site; a blank tab that never does gets the one goto again;
+// a tab already on the very url asked for is that load.
+const ABORT_LAND_MS = Number(process.env.FIVEDIVE_BROWSER_ABORT_LAND_MS || 10000);
 const sameOrigin = (a, b) => { try { return new URL(a).origin === new URL(b).origin; } catch (e) { return false; } };
-async function goTo(page, url) {
+const isBlank = (u) => !/^https?:/i.test(String(u || ''));
+async function goTo(page, url, again = true) {
   let resp = null, before = '';
   try { before = page.url(); } catch (e) { /* none */ }
   try { resp = await page.goto(url, { waitUntil: 'domcontentloaded' }); }
   catch (e) {
     const msg = String(e && e.message);
     if (/net::ERR_ABORTED/.test(msg)) {
+      if (typeof page.waitForURL === 'function') {
+        try { await page.waitForURL((u) => sameOrigin(String(u), url), { waitUntil: 'commit', timeout: ABORT_LAND_MS }); }
+        catch (e2) { /* judged by where it is */ }
+      }
       try { await page.waitForLoadState('domcontentloaded'); } catch (e2) { /* judged by where it is */ }
-      if (!sameOrigin(page.url(), url) || page.url() === before) throw e;
+      if (again && isBlank(before) && isBlank(page.url())) return goTo(page, url, false);   // (b), and both loads were dropped
+      if (!sameOrigin(page.url(), url) || (page.url() === before && !sameUrl(before, url))) throw e;
     } else {
       if (!/interrupted by another navigation/.test(msg)) throw e;
       await page.waitForLoadState('domcontentloaded');

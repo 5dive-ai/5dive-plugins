@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Fixed — browser 1.97.1: the first mint on a cold box no longer dies with net::ERR_ABORTED (DIVE-9042)
+
+- The act that starts a served browser lost its page load to that browser's own start load. It now waits for the tab to reach the site, loads the page once more if both loads were dropped, and counts a tab already on the URL as loaded. `plugins/browser` is re-synced byte for byte from 5dive-ai/5dive-browser branch `fix/dive-9042-mint-cold-shelf` (`tests/browser_mirror.sh sync`).
+
 ### Added — browser 1.97.0: a site task becomes a tool every agent on the box can call, with no model (DIVE-9033)
 
 - `5dive browser mint <url-with-{{input}}> <tool> --task=… --inputs=… --outputs=… --example=…` keeps a task an agent did once as a tool with named, typed inputs and typed outputs; mint runs the example and saves it only if every output matched. `replay <site> <tool> --input='{…}'` runs it with no snapshot and no model, and `tools` lists the box's tools for every seat. `plugins/browser` is re-synced byte for byte from 5dive-ai/5dive-browser branch `feat/dive-9033-mint` (`tests/browser_mirror.sh sync`), which also carries upstream 1.96.0 (DIVE-9011).
