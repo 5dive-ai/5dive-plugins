@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Added — browser 1.97.0: a site task becomes a tool every agent on the box can call, with no model (DIVE-9033)
+
+- `5dive browser mint <url-with-{{input}}> <tool> --task=… --inputs=… --outputs=… --example=…` keeps a task an agent did once as a tool with named, typed inputs and typed outputs; mint runs the example and saves it only if every output matched. `replay <site> <tool> --input='{…}'` runs it with no snapshot and no model, and `tools` lists the box's tools for every seat. `plugins/browser` is re-synced byte for byte from 5dive-ai/5dive-browser branch `feat/dive-9033-mint` (`tests/browser_mirror.sh sync`), which also carries upstream 1.96.0 (DIVE-9011).
+
 ### Fixed — browser 1.95.3: an agent can ask its owner to clear a captcha on a site two saved logins cover (DIVE-9003)
 
 - Box report 1323: with example.com and studio.example.com both saved, the captcha ask on studio.example.com died "2 connected accounts … name it" although the site was named. The look before the ask now runs in the named site's profile when the agent has that login. `plugins/browser` is re-synced byte for byte from 5dive-ai/5dive-browser (`tests/browser_mirror.sh sync`), which also carries upstream 1.92.0–1.95.2 to the registry copy (it sat at 1.91.0).

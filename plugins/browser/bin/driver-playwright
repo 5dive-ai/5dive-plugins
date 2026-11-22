@@ -462,6 +462,9 @@ async function snapshotMode(plan) {
     const page = ctx.pages()[0] || await ctx.newPage();
     page.setDefaultTimeout(STEP_TIMEOUT);
     assertLease('snapshot');
+    // What is still loading, from before the load (DIVE-9011): the settle below
+    // waits on past its floor while the page is busy, as the daemon's does.
+    const watch = typeof page.context === 'function' ? aria.requestWatch(page.context()) : null;
     // The document's own HTTP status (DIVE-6725): a 404 is a page too, and a
     // caller that hands this URL to a person needs to know it is one.
     const resp = await page.goto(plan.url, { waitUntil: 'domcontentloaded' });
@@ -474,7 +477,12 @@ async function snapshotMode(plan) {
       ? await aria.waitForPast(page, String(plan.wait_for), inter, { timeoutMs: stepLimit(plan) }) : null;
     // NEVER network idle, for the reason written above treeMode: a live web app
     // long-polls and never idles, and waiting for it is what makes a read hang.
+    // The floor stays a fixed wait, not a quiet one: a page fetching its scripts
+    // is quiet (scripts are not watched) and has drawn nothing yet. Past the floor
+    // a page still busy gets up to SNAP_BUSY_MS more (DIVE-9011).
     await page.waitForTimeout(Number(process.env.FIVEDIVE_BROWSER_TREE_SETTLE_MS || 1200));
+    let loading = false;
+    try { loading = !!watch && !(await aria.settleBusy(page, watch)); } finally { if (watch) watch.stop(); }
     const snap = await aria.snapshot(page, { interactiveOnly: !!plan.interactive });
     fs.writeFileSync(plan.html, snap.html || '', { mode: 0o600 });
     // The PNG is a SECOND protocol call and NOT a second load: same browser,
@@ -489,6 +497,7 @@ async function snapshotMode(plan) {
       png: plan.shot || null,
       ...(waited ? { wait_for: waited } : {}),
       ...(inter ? { interstitial: inter } : {}),
+      ...(loading ? { still_loading: true } : {}),
       browser_mode: browserMode,
       ...(resp ? { http_status: resp.status() } : {}),
     };

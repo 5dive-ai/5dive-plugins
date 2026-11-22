@@ -1508,6 +1508,22 @@ async function settleQuiet(page, ms, watch) {   // -> true when it ended quiet, 
   return false;
 }
 
+// A SNAPSHOT OF A PAGE STILL BUILDING ITSELF WAITS FOR IT, A LITTLE (DIVE-9011).
+// recreation.gov's campground page draws its tabs ("Rules & Cancellations") at
+// ~1.2 s after DOMContentLoaded and its 1,700 buttons at ~1.6 s: a coin flip
+// against the 1.2 s settle. On the DIVE-9006 bench the losing side was a walk of
+// the server-rendered shell (234 refs, no tabs, no buttons) and the agents
+// answered the site-wide policy instead of the campground's own tab. So when the
+// settle ends with the page still busy (a document, XHR or fetch in flight, or
+// the DOM still changing), it gets up to SNAP_BUSY_MS more, ending the moment it
+// goes quiet. A page that was done costs nothing extra; one that polls forever
+// costs the bound once and is still reported as loading. No watch: no wait.
+const SNAP_BUSY_MS = Number(process.env.FIVEDIVE_BROWSER_SNAP_BUSY_MS || 3000);
+async function settleBusy(page, watch) {   // -> true when the page went quiet within the bound
+  if (!watch || !(SNAP_BUSY_MS > 0)) return false;
+  return settleQuiet(page, SNAP_BUSY_MS, watch);
+}
+
 // ...AND READ AGAIN UNTIL --expect MATCHES, for a few seconds (DIVE-4983). A
 // "Message sent" toast arrives after the click; the one read taken at the settle
 // missed it, and `act` printed NOT VERIFIED on a mail that was in the Sent folder.
@@ -1777,7 +1793,7 @@ function render(nodes, { json = false } = {}) {
 module.exports = { movedSince, INTERACTIVE, pageWalk, walk, snapshot, resolveRef, resolveSelector,
   resolveRefWithin, resolveStepSelector, resolveOrRepick, nameMatches, REPICK_MIN_CONFIDENCE, FIELD_SWAP_MS,
   onRef, refind, REFIND_OPS, _markFocusedIn, clickStep, FAILED_SETTLE_MS, COVERED_CLICK_MS,
-  requestWatch, settleQuiet,
+  requestWatch, settleQuiet, settleBusy, SNAP_BUSY_MS,
   isRef, render, REF_PREFIX,
   splitRef, frameList, frameFor, FRAME_PREFIX, ENTER_FRAME,
   typeDelay, typeRefusal, typeKeys, TYPE_DELAY_DEFAULT, TYPE_DELAY_MAX,
