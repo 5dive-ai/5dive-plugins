@@ -29,7 +29,11 @@ reset_log() { : > "$T/input.log"; }
 for c in "send:Send" "send:com.app:id/btn_send" "send:sendButton" "send:Отправить" "pay:Buy now" "pay:Place order" \
          "delete:Delete chat" "publish:Post" ":Posts" ":Reply" ":Share" ":Allow" \
          "pay:Send money" "pay:Send payment" "pay:Send \$50" "pay:Send 12,50 €" "pay:Request money" "pay:Withdraw" \
-         "send:Send message"; do
+         "send:Send message" \
+         "pay:Geld senden" "pay:Geld überweisen" "pay:Überweisen" "pay:Überweisung" "pay:Отправить деньги" "pay:Перевод" \
+         "pay:Enviar dinero" "pay:Transferir" "pay:Transferencia" "pay:Envoyer de l'argent" "pay:Envoyer de l’argent" "pay:Virement" \
+         "pay:Send 50 USD" "pay:Send USD 50" "pay:Send 12,50 eur" "pay:Send 50 RUB" "pay:Отправить 500 ₽" \
+         "send:Send 2 photos" "send:Senden" "send:Enviar"; do
   want="${c%%:*}" label="${c#*:}"
   got="$(python3 "$UI" classify "$label")"
   check "classify \"$label\" -> ${want:-nothing}" [ "$got" == "$want" ]
@@ -130,7 +134,7 @@ check "an empty policy file is the default, not an error" [ "$("$PHONE" approval
 
 # ---- standard: a money button is a payment and asks; a plain Send still runs ----
 rm -f "$T/policy.json"
-for b in "Send money" "Send payment"; do
+for b in "Send money" "Send payment" "Geld senden"; do
   reset_log
   out="$(FAKE_ADB_UI="$FIX/wallet.xml" "$PHONE" act --steps="[{\"op\":\"type\",\"text\":\"50\"},{\"op\":\"tap\",\"ref\":\"button/$b\"}]" 2>&1)"; rc=$?
   check "standard: button/$b stops with exit 73, nothing typed" bash -c '[ "$1" -eq 73 ] && [ ! -s "$2" ]' _ "$rc" "$T/input.log"

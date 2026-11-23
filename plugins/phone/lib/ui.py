@@ -29,7 +29,11 @@ KINDS = [
     # Money-bearing sends come first: "Send money" in a payment app is a payment,
     # not a message, and standard lets sends through.
     ("pay", r"send money|send payment|send funds|request money|withdraw|"
-            r"send\s*[$€£₽]\s*\d+|send\s+\d+(?:[.,]\d+)?\s*[$€£₽]|"
+            r"geld senden|geld überweisen|überweisen|überweisung|"
+            r"отправить деньги|перевод|"
+            r"enviar dinero|transferir|transferencia|envoyer de l['’ ]?argent|virement|"
+            r"(?:send|senden|отправить|enviar|envoyer)\s*(?:[$€£₽]|usd|eur|gbp|rub)\s*\d+|"
+            r"(?:send|senden|отправить|enviar|envoyer)\s+\d+(?:[.,]\d+)?\s*(?:[$€£₽]|usd|eur|gbp|rub)|"
             r"pay|pay now|buy|buy now|purchase|checkout|check out|place order|order now|"
             r"subscribe|donate|top up|transfer|confirm payment|"
             r"оплатить|оплата|купить|заказать|перевести|"
