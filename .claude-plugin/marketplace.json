@@ -69,6 +69,13 @@
       "category": "productivity",
       "source": "./plugins/crew",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/crew"
+    },
+    {
+      "name": "desktop",
+      "description": "Desktop control: agents on your server see and use the apps on your Windows PC, through the 5dive desktop app (agent-desktop, UI Automation). The PC opens no port: the app polls the server. Off until the owner turns it on in the app; Stop interrupts at once. Steps that pay, post, send or delete follow the browser's approvals policy. Screen content is never logged.",
+      "category": "productivity",
+      "source": "./plugins/desktop",
+      "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/desktop"
     }
   ]
 }

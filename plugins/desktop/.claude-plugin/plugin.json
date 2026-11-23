@@ -1,0 +1,37 @@
+{
+  "name": "desktop",
+  "version": "0.1.0",
+  "description": "Let your agents see and use the apps on your Windows PC, through the 5dive desktop app. Off until you turn it on in the app; one tap on Stop interrupts it. Paying stops for your approval by default (the browser's policy: set careful and posting, sending and deleting stop too). What is on your screen is never logged.",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com",
+    "url": "https://5dive.ai"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/desktop",
+  "license": "Apache-2.0",
+  "skills": "./skills/",
+  "keywords": [
+    "desktop",
+    "windows",
+    "computer-use",
+    "automation"
+  ],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": [
+      "verb",
+      "skill"
+    ],
+    "verbs": [
+      {
+        "name": "desktop",
+        "summary": "see and use apps on the owner's Windows PC"
+      }
+    ],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    }
+  }
+}

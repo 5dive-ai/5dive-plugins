@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+# `5dive desktop` — DIVE-9063. A plugin VERB (contract §2), found by convention at
+# <installed-plugin-dir>/bin/desktop. It lets an agent on the owner's server see and
+# operate apps on the owner's Windows PC, through the 5dive desktop app.
+#
+# THE SHAPE, in one line: the agent writes a job into a spool on this box; the
+# desktop app on the PC long-polls for it over the API's exec tunnel (`_poll`),
+# runs it with agent-desktop (UI Automation), and posts the answer back
+# (`_result`). The PC opens no port; nothing here reaches out to it.
+#
+#   agent seat ── snapshot/act ──> spool ──> `_poll` (root, via the tunnel) ──> PC
+#   agent seat <── result file <── `_result` (root) <── agent-desktop on the PC
+#
+# The contract all three halves are built against is DIVE-9063's CONTRACT.md: the
+# verbs, the JSON shapes and the exit codes below are fixed by it.
+#
+# THREE THINGS THIS FILE REFUSES TO DO:
+#   1. A step the agent declared as pay/post/send/delete that the owner's policy
+#      sets to ask never reaches the PC (exit 73). The policy is the BROWSER's, read
+#      from the browser's own file: one owner answer for both, never a second store.
+#      The box checks it twice: here, before the job is written, and again as root
+#      when the PC claims it, so a job written into the spool by hand is held too.
+#   2. What is on the owner's screen is never logged. A snapshot lives only in the
+#      one result file the waiting agent reads (0600, its own, deleted on read).
+#      Typed text is never logged either: the action log keeps its length.
+#   3. The agent never builds an agent-desktop command line. It names a `do`; root
+#      maps it onto agent-desktop at claim time (_STEP_MAP below), from the
+#      validated step, and hands the PC that argv.
+# SC2016: the jq programs are single-quoted on purpose. SC2015: `a && b || die` is
+# a guard here, and die exits. SC2001: the sed indents a multi-line block.
+# shellcheck disable=SC2016,SC2015,SC2001
+set -uo pipefail
+
+PROG="5dive desktop"
+STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
+# THE SPOOL. Root creates it on the first `_poll` (the app's first check-in):
+#   computers/  0755 root   <uuid>.json {id,name,last_seen}: public, `status` reads it
+#   queue/      1733 root   a seat's request, <id>.json 0600 OWNED BY THE SEAT. -wx for
+#                           others: a seat drops a file it can name and lists nothing
+#                           (the same trade the browser's 0711/0710 dirs make); the
+#                           sticky bit lets only its owner (and root) take it back
+#   claimed/    0700 root   what the PC holds now, root's copy with the argv it was handed
+#   results/    1733 root   <id>.json, written by root and chowned 0600 to the seat that
+#                           asked; that seat reads it by name and deletes it
+#   cancel/     1733 root   <id>: a seat that stopped waiting for a claimed job says so
+#   log.jsonl   0644 root   the owner-visible action log, metadata only, root writes it
+# A seat cannot forge a result for another: a result is believed only when the
+# file is owned by the reader itself, and only root can give a file away.
+SPOOL="${FIVEDIVE_DESKTOP_SPOOL:-$STATE_DIR/desktop}"
+SEEN_WINDOW=30          # connected = a computer polled in the last 30 s (contract)
+WAIT_DEFAULT=60         # how long snapshot/act wait for the PC
+WAIT_MAX=600
+STALE_S=600             # spool leftovers older than this are swept by root at _poll
+RESULT_MAX=65536        # `_result` stdin cap (the API's exec cap; the app truncates)
+LOG_KEEP=2000           # log lines kept once it passes twice this
+MAX_STEPS=40
+TEXT_MAX=20000
+
+E_USAGE=64; E_UNAVAILABLE=69; E_NEEDS_OWNER=73; E_STOPPED=75; E_PERM=77; E_TIMEOUT=124
+# 1 is a job the PC ran and that failed (a stale ref, an app that is not open);
+# the printed error is agent-desktop's own.
+
+# THE OWNER'S POLICY — the browser's, byte for byte the same file and the same
+# rules (plugins/browser bin/browser, "THE OWNER'S POLICY PER KIND"): one
+# root-owned file in the profile store's root; a file the granting uid does not own
+# is no policy and the defaults apply; a kind left out or misspelt is the default.
+# The overrides are the browser's own names, so a box that relocated its browser
+# store relocates this read with it.
+PROFILE_ROOT="${FIVEDIVE_BROWSER_PROFILE_ROOT:-$STATE_DIR/browser-profiles}"
+_policy_file() { printf '%s\n' "${FIVEDIVE_BROWSER_APPROVAL_POLICY:-$PROFILE_ROOT/.approval-policy.json}"; }
+_grant_uid()   { printf '%s\n' "${FIVEDIVE_BROWSER_GRANT_UID:-0}"; }
+APPROVAL_DEFAULTS='{"pay":"ask","publish":"allow","send":"allow","delete":"allow"}'
+
+# Who may run the app-facing verbs. Root: the exec tunnel reaches the box as
+# `sudo -n /usr/local/bin/5dive …`. The override is a TEST SEAM honoured only
+# without root (it points the harness at its own spool with its own rights; the
+# real spool's claimed/ is root's 0700, so it reaches nothing there).
+APP_UID=0
+[[ $EUID -ne 0 && -n "${FIVEDIVE_DESKTOP_APP_UID:-}" ]] && APP_UID="$FIVEDIVE_DESKTOP_APP_UID"
+
+JSON_MODE="${FIVEDIVE_JSON_MODE:-0}"
+
+die() {  # die <rc> <message>
+  local rc="$1"; shift
+  if (( JSON_MODE )); then
+    jq -cn --argjson rc "$rc" --arg m "$*" '{ok:false, code:$rc, error:$m}'
+  fi
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  exit "$rc"
+}
+
+_seat() {
+  if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then printf '%s\n' "$SUDO_USER"
+  else id -un; fi
+}
+_now() { date +%s; }
+_iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; }
+_valid_id() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,96}$ ]]; }
+
+usage() {
+  cat <<'USAGE'
+5dive desktop — see and operate apps on the owner's Windows PC
+
+  The owner turns this on in the 5dive app on their PC ("Let my agent use this
+  computer"). Nothing reaches the PC while that switch is off.
+
+  5dive desktop status [--json]       # is a computer connected? {connected, computer, enabled}
+  5dive desktop snapshot [--app=<name>] [--interactive] [--timeout=<s>] [--json]
+                                      # the app's controls, each with a ref (@s…:e3)
+  5dive desktop act --steps='<json array>' [--app=<name>] [--timeout=<s>] [--json]
+                                      # runs the steps in order on the PC, then prints a
+                                      # fresh snapshot of the same app
+  5dive desktop log [--limit=N] [--json]
+                                      # what agents did on the PC: who, which app, which
+                                      # controls; never the screen, never typed text
+
+  A step: {"do":"click","ref":"@s8f3k2p9:e3"}   {"do":"type","ref":"…","text":"hi"}
+          {"do":"press","keys":"ctrl+s"}         {"do":"launch","app":"notepad"}
+  A step that pays, posts, sends or deletes says so with "kind":"pay|post|send|delete",
+  and the owner's policy applies (the browser's: 5dive browser approvals policy).
+
+  sudo 5dive desktop off|on           # the owner's server-side switch (default on)
+
+  exit 0 ok · 1 the PC ran it and it failed · 64 usage · 69 no computer connected ·
+  73 the owner's policy stops a step (nothing ran) · 75 the owner pressed Stop ·
+  124 the PC did not answer in time
+USAGE
+  printf '\n  steps (do → what runs on the PC):\n'
+  _step_help
+}
+
+# ------------------------------------------------------------------ the mapping
+#
+# `do` → agent-desktop (vercel-labs/agent-desktop). ONE PLACE: the agent-side check,
+# root's claim and the help all read this. The names are agent-desktop's own
+# commands, so an agent that knows agent-desktop knows these; "_" is read as "-".
+# A ref is the qualified ref the snapshot printed (@<snapshot>:e<n>); agent-desktop
+# refuses a bare @e3 (INVALID_ARGS). Typed text goes to the PC on stdin (`--stdin`),
+# never on agent-desktop's command line, as its README asks for anything private.
+# focus and double-click need --headed (agent-desktop refuses them headless on
+# Windows). Nothing here moves the mouse by coordinates: refs only.
+_STEP_HELP='click           {"do":"click","ref":R}                     agent-desktop click R
+double-click    {"do":"double-click","ref":R}              agent-desktop --headed double-click R
+right-click     {"do":"right-click","ref":R}               agent-desktop right-click R
+type            {"do":"type","ref":R,"text":T}             agent-desktop type R --stdin   (T on stdin)
+set-value       {"do":"set-value","ref":R,"text":T}        agent-desktop set-value R --stdin
+clear           {"do":"clear","ref":R}                     agent-desktop clear R
+focus           {"do":"focus","ref":R}                     agent-desktop --headed focus R
+select          {"do":"select","ref":R,"text":OPTION}      agent-desktop select R OPTION
+toggle|check|uncheck|expand|collapse|scroll-to {"do":…,"ref":R}  agent-desktop <do> R
+scroll          {"do":"scroll","ref":R,"direction":"down","amount":3}
+                                                           agent-desktop scroll R --direction D --amount N
+press           {"do":"press","keys":"ctrl+s"[,"app":A]}   agent-desktop press K [--app A]
+launch          {"do":"launch","app":A}                    agent-desktop launch A
+close-app       {"do":"close-app","app":A}                 agent-desktop close-app A
+focus-window    {"do":"focus-window","app":A}              agent-desktop focus-window --app A
+wait            {"do":"wait","ms":1000}                    agent-desktop wait 1000   (up to 30000)'
+_step_help() { sed 's/^/    /' <<<"$_STEP_HELP"; }
+
+# Validates a steps array and adds to each step the argv the PC runs ("argv",
+# after the agent-desktop binary) and, for typed text, "stdin". Errors are one
+# line on stderr, jq exit 5. The output keeps every field the agent gave that the
+# contract names (do, ref, text, keys, app, kind), with `do` normalised.
+_STEP_MAP='
+def need($f): if (.[$f] | type) == "string" and (.[$f] | length) > 0 then .[$f]
+  else error("step \(.n): \"\(.do)\" needs \"\($f)\"") end;
+def ref: need("ref") as $r | if ($r | test("^@[A-Za-z0-9:_.-]{1,96}$")) then $r
+  else error("step \(.n): \"\($r)\" is not a ref — copy it whole from the snapshot (@s…:e3)") end;
+def text: if (.text | type) == "string" then
+    (if (.text | length) <= $tmax then .text else error("step \(.n): text is over \($tmax) characters") end)
+  else error("step \(.n): \"\(.do)\" needs \"text\"") end;
+def appname: need("app") as $a | if ($a | test("^[^[:cntrl:]-][^[:cntrl:]]{0,127}$")) then $a
+  else error("step \(.n): \"\($a)\" is not an app name") end;
+def keys: need("keys") as $k | if ($k | test("^[A-Za-z0-9+_-]{1,40}$")) then $k
+  else error("step \(.n): keys look like \"ctrl+s\" or \"return\"; got \"\($k)\"") end;
+if type != "array" or length == 0 then error("--steps is a JSON array of one or more steps")
+elif length > $max then error("at most \($max) steps in one act")
+else . end
+| to_entries | map(.value as $s | ($s | type) as $t
+  | if $t != "object" then error("step \(.key + 1) is not an object") else . end
+  | $s + {n: (.key + 1)}
+  | if (.do | type) != "string" then error("step \(.n) has no \"do\"") else . end
+  | .do |= gsub("_"; "-")
+  | if has("kind") and ((.kind | IN("pay","post","publish","send","delete")) | not)
+    then error("step \(.n): \"kind\" is one of pay, post, send, delete") else . end
+  | if .do == "click" or .do == "right-click" or .do == "clear" or .do == "toggle" or .do == "check"
+       or .do == "uncheck" or .do == "expand" or .do == "collapse" or .do == "scroll-to"
+      then .argv = [.do, ref]
+    elif .do == "double-click" or .do == "focus" then .argv = ["--headed", .do, ref]
+    elif .do == "type" or .do == "set-value" then (text as $x | .argv = [.do, ref, "--stdin"] | .stdin = $x)
+    elif .do == "select" then .argv = ["select", ref, text]
+    elif .do == "scroll" then
+      ((.direction // "down") as $d | (.amount // 3) as $a
+       | if ($d | IN("up","down","left","right")) | not then error("step \(.n): direction is up, down, left or right")
+         elif ($a | type) != "number" or $a < 1 or $a > 50 then error("step \(.n): amount is 1 to 50")
+         else .argv = ["scroll", ref, "--direction", $d, "--amount", ($a | floor | tostring)] end)
+    elif .do == "press" then .argv = ["press", keys] + (if .app then ["--app", appname] else [] end)
+    elif .do == "launch" or .do == "close-app" then .argv = [.do, appname]
+    elif .do == "focus-window" then .argv = ["focus-window", "--app", appname]
+    elif .do == "wait" then
+      (if (.ms | type) == "number" and .ms >= 0 and .ms <= 30000 then .argv = ["wait", (.ms | floor | tostring)]
+       else error("step \(.n): wait takes \"ms\", 0 to 30000") end)
+    else error("step \(.n): \"\(.do)\" is not a step this box sends — see 5dive desktop act --help") end
+  | del(.n))'
+
+_steps_map() {  # <steps-json> -> mapped steps on stdout, or the reason on stderr and rc!=0
+  jq -c --argjson max "$MAX_STEPS" --argjson tmax "$TEXT_MAX" "$_STEP_MAP" <<<"$1" 2>&1 >/dev/null | sed 's/^jq: error[^:]*: //' >&2
+  jq -ce --argjson max "$MAX_STEPS" --argjson tmax "$TEXT_MAX" "$_STEP_MAP" <<<"$1" 2>/dev/null
+}
+
+_snapshot_argv() {  # <app> <interactive 0|1> -> the argv of the snapshot the PC takes
+  jq -cn --arg a "$1" --argjson i "$2" '["snapshot"] + (if $a != "" then ["--app", $a] else [] end) + (if $i == 1 then ["-i"] else [] end) + ["--compact"]'
+}
+
+# ------------------------------------------------------------------ the policy
+
+_policy_json() {
+  local f c='{}'; f="$(_policy_file)"
+  if [[ -f "$f" && ! -L "$f" && "$(stat -c %u "$f" 2>/dev/null)" == "$(_grant_uid)" ]]; then
+    c=$(jq -c 'if type == "object" then . else {} end' "$f" 2>/dev/null) || c='{}'
+  fi
+  jq -nc --argjson c "$c" --argjson d "$APPROVAL_DEFAULTS" \
+    '$d | with_entries(.value = (if $c[.key] == "ask" or $c[.key] == "allow" or $c[.key] == "always" then $c[.key] else $d[.key] end))'
+}
+
+# The first step the policy stops, as {step,kind,do,ref,app}, or nothing. "post"
+# is the browser's "publish" (the contract's word for the same kind).
+_policy_stop() {  # <mapped-steps>
+  jq -c --argjson p "$(_policy_json)" '
+    to_entries | map(select(.value.kind != null)
+      | {step: (.key + 1), kind: .value.kind, do: .value.do, ref: (.value.ref // ""), app: (.value.app // "")}
+      | select($p[if .kind == "post" then "publish" else .kind end] == "ask")) | first // empty' <<<"$1"
+}
+
+# THE STOP, in the browser's words (its _owner_ask): which step, what it would do,
+# that it is the owner's call, the one question to put to the owner, and the row ask.
+_needs_owner() {  # <stop-json> <app> <computer-name>
+  local s="$1" app="$2" comp="$3" k verb what
+  k=$(jq -r .kind <<<"$s")
+  case "$k" in pay) verb="pay or place an order" ;; post|publish) verb="post or publish" ;; send) verb="send a message" ;; delete) verb="delete something" ;; *) verb="do something only the owner can allow" ;; esac
+  [[ -n "$comp" ]] || comp="the owner's computer"
+  what="${app:+in $app }on $comp"
+  printf '%s: STOPPED before step %s — it would %s ("%s %s") %s. That is the owner'"'"'s call, not the agent'"'"'s.\n' \
+    "$PROG" "$(jq -r .step <<<"$s")" "$verb" "$(jq -r .do <<<"$s")" "$(jq -r .ref <<<"$s")" "$what" >&2
+  printf '  Nothing ran: no step of this plan reached the computer.\n' >&2
+  printf '  Ask the owner: "I am about to %s %s: <what exactly, and to whom>. OK?"\n' "$verb" "$what" >&2
+  printf '  When the owner says yes, they do that step themselves on their computer. The owner'"'"'s policy is the browser'"'"'s (5dive browser approvals policy).\n' >&2
+  printf '  Put it on your row as ONE ask:\n    5dive task need <your row> --type=approval --ask="<what you will %s, and where>?"\n' "$k" >&2
+  (( JSON_MODE )) && jq -cn --argjson rc "$E_NEEDS_OWNER" --argjson s "$s" '{ok:false, code:$rc, error:"needs_owner", stop:$s}'
+  exit "$E_NEEDS_OWNER"
+}
+
+# ------------------------------------------------------------------ computers
+
+_computers() {  # every computer record as one JSON array, newest first
+  local f
+  { for f in "$SPOOL"/computers/*.json; do [[ -f "$f" ]] && cat "$f"; done; } 2>/dev/null \
+    | jq -sc 'map(select(type == "object" and (.last_seen_at | type) == "number")) | sort_by(-.last_seen_at)'
+}
+_enabled() { [[ ! -e "$SPOOL/off" ]]; }
+_connected_json() {  # -> {connected, computer, enabled}
+  local cs; cs="$(_computers)"; [[ -n "$cs" ]] || cs='[]'
+  jq -c --argjson now "$(_now)" --argjson w "$SEEN_WINDOW" --argjson en "$(_enabled && echo true || echo false)" '
+    (.[0] // null) as $c
+    | {connected: ($en and $c != null and ($now - $c.last_seen_at) <= $w),
+       computer: (if $c == null then null else {id: $c.id, name: $c.name, last_seen: $c.last_seen} end),
+       enabled: $en}' <<<"$cs"
+}
+
+NOT_CONNECTED_MSG="no computer is connected: the owner's PC has not checked in in the last ${SEEN_WINDOW} s. The owner turns on \"Let my agent use this computer\" in the 5dive app on their Windows PC, and keeps the app running. Nothing was sent."
+
+# ------------------------------------------------------------------ agent verbs
+
+cmd_status() {
+  local json="$JSON_MODE" a
+  for a in "$@"; do case "$a" in --json) json=1; JSON_MODE=1 ;; -h|--help) usage; return 0 ;; *) die "$E_USAGE" "status: unexpected '$a'" ;; esac; done
+  local st; st="$(_connected_json)"
+  if (( json )); then printf '%s\n' "$st"; return 0; fi
+  if [[ "$(jq -r .connected <<<"$st")" == true ]]; then
+    printf 'connected: %s (seen %s)\n' "$(jq -r .computer.name <<<"$st")" "$(jq -r .computer.last_seen <<<"$st")"
+  elif [[ "$(jq -r .enabled <<<"$st")" != true ]]; then
+    printf 'off: the owner turned desktop control off on this server.\n'
+  else
+    printf 'not connected: %s\n' "$NOT_CONNECTED_MSG"
+    [[ "$(jq -r '.computer // empty' <<<"$st")" ]] && printf '  last computer: %s, seen %s\n' "$(jq -r .computer.name <<<"$st")" "$(jq -r .computer.last_seen <<<"$st")"
+  fi
+  return 0
+}
+
+# The id of the job this process is waiting on, for the traps.
+_JOB=""
+_withdraw() {  # take a job back: unclaimed → delete it; claimed → ask the PC to drop it
+  local id="$1"
+  [[ -n "$id" ]] || return 0
+  # A plain rm fails when the file is gone, i.e. when the PC already claimed it
+  # (the claim is a rename out of queue/). Then the PC is told to drop it.
+  rm "$SPOOL/queue/$id.json" 2>/dev/null && return 0
+  ( umask 077; : > "$SPOOL/cancel/$id" ) 2>/dev/null || true
+  rm -f "$SPOOL/results/$id.json" 2>/dev/null || true
+}
+
+# Writes the request, waits for its result, prints it. Shared by snapshot and act.
+_run_job() {  # <op> <app> <interactive> <steps-json|null> <timeout> <json>
+  local op="$1" app="$2" inter="$3" steps="$4" timeout="$5" json="$6"
+  local st; st="$(_connected_json)"
+  [[ "$(jq -r .enabled <<<"$st")" == true ]] || die "$E_UNAVAILABLE" "desktop control is off on this server (the owner turned it off). Nothing was sent."
+  [[ "$(jq -r .connected <<<"$st")" == true ]] || die "$E_UNAVAILABLE" "$NOT_CONNECTED_MSG"
+  local comp; comp="$(jq -r '.computer.name // ""' <<<"$st")"
+  [[ -d "$SPOOL/queue" && -w "$SPOOL/queue" ]] || die "$E_UNAVAILABLE" "the spool at $SPOOL/queue is not writable by $(id -un); the PC's next check-in repairs it. Try again in a minute. Nothing was sent."
+
+  local me id; me="$(_seat)"
+  id="$(id -un | tr -c 'A-Za-z0-9_-' '_' | cut -c1-40)-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  local req
+  req=$(jq -cn --arg id "$id" --arg op "$op" --arg app "$app" --argjson i "$inter" --argjson s "$steps" \
+        --arg seat "$me" --argjson at "$(_now)" \
+        '{id:$id, op:$op, app:$app, interactive:($i == 1), created_at:$at, seat:$seat} + (if $s == null then {} else {steps:$s} end)')
+  # Written aside, then renamed in: the poller never reads half a request.
+  ( umask 077; printf '%s\n' "$req" > "$SPOOL/queue/.$id.tmp" && mv -f "$SPOOL/queue/.$id.tmp" "$SPOOL/queue/$id.json" ) \
+    || die "$E_UNAVAILABLE" "could not write the request into $SPOOL/queue"
+  req=""; _JOB="$id"
+  trap '_withdraw "$_JOB"; exit 130' INT TERM HUP
+
+  local res="$SPOOL/results/$id.json" deadline=$(( $(_now) + timeout )) tick=0
+  while :; do
+    if [[ -f "$res" && ! -L "$res" && "$(stat -c %u "$res" 2>/dev/null)" == "$(id -u)" ]]; then break; fi
+    if (( $(_now) >= deadline )); then
+      _withdraw "$id"; _JOB=""
+      die "$E_TIMEOUT" "the computer did not answer in ${timeout} s; the job was taken back. Run it again, or check: 5dive desktop status"
+    fi
+    # Still queued (the PC has not taken it) and the PC went quiet: say so now
+    # rather than at the deadline.
+    if (( ++tick % 10 == 0 )) && [[ -e "$SPOOL/queue/$id.json" ]] \
+       && [[ "$(_connected_json | jq -r .connected)" != true ]]; then
+      _withdraw "$id"; _JOB=""
+      die "$E_UNAVAILABLE" "$NOT_CONNECTED_MSG"
+    fi
+    sleep 0.2
+  done
+  trap - INT TERM HUP; _JOB=""
+  local out; out="$(cat "$res" 2>/dev/null)"; rm -f "$res"
+  jq -e 'type == "object"' <<<"$out" >/dev/null 2>&1 || die 1 "the computer sent back something that is not a result"
+
+  if [[ "$(jq -r '.stopped // false' <<<"$out")" == true ]]; then
+    die "$E_STOPPED" "the owner pressed Stop on their computer; this job was interrupted and may have run in part. Do not retry it on your own: ask the owner first."
+  fi
+  if [[ "$(jq -r '.error // ""' <<<"$out")" == needs_owner ]]; then
+    _needs_owner "$(jq -c '.stop // {}' <<<"$out")" "$app" "$comp"
+  fi
+  local ok; ok="$(jq -r '.ok // false' <<<"$out")"
+  if (( json )); then
+    jq -c --arg id "$id" '{ok:(.ok // false), op, id:$id, snapshot, steps:(.steps // []), truncated:(.truncated // false)} + (if .error then {error} else {} end)' <<<"$out"
+  else
+    if [[ "$op" == act ]]; then
+      jq -r '(.steps // []) | to_entries[] | "step \(.key + 1): " + (if .value.ok then "ok" else "FAILED — \(.value.error // "no reason given")" end)' <<<"$out"
+    fi
+    [[ "$ok" == true ]] || printf '%s: the computer reported a failure: %s\n' "$PROG" "$(jq -r '.error // "no reason given"' <<<"$out")" >&2
+    if jq -e '.snapshot != null' <<<"$out" >/dev/null 2>&1; then
+      jq -r '.snapshot' <<<"$out"
+      [[ "$(jq -r '.truncated // false' <<<"$out")" == true ]] && printf '%s: the snapshot was cut at 64 KB; take a narrower one (--app, --interactive).\n' "$PROG" >&2
+    fi
+  fi
+  out=""
+  [[ "$ok" == true ]] && return 0 || return 1
+}
+
+_parse_timeout() {
+  [[ "$1" =~ ^[0-9]{1,4}$ ]] && (( $1 >= 1 && $1 <= WAIT_MAX )) || die "$E_USAGE" "--timeout takes seconds, 1 to $WAIT_MAX; got: $1"
+  printf '%s\n' "$1"
+}
+_check_app() { [[ -z "$1" || "$1" =~ ^[^[:cntrl:]-][^[:cntrl:]]{0,127}$ ]] || die "$E_USAGE" "--app takes an app name; got: $1"; }
+
+cmd_snapshot() {
+  local app="" inter=0 timeout="$WAIT_DEFAULT" json="$JSON_MODE" a
+  for a in "$@"; do
+    case "$a" in
+      --app=*) app="${a#*=}" ;;
+      --interactive|-i) inter=1 ;;
+      --timeout=*) timeout="$(_parse_timeout "${a#*=}")" || exit $? ;;
+      --json) json=1; JSON_MODE=1 ;;
+      -h|--help) printf 'usage: %s snapshot [--app=<name>] [--interactive] [--timeout=<s>] [--json]\n  the app'"'"'s accessibility tree as agent-desktop prints it; act on the refs it shows.\n' "$PROG"; return 0 ;;
+      *) die "$E_USAGE" "snapshot: unexpected '$a'" ;;
+    esac
+  done
+  _check_app "$app"
+  _run_job snapshot "$app" "$inter" null "$timeout" "$json"
+}
+
+cmd_act() {
+  local app="" steps="" timeout="$WAIT_DEFAULT" json="$JSON_MODE" a
+  for a in "$@"; do
+    case "$a" in
+      --steps=*) steps="${a#*=}" ;;
+      --app=*) app="${a#*=}" ;;
+      --timeout=*) timeout="$(_parse_timeout "${a#*=}")" || exit $? ;;
+      --json) json=1; JSON_MODE=1 ;;
+      -h|--help) printf 'usage: %s act --steps='"'"'<json array>'"'"' [--app=<name>] [--timeout=<s>] [--json]\n  runs the steps in order on the PC, then prints a fresh snapshot of the same app.\n  a step that pays, posts, sends or deletes carries "kind", and the owner'"'"'s policy applies.\n\n' "$PROG"; _step_help; return 0 ;;
+      *) die "$E_USAGE" "act: unexpected '$a'" ;;
+    esac
+  done
+  [[ -n "$steps" ]] || die "$E_USAGE" "act needs --steps='[{\"do\":\"click\",\"ref\":\"@s…:e3\"}]'"
+  _check_app "$app"
+  local mapped; mapped="$(_steps_map "$steps")" || die "$E_USAGE" "the steps were refused (above). Nothing ran."
+  # The app the closing snapshot reads: --app, else the last step that names one.
+  [[ -n "$app" ]] || app="$(jq -r '[.[] | .app // empty] | last // ""' <<<"$mapped")"
+  local stop; stop="$(_policy_stop "$mapped")"
+  if [[ -n "$stop" ]]; then
+    _needs_owner "$stop" "$app" "$(_connected_json | jq -r '.computer.name // ""')"
+  fi
+  # The request carries the agent's steps, not the argv: root maps them again.
+  _run_job act "$app" 1 "$(jq -c 'map(del(.argv, .stdin))' <<<"$mapped")" "$timeout" "$json"
+}
+
+cmd_log() {
+  local limit=20 json="$JSON_MODE" a
+  for a in "$@"; do
+    case "$a" in
+      --limit=*) limit="${a#*=}"; [[ "$limit" =~ ^[0-9]{1,4}$ ]] && (( limit >= 1 )) || die "$E_USAGE" "--limit takes 1 to 9999" ;;
+      --json) json=1; JSON_MODE=1 ;;
+      -h|--help) printf 'usage: %s log [--limit=N] [--json]\n' "$PROG"; return 0 ;;
+      *) die "$E_USAGE" "log: unexpected '$a'" ;;
+    esac
+  done
+  local f="$SPOOL/log.jsonl" lines=""
+  [[ -r "$f" ]] && lines="$(tail -n "$limit" "$f")"
+  if (( json )); then jq -sc '.' <<<"$lines"; return 0; fi
+  [[ -n "$lines" ]] || { printf 'nothing yet: no agent has used a computer from this server.\n'; return 0; }
+  jq -r '"\(.ts)  \(.agent) on \(.computer // "?")  \(.op)\(if .app != "" and .app != null then " " + .app else "" end)  \(.outcome)"
+         + ((.steps // []) | map("\n    " + .do + (if .ref then " " + .ref else "" end) + (if .keys then " " + .keys else "" end)
+             + (if .text_len != null then " (\(.text_len) chars)" else "" end) + (if .kind then " [" + .kind + "]" else "" end)) | join(""))
+         + (if .error then "\n    error: " + .error else "" end)' <<<"$lines"
+}
+
+# ------------------------------------------------------------------ app verbs (root)
+
+_app_only() {
+  [[ "$EUID" == "$APP_UID" ]] || die "$E_PERM" "$1 is the 5dive app's verb (it reaches the box as root over the exec tunnel); an agent uses snapshot, act, status and log."
+  # ROOT REACHED FROM AN AGENT SEAT IS NOT THE APP (the browser's _sudo_is_seat):
+  # a seat's `sudo 5dive …` grant is root, and must not hand out or answer jobs.
+  [[ "${SUDO_USER:-}" != agent-* ]] || die "$E_PERM" "$1 is the 5dive app's verb; an agent seat does not run it, even with sudo."
+}
+
+_spool_init() {  # root: create the spool with its modes; idempotent
+  ( umask 022
+    mkdir -p "$SPOOL" "$SPOOL/computers" "$SPOOL/queue" "$SPOOL/claimed" "$SPOOL/results" "$SPOOL/cancel" ) || die "$E_UNAVAILABLE" "could not create the spool at $SPOOL"
+  chmod 0755 "$SPOOL" "$SPOOL/computers"
+  chmod 1733 "$SPOOL/queue" "$SPOOL/results" "$SPOOL/cancel"
+  chmod 0700 "$SPOOL/claimed"
+  [[ -e "$SPOOL/log.jsonl" ]] || ( umask 022; : > "$SPOOL/log.jsonl" )
+  chmod 0644 "$SPOOL/log.jsonl"
+}
+
+# THE ACTION LOG LINE: time, seat, computer, op, app, per step do/ref/kind and the
+# LENGTH of any text, outcome. Built from a whitelist, so a field added to a step
+# later cannot leak into it. Never the snapshot, never the text.
+_log() {  # <claimed-json> <outcome> [<error>]
+  local f="$SPOOL/log.jsonl"
+  jq -c --arg o "$2" --arg e "${3:-}" --arg ts "$(_iso "$(_now)")" '
+    {ts:$ts, agent:.agent, computer:.computer_name, op:.op, app:(.app // ""),
+     steps:((.steps // []) | map({do} + (if .ref then {ref} else {} end) + (if .keys then {keys} else {} end)
+            + (if .kind then {kind} else {} end) + (if .text != null then {text_len:(.text | length)} else {} end))),
+     outcome:$o} + (if $e != "" then {error:($e | .[0:200])} else {} end)' <<<"$1" >> "$f" 2>/dev/null || return 0
+  if (( $(wc -l < "$f") > LOG_KEEP * 2 )); then
+    local t; t="$(mktemp "$SPOOL/.log.XXXXXX")" && tail -n "$LOG_KEEP" "$f" > "$t" && chmod 0644 "$t" && mv -f "$t" "$f"
+  fi
+}
+
+# Hand a result to the seat that asked: root writes it, gives it to that uid, 0600.
+_deliver() {  # <id> <uid> <json>
+  local id="$1" uid="$2" t
+  t="$(mktemp "$SPOOL/results/.$id.XXXXXX")" || return 1
+  printf '%s\n' "$3" > "$t" && chmod 0600 "$t" && chown "$uid" "$t" 2>/dev/null
+  mv -f "$t" "$SPOOL/results/$id.json"
+}
+
+_sweep() {  # root: drop what nobody will ever read
+  local cut f; cut=$(( $(_now) - STALE_S ))
+  for f in "$SPOOL"/queue/*.json "$SPOOL"/results/*.json "$SPOOL"/cancel/* "$SPOOL"/queue/.*.tmp "$SPOOL"/results/.*; do
+    [[ -f "$f" ]] || continue
+    (( $(stat -c %Y "$f" 2>/dev/null || echo 0) < cut )) && rm -f "$f"
+  done
+  for f in "$SPOOL"/claimed/*.json; do
+    [[ -f "$f" ]] || continue
+    if (( $(stat -c %Y "$f" 2>/dev/null || echo 0) < cut )); then _log "$(cat "$f")" expired; rm -f "$f"; fi
+  done
+}
+
+_seen() {  # <uuid> <name> — mark the computer seen now
+  local t now; now=$(_now)
+  t="$(mktemp "$SPOOL/computers/.c.XXXXXX")" || return 0
+  jq -cn --arg id "$1" --arg n "$2" --argjson at "$now" --arg iso "$(_iso "$now")" \
+    '{id:$id, name:$n, last_seen:$iso, last_seen_at:$at}' > "$t" && chmod 0644 "$t" && mv -f "$t" "$SPOOL/computers/$1.json"
+}
+
+# Claim one queued request for <uuid>: atomic rename, then root re-derives the
+# seat from the file's owner, re-validates and re-maps the steps, and re-reads the
+# policy. Prints the job for the PC, or nothing (a job refused here is answered to
+# its seat at once and never handed out).
+_claim() {  # <request-path> <uuid> <name>
+  local src="$1" uuid="$2" name="$3" base id hold
+  base="$(basename "$src" .json)"; _valid_id "$base" || { rm -f "$src"; return 0; }
+  id="$base"; hold="$SPOOL/claimed/$id.req"
+  mv "$src" "$hold" 2>/dev/null || return 0          # another poll won it
+  local uid seat req; uid="$(stat -c %u "$hold")"; seat="$(stat -c %U "$hold")"
+  req="$(head -c 262144 "$hold")"; rm -f "$hold"
+  local op app inter steps="null" mapped="null"
+  op="$(jq -r '.op // ""' <<<"$req" 2>/dev/null)"; app="$(jq -r '.app // ""' <<<"$req" 2>/dev/null)"
+  inter="$(jq -r 'if .interactive == true then 1 else 0 end' <<<"$req" 2>/dev/null)"
+  local base_job; base_job=$(jq -cn --arg id "$id" --arg op "$op" --arg app "$app" --arg seat "$seat" --argjson uid "$uid" \
+    --arg cid "$uuid" --arg cn "$name" --argjson at "$(_now)" \
+    '{id:$id, op:$op, app:$app, agent:$seat, uid:$uid, computer:$cid, computer_name:$cn, claimed_at:$at}')
+  if [[ "$op" != snapshot && "$op" != act ]] || ! [[ "$app" =~ ^([^[:cntrl:]-][^[:cntrl:]]{0,127})?$ ]]; then
+    _deliver "$id" "$uid" '{"ok":false,"error":"the request was not a job this box sends"}'; return 0
+  fi
+  if [[ "$op" == act ]]; then
+    steps="$(jq -c '.steps // null' <<<"$req")"
+    local err; err="$(_steps_map "$steps" 2>&1 >/dev/null)"
+    if ! mapped="$(_steps_map "$steps" 2>/dev/null)"; then
+      _deliver "$id" "$uid" "$(jq -cn --arg e "${err:-invalid steps}" '{ok:false, op:"act", error:$e}')"; return 0
+    fi
+    local stop; stop="$(_policy_stop "$mapped")"
+    if [[ -n "$stop" ]]; then
+      _log "$(jq -c --argjson s "$mapped" '. + {steps:$s}' <<<"$base_job")" refused "the owner's policy stops a $(jq -r .kind <<<"$stop") step"
+      _deliver "$id" "$uid" "$(jq -cn --argjson s "$stop" '{ok:false, op:"act", error:"needs_owner", stop:$s}')"; return 0
+    fi
+    inter=1
+  fi
+  local job; job=$(jq -c --argjson st "$mapped" --argjson i "$inter" --argjson sa "$(_snapshot_argv "$app" "$inter")" \
+    '. + {interactive:($i == 1), snapshot_argv:$sa} + (if $st == null then {} else {steps:$st} end)' <<<"$base_job")
+  ( umask 077; printf '%s\n' "$job" > "$SPOOL/claimed/$id.json" )
+  # What the PC is handed: the contract's fields plus the argv to run. Never the uid.
+  jq -c '{id, op, app, interactive, agent, snapshot_argv} + (if .steps then {steps} else {} end)' <<<"$job"
+}
+
+cmd__poll() {
+  _app_only _poll
+  local uuid="" name="" wait=0 a
+  for a in "$@"; do
+    case "$a" in
+      --computer=*) uuid="${a#*=}" ;;
+      --name=*) name="${a#*=}" ;;
+      --wait=*) wait="${a#*=}" ;;
+      --json) ;;
+      *) die "$E_USAGE" "_poll: unexpected '$a'" ;;
+    esac
+  done
+  [[ "$uuid" =~ ^[A-Za-z0-9-]{8,64}$ ]] || die "$E_USAGE" "_poll needs --computer=<uuid>"
+  [[ "$wait" =~ ^[0-9]{1,2}$ ]] && (( wait <= 20 )) || die "$E_USAGE" "--wait is 0 to 20 seconds"
+  name="$(printf '%s' "$name" | tr -d '[:cntrl:]' | cut -c1-64)"; [[ -n "$name" ]] || name="$uuid"
+  _spool_init; _sweep; _seen "$uuid" "$name"
+  if ! _enabled; then  # the owner turned it off on the box: hand out nothing, and do not spin the app
+    sleep "$wait"; _seen "$uuid" "$name"; printf '{"jobs":[],"cancel":[]}\n'; return 0
+  fi
+
+  local deadline=$(( $(_now) + wait )) jobs=() cancel=() last_seen
+  last_seen=$(_now)
+  while :; do
+    local f
+    # Cancels first: a job its seat gave up on, held by this computer.
+    for f in "$SPOOL"/cancel/*; do
+      [[ -f "$f" ]] || continue
+      local cid; cid="$(basename "$f")"
+      if _valid_id "$cid" && [[ -f "$SPOOL/claimed/$cid.json" ]] \
+         && [[ "$(jq -r .computer "$SPOOL/claimed/$cid.json" 2>/dev/null)" == "$uuid" ]]; then
+        cancel+=("$cid"); _log "$(cat "$SPOOL/claimed/$cid.json")" cancelled "the agent stopped waiting"
+        rm -f "$SPOOL/claimed/$cid.json" "$f"
+      elif [[ ! -f "$SPOOL/claimed/$cid.json" ]]; then rm -f "$f"
+      fi
+    done
+    # Oldest request first.
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      local j; j="$(_claim "$f" "$uuid" "$name")"
+      [[ -n "$j" ]] && jobs+=("$j")
+    done < <(find "$SPOOL/queue" -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
+    (( ${#jobs[@]} || ${#cancel[@]} )) && break
+    (( $(_now) >= deadline )) && break
+    if (( $(_now) - last_seen >= 5 )); then _seen "$uuid" "$name"; last_seen=$(_now); fi
+    sleep 0.25
+  done
+  _seen "$uuid" "$name"
+  { printf '%s\n' "${jobs[@]+"${jobs[@]}"}"; } | jq -sc --args '{jobs: map(select(. != null)), cancel: $ARGS.positional}' "${cancel[@]+"${cancel[@]}"}"
+}
+
+cmd__result() {
+  _app_only _result
+  local id="" a
+  for a in "$@"; do
+    case "$a" in --id=*) id="${a#*=}" ;; --json) ;; *) die "$E_USAGE" "_result: unexpected '$a'" ;; esac
+  done
+  _valid_id "$id" || die "$E_USAGE" "_result needs --id=<id>"
+  local body size; body="$(head -c $(( RESULT_MAX + 1 )))"; size=$(printf '%s' "$body" | wc -c)
+  local c="$SPOOL/claimed/$id.json"
+  if [[ ! -f "$c" ]]; then
+    # Cancelled, stopped or expired: nobody is waiting. Not an error for the app.
+    printf '{"ok":true,"delivered":false,"why":"no agent is waiting for that job"}\n'; return 0
+  fi
+  local job; job="$(cat "$c")"; local uid; uid="$(jq -r .uid <<<"$job")"
+  if (( size > RESULT_MAX )) || ! jq -e 'type == "object"' <<<"$body" >/dev/null 2>&1; then
+    local why="the computer's answer was not a result"; (( size > RESULT_MAX )) && why="the computer's answer was over 64 KB"
+    _deliver "$id" "$uid" "$(jq -cn --arg e "$why" --arg op "$(jq -r .op <<<"$job")" '{ok:false, op:$op, error:$e}')"
+    _log "$job" failed "$why"; rm -f "$c"; body=""
+    die "$E_USAGE" "$why"
+  fi
+  # Only the contract's fields pass to the agent.
+  local out; out=$(jq -c --arg op "$(jq -r .op <<<"$job")" \
+    '{ok:(.ok == true), op:$op, snapshot:(.snapshot // null), truncated:(.truncated == true),
+      steps:((.steps // []) | if type == "array" then map({ok:(.ok == true)} + (if .error then {error:(.error | tostring | .[0:500])} else {} end)) else [] end)}
+     + (if .error then {error:(.error | tostring | .[0:500])} else {} end)' <<<"$body")
+  body=""
+  _deliver "$id" "$uid" "$out" || die "$E_UNAVAILABLE" "could not hand the result to the agent"
+  local outcome ok err; ok="$(jq -r .ok <<<"$out")"; err="$(jq -r '.error // ""' <<<"$out")"
+  [[ "$ok" == true ]] && outcome=ok || outcome=failed
+  out=""
+  _log "$job" "$outcome" "$err"
+  rm -f "$c"
+  printf '{"ok":true,"delivered":true}\n'
+}
+
+cmd__stopped() {
+  _app_only _stopped
+  local uuid="" a
+  for a in "$@"; do
+    case "$a" in --computer=*) uuid="${a#*=}" ;; --json) ;; *) die "$E_USAGE" "_stopped: unexpected '$a'" ;; esac
+  done
+  [[ "$uuid" =~ ^[A-Za-z0-9-]{8,64}$ ]] || die "$E_USAGE" "_stopped needs --computer=<uuid>"
+  _spool_init
+  local stopped=() f id stop='{"ok":false,"stopped":true,"error":"the owner pressed Stop"}'
+  # What this computer holds…
+  for f in "$SPOOL"/claimed/*.json; do
+    [[ -f "$f" ]] || continue
+    [[ "$(jq -r .computer "$f" 2>/dev/null)" == "$uuid" ]] || continue
+    id="$(basename "$f" .json)"
+    _deliver "$id" "$(jq -r .uid "$f")" "$stop"; _log "$(cat "$f")" stopped; rm -f "$f"; stopped+=("$id")
+  done
+  # …and everything still queued: Stop drops queued jobs too. Slice 1 is one
+  # computer per box, so a queued job is this computer's next one.
+  for f in "$SPOOL"/queue/*.json; do
+    [[ -f "$f" ]] || continue
+    id="$(basename "$f" .json)"; _valid_id "$id" || continue
+    local uid seat; uid="$(stat -c %u "$f")"; seat="$(stat -c %U "$f")"
+    local op app; op="$(jq -r '.op // ""' "$f" 2>/dev/null)"; app="$(jq -r '.app // ""' "$f" 2>/dev/null)"
+    rm -f "$f" || continue
+    _deliver "$id" "$uid" "$stop"
+    _log "$(jq -cn --arg s "$seat" --arg op "$op" --arg a "$app" --arg cn "$(jq -r '.name // ""' "$SPOOL/computers/$uuid.json" 2>/dev/null)" \
+      '{agent:$s, op:$op, app:$a, computer_name:$cn}')" stopped
+    stopped+=("$id")
+  done
+  jq -cn --args '{ok:true, stopped:$ARGS.positional}' "${stopped[@]+"${stopped[@]}"}"
+}
+
+# THE BOX'S OWN SWITCH (`enabled` in status). The PC's switch is the one that
+# matters day to day and lives in the app; this one lets the owner (or support)
+# turn desktop control off from the server side without touching the PC. Off is
+# root's, any root; on refuses a seat's sudo, because a seat turning its own
+# leash back on is the one move this switch must not allow.
+cmd_switch() {  # on|off
+  [[ $EUID -eq 0 || "$EUID" == "$APP_UID" ]] || die "$E_PERM" "only the owner turns desktop control $1: sudo 5dive desktop $1"
+  if [[ "$1" == on ]]; then
+    [[ "${SUDO_USER:-}" != agent-* ]] || die "$E_PERM" "an agent seat does not turn desktop control on; the owner does"
+    rm -f "$SPOOL/off"; printf 'desktop control is on for this server (the PC'"'"'s own switch still decides).\n'
+  else
+    _spool_init; : > "$SPOOL/off"; chmod 0644 "$SPOOL/off"
+    printf 'desktop control is off for this server: agents get exit 69 and the PC is handed nothing.\n'
+  fi
+}
+
+# ------------------------------------------------------------------ dispatch
+
+# A root caller from a seat (`sudo 5dive desktop snapshot`) acts AS that seat, as
+# the browser's DIVE-4348 drop does: the result file is chowned to whoever wrote the
+# request, and a job is the seat's, not root's. The app verbs, status and log stay.
+verb="${1:-}"; [[ $# -gt 0 ]] && shift
+if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]] && [[ "$verb" == snapshot || "$verb" == act ]]; then
+  id -u "$SUDO_USER" >/dev/null 2>&1 || die "$E_PERM" "SUDO_USER=$SUDO_USER is not a user on this box"
+  exec runuser -u "$SUDO_USER" -- "$0" "$verb" "$@"
+fi
+
+command -v jq >/dev/null 2>&1 || die "$E_UNAVAILABLE" "jq is not installed on this box"
+case "$verb" in
+  status)   cmd_status "$@" ;;
+  snapshot) cmd_snapshot "$@" ;;
+  act)      cmd_act "$@" ;;
+  log)      cmd_log "$@" ;;
+  _poll)    cmd__poll "$@" ;;
+  _result)  cmd__result "$@" ;;
+  _stopped) cmd__stopped "$@" ;;
+  on|off)   cmd_switch "$verb" ;;
+  -h|--help|help|"") usage ;;
+  *) die "$E_USAGE" "unknown command '$verb' — 5dive desktop --help" ;;
+esac
