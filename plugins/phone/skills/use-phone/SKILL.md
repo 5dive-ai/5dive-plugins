@@ -47,7 +47,7 @@ words to send the owner: turn Wireless debugging on again and tell you the new p
 ## Sending, posting, paying, deleting
 
 A tap on a control that reads Send, Post, Pay/Buy or Delete is checked against **the owner's
-policy, the same one the browser uses**. By default paying stops and the other three go ahead
+policy, the same one the browser uses**. "Send money", "Send payment", "Request money", "Withdraw" or a send with an amount ("Send $50") count as paying, not sending. By default paying stops and the other three go ahead
 and are logged; under `careful` all four stop. A stop is exit 73 **before any step runs**, with
 the screenshot and the exact words to ask the owner. When they say yes (the Approve button they
 were sent, or the row's approval gate the stop prints), re-run the **same** steps with

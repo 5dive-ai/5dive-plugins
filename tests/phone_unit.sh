@@ -27,7 +27,9 @@ reset_log() { : > "$T/input.log"; }
 
 # ---- classification ----
 for c in "send:Send" "send:com.app:id/btn_send" "send:sendButton" "send:Отправить" "pay:Buy now" "pay:Place order" \
-         "delete:Delete chat" "publish:Post" ":Posts" ":Reply" ":Share" ":Allow"; do
+         "delete:Delete chat" "publish:Post" ":Posts" ":Reply" ":Share" ":Allow" \
+         "pay:Send money" "pay:Send payment" "pay:Send \$50" "pay:Send 12,50 €" "pay:Request money" "pay:Withdraw" \
+         "send:Send message"; do
   want="${c%%:*}" label="${c#*:}"
   got="$(python3 "$UI" classify "$label")"
   check "classify \"$label\" -> ${want:-nothing}" [ "$got" == "$want" ]
@@ -125,6 +127,27 @@ if [[ "$(id -u)" != 0 ]]; then
 fi
 : > "$T/policy.json"
 check "an empty policy file is the default, not an error" [ "$("$PHONE" approvals policy --json | jq -r .mode)" == standard ]
+
+# ---- standard: a money button is a payment and asks; a plain Send still runs ----
+rm -f "$T/policy.json"
+for b in "Send money" "Send payment"; do
+  reset_log
+  out="$(FAKE_ADB_UI="$FIX/wallet.xml" "$PHONE" act --steps="[{\"op\":\"type\",\"text\":\"50\"},{\"op\":\"tap\",\"ref\":\"button/$b\"}]" 2>&1)"; rc=$?
+  check "standard: button/$b stops with exit 73, nothing typed" bash -c '[ "$1" -eq 73 ] && [ ! -s "$2" ]' _ "$rc" "$T/input.log"
+done
+wsnap="$(FAKE_ADB_UI="$FIX/wallet.xml" "$PHONE" snapshot)"
+check "the wallet's Send money button is flagged pay" grep -qE '^\[e[0-9]+\] button "Send money"  ⚠ pay$' <<<"$wsnap"
+check "  and its plain Send button is flagged send" grep -qE '^\[e[0-9]+\] button "Send"  ⚠ send$' <<<"$wsnap"
+wref="$(grep -oE '^\[e[0-9]+\] button "Send money"' <<<"$wsnap" | grep -oE 'e[0-9]+')"
+reset_log
+out="$(FAKE_ADB_UI="$FIX/wallet.xml" "$PHONE" act --steps="[{\"op\":\"tap\",\"ref\":\"$wref\"}]" 2>&1)"; rc=$?
+check "standard: a snapshot ref on Send money stops too (73), no tap" bash -c '[ "$1" -eq 73 ] && [ ! -s "$2" ]' _ "$rc" "$T/input.log"
+reset_log
+out="$(FAKE_ADB_UI="$FIX/wallet.xml" "$PHONE" act --steps='[{"op":"tap","x":280,"y":460}]' 2>&1)"; rc=$?
+check "standard: a tap by position on Send money stops at run time, no tap" bash -c '[ "$1" -eq 73 ] && ! grep -q "input tap" "$2"' _ "$rc" "$T/input.log"
+reset_log
+out="$("$PHONE" act --steps='[{"op":"tap","ref":"button/Send"}]' 2>&1)"; rc=$?
+check "standard: plain button/Send still runs (exit 0, tapped)" bash -c '[ "$1" -eq 0 ] && grep -q "input tap 990 2160" "$2"' _ "$rc" "$T/input.log"
 
 # ---- refusals and the rest ----
 out="$("$PHONE" act --steps='[{"op":"type","text":"héllo"}]' 2>&1)"; rc=$?

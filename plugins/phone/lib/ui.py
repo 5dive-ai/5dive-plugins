@@ -26,7 +26,11 @@ BOUNDS = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 # languages our owners use; a resource id is split into words too, so
 # "btn_send" and "sendButton" count.
 KINDS = [
-    ("pay", r"pay|pay now|buy|buy now|purchase|checkout|check out|place order|order now|"
+    # Money-bearing sends come first: "Send money" in a payment app is a payment,
+    # not a message, and standard lets sends through.
+    ("pay", r"send money|send payment|send funds|request money|withdraw|"
+            r"send\s*[$€£₽]\s*\d+|send\s+\d+(?:[.,]\d+)?\s*[$€£₽]|"
+            r"pay|pay now|buy|buy now|purchase|checkout|check out|place order|order now|"
             r"subscribe|donate|top up|transfer|confirm payment|"
             r"оплатить|оплата|купить|заказать|перевести|"
             r"kaufen|bezahlen|jetzt kaufen|pagar|comprar|payer|acheter"),
