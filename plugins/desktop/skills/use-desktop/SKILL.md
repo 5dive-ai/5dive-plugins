@@ -40,15 +40,15 @@ snapshot and use its refs.
 |---|---|
 | `{"do":"click","ref":R}` | `agent-desktop click R` |
 | `{"do":"double-click","ref":R}` | `agent-desktop --headed double-click R` |
-| `{"do":"right-click","ref":R}` | `agent-desktop right-click R` |
-| `{"do":"type","ref":R,"text":T}` | `agent-desktop type R --stdin` (T on stdin) |
+| `{"do":"right-click","ref":R}` | `agent-desktop --headed right-click R` |
+| `{"do":"type","ref":R,"text":T}` | `agent-desktop --headed type R --stdin` (T on stdin) |
 | `{"do":"set-value","ref":R,"text":T}` | `agent-desktop set-value R --stdin` |
 | `{"do":"clear","ref":R}` | `agent-desktop clear R` |
 | `{"do":"focus","ref":R}` | `agent-desktop --headed focus R` |
 | `{"do":"select","ref":R,"text":OPTION}` | `agent-desktop select R OPTION` |
 | `toggle`, `check`, `uncheck`, `expand`, `collapse`, `scroll-to` with a `ref` | `agent-desktop <do> R` |
 | `{"do":"scroll","ref":R,"direction":"down","amount":3}` | `agent-desktop scroll R --direction down --amount 3` |
-| `{"do":"press","keys":"ctrl+s"}` (optional `"app"`) | `agent-desktop press ctrl+s [--app A]` |
+| `{"do":"press","keys":"ctrl+s"}` (optional `"app"`) | `agent-desktop press ctrl+s` (with an app: `--headed press ctrl+s --app A`) |
 | `{"do":"launch","app":"notepad"}` | `agent-desktop launch notepad` |
 | `{"do":"close-app","app":A}` | `agent-desktop close-app A` |
 | `{"do":"focus-window","app":A}` | `agent-desktop focus-window --app A` |

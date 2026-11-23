@@ -87,7 +87,7 @@ D act --app=Notepad --steps="$steps" --json >"$W/a.out" 2>"$W/a.err" & ap=$!
 queued
 out=$(poll 5)
 id=$(jq -r '.jobs[0].id // ""' <<<"$out")
-check "the act job carries the agent-desktop argv for each step" jq -e --arg t "$SECRET_TEXT" '.jobs[0].op == "act" and .jobs[0].steps[0].argv == ["type","@s1:e2","--stdin"] and .jobs[0].steps[0].stdin == $t and .jobs[0].steps[1].argv == ["press","ctrl+s"] and .jobs[0].steps[2].argv == ["click","@s1:e3"] and .jobs[0].steps[2].kind == "send"' <<<"$out"
+check "the act job carries the agent-desktop argv for each step" jq -e --arg t "$SECRET_TEXT" '.jobs[0].op == "act" and .jobs[0].steps[0].argv == ["--headed","type","@s1:e2","--stdin"] and .jobs[0].steps[0].stdin == $t and .jobs[0].steps[1].argv == ["press","ctrl+s"] and .jobs[0].steps[2].argv == ["click","@s1:e3"] and .jobs[0].steps[2].kind == "send"' <<<"$out"
 check "typed text is not on any argv" jq -e --arg t "$SECRET_TEXT" '[.jobs[0].steps[].argv[]] | index($t) == null' <<<"$out"
 result "$id" "$(jq -cn --argjson s "$SNAP" '{ok:true, op:"act", snapshot:$s, steps:[{ok:true},{ok:true},{ok:true}]}')" >/dev/null
 wait "$ap"; rc=$?

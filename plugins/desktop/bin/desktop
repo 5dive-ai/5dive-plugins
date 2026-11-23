@@ -137,12 +137,12 @@ USAGE
 # A ref is the qualified ref the snapshot printed (@<snapshot>:e<n>); agent-desktop
 # refuses a bare @e3 (INVALID_ARGS). Typed text goes to the PC on stdin (`--stdin`),
 # never on agent-desktop's command line, as its README asks for anything private.
-# focus and double-click need --headed (agent-desktop refuses them headless on
-# Windows). Nothing here moves the mouse by coordinates: refs only.
+# type, right-click, double-click, focus and a press with an app need --headed
+# (agent-desktop refuses them headless on Windows with POLICY_DENIED). Nothing here moves the mouse by coordinates: refs only.
 _STEP_HELP='click           {"do":"click","ref":R}                     agent-desktop click R
 double-click    {"do":"double-click","ref":R}              agent-desktop --headed double-click R
-right-click     {"do":"right-click","ref":R}               agent-desktop right-click R
-type            {"do":"type","ref":R,"text":T}             agent-desktop type R --stdin   (T on stdin)
+right-click     {"do":"right-click","ref":R}               agent-desktop --headed right-click R
+type            {"do":"type","ref":R,"text":T}             agent-desktop --headed type R --stdin   (T on stdin)
 set-value       {"do":"set-value","ref":R,"text":T}        agent-desktop set-value R --stdin
 clear           {"do":"clear","ref":R}                     agent-desktop clear R
 focus           {"do":"focus","ref":R}                     agent-desktop --headed focus R
@@ -150,7 +150,7 @@ select          {"do":"select","ref":R,"text":OPTION}      agent-desktop select 
 toggle|check|uncheck|expand|collapse|scroll-to {"do":…,"ref":R}  agent-desktop <do> R
 scroll          {"do":"scroll","ref":R,"direction":"down","amount":3}
                                                            agent-desktop scroll R --direction D --amount N
-press           {"do":"press","keys":"ctrl+s"[,"app":A]}   agent-desktop press K [--app A]
+press           {"do":"press","keys":"ctrl+s"[,"app":A]}   agent-desktop [--headed] press K [--app A]
 launch          {"do":"launch","app":A}                    agent-desktop launch A
 close-app       {"do":"close-app","app":A}                 agent-desktop close-app A
 focus-window    {"do":"focus-window","app":A}              agent-desktop focus-window --app A
@@ -183,18 +183,19 @@ else . end
   | .do |= gsub("_"; "-")
   | if has("kind") and ((.kind | IN("pay","post","publish","send","delete")) | not)
     then error("step \(.n): \"kind\" is one of pay, post, send, delete") else . end
-  | if .do == "click" or .do == "right-click" or .do == "clear" or .do == "toggle" or .do == "check"
+  | if .do == "click" or .do == "clear" or .do == "toggle" or .do == "check"
        or .do == "uncheck" or .do == "expand" or .do == "collapse" or .do == "scroll-to"
       then .argv = [.do, ref]
-    elif .do == "double-click" or .do == "focus" then .argv = ["--headed", .do, ref]
-    elif .do == "type" or .do == "set-value" then (text as $x | .argv = [.do, ref, "--stdin"] | .stdin = $x)
+    elif .do == "double-click" or .do == "focus" or .do == "right-click" then .argv = ["--headed", .do, ref]
+    elif .do == "type" then (text as $x | .argv = ["--headed", "type", ref, "--stdin"] | .stdin = $x)
+    elif .do == "set-value" then (text as $x | .argv = ["set-value", ref, "--stdin"] | .stdin = $x)
     elif .do == "select" then .argv = ["select", ref, text]
     elif .do == "scroll" then
       ((.direction // "down") as $d | (.amount // 3) as $a
        | if ($d | IN("up","down","left","right")) | not then error("step \(.n): direction is up, down, left or right")
          elif ($a | type) != "number" or $a < 1 or $a > 50 then error("step \(.n): amount is 1 to 50")
          else .argv = ["scroll", ref, "--direction", $d, "--amount", ($a | floor | tostring)] end)
-    elif .do == "press" then .argv = ["press", keys] + (if .app then ["--app", appname] else [] end)
+    elif .do == "press" then .argv = (if .app then ["--headed", "press", keys, "--app", appname] else ["press", keys] end)
     elif .do == "launch" or .do == "close-app" then .argv = [.do, appname]
     elif .do == "focus-window" then .argv = ["focus-window", "--app", appname]
     elif .do == "wait" then
