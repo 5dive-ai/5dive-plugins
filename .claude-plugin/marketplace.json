@@ -76,6 +76,12 @@
       "category": "productivity",
       "source": "./plugins/desktop",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/desktop"
+    },
+    {
+      "name": "phone",
+      "description": "Your agent uses apps on a spare Android phone you set aside for it (WhatsApp Business, Instagram, a bank app): it reads the screen, taps and types over your Tailscale network, with nothing installed on the phone. Sending, posting, deleting and paying follow the browser's rules: paying asks you first; careful makes all four ask.",
+      "category": "automation",
+      "source": "./plugins/phone"
     }
   ]
 }
