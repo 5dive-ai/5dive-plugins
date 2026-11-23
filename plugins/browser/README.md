@@ -688,6 +688,14 @@ is resolved from npm at install or run time. Linkedom supplies Defuddle's docume
 for the already-rendered document; a full browser emulation such as jsdom adds no fidelity after
 Chrome has done the scripting. Like `shot`, this path opens no CDP/debug socket.
 
+**An app's main list is kept (DIVE-9058).** Defuddle drops every form and selectable list
+(`role=listbox`/`option`) as clutter, which on a webmail page is the whole inbox. A form, list or
+grid holding a real share of the page's text (500 characters, or 30% of it) is unwrapped before
+Defuddle runs, so it stays; small forms and dropdowns are still dropped. If `page.md` still comes
+back under 50 words while the page shows over 300, the visible text is added under
+`## Visible text`, inside the same untrusted-page fence, and `thin_extract: true` is written to
+`page.md` and `page.meta.json`.
+
 **The boundary on whose account this is.** A profile here is a *throwaway or role* account, never a
 person's personal login — with exactly one exception, stated so it is not quietly widened: the
 owner's own box, running the owner's own login, to their own product. That is a person granting a

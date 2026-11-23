@@ -128,7 +128,7 @@ var require_utils = __commonJS({
       if (!text)
         return 0;
       let cjkCount = 0;
-      let wordCount = 0;
+      let wordCount2 = 0;
       let inWord = false;
       for (let i = 0; i < text.length; i++) {
         const code = text.charCodeAt(i);
@@ -143,11 +143,11 @@ var require_utils = __commonJS({
         } else if (code <= 32) {
           inWord = false;
         } else if (!inWord) {
-          wordCount++;
+          wordCount2++;
           inWord = true;
         }
       }
-      return cjkCount + wordCount;
+      return cjkCount + wordCount2;
     }
   }
 });
@@ -82365,6 +82365,105 @@ function factTables(document2) {
   }
   return out;
 }
+var SKIP_TEXT = /* @__PURE__ */ new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
+var BIG_LIST_CHARS = 500;
+var BIG_LIST_SHARE = 0.3;
+var BIG_LIST_FLOOR = 200;
+var ROW_LABEL_CHARS = 30;
+function textLen(node) {
+  if (node.nodeType === 3) return node.data.replace(/\s+/g, " ").trim().length;
+  if (node.nodeType !== 1 || SKIP_TEXT.has(node.tagName)) return 0;
+  let n = 0;
+  for (const c of node.childNodes) n += textLen(c);
+  return n;
+}
+function renameTo(el, tag) {
+  const d = el.ownerDocument.createElement(tag);
+  for (const a of [...el.attributes]) {
+    if (a.name !== "role" && a.name !== "action" && a.name !== "method") d.setAttribute(a.name, a.value);
+  }
+  while (el.firstChild) d.appendChild(el.firstChild);
+  el.replaceWith(d);
+  return d;
+}
+function keepBigLists(document2) {
+  const body = document2.body;
+  if (!body) return 0;
+  const total = textLen(body);
+  let kept = 0;
+  for (const el of document2.querySelectorAll('form, fieldset, [role="listbox"], [role="grid"], [role="treegrid"]')) {
+    if (!body.contains(el)) continue;
+    const len = textLen(el);
+    if (!(len >= BIG_LIST_CHARS || len >= BIG_LIST_FLOOR && total && len / total >= BIG_LIST_SHARE)) continue;
+    kept++;
+    const box = el.tagName === "FORM" || el.tagName === "FIELDSET" ? renameTo(el, "div") : el;
+    box.removeAttribute("role");
+    for (const o of box.querySelectorAll('[role="option"], [role="listbox"]')) o.removeAttribute("role");
+    for (const l of box.querySelectorAll("label")) {
+      if (textLen(l) > ROW_LABEL_CHARS) renameTo(l, "span");
+    }
+  }
+  return kept;
+}
+var THIN_MD_WORDS = 50;
+var THIN_PAGE_WORDS = 300;
+var VISIBLE_TEXT_MAX = 4e4;
+var BLOCK = /* @__PURE__ */ new Set([
+  "ADDRESS",
+  "ARTICLE",
+  "ASIDE",
+  "BLOCKQUOTE",
+  "BR",
+  "DD",
+  "DIV",
+  "DL",
+  "DT",
+  "FIELDSET",
+  "FIGCAPTION",
+  "FIGURE",
+  "FORM",
+  "H1",
+  "H2",
+  "H3",
+  "H4",
+  "H5",
+  "H6",
+  "HR",
+  "LI",
+  "MAIN",
+  "OL",
+  "OPTION",
+  "P",
+  "PRE",
+  "SECTION",
+  "TABLE",
+  "TD",
+  "TH",
+  "TR",
+  "UL"
+]);
+function visibleText(document2) {
+  const body = document2.body;
+  if (!body) return "";
+  const parts = [];
+  const walk = (node) => {
+    if (node.nodeType === 3) {
+      parts.push(node.data);
+      return;
+    }
+    if (node.nodeType !== 1 || SKIP_TEXT.has(node.tagName)) return;
+    if (node.matches('nav, header, footer, [role="navigation"], [role="banner"], [role="contentinfo"], [hidden], [aria-hidden="true"]')) return;
+    const block = BLOCK.has(node.tagName) || node.getAttribute("role") === "option" || node.getAttribute("role") === "row";
+    if (block) parts.push("\n");
+    for (const c of node.childNodes) walk(c);
+    if (block) parts.push("\n");
+  };
+  walk(body);
+  return parts.join("").split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n");
+}
+function wordCount(s) {
+  return (s.match(/\S+/g) || []).length;
+}
 async function extract(html, url) {
   const { document: document2 } = parseHTML(html);
   const canonEl = document2.querySelector('link[rel="canonical"][href]');
@@ -82373,6 +82472,8 @@ async function extract(html, url) {
   if (canonEl) canonEl.setAttribute("href", canonical_url);
   if (ogUrl) ogUrl.setAttribute("content", canonical_url);
   const tables = factTables(document2);
+  const visible = visibleText(document2);
+  keepBigLists(document2);
   const res = await (0, import_node11.Defuddle)(document2, url, { separateMarkdown: true });
   const { document: cdoc } = parseHTML(`<body>${res.content || ""}</body>`);
   const seen = /* @__PURE__ */ new Set();
@@ -82395,14 +82496,24 @@ async function extract(html, url) {
   const facts = tables.filter((t) => !t.facts.every((f) => body.includes(f.label)));
   const factLines = facts.map((t) => (t.title ? `${t.title}
 ` : "") + t.facts.map((f) => `- ${f.label}: ${f.value}`).join("\n"));
-  const markdown = factLines.length ? `## Facts on the page (its label/value tables)
+  let markdown = factLines.length ? `## Facts on the page (its label/value tables)
 
 ${factLines.join("\n\n")}
 
 ## Page text
 
 ${body}` : body;
-  return {
+  let word_count = typeof res.wordCount === "number" ? res.wordCount : 0;
+  const thin_extract = wordCount(body) < THIN_MD_WORDS && wordCount(visible) > THIN_PAGE_WORDS;
+  if (thin_extract) {
+    const text = visible.length > VISIBLE_TEXT_MAX ? visible.slice(0, VISIBLE_TEXT_MAX) + "\n\u2026" : visible;
+    const kept = markdown.replace(/<\/?body>/g, "").trim() ? markdown + "\n\n" : "";
+    markdown = `${kept}## Visible text
+
+${text}`;
+    word_count = wordCount(markdown);
+  }
+  const out = {
     url,
     canonical_url,
     title: res.title || "",
@@ -82410,7 +82521,7 @@ ${body}` : body;
     author: res.author || "",
     published: res.published || "",
     site: res.site || "",
-    word_count: typeof res.wordCount === "number" ? res.wordCount : 0,
+    word_count,
     links,
     images,
     facts,
@@ -82419,6 +82530,8 @@ ${body}` : body;
     linkedom_version: PINS.linkedom,
     markdown
   };
+  if (thin_extract) out.thin_extract = true;
+  return out;
 }
 if (!globalThis.__FIVEDIVE_EXTRACT_LIB) {
   (async () => {
