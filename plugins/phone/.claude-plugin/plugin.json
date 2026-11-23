@@ -1,0 +1,31 @@
+{
+  "name": "phone",
+  "version": "0.1.0",
+  "description": "Your agent uses apps on a spare Android phone you set aside for it: WhatsApp Business, Instagram, a bank app, anything that lives only on a phone. It reads the screen, taps and types over your Tailscale network. Nothing is installed on the phone. Sending, posting, deleting and paying follow the same rules you set for the browser: paying asks you first, and careful makes all four ask.",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com",
+    "url": "https://5dive.ai"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/phone",
+  "license": "Apache-2.0",
+  "skills": "./skills/",
+  "keywords": ["phone", "android", "adb", "automation"],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": ["verb", "skill"],
+    "verbs": [
+      {"name": "phone", "summary": "use apps on a spare Android phone (read the screen, tap, type)"}
+    ],
+    "grants": ["network", "fs-home"],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    },
+    "setup": {
+      "hint": "phone talks to the phone with adb, Android's own debugging tool, which 5dive will not install behind your back. The command below installs it (apt boxes: Debian, Ubuntu). The phone and this server must be on the same Tailscale network. Then ask your agent to \"connect my phone\".",
+      "command": "sudo 5dive phone setup"
+    }
+  }
+}

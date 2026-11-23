@@ -90,6 +90,8 @@ jobs:
           BROWSER_MIRROR_BRANCH: ${{ github.head_ref || github.ref_name }}
       - name: browser registry entry harness
         run: bash tests/browser_registry_unit.sh
+      - name: phone plugin harness (fake adb)
+        run: bash tests/phone_unit.sh
       - name: browser harnesses (5dive-browser's own, on this tree)
         run: >-
           bash tests/browser_mirror.sh run
