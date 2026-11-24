@@ -84,6 +84,28 @@ function challenge(html, url) {
   return { challenge: false, why: 'the marker matched only text a person does not see (script data, a hidden or invisible element)' };
 }
 
+// A TURNSTILE STILL WAITING FOR ITS ANSWER (DIVE-9188). challenge() leaves
+// cf-turnstile out on purpose (tally.so's is 0 px with its token filled), and
+// the box it draws sits in a closed shadow root no DOM shows. So when the AGENT
+// already says it is stuck on a check (connect-request --challenge), what tells
+// a waiting Turnstile from a passed one is its answer field: a
+// cf-turnstile-response with no value, or a container with no field yet.
+function turnstilePending(markup) {
+  const re = /<([a-z][a-z0-9-]*)\b(?:"[^"]*"|'[^']*'|[^'">])*>/gi; let m, box = false, answered = false, empty = false;
+  while ((m = re.exec(markup))) {
+    const a = attrsOf(m[0]);
+    if (/(^|\s)cf-turnstile(\s|$)/i.test(a.class || '')) box = true;
+    if ((a.name || '') === 'cf-turnstile-response') { if ((a.value || '').trim()) answered = true; else empty = true; }
+  }
+  return !answered && (empty || box);
+}
+// ask(html, url) -> challenge()'s answer, or a Turnstile still waiting.
+function ask(html, url) {
+  const c = challenge(html, url);
+  if (c.challenge || !turnstilePending(visibleMarkup(html))) return c;
+  return { challenge: true, kind: 'robot', why: 'the page shows a Cloudflare Turnstile still waiting for its answer' };
+}
+
 // A SIGN-IN CHECK THE AGENT CLEARS ITSELF (DIVE-7881). lodar 2026-11-07, after
 // a head agent refused five times to open the box's Gmail for Discord's «Verify
 // by Email»: «clicker wont check email», «remove rules». A code box, a 2-step
@@ -168,16 +190,16 @@ function signin(html, url) {
   return { verdict: 'offer', kind: 'google-button', why: `the page offers ${b} and shows no password box, code box or robot check` };
 }
 
-module.exports = { challenge, signin, verify };
+module.exports = { challenge, ask, signin, verify };
 
 if (require.main === module) {
-  // node page-check.cjs challenge|signin|verify <html-file> [<url>] [<gates-json>] -> one JSON line
+  // node page-check.cjs challenge|ask|signin|verify <html-file> [<url>] [<gates-json>] -> one JSON line
   const fs = require('fs');
   const [mode, file, url, gj] = process.argv.slice(2);
   let html = '', gates = [];
   try { html = fs.readFileSync(file, 'utf8'); } catch (e) { html = ''; }
   try { gates = JSON.parse(gj || '[]'); } catch (e) { gates = []; }
-  const fn = mode === 'signin' ? signin : mode === 'challenge' ? challenge : mode === 'verify' ? verify : null;
-  if (!fn) { process.stderr.write('usage: page-check.cjs challenge|signin|verify <html-file> [<url>] [<gates-json>]\n'); process.exit(64); }
+  const fn = mode === 'signin' ? signin : mode === 'challenge' ? challenge : mode === 'ask' ? ask : mode === 'verify' ? verify : null;
+  if (!fn) { process.stderr.write('usage: page-check.cjs challenge|ask|signin|verify <html-file> [<url>] [<gates-json>]\n'); process.exit(64); }
   process.stdout.write(JSON.stringify(fn(html, url || '', gates)) + '\n');
 }
