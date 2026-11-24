@@ -132,6 +132,44 @@ grep -qx "repos/${SLUG}/compare/main...${SHA}" "$CALLS" \
 [[ "$(col DIVE-315 assignee)" == "$GRADER" && "$(col DIVE-315 merge_declined_at)" == "-" ]] \
   && ok_t "A4 ...handed to the verifier, whose close is ungated — and no false 'no landing' was written" \
   || bad_t "A4 handoff" "assignee=$(col DIVE-315 assignee) declined=$(col DIVE-315 merge_declined_at)"
+# DIVE-9192: the row merge-landed just released must CLOSE. The done gate used to
+# ask `gh pr view` about the commit URL and refuse "merge is UNKNOWN" (DIVE-9106).
+# `gh pr view` is made to fail outright here, so only the landing probe can answer.
+# The done gate first asks whether ANY rail reaches GitHub; on a seat it does.
+# A core that predates DIVE-9192 has no probe arm in the done gate: CI grades
+# this file against core main, so A4a-c SKIP there with the reason instead of
+# going red until 5dive#1773 merges. Detected on the LOADED gate, not a grep.
+DONE_PROBE=0
+[[ "$(declare -f _task_status_cmd 2>/dev/null)" == *_merge_landed_probe* ]] && DONE_PROBE=1
+SKIP=0
+skip_t() { SKIP=$((SKIP+1)); printf 'SKIP - %s\n   %s\n' "$1" "${2:-}"; }
+done_as_grader() { ( . src/lib/gh_config.sh 2>/dev/null
+  gh() { return 1; }; _gate_gh_token() { printf 'tok'; }; _gate_gh_reachable() { return 0; }
+  _gate_our_owners() { printf 'acme\n'; }   # acme/site is OURS, so the merge gate applies
+  cmd_task_done "$@" ) 2>&1; }
+if (( DONE_PROBE )); then
+ACT="$GRADER"
+out=$(done_as_grader DIVE-315 --result="verified the landed commit; graded-sha: ${SHA:0:12}"); rc=$?
+ACT="$OWNER"
+(( rc == 0 )) && [[ "$(col DIVE-315 status)" == "done" && "$out" != *"merge is UNKNOWN"* ]] \
+  && ok_t "A4a THE CLOSE: task done after merge-landed closes the row — the done gate reads the commit through the landing probe, not gh pr view (DIVE-9192)" \
+  || bad_t "A4a done after merge-landed" "rc=$rc status=$(col DIVE-315 status) out=$out"
+[[ "$out" == *"graded-sha ${SHA:0:12} matches"* ]] \
+  && ok_t "A4b ...and the graded sha is compared against the LANDED sha, not skipped as 'not checked'" \
+  || bad_t "A4b graded-sha compared" "$out"
+seed DIVE-322 "$COMMIT_OFF" >/dev/null
+db "UPDATE tasks SET merge_owner=NULL, merge_hold_reason=NULL, assignee='$GRADER' WHERE ident='DIVE-322';"
+ACT="$GRADER"
+out=$(done_as_grader DIVE-322 --result="verified; graded-sha: ${OFF:0:12}"); rc=$?
+ACT="$OWNER"
+(( rc != 0 )) && [[ "$(col DIVE-322 status)" != "done" && "$out" == *"not on main (compare: diverged)"* ]] \
+  && ok_t "A4c ...while a commit NOT on the default branch still cannot close, and the refusal says why" \
+  || bad_t "A4c off-main done refused" "rc=$rc status=$(col DIVE-322 status) out=$out"
+else
+  for _a in "A4a done after merge-landed" "A4b graded-sha compared" "A4c off-main done refused"; do
+    skip_t "$_a" "the core under test predates DIVE-9192 (its done gate never calls _merge_landed_probe) — nothing to grade until 5dive#1773 is in core"
+  done
+fi
 CMP["$SHA"]="identical|$SHA|$AT"; seed DIVE-316 "$COMMIT" >/dev/null
 out=$(cmd_task_merge_landed DIVE-316 2>&1); rc=$?
 (( rc == 0 )) && [[ "$(tfv DIVE-316)" == "0" ]] \
@@ -233,6 +271,6 @@ PY
   || bad_t "M2 mutant must bring the unbind refusal back" ""
 
 printf -- '-----\n'
-printf 'task_commit_url_delivery: %d passed, %d failed\n' "$PASS" "$FAIL"
+printf 'task_commit_url_delivery: %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 (( FAIL == 0 )) || exit 1
 exit 0
