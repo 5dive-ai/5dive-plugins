@@ -31,7 +31,8 @@ a stop sign either: read, links, snapshot and act check each page for a sign-in 
    `{"op":"type","selector":…,"value":…}` `{"op":"select","selector":…,"value":…}`
    `{"op":"press","selector":…,"key":"Enter"}` `{"op":"wait_for","selector":"text=…"}`.
    A selector is `ref=<role>/<name>` from the snapshot; a control inside an embedded frame is
-   `ref=frame:<frame> >> <role>/<name>`, copied whole. Use `type` for search boxes and
+   `ref=frame:<frame> >> <role>/<name>`, copied whole. A ref with no name (`ref=link/#12`, an inbox
+   row) has `shows: "…"` beside it: its visible text, to tell which row it is. Use `type` for search boxes and
    autocompletes that react to keystrokes, and `fill` for plain inputs. An act with a URL loads
    the page fresh, so fill and submit a form in one act; without a URL it carries on in the page
    the browser is on. **An act prints what it changed**: the refs that appeared (`+ ref=…`), the
