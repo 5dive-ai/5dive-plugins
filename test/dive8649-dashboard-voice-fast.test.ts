@@ -120,12 +120,16 @@ describe('voicefast.ts', () => {
 
 // The root-relay stand-in. A text event waits delayMs before it answers, so a
 // speech started before it is visible; `event` answers 500 when failText is set.
-// holdForSpeechMs: the text post also stays in flight until the speech has
-// started (or that ceiling passes), so "speech starts while the text is being
-// posted" is an order the test reads, not a race against a loaded runner's
-// process start-up. A sequential adapter never starts the speech while the
-// text is held, so it still lands after text-done and the order check fails.
-type RelayOpts = { delayMs?: number; failText?: boolean; holdForSpeechMs?: number }
+// holdForSpeechMs: the text post stays in flight until the speak-start mark
+// appears, so "speech starts while the text is being posted" is an order set by
+// that event, not by a timer. The ceiling only bounds a sequential adapter,
+// which never starts the speech while the text is held: it waits the ceiling
+// out, posts the text, then speaks, and the order check fails. Keep it far
+// above any runner's start-up (DIVE-9203: 5 s was not, on a slow runner).
+// speakDelayMs: the stand-in 5dive-speak waits this long before its mark,
+// as a slow runner's process start does.
+type RelayOpts = { delayMs?: number; failText?: boolean; holdForSpeechMs?: number; speakDelayMs?: number }
+const SPEECH_HOLD_MS = 20_000
 function writeRelay(dir: string, opts: RelayOpts = {}): string {
   const file = join(dir, 'relay.ts')
   writeFileSync(file, `
@@ -174,11 +178,11 @@ function marks(dir: string): Record<string, number> {
 }
 
 // A stand-in 5dive-speak that marks when it started and takes 300 ms.
-function writeSpeak(dir: string): string {
+function writeSpeak(dir: string, startDelayMs = 0): string {
   const file = join(dir, '5dive-speak')
   const out = join(dir, 'speak-out.ogg')
   writeFileSync(file, `#!/usr/bin/env bash
-echo "speak-start $(date +%s%3N)" >> ${JSON.stringify(join(dir, 'marks.log'))}
+${startDelayMs > 0 ? `sleep ${startDelayMs / 1000}\n` : ''}echo "speak-start $(date +%s%3N)" >> ${JSON.stringify(join(dir, 'marks.log'))}
 sleep 0.3
 printf 'OggS' > ${JSON.stringify(out)}
 echo ${JSON.stringify(out)}
@@ -194,7 +198,7 @@ function writeFfmpeg(dir: string): string {
   return file
 }
 
-function startAdapter(dir: string, relay: string, labs: string | null) {
+function startAdapter(dir: string, relay: string, labs: string | null, speakDelayMs = 0) {
   const envFile = join(dir, 'connectord.env')
   writeFileSync(envFile, 'CONNECTORD_TOKEN=never-read-by-the-seat\n')
   chmodSync(envFile, 0o000)
@@ -210,7 +214,7 @@ function startAdapter(dir: string, relay: string, labs: string | null) {
       DASHBOARD_API_BASE: 'http://127.0.0.1:9',
       DASHBOARD_OUTBOX: join(dir, 'outbox'),
       DASHBOARD_FFMPEG: writeFfmpeg(dir),
-      DASHBOARD_SPEAK: writeSpeak(dir),
+      DASHBOARD_SPEAK: writeSpeak(dir, speakDelayMs),
       DASHBOARD_VOICE_LABS: labsFile,
       DASHBOARD_REPLY_RETRY_MS: '0',
       CONNECTORD_ENV_FILE: envFile,
@@ -255,7 +259,7 @@ const timingFile = (dir: string) => join(dir, 'state', 'voice-timing.log')
 
 async function run(labs: string | null, opts: RelayOpts = {}, body?: (dir: string, a: ReturnType<typeof startAdapter>) => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), 'dash-fast-'))
-  const a = startAdapter(dir, writeRelay(dir, opts), labs)
+  const a = startAdapter(dir, writeRelay(dir, opts), labs, opts.speakDelayMs)
   try {
     expect(await waitFor(() => ops(dir).some(o => o[0] === 'pending'), BOOT_MS + 8_000)).toBe(true)
     await body?.(dir, a)
@@ -279,23 +283,27 @@ describe('the test version, on and off (DIVE-8649)', () => {
     })
   }, 30_000)
 
-  test('fast: the speech starts while the text is still being posted, and the same two posts go', async () => {
-    await run('fast\n', { delayMs: 400, holdForSpeechMs: 5_000 }, async (dir, a) => {
-      a.reply('Friday at ten.')
-      expect(await waitFor(() => a.results.length >= 1, 10_000)).toBe(true)
-      const events = ops(dir).filter(o => o[0] === 'event')
-      expect(events.map(e => e[2])).toEqual(['Friday at ten.', VOICE_ONLY_BODY])
-      expect(events[1][3]).toEndWith('.mp3')
-      const m = marks(dir)
-      expect(m['speak-start']).toBeLessThan(m['text-done'])
-      expect(a.results[0]).toContain('voice note sent')
-      expect(existsSync(join(dir, 'speak-out.ogg'))).toBe(false)
-      const t = JSON.parse(readFileSync(timingFile(dir), 'utf8').trim())
-      expect(t.fast).toBe(true)
-      expect(t.ok).toBe(true)
-      expect(readFileSync(timingFile(dir), 'utf8')).not.toContain('Friday')
-    })
-  }, 30_000)
+  // One body, two runners: a quick speech start, and one that starts 7 s late
+  // (past the old 5 s hold, which red-failed this arm on slow CI runners).
+  const fastArm = (speakDelayMs: number) => run('fast\n', { delayMs: 400, holdForSpeechMs: SPEECH_HOLD_MS, speakDelayMs }, async (dir, a) => {
+    a.reply('Friday at ten.')
+    expect(await waitFor(() => a.results.length >= 1, SPEECH_HOLD_MS + 10_000)).toBe(true)
+    const events = ops(dir).filter(o => o[0] === 'event')
+    expect(events.map(e => e[2])).toEqual(['Friday at ten.', VOICE_ONLY_BODY])
+    expect(events[1][3]).toEndWith('.mp3')
+    const m = marks(dir)
+    expect(m['speak-start']).toBeLessThan(m['text-done'])
+    expect(a.results[0]).toContain('voice note sent')
+    expect(existsSync(join(dir, 'speak-out.ogg'))).toBe(false)
+    const t = JSON.parse(readFileSync(timingFile(dir), 'utf8').trim())
+    expect(t.fast).toBe(true)
+    expect(t.ok).toBe(true)
+    expect(readFileSync(timingFile(dir), 'utf8')).not.toContain('Friday')
+  })
+
+  test('fast: the speech starts while the text is still being posted, and the same two posts go', () => fastArm(0), 60_000)
+
+  test('fast, on a slow runner: a speech that starts 7 s late still starts before the text is done', () => fastArm(7_000), 60_000)
 
   test('fast, and the text is refused: no voice note is posted and the early speech file is removed', async () => {
     await run('fast\n', { failText: true }, async (dir, a) => {
