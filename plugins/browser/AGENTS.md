@@ -461,7 +461,7 @@ the agent clears one only the way a person at the screen would.
 A code, an email verification, a 2FA prompt, an "unusual activity" page or a CAPTCHA is the
 agent's to clear, like a person would (the site's mail, the owner's saved `.2fa`, tick and wait).
 It asks the owner only when it truly can't, or where the owner turned that stop back on
-(`sudo 5dive browser gate on <site|all> code|robot`): `connect-request <site> --challenge`, then
+(`sudo 5dive browser gate on <site|all> code|robot`): `connect-request <site> --challenge --url=<the page>`, then
 carry on after their Done. Never ask for a password, never accept one, never type one the owner
 did not save, never paste a code or link into chat, never export cookies out of a profile.
 <!-- 5dive:browser:end -->

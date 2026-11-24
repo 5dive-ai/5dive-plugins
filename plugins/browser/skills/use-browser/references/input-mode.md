@@ -35,7 +35,9 @@ site is in input mode: `read`, `tree` or `run` refused "INPUT mode" means use th
    1) with nothing sent past it. Read the error and the screenshot; do not repeat the same step
    blind.
 3. **There is no DOM here.** `tree`, `read`, `links`, adapter `run` actions and `selector`/`ref`
-   steps are refused, by name. Do not ask for them; use the screen.
+   steps are refused, by name. Do not ask for them; use the screen. The automated browser's
+   `eval`, `click_at`, `hover_at` and `type_at` steps do not exist here either: click is
+   `click{x,y}`, and you read the page from the `page.png`.
 4. **Say what a step does when it matters.** Nothing here can read a button's label, so a step
    that pays, publishes, sends or deletes must carry `"kind":"pay"` (or `publish`, `send`,
    `delete`). The owner's policy applies to what you declare: a kind they set to `ask` (pay, by

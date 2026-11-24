@@ -147,7 +147,7 @@ The owner wants the job done, not handed back. Clear these yourself, like a pers
   `"saved":"<name>.2fa"`. Only a code sent to the owner's phone is theirs to give.
 - **A robot check** ("verify you are human", a tick box, "Just a moment…"): tick the box,
   or wait 5-10 s and look again, then retry. No paid solver. Still stuck after a few tries:
-  run the `connect-request <site> --challenge` command the verb prints.
+  run the `connect-request <site> --challenge --url=<the page>` command the verb prints.
 - **"Unusual activity" or a new-device page**: take the site's own way through (usually the
   email step above).
 
