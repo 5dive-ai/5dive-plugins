@@ -195,6 +195,32 @@ _push_why() {
   esac
 }
 
+# _push_git_net <repo-path> <git-args...> — a git call that talks to the target
+# repo. When root's _push_do has minted a read token it sits in _PUSH_FETCH_AUTH
+# (an "Authorization: Basic …" header) and rides as http.extraheader through
+# git's GIT_CONFIG_* environment, not `-c`, so it is never in the process table.
+# Unset (the agent's preflight, every harness), the call is exactly the old
+# credential-less one. DIVE-9177.
+_push_git_net() {
+  local repopath="$1"; shift
+  local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
+  if [[ -n "${_PUSH_FETCH_AUTH:-}" ]]; then
+    GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 \
+      GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+      GIT_CONFIG_VALUE_0="$_PUSH_FETCH_AUTH" "${G[@]}" "$@"
+  else
+    GIT_TERMINAL_PROMPT=0 "${G[@]}" "$@"
+  fi
+}
+
+# _push_remote_is_empty <repo-path> <repo-url> — 0 only when ls-remote SUCCEEDS
+# and lists no ref at all. A failed ls-remote is "could not look", never "empty".
+_push_remote_is_empty() {
+  local out
+  out=$(_push_git_net "$1" ls-remote "$2" 2>/dev/null) || return 1
+  [[ -z "$out" ]]
+}
+
 # _push_range_base <repo-path> <repo-url> <branch> — the ONE range-bound resolver
 # every fail-closed pre-push scan shares (author: DIVE-2161; content/PII:
 # DIVE-2268). Extracted rather than copied on purpose: the bound is the part that
@@ -210,9 +236,18 @@ _push_why() {
 #                  cached   — no fetch; bounded by a cached remote-tracking ref,
 #                             which MAY BE STALE
 #                  none     — no bound at all. Not a measurement; callers refuse.
-#   _PUSH_RB_BASE  merge-base sha (empty for unrelated/none)
+#                  empty    — the remote holds NO refs at all (ls-remote answered,
+#                             with nothing): every commit on the branch is new to
+#                             it. Measured, like unrelated (DIVE-9177)
+#   _PUSH_RB_BASE  merge-base sha (empty for unrelated/empty/none)
 #   _PUSH_RB_CREF  the cached ref used (kind=cached only)
 #   _PUSH_RB_WHY   short named cause of the failed fetch (kind=cached|none)
+#
+# DIVE-9177: every network call here goes through _push_git_net, which carries
+# the App token when root's _push_do has minted one (_PUSH_FETCH_AUTH). Without
+# it a PRIVATE repo can never be fetched — root has no git credential of its own —
+# and an approved push refused with "author check COULD NOT RUN" on any tree with
+# no cached origin/main.
 _push_range_base() {
   local repopath="$1" repourl="$2" branch="$3"
   local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
@@ -220,9 +255,10 @@ _push_range_base() {
   _PUSH_RB_KIND=none; _PUSH_RB_BASE=""; _PUSH_RB_CREF=""; _PUSH_RB_WHY=""
   # A fresh fetch is the only authoritative bound. Keep its stderr — WHY it failed
   # is the diagnosis, and throwing it away is what left the tool with nothing to
-  # say but a fabricated list. GIT_TERMINAL_PROMPT=0 so a credential-less caller
-  # ERRORS with a readable reason instead of blocking on a username prompt.
-  if fetch_err=$(GIT_TERMINAL_PROMPT=0 "${G[@]}" fetch --quiet "$repourl" main 2>&1) \
+  # say but a fabricated list. GIT_TERMINAL_PROMPT=0 (in _push_git_net) so a
+  # credential-less caller ERRORS with a readable reason instead of blocking on a
+  # username prompt.
+  if fetch_err=$(_push_git_net "$repopath" fetch --quiet "$repourl" main 2>&1) \
      && "${G[@]}" rev-parse --verify --quiet FETCH_HEAD >/dev/null 2>&1; then
     fetch_ok=1
     base=$("${G[@]}" merge-base FETCH_HEAD "refs/heads/${branch}" 2>/dev/null) || base=""
@@ -232,6 +268,13 @@ _push_range_base() {
   fi
   if [[ $fetch_ok -eq 1 ]]; then
     _PUSH_RB_KIND=unrelated; return 0
+  fi
+  # DIVE-9177: a repo created empty has no main to fetch, credential or not. That
+  # is a MEASURABLE state, not an unknown one: ls-remote reaches the repo and lists
+  # nothing, so nothing on the branch can already be there. Only a SUCCESSFUL,
+  # EMPTY answer counts — an ls-remote that fails says nothing and falls through.
+  if _push_remote_is_empty "$repopath" "$repourl"; then
+    _PUSH_RB_KIND=empty; return 0
   fi
   _PUSH_RB_WHY=$(_push_fetch_why "$fetch_err")
   for cref in refs/remotes/origin/main refs/remotes/origin/master; do
@@ -270,7 +313,7 @@ _push_range_base() {
 #     with the reason and let the authoritative pass enforce. The predicate is the
 #     condition itself, so a tree that regains a bound is re-armed automatically.
 # Sets _PUSH_AUTHOR_SCAN_BOUND to fresh|unrelated|cached|unavailable so the caller
-# can report which bound (if any) the verdict actually rests on.
+# can report which bound (if any) the verdict actually rests on (plus empty, DIVE-9177).
 _push_author_scan() {
   local repopath="$1" repourl="$2" branch="$3" author="$4" repo_src="${5:-}" mode="${6:-authoritative}"
   _PUSH_AUTHOR_SCAN_BOUND=unavailable
@@ -292,6 +335,12 @@ _push_author_scan() {
     _PUSH_AUTHOR_SCAN_BOUND=unrelated
     rangespec="refs/heads/${branch}"
     scope="EVERY commit reachable from '${branch}' — a FRESH fetch of that repo's main succeeded and shares NO common ancestor with this branch, so all of them are new to it"
+  elif [[ "$_PUSH_RB_KIND" == empty ]]; then
+    # DIVE-9177: measured the same way — the repo answered and holds no refs, so
+    # every commit on the branch is new to it. Named as such, never as "fresh".
+    _PUSH_AUTHOR_SCAN_BOUND=empty
+    rangespec="refs/heads/${branch}"
+    scope="EVERY commit reachable from '${branch}' — that repo answered and holds NO branches at all, so all of them are new to it"
   else
     # No fresh bound. Degrade to a CACHED remote-tracking main if the tree has
     # one, and say out loud that the bound may be stale; otherwise the bound is
@@ -409,7 +458,7 @@ _push_pii_payload() {
 #   preflight — the agent's advisory pass, which by design holds no GitHub
 #     credential, so an unbounded range is NORMAL here: warn and defer. A MISSING
 #     PAYLOAD is not deferred in either mode — root will not find it either.
-# Sets _PUSH_PII_SCAN_BOUND to fresh|unrelated|cached|unavailable.
+# Sets _PUSH_PII_SCAN_BOUND to fresh|unrelated|empty|cached|unavailable.
 _push_pii_scan() {
   local repopath="$1" repourl="$2" branch="$3" mode="${4:-authoritative}"
   local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
@@ -435,6 +484,13 @@ _push_pii_scan() {
       rangespec="refs/heads/${branch}"
       diffbase=$("${G[@]}" hash-object -t tree /dev/null 2>/dev/null) || diffbase=""
       scope="EVERY commit reachable from '${branch}' — a FRESH fetch of that repo's main shares NO common ancestor with it" ;;
+    empty)
+      # DIVE-9177: the repo answered with no refs at all — same honest base as
+      # unrelated (everything is added), named for what was measured.
+      _PUSH_PII_SCAN_BOUND=empty
+      rangespec="refs/heads/${branch}"
+      diffbase=$("${G[@]}" hash-object -t tree /dev/null 2>/dev/null) || diffbase=""
+      scope="EVERY commit reachable from '${branch}' — that repo holds NO branches yet, so all of it is new to it" ;;
     cached)
       _PUSH_PII_SCAN_BOUND=cached
       rangespec="${base}..refs/heads/${branch}"; diffbase="$base"
@@ -618,10 +674,19 @@ _push_touches_workflows() { # <repopath> <repourl> <branch>
   local repopath="$1" repourl="$2" branch="$3" b base="" files
   local -a g=(git -C "$repopath" -c "safe.directory=$repopath")
   for b in main master; do
-    if "${g[@]}" fetch --quiet "$repourl" "$b" 2>/dev/null; then base="FETCH_HEAD"; break; fi
+    if _push_git_net "$repopath" fetch --quiet "$repourl" "$b" 2>/dev/null; then base="FETCH_HEAD"; break; fi
   done
-  # DIVE-2547: that fetch is UNAUTHENTICATED — it hands git a bare $repourl with no
-  # credential — so against a PRIVATE repo it can never succeed. The old code then
+  # DIVE-9177: inside _push_do this fetch now carries the App read token, so a
+  # private repo is measured instead of falling to "unknown". A repo with NO refs
+  # has no base at all: every file on the branch is added, so list them all.
+  if [[ -z "$base" ]] && _push_remote_is_empty "$repopath" "$repourl"; then
+    files=$("${g[@]}" ls-tree -r --name-only "refs/heads/${branch}" 2>/dev/null) || { echo "unknown"; return; }
+    if grep -qE '^\.github/workflows/' <<<"$files"; then echo "yes"; else echo "no"; fi
+    return
+  fi
+  # DIVE-2547: that fetch WAS UNAUTHENTICATED (DIVE-9177 gave it the App read
+  # token inside _push_do; the agent preflight still has none) — so against a
+  # PRIVATE repo it could never succeed. The old code then
   # returned "unknown" and the caller requested workflows:write defensively, on
   # EVERY push to every private repo, forever. That is a permanently over-scoped
   # token minted by a probe that never once measured anything, which is the exact
@@ -843,9 +908,15 @@ cmd_push() {
   # delegated seat — see the block above _push_override_missing_clauses. Forwarded
   # verbatim and NOT graded here: the five-clause check runs root-side, where the
   # signing agent cannot edit it.
-  local rc=0
+  local rc=0 pushout
+  # DIVE-9177: keep a copy of root's answer (it still streams) so the PR leg can
+  # see whether the push landed in an EMPTY repo.
+  pushout=$(mktemp "${TMPDIR:-/tmp}/.5dive-push-out.XXXXXX") || pushout=/dev/null
   _push_do_stdin_write "$ident" "$repopath" "$branch" "$repo" "${FIVE_PUSH_OVERRIDE:-}" \
-    | sudo -n /usr/local/bin/5dive _push_do || rc=$?
+    | sudo -n /usr/local/bin/5dive _push_do | tee "$pushout" || rc=$?
+  local remote_was_empty=0
+  grep -qF 'remote-was-empty' "$pushout" 2>/dev/null && remote_was_empty=1
+  [[ "$pushout" != /dev/null ]] && rm -f "$pushout"
   if [[ $rc -ne 0 ]]; then
     fail "$E_GENERIC" \
       "delegated push failed — the task gate is not cleared, the GitHub App credential is not provisioned (${_PUSH_APP_ENV_DEFAULT}), the NOPASSWD grant for '_push_do' is missing, or the push itself failed (see above). See DIVE-1376/1460."
@@ -856,7 +927,12 @@ cmd_push() {
   # it — a failed PR open leaves a pushed branch anyone can open a PR from by hand,
   # while making it fatal would turn a successful push into a red exit and invite a
   # re-push. The push is the irreversible half; the PR is the recoverable one.
-  if [[ $open_pr -eq 1 ]]; then
+  # DIVE-9177: a first push into an EMPTY repo makes this branch the repo's only
+  # (default) branch, so there is no base to open a pull request against. Say so
+  # and stop; asking gh would only fail with a message about a missing base.
+  if [[ $open_pr -eq 1 && $remote_was_empty -eq 1 ]]; then
+    warn "NO pull request opened — ${slug} had no branches before this push, so '${branch}' is now its default branch and there is nothing to merge it into (a base made now would share no history with it, and GitHub will not open a PR across unrelated histories). Review the branch itself; if it should be the main line, rename it to '${pr_base:-${FIVE_GATE_MAIN_BRANCH:-main}}' in the repo's branch settings. Do NOT re-push."
+  elif [[ $open_pr -eq 1 ]]; then
     if ! _push_open_pr "$ident" "$slug" "$branch" "$pr_base" "$pr_title" "$pr_body_file" "$pr_draft" "$repopath"; then
       # DIVE-4748: the advice has to be a command that RUNS. The old line printed
       # `5dive gh pr create --repo <r> --head <b>` — no --base, no --title, no
@@ -1159,6 +1235,60 @@ _push_record_ship_ledger() {
   return 0
 }
 
+# _push_mint_token <jwt> <installation-id> <request-body> <slug> — exchange the App
+# JWT for an installation token scoped by <request-body>, into _PUSH_TOK. Refuses
+# (fail) with GitHub's own reason. Extracted from cmd_push_do by DIVE-9177, which
+# mints twice: a contents:read token to bound the scans, then the write token.
+# Never call it in $(…): `fail` must end _push_do, not a subshell.
+_push_mint_token() {
+  local jwt="$1" inst="$2" body="$3" slug="$4"
+  _PUSH_TOK=""
+  # Keep the response body: `curl -fsS` prints nothing on a 4xx, so the old code
+  # turned GitHub's own explanation into "installation token exchange failed" and
+  # the operator had to re-run the call by hand to see the cause. A refusal must
+  # carry what the remote actually said (DIVE-2143).
+  local _tokresp _tokrc=0 _why _owner
+  _tokresp=$(curl -sS --max-time 15 -X POST \
+        -H "Authorization: Bearer ${jwt}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        -d "$body" \
+        "https://api.github.com/app/installations/${inst}/access_tokens" 2>&1) || _tokrc=$?
+  _PUSH_TOK=$(printf '%s' "$_tokresp" | jq -r '.token // empty' 2>/dev/null)
+  if [[ -z "$_PUSH_TOK" ]]; then
+    _why=$(printf '%s' "$_tokresp" | jq -r '.message // empty' 2>/dev/null)
+    [[ -n "$_why" ]] || _why="$(printf '%s' "$_tokresp" | head -c 300)"
+    _owner="${slug%%/*}"
+    # DIVE-2566: NOT $E_GENERIC, and not a number from someone else's namespace.
+    # The original symptom of this whole row was an operator seeing rc=22 — curl's
+    # exit for HTTP>=400 — which is not a 5dive code at all (error_codes.sh tops out
+    # at E_PERMISSION=10), so the number carried no meaning and the message named
+    # four possible causes at once. E_AUTH_REQUIRED is the honest class: the App
+    # cannot authenticate FOR THIS REPO. It is deliberately distinct from
+    # E_PERMISSION (which means "must run as root" here) and from the git-credential
+    # faults _push_fetch_why now separates.
+    #
+    # No NEW code was added to the ladder on purpose: error_codes.sh says "keep
+    # err_class_for() in sync if you add a code", so a new code has a reader outside
+    # this file, and this failure genuinely IS an authentication class rather than a
+    # class of its own. Widening a shared ladder for one call site is a bigger blast
+    # radius than the fix needs.
+    #
+    # The no-installation case gets its own SENTENCE because it is the one an
+    # operator cannot act on by retrying, and it is the case that actually happens:
+    # the App is installed on the 5dive-ai org, while lodar/5dive-api and
+    # lodar/5dive-frontend live on a personal account. Installing it there is
+    # DIVE-2033, a human-only step. Until then this refusal is CORRECT behaviour and
+    # only has to say why.
+    case "$_why" in
+      *"not installed"*|*"Not Found"*|*"not accessible"*|*"does not exist"*)
+        fail "$E_AUTH_REQUIRED" "the GitHub App has no installation covering ${slug} — it cannot mint a token for a repo it was never installed on, so this push CANNOT succeed and retrying will not help. GitHub said: ${_why}. Install the App on '${_owner}' (DIVE-2033, a human-only account-level step), or relay this push to someone holding credentials for ${slug}. This is NOT a missing sudo grant and NOT a git-credential problem." ;;
+      *)
+        fail "$E_AUTH_REQUIRED" "installation token exchange failed for ${slug} against installation ${inst}. GitHub said: ${_why:-no response body}. If that names an inaccessible repository, the App is not installed on '${_owner}'." ;;
+    esac
+  fi
+}
+
 cmd_push_do() {
   require_loaded push broker_gate_check broker_bind_target broker_task_target
   [[ "$(id -u)" -eq 0 ]] || fail "$E_PERMISSION" "_push_do is root-only"
@@ -1214,21 +1344,6 @@ cmd_push_do() {
   [[ -n "$app_id" && -n "$inst" && -r "$pem" ]] || \
     fail "$E_GENERIC" "GitHub App env incomplete (need GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, readable GITHUB_APP_PRIVATE_KEY_FILE)"
 
-  # Authoritative author scan (fail-closed). The enforced committer is config-only
-  # (GITHUB_APP_COMMIT_AUTHOR, just sourced from the App env); empty = no
-  # restriction. This is the authoritative gate — the agent pre-flight is only a
-  # best-effort preview and may have deferred here.
-  local author; author=$(_push_expected_author)
-  # DIVE-2161: `authoritative` — this pass runs as root and is the one that
-  # decides. If it cannot bound the range it REFUSES and names what is missing;
-  # it never substitutes the whole history and grades against it.
-  _push_author_scan "$repopath" "$repourl" "$branch" "$author" "the caller's resolved target" authoritative
-
-  # Authoritative CONTENT scan (DIVE-2268). Last moment before the bytes leave the
-  # box, and the pass that actually decides: no bound here REFUSES rather than
-  # reporting a push it never looked at as clean.
-  _push_pii_scan "$repopath" "$repourl" "$branch" authoritative
-
   # Build a short-lived App JWT (iat -60s for clock skew, exp +9min < 10min max).
   local now iat exp header payload unsigned sig jwt
   now=$(date +%s); iat=$((now - 60)); exp=$((now + 540))
@@ -1247,24 +1362,6 @@ cmd_push_do() {
   # owner/repo, needed by the DIVE-2563 installation lookup below. Declared here
   # rather than at the summary line further down, which ran AFTER the mint.
   slug=$(_push_repo_slug "$repourl")
-  # gh#250: contents:write alone CANNOT push .github/workflows/* — GitHub
-  # refuses the push outright, and the error names the App's permissions rather
-  # than this token's, so the operator chases the wrong thing. Ask for
-  # workflows:write only when the branch actually touches a workflow file, so
-  # the ordinary push keeps the one-permission scope DIVE-1460 intended.
-  #
-  # 'unknown' (no remote default branch reachable, so no range to diff) includes
-  # the permission and says so: match the insurance to the recoverability — a
-  # slightly over-scoped token for one gated push is bounded and visible, a push
-  # that fails after the human already cleared the gate is not.
-  local _wf; _wf=$(_push_touches_workflows "$repopath" "$repourl" "$branch")
-  if [[ "$_wf" == "no" ]]; then
-    body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write"}}')
-  else
-    [[ "$_wf" == "unknown" ]] \
-      && echo "[5dive] cannot diff ${branch} against the remote default branch — requesting workflows:write defensively" >&2
-    body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write",workflows:"write"}}')
-  fi
   # DIVE-2563: RESOLVE THE INSTALLATION FOR THIS REPO'S OWNER, don't mint against a
   # single pinned id. GITHUB_APP_INSTALLATION_ID is one number in one env file, so
   # every push on this box minted against whichever account was installed first.
@@ -1315,50 +1412,58 @@ cmd_push_do() {
     echo "[5dive] could not resolve an installation for ${slug}; falling back to the pinned id ${inst}. If the exchange refuses, the App is probably not installed on $(printf '%s' "$slug" | cut -d/ -f1)." >&2
   fi
 
-  # Keep the response body: `curl -fsS` prints nothing on a 4xx, so the old code
-  # turned GitHub's own explanation into "installation token exchange failed" and
-  # the operator had to re-run the call by hand to see the cause. A refusal must
-  # carry what the remote actually said (DIVE-2143).
-  local _tokresp _tokrc=0
-  _tokresp=$(curl -sS --max-time 15 -X POST \
-        -H "Authorization: Bearer ${jwt}" \
-        -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        -d "$body" \
-        "https://api.github.com/app/installations/${inst}/access_tokens" 2>&1) || _tokrc=$?
-  tok=$(printf '%s' "$_tokresp" | jq -r '.token // empty' 2>/dev/null)
-  if [[ -z "$tok" ]]; then
-    local _why; _why=$(printf '%s' "$_tokresp" | jq -r '.message // empty' 2>/dev/null)
-    [[ -n "$_why" ]] || _why="$(printf '%s' "$_tokresp" | head -c 300)"
-    local _owner; _owner="${slug%%/*}"
-    # DIVE-2566: NOT $E_GENERIC, and not a number from someone else's namespace.
-    # The original symptom of this whole row was an operator seeing rc=22 — curl's
-    # exit for HTTP>=400 — which is not a 5dive code at all (error_codes.sh tops out
-    # at E_PERMISSION=10), so the number carried no meaning and the message named
-    # four possible causes at once. E_AUTH_REQUIRED is the honest class: the App
-    # cannot authenticate FOR THIS REPO. It is deliberately distinct from
-    # E_PERMISSION (which means "must run as root" here) and from the git-credential
-    # faults _push_fetch_why now separates.
-    #
-    # No NEW code was added to the ladder on purpose: error_codes.sh says "keep
-    # err_class_for() in sync if you add a code", so a new code has a reader outside
-    # this file, and this failure genuinely IS an authentication class rather than a
-    # class of its own. Widening a shared ladder for one call site is a bigger blast
-    # radius than the fix needs.
-    #
-    # The no-installation case gets its own SENTENCE because it is the one an
-    # operator cannot act on by retrying, and it is the case that actually happens:
-    # the App is installed on the 5dive-ai org, while lodar/5dive-api and
-    # lodar/5dive-frontend live on a personal account. Installing it there is
-    # DIVE-2033, a human-only step. Until then this refusal is CORRECT behaviour and
-    # only has to say why.
-    case "$_why" in
-      *"not installed"*|*"Not Found"*|*"not accessible"*|*"does not exist"*)
-        fail "$E_AUTH_REQUIRED" "the GitHub App has no installation covering ${slug} — it cannot mint a token for a repo it was never installed on, so this push CANNOT succeed and retrying will not help. GitHub said: ${_why}. Install the App on '${_owner}' (DIVE-2033, a human-only account-level step), or relay this push to someone holding credentials for ${slug}. This is NOT a missing sudo grant and NOT a git-credential problem." ;;
-      *)
-        fail "$E_AUTH_REQUIRED" "installation token exchange failed for ${slug} against installation ${inst}. GitHub said: ${_why:-no response body}. If that names an inaccessible repository, the App is not installed on '${_owner}'." ;;
-    esac
+  # DIVE-9177: TOKEN FIRST, THEN THE SCANS. Both scans bound their range with a
+  # fresh fetch of the target's main, and root has no git credential of its own,
+  # so before this they fetched credential-less: any PRIVATE repo failed the fetch
+  # and refused "author check COULD NOT RUN" unless the tree happened to carry a
+  # cached origin/main. A contents:read token for just this repo is enough to
+  # fetch; it rides as an extraheader (see _push_git_net) and is dropped as soon
+  # as the scans and the workflow probe are done. Still fail-closed: a fetch that
+  # fails WITH the token refuses exactly as before.
+  _push_mint_token "$jwt" "$inst" "$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"read"}}')" "$slug"
+  _PUSH_FETCH_AUTH="Authorization: Basic $(printf 'x-access-token:%s' "$_PUSH_TOK" | base64 -w0)"
+  _PUSH_TOK=""
+
+  # Authoritative author scan (fail-closed). The enforced committer is config-only
+  # (GITHUB_APP_COMMIT_AUTHOR, just sourced from the App env); empty = no
+  # restriction. This is the authoritative gate — the agent pre-flight is only a
+  # best-effort preview and may have deferred here.
+  local author; author=$(_push_expected_author)
+  # DIVE-2161: `authoritative` — this pass runs as root and is the one that
+  # decides. If it cannot bound the range it REFUSES and names what is missing;
+  # it never substitutes the whole history and grades against it.
+  _push_author_scan "$repopath" "$repourl" "$branch" "$author" "the caller's resolved target" authoritative
+
+  # Authoritative CONTENT scan (DIVE-2268). Last moment before the bytes leave the
+  # box, and the pass that actually decides: no bound here REFUSES rather than
+  # reporting a push it never looked at as clean.
+  _push_pii_scan "$repopath" "$repourl" "$branch" authoritative
+
+  # gh#250: contents:write alone CANNOT push .github/workflows/* — GitHub
+  # refuses the push outright, and the error names the App's permissions rather
+  # than this token's, so the operator chases the wrong thing. Ask for
+  # workflows:write only when the branch actually touches a workflow file, so
+  # the ordinary push keeps the one-permission scope DIVE-1460 intended.
+  #
+  # 'unknown' (no remote default branch reachable, so no range to diff) includes
+  # the permission and says so: match the insurance to the recoverability — a
+  # slightly over-scoped token for one gated push is bounded and visible, a push
+  # that fails after the human already cleared the gate is not.
+  local _wf; _wf=$(_push_touches_workflows "$repopath" "$repourl" "$branch")
+  if [[ "$_wf" == "no" ]]; then
+    body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write"}}')
+  else
+    [[ "$_wf" == "unknown" ]] \
+      && echo "[5dive] cannot diff ${branch} against the remote default branch — requesting workflows:write defensively" >&2
+    body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write",workflows:"write"}}')
   fi
+  _PUSH_FETCH_AUTH=""   # the read token's job is done
+  # DIVE-9177: the content scan measured whether the repo held any branch at all;
+  # a first push into an EMPTY repo leaves nothing to open a pull request against.
+  local remote_empty=0; [[ "${_PUSH_PII_SCAN_BOUND:-}" == empty ]] && remote_empty=1
+
+  _push_mint_token "$jwt" "$inst" "$body" "$slug"
+  tok="$_PUSH_TOK"; _PUSH_TOK=""
 
   # Push ONLY the named branch, token via extraheader so it never lands in argv
   # (no leak via ps/audit). Discard the token immediately after.
@@ -1437,11 +1542,16 @@ cmd_push_do() {
     echo "[5dive] override signed for ${ident}; the rail printed the signed reason and the path of its root-owned log above. Nothing was written into your checkout as root." >&2
   fi
   local author_note; [[ -n "$author" ]] && author_note="author enforced" || author_note="no author restriction"
-  ok "pushed ${branch}@${sha} → ${slug} (delegated, repo-scoped token, ${author_note}, gate cleared)" \
+  # DIVE-9177: `remote-was-empty` is a fixed token cmd_push reads to skip --open-pr
+  # (there is no base branch to open it against). Keep the spelling in step.
+  local empty_note=""
+  [[ $remote_empty -eq 1 ]] && empty_note=", remote-was-empty: ${slug} had no branches, so GitHub makes '${branch}' its default branch"
+  ok "pushed ${branch}@${sha} → ${slug} (delegated, repo-scoped token, ${author_note}, gate cleared${empty_note})" \
      "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" \
            --argjson ae "$([[ -n "$author" ]] && echo true || echo false)" \
            --argjson ov "$([[ -n "$override" ]] && echo true || echo false)" \
-           '{task:$t,branch:$b,sha:$s,repo:$r,pushed:true,scoped:true,authorEnforced:$ae,railOverridden:$ov}')"
+           --argjson re "$([[ $remote_empty -eq 1 ]] && echo true || echo false)" \
+           '{task:$t,branch:$b,sha:$s,repo:$r,pushed:true,scoped:true,authorEnforced:$ae,railOverridden:$ov,remoteWasEmpty:$re}')"
 }
 
 # cmd_push_setup — DIVE-1461: bring-your-own-GitHub-App onboarding for delegated

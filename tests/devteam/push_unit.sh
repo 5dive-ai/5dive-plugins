@@ -1003,7 +1003,8 @@ fi
 # Extracts the mint's failure block and runs it with a real GitHub 404 body, with
 # `fail` stubbed to capture what the operator would actually see. Greping that the
 # body is PARSED cannot tell that apart from a fail() that drops it on the floor.
-_b_start=$(grep -n 'if \[\[ -z "\$tok" \]\]; then' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _b_start=""
+# DIVE-9177: the mint moved into _push_mint_token, which fills _PUSH_TOK.
+_b_start=$(grep -n 'if \[\[ -z "\$_PUSH_TOK" \]\]; then' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _b_start=""
 _b_end=$(awk -v s="${_b_start:-0}" 'NR>s && /^  fi$/ {print NR; exit}' "$SRC/cmd_push.sh")
 if [[ -z "$_b_start" || -z "$_b_end" ]]; then
   bad_t "installation: ARM B could not locate its subject (DIVE-2566)" \
@@ -1014,7 +1015,7 @@ else
 set -uo pipefail
 E_AUTH_REQUIRED=6; E_GENERIC=1
 fail() { printf "FAILCODE:%s\nFAILMSG:%s\n" "$1" "$2"; exit 0; }
-tok=""; slug=lodar/5dive-api; inst=147419836
+_PUSH_TOK=""; slug=lodar/5dive-api; inst=147419836
 _tokresp='"'"'{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}'"'"'
 '"$(sed -n "${_b_start},${_b_end}p" "$SRC/cmd_push.sh")"'
 ' 2>/dev/null)

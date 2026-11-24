@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Fixed — devteam 0.4.2: an approved push to a private repo lands (DIVE-9177)
+
+- `5dive push` refused every approved push to a private repo whose work tree had no cached `origin/main` ("author check COULD NOT RUN"). Root ran the author and PII scans before it minted the App token, so their fetch of `main` had no credential. Root now mints a read-only token for that one repo first, fetches with it (the token travels in git's environment, never in argv), runs the scans, and then mints the write token for the push. A fetch that still fails with the token refuses as before.
+- A repo with no branches at all is now measured as `empty`: every commit is new, and the scans say so. The push lands, and `--open-pr` opens nothing because there is no base branch. It prints one line saying why instead of failing at GitHub.
+- Harness: `tests/devteam/push_private_repo_unit.sh`, 19 arms. It drives root's push end to end against a stub GitHub that serves the repo only with a token. 12 arms are red on the old code, and a mutant that moves the scans back before the mint is red too.
+
 ### Added — desktop 0.1.0: `5dive desktop`, agents use apps on the owner's Windows PC (DIVE-9063)
 
 - New plugin `desktop` (verb `5dive desktop`), the box half of desktop control slice 1. Agents run `snapshot` and `act --steps` (refs from the snapshot, `do` mapped onto agent-desktop in one table), `status` and `log`. The 5dive desktop app polls over the API's exec tunnel with `_poll`, answers with `_result` and reports Stop with `_stopped`, all root-only and refused to an agent seat's sudo. Jobs pass through a spool in `/var/lib/5dive/desktop`. A seat writes its request 0600 into a 1733 queue, and root hands the result back chowned 0600 to that seat, which deletes it on read. Snapshot content never reaches the action log, and typed text appears there only as its length. Steps that pay, post, send or delete go through the browser's approvals policy, read from the browser's own file. A stopped step exits 73 and nothing runs. Root checks the policy again when the PC claims a job. `sudo 5dive desktop off|on` is a server-side switch.
