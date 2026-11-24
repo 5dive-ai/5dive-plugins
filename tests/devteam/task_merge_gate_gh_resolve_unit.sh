@@ -47,8 +47,15 @@ TMP="$(mktemp -d /tmp/gate-gh-resolve-unit.XXXXXX)"
 # printed a LIVE oauth token into this suite's argv log, and asserted against a
 # credential the fleet doesn't have. Always fails: no test here wants a real one.
 mkdir -p "$TMP/bin"
-printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/bin/sudo"
+# DIVE-9184: it also RECORDS its argv, so the arms below can assert which sudo
+# calls the resolver made (an unwanted one is what lands in the auth log).
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"${SUDO_ARGS_LOG:-/dev/null}"\nexit 1\n' >"$TMP/bin/sudo"
 chmod +x "$TMP/bin/sudo"
+# On a host whose /etc/environment carries FIVE_* knobs, lib/env_isolation.sh
+# installs a refusing sudo() FUNCTION, and a function shadows this PATH stub, so
+# T6/T7 would read an empty call log there and nowhere else. The stub never
+# reaches real sudo, which is all that guard exists to prevent.
+unset -f sudo 2>/dev/null || true
 
 # --- stub gh: records argv + the inherited GH_TOKEN per call, answers auth/pr. --
 cat >"$TMP/bin/gh" <<'STUB'
@@ -160,6 +167,40 @@ out=$(cmd_task_done DIVE-836 --result="close under test (DIVE-2773: a first clos
 [[ $rc -eq $E_CONFLICT && "$(statusof DIVE-836)" != "done" ]] \
   && ok_t "T5 unknown/empty state still BLOCKS (fail-safe, never false-close)" \
   || bad_t "T5 fail-safe" "rc=$rc status=$(statusof DIVE-836) out=$out"
+
+# --- T6 (DIVE-9184): SUDO_USER naming the account ALREADY running makes NO arm-2
+#     sudo call — sudo could only refuse it, and every refusal is a "command not
+#     allowed" line in the auth log on a close that worked. Arm 3 (own gh token)
+#     still resolves. ---------------------------------------------------------------
+export SUDO_ARGS_LOG="$TMP/sudo.args"; : >"$SUDO_ARGS_LOG"
+unset GH_TOKEN GITHUB_TOKEN
+export GH_STUB_AUTH_TOKEN="own-tok-9184"
+_self=$(actor_caller_unix_name)
+got=$(SUDO_USER="$_self" _gate_gh_token)
+if [[ -z "$_self" ]]; then
+  bad_t "T6 staging" "actor_caller_unix_name resolved empty — cannot name the running account"
+else
+  [[ "$got" == "own-tok-9184" ]] \
+    && ok_t "T6 SUDO_USER=self still resolves via arm 3 (own gh auth token)" \
+    || bad_t "T6 resolved via arm 3" "got=$got"
+  _calls=$(<"$SUDO_ARGS_LOG")
+  [[ "$_calls" != *"-u $_self gh auth token"* ]] \
+    && ok_t "T6 SUDO_USER=self makes NO sudo -u <self> call (nothing for the auth log)" \
+    || bad_t "T6 no self-sudo" "sudo calls: $_calls"
+fi
+
+# --- T7 (NEGATIVE CONTROL, DIVE-9184): SUDO_USER naming ANOTHER account still
+#     tries arm 2 first — the skip is for self only, precedence is unchanged. --
+: >"$SUDO_ARGS_LOG"
+got=$(SUDO_USER="dive9184-other" _gate_gh_token)
+_calls=$(<"$SUDO_ARGS_LOG")
+[[ "$_calls" == *"-n -u dive9184-other gh auth token"* ]] \
+  && ok_t "T7 NEGATIVE CONTROL: SUDO_USER=<another user> still calls sudo -n -u <that user>" \
+  || bad_t "T7 arm 2 still runs for another user" "sudo calls: $_calls"
+[[ "$got" == "own-tok-9184" ]] \
+  && ok_t "T7 a refused arm 2 still falls through to arm 3" \
+  || bad_t "T7 fallthrough" "got=$got"
+unset GH_STUB_AUTH_TOKEN SUDO_ARGS_LOG
 
 echo "-----"
 printf 'task_merge_gate_gh_resolve_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
