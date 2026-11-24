@@ -4884,7 +4884,7 @@ cmd_tree() {
   n=$(jq -er '.nodes | length' <<<"$out") \
     || die "$E_UNAVAILABLE" "the page's tree did not parse as JSON (jq's reason is above); nothing was printed."
   if (( json )); then printf '%s\n' "$out"; return 0; fi
-  jq -r '.nodes[] | "  \(.role)  \"\(.name)\"\n      ref=\(.ref)"' <<<"$out" \
+  jq -r '.nodes[] | "  \(.role)  \"\(.name)\"" + (if (.text // "") != "" then "  shows: \(.text | @json)" else "" end) + "\n      ref=\(.ref)"' <<<"$out" \
     || die "$E_UNAVAILABLE" "the page's tree could not be printed (jq refused it above)."
   printf '\n%s: %s addressable node(s) on %s\n' "$PROG" "$n" "$url" >&2
   printf 'Use one as a selector, in an adapter step or on the command line: ref=<role>/<name>\n' >&2
@@ -8524,6 +8524,12 @@ INLINE_REFS_MAX="${FIVEDIVE_BROWSER_INLINE_REFS_MAX:-60}"
 INLINE_SNAP_REFS_MAX="${FIVEDIVE_BROWSER_INLINE_SNAP_REFS_MAX:-300}"
 _inline_page() { # _inline_page <artifact dir> [<refs cap>]: a cap given prints the first ones past it
   local out="$1" body n refs_max="${2:-$INLINE_REFS_MAX}" cut=0
+  # ONE REF LINE, AND WHAT A NAMELESS ONE SHOWS (DIVE-9179). An inbox row is a link
+  # with no accessible name, so fifty of them printed as `ref=link/#1`..`#50` and the
+  # agent could not tell which message was which. Its visible text follows the ref.
+  # A local, not a top-level variable: tests lift this function alone out of the
+  # file, and under `set -u` a missing global silently dropped every ref line.
+  local ref_line='.nodes[] | "  ref=\(.ref)" + (if (.text // "") != "" then "   shows: \(.text | @json)" else "" end)'
   [[ -n "${2:-}" ]] && cut=1
   [[ "$INLINE_MD_MAX" =~ ^[0-9]{1,7}$ && "$refs_max" =~ ^[0-9]{1,5}$ ]] || return 0
   if [[ -s "$out/page.md" ]]; then
@@ -8537,7 +8543,7 @@ _inline_page() { # _inline_page <artifact dir> [<refs cap>]: a cap given prints 
     n=$(jq -r '.nodes | length' "$out/tree.json" 2>/dev/null) || n=-1
     if (( n > 0 && n <= refs_max )); then
       printf '  --- refs (tree.json: act on these) ---\n'
-      jq -r '.nodes[] | "  ref=\(.ref)"' "$out/tree.json" 2>/dev/null
+      jq -r "$ref_line" "$out/tree.json" 2>/dev/null
     elif (( n > refs_max && cut )); then
       # A BIG PAGE'S REFS ARE CUT, NOT DROPPED (DIVE-9011). Past the cap this
       # printed nothing and said nothing: on the DIVE-9006 bench every snapshot of
@@ -8547,8 +8553,8 @@ _inline_page() { # _inline_page <artifact dir> [<refs cap>]: a cap given prints 
       # the header, the tabs and the filters;
       # the rest is one line away.
       printf '  --- refs (tree.json: act on these), the first %s of %s ---\n' "$refs_max" "$n"
-      jq -r --argjson m "$refs_max" '.nodes[:$m][] | "  ref=\(.ref)"' "$out/tree.json" 2>/dev/null
-      printf '  … %s more: jq -r '"'"'.nodes[].ref'"'"' %s/tree.json | grep -i '"'"'<word>'"'"'\n' "$(( n - refs_max ))" "$out"
+      jq -r --argjson m "$refs_max" ".nodes = .nodes[:\$m] | $ref_line" "$out/tree.json" 2>/dev/null
+      printf '  … %s more: jq -r '"'"'.nodes[] | .ref + "  " + (.text // "")'"'"' %s/tree.json | grep -i '"'"'<word>'"'"'\n' "$(( n - refs_max ))" "$out"
     fi
   fi
   return 0
