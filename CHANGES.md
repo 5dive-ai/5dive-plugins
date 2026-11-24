@@ -4,6 +4,11 @@
 
 - lodar 11-24, "false takeovers": `connect-request --challenge` sent the owner a take-over even when the box's own look saw no check on the page. It is now refused (rc 69): nothing is sent and no code is minted. The look also runs `lib/page-check.cjs ask`, so a Turnstile that is still waiting, a visible hCaptcha or reCAPTCHA, or check words on the page count as a check. A Turnstile that is already answered does not. `plugins/browser` is re-synced byte for byte from 5dive-ai/5dive-browser main c2be6ad (#185, `tests/browser_mirror.sh sync`).
 
+### Fixed — devteam 0.4.3: `task done` no longer logs a refused sudo on every close (DIVE-9184)
+
+- The merge gate's token lookup ran `sudo -n -u "$SUDO_USER" gh auth token` even when `SUDO_USER` named the account already running. sudo could only refuse it, so every close on a scoped seat wrote a "command not allowed" line to the auth log, which reads like an escalation attempt. That step is now skipped for the running account and the lookup goes straight to the seat's own gh login, which is what it ended up using anyway. Any other `SUDO_USER` is tried exactly as before.
+- Harness: `tests/devteam/task_merge_gate_gh_resolve_unit.sh` T6 (no sudo call for the running account, red on the old code) and T7 (another account is still tried first).
+
 ### Fixed — devteam 0.4.2: an approved push to a private repo lands (DIVE-9177)
 
 - `5dive push` refused every approved push to a private repo whose work tree had no cached `origin/main` ("author check COULD NOT RUN"). Root ran the author and PII scans before it minted the App token, so their fetch of `main` had no credential. Root now mints a read-only token for that one repo first, fetches with it (the token travels in git's environment, never in argv), runs the scans, and then mints the write token for the push. A fetch that still fails with the token refuses as before.

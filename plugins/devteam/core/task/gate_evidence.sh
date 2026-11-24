@@ -90,7 +90,12 @@ _gate_gh_token() {
   fi
   _gate_tok_note "[1 env GH_TOKEN/GITHUB_TOKEN] absent"
   u="${SUDO_USER:-}"
-  if [[ -n "$u" && "$u" != "root" ]] && command -v sudo >/dev/null 2>&1; then
+  # DIVE-9184: SUDO_USER can equal the account already running (inherited env), and
+  # then sudo can only refuse — logging "command not allowed" on every close. Skip to
+  # arm 3, which is the same account's own token. EUID-derived, not `id -un`.
+  if [[ -n "$u" && "$u" == "$(actor_caller_unix_name)" ]]; then
+    _gate_tok_note "[2 sudo -u $u] skipped (SUDO_USER is the running account)"
+  elif [[ -n "$u" && "$u" != "root" ]] && command -v sudo >/dev/null 2>&1; then
     t=$(sudo -n -u "$u" gh auth token 2>/dev/null || true)
     if [[ -n "$t" ]]; then
       _gate_tok_note "[2 sudo -u $u gh auth token] RESOLVED"; printf '%s' "$t"; return 0
