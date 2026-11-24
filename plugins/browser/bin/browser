@@ -11932,6 +11932,15 @@ _connect_has_profile() {  # <seat> <site>
   [[ -d "$PROFILE_ROOT/$1/$2" ]] && return 0
   [[ "$1" != "$BOX_SEAT" && -f "$(_rv_offer "$BOX_SEAT" "$2")" ]]
 }
+# DIVE-9188: a check the site's marker does not name. The marker is a grep for
+# g-recaptcha/hcaptcha/cf-challenge, so a login form with an embedded Turnstile
+# ("Please verify you are a human") read as no check. Now that no check means
+# nothing is sent, the look also asks the page check: a robot widget, a check's
+# words, or a Turnstile still waiting for its answer.
+_connect_page_ask() {  # <html> [<url>] -> 0 = the page shows a check
+  _have node && [[ -r "$_SELF_DIR/../lib/page-check.cjs" ]] || return 1
+  [[ "$(node "$_SELF_DIR/../lib/page-check.cjs" ask "$1" "${2:-}" 2>/dev/null | head -1 | jq -r '.challenge' 2>/dev/null)" == true ]]
+}
 # Returns 1 when the page could not be loaded (LOOK_WHY says why), 2 when the
 # look ran out of time: that is not an answer about the page either way.
 _connect_look() {  # <seat> <site> <seconds> <snapshot args...>  -> LOOK_{HTTP,TITLE,PAGE,CHECK,WHY}
@@ -11969,7 +11978,7 @@ _connect_look() {  # <seat> <site> <seconds> <snapshot args...>  -> LOOK_{HTTP,T
   else
     art=$(jq -r '.artifacts // ""' <<<"$out")
     if [[ "$art" == /* ]] && _as_seat "$seat" head -c 4000000 -- "$art/page.html" >"$html" 2>/dev/null \
-       && [[ -s "$html" ]] && _render_is_challenge "$site" "$html" 2>/dev/null; then
+       && [[ -s "$html" ]] && { _render_is_challenge "$site" "$html" 2>/dev/null || _connect_page_ask "$html" "$LOOK_PAGE"; }; then
       LOOK_CHECK=yes
     fi
   fi
@@ -12631,7 +12640,11 @@ _connect_request() {  # <caller> <site> <reason> [challenge <url> | handoff]
         && die "$E_UNAVAILABLE" "nothing was sent: $url answered HTTP $LOOK_HTTP in the box browser (title: \"$LOOK_TITLE\"), with no check on it, so the owner would land on an error page. Find the right address first (open it yourself: 5dive browser snapshot <url>), then ask again."
       grep -qiE "$CONNECT_ERROR_TITLE" <<<"$LOOK_TITLE" \
         && die "$E_UNAVAILABLE" "nothing was sent: $url opened in the box browser as \"$LOOK_TITLE\", an error page with no check on it, so the owner would land on it. Find the right address first (open it yourself: 5dive browser snapshot <url>), then ask again."
-      check=0
+      # DIVE-9188: NO CHECK SEEN, NOBODY PAGED. chill-gorge's clicker sent its
+      # owner a takeover for a page the box itself read as having no check, and
+      # lodar got "takeover calls" for steps the agent could do alone. The owner
+      # is asked only to clear a check the box SAW and could not clear itself.
+      die "$E_UNAVAILABLE" "nothing was sent: the box loaded $url (\"$LOOK_TITLE\") and saw no check on it (no robot-check page, no captcha box), and your owner is asked only to clear a check the box sees. Do the step yourself: wait 60 s, reload the page, try again, up to 3 times. If a step truly needs your owner, name that step: 5dive browser handoff $site --reason=\"<what they must do>\" (a site in input mode), or say it in your reply."
     fi
   fi
 
@@ -12640,11 +12653,7 @@ _connect_request() {  # <caller> <site> <reason> [challenge <url> | handoff]
   _connect_send "$caller" "$site" "$kind" "$url" "$reason" "$check" "$CONNECT_TG_OWNERS" \
     || die "$E_UNAVAILABLE" "Telegram did not accept the Connect message, so nobody was asked. Nothing was bound."
   local sent="$CONNECT_SENT" exp="$CONNECT_EXP"
-  if [[ "$kind" == challenge && "$check" == 0 ]]; then
-    printf 'no check was seen on %s when the box loaded it ("%s"), so the owner was asked to take over and do what you wrote, not to clear a captcha (%s message%s). Nothing is bound until they tap; the request expires %s.\n' \
-      "$url" "$LOOK_TITLE" "$sent" "$([[ $sent == 1 ]] || echo s)" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'You will get a channel message when they tap and when they finish. Do not poll. After their Done, re-read the page and carry on from the step you stopped on; check what already happened first, so nothing is sent twice.\n'
-  elif [[ "$kind" == challenge ]]; then
+  if [[ "$kind" == challenge ]]; then
     printf 'asked the owner to clear the check on %s (%s message%s). Nothing is bound until they tap; the request expires %s.\n' \
       "$site" "$sent" "$([[ $sent == 1 ]] || echo s)" "$(date -u -d "@$exp" +%Y-%m-%dT%H:%M:%SZ)"
     printf 'You will get a channel message when they tap and when they finish. Do not poll. After their Done, re-read the page and carry on from the step you stopped on; check what already happened first, so nothing is sent twice.\n'

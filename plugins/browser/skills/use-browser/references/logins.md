@@ -103,6 +103,10 @@ A page verb that hits a check prints this exact command for you. Your paired own
 browser on that page and sends them a one-time link as code, from root, never through you.
 They clear the check and tap **Done**. Done closes their view and **hands the same browser
 back to you, on that page**, so the check stays cleared for you.
+The box loads that page first. If it sees no check there (no robot-check page, no captcha box,
+no Turnstile waiting), **nothing is sent** and you are told to do the step yourself: wait,
+reload, try again. `--challenge` is only for a check the box can see, never for a step you
+would rather the owner did.
 
 **The box loads the page first** (DIVE-6725). If the page is an error, nobody is messaged and
 the command fails: a 4xx/5xx with no check on it, a "Page not found", or a page that does not
