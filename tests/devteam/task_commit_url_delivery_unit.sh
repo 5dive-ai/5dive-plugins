@@ -136,10 +136,18 @@ grep -qx "repos/${SLUG}/compare/main...${SHA}" "$CALLS" \
 # ask `gh pr view` about the commit URL and refuse "merge is UNKNOWN" (DIVE-9106).
 # `gh pr view` is made to fail outright here, so only the landing probe can answer.
 # The done gate first asks whether ANY rail reaches GitHub; on a seat it does.
+# A core that predates DIVE-9192 has no probe arm in the done gate: CI grades
+# this file against core main, so A4a-c SKIP there with the reason instead of
+# going red until 5dive#1773 merges. Detected on the LOADED gate, not a grep.
+DONE_PROBE=0
+[[ "$(declare -f _task_status_cmd 2>/dev/null)" == *_merge_landed_probe* ]] && DONE_PROBE=1
+SKIP=0
+skip_t() { SKIP=$((SKIP+1)); printf 'SKIP - %s\n   %s\n' "$1" "${2:-}"; }
 done_as_grader() { ( . src/lib/gh_config.sh 2>/dev/null
   gh() { return 1; }; _gate_gh_token() { printf 'tok'; }; _gate_gh_reachable() { return 0; }
   _gate_our_owners() { printf 'acme\n'; }   # acme/site is OURS, so the merge gate applies
   cmd_task_done "$@" ) 2>&1; }
+if (( DONE_PROBE )); then
 ACT="$GRADER"
 out=$(done_as_grader DIVE-315 --result="verified the landed commit; graded-sha: ${SHA:0:12}"); rc=$?
 ACT="$OWNER"
@@ -157,6 +165,11 @@ ACT="$OWNER"
 (( rc != 0 )) && [[ "$(col DIVE-322 status)" != "done" && "$out" == *"not on main (compare: diverged)"* ]] \
   && ok_t "A4c ...while a commit NOT on the default branch still cannot close, and the refusal says why" \
   || bad_t "A4c off-main done refused" "rc=$rc status=$(col DIVE-322 status) out=$out"
+else
+  for _a in "A4a done after merge-landed" "A4b graded-sha compared" "A4c off-main done refused"; do
+    skip_t "$_a" "the core under test predates DIVE-9192 (its done gate never calls _merge_landed_probe) — nothing to grade until 5dive#1773 is in core"
+  done
+fi
 CMP["$SHA"]="identical|$SHA|$AT"; seed DIVE-316 "$COMMIT" >/dev/null
 out=$(cmd_task_merge_landed DIVE-316 2>&1); rc=$?
 (( rc == 0 )) && [[ "$(tfv DIVE-316)" == "0" ]] \
@@ -258,6 +271,6 @@ PY
   || bad_t "M2 mutant must bring the unbind refusal back" ""
 
 printf -- '-----\n'
-printf 'task_commit_url_delivery: %d passed, %d failed\n' "$PASS" "$FAIL"
+printf 'task_commit_url_delivery: %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 (( FAIL == 0 )) || exit 1
 exit 0
