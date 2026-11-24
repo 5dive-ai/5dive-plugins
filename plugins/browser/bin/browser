@@ -406,7 +406,7 @@ usage() {
                                       # for login, password and 2FA key). A second ask
                                       # for the site within 7 days puts the Vault first.
                                       # Never ask for a password in chat.
-  5dive browser connect-request <site> --challenge [--url=<page>] [--reason=<what you were doing>]
+  5dive browser connect-request <site> --challenge --url=<page> [--reason=<what you were doing>]
                                       # stuck on a captcha: the owner gets an "Open <site>"
                                       # button, clears the check in the box browser on that
                                       # page, taps Done — and that browser comes BACK TO YOU
@@ -415,6 +415,8 @@ usage() {
                                       # The box loads the page first: an error page is
                                       # refused and nobody is asked; a page with no check
                                       # on it is sent as "take over", --reason = what to do.
+                                      # --url is the page that showed the check; without it
+                                      # nothing is sent.
 
   INPUT MODE (an adapter with "drive": "input", e.g. tiktok.com, or every logged-in site when the
   box default is `config drive=input`): plain Chrome driven through the screen, keyboard and
@@ -12559,12 +12561,19 @@ _connect_send() {  # <caller> <site> <kind> <url> <reason> <check 0|1> <chat ids
   (( sent > 0 )) || { rm -f "$f"; return 1; }
 }
 
+_connect_challenge_needs_url() {  # <site> -> the refusal for a challenge ask with no page
+  printf 'nothing was sent: --challenge needs --url=<the page that showed the check>. Without it the owner is sent to %s'"'"'s own start page, which may have no check on it.' "$1"
+}
+
 _connect_request() {  # <caller> <site> <reason> [challenge <url> | handoff]
   local caller="$1" site="$2" reason="$3" kind="${4:-login}" url="${5:-}" check=1
   _valid_site "$site" && [[ "$site" != "$PUBLIC_SITE" ]] \
     || die "$E_USAGE" "'$site' is not a site a person can log in to"
   if [[ "$kind" == challenge ]]; then
-    [[ -n "$url" ]] || url="$(_site_url "$site")"
+    # DIVE-9152: no default page. The site's own page (its probe url, its front
+    # page) can have no check on it at all: for google.com that was the sign-in
+    # page, so the owner found nothing to clear (box report 1393).
+    [[ -n "$url" ]] || die "$E_USAGE" "$(_connect_challenge_needs_url "$site")"
     _connect_page_ok "$site" "$url" || die "$E_USAGE" "--url must be an http(s) page on $site"
   elif [[ "$kind" == handoff ]]; then
     url=""   # DIVE-5287: an input-mode window, opened as it is — no page to move it to
@@ -13824,7 +13833,8 @@ cmd_connect_request() {
     # DIVE-5200: stuck on a captcha. Name the SITE (the host), even when the page
     # was read in the public profile: the check is cleared in a box browser for
     # that site, and your next read of the page goes through it.
-    [[ -z "$url" ]] || _connect_page_ok "$site" "$url" \
+    [[ -n "$url" ]] || die "$E_USAGE" "$(_connect_challenge_needs_url "$site")"
+    _connect_page_ok "$site" "$url" \
       || die "$E_USAGE" "--url must be the http(s) page on $site you were stopped on, got: $url"
     printf '%s\0' challenge "$site" "$url" "$reason" | "${CONNECT_PRIV[@]}" || rc=$?
   else

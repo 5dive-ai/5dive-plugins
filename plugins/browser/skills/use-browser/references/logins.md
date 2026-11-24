@@ -43,7 +43,7 @@ site led there:
   wait, retry). Only a code or a prompt on the owner's phone is theirs.
 - **Hard stop (exit 75), hand it over:** a password field, Google asking for an email address
   (adding an account), a chooser whose account is signed out, and a code or robot check the owner
-  gated (`5dive browser gate`). `5dive browser handoff <site>` (a robot check: `connect-request <site> --challenge`).
+  gated (`5dive browser gate`). `5dive browser handoff <site>` (a robot check: `connect-request <site> --challenge --url=<the page>`).
 - **Google's error page (exit 76)**, "400. That's an error.": the sign-up was lost, not refused.
   Open the site's sign-up again and click its Google button.
 - **A sign-up that lands on the site's own login page** with "Continue with Google" (or a button
