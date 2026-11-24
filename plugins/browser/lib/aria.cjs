@@ -195,6 +195,19 @@ function pageWalk(opts) {
     if (own && own.length <= 120) return own;
     return '';
   }
+  // A NAMELESS ROW SAYS WHAT IT SHOWS (DIVE-9179). A webmail inbox row is one link
+  // around sender, subject, snippet and date: well over 120 characters, so it has
+  // no name above, and a 50-message inbox printed fifty `ref=link/#n` with nothing
+  // to tell them apart (box report 1397, Yandex Mail). The ref stays exactly what
+  // it was, so no saved step moves; the node only carries the row's visible text,
+  // cut, beside it. A node with a name carries nothing new.
+  var ROW_TEXT_MAX = 160;
+  function rowText(el) {
+    var t = text(el);
+    if (!t) return '';
+    var c = cut(t, ROW_TEXT_MAX);
+    return t.length > ROW_TEXT_MAX ? c.trim() + '\u2026' : c;
+  }
 
   // Hidden is not a style question we can always answer (offsetParent is null for
   // position:fixed too), so this is the conservative set: a node the page has
@@ -283,7 +296,9 @@ function pageWalk(opts) {
     var name = nameOf(el);
     var key = role + '/' + name;
     seen[key] = (seen[key] || 0) + 1;
-    out.push({ role: role, name: name, n: seen[key], el: el });
+    var o = { role: role, name: name, n: seen[key], el: el };
+    if (!name) { var rt = rowText(el); if (rt) o.text = rt; }
+    out.push(o);
   }
 
   // The #n suffix is only written when it DISAMBIGUATES. A ref that carries an
@@ -301,7 +316,9 @@ function pageWalk(opts) {
       marker = 'r' + idx;
       o.el.setAttribute('data-5dive-ref', marker);
     }
-    return { ref: ref, role: o.role, name: o.name, tag: o.el.tagName.toLowerCase() };
+    var node = { ref: ref, role: o.role, name: o.name, tag: o.el.tagName.toLowerCase() };
+    if (o.text) node.text = o.text;
+    return node;
   });
 
   // ---- ONE SNAPSHOT PER DECISION (DIVE-4653) --------------------------------
@@ -1785,7 +1802,9 @@ function render(nodes, { json = false } = {}) {
   if (json) return JSON.stringify({ nodes }, null, 2);
   const w = nodes.reduce((m, n) => Math.max(m, n.role.length), 0);
   return nodes.map((n) => {
-    const nm = n.name ? ` "${n.name}"` : ' (no accessible name — it cannot be addressed by ref)';
+    const nm = n.name ? ` "${n.name}"`
+      : n.text ? ` (no accessible name; it shows: "${n.text}")`
+      : ' (no accessible name — it cannot be addressed by ref)';
     return `${n.role.padEnd(w)}${nm}\n${' '.repeat(w + 2)}ref=${n.ref}`;
   }).join('\n');
 }
