@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Added — dashboard 0.5.44: a chat-only agent's reply sends text only (DIVE-9253)
+
+- The reply tool's `files` array copied any absolute path on the box into the chat outbox and served it, so an agent with no tools could still send its own sign-in file if someone in the chat talked it into it. For a chat-only agent (`5dive agent create --chat-only`: `DASHBOARD_CHAT_ONLY_AGENT=1` from the launcher, or a root-owned marker at `/etc/5dive/chat-only-agents/<agent>`; either one turns it on and neither turns it off) the tool offers only `chat_id` and `text`, every reply path drops `files` and `voice`, and the instructions no longer say to read or attach paths. Other agents are unchanged. The markers have their own directory because `/etc/5dive/chat-only` is already the chat-only box file.
+- 0.5.43 is skipped: an earlier version of this change was merged and reverted under that number.
+- Harness: `test/dive9253-dashboard-chat-only-agent.test.ts`, 8 arms. The process arms drive the real server: a reply naming the agent's credentials file sends the text and nothing else, with the env or the marker alone; with the lock off the same call copies the file out, so the arm can see a leak. Removing the strip turns both lock-on arms red.
+
 ### Changed — phone 0.2.0: type in any language; a restart needs one switch, not a port (DIVE-9242)
 
 - `plugins/phone` synced to 5dive-phone 0.2.0. `type` now takes any text (Cyrillic, accents, emoji, line breaks): it is pasted through `lib/type.dex`, our own code built from `android/src`, copied to the phone's temp folder for that step and deleted after; no app is installed. After a restart the owner only switches Wireless debugging back on and the next command finds the new port (`lib/ports.py`). Details: 5dive-phone's CHANGES.md.

@@ -56,6 +56,7 @@ import { deliveredLive, liveKey, loadLiveDeliveries, recordLiveDelivery, saveLiv
 import { makeWorkStatus } from './workstatus.ts'
 import { askRelayOp, numberedText, parseQuestion } from './question.ts'
 import { replyTooLong } from './replycap.ts'
+import { CHAT_ONLY_AGENT_INSTRUCTIONS, chatOnlyAgentArgs, chatOnlyAgentMode, chatOnlyAgentReplyTool } from './chatonlyagent.ts'
 import { REPLY_RETRY_BUDGET_MS, sendReplyWithRetry } from './replyretry.ts'
 import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOfficeChatBase, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
@@ -446,6 +447,10 @@ async function authedFetch(url: string, what: string, init: RequestInit = {}, re
   return res
 }
 
+// DIVE-9253: a chat-only agent (chatonlyagent.ts) offers and sends text only.
+const CHAT_ONLY_AGENT = chatOnlyAgentMode(process.env, AGENT, existsSync)
+if (CHAT_ONLY_AGENT) process.stderr.write('dashboard channel: chat-only agent: reply sends text only (no files, no voice)\n')
+
 const mcp = new Server(
   { name: 'dashboard', version: '1.0.0' },
   {
@@ -457,7 +462,8 @@ const mcp = new Server(
     },
     // DIVE-7347: Grok answers in plain text (grokdispatch.ts reads it), so the
     // reply-tool contract below would only mislead it.
-    instructions: GROK ? [
+    // DIVE-9253: a chat-only agent reads no paths and sends no files or voice.
+    instructions: CHAT_ONLY_AGENT ? CHAT_ONLY_AGENT_INSTRUCTIONS : GROK ? [
       'A message that starts with "[5dive web chat" was typed by a person in the 5dive web chat. Your plain-text answer in this session is sent back to that chat as it is; do not use a Telegram tool for it.',
       '',
       'Voice notes: a message whose text starts with "[voice note]" was SPOKEN by the person; the rest is its transcript. If it carries a "[Voice note: <path>]" line instead, run `5dive-transcribe <path>` first and answer what it says. Answer a voice note FIRST, before any other tool, in one to three short spoken sentences with no lists, links or code: your answer is spoken back to them, so do not run 5dive-speak yourself.',
@@ -1351,7 +1357,7 @@ function ensureLongPoll(): void {
 // DIVE-7603: voice is offered only where 5dive-speak exists (voicereply.ts).
 // DIVE-8649 `loaded` (labs file): the reply tool is never deferred behind tool
 // search, so a new session's first answer does not search for it first.
-mcp.setRequestHandler(ListToolsRequestSchema, async () => GROK ? { tools: [] } : ({
+mcp.setRequestHandler(ListToolsRequestSchema, async () => GROK ? { tools: [] } : CHAT_ONLY_AGENT ? { tools: [chatOnlyAgentReplyTool()] } : ({
   tools: [withAlwaysLoad(replyTool(existsSync(SPEAK)), readVoiceLabs(VOICE_LABS_FILE).has('loaded'))],
 }))
 
@@ -1586,6 +1592,8 @@ async function postReply(chatId: string, body: string, files: string[], q: ChatQ
 }
 
 async function sendDashboardReply(args: ReplyArgs): Promise<string> {
+  // DIVE-9253: every reply path, the model's and the outbox's, drops files and voice.
+  if (CHAT_ONLY_AGENT) args = chatOnlyAgentArgs(args)
   const voice = startVoiceReply(args)
   try {
     return await sendReplyAndVoice(args, voice)
