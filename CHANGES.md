@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Changed — devteam 0.4.5: two heartbeat sweeps, three scripts and two docs move in from the core (DIVE-9281)
+
+- The gate-shipped flag sweep is now `_gate_shipped_sweep` in `core/task/gate_evidence.sh`, and the forge merge poll is `_forge_merge_sweep` (with `_forge_merge_reading_path` and `_forge_merge_record_reading`) in `core/task/delivery.sh`. Their code is unchanged apart from those names. The core's `_hb_gate_shipped_sweep` and `_hb_forge_merge_sweep` only call them; a box without the plugin skips both as before. The new names do not clash with an older core, so 0.4.5 loads on today's CLI (which still runs its own copies) and on the next one.
+- `scripts/grade-burn.sh`, `scripts/dispatch-bytes.sh` (now takes the 5dive checkout as its one argument), `scripts/publish-zero-human.sh`, `docs/zero-human.md` and `docs/delegated-push.md` moved here from 5dive-ai/5dive.
+- Harness: `tests/devteam/heartbeat_forge_merge_poll_unit.sh` mutates whichever function holds the sweep body, so it grades the core from either side of the move; it calls `_forge_merge_record_reading`.
+
 ### Added — dashboard 0.5.44: a chat-only agent's reply sends text only (DIVE-9253)
 
 - The reply tool's `files` array copied any absolute path on the box into the chat outbox and served it, so an agent with no tools could still send its own sign-in file if someone in the chat talked it into it. For a chat-only agent (`5dive agent create --chat-only`: `DASHBOARD_CHAT_ONLY_AGENT=1` from the launcher, or a root-owned marker at `/etc/5dive/chat-only-agents/<agent>`; either one turns it on and neither turns it off) the tool offers only `chat_id` and `text`, every reply path drops `files` and `voice`, and the instructions no longer say to read or attach paths. Other agents are unchanged. The markers have their own directory because `/etc/5dive/chat-only` is already the chat-only box file.

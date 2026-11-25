@@ -264,13 +264,13 @@ grep -q '^creds|forge-merge-poll|ok|.*no reading' "$DOCTOR_ROWS" \
   && ok_t "C10 a box with NO reading is reported 'not measured', never a clean bill" \
   || bad_t "C10 no-reading finding" "$(cat "$DOCTOR_ROWS")"
 : >"$DOCTOR_ROWS"
-_hb_forge_merge_record_reading unreadable 3 0 2 "first was ${PR}"
+_forge_merge_record_reading unreadable 3 0 2 "first was ${PR}"
 doctor_check_forge_merge_poll
 grep -q '^creds|forge-merge-poll|warn|' "$DOCTOR_ROWS" \
   && ok_t "C10a an unreadable rail is ONE doctor warning (the DIVE-4619 shape: the sweep records, the health check reads)" \
   || bad_t "C10a unreadable finding" "$(cat "$DOCTOR_ROWS")"
 : >"$DOCTOR_ROWS"
-_hb_forge_merge_record_reading ok 3 1 0 ""
+_forge_merge_record_reading ok 3 1 0 ""
 doctor_check_forge_merge_poll
 grep -q '^creds|forge-merge-poll|ok|the forge merge poll read all 3' "$DOCTOR_ROWS" \
   && ok_t "C10b a measured pass reads differently from an absent measurement" \
@@ -284,9 +284,17 @@ unset -f doctor_add
 # A mutant that did not actually change anything grades NOTHING while reporting
 # a pass, which is the DIVE-4428 iteration-2 failure exactly. So this refuses
 # unless the sed CHANGED the extracted function and the result is still bash.
-mutate_sweep() {  # <sed-expr>  -- redefine _hb_forge_merge_sweep from a mutant
+# DIVE-9281: the sweep's body moved to the plugin as _forge_merge_sweep
+# (core/task/delivery.sh) and the core's _hb_forge_merge_sweep calls it. Mutate
+# whichever function holds the body, so this grades a core from either side.
+if grep -q '^  _forge_merge_sweep$' "$SRC/cmd_heartbeat.sh"; then
+  _MUT_FN=_forge_merge_sweep _MUT_FILE="$SRC/task/delivery.sh"
+else
+  _MUT_FN=_hb_forge_merge_sweep _MUT_FILE="$SRC/cmd_heartbeat.sh"
+fi
+mutate_sweep() {  # <sed-expr>  -- redefine the sweep's body from a mutant
   local f="$TMP/mut.sh" g="$TMP/mut-base.sh"
-  sed -n '/^_hb_forge_merge_sweep() {$/,/^}$/p' "$SRC/cmd_heartbeat.sh" >"$g"
+  sed -n "/^${_MUT_FN}() {\$/,/^}\$/p" "$_MUT_FILE" >"$g"
   [[ -s "$g" ]] || return 1
   sed "$1" "$g" >"$f"
   cmp -s "$g" "$f" && return 1          # the mutation did not land
@@ -294,7 +302,7 @@ mutate_sweep() {  # <sed-expr>  -- redefine _hb_forge_merge_sweep from a mutant
   # shellcheck source=/dev/null
   source "$f"
 }
-_sweep_orig=$(declare -f _hb_forge_merge_sweep)
+_sweep_orig=$(declare -f "$_MUT_FN")
 
 # M1 — the UNKNOWN arm falls through to the MERGED write.
 reset

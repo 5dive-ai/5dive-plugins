@@ -2658,3 +2658,139 @@ _task_bound_pr_refs() {
   return 0
 }
 
+# ── DIVE-1140 gate-shipped flag sweep (moved from the core heartbeat, DIVE-9281) ──
+# The core's _hb_gate_shipped_sweep only calls this; a box without the plugin skips it.
+# The git lookup it reads, _hb_repo_grep_ident, and its knobs (_HB_GATE_SHIPPED_REPOS,
+# _HB_GATE_SHIPPED_REF, _HB_REPO_BASE) stay in the core heartbeat.
+_gate_shipped_sweep() {
+  local grow gid gident gtype gowner repo hit _c_epoch _asked
+  # Normalize the repo allow-list: commas or spaces both separate.
+  local repos; repos="${_HB_GATE_SHIPPED_REPOS//,/ }"
+  [[ -n "${repos// }" ]] || return 0
+  # DIVE-6938: the PR reader is the devteam plugin's.
+  devteam_loaded || return 0
+  # DIVE-2414: resolve the read-only gh credential ONCE for the whole sweep, not
+  # per gate — _gate_gh_token can shell out to sudo and the sweep runs every tick.
+  # Empty is a first-class answer: the subject reader returns UNKNOWN, never a
+  # silent accept.
+  local _gs_tok=""
+  command -v gh >/dev/null 2>&1 && _gs_tok=$(_gate_gh_token)
+  while IFS= read -r grow; do
+    [[ -n "$grow" ]] || continue
+    IFS=$'\x1f' read -r gid gident gtype gowner <<<"$grow"
+    [[ -n "$gid" && -n "$gident" ]] || continue
+    # DIVE-2068: type=secret is satisfied ONLY by a human handing over a
+    # credential — that event cannot appear in a commit or a merged PR, ever.
+    # So for this type a commit/PR hit carries ZERO information and "likely
+    # shipped, verify and close" would be a false positive 100% of the time.
+    # Skip both evidence paths below (subject-PR and row-commit) up front;
+    # decision/approval/manual are unaffected — a commit genuinely can be
+    # evidence for those.
+    if [[ "$gtype" == "secret" ]]; then
+      _hb_log "[gate-shipped] ${gident} — type=secret: a commit/PR can never be evidence a credential was handed over (DIVE-2068); NOT flagging, gate stays eligible"
+      _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=type-secret" || true
+      continue
+    fi
+    # DIVE-2414: READ WHAT THE GATE IS ABOUT BEFORE READING THE ROW.
+    # The commit-stream lookup below is row-level evidence: it answers "did
+    # something naming this ROW land", which on a multi-item row is routinely a
+    # different item than the one the ask is about (DIVE-2382 — flagged "likely
+    # shipped, verify+close" while its live approval asked about something else).
+    # So when the ASK names a pull request, that PR's MEASURED state is
+    # authoritative and the row's commits are not consulted at all:
+    #   OPEN     -> withhold the flag even if the row has commits. The ask is live.
+    #   UNKNOWN  -> withhold. A state that could not be read is not a negative
+    #               (DIVE-2318). No stamp, so a later tick retries.
+    #   MERGED   -> flag, with the SUBJECT as the named evidence.
+    # A gate that names NO subject falls through to the row-level path, which
+    # keeps its DIVE-1140 behaviour and now SAYS which evidence class it used.
+    # Fetched per row rather than in the sweep query on purpose: an ask is
+    # multi-line and would break the x'1f' line-per-row read above.
+    local _ask _sbody _sslug _sv _svd
+    _ask=$(db "SELECT COALESCE(ask,'') FROM tasks WHERE id=${gid};")
+    _sbody=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${gid};")
+    _sslug=$(_gate_task_repo_slug "" "$_sbody")
+    _sv=$(_gate_subject_verdict "$_ask" "$_gs_tok" "$gident" "$_sslug")
+    _svd="${_sv#*|}"
+    case "${_sv%%|*}" in
+      OPEN)
+        _hb_log "[gate-shipped] ${gident} — the PR its ASK names is still OPEN (${_svd}); NOT flagging, and the row's own commits are NOT evidence about this gate (DIVE-2414). Gate stays eligible."
+        _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=subject-open" "subject=$_svd" || true
+        continue ;;
+      UNKNOWN)
+        _hb_log "[gate-shipped] ${gident} — its ASK names a PR whose state could NOT be read (${_svd}); NOT flagging (a non-verdict is not a negative), no stamp, will retry (DIVE-2414)."
+        _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=subject-unreadable" "subject=$_svd" || true
+        continue ;;
+      MERGED)
+        db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
+        _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "evidence=subject-pr" "subject=$_svd" || true
+        _hb_log "[gate-shipped] ${gident} — the PR its ASK names is MERGED (${_svd}) -> flagged on SUBJECT state, not on the row's commits (DIVE-2414)"
+        if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
+          ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$gowner" --message="🚢 ${gident} — the pull request this open ${gtype} gate ASKS ABOUT is now merged (${_svd}). Likely settled: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off (DIVE-555), so it stays open until you clear it." ) >/dev/null 2>&1 || true
+        fi
+        continue ;;
+    esac
+    # NO-SUBJECT from here down: the ask names no pull request, so nothing can
+    # retire it automatically and the row-level nudge has to say what it is.
+    hit=""
+    for repo in $repos; do
+      hit=$(_hb_repo_grep_ident "$repo" "$gident") && [[ -n "$hit" ]] && break
+      hit=""
+    done
+    [[ -n "$hit" ]] || continue
+    # DIVE-2001: a merge that PREDATES the open ask cannot be evidence the ask is
+    # satisfied. The flag fired on DIVE-1968 citing a commit merged ~2h before the
+    # gate existed, telling the owner "likely shipped, verify and close" about work
+    # the open ask had nothing to do with. On a ticket that lands in pieces that
+    # nudge points the right way for the wrong reason, arrives with the authority
+    # of an automatic check, and agrees with what the assignee already wants to do.
+    # Deliberately does NOT stamp shipped_flag_at: the gate stays eligible, so a
+    # genuinely later merge still flags on a subsequent tick.
+    _c_epoch=$(awk '{print $3}' <<<"$hit")
+    _asked=$(db "SELECT COALESCE(strftime('%s', need_asked_at),'') FROM tasks WHERE id=${gid};")
+    # DIVE-2003: the epoch is field 3 of _hb_repo_grep_ident's output — git's
+    # '%h %ct %s' with the repo stem PREPENDED. That field index is a contract
+    # between two functions and the unit test STUBS the producer, so a drift in
+    # the real --format string is invisible to the suite. Measured by olivia:
+    # reverting the stub to a no-epoch format and DELETING this guard outright
+    # give the IDENTICAL 8/2 signature, and the fall-through wrote nothing to
+    # _hb_log or audit_log — so the guard could vanish leaving no trace anywhere.
+    # Fail-open remains correct (withholding a legitimate flag is itself a
+    # silence), but it must never again be silent.
+    if [[ ! "$_c_epoch" =~ ^[0-9]+$ ]]; then
+      _hb_log "[gate-shipped] ${gident} — commit epoch UNPARSEABLE from lookup (\"${hit}\"); flagging anyway, but the predates-ask guard could NOT run (lookup format drift?)"
+      # DIVE-2054: task-store gate-sweep telemetry — fenced.
+      _task_store_audit_log "gate shipped-flag" "degraded" 0 -- "task=$gident" "reason=epoch-unparseable" "commit=$hit" || true
+    elif [[ ! "$_asked" =~ ^[0-9]+$ ]]; then
+      # Deliberately a DIFFERENT message from the drift case above: legacy gates
+      # predate need_asked_at, so this is expected and routine. Folding the two
+      # together would bury the drift signal in noise that operators learn to skip.
+      # And deliberately a different DURABILITY: the drift branch writes an audit
+      # row, this one does not. A routine event does not belong in the audit table
+      # — filling it with the expected case is how the exceptional case stops being
+      # findable in it.
+      _hb_log "[gate-shipped] ${gident} — no need_asked_at stamp; predates-ask guard not applicable (legacy gate)"
+    elif (( _c_epoch < _asked )); then
+      _hb_log "[gate-shipped] ${gident} — newest matching commit PREDATES the open ask ($(date -u -d @"$_c_epoch" +%FT%TZ) < $(date -u -d @"$_asked" +%FT%TZ)); NOT flagging, gate stays eligible"
+      # DIVE-2054: same reasoning as the "degraded" case above — fenced.
+      _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true
+      continue
+    fi
+    db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
+    # DIVE-2054: same reasoning as the two branches above — fenced.
+    _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "evidence=row-commit" "commit=$hit" || true
+    _hb_log "[gate-shipped] ${gident} — its ask names NO PR subject; falling back to ROW-level evidence: commit on ${_HB_GATE_SHIPPED_REF} references the row: ${hit} -> flagged"
+    if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
+      # DIVE-2414: name the EVIDENCE CLASS in the nudge. This flag says a commit
+      # named the ROW, and the ask names no PR to check instead — so on a row
+      # carrying several items it may well be about a different one (DIVE-2382).
+      # The old wording asserted "likely shipped" with no way to tell the two apart.
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate's ROW landed on ${_HB_GATE_SHIPPED_REF} (${hit}). This ask names no pull request, so the evidence is ROW-level: if the row carries several items, the commit may be about a different one — check before you clear. Verify with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true
+    fi
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||need_type||x'1f'||COALESCE(assignee,'')
+               FROM tasks
+               WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                 AND shipped_flag_at IS NULL
+                 AND status NOT IN ('done','cancelled');")
+  return 0
+}
