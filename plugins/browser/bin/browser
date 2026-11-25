@@ -1426,6 +1426,61 @@ _rv_alias_sweep() {
   return 0
 }
 
+# >>> DIVE-9318 A SECOND SITE OF A RUNNING GROUP BROWSER IS SHOWN ON ITS OWN PAGE
+#
+# chill-gorge, 11-25: group Main's one Chrome was up for a client's site, and
+# `serve bing.com` only linked bing.com's socket to it and said "already
+# serving". Nothing opened a bing.com tab, so the owner's sign-in window for Bing
+# showed another business's private account page, and the next act on bing.com
+# read that page. Now a serve of one site on its group's running browser
+# brings that site's tab forward (lib/front-tab.cjs: the tab on the site, or a
+# blank one sent there, or a new tab; the other sites' tabs are not navigated or
+# closed), the rule a viewer has followed since DIVE-7257. A plain Chrome nobody
+# can drive (a sign-in window, no daemon) has no tabs to bring forward, so it is
+# re-served on this site instead, and refused by name while it is in use.
+
+# The site a group's running browser was started for, when it is ANOTHER site:
+# on stdout, rc 0. An own profile is one site, so it never answers.
+_serve_other_site() {  # <profile-dir> <site>
+  local p="${1%/}" s
+  [[ -L "$p" ]] || return 1
+  s=$(_kv "$(_serve_pidfile "$p")" site)
+  [[ -n "$s" && "$s" != "$2" ]] || return 1
+  printf '%s\n' "$s"
+}
+
+# The daemon's `front` for <site>, its answer on stdout. Best-effort: no daemon,
+# or no answer within VIEWER_FRONT_S, is an empty answer and rc 0.
+_front_call() {  # <profile-dir> <site>
+  local dir="$1" site="$2"
+  _daemon_live "$dir" || return 0
+  jq -nc --arg u "$(_site_url "$site")" '{op:"front", url:$u}' \
+    | timeout "$VIEWER_FRONT_S" "$(_daemon_bin)" call "$(_daemon_sock "$dir")" 2>/dev/null || true
+}
+
+# A serve's "already serving" for a site of a group: its tab comes forward. Never
+# while the browser is in use (a person, a handoff, another call's lease): that
+# call's next step goes to the tab in front, so moving it would act on the wrong
+# site. Said, not refused: the serve itself is still true.
+_serve_front() {  # <site> <profile-dir>
+  local site="$1" dir="$2" busy ans moved why
+  [[ -L "${dir%/}" ]] && _daemon_live "$dir" || return 0
+  if busy=$(_serve_busy "$dir"); then
+    printf '%s: NOTE — %s shares its browser with its group, which is in use (%s), so its tab was not brought forward. A page verb with a %s URL opens it there.\n' \
+      "$PROG" "$site" "$busy" "$site" >&2
+    return 0
+  fi
+  ans=$(_front_call "$dir" "$site" | tail -n1)
+  moved=$(jq -r '.moved // empty' <<<"$ans" 2>/dev/null)
+  why=$(jq -r '.why // empty' <<<"$ans" 2>/dev/null)
+  if [[ "$moved" != true && "$why" != *"on this site already"* ]]; then
+    printf '%s: NOTE — the browser %s shares with its group did not bring a %s tab forward (%s). A page verb with a %s URL opens it there.\n' \
+      "$PROG" "$site" "$site" "${why:-no answer from its daemon}" "$site" >&2
+  fi
+  return 0
+}
+# <<< DIVE-9318
+
 # A grouped site's own cookies, out of the group's profile, when it is forgotten
 # — the group's OTHER sign-ins (Google) stay. Best-effort and said either way.
 _group_forget_cookies() {  # <group-dir> <site> -> 0 when they were cleared
@@ -6402,11 +6457,12 @@ cmd_serve() {
     fi
   fi
 
-  local disp
+  local disp _oth=""
   if disp=$(_serve_running "$dir"); then
     if (( input )) && [[ "$(_kv "$(_serve_pidfile "$dir")" drive)" == input ]]; then
       _rv_alias "$site" "$dir"
       (( private )) || _rv_offer_write "$(_seat)" "$site" input
+      _serve_front "$site" "$dir"
       printf 'already serving %s on :%s (input mode)\n' "$site" "$disp"; return 0
     elif (( input && noswitch )); then
       # DIVE-7237: an on-demand start (a status loop, a brokered seat's first
@@ -6414,6 +6470,7 @@ cmd_serve() {
       # It is left alone: only a page verb that needs this site moves it.
       _rv_alias "$site" "$dir"
       (( private )) || _rv_offer_write "$(_seat)" "$site" input
+      _serve_front "$site" "$dir"
       printf 'already serving %s on :%s (as the automated browser for another site of its group; a page verb on %s switches it)\n' "$site" "$disp" "$site"; return 0
     elif (( input )); then
       # Served the other way (a warm session from before the adapter said
@@ -6498,10 +6555,23 @@ cmd_serve() {
       ! _serve_running "$dir" >/dev/null \
         || die "$E_UNAVAILABLE" "the browser $site shares is in input mode and did not stop, so it cannot be re-served for $site. Try again, or: 5dive browser serve $site --stop"
       printf '%s: the browser %s shares with its group was in input mode for another site; re-serving it as the automated browser for %s.\n' "$PROG" "$site" "$site" >&2
+    elif _oth=$(_serve_other_site "$dir" "$site") && ! _daemon_live "$dir"; then
+      # DIVE-9318: a plain Chrome open on another site of the group (a sign-in
+      # window, no daemon) has no tab this command can bring forward. Linking
+      # this site to it showed the owner a client's page in Bing's sign-in window.
+      # Re-served on this site instead, never under a person or another call.
+      local obusy; if obusy=$(_serve_busy "$dir"); then
+        die "$E_UNAVAILABLE" "the browser $site shares with $_oth is open on $_oth and in use right now ($obusy). Nothing was switched and nothing is shown, so nobody sees $_oth instead of $site. Try again in a minute."
+      fi
+      ( _SERVE_SWAP=1 cmd_serve "$site" --stop >/dev/null 2>&1 ) || true
+      ! _serve_running "$dir" >/dev/null \
+        || die "$E_UNAVAILABLE" "the browser $site shares with $_oth is open on $_oth and did not stop, so it cannot be opened on $site. Nothing is shown; try again, or: 5dive browser serve $site --stop"
+      printf '%s: the browser %s shares was open on %s; re-serving it on %s.\n' "$PROG" "$site" "$_oth" "$site" >&2
     else
       [[ -n "$_lnote" ]] && _daemon_live "$dir" && printf '%s\n' "$_lnote" >&2
       _rv_alias "$site" "$dir"
       (( private || login )) || _rv_offer_write "$(_seat)" "$site"
+      _serve_front "$site" "$dir"
       printf 'already serving %s on :%s\n' "$site" "$disp"; return 0
     fi
   fi
@@ -6832,7 +6902,9 @@ cmd_viewer() {
   # An INPUT-mode browser (DIVE-5287) is already plain: `serve --login` answers
   # "already serving" and leaves it alone, so the person's view is the window
   # the agent was driving, which is the whole point of a handoff.
-  if _daemon_live "$dir"; then
+  # DIVE-9318: and a plain window open on ANOTHER site of the group, which no
+  # front can move, is re-served on this one (cmd_serve says no while in use).
+  if _daemon_live "$dir" || _serve_other_site "$dir" "$site" >/dev/null; then
     ( cmd_serve "$site" --login >/dev/null ) \
       || die "$E_UNAVAILABLE" "$site could not be re-served as plain Chrome for a person to sign in (above), so no link was issued. The profile is untouched."
     disp=$(_serve_running "$dir") || die "$E_UNAVAILABLE" "no browser is serving $site after re-serving it for a login — start it again: 5dive browser serve $site --login"
@@ -7041,10 +7113,7 @@ cmd_viewer_redeem() {
 # silent: the relay reads this verb's stdout, and a window that did not move is
 # still a window the person can use.
 _viewer_front() {  # <profile-dir> <site>
-  local dir="$1" site="$2" bin; bin="$(_daemon_bin)"
-  _daemon_live "$dir" || return 0
-  jq -nc --arg u "$(_site_url "$site")" '{op:"front", url:$u}' \
-    | timeout "$VIEWER_FRONT_S" "$bin" call "$(_daemon_sock "$dir")" >/dev/null 2>&1 || true
+  _front_call "$1" "$2" >/dev/null
 }
 
 _viewer_revoke_file() {

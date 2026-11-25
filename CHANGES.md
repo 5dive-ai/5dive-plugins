@@ -1,5 +1,10 @@
 ## Unreleased
 
+### Fixed — browser 1.97.6: a second site served on a running group browser is shown its own tab (DIVE-9318)
+- Mirror of 5dive-ai/5dive-browser#187. `serve` for a site whose group browser is already up for another site now
+  brings that site's tab forward instead of only saying "already serving", never while the browser is in use. A sign-in
+  window open on another site of the group is reopened on this site by `serve` and `viewer`.
+
 ### Changed — devteam 0.4.6: seating the mod guard on new Claude agents lives here now (DIVE-9307)
 
 - `lib/mod_seat.sh` left the 5dive CLI (5dive-ai/5dive, DIVE-9307, step 4 of DIVE-9262): it seats `mod@5dive-plugins` and its function-hooks flag on new Claude seats, and backs `doctor --category=mod`, on 5dive's own box only (`5dive config mod-seat=on`; off everywhere else). It moved here verbatim as `core/lib/mod_seat.sh`, an optional module like `task/filing_cap.sh`: the CLI's four callers ask `declare -F` first, so either side can ship first, and a box without this plugin reads `mod-seat = off`.
