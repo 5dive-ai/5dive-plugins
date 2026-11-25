@@ -35,7 +35,7 @@ TMP="$(mktemp -d /tmp/escalation-resume.XXXXXX)"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_agent.sh; do
+         lib/tasks_db.sh lib/actor.sh lib/verify_policy.sh cmd_task.sh cmd_org.sh cmd_agent.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -45,6 +45,9 @@ done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
 mkdir -p "$TASKS_DIR"
+# DIVE-9315: which GitHub orgs are the box's own is the core's `own-orgs`
+# setting (an older core ignores this file and keeps its built-in list).
+BOX_CONFIG="$TMP/box.json"; printf '{"own_orgs":"5dive-ai lodar"}\n' > "$BOX_CONFIG"
 set +e
 tasks_db_init
 _tasks_db_migrate
