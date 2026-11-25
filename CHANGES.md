@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Added — hosted 0.1.0: `5dive partner hire` moves in from the core (DIVE-9324)
+
+- New plugin `hosted`: commands that only work on a server 5dive built, because they talk to 5dive's servers as that server. First one: `5dive partner hire <pack> [--as=<name>]`, core's `src/cmd_partner.sh` at 5dive-ai/5dive 3a1c941c carried verbatim in `bin/partner`, with a prelude for the core helpers it used (same messages, JSON envelopes and exit codes). The seats' sudoers grant and every caller are unchanged.
+- The CLI's install and upgrade add it on every 5dive-built box in the same run that removes the built-in; merge this before the CLI change ships.
+- Harness: `tests/hosted_partner_unit.sh`, moved from the CLI's `tests/partner_hire_unit.sh` (H and NC arms unchanged; W arms now grade the manifest, the executable, the carried body's sha and the marketplace entry). Runs in `parity.yml`.
+
 ### Fixed — browser 1.97.7: a second site served on a running group browser is shown its own tab (DIVE-9318)
 - Mirror of 5dive-ai/5dive-browser#187. `serve` for a site whose group browser is already up for another site now
   brings that site's tab forward instead of only saying "already serving", never while the browser is in use. A sign-in

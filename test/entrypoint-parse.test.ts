@@ -170,8 +170,20 @@ const CORE_PLUGINS = PLUGIN_DIRS.filter(
 
 // The complement: a plugin that declares neither a TS launcher, a hooks
 // module nor the core capability must be a real bash plugin, i.e. ship an
-// executable bin/<name>. Without this a TS plugin could lose its package.json
+// executable bin/<verb> for every verb its manifest declares (the CLI
+// dispatches `5dive <verb>` to that file), or bin/<name> if it declares none. Without this a TS plugin could lose its package.json
 // and fall silently out of TS_PLUGINS instead of failing.
+function bashVerbs(pluginDir: string): string[] {
+  const manifest = join(pluginDir, '.claude-plugin', 'plugin.json')
+  const verbs: unknown = existsSync(manifest)
+    ? JSON.parse(readFileSync(manifest, 'utf8'))?.fivedive?.verbs
+    : undefined
+  const names = Array.isArray(verbs)
+    ? verbs.map(v => v?.name).filter((n): n is string => typeof n === 'string' && n !== '')
+    : []
+  return names.length ? names : [pluginDir.split('/').pop()!]
+}
+
 const BASH_PLUGINS = PLUGIN_DIRS.filter(
   d => !TS_PLUGINS.some(p => p.dir === d) && !MOD_PLUGINS.some(p => p.dir === d)
     && !CORE_PLUGINS.includes(d),
@@ -252,12 +264,36 @@ describe('every plugin TypeScript file parses', () => {
 
   test('a plugin with no declared TS entry point is a real bash plugin', () => {
     for (const d of BASH_PLUGINS) {
-      const bin = join(PLUGINS, d, 'bin', d)
-      expect(existsSync(bin)).toBe(true)
-      // executable, or the CLI's verb dispatcher refuses it (DIVE-4035)
-      expect(statSync(bin).mode & 0o111).toBeGreaterThan(0)
+      for (const verb of bashVerbs(join(PLUGINS, d))) {
+        const bin = join(PLUGINS, d, 'bin', verb)
+        expect([d, verb, existsSync(bin)]).toEqual([d, verb, true])
+        // executable, or the CLI's verb dispatcher refuses it (DIVE-4035)
+        expect(statSync(bin).mode & 0o111).toBeGreaterThan(0)
+      }
       // and it really ships no TypeScript, which is why it owes no server.ts
       expect(files.filter(f => f.startsWith(join(PLUGINS, d) + '/'))).toEqual([])
+    }
+  })
+
+  test('the bash-plugin check reads the declared verbs, not the folder name (mutants)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dive9327-verbs-'))
+    try {
+      const mk = (name: string, verbs?: string[]) => {
+        const dir = join(root, name)
+        Bun.spawnSync(['mkdir', '-p', join(dir, '.claude-plugin')])
+        const fivedive = verbs ? { capabilities: ['verb'], verbs: verbs.map(v => ({ name: v })) } : {}
+        writeFileSync(join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ name, fivedive }))
+        return dir
+      }
+      // hosted's shape: the folder is not the verb
+      expect(bashVerbs(mk('hosted', ['partner']))).toEqual(['partner'])
+      // every declared verb owes its own bin
+      expect(bashVerbs(mk('two', ['a', 'b']))).toEqual(['a', 'b'])
+      // no verbs declared: the folder name, as before
+      expect(bashVerbs(mk('plain'))).toEqual(['plain'])
+      expect(bashVerbs(mk('emptylist', []))).toEqual(['emptylist'])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
     }
   })
 
