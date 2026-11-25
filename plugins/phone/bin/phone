@@ -5,7 +5,9 @@
 # Tailscale address. Nothing is installed on the phone and nothing comes from
 # Google Play: the phone's Developer options and one pairing code are all it
 # takes. The screen is read with uiautomator, which ships inside Android, and
-# taps and typing are adb's `input`. No third-party code runs on either side.
+# taps and typing are adb's `input`. Text beyond plain English letters is pasted
+# by lib/type.dex, our own code, copied to the phone for that step and deleted
+# after. No third-party code runs on either side.
 #
 # THE SHAPE mirrors `5dive browser` so an agent needs no new habits:
 #   snapshot  the screen as controls with refs ([e3] button "Send")
@@ -47,7 +49,8 @@ usage() {
 
   5dive phone guide                     the steps your owner does on the phone, once
   5dive phone connect <ip>[:<port>] [--pair=<ip>:<port> --code=<6 digits>]
-                                        pair (first time) and connect over Tailscale
+                                        pair (first time) and connect over Tailscale;
+                                        with no port, the one the phone uses is found
   5dive phone status [--json]           connected? which phone, screen, lock, app
   5dive phone apps [<filter>]           installed apps (package names for open)
   5dive phone snapshot [--interactive] [--json]
@@ -58,7 +61,8 @@ usage() {
       {"op":"tap","ref":"e3"}                {"op":"tap","x":540,"y":1200}
       {"op":"tap","ref":"button/Send"}       a ref BY NAME (role/label) is found on
                                              the screen as it is when the step runs
-      {"op":"type","ref":"e5","text":"hi"}   (add "clear":true to empty it first)
+      {"op":"type","ref":"e5","text":"hi"}   any language, emoji, line breaks
+                                             (add "clear":true to empty it first)
       {"op":"clear","ref":"e5"}              {"op":"key","key":"back|home|enter|…"}
       {"op":"scroll","dir":"down|up|left|right"}   {"op":"wait","ms":1500}
       A tap on Pay/Buy, Post, Send or Delete is checked against your owner's
@@ -97,7 +101,9 @@ _state() { _adb_raw -s "$DEV" get-state 2>&1 | tr -d '\r' | tail -1; }
 
 # THE PHONE GOES AWAY ON A REBOOT. adb's fixed port (5555, set by `adb tcpip`)
 # is forgotten when the phone restarts, and Wireless debugging is switched off.
-# One reconnect is tried; after that only the owner can help, and the message
+# The owner switches it back on; the new port it picked is found here
+# (_find_port), so nobody reads a port off the screen. Only a phone that is off,
+# or a Wireless debugging switch still off, needs the owner, and the message
 # says exactly what to ask them.
 _ensure_connected() {
   _need_adb; _load_device
@@ -109,8 +115,50 @@ _ensure_connected() {
   case "$st" in
     *unauthorized*) die "$E_UNAVAILABLE" "the phone at $DEV has not allowed this server yet. Ask your owner: \"Unlock the phone and tap Allow on the debugging prompt (tick Always allow).\"" ;;
   esac
-  die "$E_UNAVAILABLE" "the phone at $DEV does not answer (it may have restarted, lost Tailscale, or run out of battery). Ask your owner: \"Is the phone on and on Tailscale? Open Settings > Developer options > Wireless debugging, turn it on, and tell me the port under IP address & Port.\" Then: 5dive phone connect ${DEV%:*}:<that port>"
+  local host="${DEV%:*}" rc=0
+  _find_port "$host" || rc=$?
+  case "$rc" in
+    0) note "the phone restarted; found it again at $DEV"; return 0 ;;
+    3) die "$E_UNAVAILABLE" "the phone at $host does not answer at all: it is off, out of battery, or off Tailscale. Ask your owner: \"Is the spare phone on, charging, and is Tailscale on? Then turn on Wireless debugging (Settings > Developer options) and tell me.\" Then run your command again." ;;
+  esac
+  die "$E_UNAVAILABLE" "the phone at $host is on, but adb is not listening (it restarted, which turns Wireless debugging off). Ask your owner: \"Please open Settings > Developer options > Wireless debugging on the spare phone and turn it on, then tell me.\" Then run your command again: the new port is found on its own."
 }
+
+# The port Wireless debugging listens on after the owner switched it back on:
+# lib/ports.py lists the phone's open ports, each is tried with adb (it is
+# already paired, so no new code), and the first that answers is moved to the
+# fixed port 5555 again. 0 found (DEV set), 1 none listening, 3 phone silent.
+_find_port() {
+  local host="$1" p n=0 out rc=0
+  out="$(python3 "$SELF_DIR/../lib/ports.py" "$host" ${FIVEDIVE_PHONE_PORTS:+"$FIVEDIVE_PHONE_PORTS"} 2>/dev/null)" || rc=$?
+  (( rc == 0 )) || return 3
+  for p in $out; do
+    [[ "$p" == 5555 ]] && continue
+    (( ++n > 12 )) && break
+    if [[ "$(_adb_raw connect "$host:$p" 2>&1)" == *'connected to'* ]]; then
+      DEV="$host:$p"; sleep 1
+      if [[ "$(_state)" == device ]]; then _pin_fixed_port; _save_device; return 0; fi
+      _adb_raw disconnect "$host:$p" >/dev/null 2>&1
+    fi
+  done
+  DEV="$host:5555"
+  return 1
+}
+
+# A FIXED PORT. Wireless debugging picks a new port every time it is switched on;
+# `adb tcpip 5555` makes the phone listen on 5555 until it restarts, over Wi-Fi
+# or mobile data alike, so a dropped connection can be picked up without the owner.
+_pin_fixed_port() {
+  [[ "${DEV##*:}" != 5555 && "${FIVEDIVE_PHONE_FIXED_PORT:-1}" == 1 ]] || return 0
+  local host="${DEV%:*}" was="$DEV"
+  _adb tcpip 5555 >/dev/null 2>&1 || return 0
+  sleep "${FIVEDIVE_PHONE_TCPIP_WAIT:-2}"
+  if [[ "$(_adb_raw connect "$host:5555" 2>&1)" == *'connected to'* ]]; then
+    DEV="$host:5555"; sleep 1
+    [[ "$(_state)" == device ]] || DEV="$was"
+  fi
+}
+_save_device() { _init_home; printf '%s\n' "$DEV" > "$(_device_file)"; chmod 600 "$(_device_file)"; }
 
 _screen_size() {  # -> "W H"
   local s; s="$(_adb shell wm size 2>/dev/null | tr -d '\r' | grep -oE '[0-9]+x[0-9]+' | tail -1)"
@@ -289,13 +337,14 @@ Connect a spare Android phone (once, about 5 minutes). Send your owner ONE step 
    On a spare phone, set Screen lock to None or Swipe and keep it on a charger.
 4. Settings > Developer options > Wireless debugging: turn it on, tap
    "Pair device with pairing code". Ask for the 6-digit code and the port shown
-   under it, and the port under "IP address & Port" on the screen before.
-5. You run:  5dive phone connect <tailscale ip>:<port> --pair=<tailscale ip>:<pairing port> --code=<code>
+   under it.
+5. You run:  5dive phone connect <tailscale ip> --pair=<tailscale ip>:<pairing port> --code=<code>
    If the phone shows "Allow debugging?", the owner ticks Always allow and taps Allow.
 
 After a restart the phone stops listening. Ask the owner to turn Wireless
-debugging on again and tell you the new port, then: 5dive phone connect <ip>:<port>
-(no new code needed). This server must be on the same Tailscale network.
+debugging on again and tell you when it is on; your next command finds the new
+port by itself (no new code, no port to read). This server must be on the same
+Tailscale network.
 GUIDE
 }
 
@@ -310,7 +359,7 @@ cmd_connect() {
     esac
   done
   [[ -n "$target" ]] || die "$E_USAGE" "usage: 5dive phone connect <ip>[:<port>] [--pair=<ip>:<port> --code=<6 digits>]  (steps: 5dive phone guide)"
-  [[ "$target" == *:* ]] || target="$target:5555"
+  local noport=0; [[ "$target" == *:* ]] || { target="$target:5555"; noport=1; }
   [[ "$target" =~ ^[A-Za-z0-9._-]+:[0-9]{2,5}$ ]] || die "$E_USAGE" "not an address: $target (want <ip>:<port>)"
   _need_adb; _init_home
   if [[ -n "$pair$code" ]]; then
@@ -322,28 +371,17 @@ cmd_connect() {
   local co; co="$(_adb_raw connect "$target" 2>&1 | tr -d '\r')"
   DEV="$target"
   local st; st="$(_state)"
+  # No port given and nothing on 5555: find the one Wireless debugging picked.
+  if [[ "$st" != device && "$st$co" != *unauthorized* && $noport == 1 ]] && _find_port "${target%:*}"; then st=device; fi
   if [[ "$st" != device ]]; then
     case "$st$co" in
       *unauthorized*) die "$E_UNAVAILABLE" "the phone has not allowed this server. Ask your owner to unlock it and tap Allow on \"Allow debugging?\" (tick Always allow), then run connect again." ;;
       *refused*|*"failed to connect"*|*"timed out"*|*"No route"*)
-        die "$E_UNAVAILABLE" "cannot reach $target: ${co}. Is Wireless debugging on, and is this the port under IP address & Port? Is this server on the same Tailscale network as the phone (tailscale status)?" ;;
+        die "$E_UNAVAILABLE" "cannot reach $target: ${co}. Is Wireless debugging on? Is this server on the same Tailscale network as the phone (tailscale status)? Leave the port off (5dive phone connect ${target%:*}) and it is found on its own." ;;
     esac
     die "$E_UNAVAILABLE" "connect to $target gave: ${co:-nothing} (state: $st)"
   fi
-  # A FIXED PORT. Wireless debugging picks a new port every time it is switched on;
-  # `adb tcpip 5555` makes the phone listen on 5555 until it restarts, over Wi-Fi
-  # or mobile data alike, so a dropped connection can be picked up without the owner.
-  if [[ "${target##*:}" != 5555 && "${FIVEDIVE_PHONE_FIXED_PORT:-1}" == 1 ]]; then
-    local host="${target%:*}"
-    if _adb tcpip 5555 >/dev/null 2>&1; then
-      sleep 2
-      if [[ "$(_adb_raw connect "$host:5555" 2>&1)" == *'connected to'* ]]; then
-        DEV="$host:5555"; sleep 1
-        [[ "$(_state)" == device ]] || DEV="$target"
-      fi
-    fi
-  fi
-  printf '%s\n' "$DEV" > "$(_device_file)"; chmod 600 "$(_device_file)"
+  _pin_fixed_port; _save_device
   local model rel
   model="$(_adb shell getprop ro.product.model 2>/dev/null | tr -d '\r')"
   rel="$(_adb shell getprop ro.build.version.release 2>/dev/null | tr -d '\r')"
@@ -424,15 +462,41 @@ _keycode() {
   esac
 }
 
-# `input text` takes ASCII only, and %s stands for a space. The device shell
-# reads the line, so the text goes single-quoted.
+# `input text` maps each character to a US keyboard key: plain English letters,
+# digits and punctuation, %s for a space. The device shell reads the line, so the
+# text goes single-quoted. Anything else (emoji, accents, Cyrillic, a line break)
+# is pasted: _paste_text.
+_plain_text() { local LC_ALL=C; [[ "$1" =~ ^[\ -~]*$ && "$1" != *%s* ]]; }  # a literal %s would type a space
 _type_text() {
   local t="$1" chunk q
+  _plain_text "$t" || { _paste_text "$t"; return; }
   while [[ -n "$t" ]]; do
     chunk="${t:0:80}"; t="${t:80}"
     q="${chunk// /%s}"; q="${q//\'/\'\\\'\'}"
     _adb shell "input text '$q'" >/dev/null 2>&1 || return 1
   done
+}
+
+# PASTE, for any text. lib/type.dex (built from android/src, our own code) is
+# copied to the phone's temp folder, puts the text on the clipboard as the adb
+# shell user, a PASTE key types it, the clipboard is emptied and the file is
+# deleted. Nothing is installed and nothing stays on the phone. The text rides
+# the command line as base64, so no quoting can break it.
+PHONE_HELPER=/data/local/tmp/.5dive-type.dex
+_paste_text() {
+  local dex="$SELF_DIR/../lib/type.dex" b64 o rc=0
+  [[ -r "$dex" ]] || { note "lib/type.dex is missing from this install: cannot type that text"; return 1; }
+  b64="$(printf '%s' "$1" | base64 -w0)"
+  _adb push "$dex" "$PHONE_HELPER" >/dev/null 2>&1 || { note "could not copy the typing helper to the phone"; return 1; }
+  o="$(_adb shell "CLASSPATH=$PHONE_HELPER app_process / ai.fivedive.phone.Type set $b64" 2>&1 | tr -d '\r')"
+  if [[ "$o" == *ok* ]]; then
+    _adb shell input keyevent 279 >/dev/null 2>&1 || rc=1   # KEYCODE_PASTE
+    sleep 0.3
+  else
+    note "the phone refused the clipboard: ${o:-no answer}"; rc=1
+  fi
+  _adb shell "CLASSPATH=$PHONE_HELPER app_process / ai.fivedive.phone.Type clear; rm -f $PHONE_HELPER" >/dev/null 2>&1
+  return "$rc"
 }
 
 # What a step would do, before it runs: the kind (pay|publish|send|delete or "")
@@ -466,8 +530,8 @@ cmd_act() {
   [[ -n "$steps" ]] || die "$E_USAGE" "usage: 5dive phone act --steps='[{\"op\":\"tap\",\"ref\":\"e3\"}]'"
   jq -e 'type == "array" and length > 0 and all(.[]; type == "object" and (.op | type == "string"))' <<<"$steps" >/dev/null 2>&1 \
     || die "$E_USAGE" "--steps must be a JSON array of steps, each with an \"op\""
-  local bad; bad="$(jq -r '[.[] | select(.op == "type") | .text // "" | select(test("[^ -~]"))] | length' <<<"$steps")"
-  (( bad == 0 )) || die "$E_USAGE" "a type step has text this version cannot type: Latin letters, digits and punctuation only, no line breaks (a line break that sends is a {\"op\":\"key\",\"key\":\"enter\",\"kind\":\"send\"} step)"
+  local bad; bad="$(jq -r '[.[] | select(.op == "type") | .text // "" | select(length > 4000)] | length' <<<"$steps")"
+  (( bad == 0 )) || die "$E_USAGE" "a type step has more than 4000 characters: split it into several type steps"
   _ensure_connected; _init_home; _wake
 
   local hash pol granted=0 n i
