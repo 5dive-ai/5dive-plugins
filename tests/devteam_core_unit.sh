@@ -14,12 +14,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 D=plugins/devteam
+# DIVE-9315: data the core reads with jq, never sources; hashed like the modules.
+DATA="box-defaults.json"
 FILES="cmd_deploy.sh cmd_gh.sh cmd_proof.sh cmd_push.sh lib/gh_config.sh lib/mod_seat.sh task/delivery.sh task/filing_cap.sh task/gate_evidence.sh task/grader_pool.sh task/grader_process.sh"
 
 if [[ "${1:-}" == --rehash ]]; then
   {
     grep -E '^(#|from )' "$D/core/SOURCE"
-    for f in $FILES; do echo "$(sha256sum < "$D/core/$f" | cut -d' ' -f1)  $f"; done
+    for f in $FILES $DATA; do echo "$(sha256sum < "$D/core/$f" | cut -d' ' -f1)  $f"; done
   } > "$D/core/SOURCE.new" && mv "$D/core/SOURCE.new" "$D/core/SOURCE"
   echo "rehashed core/SOURCE — bump version in $D/.claude-plugin/plugin.json"
   exit 0
@@ -82,6 +84,17 @@ t "T14 its default for the core's agent-task-cap is 15" 15 \
 for fn in mod_seat_enabled mod_seat_ensure doctor_check_mod_seats; do
   t "T15 lib/mod_seat.sh defines $fn" 1 "$(grep -cE "^${fn}\(\)" "$D/core/lib/mod_seat.sh")"
 done
+
+# DIVE-9315: the values 5dive's own boxes keep for the core's box settings
+# (wake-protected, own-orgs, principals, projects-root), which left the core.
+for f in $DATA; do
+  t "T16 $f matches core/SOURCE" "$(awk -v f="$f" '$2 == f { print $1 }' "$D/core/SOURCE")" "$(sha256sum < "$D/core/$f" | cut -d' ' -f1)"
+done
+t "T17 box-defaults.json holds exactly the four settings, each a string" \
+  'own_orgs principals projects_root wake_protected' \
+  "$(jq -r '[to_entries[] | select(.value | type == "string") | .key] | sort | join(" ")' "$D/core/box-defaults.json")"
+t "T18 and keeps today's values" 'main marketing|5dive-ai lodar|lodar|/home/claude/projects/5dive' \
+  "$(jq -r '[.wake_protected, .own_orgs, .principals, .projects_root] | join("|")' "$D/core/box-defaults.json")"
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

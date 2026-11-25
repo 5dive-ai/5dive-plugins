@@ -64,6 +64,15 @@ seats and backs `doctor --category=mod`, on a box that turned it on with
 CLI in DIVE-9307 and is optional the same way: without it the CLI reads
 `mod-seat = off` and seats nothing.
 
+## Box defaults (since 0.4.7)
+
+`core/box-defaults.json` holds 5dive's own values for four core box settings
+whose names used to be written into the core: `wake-protected` (main,
+marketing), `own-orgs` (5dive-ai, lodar), `principals` (lodar) and
+`projects-root` (/home/claude/projects/5dive). The core reads it with jq, never
+sources it, and only for a setting the box leaves unset (DIVE-9315). It is
+optional the same way: without it those settings are empty.
+
 ## Tests
 
 The harnesses for these files moved here with them, unchanged, in
