@@ -68,6 +68,12 @@ if [[ ! -f "$TREE/src/task/filing_cap.sh" ]] \
   cp "$PC/task/filing_cap.sh" "$TREE/src/task/filing_cap.sh"
   put_back+=("task/filing_cap.sh")
 fi
+# DIVE-9307: the optional mod seating, put back into a core that no longer
+# carries src/lib/mod_seat.sh (a pre-9307 core grades its own copy).
+if [[ ! -f "$TREE/src/lib/mod_seat.sh" ]]; then
+  cp "$PC/lib/mod_seat.sh" "$TREE/src/lib/mod_seat.sh"
+  put_back+=("lib/mod_seat.sh")
+fi
 if (( ${#put_back[@]} )); then
   python3 - "$TREE" "${put_back[@]}" <<'PY' || { echo "FAIL: could not put the modules back into build.sh" >&2; exit 1; }
 import sys
@@ -83,6 +89,8 @@ def insert(anchor, files, before=False):
 insert("  src/lib/env_overrides.sh\n", ["lib/gh_config.sh"])
 # the task modules sat around the pace, which took grader_pool's slot;
 insert("  src/lib/pace.sh\n", ["task/gate_evidence.sh", "task/grader_pool.sh", "task/grader_process.sh", "task/delivery.sh"])
+# mod seating right after the plugin channels it sat beside (DIVE-9307);
+insert("  src/lib/plugin_channels.sh\n", ["lib/mod_seat.sh"])
 # the optional filing cap right after the routing it used to live in;
 insert("  src/task/routing.sh\n", ["task/filing_cap.sh"])
 # and the four verbs just before cmd_bug.sh.
