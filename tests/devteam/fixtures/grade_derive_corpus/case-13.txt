@@ -1,0 +1,11 @@
+# case-13 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+TREE-FILE: scripts/install.sh
+TREE-FILE: scripts/nginx/install.sh
+TREE-FILE: scripts/systemd/install.sh
+CHANGED-FILE: scripts/test-soft-update-survives.test.sh
+---
+CHECKED: ./scripts/test-soft-update-survives.test.sh — 24 lore / 0 mips, umdo. l CONTROL ors itame tco nse-cte `tura | bash` dipiscin g eli tseddo eiu smodtem 0, por lor emip sumdol install.sh orsitam etc ons ectet uradi; 7 piscing (el itse ddoei, us modt em porlo, remipsum dolorsitametc, on sect etura dipiscin, ge litse ddo, ei UsmoDtem, porl oremipsu) mdo lor. Sitametcon: sect-eturad-ipisci-nge-litsed 49/0, doei-usmo-dtemp-orlorem-ip-su-mdolor 116/0, sita-metcon-secte-turad-ipisci-ngelits 16/0. Eddo ei usmodte 255: mporlorem ipsumdo-lorsi `tametc.onsecte` turadipi sci ngel itseddoe ius modte mporlo remi psumdolo rsitam — etconse ctetur adipi START, sci ngelits DONE ed 5doei-usmo-dtempo-*.rloremi, psum dolorsita.

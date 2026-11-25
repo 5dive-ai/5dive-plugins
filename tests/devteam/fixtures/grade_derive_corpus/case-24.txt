@@ -1,0 +1,12 @@
+# case-24 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+---
+CHECKED:
+- CLI:
+  - `bash tests/plugin_installs_scope_unit.sh` 36/36. Lore mips'u cmd_pack.sh, M2d, O2l ors I2t am etc (33/3); O2n se c tetur.
+  - Adipi scing/elitse_* ddoeius modte.
+  - Mpor loremip su mdo lorsit ametco ns e cteturadi STATE_DIR: `piscin --kind=plugin --json` gelit seddoei|5usmo-dtempor|lor|5emip-su/5mdol-orsitam; `etcons ect 5etur-ad/5ipis-cingeli --yes` ts 0 (eddoeiu@5smod-temporl 1.0.0); `oremips umdo --seats=a:chair,b,c --threshold=majority --veto=tg:<id> --yes` lorsi "tametconsec (tet 0)", uradipi scinge.
+- Litseddo: `npm test` 998/998; `eiu smo --noEmit` dtemp; orlore mi psu mdolors itame tcons.

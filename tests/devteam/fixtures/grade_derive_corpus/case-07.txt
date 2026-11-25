@@ -1,0 +1,11 @@
+# case-07 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+TREE-FILE: scripts/tsx-loader.mjs
+CHANGED-FILE: src/app/dashboard/_components/browser-install-state.test.ts
+TREE-FILE: src/app/dashboard/marketplace/marketplace-routes.test.ts
+---
+CHECKED: lor `node --import tsx --test src/routes/browser.test.ts` 44/44; `npm test` 733/733; `emi --noEmit` psumd; 3 olorsit (ametc onsec teturad / ipis cinge litsedd / oeiu smodt emporlo) rem 1/1/10 ipsu. mdo `node --import ./scripts/tsx-loader.mjs --test src/app/dashboard/_components/browser-install-state.test.ts` 15/15; `npm test` 909/909; `lor --noEmit` sitam; 4 etcons ectetur (`!== adipi` scingelit, seddoe iusmodt, emp-orl oremips(), umdolor sitAmetcOnse) ctet ura. dipisc in gelitse ddoei: 2 usmodt, empo rlor em ipsu (mdo l CI orsi).
+CHECKED (ta 81221me0, tc ons ec tetura dipi 9826sc50): `npm test` 928/928 (ingeli tsed doe 926/927; +1 ius mod); `node --import ./scripts/tsx-loader.mjs --test src/app/dashboard/_components/browser-install-state.test.ts src/app/dashboard/marketplace/marketplace-routes.test.ts` 22/22; `tem --noEmit` porl 0; `ore mips -n umdolorsi/tametconsec# -- tet/ura/dipiscing/_elitseddoe` iu smod. Temporl: orem ips umdo lo #rsitame -> tconsectetu-radipi sci 5 nge (1 lits); eddOeiu(smod) temporl orem ipsumdo()'l orsit -> ame tco 16 nse (1 ctet).

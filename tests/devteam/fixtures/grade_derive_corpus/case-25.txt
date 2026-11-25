@@ -1,0 +1,11 @@
+# case-25 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: scripts/inc/shelld.mjs
+CHANGED-FILE: scripts/test-shelld-viewer-novnc-graph.test.mjs
+CHANGED-FILE: scripts/test-shelld-viewer-relay.test.sh
+TREE-FILE: scripts/test-shelld-viewer-unfurler-ua.test.mjs
+---
+CHECKED: sudo -E scripts/test-shelld-viewer-relay.test.sh → 66 loremi, 0 psumdo; lors itametc on sectet/urad'i shelld.mjs → 50 piscin, 16 gelits (E11d-d, O12e/i/u/s/m odte. mpo rlore mips-umdolo "rsitame tcon", S13e-c); TET-urad ipisci (60_000) → 64/2, N12g/e lit; node scripts/test-shelld-viewer-novnc-graph.test.mjs → PASS (50 seddoei), usmodte-mporlo remips → UmdolorsiTamet; node scripts/test-shelld-viewer-unfurler-ua.test.mjs → PASS; cons-ectetu-radi-piscing → PASS; elit-seddoe-iusmodt-emp → 23/23; node --check shelld.mjs → or.

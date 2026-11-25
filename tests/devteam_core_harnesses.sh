@@ -61,6 +61,13 @@ for f in lib/gh_config.sh task/gate_evidence.sh task/grader_pool.sh task/grader_
     fi
   fi
 done
+# DIVE-9262: the optional filing cap, put back only into a core that no longer
+# carries its own classifier (a pre-9262 core still has it in routing.sh).
+if [[ ! -f "$TREE/src/task/filing_cap.sh" ]] \
+   && ! grep -q '^_task_internal_subject_reason()' "$TREE/src/task/routing.sh" 2>/dev/null; then
+  cp "$PC/task/filing_cap.sh" "$TREE/src/task/filing_cap.sh"
+  put_back+=("task/filing_cap.sh")
+fi
 if (( ${#put_back[@]} )); then
   python3 - "$TREE" "${put_back[@]}" <<'PY' || { echo "FAIL: could not put the modules back into build.sh" >&2; exit 1; }
 import sys
@@ -76,6 +83,8 @@ def insert(anchor, files, before=False):
 insert("  src/lib/env_overrides.sh\n", ["lib/gh_config.sh"])
 # the task modules sat around the pace, which took grader_pool's slot;
 insert("  src/lib/pace.sh\n", ["task/gate_evidence.sh", "task/grader_pool.sh", "task/grader_process.sh", "task/delivery.sh"])
+# the optional filing cap right after the routing it used to live in;
+insert("  src/task/routing.sh\n", ["task/filing_cap.sh"])
 # and the four verbs just before cmd_bug.sh.
 insert("  src/cmd_bug.sh\n", ["cmd_proof.sh", "cmd_push.sh", "cmd_deploy.sh", "cmd_gh.sh"], before=True)
 open(p, "w").write(s)
@@ -86,6 +95,9 @@ if "task/gate_evidence.sh" in back and "task/gate_evidence.sh" not in s:
     s = s.replace(anchor, 'declare -F _gate_tok_note >/dev/null 2>&1 || . "$_task_src_dir/task/gate_evidence.sh"\n' + anchor, 1)
 if "task/delivery.sh" in back and "task/delivery.sh" not in s:
     s = s.replace(anchor, anchor + 'declare -F cmd_task_deliver >/dev/null 2>&1 || . "$_task_src_dir/task/delivery.sh"\n', 1)
+if "task/filing_cap.sh" in back and "task/filing_cap.sh" not in s:
+    r = 'declare -F _task_resolve_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/routing.sh"\n'
+    s = s.replace(r, r + 'declare -F _task_filing_ratio_cap >/dev/null 2>&1 || . "$_task_src_dir/task/filing_cap.sh"\n', 1)
 open(p, "w").write(s)
 PY
   git -C "$TREE" add -A
@@ -117,6 +129,9 @@ done
 # (digest_window_30d_controls stages and mutates digest_window_30d_unit), and the
 # sibling can land in another shard.
 cp "$HARNESS_DIR"/*.sh "$TREE/tests/" || { echo "FAIL: could not copy the harnesses into the tree" >&2; exit 1; }
+# Their fixtures stay here, read in place (DIVE-9269: the grade-derive corpus left
+# the public core tree and lives only in tests/devteam/fixtures/).
+export DEVTEAM_FIXTURES="$HARNESS_DIR/fixtures"
 
 printf 'core %s @ %s; modules put back: %s\n' "$core" "${graded:0:12}" "${put_back[*]:-none (the core still carries them)}"
 pass=0; fail=0; failed=()

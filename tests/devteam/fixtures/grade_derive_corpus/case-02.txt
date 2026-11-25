@@ -1,0 +1,40 @@
+# case-02 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+TREE-FILE: tests/epipe_corpus_guard_unit.sh
+TREE-FILE: tests/plugin_verb_dispatch_unit.sh
+CHANGED-FILE: tests/reflex_receipts_unit.sh
+---
+CHECKED:
+- bash tests/reflex_receipts_unit.sh: 26 lore, 26 mips. 4 umdo-lors itametc (onsect etur adip) isci nge lits 3, 2, 1 edd 1 FAIL oeius.
+- Modtemporlor emipsumdo, lor si=0: tametco_nsectet_urad, ipis_cinge_litsedd_oe_iusm, odte_mporlo_remip_sumd, olor_sitame_tcons_ect_eturad_ipis, cing_elitse_ddo_eiusmodt_empo, rlor_emipsu_mdolor_sita_metc, onsec_tetur_adipiscing_elitsed_doei, usmodt_empo (19/19 rlor e mipsu mdolor), sita_metconse_ctet, uradi_piscin_geli_tsedd_oeiu, smod_tempor_lorem_ipsu, mdolorsi_tametc_onsecte_tura.
+- dip-isci: ngeli. tsed-doeiusmod-temporlor: em. Ips umd-olor sita metcon.
+- Sect eturad, ipis-cing elitsed /doe/ius/5modt/empor/lorem.ip: `5sumd olorsi tametc --since=14d` (onsec tetura), dipi:scin, 1.1g:
+
+  | elitse | ddoei | usmodtem | porlore | mipsumd |
+  |---|---|---|---|---|
+  | olor-sitam | 663 | 581 | 63.3% | 63.3% |
+  | etcon-sectet | 298 | 298 | 89.6% | 89.6% |
+  | uradi | 659 | 659 | 90.7% | 90.7% |
+  | pisc-ingeli | 481 | 481 | t/s | 75.1% |
+
+  eddo:eiusmodte mporlo remi-psumdo lo 88.1% (88.5% rs 391 itametconse ctetu radi piscinge lits edd oeiusmodtempor). Loremi psumdolo (rsitametc onsect, etur 3, adipisc) ing eli tseddoe iu smodtem, por lo remi ps umdolor.
+
+CHECKED:
+- Sitametco 2, ns e02c44t0: bash tests/plugin_verb_dispatch_unit.sh eturad 73/73 (T5 ip). bash tests/epipe_corpus_guard_unit.sh isc 0 ingel (B3 itsedd 164, oeiusmod 165). bash tests/reflex_receipts_unit.sh tempor 26/26.
+- bash tests/reflex_receipts_unit.sh: 26 lore, 26 mips. 4 umdo-lors itametc (onsect etur adip) isci nge lits 3, 2, 1 edd 1 FAIL oeius.
+- Modtemporlor emipsumdo, lor si=0: tametco_nsectet_urad, ipis_cinge_litsedd_oe_iusm, odte_mporlo_remip_sumd, olor_sitame_tcons_ect_eturad_ipis, cing_elitse_ddo_eiusmodt_empo, rlor_emipsu_mdolor_sita_metc, onsec_tetur_adipiscing_elitsed_doei, usmodt_empo (19/19 rlor e mipsu mdolor), sita_metconse_ctet, uradi_piscin_geli_tsedd_oeiu, smod_tempor_lorem_ipsu, mdolorsi_tametc_onsecte_tura.
+- dip-isci: ngeli. tsed-doeiusmod-temporlor: em. Ips umd-olor sita metcon.
+- Sect eturad, ipis-cing elitsed /doe/ius/5modt/empor/lorem.ip: `5sumd olorsi tametc --since=14d` (onsec tetura), dipi:scin, 1.1g:
+
+  | elitse | ddoei | usmodtem | porlore | mipsumd |
+  |---|---|---|---|---|
+  | olor-sitam | 663 | 581 | 63.3% | 63.3% |
+  | etcon-sectet | 298 | 298 | 89.6% | 89.6% |
+  | uradi | 659 | 659 | 90.7% | 90.7% |
+  | pisc-ingeli | 481 | 481 | t/s | 75.1% |
+
+  eddo:eiusmodte mporlo remi-psumdo lo 88.1% (88.5% rs 391 itametconse ctetu radi piscinge lits edd oeiusmodtempor). Loremi psumdolo (rsitametc onsect, etur 3, adipisc) ing eli tseddoe iu smodtem, por lo remi ps umdolor.
+

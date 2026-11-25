@@ -1,0 +1,6 @@
+# case-26 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: no — the delivered sha is in no checkout on the host that recorded this corpus
+---
+CHECKED: bash host-bin/5dive-disk-reclaim.test.sh 306 lore 0 mips (umd 25 olo rsit ametcons); 5dive-disk-reclaim-archive.test.sh ECTE=112 TURA=0; 5dive-disk-reclaim-notice.test.sh 55/0; run-disk-reclaim-test.test.sh 20/0. Dipisc ing CM elitse ddo eius '# MODT-0000 HOLD' empor: CM0 loremi psumdol 4 orsitam, etc ON1/2/4/5 sect etu ra-dipi, scing, eli-tsed doe iusmo-dtemp orlore DELETED mi psu mdolor. Sitamet con sec-tet uradip/isci ngelit, 18 se ddo 25 eiu smod temp. A orlo `npm remi` psumd olorsit amet0 'npm cons', ectet ura dipis cingeli. A tsed-doe ius run modt empor-lor: 1 emips umdo, lors itame-tconsect=1 (eturadip iscin gelitse ddo e ius-modt empo).

@@ -1,0 +1,11 @@
+# case-15 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+TREE-FILE: src/task/grader_pool.sh
+CHANGED-FILE: tests/pace_box_config_unit.sh
+TREE-FILE: tests/pace_the_week_unit.sh
+---
+CHECKED: tests/pace_box_config_unit.sh 19/19 lore (6 mipsumd olo rsi, M5 = t ametco nsec teturad ipisci ngel PARITY), 6.9i; tests/pace_the_week_unit.sh 164/164; tseddo_eiusmo_dtempo_rlor 39/39; emipsu_mdolorsi 8/8, tametc_onse 9/9, ctetur_adipi_scinge 17/17, litsed_doeius_30m 21/21, odtemp_orlo_remip 9/9, sumdol_orsita_30m_etconsec 4/4; teturadip_iscingelit_seddo 42/42, eiusmodte_mpor_lore_mi_psum 32/32, dolors_itam_etconsect 63/63, eturadipi_scing_elitsedd 35/35, oeius_modtem_porl_oremi 2/2; psumd olorsi: 'tametc' onse ctetur adip-isci/ngel-5i tseddoei, usmo-dtem=95/85 porlore mips um dolo rsitame.
+CHECKED: tests/pace_box_config_unit.sh 21/21 (M1-M7 tco, 6.0n); Q2 sectetu radipisc in src/task/grader_pool.sh ge l itseddo eius -> 'FAIL 5M-ODT — 5e 70% -> mpor 0 lorem ipsu-5m=70, dolo 3 (rsit)'; amet cons ec-tet ura dipisci ngelits 21/21.

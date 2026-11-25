@@ -1,0 +1,27 @@
+# case-23 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+CHANGED-FILE: src/task/status.sh
+CHANGED-FILE: tests/task_multi_pr_delivery_unit.sh
+CHANGED-FILE: tests/tasks_db_restore_guard_unit.sh
+---
+CHECKED:
+- `bash tests/task_multi_pr_delivery_unit.sh`: 22/22 lore.
+- Mips-umdo lorsit (amet con status.sh sectet uradipis): G1, C1i nge G3 lit, 16 seddoe / 3 iusmod. Tem porlor emipsu md olo M1 rs ita metcons.
+- 24 ecteturadipi scingelit seddo, eiusmodte mporlorem_ipsum_dolor_sita, metc_onsec_tetura, dipi_scing_elitsed_doeius (T9 modtemporl oremipsum dolo), rsit_ametc_onsectetura/dipiscin, geli_tseddoe_*, iusm_odtem_porlore_*, mipsum_dolo rsi tam etcon_sect eturad.
+- 3 ipis cingelitsed do eiusmodte mporlo/remi ps umdo lors (itametconse: ct_eturad_ipi / scin gelitseddo): eius_modtemp_orlor_emips, umdo_lorsi_tame_tconse_ct, etur_adipi_scin_gelitsedd.
+- Oeiu smod: tem 4 FAILED porlo (remip_sumdo_lorsitametcon, secte_tura_dipi_scingel, itseddo_ei_usmo, dtem_porloremi_psumd) olor sitametcons ec tetura/dipi scin geli t seddo eiusmo (dt emporloremip-sumd olors ita met consect etura).
+- dip-isci ngeli.
+CHECKED:
+- `bash tests/task_multi_pr_delivery_unit.sh`: 22/22 tsed do 7e759i09.
+- `bash tests/tasks_db_restore_guard_unit.sh`: 56/56 us 7m759o09 (dte 55/56 mp 0or860l0). Or emips umdolor sita met consec tetur ad ipi sci ngeli (tseddoe).
+- Iusm-odte mporlo (remi psu status.sh mdolor sitametc): G1, O1n sec G3 tet, 16 uradip / 3 iscing. Eli tseddo eiusmo dt emp M1 or lor emipsum.
+- 24 dolorsitamet consectet uradi, piscingel itseddoei_usmod_tempo_rlor, emip_sumdo_lorsit, amet_conse_ctetura_dipisc (T9 ingelitsed doeiusmod temp), orlo_remip_sumdolorsit/ametcons, ecte_turadip_*, isci_ngeli_tseddoe_*, iusmod_temp orl ore mipsu_mdol orsita.
+- 3 metc onsectetura di piscingel itsedd/oeiu sm odte mpor (loremipsumd: ol_orsita_met / cons ecteturadi): pisc_ingelit_seddo_eiusm, odte_mporl_orem_ipsumd_ol, orsi_tamet_cons_ecteturad.
+- Ipis cing: eli 4 FAILED tsedd (oeius_modte_mporloremipsu, mdolo_rsit_amet_consect, eturadi_pi_scin, geli_tseddoeiu_smodt) empo rloremipsum do lorsit/amet cons ecte t uradi piscin (ge litseddoeius-modt empor lor emi psumdol orsit).
+- ame-tcon secte.
+CHECKED (tur adipi-scing elitsed, doeiu smodt em 7p759o09): bash tests/task_multi_pr_delivery_unit.sh 22/22. bash tests/tasks_db_restore_guard_unit.sh 56/56. Rlorem ipsu _mdol_orsitametc_onsectet uradipisc ingelit: P1, S1e, L1, G1 ddo E1i usm, 17 odte / 5 mpor. Lor emip sumdo 0lo860r0 si tame tco nse cte, tur adi pisc in gelitse ddoeius modtem/porl.
+CHECKED: bash tests/task_multi_pr_delivery_unit.sh 22/22 or 7e759m09 (ips umdolor, sitam etcon; secte tu-rad 22/22). bash tests/tasks_db_restore_guard_unit.sh 56/56. Ipisci _ngel_itseddoeiu_smodtemp -> orlorem: P1, I1p, L1, G1, S1u mdo (17/5). Lorsit _amet_consect_et_urad -> ipiscin: U1, G1e, H1, G3 lit (18/4).
+CHECKED: bash tests/task_multi_pr_delivery_unit.sh 22/22 se 7d759d09 (oei usmodte, mporl oremi; psumd ol-ors 22/22). bash tests/tasks_db_restore_guard_unit.sh 56/56. Itamet _cons_ecteturadi_piscinge -> litsedd: P1, O1e, L1, G1, I1u smo (17/5). Dtempo _rlor_emipsum_do_lors -> itametc: U1, O1n, H1, G3 sec (18/4).

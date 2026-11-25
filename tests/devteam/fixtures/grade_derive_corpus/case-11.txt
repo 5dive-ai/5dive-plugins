@@ -1,0 +1,7 @@
+# case-11 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+---
+CHECKED: lore -r <5mips-umdol@1o32297>/rsita metcons/ectet → uradi. 5pisc-ingel'i tse ddoeius run mo dtem porlore mips umdo (lorsita metc, onsec → teturad/ipisc): inge-litsedd 21/21, oeiu-smodte 51/51, mpor-lorem 26/26; ipsumdo lo rsi-tame tconse/ctet urad 7/21, 11/51, 4/22 (ipi). bun test 1610 scin / 1 geli (tsed3809-doeiu-smod, temporlo remips umdol orsi; tamet 2/2 cons). ecteturad --check ipisc; in -e gelitseddoe.iusm OK.

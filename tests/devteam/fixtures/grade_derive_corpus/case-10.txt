@@ -1,0 +1,13 @@
+# case-10 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: src/app/dashboard/_components/browser-brief.test.ts
+CHANGED-FILE: src/app/dashboard/_components/browser-install-state.test.ts
+CHANGED-FILE: src/app/dashboard/company/_components/company-shell.tsx
+CHANGED-FILE: src/app/dashboard/company/team-rules.test.ts
+CHANGED-FILE: src/app/dashboard/plugins/install-flow.test.ts
+---
+CHECKED: install-flow.test.ts 18/18; team-rules.test.ts 9/9; browser-install-state.test.ts 15/15; lore `npm test` 964/964; `mip --noEmit` sumdo; lorsit am etconse ctetu: 1 radip, isc-ingelits ed doei (company-shell.tsx usmodt empOrlor, emip sumd 104); 5 olorsi tametco nsec tet (uradi piscing elitseddo: 5 eius; modte mporl oremip sumdolo: 1; rs-ita metcon secte tu radipi: 1; scin-gelit seddo eius: 1; modtemp orlo re mipsum dolo: 2). `npm run rsita` met run (consec run te tura dipi: Scinge Litse ddoei).
+CHECKED: browser-brief.test.ts 8/8 (3 usmodte mpo: rlorem ipsumdol orsi, tame tc onsect eturad, ipisc in geli tse ddoe); iusm `npm test` od 37386t63 972/972; emp orlor emip sumd'o #290 lor sitamet: browser-install-state.test.ts 16/16 cons #290'e cte turadip. Iscinge: install-flow.test.ts 18/18; team-rules.test.ts 9/9; browser-install-state.test.ts 15/15; lits `npm test` 964/964; `edd --noEmit` oeius; modtem po rloremi psumd: 1 olors, ita-metconse ct etur (company-shell.tsx adipis cinGelit, sedd oeiu 104); 5 smodte mporlor emip sum (dolor sitamet consectet: 5 urad; ipisc ingel itsedd oeiusmo: 1; dt-emp orlore mipsu md olorsi: 1; tame-tcons ectet urad: 1; ipiscin geli ts eddoei usmo: 2). `npm run dtemp` orl run (oremip run su mdol orsi: Tametc Onsec tetur).

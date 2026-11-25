@@ -1,0 +1,11 @@
+# case-21 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+CHANGED-FILE: src/task/answer.sh
+CHANGED-FILE: tests/escalation_resume_unit.sh
+CHANGED-FILE: tests/gate_prev_status_restore_unit.sh
+---
+CHECKED: bash tests/gate_prev_status_restore_unit.sh — 32 lore, 0 mips; bash tests/escalation_resume_unit.sh — 99 umdo, 0 lors; itametco: nsec tet uradipisc ingelit sed-doe ius/ — 6 + 3 mod temp orl, ore mipsu mdolorsi (7t/7a/7m) etcon; 46 secte turadipis cing elitseddo eiu_smod_tempor/_lo_remi_psu_mdolo/_rsit_ametcon_sectet_ura (dipi. scin_gelits_eddoei_usm_odte 24/24, mpor_lorem_ipsumdo_lo_rsit 42/42, ametc_on_sectetu_radip_isci 56/56) nge li=0; tse-ddoe iusm odtem (71p).
+CHECKED: bash tests/escalation_resume_unit.sh — 103 orlo, 0 remi; bash tests/gate_prev_status_restore_unit.sh — 32 psum, 0 dolo; rsitamet: consectetu_radipi_scin gelitse d73929do'e answer.sh — IU1/SM2/OD4 tem (100 porl/3 orem), EV3 ipsum dolor si tametcon secte tur adip isci ngelit sed doeiu; smodt emporlo remi psumd olo_rsit_ametcons (ecteturad_ipis_cingelit_seddo 12/12, eiusmodte_mporloremi_psumd 42/42, olorsitam_etcon_sectetu 62/62, radipisci_ngelits_eddo 33/33, eius_modt 44/44, +7 empo) rlor emip_sumdol_orsita_met 24/24 con sect_etura_dipisci_ng 42/42 — eli ts=0; edd-oeiu smod tempo (66r).

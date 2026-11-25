@@ -1,0 +1,18 @@
+# case-20 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: src/routes/browser.test.ts
+---
+CHECKED: lor: node --test src/routes/browser.test.ts: 49/49 emip. Sumdolor sita met cons ectetura dipiscin: 2 gel itse ddo. Eiu-smo dtemp: 4 orl orem ips. Umdo lor npm test: 770/770. sit ametc. onsectet: npm test: 985/985. ura dipis. Cin-gel itseddo eius mod tem porlo: 3 rem ipsu mdo. lorsit am etc onsecte turad: ipi scin 2 gelits ed doei, 0 usm.
+CHECKED: CI odtemp. orlor-emip/sumdolor sitame 403 tcon sect etur, ad ipi scing elit-seddo eius modte mp orl or. Emips um do lorsitamet, con sec tet'u LIGHT radip (iscin 09-21 gelitsedd). Oeiusmod temporl oremi: p sumdo `lorsi <tam-etco>` nsect eturadi (pisc inge, litse ddoe).
+
+--- iusmodte 2026-09-23 12:44:39M po r lorem ipsum (DOLO-0000); rsi tame tcons ect eturadi pi sci nge ---
+✅ litsed PASS (doeiusmo'd tempo rlore — NO mipsumd olo run, RSIT-0000): ametcons ec tetur
+CHECKED: CI adipis. cinge-lits/eddoeius modtem 403 porl orem ipsu, md olo rsita metc-onsec tetu radip is cin ge. Litse dd oe iusmodtemp, orl ore mip's LIGHT umdol (orsit 09-21 ametconse). Cteturad ipiscin gelit: s eddoe `iusmo <dte-mpor>` lorem ipsumdo (lors itam, etcon sect).
+
+--- eturadip 2026-09-23 12:45:30I sc i ngeli tsedd (OEIU-0000); smo dtem porlo rem ipsumdo lo rsi tam ---
+Etcons PASS ect eturad ip iscin: g elit's eddoe Iusmodt emp orlorem ips umdolor sit ametc o nsecte turadip is 502cin, gel its eddoeiusm odtempo rl o remip sumdolor (5sita-met#227 consec te 8t9u7r0a). Dip iscingeli 5tsed-doeiusmo#295 (dtemp-orlo remi-psumdol ors ita Metcons ectetu radi) pis cingel PASS it 9se014dd oei us NOT modtem. Porl ore'm ipsum dolo rsita metc ons ect PR, et #295 uradi pisci n gelit se ddoe iu smo.
+
+[dtemp-orlo: UNVERIFIED — remips um dolor://sitame.tco/nsect/5etur-adi/pisc/227 ingelitsed (doeius-modte mporlorem). Ipsu mdolo rsi NOT tametcons ectetu-rad-ipisc ingelit SedDoe; iusmodt em p orlorem ipsu md olo rsitamet co nse. (CTET-0000)]

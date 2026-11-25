@@ -36,7 +36,7 @@ sudo 5dive plugin upgrade devteam@5dive-plugins
 ```
 
 The CLI reads `core/` on first use in a run, not at every start: it defines one
-stub per function here and reads all nine files the first time one is called. A
+stub per function here and reads all of them the first time one is called. A
 file here that defines a function the core also defines is refused whole.
 
 `core/SOURCE` is the manifest (sha256 per file). After editing a file:
@@ -46,6 +46,15 @@ bash tests/devteam_core_unit.sh --rehash
 ```
 
 and bump the version in `.claude-plugin/plugin.json`.
+
+## The filing cap (since 0.4.4)
+
+`core/task/filing_cap.sh` holds 5dive's own filing rules, which left the core
+CLI in DIVE-9262 because they judged customers' tasks by our words: the
+title-word classifier (harness, lint, rails, smoke…), the 1-in-4 refusal at
+`task add`, the grader skip on a matching row, and 15 as the default for the
+core's `agent-task-cap` setting. It is optional: a CLI that knows it reads it,
+an older CLI ignores it, and either can be upgraded first.
 
 ## Tests
 

@@ -1,0 +1,7 @@
+# case-22 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+---
+CHECKED: `lor emi --noEmit` ps 0; `node --test` umdo lorsita/** met conse/**: 62/62; `npm test`: 988/988; `cte turadi` pi scin gelit: se 0. Ddo eius modtempo rlor_emipsum (dol-4893-ors).
