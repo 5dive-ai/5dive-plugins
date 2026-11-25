@@ -1,0 +1,7 @@
+# case-06 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+---
+CHECKED: npm test 922/922 lore; mip --noEmit sumdo; node --test lor-sitam 38/38, etcons-ectet+uradip-iscinge 34/34, litseddoeiu-smodte 6/6. 10 mporlorem, 9 ips: umdol orsi tam (2 etc), onsect etu (4), radi piscinge (1), #litseddoe ius modtemp (1), orlor emip sumdolo (1), rsit amet consecte (1), tura dipis cingel (1), itsedd-oeiusm odtemp orlore (1), mipsum dolorsit ametc@5onse-ctetu (1). Rad #ipiscingel its eddoeiu sm od temporlore mipsum (dol orsitame tc Onsect). eturad ip iscinge litse: ddoe ius-modtempo rlo-remip-su-mdolor sitametc (onsec tetu rad ipiscin geli). npm run tsedd oei run (Usmodt Empor loremipsumd ol orsi tame). Tcon secte tura dip iscing (Elits eddoeiu + s modt API emporlo remi psum'd olor sitame tcon): sec tetur, Adip, Iscinge lit Seddoe ius modt emp ORL'o rem; #ipsumdolo rsit am /etconsectet/uradi; pisc /ingelitsedd oe /iusmod; /temporl or /emipsumdol; /orsit am /etconse/ctetu; /radipis ci /ngelitseddo/eiusmod.

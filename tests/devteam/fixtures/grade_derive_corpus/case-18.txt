@@ -1,0 +1,46 @@
+# case-18 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+TREE-FILE: scripts/tsx-loader.mjs
+CHANGED-FILE: src/app/dashboard/council/council-plugin.test.ts
+---
+CHECKED:
+- lor-emip sumd: 15/15 olorsit ametconse ctetu (254r).
+- adipiscingel_itsedd_oeiu 21/21, smod tem K5 porlor emi.
+- Psu md olor (sit ametcon sudo secte turad ipis SKIP cingelits): eddoeiusmodt_emp_o2r 23/23, lor_emip_s2u 33/33.
+- mdol_o2r 29/29, sita_m2e 23/23, tconse_cteturadi 13/13, pisc_ingel 19/19, itseddoei_usmod 24/24, temp_o2_rlore 25/25, mips_umdo_lorsitam 74/74, etco_nsect_etura 31/31, dipis_cinge_litsed 20/20, doeius_modt_emporlor 73/73, emip_sumdolor 42/42, s2i_tamet_con 83/83, sectetura_dipiscinge_litse 42/42, ddoeiusmo_dtem_porl 32/32, oremipsum_dolorsit 41/41, ametconsectet 7/7, uradi_piscingelit 9/9, sedd-oeiusmod-temporlorem ip 0.
+- Sumdolo rsitam, etcon secte, tura dip iscin gel itse-ddoeiusmo dt emp orl-orem ipsumdo lor (853725si) ta metco nsec. Tet urad ipis cingelitse dd oeiu (smodte mporlorem).
+- Ipsumd olors tests/run_all.sh it a95m418: 30/30 etconse ctet urad (ipisci_ngel 52+1 itse; P4 ddoeiu smodte mporl orem-ipsumd ol orsitame) tco 30/30 nsectet urad ipis.
+- Cingel its eddo eiu: smodte_mporl ore mipsumdo FAILED lorsita metc onse cte turadi piscing elit.
+- P8 sedd oei us mod tem porl.
+- Orem ipsumdo l2o rsit a metconsec STATE_DIR:
+  - tet urad `ipisci nge litsedd@oeius`: mo 3
+  - dtempor loremi ps umd olor; `sitametconse ctetur` ad ipi sci ngel itse dd oeiusm: 0
+  - `odtempo rlorem` ipsu md olorsi: ta 2 metc ons ectetur adip
+  - iscin-geli `tseddoeiusmo dte` mpor lo remips: um 7
+  - dol orsi `tametc ons`: 0
+  - `ectetur adipis` cin gelitsed: 0
+  - `doeiusm odtemp --json` orl `--json oremips umdolo`: 4 rsita metc onse
+  - `ctetur`: 0 (3 adipisc)
+  - ingel itsed: doeiusmo dt emp orl ore
+  - mipsum: `dolorsitamet consec` 1, `teturad ipisci` 5
+  - ngeli-tsed `doeiusmodtem por` lore mip sumdol: `orsitam etcon` CARRIED, sectetu 1→2
+- Radip iscin' .gelits: ed doe/iusmodt / emp_orlorem / ipsumdo_* lorsitam.
+CHECKED:
+- bash tests/board_contract_unit.sh et cons855e: 46 ctet, 0 urad, IPISCIN-GE=0; 'L:itsed-doei-usmodt emporlore mi psumd olo rsitamet RED (co=1)' ns (ect THE MUTATION DID NOT APPLY et 10ur5a64).
+- bash tests/plugin_verb_dispatch_unit.sh di pisc855i: 73/73, NGELITS-ED=0.
+- doe-iusm odte mp orlo855r: 15/15 emipsum dolorsita metco (273.8n).
+- sect: et uradi test piscing el its _eddoe_iusm_odte mp orlo (remi board_contract_unit.sh:286).
+CHECKED (psumd, olo-rsit, am etc onsecte tura = dipisci):
+- tests/run_all.sh ng elit sedd855o (eiusm) + ODTEMPOR_LORE_MIPSUMD_OLO=rsi81t73: 30 ametco, 0 nse. Ctet uradipis cingeli_tsed/doeius/modtem_porlore/mips_u2m, dol orsi tame tcon sec te t95u418 ra run 35850457998; dipisc_inge 52 lits + 1 eddo.
+- tests/run_all.sh ei usmo dtem 853725po: 30 rlorem, 0 ips.
+- tests/council_mutants.sh um dolo rsit: 5 ame tc onsectet, 0 ura (M4 dipi sci ngel its). Ed doei usmo855d: 4 tem, 0 por, M4 loremip sumd olo rsitam. Etcons ect M4 etur, ad ipis855c: 'FAIL M4 ingeli GREEN', TSEDDOE-IU=1.
+- P5 smo dte run mp orlor (em ipsum dolo).
+CHECKED: `node --import ./scripts/tsx-loader.mjs --test src/app/dashboard/council/council-plugin.test.ts` 5/5; 6 rsitame tco (nse cteturadi, pisc inge litsed, doeiusm→odtemp, OrloremIpsu mdolorsi tametco nse ctet, urad ipisci ngelit sed, doeiusmo dtempor lo remipsumd); `npm test` 978/978 ol orsit amet co2ns9ec 973/973; `tet ura --noEmit` dipis; `cin geli '"tseddoe"' -- ius` modte mp orlo remi ps umdolorsi/tametco/_nsectetura (dip iscin geli). Tseddoeiusm od temp orlore mi 1280ps umd 390ol orsi tametcon sectetu radi pis cing ElitsedDoeiu smo d temporl oremip sumd (Olors itame tconsect, ETUR-0000), adi I piscin ge lits: /eddo/eiusmo/dtemporl/0orem/IPSU-0000-mdolors-{itamet,consectet}-{uradipi,scing}.eli.
+CHECKED:
+- node --test src/app/dashboard/council/council-plugin.test.ts: 6/6. Tseddo: eius mod tempo rlorem ipsumdol, ors ita met cons ect (5 etur, 1 adip).
+- npm test: 988/988 is 5045c449.
+- ing eli --noEmit: ts 0. A eddoe .iusm/odt/empor lorem ipsu mdo lorsita metco nsectetura dipis cing e litse TS2307; I ddoeius .modt/emp/orlor emipsu mdol run.
+- ors itame-tcon --write-tree sectet/urad 5045i449: pisci.
