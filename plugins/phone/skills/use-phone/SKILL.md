@@ -14,7 +14,7 @@ Run `5dive phone guide` and walk the owner through it **one step per message**, 
 Developer options, Tailscale on the phone, Wireless debugging, the pairing code. Then:
 
 ```
-5dive phone connect <tailscale ip>:<port> --pair=<tailscale ip>:<pairing port> --code=<6 digits>
+5dive phone connect <tailscale ip> --pair=<tailscale ip>:<pairing port> --code=<6 digits>
 ```
 
 If adb is missing, the owner runs `sudo 5dive phone setup` (say it as "one command on your
@@ -22,8 +22,8 @@ server", or ask a teammate with sudo). The pairing code is a one-time code, not 
 keep: use it at once, never repeat it back.
 
 **After the phone restarts** it stops listening, and any call says so (exit 69) with the exact
-words to send the owner: turn Wireless debugging on again and tell you the new port. Then
-`5dive phone connect <ip>:<new port>`. No new code is needed.
+words to send the owner: turn Wireless debugging on again and tell you. Then just run your
+command again: the new port is found on its own. No port to ask for, no new code.
 
 ## Use it
 
@@ -41,7 +41,8 @@ words to send the owner: turn Wireless debugging on again and tell you the new p
 - Ops: `open` (app or url), `tap` (ref, or x/y), `type` (ref + text, `"clear":true` empties
   first), `clear`, `key` (back, home, enter, recents…), `scroll` (down/up/left/right), `swipe`,
   `wait`. `--expect=<regex>` checks the screen after.
-- Typing takes Latin letters, digits and punctuation only, and no line breaks.
+- Type in any language, with emoji and line breaks: the text is pasted, so a line break never
+  sends. An Enter that sends is its own step: `{"op":"key","key":"enter","kind":"send"}`.
 - A refused screen read (a bank app's secure screen, a game) reads empty: take a screenshot.
 
 ## Sending, posting, paying, deleting

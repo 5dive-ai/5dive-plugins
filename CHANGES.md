@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Changed — phone 0.2.0: type in any language; a restart needs one switch, not a port (DIVE-9242)
+
+- `plugins/phone` synced to 5dive-phone 0.2.0. `type` now takes any text (Cyrillic, accents, emoji, line breaks): it is pasted through `lib/type.dex`, our own code built from `android/src`, copied to the phone's temp folder for that step and deleted after; no app is installed. After a restart the owner only switches Wireless debugging back on and the next command finds the new port (`lib/ports.py`). Details: 5dive-phone's CHANGES.md.
+
 ### Changed — phone 0.1.1: the phone plugin has its own repo (DIVE-9230)
 
 - Phone now lives at 5dive-ai/5dive-phone and installs with `sudo 5dive plugin add 5dive-ai/5dive-phone`. `phone@5dive-plugins` keeps working: `plugins/phone` is a byte-for-byte mirror of 5dive-phone's `phone/` (0.1.1 changes only the manifest's `homepage` and version), checked by `tests/phone_mirror.sh check` in the parity workflow. 5dive-phone's own harness grades this tree (`tests/phone_mirror.sh run phone_unit.sh`), so the hand-kept `tests/phone_unit.sh` and its fixtures moved there.
