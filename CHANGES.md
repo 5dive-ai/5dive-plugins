@@ -1,5 +1,12 @@
 ## Unreleased
 
+### Added — hosted 0.3.0: the owner's first job at hire moves in from the core (DIVE-9328)
+
+- `bin/first-job` is the 5dive CLI's `src/cmd_agent_first_job.sh` at 5dive-ai/5dive 2edbe6f9 with one function replaced (step 6c of DIVE-9262). It only works against 5dive's API as the box, so it leaves the public core.
+- The done task (DIVE-5946) is filed through the CLI's new root-only `5dive task record-done` (fields as JSON on stdin) instead of an INSERT into core's tasks table: a plugin never writes core's schema.
+- Core keeps `agent first-job` and `agent _first_job_run` and forwards both here (official plugin only), so the API's call and every first-job unit already running are unchanged. Merge this before the CLI change ships: a CLI without the built-in and a box without this version refuse a new first job (the API retries) until the nightly `plugin auto-upgrade`.
+- Harness: `tests/hosted_first_job_unit.sh`, moved from the CLI's `tests/agent_first_job_unit.sh` (V, S, I, R, J arms unchanged; T arms now grade the `task record-done` call; W arms grade the manifest, the entry and the carried body). Runs in `parity.yml`.
+
 ### Added — hosted 0.2.0: the native-push helper moves in from the core (DIVE-9327)
 
 - `lib/push-notify.sh` is the 5dive CLI's `hooks/push-notify.sh` at 5dive-ai/5dive 3a1c941c, carried verbatim: the best-effort phone push an agent's failure hook sends, as the box, to 5dive's API. It is a no-op on a self-hosted box, so it leaves the public core (step 6d of DIVE-9262).

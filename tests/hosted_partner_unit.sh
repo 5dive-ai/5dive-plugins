@@ -17,7 +17,7 @@
 #   H14-H15 no box identity (unreadable / absent) refuses with NO curl call.
 #   H16-H17 the --json envelopes, including error.reason (the API's code).
 #   H18     transport failure.
-#   W1-W5   the wiring: plugin.json declares the `partner` verb, bin/partner is
+#   W1-W5   the wiring: plugin.json declares the `partner` verb (and, since DIVE-9328, first-job), bin/partner is
 #           executable and runs as an executable (--json envelope), the carried
 #           body never sudos, it is byte-identical to core's src/cmd_partner.sh
 #           @ 3a1c941c, and the marketplace lists the plugin.
@@ -206,8 +206,9 @@ STUB_RC=28 run 0 hire galina
 
 # ── W1-W5: wiring ─────────────────────────────────────────────────────────────
 MAN=plugins/hosted/.claude-plugin/plugin.json
-[[ "$(jq -r '[.fivedive.verbs[].name] | join(",")' "$MAN" 2>/dev/null)" == partner && "$(jq -r '.fivedive.capabilities | index("verb") != null' "$MAN")" == true ]] \
-  && ok_t "W1 plugin.json declares exactly the 'partner' verb" || bad_t "W1 plugin.json declares the 'partner' verb" "$(jq -c .fivedive "$MAN" 2>&1)"
+# DIVE-9328: first-job joined it (tests/hosted_first_job_unit.sh grades that verb).
+[[ "$(jq -r '[.fivedive.verbs[].name] | sort | join(",")' "$MAN" 2>/dev/null)" == first-job,partner && "$(jq -r '.fivedive.capabilities | index("verb") != null' "$MAN")" == true ]] \
+  && ok_t "W1 plugin.json declares the 'partner' verb (and first-job, nothing else)" || bad_t "W1 plugin.json declares the 'partner' verb" "$(jq -c .fivedive "$MAN" 2>&1)"
 out=$(FIVEDIVE_JSON_MODE=1 FIVE_CONNECTORD_ENV="$TMP/connectord.env" "$BIN" hire 'Bad Pack!' 2>/dev/null); rc=$?
 [[ -x "$BIN" && $rc -eq $E_VALIDATION && "$(jq -r '.error.reason' <<<"$out" 2>/dev/null)" == invalid_pack ]] \
   && ok_t "W2 bin/partner runs as an executable: core's forwarded JSON mode gives the envelope, rc 3" \
