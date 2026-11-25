@@ -12,6 +12,12 @@
 - The CLI's install and upgrade add it on every 5dive-built box in the same run that removes the built-in; merge this before the CLI change ships.
 - Harness: `tests/hosted_partner_unit.sh`, moved from the CLI's `tests/partner_hire_unit.sh` (H and NC arms unchanged; W arms now grade the manifest, the executable, the carried body's sha and the marketplace entry). Runs in `parity.yml`.
 
+### Fixed — browser 1.97.7: a second site served on a running group browser is shown its own tab (DIVE-9318)
+- Mirror of 5dive-ai/5dive-browser#187. `serve` for a site whose group browser is already up for another site now
+  brings that site's tab forward instead of only saying "already serving", never while the browser is in use. A sign-in
+  window open on another site of the group is reopened on this site by `serve` and `viewer`; an agent's automatic start
+  never closes it.
+
 ### Changed — devteam 0.4.7: 5dive's seat names, GitHub orgs and paths live here now, not in the CLI (DIVE-9315)
 
 - The 5dive CLI stopped carrying 5dive's own names (5dive-ai/5dive, DIVE-9315, step 5 of DIVE-9262): main and marketing never going cold, 5dive-ai and lodar as "our" GitHub orgs, lodar as a person who files tasks, and /home/claude/projects/5dive as where checkouts and community/wiki live. They are four box settings now (`5dive config wake-protected= own-orgs= principals= projects-root=`), empty by default.

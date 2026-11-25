@@ -23,8 +23,8 @@ a stop sign either: read, links, snapshot and act check each page for a sign-in 
 ```
 
 1. **Snapshot** with `--interactive` and pick refs from what it printed. Never invent a ref.
-   Exit 76 is a loading screen, not the page: run it again with `--wait-for='text=<words the
-   loaded page has>'`. Never guess a CSS selector for `--wait-for`; a miss waits 10 s.
+   Exit 76 is a loading screen, not the page (an app's logo splash with nothing on it is one):
+   snapshot again with no URL, or with `--wait-for='text=<words the loaded page has>'`. Never guess a CSS selector for `--wait-for`; a miss waits 10 s.
 2. **Act** on those refs. `--steps` is a JSON array, never empty, run in order in one tab. Each
    step is one of:
    `{"op":"goto","url":…}` `{"op":"click","selector":…}` `{"op":"fill","selector":…,"value":…}`
