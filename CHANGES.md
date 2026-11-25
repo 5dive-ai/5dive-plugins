@@ -3,8 +3,13 @@
 ### Changed — devteam 0.4.6: seating the mod guard on new Claude agents lives here now (DIVE-9307)
 
 - `lib/mod_seat.sh` left the 5dive CLI (5dive-ai/5dive, DIVE-9307, step 4 of DIVE-9262): it seats `mod@5dive-plugins` and its function-hooks flag on new Claude seats, and backs `doctor --category=mod`, on 5dive's own box only (`5dive config mod-seat=on`; off everywhere else). It moved here verbatim as `core/lib/mod_seat.sh`, an optional module like `task/filing_cap.sh`: the CLI's four callers ask `declare -F` first, so either side can ship first, and a box without this plugin reads `mod-seat = off`.
-- 0.4.5 is DIVE-9281's (plugins#377); merge that first.
 - Harness: `tests/devteam/mod_seat_unit.sh`, moved unchanged from the CLI's `tests/mod_seat_unit.sh`, plus T8 (the probe's half of the CLI's DIVE-7573 quiet-env arm); `tests/devteam_core_harnesses.sh` puts the file back into a core that no longer has it; `tests/devteam_core_unit.sh` T15.
+
+### Changed — devteam 0.4.5: two heartbeat sweeps, three scripts and two docs move in from the core (DIVE-9281)
+
+- The gate-shipped flag sweep is now `_gate_shipped_sweep` in `core/task/gate_evidence.sh`, and the forge merge poll is `_forge_merge_sweep` (with `_forge_merge_reading_path` and `_forge_merge_record_reading`) in `core/task/delivery.sh`. Their code is unchanged apart from those names. The core's `_hb_gate_shipped_sweep` and `_hb_forge_merge_sweep` only call them; a box without the plugin skips both as before. The new names do not clash with an older core, so 0.4.5 loads on today's CLI (which still runs its own copies) and on the next one.
+- `scripts/grade-burn.sh`, `scripts/dispatch-bytes.sh` (now takes the 5dive checkout as its one argument), `scripts/publish-zero-human.sh`, `docs/zero-human.md` and `docs/delegated-push.md` moved here from 5dive-ai/5dive.
+- Harness: `tests/devteam/heartbeat_forge_merge_poll_unit.sh` mutates whichever function holds the sweep body, so it grades the core from either side of the move; it calls `_forge_merge_record_reading`.
 
 ### Changed — devteam 0.4.4: 5dive's filing cap lives here now, not in the CLI (DIVE-9262)
 
