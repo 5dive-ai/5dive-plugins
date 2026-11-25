@@ -6555,11 +6555,14 @@ cmd_serve() {
       ! _serve_running "$dir" >/dev/null \
         || die "$E_UNAVAILABLE" "the browser $site shares is in input mode and did not stop, so it cannot be re-served for $site. Try again, or: 5dive browser serve $site --stop"
       printf '%s: the browser %s shares with its group was in input mode for another site; re-serving it as the automated browser for %s.\n' "$PROG" "$site" "$site" >&2
-    elif _oth=$(_serve_other_site "$dir" "$site") && ! _daemon_live "$dir"; then
+    elif (( ! noswitch )) && _oth=$(_serve_other_site "$dir" "$site") && ! _daemon_live "$dir"; then
       # DIVE-9318: a plain Chrome open on another site of the group (a sign-in
       # window, no daemon) has no tab this command can bring forward. Linking
       # this site to it showed the owner a client's page in Bing's sign-in window.
-      # Re-served on this site instead, never under a person or another call.
+      # Re-served on this site instead, never under a person or another call,
+      # and never by an on-demand start (--no-switch: a brokered seat's first
+      # verb or a status loop), which only links; the owner's sign-in window is
+      # then named by _serve_offered_cold (DIVE-8793's words), not closed.
       local obusy; if obusy=$(_serve_busy "$dir"); then
         die "$E_UNAVAILABLE" "the browser $site shares with $_oth is open on $_oth and in use right now ($obusy). Nothing was switched and nothing is shown, so nobody sees $_oth instead of $site. Try again in a minute."
       fi

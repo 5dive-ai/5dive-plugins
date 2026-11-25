@@ -3,7 +3,8 @@
 ### Fixed — browser 1.97.6: a second site served on a running group browser is shown its own tab (DIVE-9318)
 - Mirror of 5dive-ai/5dive-browser#187. `serve` for a site whose group browser is already up for another site now
   brings that site's tab forward instead of only saying "already serving", never while the browser is in use. A sign-in
-  window open on another site of the group is reopened on this site by `serve` and `viewer`.
+  window open on another site of the group is reopened on this site by `serve` and `viewer`; an agent's automatic start
+  never closes it.
 
 ### Changed — devteam 0.4.6: seating the mod guard on new Claude agents lives here now (DIVE-9307)
 
