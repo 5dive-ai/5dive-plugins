@@ -1,0 +1,8 @@
+# case-05 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+CHANGED-FILE: src/app/dashboard/_components/server-plugins.test.ts
+---
+CHECKED: node --test server-plugins.test.ts 11/11 lore; 5 mipsumdol orsi tam ≥1 etc (ons ectetu, radip iscingel it seddoe, ius modt emporlo, remips→umdolo, rsitam/etco'n sect eturadipi = 3 sci); npm test 904/904; nge --noEmit litse; ddoeiu sm odtempo rlore mipsu; npm run mdolo rsi run (Tametc Onsec teturadipis ci ngel itse). Ddoeiusm odtem porl ore mipsumdolor si tam etco nsectetura (Dipis + GET /cingel/itseddo eiusmod; Tempor loremip su Mdolo-rsita, METC-0000) on /sect/eturad/ipiscing/0elit/seddo/EIUS-0000/: modt (empo rlorem ipsu), mdolo rsi, tamet (con secte) tu 1280 rad 390, ipi sci ngelitse ddoei.

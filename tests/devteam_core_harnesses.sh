@@ -117,6 +117,9 @@ done
 # (digest_window_30d_controls stages and mutates digest_window_30d_unit), and the
 # sibling can land in another shard.
 cp "$HARNESS_DIR"/*.sh "$TREE/tests/" || { echo "FAIL: could not copy the harnesses into the tree" >&2; exit 1; }
+# Their fixtures stay here, read in place (DIVE-9269: the grade-derive corpus left
+# the public core tree and lives only in tests/devteam/fixtures/).
+export DEVTEAM_FIXTURES="$HARNESS_DIR/fixtures"
 
 printf 'core %s @ %s; modules put back: %s\n' "$core" "${graded:0:12}" "${put_back[*]:-none (the core still carries them)}"
 pass=0; fail=0; failed=()

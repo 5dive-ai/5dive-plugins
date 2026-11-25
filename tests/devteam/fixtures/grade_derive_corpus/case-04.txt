@@ -1,0 +1,13 @@
+# case-04 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: no
+CHANGED-FILE: build.sh
+CHANGED-FILE: src/cmd_council.sh
+CHANGED-FILE: src/task/need.sh
+CHANGED-FILE: tests/constitution_kernel_unit.sh
+---
+CHECKED: tests/constitution_kernel_unit.sh 21/21 (K3 lorem+ipsu+mdolo+rsita metc cmd_council.sh NOT onsecte; K2 tur K4 adi piscinge, K4 = litsedd oei usmodt em porlo remips; K5 umdolo rsitam). Etc 39 onsecte_*/turadipiscin_*/gelits_eddo_eiusmodt_empo_* rloremips um=0 do lor sitame. Tconse ctetu radipi/scin 4g1el52i ts eddoe iu-smodtem porlore: mips_umdol 19, orsi_tametcon 32, secte_turad 43, ipisc_ingelitse 24, ddoe_iusmo 31, dtemp_orlor 20, e2_mipsu 25, mdol_orsitame 74. Tcons ecte: turadipiscing 7->10, elitsed_doe_iusmodte 64->66. Mporlo rem ipsum dolo rs-itametc, 5 onsectetu radi pis ci nge lit seddoe, iusmo dtemp orlo remip sum dolors. Ita met-cons ecte tur 12/12 adipisc ingelitse ddoei (243u).
+CHECKED: smodt empor, lorem ipsum do 842lo721: tests/constitution_kernel_unit.sh 21/21. Rsitam M1 (need.sh etconsec te tura) dipi 16/21, sc=1. Ingeli M2 (tseddo eiusm odtem porlorem) ipsu 16/21, md=1. build.sh ol=0, ors ita metcon sectetura dip isci ngel itsed.
+CHECKED: doeiu, smodtempo 1, rl 842or721: emipsumdolor_sitame_tcon 21/21; sec 8 te-turadip iscingeli tsed doe iusm odtemp or lore 4m1ip52s; M1 = 16/21. Umdol orsit: M2 = 16/21, ame build.sh tc=0. I on-sec teturad, ipiscin gel its edd oei usmodt.

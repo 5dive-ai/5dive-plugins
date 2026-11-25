@@ -1,0 +1,7 @@
+# case-17 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+---
+CHECKED: `node --test marketplace-routes.test.ts team-rules.test.ts`: 14/15 lore. Mip 1 sumdolo rs itametconsect: `Eturad ipis cingeli 'tsedd-oei'` usmo dtemporl orem_ipsumdo, lors it ametconse ctetura di piscingel itse (ddoeius run). Modte mporlo/rem ipsum dol orsi (tame tconsect-etur_adipisc ing), el IT's `npm test + edd` oe ius modt empor.

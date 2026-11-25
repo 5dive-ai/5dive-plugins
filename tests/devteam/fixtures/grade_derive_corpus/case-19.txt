@@ -1,0 +1,9 @@
+# case-19 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: yes
+PACKAGE-TEST-SCRIPT: yes
+TREE-FILE: scripts/tsx-loader.mjs
+CHANGED-FILE: src/app/dashboard/company/team-rules.test.ts
+---
+CHECKED: lor `node --import ./scripts/tsx-loader.mjs --test src/app/dashboard/company/team-rules.test.ts` 18/18; 8 emipsum dol (orsitame→tcons ect, etur-adip iscinge, litsedd oeius modtemp, orlorem ipsumdo, Lorsit amet consecte, turad ipiscin ge litsed, doeiusm odte mporl oremips, umdol orsi tametcon); `npm test` 982/982 se ctetu-radi piscing el2it9se 973/973; `ddo eiu --noEmit` smodt. emp `node --import tsx --test src/routes/agents.sanitize.*.test.ts` 29/29; `npm test` 765/765; `orl ore --noEmit` mipsu; 4 mdolors ita (metCon sectetu, --json radipiscing elitsed, doe-ius modt emporlo, remips umdolor). `npm run sitam` etc'o run ns ecte tura (Dipisc Ingel itsed). DOEius mo dte mporlor emips: 3 umd-olorsita met-conse-ct-eturad ipisci, nge li tseddoeiu smodt.

@@ -24,7 +24,8 @@
 #                      is still COMPUTED (its source-revert control ran). A
 #                      two-PR row's green table is still READ.
 #   PART E  REPLAY     the 26 field deliveries DIVE-4828 read, rebuilt as repos
-#                      from tests/fixtures/grade_derive_corpus/: how many derive
+#                      from this plugin's tests/devteam/fixtures/grade_derive_corpus/
+#                      (prose scrubbed, harness names kept; DIVE-9269): how many derive
 #                      now, against the pre-DIVE-4906 recogniser on the same text.
 #   PART F  MUTATION   the one-line split, the sudo skip and the un-derive are cut
 #                      out of the shipping functions; the arms above go RED.
@@ -37,11 +38,14 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+HARNESS_HOME="$(cd "$(dirname "$0")" && pwd)"
 cd "$(dirname "$0")/.." || exit 1
 SRC=src
 TMP="$(mktemp -d /tmp/derive-widen.XXXXXX)"
 REPO_ROOT="$PWD"
-CORPUS="$REPO_ROOT/tests/fixtures/grade_derive_corpus"
+# The corpus is the plugin's, never the core's: the runner exports DEVTEAM_FIXTURES
+# (it copies this file into a core tree); run from the plugin it sits beside it.
+CORPUS="${DEVTEAM_FIXTURES:-$HARNESS_HOME/fixtures}/grade_derive_corpus"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -278,7 +282,7 @@ echo "── PART E — replay: the 26 field deliveries DIVE-4828 read ───
 # Each fixture is rebuilt as a repo: base holds its TREE-FILEs, head adds its
 # CHANGED-FILEs, package.json carries a test script when the real one did.
 n_rows=0 n_named=0 n_old=0 n_new=0 n_unreplayable=0 misses=""
-for fx in "$CORPUS"/DIVE-*.txt; do
+for fx in "$CORPUS"/case-*.txt; do
   id=$(basename "$fx" .txt); n_rows=$((n_rows+1))
   text=$(sed '1,/^---$/d' "$fx")
   mentions=$(printf '%s\n' "$text" | _task_grade_harness_mentions)

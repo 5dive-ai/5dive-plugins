@@ -1,0 +1,6 @@
+# case-12 — the CHECKED text of one stored delivery result, as the recogniser reads it.
+# TREE lists the files at the delivered sha whose names the text mentions; CHANGED is
+# the subset the delivered diff touched. Prose words are filler; harness names are real.
+REPLAYABLE: no — the delivered sha is in no checkout on the host that recorded this corpus
+---
+CHECKED: loremipsu mdolorsi PASS (RARE, 63%); tametcons ectetu VERIFIED; radip:iscin gelitse ddoeiusmo->dtem; porlo:remip su=0; mdolo-rsita --check 39/39; metco-nsecte tu=0 (1 radipisc ingelit: seddo eius modtemp orlore-mips, umd olor sita me tco nsecte turad); ipis-cinge-litsed 114/0; doeiu:smodt 5/0; empor:lore-mipsum 4 dolo rsitame; 39 tcon / 39 secte turadip. Isc ingeli-tsedd oe iusmodte mp o rlor emip sum: d olo-rsita metcons ect eturadip {iscingel,its,eddoeiu@5smod-temporl} orem ips umdo'l ors; [] itamet co nsecte.
