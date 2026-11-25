@@ -1,10 +1,17 @@
 ## Unreleased
 
-### Fixed — browser 1.97.6: a second site served on a running group browser is shown its own tab (DIVE-9318)
+### Fixed — browser 1.97.7: a second site served on a running group browser is shown its own tab (DIVE-9318)
 - Mirror of 5dive-ai/5dive-browser#187. `serve` for a site whose group browser is already up for another site now
   brings that site's tab forward instead of only saying "already serving", never while the browser is in use. A sign-in
   window open on another site of the group is reopened on this site by `serve` and `viewer`; an agent's automatic start
   never closes it.
+
+### Fixed — telegram-codex 0.5.55: a turn cut off by a dropped stream is re-run, not dropped (DIVE-9316)
+
+- Box report 1450: Codex seats stopped mid-task and needed a nudge. A turn that ended on "stream disconnected" was final and silent: the dispatcher cleared it and moved on, a heartbeat turn's error notice went nowhere, and the row sat in progress until the reaper took it 20+ minutes later.
+- Now a failed turn whose error is transient (`codexErrorInfo` of a stream/connection/server failure, else the text: stream disconnected, 5xx, timeout) and that sent no final answer runs the same message again, ahead of the queue, with a "you were cut off, continue" preface. At most 2 re-runs (`MAX_DROP_RETRIES`); then the error goes out as before. Usage limits, context overflow and refusals are never re-run.
+- `health.json` gets `lastTurnError` (`at`, `detail`, `source`, `messageId`, `transient`, `retrying`, `attempt`), cleared by the next completed turn. Optional field, no schema bump. A teammate turn's failure is also logged to stderr.
+- Harness: `test/dive9316-codex-stream-drop-retry.test.ts` (6 arms; with the requeue removed 3 go red).
 
 ### Changed — devteam 0.4.6: seating the mod guard on new Claude agents lives here now (DIVE-9307)
 

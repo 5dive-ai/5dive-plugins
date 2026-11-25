@@ -298,7 +298,8 @@ and capture once the page shows it:
 ```
 
 **Exit 76 means the capture is NOT the page:** a known loading screen (Gmail's splash is one;
-the output says `LOADING SCREEN`), or a `--wait-for` that never appeared. `page.meta.json` and
+the output says `LOADING SCREEN`), a page that shows nothing yet (0 nodes and no text, on any
+site: an app's logo splash, `loading_screen: "empty"`), or a `--wait-for` that never appeared. `page.meta.json` and
 `page.md` say `partial: true`. Do not read refs or text out of it and do not report it as the
 page; run it again with a `--wait-for` the loaded page has. 76 is not 75: the login is fine,
 so do not ask anyone to log in, and do not re-run an `act`'s steps — they already ran.
