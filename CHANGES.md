@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Added — hosted 0.4.0: the pre-sale handover to the first hire moves in from the core (DIVE-9329)
+
+- `bin/handover` (`5dive handover _tick|status`) is the handover half of the 5dive CLI's `src/cmd_helper.sh` (step 6b of DIVE-9262): what the owner told 5dive before buying goes to their first hire once, as a marked block in its instructions file and one notice. It reads 5dive's API as the box, so it leaves the public core.
+- Core's heartbeat runs `handover _tick` only on a box with the demo AI account, no `handed-over`/`welcomed` record and this official plugin claiming the verb; a finished box pays one stat and no fork. The state dir is core's, so a box that handed over before the move never does again.
+- The old helper seat's one welcome (seats built by CLI 0.138.0-0.140.x) is retired, not moved: it needed core's chat encryption and dashboard relay. A built seat with no welcome now gets the handover in its first hire like every other box.
+- Either repo can ship first: an older CLI never runs this verb (it keeps its own tick), and a newer CLI without this version waits, nothing recorded, until the nightly `plugin auto-upgrade`.
+- Harness: `tests/hosted_handover_unit.sh` (the CLI's handover arms, plus the old-seat cases, the instructions paths, status and wiring). Runs in `parity.yml`.
+
 ### Added — hosted 0.3.0: the owner's first job at hire moves in from the core (DIVE-9328)
 
 - `bin/first-job` is the 5dive CLI's `src/cmd_agent_first_job.sh` at 5dive-ai/5dive 2edbe6f9 with one function replaced (step 6c of DIVE-9262). It only works against 5dive's API as the box, so it leaves the public core.

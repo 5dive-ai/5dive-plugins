@@ -7,6 +7,7 @@ own servers as that server (its box token in `/etc/5dive/connectord.env`).
 |---|---|
 | `5dive partner hire <pack> [--as=<name>]` | on a partner's server: a client's agent hires a colleague from the partner's catalogue. No root. |
 | `5dive first-job …` | the owner's first job at hire: the agent answers it, the reply waits in Telegram, it shows as a done task, the API is told. Root; the 5dive API and running units reach it through core's `5dive agent first-job` / `agent _first_job_run`, which forward here. |
+| `5dive handover status` | the pre-sale handover: what the owner told 5dive before buying goes to their first hire once. Core's heartbeat runs `handover _tick` (root) until it is done. |
 | `lib/push-notify.sh` | not a command: the phone push an agent's hooks send when it fails. 5dive's install copies it, root-owned, to `/usr/local/lib/5dive/push-notify.sh`, the path the agents' sudoers grants name. |
 
 5dive's install and upgrade add this plugin on every server 5dive built, in the
@@ -22,3 +23,6 @@ verbatim (DIVE-9327); `tests/hosted_push_notify_unit.sh` pins it.
 `bin/first-job` is the CLI's `src/cmd_agent_first_job.sh` at 5dive-ai/5dive 2edbe6f9 with one
 function replaced: the done task is filed through core's `5dive task record-done`, not by SQL
 (DIVE-9328); `tests/hosted_first_job_unit.sh` pins the rest.
+
+`bin/handover` is the handover half of the CLI's `src/cmd_helper.sh` (DIVE-9329); the old
+helper seat's welcome was retired, not moved. `tests/hosted_handover_unit.sh` pins it.
