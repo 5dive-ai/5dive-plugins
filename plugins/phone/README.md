@@ -50,12 +50,13 @@ phone, for 30 minutes, once.
 Every step goes to the seat's `~/.5dive/phone/actions.jsonl` (0600). Screenshots stay in
 `~/.5dive/phone/shots` (0700).
 
+Websites go through the agent's own browser, `5dive browser` on the server: the phone is for
+apps. (Chrome on the phone also drops its page tree between screen reads.)
+
 ## Limits
 
 - After a restart the owner turns Wireless debugging back on (Android switches it off on every
   restart). The port is found without them.
 - A locked phone cannot be driven: set the spare phone's screen lock to None or Swipe. Opening
   a PIN lock would mean handing the agent the phone's PIN; a spare phone does not need one.
-- A browser page on the phone reads unreliably (Chrome drops its page tree between reads): use
-  `5dive browser` on the server for websites.
 - iPhone is not supported (it needs a Mac with Xcode).
