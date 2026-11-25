@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Changed — devteam 0.4.7: 5dive's seat names, GitHub orgs and paths live here now, not in the CLI (DIVE-9315)
+
+- The 5dive CLI stopped carrying 5dive's own names (5dive-ai/5dive, DIVE-9315, step 5 of DIVE-9262): main and marketing never going cold, 5dive-ai and lodar as "our" GitHub orgs, lodar as a person who files tasks, and /home/claude/projects/5dive as where checkouts and community/wiki live. They are four box settings now (`5dive config wake-protected= own-orgs= principals= projects-root=`), empty by default.
+- `core/box-defaults.json` supplies today's values for any of the four a box leaves unset, so 5dive's own boxes keep them with no config step. It is data: the CLI reads it with jq and never sources it, after the same ownership check as the modules. An older CLI ignores it; a newer CLI without it reads the settings as empty.
+- Harness: `tests/devteam_core_unit.sh` T16-T18; `tests/devteam/escalation_resume_unit.sh` names the orgs through the setting.
+
 ### Fixed — telegram-codex 0.5.55: a turn cut off by a dropped stream is re-run, not dropped (DIVE-9316)
 
 - Box report 1450: Codex seats stopped mid-task and needed a nudge. A turn that ended on "stream disconnected" was final and silent: the dispatcher cleared it and moved on, a heartbeat turn's error notice went nowhere, and the row sat in progress until the reaper took it 20+ minutes later.
