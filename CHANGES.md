@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Added — hosted 0.5.0: a premium team's update moves in from the core (DIVE-9330)
+
+- `bin/premium-team` (`5dive premium-team update <team> [--allow-downgrade]`; core's `5dive team update` forwards here, official plugin only) is the CLI's `_team_premium_update_online` (step 6e of DIVE-9262): it asks 5dive's API as the box for the newest signed file of a premium team and hands it to core's `5dive team import`, which checks and applies it. The verify side stays in core, so an offline box still imports the file by hand.
+- `tools/premium-team-build.sh` is the CLI's `packaging/premium-team/build.sh`, the reference producer of premium team files (5dive's API makes the real ones with a port of it). The CLI's tests now use a small test producer of their own.
+- Core installs this plugin on every server 5dive built, and now also on any server with a box token that holds a premium team.
+- Either repo can ship first: an older CLI keeps its own `team update` and never runs this verb (named `premium-team`, which no core ever held, so an older core accepts the plugin); a newer CLI without this version answers `team update` with one line naming the plugin and the offline import until the nightly `plugin auto-upgrade`. Merge this first: a CLI upgrade then upgrades the plugin in the same run.
+- Harness: `tests/hosted_premium_team_unit.sh` (the CLI's O arms of `team update`, the producer's B1/B2 arms, and wiring). Runs in `parity.yml`.
+
 ### Added — hosted 0.4.0: the pre-sale handover to the first hire moves in from the core (DIVE-9329)
 
 - `bin/handover` (`5dive handover _tick|status`) is the handover half of the 5dive CLI's `src/cmd_helper.sh` (step 6b of DIVE-9262): what the owner told 5dive before buying goes to their first hire once, as a marked block in its instructions file and one notice. It reads 5dive's API as the box, so it leaves the public core.

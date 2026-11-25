@@ -15,7 +15,7 @@
 #           handover in its first hire like any box (the welcome is retired).
 #   P1      each agent type's instructions file is core's TYPE_PERSONA_FILE.
 #   S1-S2   status for a person and --json.
-#   W1-W4   wiring: the manifest declares handover (0.4.0); `_tick` refuses a
+#   W1-W4   wiring: the manifest declares handover (0.5.0 since DIVE-9330); `_tick` refuses a
 #           non-root caller; no core internals are called; the marketplace.
 #   NC1     NEGATIVE CONTROL: a tick without the handed-over check is CAUGHT by H2.
 # Run: bash tests/hosted_handover_unit.sh   (no root, no network)
@@ -150,8 +150,8 @@ grep -q '^handover: eligible=true handover=done (.* to dude) welcomed=false help
 
 # ── W: wiring ────────────────────────────────────────────────────────────────
 PJ=plugins/hosted/.claude-plugin/plugin.json
-[[ "$(jq -c '[.fivedive.verbs[].name] | sort' "$PJ")" == '["first-job","handover","partner"]' && "$(jq -r .version "$PJ")" == 0.4.0 ]] \
-  && ok_t "W1 plugin.json 0.4.0 declares first-job, handover and partner" || bad_t "W1 manifest" "$(jq -c '.version, [.fivedive.verbs[].name]' "$PJ")"
+[[ "$(jq -c '[.fivedive.verbs[].name] | sort' "$PJ")" == '["first-job","handover","partner","premium-team"]' && "$(jq -r .version "$PJ")" == 0.5.0 ]] \
+  && ok_t "W1 plugin.json 0.5.0 declares first-job, handover, partner and premium-team" || bad_t "W1 manifest" "$(jq -c '.version, [.fivedive.verbs[].name]' "$PJ")"
 out=$(env -u FIVEDIVE_JSON_MODE "$BIN" _tick 2>&1); rc=$?; "$BIN" --help >/dev/null 2>&1; rc_help=$?; "$BIN" bogus >/dev/null 2>&1; rc_bad=$?
 { [[ -x "$BIN" && $rc -eq $E_PERMISSION && $rc_help -eq 0 && $rc_bad -eq $E_USAGE ]] && grep -q 'must run as root (5dive handover _tick)' <<<"$out"; } \
   && ok_t "W2 executed: _tick refuses a non-root caller; --help rc 0; an unknown word is a usage error" || bad_t "W2 entry" "rc=$rc $out help=$rc_help bad=$rc_bad"

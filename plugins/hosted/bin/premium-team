@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# `5dive premium-team update <team> [--allow-downgrade]` — bring a premium team
+# bought from 5dive up to its newest version. Core's `5dive team update` forwards
+# here. Published by hosted@5dive-plugins (DIVE-9330, step 6e of DIVE-9262); it
+# was core's `_team_premium_update_online` (src/cmd_team_pack.sh, DIVE-9116).
+#
+# WHY A PLUGIN. It asks 5dive's API, as the box (its CONNECTORD_TOKEN):
+# GET <api>/server/premium-teams/<team>/latest?have=<version>. 200 = the buyer's
+# signed file, 204 = nothing newer, 402/403 = the subscription ended, 404 = no
+# such premium team for this account. A file it gets goes to core's
+# `5dive team import`, which checks the signature and applies it in place exactly
+# as a file brought by hand: the verify side stays in core, so an offline box
+# imports the same file without this plugin.
+#
+# Core installs this plugin on every box with a box token that 5dive built or
+# that holds a premium team (install.sh _hosted_plugin_ensure).
+
+# Error codes: values identical to core's src/lib/error_codes.sh.
+E_GENERIC=1 E_USAGE=2 E_VALIDATION=4 E_NOT_FOUND=5 E_PERMISSION=10
+
+# Core strips a global `--json` and forwards the mode (FIVEDIVE_JSON_MODE).
+JSON_MODE="${FIVEDIVE_JSON_MODE:-${JSON_MODE:-0}}"
+STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
+USAGE="usage: 5dive team update <team> [--allow-downgrade]"
+
+fail() {
+  local code="$1"; shift
+  if (( JSON_MODE )); then
+    jq -cn --argjson c "$code" --arg m "$*" '{ok:false, error:{code:$c, message:$m}}'
+  fi
+  echo "error: $*" >&2
+  exit "$code"
+}
+
+require_root() {
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root (sudo 5dive team update $1)"
+}
+
+# The API and the box token, read the way core's src/lib/box_token.sh reads them.
+_pt_api_base() {
+  local b="" f="${FIVE_API_BASE_FILE:-/etc/5dive/api-base}"
+  [[ -r "$f" ]] && IFS= read -r b <"$f" 2>/dev/null
+  [[ "$b" =~ ^https?://[^[:space:]/]+(/[^[:space:]]*)?$ ]] || b="${FIVE_API_BASE:-https://api.5dive.com}"
+  printf '%s' "${b%/}"
+}
+_pt_token() {
+  local f="${FIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}" t=""
+  if [[ -n "${CONNECTORD_TOKEN:-}" ]]; then printf '%s' "$CONNECTORD_TOKEN"; return 0; fi
+  [[ -r "$f" ]] || return 1
+  t=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$f" 2>/dev/null | head -n 1) || t=""
+  t="${t%$'\r'}"; t="${t#\"}"; t="${t%\"}"; t="${t#\'}"; t="${t%\'}"
+  [[ -n "$t" ]] || return 1
+  printf '%s' "$t"
+}
+_pt_self() { printf '%s' "${FIVEDIVE_SELF_BIN:-/usr/local/bin/5dive}"; }
+
+_pt_usage() {
+  printf '%s\n' "$USAGE" \
+    "  Bring a premium team bought from 5dive up to its newest version: personas," \
+    "  skills, roles and loops move; every agent keeps its memory, channels and bot." \
+    "  Needs this server online. Offline: 5dive team import <newer file>"
+}
+
+cmd_premium_team_update() {
+  local team="" allow=0 a f have tok url out http rc=0
+  for a in "$@"; do
+    case "$a" in
+      --allow-downgrade) allow=1 ;;
+      -h|--help) _pt_usage >&2; return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $a ($USAGE)" ;;
+      *)  [[ -z "$team" ]] && team="$a" || fail "$E_USAGE" "$USAGE" ;;
+    esac
+  done
+  # The API's partner route probes a bare `team update --json` and reads only
+  # "unknown team subcommand" as missing: this usage line must never say that.
+  [[ "$team" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || fail "$E_USAGE" "$USAGE"
+  require_root "$team"
+  f="$STATE_DIR/premium-teams/$team.json"
+  [[ -f "$f" ]] || fail "$E_NOT_FOUND" "'$team' is not a premium team on this server (only a team bought from 5dive updates this way)"
+  have=$(jq -r '.version // empty' "$f" 2>/dev/null)
+  if [[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]]; then
+    fail "$E_VALIDATION" "this server works offline, so it cannot ask 5dive for a newer $team. Bring the newer file and run: 5dive team import <file>"
+  fi
+  tok=$(_pt_token) || tok=""
+  [[ -n "$tok" ]] || fail "$E_PERMISSION" "this server has no 5dive sign-in to ask with. Import the newer file by hand: 5dive team import <file>"
+  url="$(_pt_api_base)/server/premium-teams/$team/latest?have=${have}"
+  out=$(mktemp --suffix=.gz) || fail "$E_GENERIC" "could not stage the download"
+  # The bearer goes in on STDIN (-H @-), never argv (DIVE-5168).
+  http=$(printf 'Authorization: Bearer %s\n' "$tok" \
+           | curl -sS --max-time "${FIVE_TEAM_UPDATE_TIMEOUT:-120}" -H @- -o "$out" -w '%{http_code}' "$url" 2>/dev/null) || true
+  case "${http:-000}" in
+    200) ;;
+    204) rm -f "$out"
+         if (( JSON_MODE )); then jq -cn --arg t "$team" --arg v "$have" '{ok:true, data:{team:$t, version:$v, updated:false}}'
+         else echo "OK — premium team $team is up to date (${have:-unknown version})"; fi
+         return 0 ;;
+    402|403) rm -f "$out"; fail "$E_PERMISSION" "the subscription to premium team $team has ended for this account — renew it to get updates. The team on this server keeps working." ;;
+    404) rm -f "$out"; fail "$E_NOT_FOUND" "5dive has no premium team $team for this server's account" ;;
+    *)   rm -f "$out"; fail "$E_GENERIC" "could not reach 5dive for premium team $team (HTTP ${http:-000}) — try again later, or import the newer file by hand" ;;
+  esac
+  local -a iargs=(team import "$out")
+  (( allow )) && iargs+=(--allow-downgrade)
+  (( JSON_MODE )) && iargs+=(--json)
+  "$(_pt_self)" "${iargs[@]}" || rc=$?
+  rm -f "$out"
+  return "$rc"
+}
+
+# ==================== entry ====================
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -uo pipefail
+  _pt_argv=()
+  for _pt in "$@"; do [[ "$_pt" == --json ]] && JSON_MODE=1 || _pt_argv+=("$_pt"); done
+  set -- "${_pt_argv[@]+"${_pt_argv[@]}"}"
+  case "${1:-}" in
+    update) shift; cmd_premium_team_update "$@"; exit $? ;;
+    help|-h|--help) _pt_usage ;;
+    *) _pt_usage >&2; exit "$E_USAGE" ;;
+  esac
+fi
