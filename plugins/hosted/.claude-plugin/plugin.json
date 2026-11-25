@@ -1,7 +1,7 @@
 {
   "name": "hosted",
-  "description": "Commands that only work on a server 5dive built, because they talk to 5dive's own servers as that server: today `5dive partner hire`, which lets a partner client's agent hire a colleague from the partner's catalogue. 5dive's install adds it on every server 5dive built; a self-hosted server has no use for it.",
-  "version": "0.1.0",
+  "description": "Commands and helpers that only work on a server 5dive built, because they talk to 5dive's own servers as that server: `5dive partner hire` (a partner client's agent hires a colleague from the partner's catalogue) and the native-push helper agents' hooks call when they fail. 5dive's install adds it on every server 5dive built; a self-hosted server has no use for it.",
+  "version": "0.2.0",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com"
@@ -10,7 +10,8 @@
   "keywords": [
     "hosted",
     "partner",
-    "hire"
+    "hire",
+    "push"
   ],
   "fivedive": {
     "contract": "1",

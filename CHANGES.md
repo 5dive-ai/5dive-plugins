@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Added — hosted 0.2.0: the native-push helper moves in from the core (DIVE-9327)
+
+- `lib/push-notify.sh` is the 5dive CLI's `hooks/push-notify.sh` at 5dive-ai/5dive 3a1c941c, carried verbatim: the best-effort phone push an agent's failure hook sends, as the box, to 5dive's API. It is a no-op on a self-hosted box, so it leaves the public core (step 6d of DIVE-9262).
+- It is not a verb. The CLI's install and upgrade copy it, root-owned, to `/usr/local/lib/5dive/push-notify.sh`, the exact path every seat's sudoers grant and `stop-failure-telegram.sh` already name, so no grant is rewritten. An older CLI ignores the file and keeps shipping its own copy; a newer CLI with an older plugin keeps the copy already on the box. Either can ship first.
+- Harness: `tests/hosted_push_notify_unit.sh` (P1-P3 moved unchanged from the CLI's `tests/secrets_posture_unit.sh` T7; P4-P5 pin the request; W1 the verbatim sha; NC1 a copy without the `sudo -l` probe turns P2 red). Runs in `parity.yml`.
+
 ### Added — hosted 0.1.0: `5dive partner hire` moves in from the core (DIVE-9324)
 
 - New plugin `hosted`: commands that only work on a server 5dive built, because they talk to 5dive's servers as that server. First one: `5dive partner hire <pack> [--as=<name>]`, core's `src/cmd_partner.sh` at 5dive-ai/5dive 3a1c941c carried verbatim in `bin/partner`, with a prelude for the core helpers it used (same messages, JSON envelopes and exit codes). The seats' sudoers grant and every caller are unchanged.
