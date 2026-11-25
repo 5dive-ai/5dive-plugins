@@ -1,5 +1,12 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.55: a turn cut off by a dropped stream is re-run, not dropped (DIVE-9316)
+
+- Box report 1450: Codex seats stopped mid-task and needed a nudge. A turn that ended on "stream disconnected" was final and silent: the dispatcher cleared it and moved on, a heartbeat turn's error notice went nowhere, and the row sat in progress until the reaper took it 20+ minutes later.
+- Now a failed turn whose error is transient (`codexErrorInfo` of a stream/connection/server failure, else the text: stream disconnected, 5xx, timeout) and that sent no final answer runs the same message again, ahead of the queue, with a "you were cut off, continue" preface. At most 2 re-runs (`MAX_DROP_RETRIES`); then the error goes out as before. Usage limits, context overflow and refusals are never re-run.
+- `health.json` gets `lastTurnError` (`at`, `detail`, `source`, `messageId`, `transient`, `retrying`, `attempt`), cleared by the next completed turn. Optional field, no schema bump. A teammate turn's failure is also logged to stderr.
+- Harness: `test/dive9316-codex-stream-drop-retry.test.ts` (6 arms; with the requeue removed 3 go red).
+
 ### Changed — devteam 0.4.5: two heartbeat sweeps, three scripts and two docs move in from the core (DIVE-9281)
 
 - The gate-shipped flag sweep is now `_gate_shipped_sweep` in `core/task/gate_evidence.sh`, and the forge merge poll is `_forge_merge_sweep` (with `_forge_merge_reading_path` and `_forge_merge_record_reading`) in `core/task/delivery.sh`. Their code is unchanged apart from those names. The core's `_hb_gate_shipped_sweep` and `_hb_forge_merge_sweep` only call them; a box without the plugin skips both as before. The new names do not clash with an older core, so 0.4.5 loads on today's CLI (which still runs its own copies) and on the next one.

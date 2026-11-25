@@ -46,6 +46,12 @@ export type DispatchMessage = {
    * the seat's ChatGPT plan refused the one it asked for. Set by the dispatcher.
    */
   planRetry?: number
+  /**
+   * DIVE-9316: how many times this message was re-run after its turn was cut
+   * off by a transient stream error (a dropped connection, a 5xx). Set by the
+   * dispatcher only; bounded by MAX_DROP_RETRIES.
+   */
+  dropRetry?: number
 }
 
 /**
@@ -158,6 +164,12 @@ export type DispatcherState = {
   context?: ContextUsage
   /** Newest last, bounded by MAX_RECEIPTS. */
   sessions?: SessionReceipt[]
+  /**
+   * DIVE-9316: the newest turn that ended failed, kept until a later turn
+   * completes. Published in health.json so the host's heartbeat can tell a
+   * seat whose work was cut off (idle, nothing queued) from one that is busy.
+   */
+  lastTurnError?: TurnErrorRecord
   /** Short snippets of the last few user requests: the continuity a new
    *  session carries, without a model call to summarise. */
   recent?: string[]
@@ -196,6 +208,48 @@ export function planRefusedModel(detail: string): string | null {
 
 /** How many models one message may be re-run on before the error goes out. */
 export const MAX_PLAN_RETRIES = 3
+
+/**
+ * DIVE-9316: a failed turn whose error is a transient transport failure, not a
+ * refusal. Codex already retries a dropped stream itself (stream_max_retries)
+ * before it fails the turn, so by the time this matches, the turn is over and,
+ * before this, the message was simply dropped: the row stayed in progress and
+ * the seat sat idle until the reaper took it 20+ minutes later (box report
+ * 1450). Reads the app-server's typed `codexErrorInfo` when present, else the
+ * message text. A usage limit, a context overflow, a bad request or a plan
+ * refusal is never transient: re-running it would fail the same way.
+ */
+const TRANSIENT_ERROR_INFO = /^(responseStreamDisconnected|responseStreamConnectionFailed|httpConnectionFailed|internalServerError|responseTooManyFailedAttempts)$/i
+const TRANSIENT_ERROR_TEXT = /stream disconnected|disconnected before completion|stream (?:error|closed)|connection (?:reset|refused|closed|error)|error sending request|timed? ?out|\b(?:500|502|503|504|520|522|524|529)\b|internal server error|bad gateway|service unavailable|gateway time-?out|overloaded|econnreset|etimedout|network error/i
+const NOT_TRANSIENT_TEXT = /usage limit|rate limit|quota|context window|context length|unauthori[sz]ed|forbidden|not supported|invalid|bad request/i
+
+export function transientTurnError(error: unknown): boolean {
+  const e = (error ?? {}) as { message?: unknown; codexErrorInfo?: unknown }
+  const info = e.codexErrorInfo
+  const infoKey = typeof info === 'string' ? info
+    : info && typeof info === 'object' ? Object.keys(info as object)[0] ?? '' : ''
+  if (infoKey) return TRANSIENT_ERROR_INFO.test(infoKey)
+  const text = String(e.message ?? '')
+  return TRANSIENT_ERROR_TEXT.test(text) && !NOT_TRANSIENT_TEXT.test(text)
+}
+
+/** How many times one message is re-run after a transient drop before the error goes out. */
+export const MAX_DROP_RETRIES = 2
+
+export type TurnErrorRecord = {
+  at: string
+  /** The app-server's error text, one line, bounded. */
+  detail: string
+  /** The route source of the message whose turn failed (`agent` = heartbeat/teammate work). */
+  source: string
+  messageId: string
+  /** Matched transientTurnError(). */
+  transient: boolean
+  /** True when the same message was queued again; false when the error went out and the message was dropped. */
+  retrying: boolean
+  /** Which run of the message failed: 0 for the first, then each re-run. */
+  attempt: number
+}
 
 /** A model choice. `effort` is a Codex reasoning effort (`low`, `high`, …). */
 export type ModelSelection = { model?: string; effort?: string }
@@ -439,6 +493,13 @@ function carryNote(carry: string[]): string {
  * One short line, not a transcript. It rides the next turn's input so the model
  * learns what it lost without the dispatcher re-sending the lost message.
  */
+/** DIVE-9316: the preface of a message re-run after its turn was cut off. */
+export function dropRetryLine(attempt: number): string {
+  return `[5dive retry ${attempt}/${MAX_DROP_RETRIES}] Your last turn on the message below was cut off by a dropped connection `
+    + 'before it finished. Continue from where you were: check what you already did, do not redo finished steps, '
+    + 'and finish the task.'
+}
+
 export function recoveryLine(recovery: RecoveryContext): string {
   return `[5dive recovery] Since your last turn: ${recovery.detail}. Continue from the message below; `
     + 'do not replay the interrupted work unless the user asks for it.'
@@ -618,6 +679,7 @@ function inputFor(message: DispatchMessage, recovery?: RecoveryContext, handoff?
   if (handoff) input.push({ type: 'text', text: handoff, text_elements: [] })
   if (receipts) input.push({ type: 'text', text: receipts, text_elements: [] })
   if (message.route.source === 'agent') input.push({ type: 'text', text: teammateLine(), text_elements: [] })
+  if (message.dropRetry) input.push({ type: 'text', text: dropRetryLine(message.dropRetry), text_elements: [] })
   input.push({ type: 'text', text: message.text, text_elements: [] })
   const attached = attachmentInput(message.image_path)
   if (attached) input.push(attached)
@@ -685,6 +747,8 @@ export class ChannelDispatcher {
   }
   /** DIVE-7811: the over-cap reply of the active turn, held back while the model rewrites it. */
   private cut?: { turnId: string; refusal: string; text: string; itemId: string }
+  /** DIVE-9316: the turn that has sent a final answer with no ack to record it on. */
+  private finalAnswered?: string
 
   constructor(
     private readonly rpc: RpcPort,
@@ -1164,6 +1228,7 @@ export class ChannelDispatcher {
           // DIVE-6579: no ack to fold commentary into, so every message goes;
           // `notify` still marks which is the answer (unknown phase: unset).
           const phase = params?.item?.phase
+          if (phase === 'final_answer') this.finalAnswered = turnId
           const notify = phase === 'final_answer' ? { notify: true } : phase === 'commentary' ? { notify: false } : {}
           await this.publishAnswer(this.state.active.route, text, { turnId, itemId, kind: 'message', ...notify })
           return
@@ -1201,6 +1266,28 @@ export class ChannelDispatcher {
         const refused = failedDetail && !completed.message.control
           && (completed.message.planRetry ?? 0) < MAX_PLAN_RETRIES ? planRefusedModel(failedDetail) : null
         const fallback = refused ? await this.planFallback(refused) : null
+        // DIVE-9316: a turn cut off by a dropped stream, before it gave an
+        // answer, runs the same message again (bounded) instead of dropping it.
+        // An answer that already went out is never re-run: that would send it twice.
+        const answered = Boolean(progress?.answered) || this.finalAnswered === turnId
+        this.finalAnswered = undefined
+        const dropRetry = completed.message.dropRetry ?? 0
+        const transient = Boolean(failedDetail) && transientTurnError(params?.turn?.error)
+        const requeue = !fallback && transient && !answered && !completed.message.control
+          && dropRetry < MAX_DROP_RETRIES
+        if (failedDetail && !fallback) {
+          this.state.lastTurnError = {
+            at: new Date().toISOString(),
+            detail: failedDetail.replace(/\s+/g, ' ').trim().slice(0, 240),
+            source: completed.route.source,
+            messageId: completed.message.id,
+            transient,
+            retrying: requeue,
+            attempt: dropRetry,
+          }
+        } else if (!failedDetail) {
+          this.state.lastTurnError = undefined
+        }
         // The held message was the turn's last: it notifies, unless an error follows.
         if (progress) await this.flushHeld(params?.turn?.status === 'completed', completed.route)
         // A turn that only ever wrote commentary still owes the chat an answer:
@@ -1217,7 +1304,8 @@ export class ChannelDispatcher {
           const steps = progress.steps ? ` · ${progress.steps} step${progress.steps === 1 ? '' : 's'}` : ''
           await this.publishProgress(completed.route, params?.turn?.status === 'completed'
             ? `✅ Done in ${took}${steps}`
-            : fallback ? `🔁 Switching to ${fallback.model}` : `⚠️ Stopped after ${took}${steps}`,
+            : fallback ? `🔁 Switching to ${fallback.model}`
+              : requeue ? `🔁 Connection dropped after ${took}${steps}, retrying` : `⚠️ Stopped after ${took}${steps}`,
           { turnId, kind: 'progress-done', steps: progress.steps })
         }
         this.state.active = undefined
@@ -1247,6 +1335,10 @@ export class ChannelDispatcher {
             { turnId, kind: 'control' })
           const { planRetry, ...message } = completed.message
           this.state.pending.unshift({ ...message, planRetry: (planRetry ?? 0) + 1 })
+        } else if (requeue) {
+          // Ahead of the queue, like the plan retry: it is the same message.
+          // No error notice: the retry is the answer; the ack above says it.
+          this.state.pending.unshift({ ...completed.message, dropRetry: dropRetry + 1 })
         } else if (params?.turn?.status !== 'completed') {
           const detail = failedDetail
           await this.sink.publish(completed.route, compaction

@@ -99,6 +99,18 @@ export type ChannelHealth = {
     calls: number
     at: string
   }
+  /** DIVE-9316: the newest turn that ended failed, kept until a later turn
+   *  completes. `retrying: false` with no `active` turn and an empty queue is a
+   *  seat whose work was cut off, not a busy one. Optional: no schema bump. */
+  lastTurnError?: {
+    at: string
+    detail: string
+    source: string
+    messageId: string
+    transient: boolean
+    retrying: boolean
+    attempt: number
+  }
   /** The newest saved session receipt, if a new session was ever started. */
   lastSession?: { threadId: string; endedAt: string; reason: string; calls?: number; inContext?: number }
   /** OpenAI's own rate-limit report, as last read (`/usage`) or pushed
