@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Added — hosted 0.1.0: `5dive partner hire` moves in from the core (DIVE-9324)
+
+- New plugin `hosted`: commands that only work on a server 5dive built, because they talk to 5dive's servers as that server. First one: `5dive partner hire <pack> [--as=<name>]`, core's `src/cmd_partner.sh` at 5dive-ai/5dive 3a1c941c carried verbatim in `bin/partner`, with a prelude for the core helpers it used (same messages, JSON envelopes and exit codes). The seats' sudoers grant and every caller are unchanged.
+- The CLI's install and upgrade add it on every 5dive-built box in the same run that removes the built-in; merge this before the CLI change ships.
+- Harness: `tests/hosted_partner_unit.sh`, moved from the CLI's `tests/partner_hire_unit.sh` (H and NC arms unchanged; W arms now grade the manifest, the executable, the carried body's sha and the marketplace entry). Runs in `parity.yml`.
+
 ### Fixed — telegram-codex 0.5.55: a turn cut off by a dropped stream is re-run, not dropped (DIVE-9316)
 
 - Box report 1450: Codex seats stopped mid-task and needed a nudge. A turn that ended on "stream disconnected" was final and silent: the dispatcher cleared it and moved on, a heartbeat turn's error notice went nowhere, and the row sat in progress until the reaper took it 20+ minutes later.

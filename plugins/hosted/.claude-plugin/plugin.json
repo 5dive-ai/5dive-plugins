@@ -1,0 +1,32 @@
+{
+  "name": "hosted",
+  "description": "Commands that only work on a server 5dive built, because they talk to 5dive's own servers as that server: today `5dive partner hire`, which lets a partner client's agent hire a colleague from the partner's catalogue. 5dive's install adds it on every server 5dive built; a self-hosted server has no use for it.",
+  "version": "0.1.0",
+  "author": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/hosted",
+  "keywords": [
+    "hosted",
+    "partner",
+    "hire"
+  ],
+  "fivedive": {
+    "contract": "1",
+    "capabilities": [
+      "verb"
+    ],
+    "verbs": [
+      {
+        "name": "partner",
+        "summary": "on a partner's server: hire a colleague from the partner's catalogue"
+      }
+    ],
+    "trust": {
+      "publisher": "5dive",
+      "did": "did:key:5dive",
+      "review": "official"
+    }
+  }
+}

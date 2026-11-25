@@ -75,6 +75,10 @@ jobs:
       # silence, not a green.
       - name: devteam core files harness
         run: bash tests/devteam_core_unit.sh
+      # DIVE-9324: `5dive partner hire` moved here from the CLI (plugins/hosted),
+      # and its harness came with it.
+      - name: hosted plugin harness
+        run: bash tests/hosted_partner_unit.sh
       # DIVE-8050: plugins/browser IS 5dive-ai/5dive-browser's browser/, byte for
       # byte. A hand edit here matches no upstream commit and is red; behind main is
       # a named warning. Then 5dive-browser's OWN harnesses, from the matched commit,
