@@ -90,8 +90,19 @@ jobs:
           BROWSER_MIRROR_BRANCH: ${{ github.head_ref || github.ref_name }}
       - name: browser registry entry harness
         run: bash tests/browser_registry_unit.sh
-      - name: phone plugin harness (fake adb)
-        run: bash tests/phone_unit.sh
+      # DIVE-9230: plugins/phone IS 5dive-ai/5dive-phone's phone/, the same contract
+      # as browser above (one script, tests/plugin_mirror.sh), and 5dive-phone's own
+      # harness grades this tree.
+      - name: phone mirror is byte-for-byte 5dive-phone
+        run: bash tests/phone_mirror.sh check
+        env:
+          PHONE_UPSTREAM_DIR: ${{ runner.temp }}/5dive-phone
+          PHONE_MIRROR_BRANCH: ${{ github.head_ref || github.ref_name }}
+      - name: phone harness (5dive-phone's own, fake adb, on this tree)
+        run: bash tests/phone_mirror.sh run phone_unit.sh
+        env:
+          PHONE_UPSTREAM_DIR: ${{ runner.temp }}/5dive-phone
+          PHONE_MIRROR_BRANCH: ${{ github.head_ref || github.ref_name }}
       - name: browser harnesses (5dive-browser's own, on this tree)
         run: >-
           bash tests/browser_mirror.sh run

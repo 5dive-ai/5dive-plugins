@@ -1,13 +1,13 @@
 {
   "name": "phone",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Your agent uses apps on a spare Android phone you set aside for it: WhatsApp Business, Instagram, a bank app, anything that lives only on a phone. It reads the screen, taps and types over your Tailscale network. Nothing is installed on the phone. Sending, posting, deleting and paying follow the same rules you set for the browser: paying asks you first, and careful makes all four ask.",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com",
     "url": "https://5dive.ai"
   },
-  "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/phone",
+  "homepage": "https://github.com/5dive-ai/5dive-phone",
   "license": "Apache-2.0",
   "skills": "./skills/",
   "keywords": ["phone", "android", "adb", "automation"],
