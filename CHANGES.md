@@ -1,5 +1,10 @@
 ## Unreleased
 
+### Changed — phone 0.1.1: the phone plugin has its own repo (DIVE-9230)
+
+- Phone now lives at 5dive-ai/5dive-phone and installs with `sudo 5dive plugin add 5dive-ai/5dive-phone`. `phone@5dive-plugins` keeps working: `plugins/phone` is a byte-for-byte mirror of 5dive-phone's `phone/` (0.1.1 changes only the manifest's `homepage` and version), checked by `tests/phone_mirror.sh check` in the parity workflow. 5dive-phone's own harness grades this tree (`tests/phone_mirror.sh run phone_unit.sh`), so the hand-kept `tests/phone_unit.sh` and its fixtures moved there.
+- `tests/browser_mirror.sh` became `tests/plugin_mirror.sh <plugin>`, shared by browser and phone; `tests/browser_mirror.sh` and `tests/phone_mirror.sh` are two-line wrappers, with the same commands and environment as before (`BROWSER_UPSTREAM_DIR`, `PHONE_MIRROR_BRANCH`, …).
+
 ### Fixed — browser 1.97.4: no robot check seen, no take-over call to the owner (DIVE-9188)
 
 - lodar 11-24, "false takeovers": `connect-request --challenge` sent the owner a take-over even when the box's own look saw no check on the page. It is now refused (rc 69): nothing is sent and no code is minted. The look also runs `lib/page-check.cjs ask`, so a Turnstile that is still waiting, a visible hCaptcha or reCAPTCHA, or check words on the page count as a check. A Turnstile that is already answered does not. `plugins/browser` is re-synced byte for byte from 5dive-ai/5dive-browser main c2be6ad (#185, `tests/browser_mirror.sh sync`).
