@@ -2,7 +2,8 @@
 # DIVE-6935/6938 — plugins/devteam/core/ is read INTO the 5dive CLI (its
 # src/lib/devteam.sh), inside the CLI's own process. So the files must parse,
 # must be exactly the modules that loader knows (nine required, plus the
-# optional task/filing_cap.sh since DIVE-9262), must not declare a
+# optional task/filing_cap.sh since DIVE-9262 and lib/mod_seat.sh since
+# DIVE-9307), must not declare a
 # column-0 array without -g (it would bind as a local of the loader function),
 # and must match core/SOURCE. Since DIVE-6938 the core keeps no copy: these
 # files are the code, and SOURCE is their manifest.
@@ -13,7 +14,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 D=plugins/devteam
-FILES="cmd_deploy.sh cmd_gh.sh cmd_proof.sh cmd_push.sh lib/gh_config.sh task/delivery.sh task/filing_cap.sh task/gate_evidence.sh task/grader_pool.sh task/grader_process.sh"
+FILES="cmd_deploy.sh cmd_gh.sh cmd_proof.sh cmd_push.sh lib/gh_config.sh lib/mod_seat.sh task/delivery.sh task/filing_cap.sh task/gate_evidence.sh task/grader_pool.sh task/grader_process.sh"
 
 if [[ "${1:-}" == --rehash ]]; then
   {
@@ -75,6 +76,12 @@ for fn in _task_internal_subject_reason _task_internal_recent_ratio _task_filing
 done
 t "T14 its default for the core's agent-task-cap is 15" 15 \
   "$(bash -c ". $D/core/task/filing_cap.sh; _task_agent_task_cap_default")"
+
+# DIVE-9307: the optional mod seating defines the names the core's callers ask
+# `declare -F` for (create, switch, config, doctor).
+for fn in mod_seat_enabled mod_seat_ensure doctor_check_mod_seats; do
+  t "T15 lib/mod_seat.sh defines $fn" 1 "$(grep -cE "^${fn}\(\)" "$D/core/lib/mod_seat.sh")"
+done
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
