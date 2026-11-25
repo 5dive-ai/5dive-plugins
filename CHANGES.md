@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Changed — devteam 0.4.5: two heartbeat sweeps, three scripts and two docs move in from the core (DIVE-9281)
+
+- The gate-shipped flag sweep is now `_gate_shipped_sweep` in `core/task/gate_evidence.sh`, and the forge merge poll is `_forge_merge_sweep` (with `_forge_merge_reading_path` and `_forge_merge_record_reading`) in `core/task/delivery.sh`. Their code is unchanged apart from those names. The core's `_hb_gate_shipped_sweep` and `_hb_forge_merge_sweep` only call them; a box without the plugin skips both as before. The new names do not clash with an older core, so 0.4.5 loads on today's CLI (which still runs its own copies) and on the next one.
+- `scripts/grade-burn.sh`, `scripts/dispatch-bytes.sh` (now takes the 5dive checkout as its one argument), `scripts/publish-zero-human.sh`, `docs/zero-human.md` and `docs/delegated-push.md` moved here from 5dive-ai/5dive.
+- Harness: `tests/devteam/heartbeat_forge_merge_poll_unit.sh` mutates whichever function holds the sweep body, so it grades the core from either side of the move; it calls `_forge_merge_record_reading`.
+
 ### Changed — devteam 0.4.4: 5dive's filing cap lives here now, not in the CLI (DIVE-9262)
 
 - The title-word filing cap (harness, lint, rails, smoke…), its 1-in-4 refusal at `task add` and its grader skip refused customers' own tasks, so the 5dive CLI dropped them (5dive-ai/5dive, DIVE-9262). They moved here verbatim as `core/task/filing_cap.sh`, an optional module: a CLI that knows it reads it, an older CLI ignores it, so either side can ship first. It also supplies 15 as the default for the CLI's new `agent-task-cap` owner setting, so 5dive's own boxes keep today's per-agent cap.
