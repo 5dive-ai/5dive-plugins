@@ -79,6 +79,9 @@ jobs:
       # and its harness came with it.
       - name: hosted plugin harness
         run: bash tests/hosted_partner_unit.sh
+      # DIVE-9327: the native-push helper moved here too (plugins/hosted/lib).
+      - name: hosted push-notify harness
+        run: bash tests/hosted_push_notify_unit.sh
       # DIVE-8050: plugins/browser IS 5dive-ai/5dive-browser's browser/, byte for
       # byte. A hand edit here matches no upstream commit and is red; behind main is
       # a named warning. Then 5dive-browser's OWN harnesses, from the matched commit,
