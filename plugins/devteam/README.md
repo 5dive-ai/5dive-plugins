@@ -56,6 +56,14 @@ title-word classifier (harness, lint, rails, smoke…), the 1-in-4 refusal at
 core's `agent-task-cap` setting. It is optional: a CLI that knows it reads it,
 an older CLI ignores it, and either can be upgraded first.
 
+## Mod seating (since 0.4.6)
+
+`core/lib/mod_seat.sh` seats the `mod` plugin's tool-call guard on new Claude
+seats and backs `doctor --category=mod`, on a box that turned it on with
+`5dive config mod-seat=on` (5dive's own; off everywhere else). It left the core
+CLI in DIVE-9307 and is optional the same way: without it the CLI reads
+`mod-seat = off` and seats nothing.
+
 ## Tests
 
 The harnesses for these files moved here with them, unchanged, in
