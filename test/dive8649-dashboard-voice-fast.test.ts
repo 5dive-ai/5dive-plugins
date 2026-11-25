@@ -138,17 +138,17 @@ const dir = ${JSON.stringify(dir)}
 const raw = await new Response(Bun.stdin.stream()).text()
 const op = raw.split('\\0').slice(0, -1)
 if (op[0] === 'event' && op[2] !== ${JSON.stringify(VOICE_ONLY_BODY)}) {
-  appendFileSync(dir + '/marks.log', 'text-start ' + Date.now() + '\\n')
+  appendFileSync(dir + '/marks.log', 'text-start\\n')
   const holdUntil = Date.now() + ${opts.holdForSpeechMs ?? 0}
   while (Date.now() < holdUntil) {
     let m = ''
     try { m = readFileSync(dir + '/marks.log', 'utf8') } catch {}
-    if (m.includes('speak-start ')) break
+    if (m.includes('speak-start\\n')) break
     await Bun.sleep(10)
   }
   await Bun.sleep(${opts.delayMs ?? 0})
   if (${opts.failText ? 'true' : 'false'}) { appendFileSync(dir + '/ops.log', JSON.stringify(['failed', ...op]) + '\\n'); process.stdout.write('500\\n{"error":"down"}'); process.exit(0) }
-  appendFileSync(dir + '/marks.log', 'text-done ' + Date.now() + '\\n')
+  appendFileSync(dir + '/marks.log', 'text-done\\n')
 }
 appendFileSync(dir + '/ops.log', JSON.stringify(op) + '\\n')
 if (op[0] === 'ping') process.stdout.write('200\\n{"ok":true}')
@@ -166,23 +166,25 @@ function ops(dir: string): string[][] {
   return readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l))
 }
 
+// Each mark's place in marks.log, first one wins. Every writer appends, so the
+// line order IS the order the marks happened. No clock is compared: the stand-in
+// speech stamped itself with `date +%s%3N`, which the uutils date on ubuntu-26.04
+// misprints in the first tenth of a second (DIVE-7978: .067 reads .676), so a
+// speak-start the relay had held text-done for read 205 ms after it (DIVE-9241).
 function marks(dir: string): Record<string, number> {
   const p = join(dir, 'marks.log')
   const out: Record<string, number> = {}
   if (!existsSync(p)) return out
-  for (const l of readFileSync(p, 'utf8').split('\n').filter(Boolean)) {
-    const [k, v] = l.split(' ')
-    out[k] ??= Number(v)
-  }
+  readFileSync(p, 'utf8').split('\n').filter(Boolean).forEach((l, i) => { out[l.split(' ')[0]] ??= i })
   return out
 }
 
-// A stand-in 5dive-speak that marks when it started and takes 300 ms.
+// A stand-in 5dive-speak that marks that it started and takes 300 ms.
 function writeSpeak(dir: string, startDelayMs = 0): string {
   const file = join(dir, '5dive-speak')
   const out = join(dir, 'speak-out.ogg')
   writeFileSync(file, `#!/usr/bin/env bash
-${startDelayMs > 0 ? `sleep ${startDelayMs / 1000}\n` : ''}echo "speak-start $(date +%s%3N)" >> ${JSON.stringify(join(dir, 'marks.log'))}
+${startDelayMs > 0 ? `sleep ${startDelayMs / 1000}\n` : ''}echo speak-start >> ${JSON.stringify(join(dir, 'marks.log'))}
 sleep 0.3
 printf 'OggS' > ${JSON.stringify(out)}
 echo ${JSON.stringify(out)}
@@ -346,7 +348,7 @@ function writeSpeakEach(dir: string): string {
   writeFileSync(file, `#!/usr/bin/env bash
 w=$(printf '%s' "$2" | tr -cd 'A-Za-z' | head -c 12)
 out=${JSON.stringify(dir)}/speak-$w-$RANDOM.ogg
-echo "speak $w $(date +%s%3N)" >> ${JSON.stringify(join(dir, 'speaks.log'))}
+echo "speak $w" >> ${JSON.stringify(join(dir, 'speaks.log'))}
 sleep 0.3
 printf 'OggS' > "$out"
 echo "$out"
