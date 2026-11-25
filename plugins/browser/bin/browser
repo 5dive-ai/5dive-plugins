@@ -1426,6 +1426,61 @@ _rv_alias_sweep() {
   return 0
 }
 
+# >>> DIVE-9318 A SECOND SITE OF A RUNNING GROUP BROWSER IS SHOWN ON ITS OWN PAGE
+#
+# chill-gorge, 11-25: group Main's one Chrome was up for a client's site, and
+# `serve bing.com` only linked bing.com's socket to it and said "already
+# serving". Nothing opened a bing.com tab, so the owner's sign-in window for Bing
+# showed another business's private account page, and the next act on bing.com
+# read that page. Now a serve of one site on its group's running browser
+# brings that site's tab forward (lib/front-tab.cjs: the tab on the site, or a
+# blank one sent there, or a new tab; the other sites' tabs are not navigated or
+# closed), the rule a viewer has followed since DIVE-7257. A plain Chrome nobody
+# can drive (a sign-in window, no daemon) has no tabs to bring forward, so it is
+# re-served on this site instead, and refused by name while it is in use.
+
+# The site a group's running browser was started for, when it is ANOTHER site:
+# on stdout, rc 0. An own profile is one site, so it never answers.
+_serve_other_site() {  # <profile-dir> <site>
+  local p="${1%/}" s
+  [[ -L "$p" ]] || return 1
+  s=$(_kv "$(_serve_pidfile "$p")" site)
+  [[ -n "$s" && "$s" != "$2" ]] || return 1
+  printf '%s\n' "$s"
+}
+
+# The daemon's `front` for <site>, its answer on stdout. Best-effort: no daemon,
+# or no answer within VIEWER_FRONT_S, is an empty answer and rc 0.
+_front_call() {  # <profile-dir> <site>
+  local dir="$1" site="$2"
+  _daemon_live "$dir" || return 0
+  jq -nc --arg u "$(_site_url "$site")" '{op:"front", url:$u}' \
+    | timeout "$VIEWER_FRONT_S" "$(_daemon_bin)" call "$(_daemon_sock "$dir")" 2>/dev/null || true
+}
+
+# A serve's "already serving" for a site of a group: its tab comes forward. Never
+# while the browser is in use (a person, a handoff, another call's lease): that
+# call's next step goes to the tab in front, so moving it would act on the wrong
+# site. Said, not refused: the serve itself is still true.
+_serve_front() {  # <site> <profile-dir>
+  local site="$1" dir="$2" busy ans moved why
+  [[ -L "${dir%/}" ]] && _daemon_live "$dir" || return 0
+  if busy=$(_serve_busy "$dir"); then
+    printf '%s: NOTE — %s shares its browser with its group, which is in use (%s), so its tab was not brought forward. A page verb with a %s URL opens it there.\n' \
+      "$PROG" "$site" "$busy" "$site" >&2
+    return 0
+  fi
+  ans=$(_front_call "$dir" "$site" | tail -n1)
+  moved=$(jq -r '.moved // empty' <<<"$ans" 2>/dev/null)
+  why=$(jq -r '.why // empty' <<<"$ans" 2>/dev/null)
+  if [[ "$moved" != true && "$why" != *"on this site already"* ]]; then
+    printf '%s: NOTE — the browser %s shares with its group did not bring a %s tab forward (%s). A page verb with a %s URL opens it there.\n' \
+      "$PROG" "$site" "$site" "${why:-no answer from its daemon}" "$site" >&2
+  fi
+  return 0
+}
+# <<< DIVE-9318
+
 # A grouped site's own cookies, out of the group's profile, when it is forgotten
 # — the group's OTHER sign-ins (Google) stay. Best-effort and said either way.
 _group_forget_cookies() {  # <group-dir> <site> -> 0 when they were cleared
@@ -6402,11 +6457,12 @@ cmd_serve() {
     fi
   fi
 
-  local disp
+  local disp _oth=""
   if disp=$(_serve_running "$dir"); then
     if (( input )) && [[ "$(_kv "$(_serve_pidfile "$dir")" drive)" == input ]]; then
       _rv_alias "$site" "$dir"
       (( private )) || _rv_offer_write "$(_seat)" "$site" input
+      _serve_front "$site" "$dir"
       printf 'already serving %s on :%s (input mode)\n' "$site" "$disp"; return 0
     elif (( input && noswitch )); then
       # DIVE-7237: an on-demand start (a status loop, a brokered seat's first
@@ -6414,6 +6470,7 @@ cmd_serve() {
       # It is left alone: only a page verb that needs this site moves it.
       _rv_alias "$site" "$dir"
       (( private )) || _rv_offer_write "$(_seat)" "$site" input
+      _serve_front "$site" "$dir"
       printf 'already serving %s on :%s (as the automated browser for another site of its group; a page verb on %s switches it)\n' "$site" "$disp" "$site"; return 0
     elif (( input )); then
       # Served the other way (a warm session from before the adapter said
@@ -6498,10 +6555,26 @@ cmd_serve() {
       ! _serve_running "$dir" >/dev/null \
         || die "$E_UNAVAILABLE" "the browser $site shares is in input mode and did not stop, so it cannot be re-served for $site. Try again, or: 5dive browser serve $site --stop"
       printf '%s: the browser %s shares with its group was in input mode for another site; re-serving it as the automated browser for %s.\n' "$PROG" "$site" "$site" >&2
+    elif (( ! noswitch )) && _oth=$(_serve_other_site "$dir" "$site") && ! _daemon_live "$dir"; then
+      # DIVE-9318: a plain Chrome open on another site of the group (a sign-in
+      # window, no daemon) has no tab this command can bring forward. Linking
+      # this site to it showed the owner a client's page in Bing's sign-in window.
+      # Re-served on this site instead, never under a person or another call,
+      # and never by an on-demand start (--no-switch: a brokered seat's first
+      # verb or a status loop), which only links; the owner's sign-in window is
+      # then named by _serve_offered_cold (DIVE-8793's words), not closed.
+      local obusy; if obusy=$(_serve_busy "$dir"); then
+        die "$E_UNAVAILABLE" "the browser $site shares with $_oth is open on $_oth and in use right now ($obusy). Nothing was switched and nothing is shown, so nobody sees $_oth instead of $site. Try again in a minute."
+      fi
+      ( _SERVE_SWAP=1 cmd_serve "$site" --stop >/dev/null 2>&1 ) || true
+      ! _serve_running "$dir" >/dev/null \
+        || die "$E_UNAVAILABLE" "the browser $site shares with $_oth is open on $_oth and did not stop, so it cannot be opened on $site. Nothing is shown; try again, or: 5dive browser serve $site --stop"
+      printf '%s: the browser %s shares was open on %s; re-serving it on %s.\n' "$PROG" "$site" "$_oth" "$site" >&2
     else
       [[ -n "$_lnote" ]] && _daemon_live "$dir" && printf '%s\n' "$_lnote" >&2
       _rv_alias "$site" "$dir"
       (( private || login )) || _rv_offer_write "$(_seat)" "$site"
+      _serve_front "$site" "$dir"
       printf 'already serving %s on :%s\n' "$site" "$disp"; return 0
     fi
   fi
@@ -6832,7 +6905,9 @@ cmd_viewer() {
   # An INPUT-mode browser (DIVE-5287) is already plain: `serve --login` answers
   # "already serving" and leaves it alone, so the person's view is the window
   # the agent was driving, which is the whole point of a handoff.
-  if _daemon_live "$dir"; then
+  # DIVE-9318: and a plain window open on ANOTHER site of the group, which no
+  # front can move, is re-served on this one (cmd_serve says no while in use).
+  if _daemon_live "$dir" || _serve_other_site "$dir" "$site" >/dev/null; then
     ( cmd_serve "$site" --login >/dev/null ) \
       || die "$E_UNAVAILABLE" "$site could not be re-served as plain Chrome for a person to sign in (above), so no link was issued. The profile is untouched."
     disp=$(_serve_running "$dir") || die "$E_UNAVAILABLE" "no browser is serving $site after re-serving it for a login — start it again: 5dive browser serve $site --login"
@@ -7041,10 +7116,7 @@ cmd_viewer_redeem() {
 # silent: the relay reads this verb's stdout, and a window that did not move is
 # still a window the person can use.
 _viewer_front() {  # <profile-dir> <site>
-  local dir="$1" site="$2" bin; bin="$(_daemon_bin)"
-  _daemon_live "$dir" || return 0
-  jq -nc --arg u "$(_site_url "$site")" '{op:"front", url:$u}' \
-    | timeout "$VIEWER_FRONT_S" "$bin" call "$(_daemon_sock "$dir")" >/dev/null 2>&1 || true
+  _front_call "$1" "$2" >/dev/null
 }
 
 _viewer_revoke_file() {
@@ -7767,11 +7839,43 @@ _loading_screen() {  # _loading_screen <url> <page.html> [<tree.json>] -> "<name
   return 1
 }
 
+# A CAPTURE WITH NOTHING IN IT (DIVE-9310). The table above names one site's
+# splash; most apps draw theirs with no words at all. Box report 1453: `snapshot`
+# of a messaging web app came back as its SVG logo (0 nodes, word_count 0), rc 0,
+# and the agent filed it as a broken page; 25 s later the same tab had 64 refs
+# and 547 words. So, for any site: nothing to act on AND nothing to read is not
+# the page. Both halves, because a plain article with no links has no refs and
+# is still the page, and a bare form has no words and is still the page.
+# "Nothing to read" is the body's text with scripts, styles, SVG, <noscript>
+# and <template> taken out, plus the text the executor read (`act`), so a page
+# whose only words are a field's value still counts as having some. Any doubt
+# (no node, an unreadable file) reads as "has text": the old rc 0, never a new
+# false NOT READY.
+_EMPTY_TEXT_JS='const fs = require("fs"); const [html, exe] = process.argv.slice(1); let t = "";
+try { if (exe) t = String(JSON.parse(fs.readFileSync(exe, "utf8")).text || ""); } catch (e) {}
+let s = fs.readFileSync(html, "utf8").replace(/<!--[\s\S]*?-->/g, " ").replace(/<head[\s>][\s\S]*?<\/head\s*>/gi, " ");
+for (const tag of ["script", "style", "svg", "noscript", "template", "title"]) s = s.replace(new RegExp("<" + tag + "\\b[\\s\\S]*?</" + tag + "\\s*>", "gi"), " ");
+s = s.replace(/<[^>]*>/g, " ").replace(/&(nbsp|amp|lt|gt|quot|apos|#160|#xa0);/gi, " ");
+process.exit(/[\p{L}\p{N}]/u.test(t + " " + s) ? 1 : 0);'
+_empty_capture() {  # _empty_capture <page.html> [<tree.json>] [<executor.json>] -> rc 0 when the capture is empty
+  local html="$1" tree="${2:-}" exe="${3:-}" n
+  if [[ -n "$tree" && -s "$tree" ]]; then
+    n=$(jq '.nodes | length' "$tree" 2>/dev/null)
+  else
+    n=$(grep -oiE '<(a|button|input|select|textarea)[[:space:]>]' "$html" 2>/dev/null | wc -l)
+  fi
+  [[ "$n" == 0 ]] || return 1
+  node -e "$_EMPTY_TEXT_JS" "$html" "$exe" 2>/dev/null
+}
+
 _wait_for_ok() { [[ -n "$1" && ${#1} -le 500 && "$1" != *$'\n'* ]]; }
 
-# _ready_verdict <url> <wait-for> <wait-json|null> <page.html> [<tree.json>] [<partial>] [<capture>]
+# _ready_verdict <url> <wait-for> <wait-json|null> <page.html> [<tree.json>] [<partial>] [<capture>] [<executor.json>]
 # Prints the metadata fragment (partial / wait_for / loading_screen) on stdout and
 # says why on stderr. Returns E_NOT_READY when what was captured is not the page.
+# An empty capture (DIVE-9310) is named loading_screen "empty". A --wait-for
+# switches that rule off: met, the agent named what the page is; unmet, the
+# capture is already NOT READY above.
 #
 # A --wait-for the capture did not ANSWER is not a met one: a served browser whose
 # daemon started before this release ignores the field and captures at the
@@ -7785,7 +7889,7 @@ _wait_for_ok() { [[ -n "$1" && ${#1} -le 500 && "$1" != *$'\n'* ]]; }
 # was not there, and following it changed nothing. A timeout is a separate branch
 # below: an answer with met:false, never a missing one.
 _ready_verdict() {
-  local url="$1" want="$2" got="${3:-null}" html="$4" tree="${5:-}" partial="${6:-false}" source="${7:-session-daemon}" screen="" rc=0
+  local url="$1" want="$2" got="${3:-null}" html="$4" tree="${5:-}" partial="${6:-false}" source="${7:-session-daemon}" exe="${8:-}" screen="" rc=0
   [[ -n "$got" ]] || got=null
   if [[ -n "$want" && "$got" == null && "$source" != session-daemon ]]; then
     printf '%s: NOT READY — --wait-for=%s was not answered: the %s capture came back without a verdict on it (the field was missing, or its reply could not be read), so nothing says this is the page you waited for. No daemon was involved; restarting one will not change it.\n' "$PROG" "$want" "$source" >&2
@@ -7808,6 +7912,11 @@ _ready_verdict() {
   if screen=$(_loading_screen "$url" "$html" "$tree"); then
     printf '%s: LOADING SCREEN — %s is still showing the %s loading page (%s interactive nodes). This capture is NOT the page you asked for. Run it again with --wait-for=<something the loaded page has>, e.g. --wait-for='"'"'[role=main]'"'"'.\n' \
       "$PROG" "$url" "${screen% *}" "${screen##* }" >&2
+    partial=true; rc=$E_NOT_READY
+  elif [[ -z "$want" ]] && _empty_capture "$html" "$tree" "$exe"; then
+    printf '%s: NOT READY — %s shows nothing to act on yet (0 nodes, no text), most likely still loading. This capture is NOT the page (partial: true). Look again in a few seconds (snapshot with no URL reads the same tab without reloading it), or use --wait-for=<something the loaded page has>. A page that truly has no words (an image, a canvas): name what it shows with --wait-for and this check steps aside.\n' \
+      "$PROG" "${url:-the page}" >&2
+    screen="empty 0"
     partial=true; rc=$E_NOT_READY
   else
     screen=""
@@ -9517,7 +9626,7 @@ cmd_act() {
   local extra="{}" rrc=0
   if [[ -s "$stage/page.html" ]]; then
     extra=$(_ready_verdict "$final" "$wait_for" "$(jq -c '.wait_for // null' "$stage/after.json" 2>/dev/null || echo null)" \
-              "$stage/page.html" "$stage/tree.json") || rrc=$?
+              "$stage/page.html" "$stage/tree.json" false "" "$stage/after.json") || rrc=$?
     extra=$(_capture_facts "$extra" "$stage/after.json")
     # A SERVED ACT SAYS WHAT CHANGED, and page.md is not derived (DIVE-6795): it
     # cost 0.9-4 s of Defuddle per act for text the agent mostly did not read.
