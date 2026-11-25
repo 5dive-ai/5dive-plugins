@@ -44,6 +44,7 @@ These don't translate to Codex's runtime, mentioned for completeness:
 - v0.5.47 — DIVE-7730: a non-picture chat attachment goes to the model as its path, not as an image.
 - v0.5.48 — DIVE-7811: a chat reply over 70 words goes back to the agent to cut; only the rewrite is sent (shared `replycap.ts`).
 - v0.5.49 — DIVE-7825: a Telegram poll with no answer is cut off at 45 s and retried, logged, and recorded in `bot.lastpoll` (shared `pollguard.ts`).
+- v0.5.55 — DIVE-9316: a transient turn failure (stream drop / 5xx / timeout) with no answer re-runs the message (max 2); `lastTurnError` in health.json. Residual: messages steered into the cut-off turn are not re-run on their own (they are in the thread); codex has already retried the stream itself before it fails the turn.
 - v0.5.54 — DIVE-8896: a getUpdates 409 (second poller on the token) is logged and recorded in `bot.conflict`, and `bot.lastpoll` no longer moves on it (shared `pollguard.ts`).
 - v0.5.53 — DIVE-8464: channel plugins as adapters (`CODEX_DISPATCHER_PLUGIN_ADAPTERS`); Teams runs on Codex seats. Residual: no `edit_message`/`ask_admin` for an adapter channel. Hooks 5dive wired are trusted at boot (`CODEX_DISPATCHER_TRUST_HOOKS`, hook-trust.ts): app-server has no hook-trust bypass and skipped them.
 - v0.5.52 — DIVE-8462: plan-refused model falls back to the account's `model/list`. Residual: the pick is list order (newest first per Codex), not a price check; a seat whose config layer overrides `model` re-announces the switch after each restart.

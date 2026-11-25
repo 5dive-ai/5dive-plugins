@@ -153,6 +153,8 @@ function publishHealth(): void {
           lastCached: ctx.lastCached, lastOutput: ctx.lastOutput, calls: ctx.calls, at: ctx.at }
       : undefined
     health.lastSession = snap.sessions?.at(-1)
+    // DIVE-9316: the newest failed turn, until a later one completes.
+    health.lastTurnError = snap.lastTurnError
     health.rateLimits = dispatcher.rateLimits()
     health.active = snap.active
       ? { turnId: snap.active.turnId, source: snap.active.route.source, startedAt: health.active?.turnId === snap.active.turnId ? health.active.startedAt : new Date().toISOString() }
@@ -300,6 +302,9 @@ async function publish(route: DispatchRoute, text: string, meta: Record<string, 
     // owner's chat; this one is the teammate's copy. Unreachable is said here,
     // where an operator reading the seat's log will look for it.
     if (meta.ownerUnreachable) process.stderr.write('codex-dispatcher: a message for the owner was dropped: no paired Telegram owner and no chat served yet\n')
+    // DIVE-9316: nobody reads a teammate turn's error notice; the log and
+    // health.json (lastTurnError) are where its failure is seen.
+    if (meta.kind === 'error') process.stderr.write(`codex-dispatcher: a teammate turn failed: ${text}\n`)
     return
   }
   if (!outbound.text) throw new Error('dispatcher reply has no text after attachment directives')

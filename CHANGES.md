@@ -1,5 +1,12 @@
 ## Unreleased
 
+### Fixed — telegram-codex 0.5.55: a turn cut off by a dropped stream is re-run, not dropped (DIVE-9316)
+
+- Box report 1450: Codex seats stopped mid-task and needed a nudge. A turn that ended on "stream disconnected" was final and silent: the dispatcher cleared it and moved on, a heartbeat turn's error notice went nowhere, and the row sat in progress until the reaper took it 20+ minutes later.
+- Now a failed turn whose error is transient (`codexErrorInfo` of a stream/connection/server failure, else the text: stream disconnected, 5xx, timeout) and that sent no final answer runs the same message again, ahead of the queue, with a "you were cut off, continue" preface. At most 2 re-runs (`MAX_DROP_RETRIES`); then the error goes out as before. Usage limits, context overflow and refusals are never re-run.
+- `health.json` gets `lastTurnError` (`at`, `detail`, `source`, `messageId`, `transient`, `retrying`, `attempt`), cleared by the next completed turn. Optional field, no schema bump. A teammate turn's failure is also logged to stderr.
+- Harness: `test/dive9316-codex-stream-drop-retry.test.ts` (6 arms; with the requeue removed 3 go red).
+
 ### Changed — devteam 0.4.6: seating the mod guard on new Claude agents lives here now (DIVE-9307)
 
 - `lib/mod_seat.sh` left the 5dive CLI (5dive-ai/5dive, DIVE-9307, step 4 of DIVE-9262): it seats `mod@5dive-plugins` and its function-hooks flag on new Claude seats, and backs `doctor --category=mod`, on 5dive's own box only (`5dive config mod-seat=on`; off everywhere else). It moved here verbatim as `core/lib/mod_seat.sh`, an optional module like `task/filing_cap.sh`: the CLI's four callers ask `declare -F` first, so either side can ship first, and a box without this plugin reads `mod-seat = off`.
