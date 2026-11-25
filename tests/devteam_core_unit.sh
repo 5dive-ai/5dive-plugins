@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # DIVE-6935/6938 — plugins/devteam/core/ is read INTO the 5dive CLI (its
 # src/lib/devteam.sh), inside the CLI's own process. So the files must parse,
-# must be exactly the nine modules that loader knows, must not declare a
+# must be exactly the modules that loader knows (nine required, plus the
+# optional task/filing_cap.sh since DIVE-9262), must not declare a
 # column-0 array without -g (it would bind as a local of the loader function),
 # and must match core/SOURCE. Since DIVE-6938 the core keeps no copy: these
 # files are the code, and SOURCE is their manifest.
@@ -12,7 +13,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 D=plugins/devteam
-FILES="cmd_deploy.sh cmd_gh.sh cmd_proof.sh cmd_push.sh lib/gh_config.sh task/delivery.sh task/gate_evidence.sh task/grader_pool.sh task/grader_process.sh"
+FILES="cmd_deploy.sh cmd_gh.sh cmd_proof.sh cmd_push.sh lib/gh_config.sh task/delivery.sh task/filing_cap.sh task/gate_evidence.sh task/grader_pool.sh task/grader_process.sh"
 
 if [[ "${1:-}" == --rehash ]]; then
   {
@@ -66,6 +67,14 @@ want=$(awk '$2 == "cmd_gh.sh" { print $1 }' "$D/core/SOURCE")
 cp "$D/core/task/grader_pool.sh" "$tmp"; printf '_pace_band() { :; }\n' >> "$tmp"
 t "T0b a pace function pasted back is caught by T9's count" 1 "$(grep -cE '^_pace_[A-Za-z0-9_]*\(\)' "$tmp")"
 rm -f "$tmp"
+
+# DIVE-9262: the optional filing cap must not define a name the core keeps, or
+# a core that reads it refuses the whole plugin.
+for fn in _task_internal_subject_reason _task_internal_recent_ratio _task_filing_ratio_cap _task_agent_task_cap_default; do
+  t "T13 task/filing_cap.sh defines $fn" 1 "$(grep -cE "^${fn}\(\)" "$D/core/task/filing_cap.sh")"
+done
+t "T14 its default for the core's agent-task-cap is 15" 15 \
+  "$(bash -c ". $D/core/task/filing_cap.sh; _task_agent_task_cap_default")"
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

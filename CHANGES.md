@@ -1,5 +1,10 @@
 ## Unreleased
 
+### Changed — devteam 0.4.4: 5dive's filing cap lives here now, not in the CLI (DIVE-9262)
+
+- The title-word filing cap (harness, lint, rails, smoke…), its 1-in-4 refusal at `task add` and its grader skip refused customers' own tasks, so the 5dive CLI dropped them (5dive-ai/5dive, DIVE-9262). They moved here verbatim as `core/task/filing_cap.sh`, an optional module: a CLI that knows it reads it, an older CLI ignores it, so either side can ship first. It also supplies 15 as the default for the CLI's new `agent-task-cap` owner setting, so 5dive's own boxes keep today's per-agent cap.
+- Harness: `tests/devteam/filing_ratio_cap_unit.sh` carries the cap's arms from the CLI's `task_verifier_rail_unit.sh` (T11/T12), unchanged; `tests/devteam_core_unit.sh` T13/T14.
+
 ### Changed — phone 0.2.0: type in any language; a restart needs one switch, not a port (DIVE-9242)
 
 - `plugins/phone` synced to 5dive-phone 0.2.0. `type` now takes any text (Cyrillic, accents, emoji, line breaks): it is pasted through `lib/type.dex`, our own code built from `android/src`, copied to the phone's temp folder for that step and deleted after; no app is installed. After a restart the owner only switches Wireless debugging back on and the next command finds the new port (`lib/ports.py`). Details: 5dive-phone's CHANGES.md.
