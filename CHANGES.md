@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Added — phone 0.3.0: routines, shown once and repeated with no AI (DIVE-9347)
+
+- `plugins/phone` synced from 5dive-ai/5dive-phone 0.3.0 (`bash tests/phone_mirror.sh sync`). `act --record=<name>` keeps a run's steps by control name, never sign-in text; the save asks the owner (the browser's ask, grant bound to the steps); `replay <name>` runs it with no model and stops on a wrong screen (exit 65), naming the step. Details: 5dive-phone's CHANGES.md. Merge 5dive-phone first.
+
 ### Fixed — mod 0.6.5: the guard lets 5dive-bot open a list PR on someone else's repo (DIVE-9350)
 
 - lodar gave a standing yes on 2026-11-26: a PR that adds a 5dive entry to a free list, opened as 5dive-bot, needs no per-thread approval. `external-reply` could not tell `5dive gh --as=bot` from the seat's own `gh` login, so it refused marketing's awesome-pi PR on two seats. Its one check is now two: `gh-comment-foreign-repo` (pr/issue comment, pr review, issue create; still refused from any login, the bot included) and `gh-pr-create-foreign-repo-not-bot` (a `pr create` refused unless it runs as `5dive gh --as=bot`, the wrapper's explicit bot form; `5dive gh` with no `--as`, `--as=caller` and a later `--as=` that overrides it stay refused).

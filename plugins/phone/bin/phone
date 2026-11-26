@@ -21,6 +21,15 @@
 # so the owner's one-tap Approve in Telegram (`5dive owner-ask`) and
 # `sudo 5dive browser approve <id>` answer a phone ask exactly as a browser one.
 #
+# ROUTINES (DIVE-9347): `act --record=<name>` keeps the steps a run took, by the
+# NAME of each control (button/Share), never by its number, and never the text
+# typed into a sign-in box. The save asks the owner, like a Send under careful,
+# and the yes is bound to those exact steps: change one and it asks again.
+# `replay <name>` runs them with no model, one call (cron can run it daily). Each
+# step first checks it is on the screen it was recorded on (same app, the same
+# control there); a wrong screen STOPS the replay (exit 65) and names the step.
+# v1 never repairs a routine on its own.
+#
 # EVERY STEP IS LOGGED in the seat's own ~/.5dive/phone/actions.jsonl (0600).
 # Screenshots stay in ~/.5dive/phone/shots (0700) and are never printed into a
 # log or a chat by this command: it prints their path, nothing else.
@@ -38,7 +47,7 @@ APPROVAL_KINDS="pay publish send delete"
 APPROVAL_DEFAULTS='{"pay":"ask","publish":"allow","send":"allow","delete":"allow"}'
 JSON="${FIVEDIVE_JSON_MODE:-0}"
 
-E_USAGE=2 E_UNAVAILABLE=69 E_OWNER=73
+E_USAGE=2 E_CHECK=65 E_UNAVAILABLE=69 E_OWNER=73
 die() { local rc="$1"; shift; printf '%s: %s\n' "$PROG" "$*" >&2; exit "$rc"; }
 note() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -56,7 +65,7 @@ usage() {
   5dive phone snapshot [--interactive] [--json]
                                         the screen as controls with refs:
                                         [e3] button "Send"  ⚠ send
-  5dive phone act --steps='[...]' [--approved=<id>] [--expect=<regex>]
+  5dive phone act --steps='[...]' [--approved=<id>] [--expect=<regex>] [--record=<name>]
       {"op":"open","app":"com.whatsapp"}     {"op":"open","url":"https://…"}
       {"op":"tap","ref":"e3"}                {"op":"tap","x":540,"y":1200}
       {"op":"tap","ref":"button/Send"}       a ref BY NAME (role/label) is found on
@@ -70,6 +79,16 @@ usage() {
       (exit 73) and asks your owner. Label any other step that sends, posts,
       pays or deletes with "kind":"send" etc. (an Enter that sends, a swipe).
       After the steps it prints the screen they left.
+      --record=<name> keeps these steps as a ROUTINE (by control name, never
+      what was typed into a sign-in box) and asks your owner to approve it.
+  5dive phone replay <name> [--values='["…"]'] [--wake-on-stop] [--json]
+                                        run a saved routine again WITHOUT the model,
+                                        once your owner approved it. A step on the
+                                        wrong screen STOPS it (exit 65) and names the
+                                        step. --values fills its sign-in boxes, in
+                                        order. Daily: crontab -e, then
+                                        0 8 * * * 5dive phone replay <name> --wake-on-stop
+  5dive phone routine ls | show <name> [--json] | forget <name>
   5dive phone screenshot [--out=<file>] a PNG of the screen, saved privately
   5dive phone log [--n=20]              the steps this seat ran on the phone
   5dive phone approvals policy [--json] your owner's policy (shared with browser)
@@ -517,87 +536,78 @@ _preflight_kind() {  # <step-json> -> "kind<TAB>label"
   printf '%s\t%s\n' "$k" "$label"
 }
 
-cmd_act() {
-  local steps="" approved="" expect="" a
-  for a in "$@"; do
-    case "$a" in
-      --steps=*) steps="${a#*=}" ;;
-      --approved=*) approved="${a#*=}" ;;
-      --expect=*) expect="${a#*=}" ;;
-      *) die "$E_USAGE" "unknown argument: $a (usage: 5dive phone act --steps='[...]')" ;;
-    esac
-  done
-  [[ -n "$steps" ]] || die "$E_USAGE" "usage: 5dive phone act --steps='[{\"op\":\"tap\",\"ref\":\"e3\"}]'"
-  jq -e 'type == "array" and length > 0 and all(.[]; type == "object" and (.op | type == "string"))' <<<"$steps" >/dev/null 2>&1 \
-    || die "$E_USAGE" "--steps must be a JSON array of steps, each with an \"op\""
-  local bad; bad="$(jq -r '[.[] | select(.op == "type") | .text // "" | select(length > 4000)] | length' <<<"$steps")"
-  (( bad == 0 )) || die "$E_USAGE" "a type step has more than 4000 characters: split it into several type steps"
-  _ensure_connected; _init_home; _wake
-
-  local hash pol granted=0 n i
-  hash="$(_act_hash "$DEV" "$steps")"
-  pol="$(_policy_json)"
-  if [[ -n "$approved" ]]; then
-    _grant_ok "$approved" "$hash"; case $? in
-      0) granted=1 ;;
-      2) die "$E_OWNER" "approval $approved was for different steps. Re-run the exact steps the owner approved, or ask again." ;;
-      3) die "$E_OWNER" "approval $approved has expired (good for $((APPROVAL_TTL/60)) minutes). Ask again." ;;
-      *) die "$E_OWNER" "approval $approved is not granted (yet). The owner answers it: the Approve button, or sudo 5dive browser approve $approved" ;;
-    esac
-  fi
-  n="$(jq 'length' <<<"$steps")"
-  local app; app="$(_current_app)"
-  local typed=""; typed="$(jq -r '[.[] | select(.op == "type") | .text // ""] | last // ""' <<<"$steps")"
-
-  # PREFLIGHT: a step the owner must allow stops the act BEFORE any step runs, so
-  # an approved re-run does not type the same text twice.
-  if (( ! granted )); then
-    local kl k label
-    for (( i = 0; i < n; i++ )); do
-      kl="$(_preflight_kind "$(jq -c ".[$i]" <<<"$steps")")"; k="${kl%%$'\t'*}"; label="${kl#*$'\t'}"
-      [[ -n "$k" ]] || continue
-      if [[ "$(jq -r --arg k "$k" '.[$k]' <<<"$pol")" == ask ]]; then
-        _log "$(jq -nc --argjson i $((i+1)) --arg k "$k" --arg l "$label" --arg a "$app" '{step:$i, op:"stop", kind:$k, label:$l, app:$a, allowed_by:"asked owner"}')"
-        _owner_ask "$hash" "$steps" "$((i+1))" "$k" "$label" "$typed" "$app"
-        exit "$E_OWNER"
-      fi
-    done
-  fi
-
-  local s op ref x y r W H res kind lbl by
+# ---------- the steps, run (act and replay share this) ----------
+# Reads the caller's locals (bash scope is dynamic): steps n hash pol granted
+# approved typed app, MODE (act|replay), record, and for a replay R_NAME R_ASK.
+# A record appends each step, as it is kept, to REC.
+_run_steps() {
+  local s op ref x y r W H res kind lbl by now="" want rk named try ok nm nk secret first_open
   read -r W H < <(_screen_size)
+  # The steps before a routine's first open only lead to its start (home, back):
+  # they run from any screen, so they keep no app to check.
+  first_open="$(jq '[.[].op] | index("open") // -1' <<<"$steps")"
   for (( i = 0; i < n; i++ )); do
     s="$(jq -c ".[$i]" <<<"$steps")"; op="$(jq -r .op <<<"$s")"; ref="$(jq -r '.ref // ""' <<<"$s")"
     kind="$(jq -r '.kind // ""' <<<"$s")"; [[ " $APPROVAL_KINDS " == *" $kind "* ]] || kind=""
-    lbl="" x="" y="" res=""
+    rk="$kind"
+    lbl="" x="" y="" res="" named=0
+    # CHECKPOINT 1, the app: the step runs on the app it was recorded on.
+    if [[ "$MODE" == replay || -n "$record" ]]; then now="$(_current_app)"; fi
+    if [[ "$MODE" == replay ]]; then
+      want="$(jq -r '.check.app // ""' <<<"$s")"
+      [[ -z "$want" || "$op" == open || "$now" == "$want" ]] \
+        || _checkpoint_stop "$((i+1))" "$s" "the phone shows ${now:-no app} instead of $want"
+    fi
     # Where a ref or a point lands NOW, read on a fresh dump.
     if [[ -n "$ref" && "$op" =~ ^(tap|type|clear)$ ]]; then
       # A screen mid-change, or an app whose tree comes and goes between dumps
       # (a browser's web page does), is read again before the step gives up.
-      local try ok=0
+      ok=0
       for try in 1 2 3; do
         _dump "$HOME_DIR/ui-now.xml"
         res="$(python3 "$UI" resolve "$HOME_DIR/refs.json" "$ref" "$HOME_DIR/ui-now.xml" 2>&1)" && { ok=1; break; }
-        sleep 1
+        sleep "${FIVEDIVE_PHONE_RETRY_WAIT:-1}"
       done
-      (( ok )) || die "$E_USAGE" "step $((i+1)): $res"
-    elif [[ "$op" == tap ]]; then
+      if (( ! ok )); then
+        # CHECKPOINT 2, the control: the button the routine taps is not there.
+        [[ "$MODE" == replay ]] && _checkpoint_stop "$((i+1))" "$s" "there is no $(_ref_words "$ref") on the screen"
+        die "$E_USAGE" "step $((i+1)): $res"
+      fi
+    elif [[ "$op" == tap || ( "$op" =~ ^(type|clear)$ && -n "$(jq -r '.x // empty' <<<"$s")" ) ]]; then
       x="$(jq -r '.x // empty' <<<"$s")"; y="$(jq -r '.y // empty' <<<"$s")"
       [[ "$x" =~ ^[0-9]+$ && "$y" =~ ^[0-9]+$ ]] || die "$E_USAGE" "step $((i+1)): a tap needs a ref or x and y"
       _dump "$HOME_DIR/ui-now.xml"
       res="$(python3 "$UI" at "$HOME_DIR/ui-now.xml" "$x" "$y")"
+      if [[ "$MODE" == replay ]]; then
+        want="$(jq -r '.check.label // empty' <<<"$s")"
+        [[ -z "$want" || "$(jq -r .label <<<"$res")" == "$want" ]] \
+          || _checkpoint_stop "$((i+1))" "$s" "at that spot is \"$(jq -r .label <<<"$res")\", not \"$want\""
+      fi
     fi
     if [[ -n "$res" ]]; then
       x="$(jq -r .x <<<"$res")"; y="$(jq -r .y <<<"$res")"; lbl="$(jq -r .label <<<"$res")"
       [[ "$op" == tap && -z "$kind" ]] && kind="$(jq -r .kind <<<"$res")"
       [[ "$(jq -r .stale <<<"$res")" == true ]] && note "step $((i+1)): $ref is not on the screen any more; tapping where it was. Take a fresh snapshot if this misses."
+      # A recorded step is kept by NAME when the name finds this same control.
+      if [[ -n "$record" && -n "$ref" && "$(jq -r .stale <<<"$res")" != true ]]; then
+        nm="$(jq -r '.role + "/" + .label' <<<"$res")"
+        [[ "$(python3 "$UI" resolve "$HOME_DIR/refs.json" "$nm" "$HOME_DIR/ui-now.xml" 2>/dev/null | jq -r '"\(.x) \(.y)"' 2>/dev/null)" == "$x $y" ]] && named=1
+      fi
+    fi
+    # CHECKPOINT 3, what the step does: a replayed tap that would now pay, post,
+    # send or delete when the approved routine's step did not is a different screen.
+    if [[ "$MODE" == replay && "$op" == tap && -n "$res" ]]; then
+      nk="$(jq -r '.kind // ""' <<<"$res")"
+      [[ -z "$nk" || "$nk" == "$rk" ]] || _checkpoint_stop "$((i+1))" "$s" "that button would now $(_verb_of "$nk"), which the approved routine did not"
     fi
     # A kind the preflight could not see (a tap by position, a control that changed).
     by="-"
     if [[ -n "$kind" ]]; then
       case "$(jq -r --arg k "$kind" '.[$k]' <<<"$pol")" in
         ask)
-          if (( granted )); then by="approved $approved"; else
+          if (( granted )); then by="approved $approved"
+          elif [[ "$MODE" == replay ]]; then by="routine $R_NAME (approved $R_ASK)"
+          else
             _log "$(jq -nc --argjson i $((i+1)) --arg k "$kind" --arg l "$lbl" --arg a "$app" '{step:$i, op:"stop", kind:$k, label:$l, app:$a, allowed_by:"asked owner"}')"
             _owner_ask "$hash" "$steps" "$((i+1))" "$kind" "$lbl" "$typed" "$app"
             exit "$E_OWNER"
@@ -653,12 +663,288 @@ cmd_act() {
         sleep "$(awk -v m="$r" 'BEGIN{printf "%.3f", m/1000}')" ;;
       *) die "$E_USAGE" "step $((i+1)): unknown op \"$op\" (open, tap, type, clear, key, scroll, swipe, wait)" ;;
     esac
+    # Text typed into a sign-in box is never logged nor kept in a routine.
+    secret=false
+    [[ -n "$res" && "$op" == type && "$(jq -r '.signin // false' <<<"$res")" == true ]] && secret=true
+    [[ "$(jq -r '.secret // false' <<<"$s")" == true ]] && secret=true
     _log "$(jq -nc --argjson i $((i+1)) --arg op "$op" --arg l "$lbl" --arg k "$kind" --arg a "$app" --arg by "$by" \
-      --argjson s "$s" '{step:$i, op:$op, label:$l, kind:$k, app:$a, allowed_by:$by}
-        + (if $op == "type" then {text:($s.text // "")} elif $op == "open" then {target:($s.app // $s.url)} elif $op == "key" then {key:$s.key} else {} end)')"
+      --argjson s "$s" --argjson sec "$secret" --arg r "$R_NAME" '{step:$i, op:$op, label:$l, kind:$k, app:$a, allowed_by:$by}
+        + (if $r != "" then {routine:$r} else {} end)
+        + (if $op == "type" then {text:(if $sec then "(a sign-in, not logged)" else ($s.text // "") end)} elif $op == "open" then {target:($s.app // $s.url)} elif $op == "key" then {key:$s.key} else {} end)')"
+    if [[ -n "$record" ]]; then
+      local ca="$now"; (( i < first_open )) && ca=""
+      REC="$(jq -c --argjson r "$(_rec_step "$s" "${res:-null}" "$ca" "$kind" "$named" "$secret")" '. + [$r]' <<<"$REC")"
+    fi
     sleep "${FIVEDIVE_PHONE_STEP_GAP:-0.4}"
   done
+}
+
+# ---------- routines (DIVE-9347) ----------
+_routine_dir() { printf '%s/routines\n' "$HOME_DIR"; }
+_routine_file() { printf '%s/%s.json\n' "$(_routine_dir)" "$1"; }
+_routine_name_ok() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$ ]]; }
+# The owner's yes is bound to this: the name and the exact steps, checks included.
+_routine_hash() { printf 'phone-routine:%s\n%s\n' "$1" "$(jq -cS . <<<"$2")" | sha256sum | cut -d' ' -f1; }
+# Remove an ask and its grant from the approvals directory (an edit or a forget).
+_ask_drop() { local ad; ad="$(_approval_dir)"; [[ -n "$1" ]] || return 0; rm -f -- "${ad:?}/${1:?}.json" "${ad:?}/${1:?}.granted" 2>/dev/null; }
+
+# One step as it is KEPT: a control by name (button/Share) when the name finds
+# that same control, else the point plus the words that must be there; the app it
+# ran on; never the text typed into a sign-in box.
+_rec_step() {  # <step> <res|null> <app> <kind> <named 0|1> <secret true|false>
+  jq -c --argjson res "$2" --arg app "$3" --arg k "$4" --arg named "$5" --argjson sec "$6" '
+    . as $s
+    | ({op: $s.op}
+       + (if $res != null and $named == "1" then {ref: ($res.role + "/" + $res.label)}
+          elif $res != null and ($s.op == "tap" or $s.op == "type" or $s.op == "clear") then {x: $res.x, y: $res.y}
+          else ($s | del(.op, .ref, .text, .kind, .clear, .secret, .check)) end)
+       + (if $s.op == "type" then (if $sec then {secret: true} else {text: ($s.text // "")} end) + (if $s.clear then {clear: true} else {} end) else {} end)
+       + (if $k != "" then {kind: $k} else {} end)
+       + (if $s.op == "open" then {} else
+           {check: ({app: $app} + (if $res != null and $named != "1" and $res.label != "" then {label: $res.label} else {} end))
+                   | with_entries(select(.value != ""))} end))
+    | if .check == {} then del(.check) else . end' <<<"$1"
+}
+
+_ref_words() { local r="$1"; if [[ "$r" == */* ]]; then printf '%s "%s"' "${r%%/*}" "${r#*/}"; else printf '%s' "$r"; fi; }
+
+# A step in a person's words, for the owner's ask and for a stop.
+_step_words_jq='
+  def w: if .op == "open" then "open " + (.app // .url)
+    elif .op == "tap" then "tap " + (if .ref then (.ref | sub("^[^/]*/"; "") | "\"" + . + "\"") else "\"\(.check.label // "")\" at \(.x),\(.y)" end)
+                          + (if .kind then " (" + .kind + ")" else "" end)
+    elif .op == "type" then (if .secret then "type a sign-in (never kept; given at each run)" else "type \"" + (.text // "" | .[0:60]) + "\"" end)
+                          + (if .ref then " in " + (.ref | sub("^[^/]*/"; "")) else "" end)
+    elif .op == "clear" then "clear " + (.ref // "a box" | sub("^[^/]*/"; ""))
+    elif .op == "key" then "press " + (.key // "")
+    elif .op == "scroll" then "scroll " + (.dir // "down")
+    elif .op == "wait" then "wait \(.ms // 1000) ms"
+    else .op end;'
+_step_words() { jq -r "$_step_words_jq w" <<<"$1"; }
+
+# THE SAVE ASKS. Written in the browser's request format, like a Send under
+# careful, so the owner's Approve button and `sudo 5dive browser approve <id>`
+# answer it. The request's hash is the routine's, so the grant fits only these
+# steps; it is kept (not spent) because it approves the routine, not one run.
+_routine_save() {  # <name> <steps-json>
+  local name="$1" rs="$2" f h ad id old model where shot
+  mkdir -p "$(_routine_dir)" && chmod 700 "$(_routine_dir)"
+  f="$(_routine_file "$name")"
+  old="$(jq -r '.ask // ""' "$f" 2>/dev/null)"
+  h="$(_routine_hash "$name" "$rs")"
+  ad="$(_approval_dir)"; mkdir -p "$ad" && chmod 700 "$ad" 2>/dev/null
+  # An edit asks again: the yes for the old steps goes with them.
+  _ask_drop "$old"
+  id="$(_seat)-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  model="$(_adb shell getprop ro.product.model 2>/dev/null | tr -d '\r')"
+  where="your phone${model:+ ($model)}"
+  ( umask 077; jq -n --arg n "$name" --argjson s "$rs" --arg ask "$id" --arg dev "$DEV" --argjson at "$(date +%s)" \
+      '{name:$n, saved_at:$at, device:$dev, ask:$ask, steps:$s}' > "$f.tmp" && mv -f -- "$f.tmp" "$f" ) \
+    || die 1 "could not save the routine at $f"
+  shot="$HOME_DIR/shots/ask-$id.png"; _shot "$shot" || shot=""
+  jq -n --arg id "$id" --arg seat "$(_seat)" --arg site "$where" --arg h "$h" --argjson s "$rs" --arg n "$name" \
+        --arg shot "$shot" --argjson at "$(date +%s)" "$_step_words_jq"'
+    {id:$id, seat:$seat, site:$site, hash:$h, steps:$s, class:"save a routine", label:("routine " + $n), step:"save",
+     page:("routine " + $n), screenshot:$shot, asked_at:$at, source:"phone-routine",
+     payload:({"saves the routine": ($n + ": \($s | length) steps, repeated with no AI")}
+              + ([$s | to_entries[] | select(.key < 12) | {key: ("step \(.key + 1)"), value: (.value | w)}] | from_entries)
+              + (if ($s | length) > 12 then {more: "\(($s | length) - 12) more steps"} else {} end))}' > "$ad/$id.json" \
+    || { note "the ask could not be recorded; the routine stays unapproved"; return 0; }
+  _log "$(jq -nc --arg n "$name" --arg id "$id" --argjson c "$(jq length <<<"$rs")" '{op:"routine-save", routine:$n, steps:$c, ask:$id}')"
+  printf '%s: saved routine "%s" (%s steps). It does not run until your owner approves it.\n' "$PROG" "$name" "$(jq length <<<"$rs")" >&2
+  printf '  Ask the owner: "I saved a phone routine, %s, that repeats these steps with no AI. OK to keep it?"\n' "$name" >&2
+  printf '  The owner approves: the Approve button, or sudo 5dive browser approve %s (5dive phone routine show %s lists the steps)\n' "$id" "$name" >&2
+  local o rc=0
+  if have 5dive; then o=$(timeout 30 5dive owner-ask browser "$ad/$id.json" 2>/dev/null) || rc=$?; else rc=1; fi
+  (( rc == 0 )) && [[ -n "${o:-}" ]] && printf '  %s\n' "$o" >&2
+  if (( rc != 0 )) || [[ -z "${o:-}" || "${o:-}" == "not sent"* ]]; then
+    printf '  Put it on your row as ONE ask (the owner'"'"'s yes there is this approval):\n    5dive task need <your row> --type=approval --browser-ask=%s --ask="Keep the phone routine %s (it repeats on its own)?"\n' "$id" "$name" >&2
+  fi
+}
+
+# approved | waiting | declined | edited
+_routine_state() {  # <routine-file>
+  local f="$1" name ask h d g
+  name="$(jq -r .name "$f")"; ask="$(jq -r '.ask // ""' "$f")"
+  h="$(_routine_hash "$name" "$(jq -c .steps "$f")")"
+  d="$(_approval_dir)"; g="$d/$ask.granted"
+  if [[ -n "$ask" && -f "$g" && ! -L "$g" && "$(stat -c %u "$g" 2>/dev/null)" == "$(_grant_uid)" ]]; then
+    if [[ "$(jq -r '.hash // ""' "$g" 2>/dev/null)" == "$h" ]]; then echo approved; else echo edited; fi
+  elif [[ -n "$ask" && -f "$d/$ask.json" ]]; then
+    if [[ "$(jq -r '.hash // ""' "$d/$ask.json" 2>/dev/null)" == "$h" ]]; then echo waiting; else echo edited; fi
+  else
+    echo declined
+  fi
+}
+
+_routine_last() {  # <name> <ok|stopped> <step> <why>
+  ( umask 077; jq -nc --arg r "$2" --arg s "$3" --arg w "$4" --argjson at "$(date +%s)" '{at:$at, result:$r, step:$s, why:$w}' \
+      > "$(_routine_dir)/$1.last" ) 2>/dev/null || true
+}
+
+# A WRONG SCREEN STOPS THE REPLAY. Nothing after the step runs; the agent tells
+# the owner. v1 never repairs a routine on its own (a scheduled run that "fixes"
+# itself is a run nobody approved).
+WAKE_ON_STOP=0
+_checkpoint_stop() {  # <step#> <step-json> <what is wrong>
+  local i="$1" s="$2" why="$3" what shot msg
+  what="$(_step_words "$s")"
+  _init_home; shot="$HOME_DIR/shots/stop-$R_NAME-$(date -u +%Y%m%dT%H%M%SZ).png"; _shot "$shot" || shot=""
+  _log "$(jq -nc --arg r "$R_NAME" --argjson i "$i" --arg w "$why" --arg what "$what" '{op:"checkpoint-stop", routine:$r, step:$i, label:$what, why:$w}')"
+  _routine_last "$R_NAME" stopped "$i" "$why"
+  msg="My phone routine \"$R_NAME\" stopped at step $i of $n ($what): $why. I did not try to fix it. Shall I look?"
+  if [[ "$JSON" == 1 ]]; then
+    jq -nc --arg r "$R_NAME" --argjson i "$i" --argjson n "$n" --arg what "$what" --arg w "$why" --arg shot "$shot" --arg m "$msg" \
+      '{ok:false, routine:$r, stopped_at:$i, steps:$n, step:$what, why:$w, screenshot:$shot, tell_owner:$m}'
+  fi
+  printf '%s: STOPPED routine "%s" at step %s of %s (%s): wrong screen, %s. Steps before it ran; nothing after it did.\n' \
+    "$PROG" "$R_NAME" "$i" "$n" "$what" "$why" >&2
+  printf '  Tell your owner: "%s"\n' "$msg" >&2
+  [[ -n "$shot" ]] && printf '  screenshot: %s (the screen it stopped on)\n' "$shot" >&2
+  # From cron nobody reads stderr: --wake-on-stop wakes this seat's agent to tell the owner.
+  if (( WAKE_ON_STOP )) && have 5dive; then
+    timeout 30 5dive agent send "$(_seat | sed 's/^agent-//')" --message="5dive phone: $msg Tell your owner in one line, with the screenshot $shot. Do not re-run or edit the routine unasked." >/dev/null 2>&1 || true
+  fi
+  exit "$E_CHECK"
+}
+
+cmd_replay() {
+  local name="" values='[]' a
+  for a in "$@"; do
+    case "$a" in
+      --values=*) values="${a#*=}" ;;
+      --wake-on-stop) WAKE_ON_STOP=1 ;;
+      -*) die "$E_USAGE" "unknown flag: $a (usage: 5dive phone replay <name> [--values='[\"…\"]'] [--wake-on-stop])" ;;
+      *) [[ -z "$name" ]] || die "$E_USAGE" "one routine at a time"; name="$a" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "$E_USAGE" "usage: 5dive phone replay <name>  (saved ones: 5dive phone routine ls)"
+  _routine_name_ok "$name" || die "$E_USAGE" "not a routine name: $name"
+  local f; f="$(_routine_file "$name")"
+  [[ -r "$f" ]] || die "$E_USAGE" "no routine \"$name\" on this seat (5dive phone routine ls; save one with act --record=$name)"
+  jq -e '(.steps | type == "array" and length > 0) and (.name | type == "string")' "$f" >/dev/null 2>&1 || die 1 "routine $name is unreadable: $f"
+  jq -e 'type == "array" and all(.[]; type == "string")' <<<"$values" >/dev/null 2>&1 || die "$E_USAGE" "--values is a JSON array of strings, one per sign-in box, in order"
+  local R_NAME="$name" R_ASK MODE=replay REC='[]' record=""
+  R_ASK="$(jq -r '.ask // ""' "$f")"
+  # THE OWNER'S YES, for exactly these steps.
+  case "$(_routine_state "$f")" in
+    approved) ;;
+    waiting)  die "$E_OWNER" "routine $name is waiting for your owner's yes (ask $R_ASK: the Approve button, or sudo 5dive browser approve $R_ASK). Nothing ran." ;;
+    edited)   die "$E_OWNER" "routine $name changed since your owner approved it, so it does not run. Record it again (act --record=$name) to ask again. Nothing ran." ;;
+    *)        die "$E_OWNER" "routine $name has no yes from your owner (declined, or the ask was lost). Record it again to ask again. Nothing ran." ;;
+  esac
+  # Sign-in boxes take their text now, in order; it is never written down.
+  local need have_n steps
+  need="$(jq '[.steps[] | select(.secret == true)] | length' "$f")"; have_n="$(jq length <<<"$values")"
+  (( need == have_n )) || die "$E_USAGE" "routine $name types into $need sign-in box(es) and keeps none of it: pass --values='[…]' with $need value(s), in order (got $have_n). Nothing ran."
+  steps="$(jq -c --argjson v "$values" '
+      [foreach .steps[] as $s (-1; if $s.secret == true then . + 1 else . end;
+        if $s.secret == true then $s + {text: $v[.]} else $s end)]' "$f")"
+  _ensure_connected; _init_home; _wake
+  local hash="" pol granted=0 approved="" n typed="" app
+  pol="$(_policy_json)"; n="$(jq length <<<"$steps")"; app="$(_current_app)"
+  _log "$(jq -nc --arg r "$name" --arg a "$R_ASK" --argjson c "$n" '{op:"replay", routine:$r, steps:$c, allowed_by:("routine approved " + $a)}')"
+  _run_steps
+  _routine_last "$name" ok "$n" ""
+  if [[ "$JSON" == 1 ]]; then
+    jq -nc --arg r "$name" --argjson n "$n" --arg a "$(_current_app)" '{ok:true, routine:$r, steps:$n, app:$a, model_calls:0}'
+  else
+    printf 'replayed routine "%s": %s steps, every screen as recorded, no AI used. The phone now shows %s.\n' "$name" "$n" "$(_current_app)"
+  fi
+}
+
+cmd_routine() {
+  local verb="${1:-ls}"; shift || true
+  local d; d="$(_routine_dir)"
+  case "$verb" in
+    ls)
+      local f any=0 st last
+      for f in "$d"/*.json; do
+        [[ -r "$f" ]] || continue; any=1
+        st="$(_routine_state "$f")"
+        last="$(jq -r '"last run: " + (.at | todate) + " " + .result + (if .result == "stopped" then " at step \(.step)" else "" end)' "${f%.json}.last" 2>/dev/null)"
+        if [[ "$JSON" == 1 ]]; then
+          jq -c --arg st "$st" '{name, steps: (.steps | length), state: $st, ask}' "$f"
+        else
+          printf '%s\t%s steps\t%s%s\n' "$(jq -r .name "$f")" "$(jq '.steps | length' "$f")" \
+            "$(case "$st" in approved) echo approved ;; waiting) echo "waiting for your owner's yes" ;; edited) echo "changed since approved: record again" ;; *) echo "declined: record again to ask" ;; esac)" \
+            "${last:+	$last}"
+        fi
+      done
+      (( any )) || [[ "$JSON" == 1 ]] || echo "(no routines on this seat: save one with 5dive phone act --steps='[...]' --record=<name>)"
+      ;;
+    show)
+      local name="${1:-}"; _routine_name_ok "$name" || die "$E_USAGE" "usage: 5dive phone routine show <name>"
+      local f; f="$(_routine_file "$name")"; [[ -r "$f" ]] || die "$E_USAGE" "no routine \"$name\" (5dive phone routine ls)"
+      if [[ "$JSON" == 1 || "${2:-}" == --json ]]; then jq -c --arg st "$(_routine_state "$f")" '. + {state: $st}' "$f"; return 0; fi
+      printf 'routine %s: %s (ask %s)\n' "$name" "$(_routine_state "$f")" "$(jq -r .ask "$f")"
+      jq -r "$_step_words_jq"' .steps | to_entries[] | "  \(.key + 1). \(.value | w)" + (if .value.check.app then "   [on \(.value.check.app)]" else "" end)' "$f"
+      ;;
+    forget)
+      local name="${1:-}"; _routine_name_ok "$name" || die "$E_USAGE" "usage: 5dive phone routine forget <name>"
+      local f; f="$(_routine_file "$name")"; [[ -r "$f" ]] || die "$E_USAGE" "no routine \"$name\""
+      _ask_drop "$(jq -r '.ask // ""' "$f")"
+      rm -f -- "${f:?}" "${f%.json}.last"
+      _log "$(jq -nc --arg n "$name" '{op:"routine-forget", routine:$n}')"
+      printf 'forgot routine %s (and its approval)\n' "$name"
+      ;;
+    *) die "$E_USAGE" "usage: 5dive phone routine ls | show <name> | forget <name>" ;;
+  esac
+}
+
+cmd_act() {
+  local steps="" approved="" expect="" record="" a
+  for a in "$@"; do
+    case "$a" in
+      --steps=*) steps="${a#*=}" ;;
+      --approved=*) approved="${a#*=}" ;;
+      --expect=*) expect="${a#*=}" ;;
+      --record=*) record="${a#*=}" ;;
+      *) die "$E_USAGE" "unknown argument: $a (usage: 5dive phone act --steps='[...]')" ;;
+    esac
+  done
+  [[ -z "$record" ]] || _routine_name_ok "$record" || die "$E_USAGE" "a routine name is 1-48 letters, digits, - or _ (got: $record)"
+  [[ -n "$steps" ]] || die "$E_USAGE" "usage: 5dive phone act --steps='[{\"op\":\"tap\",\"ref\":\"e3\"}]'"
+  jq -e 'type == "array" and length > 0 and all(.[]; type == "object" and (.op | type == "string"))' <<<"$steps" >/dev/null 2>&1 \
+    || die "$E_USAGE" "--steps must be a JSON array of steps, each with an \"op\""
+  local bad; bad="$(jq -r '[.[] | select(.op == "type") | .text // "" | select(length > 4000)] | length' <<<"$steps")"
+  (( bad == 0 )) || die "$E_USAGE" "a type step has more than 4000 characters: split it into several type steps"
+  _ensure_connected; _init_home; _wake
+
+  local hash pol granted=0 n i
+  hash="$(_act_hash "$DEV" "$steps")"
+  pol="$(_policy_json)"
+  if [[ -n "$approved" ]]; then
+    _grant_ok "$approved" "$hash"; case $? in
+      0) granted=1 ;;
+      2) die "$E_OWNER" "approval $approved was for different steps. Re-run the exact steps the owner approved, or ask again." ;;
+      3) die "$E_OWNER" "approval $approved has expired (good for $((APPROVAL_TTL/60)) minutes). Ask again." ;;
+      *) die "$E_OWNER" "approval $approved is not granted (yet). The owner answers it: the Approve button, or sudo 5dive browser approve $approved" ;;
+    esac
+  fi
+  n="$(jq 'length' <<<"$steps")"
+  local app; app="$(_current_app)"
+  local typed=""; typed="$(jq -r '[.[] | select(.op == "type") | .text // ""] | last // ""' <<<"$steps")"
+
+  # PREFLIGHT: a step the owner must allow stops the act BEFORE any step runs, so
+  # an approved re-run does not type the same text twice.
+  if (( ! granted )); then
+    local kl k label
+    for (( i = 0; i < n; i++ )); do
+      kl="$(_preflight_kind "$(jq -c ".[$i]" <<<"$steps")")"; k="${kl%%$'\t'*}"; label="${kl#*$'\t'}"
+      [[ -n "$k" ]] || continue
+      if [[ "$(jq -r --arg k "$k" '.[$k]' <<<"$pol")" == ask ]]; then
+        _log "$(jq -nc --argjson i $((i+1)) --arg k "$k" --arg l "$label" --arg a "$app" '{step:$i, op:"stop", kind:$k, label:$l, app:$a, allowed_by:"asked owner"}')"
+        _owner_ask "$hash" "$steps" "$((i+1))" "$k" "$label" "$typed" "$app"
+        exit "$E_OWNER"
+      fi
+    done
+  fi
+
+  local MODE=act REC='[]' R_NAME="" R_ASK=""
+  _run_steps
   (( granted )) && _grant_spend "$approved"
+  [[ -n "$record" ]] && _routine_save "$record" "$REC"
 
   # The screen the steps left, as a snapshot, so the next call starts from it.
   local out
@@ -690,6 +976,8 @@ case "$verb" in
   apps) cmd_apps "$@" ;;
   snapshot) cmd_snapshot "$@" ;;
   act) cmd_act "$@" ;;
+  replay) cmd_replay "$@" ;;
+  routine|routines) cmd_routine "$@" ;;
   screenshot) cmd_screenshot "$@" ;;
   log) cmd_log "$@" ;;
   approvals) cmd_approvals "$@" ;;
