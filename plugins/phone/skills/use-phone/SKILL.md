@@ -1,6 +1,6 @@
 ---
 name: use-phone
-description: Use apps on the Android phone your owner set aside for you — read the screen, tap, type, open an app, send a WhatsApp or Instagram message, check a bank app. Use for "on my phone …", "in WhatsApp/Instagram/<app> …", "connect my phone", or anything that exists only as a phone app. For a website, use the browser instead (5dive browser): it is faster and reads pages better.
+description: Use apps on the Android phone your owner set aside for you — read the screen, tap, type, open an app, post on TikTok or Instagram, test an app build, check a rival's paywall. Use for "on my phone …", "in WhatsApp/Instagram/<app> …", "connect my phone", or anything that exists only as a phone app. For a website, use the browser instead (5dive browser): it is faster and reads pages better.
 ---
 
 # use-phone — snapshot, act by ref, check; the owner's rules for send, post, pay, delete
@@ -54,6 +54,26 @@ the screenshot and the exact words to ask the owner. When they say yes (the Appr
 were sent, or the row's approval gate the stop prints), re-run the **same** steps with
 `--approved=<id>`. Any other step that sends — an Enter that sends, a swipe that pays — you label
 yourself: `{"op":"key","key":"enter","kind":"send"}`.
+
+## Routines: "do this every morning"
+
+When the owner wants a phone task repeated, do it once with `--record=<name>`, in **one act**,
+starting from the home screen:
+
+```
+5dive phone act --steps='[{"op":"key","key":"home"},{"op":"open","app":"com.instagram.android"},
+  {"op":"tap","ref":"button/New post"},…,{"op":"tap","ref":"button/Share"}]' --record=morning-post
+```
+
+Use name refs (`button/Share`) for screens you have not snapshotted yet. The save asks the owner
+(exit 0, the ask printed): tell them in one line what it will repeat. It does not run until they
+say yes. Then `5dive phone replay morning-post` runs it with no model. To repeat it daily, add a
+crontab line on your seat: `0 8 * * * 5dive phone replay morning-post --wake-on-stop`.
+
+A replay that **stops (exit 65) is the answer, not a problem to solve.** Send the owner the line it
+prints and the screenshot. Do not re-run it, tap past the screen, or re-record it unasked. To
+change a routine, record it again under the same name: that asks the owner again. A routine never
+keeps what you typed into a sign-in box: pass it at each run with `--values='["…"]'`.
 
 Never work around a stop: no tap by position on a Send button you were stopped at, no adb
 command of your own. Every step is logged in `~/.5dive/phone/actions.jsonl` (`5dive phone log`);

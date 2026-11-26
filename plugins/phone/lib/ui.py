@@ -11,6 +11,10 @@
   ui.py classify <label>
       print the kind a tap on that label is (pay|publish|send|delete) or ""
 
+resolve and at also say "signin": true for a text box that holds a sign-in (a
+password, PIN or one-time code box, or any text box on a screen that has a
+password box): a recorded routine never keeps what was typed there.
+
 Standard library only: the box needs python3 and nothing else.
 """
 import json
@@ -45,6 +49,22 @@ KINDS = [
     ("send", r"send|send message|отправить|senden|enviar|envoyer"),
 ]
 KIND_RES = [(k, re.compile(r"(?<![\w])(?:%s)(?![\w])" % words, re.I)) for k, words in KINDS]
+
+# A text box that holds a sign-in, by its words (DIVE-9347). Android marks a
+# password box itself (password="true"); a PIN or code box often is not marked.
+SIGNIN_RE = re.compile(r"(?<![\w])(?:password|passcode|passwort|kennwort|contraseña|mot de passe|пароль|"
+                       r"pin|pin code|otp|one[- ]time (?:code|password)|verification code|security code|"
+                       r"2fa|two[- ]factor|код подтверждения|bestätigungscode|código de verificación)(?![\w])", re.I)
+
+
+def signin_of(n, nodes):
+    """True for a text box whose typed text a routine must never keep."""
+    if n.get("role") != "textbox":
+        return False
+    if n.get("password") or SIGNIN_RE.search(words_of(n.get("label", ""), n.get("rid", ""), n.get("desc", ""))):
+        return True
+    # The user name next to a password box is half of the same sign-in.
+    return any(m.get("password") for m in nodes)
 
 
 def words_of(*parts):
@@ -227,7 +247,8 @@ def resolve_named(ref, dump):
             n = min(hits, key=lambda n: (n["bounds"][1], n["bounds"][0]))
             x, y = center(n["bounds"])
             print(json.dumps({"x": x, "y": y, "label": n["label"], "role": n["role"], "value": n["value"],
-                              "kind": classify(*own_words(n)), "moved": False, "stale": False}))
+                              "kind": classify(*own_words(n)), "moved": False, "stale": False,
+                              "signin": signin_of(n, nodes)}))
             return
     sys.exit("ui.py: no %s \"%s\" on the screen now — take a snapshot and pick a ref from it" % (role, want))
 
@@ -273,22 +294,26 @@ def cmd_resolve(refs_path, ref, dump):
         "x": x, "y": y, "label": n["label"], "role": n["role"], "value": n.get("value", ""),
         "kind": classify(*own_words(n)) if n.get("interactive", True) else "",
         "moved": (not stale) and (x, y) != (ox, oy), "stale": stale,
+        "signin": signin_of(n, nodes) or bool(saved.get("password")),
     }))
 
 
 def cmd_at(dump, x, y):
     """The smallest control under a point: what a tap there would hit."""
     hit = None
-    for n in walk(load(dump), False):
+    nodes = walk(load(dump), False)
+    for n in nodes:
         b = n["bounds"]
         if n["interactive"] and b[0] <= x < b[2] and b[1] <= y < b[3]:
             if hit is None or (b[2] - b[0]) * (b[3] - b[1]) < (hit["bounds"][2] - hit["bounds"][0]) * (hit["bounds"][3] - hit["bounds"][1]):
                 hit = n
     if hit is None:
-        print(json.dumps({"x": x, "y": y, "label": "", "role": "", "value": "", "kind": "", "moved": False, "stale": False}))
+        print(json.dumps({"x": x, "y": y, "label": "", "role": "", "value": "", "kind": "", "moved": False, "stale": False,
+                          "signin": False}))
         return
     print(json.dumps({"x": x, "y": y, "label": hit["label"], "role": hit["role"], "value": hit["value"],
-                      "kind": classify(*own_words(hit)), "moved": False, "stale": False}))
+                      "kind": classify(*own_words(hit)), "moved": False, "stale": False,
+                      "signin": signin_of(hit, nodes)}))
 
 
 def main(argv):

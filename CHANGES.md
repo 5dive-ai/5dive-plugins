@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Added — phone 0.3.0: routines, shown once and repeated with no AI (DIVE-9347)
+
+- `plugins/phone` synced from 5dive-ai/5dive-phone 0.3.0 (`bash tests/phone_mirror.sh sync`). `act --record=<name>` keeps a run's steps by control name, never sign-in text; the save asks the owner (the browser's ask, grant bound to the steps); `replay <name>` runs it with no model and stops on a wrong screen (exit 65), naming the step. Details: 5dive-phone's CHANGES.md. Merge 5dive-phone first.
+
 ### Added — hosted 0.5.0: a premium team's update moves in from the core (DIVE-9330)
 
 - `bin/premium-team` (`5dive premium-team update <team> [--allow-downgrade]`; core's `5dive team update` forwards here, official plugin only) is the CLI's `_team_premium_update_online` (step 6e of DIVE-9262): it asks 5dive's API as the box for the newest signed file of a premium team and hands it to core's `5dive team import`, which checks and applies it. The verify side stays in core, so an offline box still imports the file by hand.
