@@ -207,8 +207,8 @@ STUB_RC=28 run 0 hire galina
 # ── W1-W5: wiring ─────────────────────────────────────────────────────────────
 MAN=plugins/hosted/.claude-plugin/plugin.json
 # DIVE-9328: first-job joined it (tests/hosted_first_job_unit.sh grades that verb).
-[[ "$(jq -r '[.fivedive.verbs[].name] | sort | join(",")' "$MAN" 2>/dev/null)" == first-job,handover,partner && "$(jq -r '.fivedive.capabilities | index("verb") != null' "$MAN")" == true ]] \
-  && ok_t "W1 plugin.json declares the 'partner' verb (and first-job, handover, nothing else)" || bad_t "W1 plugin.json declares the 'partner' verb" "$(jq -c .fivedive "$MAN" 2>&1)"
+[[ "$(jq -r '[.fivedive.verbs[].name] | sort | join(",")' "$MAN" 2>/dev/null)" == first-job,handover,partner,premium-team && "$(jq -r '.fivedive.capabilities | index("verb") != null' "$MAN")" == true ]] \
+  && ok_t "W1 plugin.json declares the 'partner' verb (and first-job, handover, premium-team, nothing else)" || bad_t "W1 plugin.json declares the 'partner' verb" "$(jq -c .fivedive "$MAN" 2>&1)"
 out=$(FIVEDIVE_JSON_MODE=1 FIVE_CONNECTORD_ENV="$TMP/connectord.env" "$BIN" hire 'Bad Pack!' 2>/dev/null); rc=$?
 [[ -x "$BIN" && $rc -eq $E_VALIDATION && "$(jq -r '.error.reason' <<<"$out" 2>/dev/null)" == invalid_pack ]] \
   && ok_t "W2 bin/partner runs as an executable: core's forwarded JSON mode gives the envelope, rc 3" \

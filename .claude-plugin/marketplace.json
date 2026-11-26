@@ -86,7 +86,7 @@
     },
     {
       "name": "hosted",
-      "description": "Commands that only work on a server 5dive built (they talk to 5dive's servers as that server): `5dive partner hire`, the owner's first job at hire, the pre-sale handover to the first hire and the agents' phone-push helper. Added by 5dive's install on every server 5dive built.",
+      "description": "Commands that only work on a server 5dive built (they talk to 5dive's servers as that server): `5dive partner hire`, the owner's first job at hire, the pre-sale handover to the first hire, a premium team's update to its newest version and the agents' phone-push helper. Added by 5dive's install on every server 5dive built, and on any server holding a premium team.",
       "category": "productivity",
       "source": "./plugins/hosted",
       "homepage": "https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/hosted"
