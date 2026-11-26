@@ -1,7 +1,7 @@
 {
   "name": "hosted",
-  "description": "Commands and helpers that only work on a server 5dive built, because they talk to 5dive's own servers as that server: `5dive partner hire` (a partner client's agent hires a colleague from the partner's catalogue), the owner's first job at hire (`5dive agent first-job`), and the native-push helper agents' hooks call when they fail. 5dive's install adds it on every server 5dive built; a self-hosted server has no use for it.",
-  "version": "0.3.0",
+  "description": "Commands and helpers that only work on a server 5dive built, because they talk to 5dive's own servers as that server: `5dive partner hire` (a partner client's agent hires a colleague from the partner's catalogue), the owner's first job at hire (`5dive agent first-job`), the pre-sale handover to the first hire (`5dive handover`), and the native-push helper agents' hooks call when they fail. 5dive's install adds it on every server 5dive built; a self-hosted server has no use for it.",
+  "version": "0.4.0",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com"
@@ -12,7 +12,8 @@
     "partner",
     "hire",
     "push",
-    "first-job"
+    "first-job",
+    "handover"
   ],
   "fivedive": {
     "contract": "1",
@@ -27,6 +28,10 @@
       {
         "name": "first-job",
         "summary": "on a 5dive-built server: run the owner's first job at hire (core's `agent first-job` forwards here)"
+      },
+      {
+        "name": "handover",
+        "summary": "on a 5dive-built server: give what the owner told 5dive before buying to their first hire, once (core's heartbeat runs `handover _tick`)"
       }
     ],
     "trust": {

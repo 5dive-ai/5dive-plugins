@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# `5dive handover …` — what the owner told 5dive before buying goes to their
+# first hire, once (DIVE-8946). Published by hosted@5dive-plugins (DIVE-9329,
+# step 6b of DIVE-9262); it was core's `_helper_tick` (src/cmd_helper.sh).
+#
+#   5dive handover _tick       root, from core's heartbeat tick: hand over once
+#   5dive handover status      eligible / done / the helper seat, for a person or --json
+#
+# WHY A PLUGIN. It only works on a box 5dive built for a paying owner: it reads
+# GET /helper/handover from 5dive's API as the box (its CONNECTORD_TOKEN). Core's
+# heartbeat execs `_tick` only while it can still be needed (a box holding the
+# demo AI account, no handed-over / welcomed record) and only when this official
+# plugin claims the verb, so a finished box pays one stat per tick and no fork.
+#
+# WHICH BOXES. A box that holds the demo AI account (demo-ai): the account a paid
+# my.5dive server is built with, the paid path that writes the handover.
+# Self-hosted and partner boxes have none and read nothing.
+#
+# THE HANDOVER waits for the first hire (an unclaimed spare has none), then reads
+# GET /helper/handover. 200 = a marked block in that agent's instructions file
+# (every later session reads it) and one system notice (the session already
+# running gets it now). 404 = the owner told 5dive nothing: done. Anything else is
+# retried next tick, at most HANDOVER_TRIES times. A first hire older than
+# HANDOVER_MAX_AGE gets nothing: days into the chat, the note is stale.
+# <state>/helper/handed-over records it, so it happens once. The state dir is
+# core's, unchanged, so a box that handed over before the move never does again.
+#
+# THE OLD HELPER SEAT (built by 0.138.0-0.140.x, before DIVE-8946). Its one
+# welcome is RETIRED, not moved (DIVE-9329): the welcome needed core's chat
+# encryption and dashboard relay, which a plugin cannot carry. Every seat still
+# unwelcomed was built at least four days before this shipped, so its box falls
+# into one of two cases, and both are served here: an owner who hired days ago
+# (the welcome would be stale, as a stale handover is) or an unclaimed spare (its
+# owner, when one comes, gets the handover in their first hire like every other
+# new box). A `welcomed` record still means done. The seat itself is left as it is.
+
+# Error codes: values identical to core's src/lib/error_codes.sh.
+E_GENERIC=1 E_USAGE=2 E_PERMISSION=10
+
+# Core strips a global `--json` and forwards the mode (FIVEDIVE_JSON_MODE).
+JSON_MODE="${FIVEDIVE_JSON_MODE:-${JSON_MODE:-0}}"
+
+# Core's header.sh paths: the same state dir, registry and auth profiles.
+STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
+REGISTRY="${REGISTRY:-$STATE_DIR/agents.json}"
+AUTH_PROFILES_DIR="${AUTH_PROFILES_DIR:-$STATE_DIR/auth-profiles}"
+
+HANDOVER_ACCOUNT="demo-ai"            # = core's CREATE_DEMO_AI_ACCOUNT
+HANDOVER_TRIES="${HANDOVER_TRIES:-12}"
+HANDOVER_MAX_AGE="${HANDOVER_MAX_AGE:-172800}"   # 2 days
+HELPER_AGENT="helper" HELPER_SYSTEM="helper"     # the pre-8946 seat, for status
+
+# Core's TYPE_PERSONA_FILE (src/header.sh): where each harness reads its
+# instructions, relative to the agent's home. A type not here gets the notice only.
+declare -A HANDOVER_PERSONA_FILE=(
+  [claude]=".claude/CLAUDE.md" [grok]=".claude/CLAUDE.md" [codex]=".codex/AGENTS.md"
+  [opencode]=".config/opencode/AGENTS.md" [pi]=".pi/agent/AGENTS.md"
+  [antigravity]=".gemini/GEMINI.md" [hermes]=".hermes/SOUL.md"
+  [openclaw]=".openclaw/workspace/AGENTS.md"
+)
+
+HANDOVER_BEGIN="<!-- 5dive: what your owner told 5dive before buying -->"
+HANDOVER_END="<!-- end of what your owner told 5dive -->"
+
+fail() {
+  local code="$1"; shift
+  if (( JSON_MODE )); then
+    jq -cn --argjson c "$code" --arg m "$*" '{ok:false, error:{code:$c, message:$m}}'
+  fi
+  echo "error: $*" >&2
+  exit "$code"
+}
+
+require_root() {
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "must run as root (5dive handover $1)"
+}
+
+_handover_dir()  { printf '%s/helper' "$STATE_DIR"; }
+_handover_self() { printf '%s' "${FIVEDIVE_SELF_BIN:-/usr/local/bin/5dive}"; }
+
+_handover_eligible() { [[ -s "${AUTH_PROFILES_DIR}/${HANDOVER_ACCOUNT}/combined.env" ]]; }
+
+# The API and the box token, read the way core's src/lib/box_token.sh reads them.
+_handover_api_base() {
+  local b="" f="${FIVE_API_BASE_FILE:-/etc/5dive/api-base}"
+  [[ -r "$f" ]] && IFS= read -r b <"$f" 2>/dev/null
+  [[ "$b" =~ ^https?://[^[:space:]/]+(/[^[:space:]]*)?$ ]] || b="${FIVE_API_BASE:-https://api.5dive.com}"
+  printf '%s' "${b%/}"
+}
+_handover_token() {
+  local f="${FIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}" t=""
+  if [[ -n "${CONNECTORD_TOKEN:-}" ]]; then printf '%s' "$CONNECTORD_TOKEN"; return 0; fi
+  [[ -r "$f" ]] || return 1
+  t=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$f" 2>/dev/null | head -n 1) || t=""
+  t="${t%$'\r'}"; t="${t#\"}"; t="${t%\"}"; t="${t#\'}"; t="${t%\'}"
+  [[ -n "$t" ]] || return 1
+  printf '%s' "$t"
+}
+
+# GET /helper/handover. Prints "<business>\t<slug, slug>" and rc 0 on 200, rc 3
+# on 404 (never asked), rc 1 on anything else (retry).
+_handover_fetch() {
+  local tok body http rc
+  tok=$(_handover_token) || return 1
+  body=$(mktemp) || return 1
+  # The bearer rides stdin (`-H @-`), never argv (DIVE-5168).
+  http=$(printf 'Authorization: Bearer %s\n' "$tok" \
+           | curl -sS --max-time 15 "$(_handover_api_base)/helper/handover" -H @- -o "$body" -w '%{http_code}' 2>/dev/null) || http=000
+  case "$http" in
+    200) jq -r '[(.business // "" | tostring | gsub("[\\t\\r\\n]+"; " ") | .[0:300]),
+                 ([.suggested // [] | .[] | strings | select(test("^[a-z0-9][a-z0-9_-]{0,63}$"))][0:2] | join(", "))] | @tsv' \
+           "$body" 2>/dev/null; rc=$?; rm -f "$body"; return $(( rc == 0 ? 0 : 1 )) ;;
+    404) rm -f "$body"; return 3 ;;
+    *)   rm -f "$body"; return 1 ;;
+  esac
+}
+
+# -> "<name>\t<type>\t<createdAt>" of the first agent the owner hired, or nothing.
+# System seats (the old helper) and sysadmin are not hires.
+_handover_first_hire() {
+  jq -r '[.agents // {} | to_entries[] | select((.value.system // "") == "" and .key != "sysadmin")]
+         | sort_by(.value.createdAt // "") | .[0] // empty
+         | [.key, (.value.type // "claude"), (.value.createdAt // "")] | @tsv' "$REGISTRY" 2>/dev/null
+}
+
+# theo -> Theo (an agent id from the helper's fact sheet is its first name).
+_handover_cap() { printf '%s' "${1^}"; }
+
+_handover_hire_names() { # <suggested> <joiner>
+  local a b
+  IFS=', ' read -r a b <<<"$1"
+  [[ -n "$a" ]] && printf '%s' "$(_handover_cap "$a")${b:+ $2 $(_handover_cap "$b")}"
+}
+
+# <business> <suggested> -> the block for the first hire's instructions file.
+_handover_block() {
+  local business="${1//[<>]/}" hire
+  hire=$(_handover_hire_names "$2" and)
+  printf '%s\n' "$HANDOVER_BEGIN" \
+    "## What your owner told 5dive before buying" "" \
+    "Before they bought this server, your owner told 5dive about their business: ${business}"
+  [[ -n "$hire" ]] && printf '%s\n' "5dive suggested they hire ${hire}."
+  printf '%s\n' "You know this already: never ask them what their business does. Use it when you plan work for them." \
+    "$HANDOVER_END"
+}
+
+# <business> <suggested> -> the one notice the first hire's running session gets.
+_handover_notice() {
+  local hire
+  hire=$(_handover_hire_names "$2" and)
+  printf '%s' "5dive: before buying, your owner told 5dive about their business: ${1//[<>]/}.${hire:+ 5dive suggested they hire ${hire}.} It is in your instructions now. Never ask them again what their business does. No reply needed."
+}
+
+# <file> <block> <user> -> the block appended once (a file that already holds it is left alone).
+_handover_write() {
+  local md="$1" block="$2" user="$3" new=0
+  [[ -e "$md" ]] || new=1
+  if [[ -f "$md" ]] && grep -qF "$HANDOVER_BEGIN" "$md" 2>/dev/null; then return 0; fi
+  mkdir -p "$(dirname "$md")" 2>/dev/null || return 1
+  { [[ -s "$md" ]] && printf '\n'; printf '%s\n' "$block"; } >>"$md" 2>/dev/null || return 1
+  (( new )) && chown "$user:$user" "$md" 2>/dev/null
+  return 0
+}
+
+_handover_record() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >"$(_handover_dir)/handed-over"; }
+
+# The heartbeat's step. Prints one line when it did something, nothing otherwise.
+_handover_tick() {
+  local d first lead type created age h="" rc=0 business="" suggested="" rel md tries=0
+  d=$(_handover_dir)
+  [[ -e "$d/welcomed" || -e "$d/handed-over" ]] && return 0
+  _handover_eligible || return 0
+  mkdir -p "$d" 2>/dev/null || return 1
+  first=$(_handover_first_hire)
+  [[ -n "$first" ]] || return 0                     # no hire yet (an unclaimed spare)
+  IFS=$'\t' read -r lead type created <<<"$first"
+  if [[ -n "$created" ]] && created=$(date -d "$created" +%s 2>/dev/null); then
+    age=$(( $(date +%s) - created ))
+    if (( age > HANDOVER_MAX_AGE )); then
+      _handover_record "skipped: $lead was hired ${age}s ago"; return 0
+    fi
+  fi
+  h=$(_handover_fetch) || rc=$?
+  if (( rc == 3 )); then
+    _handover_record "nothing: the owner told 5dive nothing"; rm -f "$d/handover-tries"; return 0
+  fi
+  if (( rc != 0 )); then
+    read -r tries 2>/dev/null <"$d/handover-tries" || tries=0
+    [[ "$tries" =~ ^[0-9]+$ ]] || tries=0
+    tries=$((tries + 1)); printf '%s\n' "$tries" >"$d/handover-tries"
+    (( tries < HANDOVER_TRIES )) && return 1
+    _handover_record "gave up: the API did not answer $tries times"; rm -f "$d/handover-tries"; return 0
+  fi
+  IFS=$'\t' read -r business suggested <<<"$h"
+  if [[ -z "$business" ]]; then
+    _handover_record "nothing: an empty handover"; return 0
+  fi
+  rel="${HANDOVER_PERSONA_FILE[$type]:-}"
+  md=""; [[ -n "$rel" ]] && md="${PERSONA_HOME_ROOT:-/home}/agent-${lead}/${rel}"
+  # No instructions file for that agent type: the notice alone carries it.
+  if [[ -n "$md" ]] && ! _handover_write "$md" "$(_handover_block "$business" "$suggested")" "agent-${lead}"; then
+    return 1                                         # retried next tick
+  fi
+  "$(_handover_self)" agent _deliver --system-notice "$lead" "$(_handover_notice "$business" "$suggested")" \
+    </dev/null >/dev/null 2>&1 || true
+  _handover_record "to $lead"
+  rm -f "$d/handover-tries"
+  printf 'gave the handover to the first hire %s\n' "$lead"
+}
+
+cmd_handover_status() {
+  local d eligible=false welcomed=false handover=pending note="" seat
+  d=$(_handover_dir)
+  _handover_eligible && eligible=true
+  [[ -e "$d/welcomed" ]] && welcomed=true
+  if [[ -e "$d/handed-over" ]]; then handover=done; read -r note <"$d/handed-over" 2>/dev/null || note=""; fi
+  seat=$(jq -r --arg n "$HELPER_AGENT" --arg s "$HELPER_SYSTEM" '.agents[$n] as $a
+    | if $a == null then "none" elif ($a.system // "") == $s then "mine" else "taken" end' "$REGISTRY" 2>/dev/null) || seat=none
+  [[ -n "$seat" ]] || seat=none
+  if (( JSON_MODE )); then
+    jq -cn --argjson e "$eligible" --arg h "$handover" --arg n "$note" --argjson w "$welcomed" --arg s "$seat" \
+      '{ok:true, data:{eligible:$e, handover:$h, note:$n, welcomed:$w, seat:$s}}'
+  else
+    printf 'handover: eligible=%s handover=%s%s welcomed=%s helper-seat=%s\n' \
+      "$eligible" "$handover" "${note:+ ($note)}" "$welcomed" "$seat"
+  fi
+}
+
+_handover_usage() {
+  cat <<'EOF'
+usage: 5dive handover status [--json]
+
+What the owner told 5dive before buying goes to their first hire, once: a note
+in that agent's instructions and one notice. Only on a server 5dive built.
+
+  5dive handover status   is this box eligible, is the handover done
+  5dive handover _tick    root: the heartbeat's step (hand over once)
+EOF
+}
+
+# ==================== entry ====================
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -uo pipefail
+  _ho_argv=()
+  for _ho in "$@"; do [[ "$_ho" == --json ]] && JSON_MODE=1 || _ho_argv+=("$_ho"); done
+  set -- "${_ho_argv[@]+"${_ho_argv[@]}"}"
+  case "${1:-status}" in
+    _tick)  require_root _tick; _handover_tick; exit 0 ;;
+    status) cmd_handover_status ;;
+    help|-h|--help) _handover_usage ;;
+    *) _handover_usage >&2; exit "$E_USAGE" ;;
+  esac
+fi

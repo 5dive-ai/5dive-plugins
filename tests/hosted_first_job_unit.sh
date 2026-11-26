@@ -383,8 +383,8 @@ start_job ada 'Plan my week'; STUB_ASK=auth run cmd_agent_first_job_run ada "$TO
 
 # ── W: wiring ────────────────────────────────────────────────────────────────
 PJ=plugins/hosted/.claude-plugin/plugin.json
-[[ "$(jq -c '[.fivedive.verbs[].name] | sort' "$PJ")" == '["first-job","partner"]' && "$(jq -r .version "$PJ")" == 0.3.0 ]] \
-  && ok_t "W1 plugin.json 0.3.0 declares exactly the first-job and partner verbs" || bad_t "W1 manifest" "$(jq -c '.version, [.fivedive.verbs[].name]' "$PJ")"
+[[ "$(jq -c '[.fivedive.verbs[].name] | sort' "$PJ")" == '["first-job","handover","partner"]' && "$(jq -r .version "$PJ")" == 0.4.0 ]] \
+  && ok_t "W1 plugin.json 0.4.0 declares exactly the first-job, handover (DIVE-9329) and partner verbs" || bad_t "W1 manifest" "$(jq -c '.version, [.fivedive.verbs[].name]' "$PJ")"
 reset; "$BIN" ada --token="$TOKEN" --job-b64="$(b64 'Plan my week')" >"$TMP/out" 2>&1; rc_start=$?
 "$BIN" _run ada >"$TMP/out2" 2>&1; rc_run=$?
 "$BIN" --help >"$TMP/out3" 2>&1; rc_help=$?

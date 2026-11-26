@@ -85,6 +85,9 @@ jobs:
       # DIVE-9328: the owner's first job at hire moved here too (bin/first-job).
       - name: hosted first-job harness
         run: bash tests/hosted_first_job_unit.sh
+      # DIVE-9329: the pre-sale handover to the first hire moved here too (bin/handover).
+      - name: hosted handover harness
+        run: bash tests/hosted_handover_unit.sh
       # DIVE-8050: plugins/browser IS 5dive-ai/5dive-browser's browser/, byte for
       # byte. A hand edit here matches no upstream commit and is red; behind main is
       # a named warning. Then 5dive-browser's OWN harnesses, from the matched commit,
