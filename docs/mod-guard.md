@@ -70,7 +70,7 @@ reason, not a report.
 | `smoke-attestation` | applying the `smoke-verified` label | `FIVEDIVE_MOD_GUARD_SMOKE_RECEIPT=<sha>` |
 | `runtime-store` | a direct write into `/var/lib/5dive`, `/var/log/5dive`, `/etc/5dive` or `tasks.db` | `FIVEDIVE_MOD_GUARD_ALLOW_RUNTIME_WRITE` |
 | `destructive-outside-workdir` | `rm -r` of a host path or a seat's dotfiles; `git clean -f` | `FIVEDIVE_MOD_GUARD_ALLOW_DESTRUCTIVE` |
-| `external-reply` | `gh pr/issue comment|review|create --repo <owner we do not own>` | `FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED` |
+| `external-reply` | `gh pr/issue comment|review`, `gh issue create` (from any login, 5dive-bot included) and `gh pr create` under the seat's own login, `--repo <owner we do not own>`. `5dive gh --as=bot pr create` runs: lodar's standing yes of 2026-11-26 covers a free-list entry PR from 5dive-bot (DIVE-9350) | `FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED` |
 | `openrouter-key-mint` | creating or raising an OpenRouter key over the keys API (POST/PATCH) | `FIVEDIVE_MOD_GUARD_ALLOW_OPENROUTER_MINT` |
 | `heavy-local` | **poke-two only** (`hosts`). A whole-project typecheck (`tsc` with no file, or `-p`/`--build`; `npm/bun run typecheck`), `next build`/`next dev` (bare, or `npm run build|dev` naming a Next app checkout), or a test runner with no test file after it (`npm test`, `bun test`, `node --test`, a `**` glob). `node --test <file>`, `bun test <file>`, `npm test -- <file>`, `tsc --noEmit <file>` and anything over `ssh` run | `FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL` |
 | `heavy-local-chrome` | **poke-two only.** Starting Chrome/Chromium/headless_shell directly, or running a 5dive-browser harness (`tests/browser_*.sh`, one at a time or in a `for` loop), which starts Chrome through `bin/browser`. `--version`, `which`, `killall`, reading a harness, `browser_mirror.sh check`, `ci-browser` and anything over `ssh` run | `FIVEDIVE_MOD_GUARD_ALLOW_HEAVY_LOCAL` |
@@ -151,6 +151,10 @@ than one whose edges are written down.
   re-runs itself. The backstop for all of these is poke-two's root-cron RAM reaper (DIVE-8804).
 - **`external-reply` only sees an explicit `--repo`/`-R`.** `gh pr comment 4` run from inside a
   foreign checkout carries no owner on the command line, so nothing is refused.
+  It also cannot tell a list PR from any other PR: every `5dive gh --as=bot pr create` on a foreign
+  repo runs, so keeping the bot to list entries is the maker's discipline. A chained command with
+  a bot PR and a plain `gh pr create` is refused whole, since the check cannot pair a `--repo` with
+  its `gh`.
 - **`pii-fixture` judges the path by NAME** (`test/`, `spec/`, `fixture`, `*.test.*`). A fixture
   living anywhere else is not covered.
 - **A seat cannot tell "guarded" from "guard broken" except from the sink.** That is the price of

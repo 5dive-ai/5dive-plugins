@@ -130,7 +130,7 @@
     },
     {
       "id": "external-reply",
-      "rule": "A reply on a repo we do not own goes out as lodar; it needs a per-thread approval (main's identity-cap rule)",
+      "rule": "A reply on a repo we do not own needs a per-thread approval (main's identity-cap rule); a free-list entry PR opened as 5dive-bot is covered by lodar's standing yes of 2026-11-26 (DIVE-9350)",
       "tools": ["Bash"],
       "text_keys": ["command"],
       "unless_env": "FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED",
@@ -143,12 +143,23 @@
           "allow_any": ["^5dive-ai$", "^lodar$", "^5dive$"],
           "require_all": [
             "\\bgh\\b",
-            "\\b(?:pr\\s+comment|issue\\s+comment|pr\\s+review|pr\\s+create|issue\\s+create)\\b"
+            "\\b(?:pr\\s+comment|issue\\s+comment|pr\\s+review|issue\\s+create)\\b"
           ],
           "say": "a public reply on a repository owned by {match}"
+        },
+        {
+          "id": "gh-pr-create-foreign-repo-not-bot",
+          "find": "(?:--repo|-R)[=\\s]+(?:https://github\\.com/)?([A-Za-z0-9_.-]+)/[A-Za-z0-9_.-]+",
+          "flags": "g",
+          "group": 1,
+          "allow_any": ["^5dive-ai$", "^lodar$", "^5dive$"],
+          "require_all": [
+            "(?:(?<!\\b5dive\\s+)\\bgh\\s+|\\b5dive\\s+gh\\s+(?!(?:--explain\\s+)?--as=bot\\s+(?!--as=|--explain\\b))(?:\\S+\\s+)*?)pr\\s+create\\b"
+          ],
+          "say": "a pull request opened under this seat's own GitHub login on a repository owned by {match}. Only a free-list entry PR may skip the approval, and only as 5dive-bot: `5dive gh --as=bot pr create`, with a body that says it comes from the 5dive team"
         }
       ],
-      "deny": "{found}. This seat's GitHub token writes under an identity that is not yours, so the comment is published in someone else's name on a project we do not own — it cannot be unsent. Put the text on the row and get the one-line approval first. [{rule}]"
+      "deny": "{found}. This seat's GitHub token writes under an identity that is not yours, so the post is published in someone else's name on a project we do not own — it cannot be unsent. Put the text on the row and get the one-line approval first. [{rule}]"
     },
     {
       "id": "openrouter-key-mint",
