@@ -314,6 +314,63 @@ describe('policy: external-reply — publishing under an identity that is not yo
     expect(verdict(bash('gh repo clone someorg/somerepo'))).toBeNull()
   })
 
+  // DIVE-9350: lodar's standing yes (2026-11-26) covers a free-list entry PR opened as
+  // 5dive-bot. The old check could not tell `5dive gh --as=bot` from this seat's own
+  // `gh` login, so it refused marketing's awesome-pi PR on two seats. Only `pr create`
+  // through the explicit bot form is let through; every other write stays refused.
+  test('DIVE-9350: a list PR opened as 5dive-bot on a foreign repo runs', () => {
+    const pr = 'pr create --repo bubbleptr/awesome-pi --head 5dive-bot:add-5dive --title "Add 5dive" --body-file b.md'
+    expect(verdict(bash(`5dive gh --as=bot ${pr}`))).toBeNull()
+    expect(verdict(bash(`sudo 5dive gh --as=bot ${pr}`))).toBeNull()
+    expect(verdict(bash(`5dive gh --explain --as=bot ${pr}`))).toBeNull()
+    expect(verdict(bash(`cd /tmp/x && 5dive gh --as=bot pr create -R bubbleptr/awesome-pi --fill`))).toBeNull()
+  })
+
+  test('DIVE-9350: a PR under this seat\'s own login on a foreign repo is still refused', () => {
+    expect(verdict(bash('gh pr create --repo otherorg/x --title t --body b'))).toBe('external-reply')
+    expect(verdict(bash('gh pr create -R https://github.com/otherorg/x --fill'))).toBe('external-reply')
+    // `5dive gh` without the explicit bot form: the routing default is configuration
+    // that can change, and `--as=caller` is lodar's token by name.
+    expect(verdict(bash('5dive gh pr create --repo otherorg/x --fill'))).toBe('external-reply')
+    expect(verdict(bash('5dive gh --as=caller pr create --repo otherorg/x --fill'))).toBe('external-reply')
+    // The wrapper's flag loop keeps the LAST --as, so a later one undoes the bot form.
+    expect(verdict(bash('5dive gh --as=bot --as=caller pr create --repo otherorg/x --fill'))).toBe(
+      'external-reply',
+    )
+    // The wrapper reads only `--as=<v>`; `--as bot` reaches gh as an unknown flag.
+    expect(verdict(bash('5dive gh --as bot pr create --repo otherorg/x --fill'))).toBe('external-reply')
+    expect(evaluate(SHIPPED, bash('gh pr create --repo otherorg/x --fill'), NO_ENV)?.check).toBe(
+      'gh-pr-create-foreign-repo-not-bot',
+    )
+  })
+
+  test('DIVE-9350: a bot PR chained with a plain gh PR is refused (the plain one is lodar)', () => {
+    expect(
+      verdict(
+        bash('5dive gh --as=bot pr create --repo bubbleptr/awesome-pi --fill && gh pr create --repo otherorg/y --fill'),
+      ),
+    ).toBe('external-reply')
+  })
+
+  test('DIVE-9350: comments, reviews and issues stay refused even from 5dive-bot', () => {
+    expect(verdict(bash('5dive gh --as=bot pr comment 4 --repo otherorg/x --body "hi"'))).toBe('external-reply')
+    expect(verdict(bash('5dive gh --as=bot issue comment 9 --repo otherorg/x --body "hi"'))).toBe(
+      'external-reply',
+    )
+    expect(verdict(bash('5dive gh --as=bot pr review 4 --repo otherorg/x --approve'))).toBe('external-reply')
+    expect(verdict(bash('5dive gh --as=bot issue create --repo otherorg/x --title t --body b'))).toBe(
+      'external-reply',
+    )
+    expect(evaluate(SHIPPED, bash('5dive gh --as=bot pr comment 4 --repo otherorg/x --body "hi"'), NO_ENV)?.check).toBe(
+      'gh-comment-foreign-repo',
+    )
+  })
+
+  test('DIVE-9350 MUTANT: a bot PR on our own repo is unaffected', () => {
+    expect(verdict(bash('5dive gh --as=bot pr create --repo 5dive-ai/5dive-plugins --fill'))).toBeNull()
+    expect(verdict(bash('gh pr create --repo 5dive-ai/5dive-plugins --fill'))).toBeNull()
+  })
+
   test('a per-thread approval is what opens it', () => {
     const on = { FIVEDIVE_MOD_GUARD_EXTERNAL_REPLY_APPROVED: 'DIVE-4696' }
     expect(verdict(bash('gh pr comment 4 --repo someorg/somerepo --body "hi"'), on)).toBeNull()
