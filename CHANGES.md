@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Fixed — telegram 0.5.147, dashboard 0.5.45: a numeric dated reset (`reset at 12-12 16:00:00 UTC`) is that date, and a monthly one is waited out (DIVE-9420)
+
+- A Qwen monthly quota prints `Your token-plan 1-month quota has been exhausted. The quota will reset at 12-12 16:00:00 UTC.` No arm in `hooks/lib/time.ts` knew a numeric date, so the clock path read `16:00` as today: the seat was scheduled to resume, and the sender told, 15 days early (teal-fox 2026-11-27, sig e4defe98903d). The bare sentence was worse: the loose `Date.parse` read it as 2001-12-12.
+- `time.ts`: a numeric `MM-DD HH:MM[:SS]` arm after `reset(s) (at )`, read month-day; when both numbers could be a month and differ, the one reading inside the bound wins, and both or neither is null. A line naming a monthly quota (`1-month`, `monthly`), or a numeric date on a line that names no shorter window, may reset up to 32 days out (`takesMonthlyBound`); every other dated line keeps 8 days, so a stale weekly banner stays unknown. `Date.parse` now runs only on ISO-shaped text.
+- `resume-retry.ts` `planWait`: a monthly reset (the hook passes `monthly` as the helper's 8th argument, from `resolveResetEpoch`) waits up to 32 days, and outside that goes to the blind park-hold, never to `untrusted`, which typed `continue` every few minutes into the wall. Non-monthly windows are unchanged.
+- The shared files are synced to the dashboard copy (`bun generator/sync-dashboard-hooks.ts`); the dashboard hook passes the same flag.
+- Harness: `test/dive9420-monthly-numeric-dated-reset.test.ts`, 20 arms, run against both copies: 17 are red on the 0.5.146 tree; the arm keeping the old forms (`resets 4pm`, `resets at 21:00 UTC`, `resets Nov 9, 5am (Europe/Nicosia)`, epoch and ISO passthrough) is green on both.
+
 ### Added — phone 0.3.0: routines, shown once and repeated with no AI (DIVE-9347)
 
 - `plugins/phone` synced from 5dive-ai/5dive-phone 0.3.0 (`bash tests/phone_mirror.sh sync`). `act --record=<name>` keeps a run's steps by control name, never sign-in text; the save asks the owner (the browser's ask, grant bound to the steps); `replay <name>` runs it with no model and stops on a wrong screen (exit 65), naming the step. Details: 5dive-phone's CHANGES.md. Merge 5dive-phone first.

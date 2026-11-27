@@ -12,6 +12,8 @@
 // caller is told WHICH — the paired human reading "couldn't auto-resume" needs
 // to know if we ran out of tries or out of clock.
 
+import { MONTHLY_MAX_AHEAD_S } from './time'
+
 export type RetryDeps = {
   // One resume attempt: type the prompt and watch for a confirmed pick-up.
   attempt: () => Promise<boolean>
@@ -88,6 +90,11 @@ export async function retryResume(deps: RetryDeps, limits: RetryLimits): Promise
 // already puts on a dated reset (DATED_MAX_AHEAD_S in lib/time.ts): anything
 // further out is a stale or mis-parsed line, not this wall.
 export const MAX_RESET_WAIT_SEC = 8 * 86400
+// DIVE-9420: a monthly quota (Qwen's `token-plan 1-month quota … reset at 12-12
+// 16:00:00 UTC`) resets up to a month out. The parser accepts such a date only
+// on a line that names a monthly quota (MONTHLY_MAX_AHEAD_S in lib/time.ts), and
+// the hook tells the helper so; the wait trusts the same bound.
+export const MONTHLY_RESET_WAIT_SEC = MONTHLY_MAX_AHEAD_S
 
 export type WaitPlan =
   // A reset in the trusted window: sleep this long (reset + 30s buffer), then resume.
@@ -97,9 +104,20 @@ export type WaitPlan =
   // No epoch at all: the DIVE-122 blind park-hold.
   | { kind: 'blind' }
 
-export function planWait(resetEpoch: number, nowSec: number, maxWaitSec: number = MAX_RESET_WAIT_SEC): WaitPlan {
+// `monthly`: the reset came from a line naming a monthly quota. Its window is a
+// month, and a monthly reset outside it goes to the blind park-hold, never to
+// `untrusted`: that path types `continue` at 5, 10, 20… minutes into a wall with
+// weeks left (DIVE-8374's shape).
+export function planWait(
+  resetEpoch: number,
+  nowSec: number,
+  maxWaitSec: number = MAX_RESET_WAIT_SEC,
+  monthly: boolean = false,
+): WaitPlan {
   if (!(resetEpoch > 0)) return { kind: 'blind' }
   const delta = resetEpoch - nowSec
-  if (delta > 0 && delta <= maxWaitSec) return { kind: 'wait', sec: delta + 30 }
+  const window = monthly ? Math.max(maxWaitSec, MONTHLY_RESET_WAIT_SEC) : maxWaitSec
+  if (delta > 0 && delta <= window) return { kind: 'wait', sec: delta + 30 }
+  if (monthly) return { kind: 'blind' }
   return { kind: 'untrusted', delta }
 }

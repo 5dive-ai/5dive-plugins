@@ -111,6 +111,7 @@ void RESUME_LOCK_TTL_MS
 // for ~2s on a usage limit, the flush race) → message text → pane.
 const resolved = await resolveResetEpoch(payload, msg, pane, isRateLimit, entries, inboundWindow)
 const resetEpoch: number | null = resolved.resetEpoch
+const resetMonthly: boolean = resolved.monthly
 entries = resolved.entries
 
 // Time-left string for the DM.
@@ -477,7 +478,7 @@ if (needsRecovery && tmuxCtx && lockPath && shouldSend) {
     ? join(import.meta.dir, 'resume-after-reset.ts')
     : join(import.meta.dir, 'resume-after-error.ts')
   const helperArgs = isRateLimit
-    ? [resumeHelper, String(resetEpoch ?? 0), tmuxCtx.socket, tmuxCtx.target, chatsCsv, lockPath, transcriptPath ?? '']
+    ? [resumeHelper, String(resetEpoch ?? 0), tmuxCtx.socket, tmuxCtx.target, chatsCsv, lockPath, transcriptPath ?? '', resetMonthly ? 'monthly' : '']
     : [resumeHelper, tmuxCtx.socket, tmuxCtx.target, chatsCsv, lockPath, transcriptPath ?? '']
   if (existsSync(resumeHelper)) {
     // DIVE-1107: the log dir was never pruned (725 accrued). Sweep old logs on

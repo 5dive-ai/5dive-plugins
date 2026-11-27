@@ -10,6 +10,11 @@
 // That form is read as a date, tried before any clock: the clock path alone took
 // it as the next 5am, and the walled account left cooldown ~4 days early.
 //
+// DIVE-9420: a Qwen monthly quota prints a NUMERIC date (`The quota will reset
+// at 12-12 16:00:00 UTC.`). No arm knew that form, so the clock path took `16:00`
+// as today and the seat was resumed 15 days early. It is read as a date now, and
+// a line that names a monthly quota may reset up to MONTHLY_MAX_AHEAD_S out.
+//
 // Every parser takes an optional `nowMs` so a test can pin the clock; callers
 // omit it and get Date.now().
 
@@ -22,11 +27,38 @@ const TZ_RE = /\(([A-Za-z_]+\/[A-Za-z_]+|UTC|GMT)\)/
 // dated arm (DIVE-5837), plus a 24h clock.
 const DATED_RE =
   /\bresets?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?(?:(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b\.?|([01]?\d|2[0-3]):([0-5]\d)\b)/i
+// DIVE-9420: the numeric dated reset, `reset at 12-12 16:00:00 UTC` (Qwen /
+// Alibaba print MM-DD). Read as month-day; see parseDated for an ambiguous pair.
+const NUMERIC_DATED_RE =
+  /\bresets?\s+(?:at\s+|on\s+)?(\d{1,2})-(\d{1,2})\s+(?:at\s+)?([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?\b/i
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
 // No weekly or session wall resets more than 7 days out. A date further ahead
 // than this is a stale or quoted line (last year's banner read as next year's),
 // not this wall's reset: it reads as unknown, never as a months-long park.
 const DATED_MAX_AHEAD_S = 8 * 86400
+// DIVE-9420: a monthly quota resets up to a month out, so a line that takes the
+// monthly bound may reset this far ahead; every other dated line keeps 8 days.
+export const MONTHLY_MAX_AHEAD_S = 32 * 86400
+const MONTHLY_RE = /\b(?:\d+[- ]?months?|one[- ]month|monthly|month(?:ly)?\s+(?:quota|limit|usage|cap|plan))\b/i
+// A window shorter than a month, named on the line (`Weekly limit`, `5-hour`).
+const SHORT_WINDOW_RE = /\b(?:week(?:ly)?|\d+[- ]?h(?:ours?|rs?)?|hour(?:ly)?|session|daily|day)\b/i
+
+// Does this limit line name a monthly quota (`token-plan 1-month quota`,
+// `monthly limit`)?
+export function isMonthlyQuota(text: string): boolean {
+  return MONTHLY_RE.test(text)
+}
+
+// Does a dated reset on this line take the monthly bound? A line that names a
+// monthly quota does. So does a NUMERIC date (`reset at 12-12 16:00 UTC`, the
+// Qwen/Alibaba form, whose bare sentence names no window) unless the line names
+// a shorter one. A month-name date (`resets Nov 9, 5am`, Anthropic's weekly
+// banner) without the word keeps 8 days, so a stale weekly banner stays unknown.
+// The hook passes this to the resume helper: the wait trusts the same bound.
+export function takesMonthlyBound(text: string): boolean {
+  if (isMonthlyQuota(text)) return true
+  return !DATED_RE.test(text) && NUMERIC_DATED_RE.test(text) && !SHORT_WINDOW_RE.test(text)
+}
 
 // Common timezone abbreviations → IANA zones, so epochAtTz resolves them
 // DST-correctly via Intl. US-centric, matching the zones Anthropic's limit
@@ -49,9 +81,13 @@ export function parseResetEpoch(text: string, nowMs: number = Date.now()): numbe
     return n
   }
 
-  // ISO-ish (RFC3339) — let Date handle it.
-  const iso = Date.parse(text)
-  if (!isNaN(iso)) return Math.floor(iso / 1000)
+  // ISO (RFC3339) — let Date handle it. DIVE-9420: only ISO-SHAPED text. The
+  // engine's legacy parser accepts loose prose, and read `The quota will reset at
+  // 12-12 16:00:00 UTC.` as 2001-12-12.
+  if (/^\s*\d{4}-\d{2}-\d{2}/.test(text)) {
+    const iso = Date.parse(text.trim())
+    if (!isNaN(iso)) return Math.floor(iso / 1000)
+  }
 
   // Plain-English: absolute clock ("9pm (TZ)", "21:00 UTC") or relative
   // ("resets in 2h 30m").
@@ -63,7 +99,7 @@ export function parseResetFromText(text: string, nowMs: number = Date.now()): nu
   // whenever the text carries one. A date that does not land within the bound
   // is unknown: falling through to the clock would read it as the next 5am,
   // the very bug DIVE-7748 fixed.
-  if (DATED_RE.test(text)) return parseDated(text, nowMs)
+  if (DATED_RE.test(text) || NUMERIC_DATED_RE.test(text)) return parseDated(text, nowMs)
   // Absolute clock time (am/pm preferred, else 24h) wins when present; it's
   // the canonical Anthropic format. Relative duration is the fallback.
   const abs = parseClock(text, nowMs)
@@ -71,28 +107,61 @@ export function parseResetFromText(text: string, nowMs: number = Date.now()): nu
   return parseRelativeDuration(text, nowMs)
 }
 
-// `resets Nov 9, 5am (TZ)` → that instant. The year is not printed, so it is the
-// one of last, this or next year (in the reset's zone) nearest to now: a `resets
-// Jan 2` read on Dec 30 lands next year. A reset already past, or more than
-// DATED_MAX_AHEAD_S ahead, is not a wall in force → null (the caller's fallback).
+// `resets Nov 9, 5am (TZ)` / `reset at 12-12 16:00 UTC` → that instant. The year
+// is not printed, so it is the one of last, this or next year (in the reset's
+// zone) nearest to now: a `resets Jan 2` read on Dec 30 lands next year. A reset
+// already past, or further ahead than the bound (8 days; 32 when the line takes
+// the monthly bound, see takesMonthlyBound), is not a wall in force → null.
+//
+// A numeric date is read month-day. When both numbers could be a month and they
+// differ (`07-08`), each reading is tried: exactly one inside the bound wins,
+// and both or neither is null. It never guesses.
 function parseDated(text: string, nowMs: number): number | null {
+  const bound = takesMonthlyBound(text) ? MONTHLY_MAX_AHEAD_S : DATED_MAX_AHEAD_S
   const m = DATED_RE.exec(text)
-  if (!m) return null
-  const month = MONTHS.indexOf(m[1].slice(0, 3).toLowerCase()) + 1
-  const day = parseInt(m[2], 10)
-  let hour24: number
-  let minute: number
-  if (m[3] !== undefined) {
-    const hour12 = parseInt(m[3], 10)
-    minute = m[4] ? parseInt(m[4], 10) : 0
-    if (hour12 < 1 || hour12 > 12 || minute > 59) return null
-    hour24 = (hour12 % 12) + (m[5].toLowerCase() === 'p' ? 12 : 0)
-  } else {
-    hour24 = parseInt(m[6], 10)
-    minute = parseInt(m[7], 10)
+  if (m) {
+    const month = MONTHS.indexOf(m[1].slice(0, 3).toLowerCase()) + 1
+    const day = parseInt(m[2], 10)
+    let hour24: number
+    let minute: number
+    if (m[3] !== undefined) {
+      const hour12 = parseInt(m[3], 10)
+      minute = m[4] ? parseInt(m[4], 10) : 0
+      if (hour12 < 1 || hour12 > 12 || minute > 59) return null
+      hour24 = (hour12 % 12) + (m[5].toLowerCase() === 'p' ? 12 : 0)
+    } else {
+      hour24 = parseInt(m[6], 10)
+      minute = parseInt(m[7], 10)
+    }
+    return datedEpoch(text, month, day, hour24, minute, nowMs, bound)
   }
-  if (month < 1 || day < 1 || day > 31) return null
+  const n = NUMERIC_DATED_RE.exec(text)
+  if (!n) return null
+  const a = parseInt(n[1], 10)
+  const b = parseInt(n[2], 10)
+  const hour24 = parseInt(n[3], 10)
+  const minute = parseInt(n[4], 10)
+  // Month-day first; day-month only when the numbers differ.
+  const readings: [number, number][] = a === b ? [[a, b]] : [[a, b], [b, a]]
+  const hits = new Set<number>()
+  for (const [month, day] of readings) {
+    if (month > 12) continue
+    const e = datedEpoch(text, month, day, hour24, minute, nowMs, bound)
+    if (e !== null) hits.add(e)
+  }
+  return hits.size === 1 ? [...hits][0] : null
+}
 
+function datedEpoch(
+  text: string,
+  month: number,
+  day: number,
+  hour24: number,
+  minute: number,
+  nowMs: number,
+  bound: number,
+): number | null {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null
   const tzName = resolveTz(text)
   const nowSec = Math.floor(nowMs / 1000)
   const year = ymdInTz(new Date(nowMs), tzName)?.[0]
@@ -104,7 +173,7 @@ function parseDated(text: string, nowMs: number): number | null {
     if (e === null || ymdInTz(new Date(e * 1000), tzName)?.[2] !== day) continue
     if (best === null || Math.abs(e - nowSec) < Math.abs(best - nowSec)) best = e
   }
-  if (best === null || best <= nowSec || best - nowSec > DATED_MAX_AHEAD_S) return null
+  if (best === null || best <= nowSec || best - nowSec > bound) return null
   return best
 }
 

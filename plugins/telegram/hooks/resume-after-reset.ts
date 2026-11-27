@@ -46,6 +46,9 @@ const target = process.argv[4] ?? ''
 const chatIdsCsv = process.argv[5] ?? ''
 const lockPath = process.argv[6] ?? ''
 const transcriptPath = process.argv[7] ?? ''
+// DIVE-9420: 'monthly' when the reset came from a line naming a monthly quota —
+// Phase 2 then trusts a reset up to a month out (planWait's monthly window).
+const monthly = (process.argv[8] ?? '') === 'monthly'
 
 // Split into two budgets so weekly-cap resets — where the API hands us a
 // real future epoch days out — don't get treated as untrustworthy and
@@ -204,7 +207,7 @@ async function attemptResume(): Promise<boolean> {
 // helper had the answer in argv the whole time and printed everything except.
 log(
   `resume-after-reset start: reset_epoch=${resetEpoch} socket=${socket} ` +
-    `target=${target} chats=${chatIdsCsv || '(none)'} transcript=${transcriptPath ? 'yes' : 'no'}`,
+    `target=${target} chats=${chatIdsCsv || '(none)'} transcript=${transcriptPath ? 'yes' : 'no'} monthly=${monthly ? 'yes' : 'no'}`,
 )
 
 let resumed = false
@@ -232,7 +235,7 @@ try {
 
   // Phase 2 — precise wait only for a trustworthy epoch.
   {
-    const plan = planWait(resetEpoch, Math.floor(Date.now() / 1000))
+    const plan = planWait(resetEpoch, Math.floor(Date.now() / 1000), undefined, monthly)
     if (plan.kind === 'wait') {
       log(`phase2 sleeping ${plan.sec}s until reset`)
       await sleepHeartbeat(plan.sec * 1000)

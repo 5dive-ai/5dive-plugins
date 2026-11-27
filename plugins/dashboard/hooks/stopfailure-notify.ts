@@ -69,7 +69,7 @@ const transcriptPath = payload.transcript_path
 // inboundWindow: the notice goes to the newest web-chat message, which may
 // predate the current turn (DIVE-7434).
 const first = transcriptPath ? readEntries(transcriptPath, inboundWindow) : []
-const { resetEpoch, entries } = await resolveResetEpoch(payload, msg, pane, kind.isRateLimit, first, inboundWindow)
+const { resetEpoch, entries, monthly } = await resolveResetEpoch(payload, msg, pane, kind.isRateLimit, first, inboundWindow)
 
 const inbound = lastDashboardInbound(entries)
 const pending = inbound !== null && !answeredAfter(entries, inbound.index)
@@ -139,7 +139,7 @@ if (!existsSync(helper)) {
 // No Telegram chats to ping: the helper only drives the pane. It types "continue
 // and reply to the latest message" when the web chat is waiting (resume-prompt.ts).
 const args = kind.isRateLimit
-  ? [helper, String(resetEpoch ?? 0), tmuxCtx.socket, tmuxCtx.target, '', lockPath, transcriptPath ?? '']
+  ? [helper, String(resetEpoch ?? 0), tmuxCtx.socket, tmuxCtx.target, '', lockPath, transcriptPath ?? '', monthly ? 'monthly' : '']
   : [helper, tmuxCtx.socket, tmuxCtx.target, '', lockPath, transcriptPath ?? '']
 pruneOldResumeLogs(dir, Date.now())
 const out = openSync(join(dir, `resume-dashboard-${Math.floor(Date.now() / 1000)}-${process.pid}.log`), 'a')
