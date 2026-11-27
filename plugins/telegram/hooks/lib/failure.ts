@@ -5,7 +5,7 @@
 // disagree about whether an agent hit its limit or a server blip.
 
 import { readEntries, findRateLimitText, findWallText, isWallLine, turnWindow, type WindowCheck } from './transcript'
-import { parseResetEpoch } from './time'
+import { parseResetEpoch, takesMonthlyBound } from './time'
 import { isTermsWall } from './terms'
 import type { HookPayload, TranscriptEntry } from './types'
 import type { Lang } from './lite'
@@ -145,15 +145,23 @@ export async function resolveResetEpoch(
   isRateLimit: boolean,
   entries: TranscriptEntry[],
   enough: WindowCheck = turnWindow,
-): Promise<{ resetEpoch: number | null; entries: TranscriptEntry[] }> {
+): Promise<{ resetEpoch: number | null; entries: TranscriptEntry[]; monthly: boolean }> {
   let resetEpoch: number | null = null
+  // DIVE-9420: the text the epoch was read from, so the caller can tell the
+  // resume helper it is a monthly quota (a month-long wait, not a poke loop).
+  let source = ''
+  const read = (text: string): number | null => {
+    const e = parseResetEpoch(text)
+    if (e !== null) source = text
+    return e
+  }
   const resetRaw =
     (payload.resetsAt as number | string | undefined) ??
     (payload.reset_at as number | string | undefined) ??
     (payload.resetAt as number | string | undefined) ??
     (typeof payload.error === 'object' && payload.error?.resetsAt) ??
     payload.rateLimit?.resetsAt
-  if (resetRaw !== undefined && resetRaw !== null) resetEpoch = parseResetEpoch(String(resetRaw))
+  if (resetRaw !== undefined && resetRaw !== null) resetEpoch = read(String(resetRaw))
 
   const transcriptPath = payload.transcript_path
   if (resetEpoch === null && transcriptPath) {
@@ -165,7 +173,7 @@ export async function resolveResetEpoch(
       }
       const wallText = findWallText(entries)
       if (wallText) {
-        const e = parseResetEpoch(wallText)
+        const e = read(wallText)
         if (e !== null) {
           resetEpoch = e
           break
@@ -173,16 +181,16 @@ export async function resolveResetEpoch(
       }
     }
   }
-  if (resetEpoch === null && isWallLine(msg)) resetEpoch = parseResetEpoch(msg)
+  if (resetEpoch === null && isWallLine(msg)) resetEpoch = read(msg)
   if (resetEpoch === null && transcriptPath) {
     const looseText = findRateLimitText(entries)
-    if (looseText) resetEpoch = parseResetEpoch(looseText)
+    if (looseText) resetEpoch = read(looseText)
   }
-  if (resetEpoch === null) resetEpoch = parseResetEpoch(msg)
+  if (resetEpoch === null) resetEpoch = read(msg)
   if (resetEpoch === null && pane) {
     // `resets 9pm` or, on a weekly wall, `resets Nov 9, 5am` (DIVE-7748).
     const line = pane.split('\n').find(l => /resets?\s+(?:\d|[a-z]{3}[a-z]*\.?\s+\d)/i.test(l))
-    if (line) resetEpoch = parseResetEpoch(line)
+    if (line) resetEpoch = read(line)
   }
-  return { resetEpoch, entries }
+  return { resetEpoch, entries, monthly: resetEpoch !== null && takesMonthlyBound(source) }
 }
