@@ -62,7 +62,11 @@ MARKER_V5="<!-- 5dive-setup-voice: voice section v5 -->"
 # which the next update overwrites.
 MARKER_V6="<!-- 5dive-setup-voice: voice section v6 -->"
 # v7 (DIVE-5897): which whisper model hears, and when to offer the other one.
-MARKER="<!-- 5dive-setup-voice: voice section v7 -->"
+MARKER_V7="<!-- 5dive-setup-voice: voice section v7 -->"
+# v8 (DIVE-9468): the app's «Faster voice» switch, on by default except in
+# encrypted chats, so an agent can point an owner who finds app voice slow at it,
+# or one who wants their voice private at turning it off.
+MARKER="<!-- 5dive-setup-voice: voice section v8 -->"
 # v4 is the first version with a CLOSING marker (DIVE-5189). Every section a
 # later release appends below this one (human-messaging, agent-sites) would be
 # eaten by the old "marker to end of file" strip, so a strip is now bounded.
@@ -581,14 +585,14 @@ step_claudemd() {
   fi
 
   if grep -qF "$MARKER" "$CLAUDE_MD"; then
-    ok "Voice section already present (v7) — not re-appending."
+    ok "Voice section already present (v8) — not re-appending."
     return
   fi
 
-  # v4 to v6 have a closing marker, so each is replaced by its own lines only:
+  # v4 to v7 have a closing marker, so each is replaced by its own lines only:
   # whatever a later release appended below it stays (DIVE-5397).
   local closed
-  for closed in "$MARKER_V6" "$MARKER_V5" "$MARKER_V4"; do
+  for closed in "$MARKER_V7" "$MARKER_V6" "$MARKER_V5" "$MARKER_V4"; do
     if grep -qF "$closed" "$CLAUDE_MD" \
        && sed -n "\|${closed}|,\$p" "$CLAUDE_MD" | grep -qF "$MARKER_END"; then
       cp -a "$CLAUDE_MD" "${CLAUDE_MD}.bak"
@@ -602,7 +606,8 @@ step_claudemd() {
   # the v2 block. If the user has manually added content after the v1 marker,
   # they'll need to restore it from the .bak we leave behind.
   local old_marker=""
-  if   grep -qF "$MARKER_V6"  "$CLAUDE_MD"; then old_marker="$MARKER_V6"
+  if   grep -qF "$MARKER_V7"  "$CLAUDE_MD"; then old_marker="$MARKER_V7"
+  elif grep -qF "$MARKER_V6"  "$CLAUDE_MD"; then old_marker="$MARKER_V6"
   elif grep -qF "$MARKER_V5"  "$CLAUDE_MD"; then old_marker="$MARKER_V5"
   elif grep -qF "$MARKER_V4"  "$CLAUDE_MD"; then old_marker="$MARKER_V4"
   elif grep -qF "$MARKER_V3"  "$CLAUDE_MD"; then old_marker="$MARKER_V3"
@@ -632,6 +637,7 @@ $MARKER
 - **If the owner says a note was misheard**, or a transcript comes back garbled or cut off (a sentence mixing two languages is the usual case), offer the more accurate model and warn that hearing will be about 2-3 times slower: \`sudo 5dive voice config set whisper_model small\`. **If they find hearing slow**, offer the faster one (\`whisper_model base\`, a little less accurate), and if their notes are always in one language, pinning it helps too: \`sudo 5dive voice config set stt_language ru\` (their language code) and \`sudo 5dive voice config set stt_fast 1\`. Switch only after they say yes; \`whisper_model auto\` goes back to the box's default. Never edit the voice plugin's own files or the whisper unit: the next update replaces them.
 - **Answer in the way the user wrote**: a typed message gets a text reply only — no voice note. Send a voice reply only when the user's own message was a voice note, or when they ask you for one. A voice reply spends credit, so never add one nobody asked for.
 - **Reply order for speed** (voice replies only): send the text reply first (so the user sees it immediately), then generate and send the voice attachment as a follow-up message. Never bundle them together — text first, voice second.
+- **Faster voice in the 5dive app**: the app has a «Faster voice» switch (the chat's ⋮ menu, and Settings › Voice), on by default except in encrypted chats. The owner's phone hears the words, so voice is faster, but the audio goes to Google (Android) or Apple (iPhone), not this box. If an owner finds voice in the app slow, point them to it. If they want their voice to stay private, tell them to switch it off.
 - **When a voice reply fails** (for example OpenRouter answers HTTP 402 because this box's voice credit is used up), your text reply is the answer: say in one line that the voice reply did not work this time. Do not retry it in a loop, do not change voice settings, and never ask the user for a key.
 $MARKER_END
 EOF
