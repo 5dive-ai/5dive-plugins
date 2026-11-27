@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Added — voice 1.11.8: agents learn the app's Faster voice switch (DIVE-9468)
+
+- **`5dive-setup-voice`:** the Voice section in the box's CLAUDE.md is now v8, with one line: the 5dive app has a «Faster voice» switch (chat ⋮ menu and Settings › Voice), on by default except in encrypted chats; the phone hears, so it is faster, but the audio goes to Google or Apple. An owner who finds app voice slow is pointed to it; one who wants their voice private is told to switch it off. v7 joins the replaced markers, bounded by its closing marker. Mirrors 5dive-voice 1.11.8 byte for byte.
+
+Harness: 5dive-voice `tests/whisper-model.test.sh` (48 arms; 8 of the 10 new v7-to-v8 arms red on 1.11.7, the other two guard the lines below the old section).
+
 ### Fixed — telegram 0.5.147, dashboard 0.5.45: a numeric dated reset (`reset at 12-12 16:00:00 UTC`) is that date, and a monthly one is waited out (DIVE-9420)
 
 - A Qwen monthly quota prints `Your token-plan 1-month quota has been exhausted. The quota will reset at 12-12 16:00:00 UTC.` No arm in `hooks/lib/time.ts` knew a numeric date, so the clock path read `16:00` as today: the seat was scheduled to resume, and the sender told, 15 days early (teal-fox 2026-11-27, sig e4defe98903d). The bare sentence was worse: the loose `Date.parse` read it as 2001-12-12.
