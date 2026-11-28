@@ -5,9 +5,10 @@
 // set-account` path, and resumes the same conversation on the new account. Nothing switches without the tap;
 // rotation and its defaults are untouched. With no such account the notice is exactly what it was.
 //
-// The one place both channels read (Telegram's hook and server, and the dashboard's, which run a byte-identical
-// copy of this file: plugins/dashboard/hooks/SHARED.txt). It decides WHICH account is offered, the button's
-// words, and arms the resume marker a tap needs. Pure where it can be: the CLI reads come in through `Read`.
+// The one place both channels read (Telegram's hook and server, and the dashboard's hook and server, which run a
+// byte-identical copy of this file: plugins/dashboard/hooks/SHARED.txt). It decides WHICH account is offered, the
+// button's words, and arms the resume marker a tap needs. The app chat adds «Wait for reset» beside it (waitLabel).
+// Pure where it can be: the CLI reads come in through `Read`.
 
 import { execFile } from 'child_process'
 import { existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs'
@@ -73,6 +74,14 @@ export function pickSwitchAccount(o: {
 export function switchLabel(account: string, lang: 'en' | 'ru' = 'en'): string {
   return lang === 'ru' ? `Перейти на ${account}` : `Switch to ${account}`
 }
+/**
+ * The app chat's second button. Its buttons are a question of 2 to 10 options (the app, the relay's `ask` op and
+ * the dashboard's question.ts all hold that floor), so the app's notice pairs the one action with a do-nothing
+ * choice: the notice's own promise, to answer once the limit resets. Telegram's notice keeps its single button.
+ */
+export function waitLabel(lang: 'en' | 'ru' = 'en'): string {
+  return lang === 'ru' ? 'Подождать сброса' : 'Wait for reset'
+}
 
 /** Telegram's callback data for the tap (≤ 64 bytes: 4 + a 32-character name). */
 export const SWITCH_CALLBACK_PREFIX = 'lsw:'
@@ -117,22 +126,28 @@ function dataArray(j: unknown): unknown[] | null {
  * answered by then is a null, so the notice goes out on time and without a button.
  */
 export async function readSwitchAccount(o: {
-  active: string | null
+  /** The account this agent runs on; or `agent` instead, and it is read in the same budget (the dashboard hook). */
+  active?: string | null
+  agent?: string
   type: string
   read: Read
   budgetMs: number
   nowSec?: number
 }): Promise<string | null> {
-  if (!o.active) return null
+  const lookup = o.active === undefined && !!o.agent && NAME_RE.test(o.agent)
+  if (!o.active && !lookup) return null
   const timeout = new Promise<null>(res => setTimeout(() => res(null), o.budgetMs).unref?.())
-  const both = Promise.all([
+  const all = Promise.all([
     o.read(['--json', 'account', 'list'], o.budgetMs).catch(() => null),
     o.read(['--json', 'account', 'usage'], o.budgetMs).catch(() => null),
+    lookup ? o.read(['--json', 'agent', 'rotation', 'get', o.agent!], o.budgetMs).catch(() => null) : Promise.resolve(null),
   ])
-  const got = await Promise.race([both, timeout])
+  const got = await Promise.race([all, timeout])
   if (!got) return null
+  const rot = got[2] as { ok?: unknown; data?: { active?: unknown } } | null
+  const active = lookup ? (rot?.ok === true && typeof rot.data?.active === 'string' ? rot.data.active : null) : o.active!
   return pickSwitchAccount({
-    active: o.active,
+    active,
     type: o.type,
     accounts: dataArray(got[0]) as AccountRow[] | null,
     usage: dataArray(got[1]) as UsageRow[] | null,
