@@ -1,5 +1,12 @@
 ## Unreleased
 
+### Added — telegram 0.5.148: «Switch to <account>» on the usage-limit notice, when a second account has room (DIVE-9477)
+
+- lodar 2026-11-28: at the limit, one button to move the agent onto the box's other account, and nothing switches without the tap. When an owner's agent hits its usage limit in a Telegram chat and another account holding a Claude sign-in reads under 90% on both windows (a reading from the last 6 h, no failed poll), the notice carries one button, «Switch to <account>». No such account, a read that does not answer inside the hook's budget (≤ 4 s, never past 7.5 s into the hook), a partner box, the demo key or an autonomous turn: no button, and the notice is exactly what it was.
+- The tap (`lsw:<account>`) is the `/account` switch (`applyAccount` → `5dive agent set-account`), once, after arming the same one-shot `resume-next` the rotation path arms, so the agent comes back in this conversation on the new account and answers the message that hit the limit. A refused or failed switch removes that marker. Rotation, its defaults and its settings are untouched.
+- `hooks/lib/limit-switch.ts` holds the pick, the button's words, the callback and the resume arm, so the app chat's copy reads the same rules when it lands (the app's one-button shape needs the chat, the relay and the plugin to accept a single option first).
+- Harness: `test/dive9477-limit-switch.test.ts`, 14 arms: the button only with a second same-AI account with room (no second account, other AI, at limit on 5h or 7d, no/failed/stale reading, unknown current account, typeless list: all none), the callback round trip and its refusals, the budget (a slow read is no button, on time), the resume marker in the shape `5dive-agent-start` validates and its removal, and the wiring (the hook's only new markup; the tap's set-account path).
+
 ### Added — voice 1.11.8: agents learn the app's Faster voice switch (DIVE-9468)
 
 - **`5dive-setup-voice`:** the Voice section in the box's CLAUDE.md is now v8, with one line: the 5dive app has a «Faster voice» switch (chat ⋮ menu and Settings › Voice), on by default except in encrypted chats; the phone hears, so it is faster, but the audio goes to Google or Apple. An owner who finds app voice slow is pointed to it; one who wants their voice private is told to switch it off. v7 joins the replaced markers, bounded by its closing marker. Mirrors 5dive-voice 1.11.8 byte for byte.

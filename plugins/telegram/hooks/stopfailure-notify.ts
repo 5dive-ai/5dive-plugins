@@ -25,6 +25,7 @@ import { resumePrompt } from './lib/resume-prompt'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs, type DedupResult } from './lib/notify-dedup'
 import type { HookPayload } from './lib/types'
 import { wallRotate, readActiveAccount, type Run } from './lib/wall-rotate'
+import { cliRead, readSwitchAccount, switchCallbackData, switchLabel } from './lib/limit-switch'
 import { isLite, readLiteLang, readAllowance, liteLimitText, liteAccountUrl, readChannelEnv, recordOpsDetail, LITE_STRINGS } from './lib/lite'
 import { inboundLang, TERMS_NOTICE } from './lib/terms'
 import { classifyFailure, failureMessage, resolveResetEpoch, CREDIT_NOTICE } from './lib/failure'
@@ -406,6 +407,18 @@ if (shouldSend) {
   // notice was lost, the way the 'nowhere to fall back to' branch does.
   if (targets.length === 0 && routeKind !== 'autonomous-silent') {
     console.error('[stopfailure-notify] no paired chat configured — usage-limit notice NOT sent (lost)')
+  }
+  // DIVE-9477: a usage limit told to the person who wrote, on an owner's box, gets ONE button when another
+  // account of this AI has room left: «Switch to <account>». The tap is the server's (lsw:<account>: the
+  // /account switch, then this conversation resumed). No such account, or no answer inside the budget: markup
+  // stays what it was and the notice goes out as before. Never on a partner box (accounts are not the client's).
+  if (isRateLimit && !LITE && demoFingerprint === null && routeKind === 'caller' && markup === undefined) {
+    const budgetMs = Math.min(4000, 7500 - Math.round(performance.now()))
+    const other = budgetMs >= 800
+      ? await readSwitchAccount({ active: resolveActiveAccount(), type: 'claude', read: cliRead, budgetMs })
+      : null
+    console.error(`[stopfailure-notify] switch offer: ${other ?? 'none'} (budget ${budgetMs}ms)`)
+    if (other) markup = { inline_keyboard: [[{ text: switchLabel(other), callback_data: switchCallbackData(other) }]] }
   }
   const results = await Promise.all(targets.map(t => sendMessage(t.chatId, text, t.threadId, markup)))
   targets.forEach((t, i) => {
