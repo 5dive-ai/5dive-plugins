@@ -919,8 +919,40 @@ function _labelIn(arg) {
   // button-shaped input carries its label in value.
   const btnValue = (n) => String(n.tagName || '').toLowerCase() === 'input'
     && /^(submit|button|reset|image)$/i.test(String((n.getAttribute && n.getAttribute('type')) || n.type || ''));
-  const txt = (n) => n ? cut([n.getAttribute && n.getAttribute('aria-label'), n.innerText, btnValue(n) ? n.value : '', n.title]
-    .filter((x) => typeof x === 'string' && x.trim()).join(' '), 160) : '';
+  // A CARD IS NAMED BY ITS TITLE, NOT BY ITS DESCRIPTION (DIVE-9502). A menu
+  // item or card prints a title and a description line under it, and innerText
+  // is both: "Automation builder\nAccept payments, sell with Pay…" stopped as a
+  // pay, though the click only opened a builder. The control says what it does in
+  // its name (aria-label / aria-labelledby) when it has one, else its first line;
+  // the text in its <p>s and on the lines after the first is what it describes.
+  // A button's label is one line, so "Buy now", "Place your order" and "Pay"
+  // still stop. Not caught any more: a button whose pay word is on its 2nd line.
+  // A NAME DOES NOT HIDE THE TEXT: with an aria-label the visible first line is
+  // still read beside it, so <button aria-label="Product image">Buy now</button>
+  // stops. It is only the first line (no fall back to the whole text when a name
+  // exists), so a card named by aria-labelledby whose text is all <p> stays quiet.
+  const named = (n) => {
+    const ids = String((n.getAttribute && n.getAttribute('aria-labelledby')) || '').split(/\s+/).filter(Boolean);
+    return ids.map((id) => { const e = document.getElementById ? document.getElementById(id) : null; return e ? String(e.innerText || e.textContent || '') : ''; }).join(' ');
+  };
+  const first = (s) => String(s || '').split('\n').map((x) => x.trim()).filter(Boolean)[0] || '';
+  const said = (n, named1) => {
+    const all = String(n.innerText == null ? '' : n.innerText);
+    let t = all;
+    try { const ps = n.querySelectorAll ? n.querySelectorAll('p') : [];
+      for (let i = 0; i < ps.length; i++) { const pt = String(ps[i].innerText || '').trim(); if (pt) t = t.split(pt).join('\n'); } } catch (e) { t = all; }
+    if (named1) return first(t);
+    return first(t) || first(all);
+  };
+  const txt = (n) => {
+    if (!n) return '';
+    const name = [n.getAttribute && n.getAttribute('aria-label'), named(n)].filter((x) => typeof x === 'string' && x.trim()).join(' ');
+    const low = (x) => String(x || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    let line = name ? said(n, true) : said(n);
+    if (name && line && low(name).includes(low(line))) line = '';  // the name already says it
+    return cut([name, line, btnValue(n) ? n.value : '', n.title]
+      .filter((x) => typeof x === 'string' && x.trim()).join(' '), 160);
+  };
   if (arg.op !== 'press') return txt(el);
   const form = el.form || (el.closest && el.closest('form'));
   if (!form) return '';
@@ -1077,7 +1109,14 @@ async function stepRisk(page, step, sel) {
     const refName = isRef(step.selector) ? refBody(step.selector).replace(/^[^/]*\//, '').replace(/#\d+$/, '') : '';
     let live = '';
     try { live = await at.evaluate(_labelIn, { sel: inSel, op: step.op, riskOf: true }); } catch (e) { live = ''; }
-    label = cutUnits([refName, live].filter(Boolean).join(' | '), 200);
+    // The ref's name is the snapshot's accessible name, and for a card that is its
+    // whole text on one line, description included (DIVE-9502). When it only
+    // EXTENDS the live label — the same title, then more words — those words are
+    // the description _labelIn left out, and the name goes. A ref that names
+    // something else (a picked element under another name) is still read whole.
+    const norm = (x) => String(x || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const refSays = (refName && live && norm(refName).startsWith(norm(live) + ' ')) ? '' : refName;
+    label = cutUnits([refSays, live].filter(Boolean).join(' | '), 200);
     cls = classifyLabel(label);
   }
   if (!cls) return null;

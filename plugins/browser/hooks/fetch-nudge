@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# DIVE-9500: after a WebFetch, or a Bash call that ran curl/wget, hand the hook
+# input to fetch-nudge.cjs, which adds one line of context when the page did not
+# come back. Every other Bash call leaves here without starting node, so the
+# hook costs nothing on the common path. Never fails the tool: always exit 0.
+in=$(cat) || exit 0
+case $in in
+  *WebFetch*|*curl*|*wget*) ;;
+  *) exit 0 ;;
+esac
+command -v node >/dev/null 2>&1 || exit 0
+printf '%s' "$in" | node "$(dirname "$0")/fetch-nudge.cjs" 2>/dev/null
+exit 0
