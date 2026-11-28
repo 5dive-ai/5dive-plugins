@@ -60,6 +60,8 @@ import { CHAT_ONLY_AGENT_INSTRUCTIONS, chatOnlyAgentArgs, chatOnlyAgentMode, cha
 import { REPLY_RETRY_BUDGET_MS, sendReplyWithRetry } from './replyretry.ts'
 import { CHAT_FILE_MAX_BYTES, LONG_POLL_WAIT_S, hearJobs, hearText, isChatOnly, isOfficeChatBase, isOwnUpload, runLongPoll, writeFileAtomic, type Hear, type HearJob, type PollOutcome } from './chatonly.ts'
 import { questionsDir, resolveAnswer, statusLabelPath, turnEndedPath, type ChatQuestion, type PendingQuestion } from './hooks/lib/dashboard-chat.ts'
+import { limitSwitchText, runLimitSwitch, takeLimitOffer, type SwitchExec } from './hooks/lib/dashboard-chat.ts'
+import { armSwitchResume, disarmSwitchResume } from './hooks/lib/limit-switch.ts'
 import { E2E_ARGV_DEFAULT, E2E_DIR_DEFAULT, E2E_REFUSED_TEXT, E2E_UNKNOWN_TEXT, dropPlainCopies, makeChatE2E, makeE2EGate, parseEnvelope, rootBoxCall } from './chate2e.ts'
 
 let PLUGIN_VERSION = '?'
@@ -600,6 +602,34 @@ function answerPendingQuestion(chatId: string, text: string): boolean {
   return true
 }
 
+// --- DIVE-9477: «Switch to <account>» / «Wait for reset» on the usage-limit notice ---
+// hooks/stopfailure-notify.ts offers them (dashboard-chat.ts takeLimitOffer). A tap is answered here and never
+// typed into the session, which is at its limit. «Switch»: the existing set-account, once, after arming the
+// one-shot resume the rotation path arms, so the agent comes back in this conversation on the new account and
+// answers the message that hit the limit; a switch that did not land removes that marker. «Wait»: one line.
+const switchExec: SwitchExec = (cmd, args, timeoutMs) => new Promise(res => {
+  execFile(cmd, args, { encoding: 'utf8', timeout: timeoutMs }, (err, stdout, stderr) => res({ ok: !err, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') }))
+})
+function answerLimitOffer(chatId: string, text: string): boolean {
+  const tap = takeLimitOffer(chatId, text, Date.now())
+  if (!tap) return false
+  const { account, lang } = tap.offer
+  const say = (t: string) => sendDashboardReply({ chat_id: chatId, text: t }).catch(err => {
+    process.stderr.write(`dashboard channel: limit-switch reply failed: ${err}\n`)
+  })
+  recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `limit offer ${tap.offer.id}: ${tap.action}${tap.action === 'switch' ? ` to ${account}` : ''}`)
+  if (tap.action === 'wait') { void say(limitSwitchText('wait', account, lang)); return true }
+  void (async () => {
+    await say(limitSwitchText('pending', account, lang))
+    const marker = armSwitchResume()
+    const r = await runLimitSwitch(AGENT, account, switchExec)
+    if (!r.ok) disarmSwitchResume(marker)
+    recordLifecycle(STATE_DIR, 'delivery', 'dashboard', `limit switch to ${account}: ${r.ok ? 'done' : `failed ${r.detail}`}`)
+    await say(limitSwitchText(r.ok ? 'done' : 'failed', account, lang, r.detail))
+  })()
+  return true
+}
+
 // --- DIVE-6715: "working: <step>" in the web chat ------------------------------
 // The status-label hook writes the step, the Stop/StopFailure hooks stamp the
 // end of the turn; workstatus.ts decides what the chat shows. A relay or an api
@@ -655,6 +685,7 @@ let dispatcherInboxSeq = 0
 async function deliverInbound(id: string, text: string, meta: Record<string, unknown>): Promise<void> {
   if (!DISPATCHER_ADAPTER) {
     const chatId = String(meta.chat_id ?? 'dashboard')
+    if (answerLimitOffer(chatId, text)) return
     if (answerPendingQuestion(chatId, text)) return
     await deliverToSession(text, meta)
     workStatus.inbound(chatId)

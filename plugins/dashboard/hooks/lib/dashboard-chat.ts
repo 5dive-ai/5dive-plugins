@@ -5,7 +5,7 @@
 // file the dashboard server sends. DIVE-6715 adds what the Stop, question and
 // status hooks need from the web chat on top of that.
 
-import { mkdirSync, renameSync, writeFileSync } from 'fs'
+import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { A2A_ENVELOPE_RE, entryTexts, refusedTooLongIds } from './transcript'
@@ -225,4 +225,122 @@ export function signalTurnEnded(env: NodeJS.ProcessEnv = process.env): void {
   } catch {
     // cosmetic: the server's ceiling clears the label anyway
   }
+}
+
+// --- DIVE-9477: «Switch to <account>» on the usage-limit notice ----------------
+// The hook (stopfailure-notify.ts) sends the notice with two buttons when another account of this AI has room
+// (limit-switch.ts picks it): «Switch to <account>» and «Wait for reset». The app's buttons are a question of
+// 2 to 10 options, so the one action goes with the notice's own promise. It records the offer here; the
+// server's next message from that chat that is one of those buttons (a tap sends the label, an older relay's
+// numbered text is answered with "1" or "2") is the answer, and is NOT typed into the session, which is at its
+// limit. Anything else the person writes goes on as before. An offer lives until the limit lifts, 6 h at most.
+
+export type LimitOffer = {
+  id: string
+  chatId: string
+  account: string
+  lang: Lang
+  labels: [string, string]
+  expiresAt: number
+}
+
+export const LIMIT_OFFER_MAX_MS = 6 * 3600_000
+
+export function limitOfferDir(env: NodeJS.ProcessEnv = process.env): string {
+  return join(dashboardStateDir(env), 'limit-switch')
+}
+
+/** The offer's expiry: the reset when it is known and sooner than 6 h, else 6 h. */
+export function limitOfferExpiry(resetEpoch: number | null, nowMs: number): number {
+  const cap = nowMs + LIMIT_OFFER_MAX_MS
+  return resetEpoch !== null && resetEpoch * 1000 > nowMs ? Math.min(resetEpoch * 1000, cap) : cap
+}
+
+export function writeLimitOffer(o: LimitOffer, env: NodeJS.ProcessEnv = process.env): string {
+  const dir = limitOfferDir(env)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const dest = join(dir, `${o.id}.json`)
+  writeFileSync(`${dest}.tmp`, JSON.stringify(o), { mode: 0o600 })
+  renameSync(`${dest}.tmp`, dest)
+  return dest
+}
+
+/**
+ * The answer to this chat's newest live offer, or null when `text` is not one of its buttons (or no offer is
+ * live). A button answer removes every offer for that chat, so a second tap does nothing; expired offers are
+ * removed as they are read.
+ */
+export function takeLimitOffer(
+  chatId: string,
+  text: string,
+  nowMs: number,
+  env: NodeJS.ProcessEnv = process.env,
+): { action: 'switch' | 'wait'; offer: LimitOffer } | null {
+  const dir = limitOfferDir(env)
+  let names: string[]
+  try { names = readdirSync(dir).filter(n => n.endsWith('.json')) } catch { return null }
+  const mine: Array<{ path: string; o: LimitOffer }> = []
+  for (const n of names) {
+    const path = join(dir, n)
+    try {
+      const o = JSON.parse(readFileSync(path, 'utf8')) as LimitOffer
+      if (!(o.expiresAt > nowMs)) { try { unlinkSync(path) } catch {} ; continue }
+      if (o.chatId === chatId && Array.isArray(o.labels) && o.labels.length === 2) mine.push({ path, o })
+    } catch {}
+  }
+  if (!mine.length) return null
+  const newest = mine.reduce((a, b) => (b.o.expiresAt > a.o.expiresAt ? b : a))
+  const { idx } = resolveAnswer({ labels: newest.o.labels, answers: [] }, text)
+  if (idx < 0) return null
+  for (const m of mine) { try { unlinkSync(m.path) } catch {} }
+  return { action: idx === 0 ? 'switch' : 'wait', offer: newest.o }
+}
+
+export type SwitchExec = (cmd: string, args: string[], timeoutMs: number) => Promise<{ ok: boolean; stdout: string; stderr: string }>
+
+/** Under set-account's own budget on Telegram (seatpriv.ts ACCOUNT_SWITCH_TIMEOUT_MS): never killed mid-write. */
+export const LIMIT_SWITCH_TIMEOUT_MS = 60_000
+
+/**
+ * The existing switch, once: `5dive agent set-account <agent> <account>`, as root first (an admin seat) and then
+ * as the seat itself (a standard seat holding its own `_self_account` line, DIVE-5367). A failed call is checked
+ * against `agent rotation get` before it counts as failed (DIVE-6867: a switch that landed is never reported as
+ * failed, and never run twice).
+ */
+export async function runLimitSwitch(agent: string, account: string, exec: SwitchExec): Promise<{ ok: boolean; detail: string }> {
+  const NAME = /^[a-z][a-z0-9_-]{0,31}$/
+  if (!NAME.test(agent) || !NAME.test(account)) return { ok: false, detail: 'invalid name' }
+  const moved = async (): Promise<boolean> => {
+    for (const cmd of [['5dive'], ['sudo', '-n', '5dive']]) {
+      const r = await exec(cmd[0]!, [...cmd.slice(1), '--json', 'agent', 'rotation', 'get', agent], 5_000).catch(() => null)
+      try {
+        const j = JSON.parse(r?.stdout ?? '')
+        if (j?.ok === true) return j.data?.active === account
+      } catch {}
+    }
+    return false
+  }
+  let detail = ''
+  for (const cmd of [['sudo', '-n', '5dive'], ['5dive']]) {
+    const r = await exec(cmd[0]!, [...cmd.slice(1), 'agent', 'set-account', agent, account], LIMIT_SWITCH_TIMEOUT_MS)
+      .catch(err => ({ ok: false, stdout: '', stderr: String(err) }))
+    if (r.ok) return { ok: true, detail: '' }
+    if (await moved()) return { ok: true, detail: '' }
+    detail = (r.stderr || r.stdout).trim().split('\n').filter(Boolean).pop()?.slice(0, 200) ?? ''
+  }
+  return { ok: false, detail }
+}
+
+/** What the chat is told around a tapped switch. The agent restarts on success, so "done" may not get out. */
+export function limitSwitchText(step: 'pending' | 'done' | 'failed' | 'wait', account: string, lang: Lang, detail = ''): string {
+  if (lang === 'ru') {
+    if (step === 'pending') return `Перехожу на ${account}…`
+    if (step === 'done') return `Перешёл на ${account}. Вернусь примерно через 30 секунд и отвечу на ваше сообщение.`
+    if (step === 'wait') return 'Хорошо, жду сброса лимита.'
+    return `Не получилось перейти на ${account}${detail ? `: ${detail}` : ''}. Остаюсь на текущем аккаунте и отвечу, когда лимит сбросится.`
+  }
+  if (step === 'pending') return `Switching to ${account}…`
+  if (step === 'done') return `Switched to ${account}. Back in about 30 seconds, then I'll answer your message.`
+  if (step === 'wait') return "OK, I'll wait for the reset."
+  return `Couldn't switch to ${account}${detail ? `: ${detail}` : ''}. I'm still on my current account and will answer when the limit resets.`
 }

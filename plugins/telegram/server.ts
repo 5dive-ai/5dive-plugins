@@ -82,6 +82,7 @@ import { resolveQuestionTap } from './hooks/lib/question-bridge'
 import { questionLabel } from './hooks/lib/question-bridge'
 import { sweepStaleRelayIn } from './hooks/lib/relay-quarantine'
 import { authStartArgv, LOGIN_ADMIN_TIER } from './hooks/lib/signin'
+import { armSwitchResume, disarmSwitchResume, parseSwitchCallback } from './hooks/lib/limit-switch'
 import { summarizeNeeds, reconcileBanner, armNeedsBanner, retireBannerStore, type BannerState, type NeedSummary } from './banner'
 import { installLifecycle } from './lifecycle.ts'
 import { protectTelegramViewerLinks } from './viewer-link.ts'
@@ -3387,7 +3388,9 @@ function applyModel(alias: string, chatId: number): ApplyResult {
 // restart clock only starts once the handler has finished sending the ack.
 // (/model and /effort defer too, but no longer to a restart — they defer the
 // live TUI switch and its pane poll.)
-async function applyAccount(name: string, chatId: number, lang: Lang = 'en'): Promise<ApplyResult> {
+// DIVE-9477: `settled` hears whether the switch landed (true) or not (false), once; the limit notice's
+// «Switch to…» tap uses it to drop the resume marker it armed when nothing moved. /account passes none.
+async function applyAccount(name: string, chatId: number, lang: Lang = 'en', settled?: (ok: boolean) => void): Promise<ApplyResult> {
   const me = thisAgentName()
   if (!me) return { text: `Can't determine this agent's name (not running as agent-* user).` }
   // Validate against the shell command after() will construct. The CLI also
@@ -3450,6 +3453,7 @@ async function applyAccount(name: string, chatId: number, lang: Lang = 'en'): Pr
             }
           }
         }
+        settled?.(text === accountSwitchDoneText(name))
         await bot.api.sendMessage(chatId, text)
       })().catch(() => {})
     },
@@ -6853,6 +6857,23 @@ bot.on('callback_query:data', async ctx => {
   // read at boot — which is why it keeps the shape /model has dropped.
   if (data === 'account:noop') {
     await ctx.answerCallbackQuery({ text: 'Already active.' }).catch(() => {})
+    return
+  }
+  // DIVE-9477: «Switch to <account>» on a usage-limit notice (hooks/stopfailure-notify.ts). The /account switch
+  // above, once, plus the resume the rotation path arms, so the agent comes back in this conversation on the
+  // new account and answers the message that hit the limit. The notice keeps its words and loses its button.
+  const limitSwitch = parseSwitchCallback(data)
+  if (limitSwitch) {
+    const chatId = ctx.chat?.id ?? Number(ctx.callbackQuery.from.id)
+    const marker = armSwitchResume()
+    const r = await applyAccount(limitSwitch, chatId, tapLang(ctx.from?.language_code, langOfChat(String(chatId))), ok => {
+      if (!ok) disarmSwitchResume(marker)
+    })
+    if (!r.after) disarmSwitchResume(marker)
+    await ctx.answerCallbackQuery({ text: r.after ? 'Switching…' : 'Not switched' }).catch(() => {})
+    await ctx.editMessageReplyMarkup().catch(() => {})
+    await ctx.reply(r.text).catch(() => {})
+    r.after?.()
     return
   }
   const accountM = /^account:([a-z][a-z0-9_-]{0,31}|default)$/.exec(data)

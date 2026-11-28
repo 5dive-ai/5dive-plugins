@@ -33,7 +33,8 @@ import { capturePane, getTmuxContext } from './lib/tmux'
 import { classifyFailure, failureMessage, resolveResetEpoch } from './lib/failure'
 import { claimNotify, notifyStampPath, pruneStaleNotifyStamps, pruneOldResumeLogs } from './lib/notify-dedup'
 import { resumeLogDir, tryAcquireResumeLock } from './lib/resume-lock'
-import { answeredAfter, dashboardStateDir, lastDashboardInbound, noticeLang, noticeText, signalTurnEnded, writeNotice } from './lib/dashboard-chat'
+import { answeredAfter, dashboardStateDir, lastDashboardInbound, limitOfferExpiry, noticeLang, noticeText, signalTurnEnded, writeLimitOffer, writeNotice, writeOutbox } from './lib/dashboard-chat'
+import { cliRead, readSwitchAccount, switchLabel, waitLabel } from './lib/limit-switch'
 import { textLang } from './lib/terms'
 import { isLite, liteLimitText, readAllowance, readLiteLang, recordOpsDetail } from './lib/lite'
 import type { HookPayload } from './lib/types'
@@ -97,8 +98,25 @@ if (claim.send) {
     const text = ownCapUsedUp && allowance
       ? liteLimitText(lang, allowance)
       : noticeText(noticeKind, resetEpoch, Math.floor(Date.now() / 1000), lang, lite)
-    const file = writeNotice(inbound.chatId, text)
-    log(`notice queued ${file}`)
+    // DIVE-9477: a usage limit on an owner's box, when another account of this AI has room: the same words,
+    // plus «Switch to <account>» and «Wait for reset» (the app's buttons need two). The server answers the tap
+    // (takeLimitOffer). No such account, or no answer inside the budget: the notice is exactly as before.
+    let other: string | null = null
+    if (kind.isRateLimit && !lite) {
+      const budgetMs = Math.min(4000, 7500 - Math.round(performance.now()))
+      other = budgetMs >= 800 ? await readSwitchAccount({ agent, type: 'claude', read: cliRead, budgetMs }) : null
+      log(`switch offer: ${other ?? 'none'} (budget ${budgetMs}ms)`)
+    }
+    if (other) {
+      const id = `lsw-${Date.now()}-${process.pid}`
+      const labels: [string, string] = [switchLabel(other, lang), waitLabel(lang)]
+      writeLimitOffer({ id, chatId: inbound.chatId, account: other, lang, labels, expiresAt: limitOfferExpiry(resetEpoch, Date.now()) })
+      const file = writeOutbox('stopfailure', { chat_id: inbound.chatId, text, question: { id, options: labels.map(label => ({ label })) } })
+      log(`notice queued with a switch to ${other} ${file}`)
+    } else {
+      const file = writeNotice(inbound.chatId, text)
+      log(`notice queued ${file}`)
+    }
   } else {
     log('no web-chat message this session — no notice')
   }

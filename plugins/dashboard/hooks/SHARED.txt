@@ -8,6 +8,7 @@
 #   bun generator/sync-dashboard-hooks.ts
 # test/dive6714-dashboard-stopfailure.test.ts fails on any drift.
 lib/failure.ts
+lib/limit-switch.ts
 lib/lite.ts
 lib/live-transcript.ts
 lib/local-only.ts
