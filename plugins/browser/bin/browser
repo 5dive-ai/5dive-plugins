@@ -8904,11 +8904,16 @@ _owner_ask_deliver() {  # <request-file>
   (( rc == 0 )) && [[ -n "$o" ]] && printf '  %s\n' "$o" >&2
   # ONE YES, NOT TWO (DIVE-7164). With no chat to the owner the ask waits on a
   # shell command, and an owner who already said yes on the row was asked again.
-  # A gate that names this ask IS the approval: the owner's yes on it approves it.
+  # A gate that names this ask IS the approval: the owner's tap on its card approves it.
+  # A TYPED YES APPROVES NOTHING (DIVE-9502, Y9). "The owner's yes there" was read as
+  # a yes in chat: the owner typed "try now", the gate stayed pending and nobody was
+  # told to tap. So the line says which yes counts, and what to do with a typed one.
   if (( rc != 0 )) || [[ -z "$o" || "$o" == "not sent"* ]]; then
     local id; id="$(basename "$1" .json)"
-    printf '  Put it on your row as ONE ask (the owner'"'"'s yes there is this approval, nothing else to run):
+    printf '  Put it on your row as ONE ask:
     5dive task need <your row> --type=approval --browser-ask=%s --ask="<what you will pay or send, and to whom>?"
+  The owner approves by pressing Approve (or Yes) on the card. A typed yes in chat does not approve.
+  If they answer in chat, cite that message on the gate (5dive task answer <row> yes --channel-msg=<message_id> --channel-proof=<chat_id>) and they are sent the buttons again.
 ' "$id" >&2
   fi
   return 0

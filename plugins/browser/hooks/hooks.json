@@ -1,0 +1,29 @@
+{
+  "description": "5dive browser: when a page fetch fails (WebFetch, or curl/wget on a web page) with a block, a robot check, a JavaScript-only page or a timeout, tell the agent on the spot that 5dive browser can open it. Silent on success. No network: a regex on the tool result only.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "WebFetch|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/fetch-nudge",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "WebFetch|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/fetch-nudge",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

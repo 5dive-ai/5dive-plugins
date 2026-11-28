@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Fixed — browser 1.98.1: opening a menu card is not a payment, and a typed yes approves nothing (DIVE-9502)
+- Mirror of 5dive-ai/5dive-browser#190 (85c8e72), which also brings 1.98.0 (#189, DIVE-9500: a failed page fetch
+  points the agent at `5dive browser read`, the new `hooks/`). A click is classified by the control's name plus its
+  visible first line, so a menu card whose description mentions payments no longer stops as a pay; "Buy now" still
+  does, also under an unrelated aria-label. A stop that reached no chat says the owner approves by pressing Approve on
+  the card, and a typed yes approves nothing.
+- parity runs two more upstream harnesses on this copy: `browser_pay_checkout_unit.sh`, `browser_fetch_nudge_unit.sh`.
+
 ### Added — telegram 0.5.148, dashboard 0.5.46: «Switch to <account>» on the usage-limit notice, in Telegram and the 5dive app chat, when a second account has room (DIVE-9477)
 
 - lodar 2026-11-28: at the limit, one button to move the agent onto the box's other account, and nothing switches without the tap. When an owner's agent hits its usage limit in a Telegram chat and another account holding a Claude sign-in reads under 90% on both windows (a reading from the last 6 h, no failed poll), the notice carries one button, «Switch to <account>». No such account, a read that does not answer inside the hook's budget (≤ 4 s, never past 7.5 s into the hook), a partner box, the demo key or an autonomous turn: no button, and the notice is exactly what it was.
